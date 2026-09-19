@@ -1,0 +1,110 @@
+# CI：bbtools-infra 最小构建门禁（#4）
+#
+# 范围：
+#   - C++17 Release 构建（cmake + ninja）
+#   - 固定 coroutine 依赖到 main HEAD（每次取最新 main，自带质量保障）
+#   - ctest -j1：contract.basics、http.loopback、http.lifecycle
+#   - 干净 runner 验证：无 /usr/local 旧产物兜底（依赖只来自 bbtools-runner:v1 + checkout coroutine）
+#
+# 非目标（#4 明确不做）：
+#   - sanitizer、性能门禁、平台矩阵
+#
+# Runner：arc-s4-infra（ARC scale set 绑定 yqm-307/bbtools-infra）
+#   Pod 模板已固定 bbtools-runner:v1 镜像（g++14 + cmake 3.31 + ninja + Boost 1.90）
+#   不需要 workflow 里再写 container:（ARC 不支持该语法，镜像在 Pod template 层固化）
+#
+# 公开仓库 + 常驻 self-hosted：fork PR 会执行 PR head 里的 workflow，
+# YAML 内 if 挡不住被替换的文件。硬闸门是仓库 Actions
+# approval_policy=all_external_contributors；不得批准未审查的 fork workflow。
+
+name: CI
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+
+env:
+  BUILD_DIR: ${{ github.workspace }}/build
+  COROUTINE_DIR: ${{ github.workspace }}/coroutine
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build-and-test:
+    name: "编译 & ctest"
+    runs-on: arc-s4-infra
+    timeout-minutes: 15
+    steps:
+      - name: "拉取 bbtools-infra"
+        uses: actions/checkout@v4
+        with:
+          path: infra
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: "拉取 bbtools-coroutine @ main"
+        uses: actions/checkout@v4
+        with:
+          repository: yqm-307/bbtools-coroutine
+          ref: main
+          path: coroutine
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: "记录 coroutine 依赖版本"
+        run: |
+          cd coroutine
+          echo "coroutine_ref=$(git rev-parse HEAD)" | tee "$GITHUB_OUTPUT"
+          git log -1 --format='coroutine main HEAD: %h %s (%ci)'
+
+      - name: "干净性预检：无 /usr/local 兜底产物"
+        run: |
+          echo "=== /usr/local 下的 bbt 痕迹（应为空）==="
+          find /usr/local/include/bbt /usr/local/lib -name '*bbt*' 2>/dev/null || true
+          echo "=== cmake/编译器版本 ==="
+          cmake --version | head -1
+          g++ --version | head -1
+          ninja --version
+
+      - name: "编译（Release）"
+        run: |
+          rm -rf "$BUILD_DIR" && mkdir -p "$BUILD_DIR"
+          cd "$BUILD_DIR"
+          cmake ../infra -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=ON \
+            -DBBT_COROUTINE_SOURCE_DIR="$COROUTINE_DIR"
+          ninja -j"$(nproc)"
+
+      - name: "ctest -j1"
+        run: |
+          cd "$BUILD_DIR"
+          ctest -j1 --output-on-failure --timeout 180
+        timeout-minutes: 5
+
+      - name: "依赖来源核查"
+        run: |
+          cd "$BUILD_DIR"
+          echo "=== libbbt_coroutine.so 链接路径 ==="
+          find . -name 'libbbt_coroutine.so*' -exec ls -la {} \;
+          echo "=== test 二进制 ldd（关键依赖） ==="
+          for bin in tests/Test_contract_basics tests/Test_http_loopback tests/Test_http_lifecycle; do
+            [ -x "$bin" ] || continue
+            echo "--- $bin ---"
+            ldd "$bin" | grep -E 'bbt|boost|libevent|hiredis|mysql' || echo "(静态/无外部依赖)"
+          done
