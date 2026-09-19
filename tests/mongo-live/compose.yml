@@ -1,0 +1,26 @@
+# Issue #7 真实 MongoDB 验收用临时容器：资源受限（cpus<=0.75,
+# mem_limit<=512m, wiredTigerCacheSizeGB<=0.25），动态项目名由编排脚本
+# 经 -p 指定，结束即 down -v 清理容器/网络/匿名卷。
+services:
+  mongo:
+    image: mongo:8.0
+    command:
+      - "mongod"
+      - "--wiredTigerCacheSizeGB"
+      - "0.25"
+      - "--bind_ip"
+      - "0.0.0.0"
+    cpus: 0.75
+    mem_limit: 512m
+    memswap_limit: 512m
+    ports:
+      # 宿主机端口必须固定：实测 `docker compose stop`+`start` 会为随机
+      # 映射重分端口，client 只能重连固定地址。端口由编排脚本探测空闲
+      # 端口后经 BBT_MONGO_PORT 注入，仍属动态分配且避免撞端口。
+      - "127.0.0.1:${BBT_MONGO_PORT:?must be set by run.sh}:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval",
+             "db.adminCommand('ping').ok"]
+      interval: 2s
+      timeout: 3s
+      retries: 45
