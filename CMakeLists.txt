@@ -142,6 +142,13 @@ else()
     target_link_libraries(bbt_infra_common INTERFACE bbt_coroutine)
 endif()
 
+# --- hiredis 依赖接入（Issue #6，Redis 模块）---------------------------------
+# 与 coroutine 同规约：仅允许经显式前缀接入，禁止把本机私有绝对路径
+# 写进默认值或任何提交内容。src/CMakeLists.txt 内 find_package 限定
+# NO_DEFAULT_PATH，杜绝误链系统位置 hiredis；未设置时跳过 Redis 模块。
+set(BBT_HIREDIS_PREFIX "" CACHE PATH
+    "hiredis 安装前缀（含 include/hiredis 与 lib/cmake/hiredis）")
+
 add_subdirectory(src)
 
 # 每个公共头单独编译 TU，验证头文件自给
@@ -154,7 +161,8 @@ set(BBT_INFRA_PUBLIC_HEADERS
     Codec.hpp
     HttpClient.hpp
     HttpServer.hpp
-    NetworkRuntime.hpp)
+    NetworkRuntime.hpp
+    CoRedisCli.hpp)
 set(_selfcheck_dir "${CMAKE_CURRENT_BINARY_DIR}/header_selfcheck")
 file(MAKE_DIRECTORY "${_selfcheck_dir}")
 set(_selfcheck_srcs "")

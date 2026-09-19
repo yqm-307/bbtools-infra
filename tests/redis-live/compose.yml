@@ -1,0 +1,20 @@
+# Issue #6 真实 Redis 验收用临时容器：资源受限（cpus<=0.5,
+# mem_limit<=256m），动态项目名由编排脚本经 -p 指定，结束即 down -v
+# 清理容器/网络/匿名卷。
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    cpus: 0.5
+    mem_limit: 256m
+    memswap_limit: 256m
+    ports:
+      # 宿主机端口必须固定：实测 `docker compose stop`+`start` 会为随机
+      # 映射重分端口，client 只能重连固定地址。端口由编排脚本探测空闲
+      # 端口后经 BBT_REDIS_PORT 注入，仍属动态分配且避免撞端口。
+      - "127.0.0.1:${BBT_REDIS_PORT:?must be set by run.sh}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 2s
+      retries: 30

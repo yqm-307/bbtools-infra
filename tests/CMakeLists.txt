@@ -22,3 +22,22 @@ target_link_libraries(Test_http_lifecycle
 target_compile_options(Test_http_lifecycle PRIVATE -Wall -Wextra)
 add_test(NAME http.lifecycle COMMAND Test_http_lifecycle)
 set_tests_properties(http.lifecycle PROPERTIES TIMEOUT 120)
+
+# --- Redis 模块测试（Issue #6）：仅在构建 bbt_infra_redis 时注册。
+# 单元套件不依赖外部 Redis（内置 FakeRedis/静默对端）；live 套件按
+# BBT_TEST_REDIS_ADDR 环境变量驱动真实容器验收，未提供时整件跳过。
+if(TARGET bbt_infra_redis)
+    add_executable(Test_redis_unit Test_redis_unit.cc)
+    target_link_libraries(Test_redis_unit PRIVATE
+        bbt_infra_redis bbt::infra_common Boost::boost Threads::Threads)
+    target_compile_options(Test_redis_unit PRIVATE -Wall -Wextra)
+    add_test(NAME redis.unit COMMAND Test_redis_unit)
+    set_tests_properties(redis.unit PROPERTIES TIMEOUT 120)
+
+    add_executable(Test_redis_live Test_redis_live.cc)
+    target_link_libraries(Test_redis_live PRIVATE
+        bbt_infra_redis bbt::infra_common Boost::boost Threads::Threads)
+    target_compile_options(Test_redis_live PRIVATE -Wall -Wextra)
+    add_test(NAME redis.live COMMAND Test_redis_live)
+    set_tests_properties(redis.live PROPERTIES TIMEOUT 120)
+endif()
