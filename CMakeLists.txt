@@ -122,7 +122,7 @@ if(BBT_COROUTINE_SOURCE_DIR)
     # bbt_core，此处自动放行。
     if(NOT TARGET bbt_core)
         file(READ "${BBT_COROUTINE_SOURCE_DIR}/CMakeLists.txt" _bbt_co_cmake)
-        if(_bbt_co_cmake MATCHES "bbt_core")
+        if(_bbt_co_cmake MATCHES "(^|[^_A-Za-z0-9])bbt_core([^_A-Za-z0-9]|$)")
             message(FATAL_ERROR
                 "bbtools-coroutine('${BBT_COROUTINE_SOURCE_DIR}') 依赖 bbtools-core，"
                 "但本构建未提供 bbt_core target。bbtools-core 当前没有 install/export "

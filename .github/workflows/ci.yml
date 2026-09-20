@@ -2,9 +2,9 @@
 #
 # 范围：
 #   - C++17 Release 构建（cmake + ninja）
-#   - 固定 coroutine 依赖到 main HEAD（每次取最新 main，自带质量保障）
+#   - 固定 coroutine 依赖到 main HEAD、core 依赖到 master HEAD（每次取最新默认分支）
 #   - ctest -j1：contract.basics、http.loopback、http.lifecycle
-#   - 干净 runner 验证：无 /usr/local 旧产物兜底（依赖只来自 bbtools-runner:v1 + checkout coroutine）
+#   - 干净 runner 验证：无 /usr/local 旧产物兜底（依赖只来自 runner 镜像 + checkout 源码树）
 #
 # 非目标（#4 明确不做）：
 #   - sanitizer、性能门禁、平台矩阵
@@ -39,6 +39,7 @@ on:
 env:
   BUILD_DIR: ${{ github.workspace }}/build
   COROUTINE_DIR: ${{ github.workspace }}/coroutine
+  CORE_DIR: ${{ github.workspace }}/bbtools-core
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -66,11 +67,23 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: "记录 coroutine 依赖版本"
+      - name: "拉取 bbtools-core @ master"
+        uses: actions/checkout@v4
+        with:
+          repository: yqm-307/bbtools-core
+          ref: master
+          path: bbtools-core
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: "记录上游依赖版本"
         run: |
           cd coroutine
           echo "coroutine_ref=$(git rev-parse HEAD)" | tee "$GITHUB_OUTPUT"
           git log -1 --format='coroutine main HEAD: %h %s (%ci)'
+          cd "$CORE_DIR"
+          echo "core_ref=$(git rev-parse HEAD)" | tee -a "$GITHUB_OUTPUT"
+          git log -1 --format='core master HEAD: %h %s (%ci)'
 
       - name: "干净性预检：无 /usr/local 兜底产物"
         run: |
@@ -88,7 +101,8 @@ jobs:
           cmake ../infra -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_TESTING=ON \
-            -DBBT_COROUTINE_SOURCE_DIR="$COROUTINE_DIR"
+            -DBBT_COROUTINE_SOURCE_DIR="$COROUTINE_DIR" \
+            -DBBT_CORE_SOURCE_DIR="$CORE_DIR"
           ninja -j"$(nproc)"
 
       - name: "ctest -j1"
@@ -100,8 +114,10 @@ jobs:
       - name: "依赖来源核查"
         run: |
           cd "$BUILD_DIR"
-          echo "=== libbbt_coroutine.so 链接路径 ==="
-          find . -name 'libbbt_coroutine.so*' -exec ls -la {} \;
+          echo "=== bbt 源码依赖产物 ==="
+          find . \( -name 'libbbt_core.so*' -o -name 'libbbt_coroutine.so*' \) -exec ls -la {} \;
+          test -n "$(find . -name 'libbbt_core.so*' -print -quit)"
+          test -n "$(find . -name 'libbbt_coroutine.so*' -print -quit)"
           echo "=== test 二进制 ldd（关键依赖） ==="
           for bin in tests/Test_contract_basics tests/Test_http_loopback tests/Test_http_lifecycle; do
             [ -x "$bin" ] || continue
