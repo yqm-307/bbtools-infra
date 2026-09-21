@@ -239,6 +239,10 @@ void HttpSession::RunHandler(HttpRequest request, IncomingCallContext ctx,
     auto self = shared_from_this();
     // TryPost 失败 = io 域已封，回复路径已随 teardown 消失，结果直接丢弃；
     // 在途状态随本 coroutine task 退出释放——token 覆盖 handler 全程。
+    // issue #19：先置 reply_posted 再投递——若 RequestClose 的 Teardown
+    // 抢先进 io 队列并 Abort→Close，Close 见 reply_posted 会延迟到本
+    // DeliverResult 写完才真关，不再丢弃已产出的响应。
+    reply_posted.store(true, std::memory_order_release);
     server->Engine()->TryPost(
         [self, r = std::move(r), keep_alive]() mutable {
             self->DeliverResult(std::move(r), keep_alive);
@@ -284,6 +288,9 @@ void HttpSession::DeliverResult(result<HttpResponse> r, bool keep_alive) {
             });
     } catch (...) {
         IoAsyncDone();
+        // 写发起失败=本次回复无法落地，清 reply_posted 使 Close 立即生效，
+        // 不被 close_after_write 延迟逻辑卡在不关等待。
+        reply_posted.store(false, std::memory_order_release);
         Close();
     }
 }
@@ -291,9 +298,13 @@ void HttpSession::DeliverResult(result<HttpResponse> r, bool keep_alive) {
 void HttpSession::OnWritten(boost::system::error_code ec, std::size_t,
                             bool keep_alive) {
     IoAsyncDone();
+    // issue #19：响应写完即本次请求的回复终结——清 reply_posted 让随后
+    // 的 Close（含 close_after_write 延迟路径）真正关闭 socket。
+    reply_posted.store(false, std::memory_order_release);
     if (closed)
         return;
-    if (ec || !keep_alive || !server->Accepting() || !server->OpenForIo()) {
+    if (close_after_write || ec || !keep_alive || !server->Accepting() ||
+        !server->OpenForIo()) {
         Close();
         return;
     }
@@ -355,6 +366,14 @@ void HttpSession::MaybeRelease() {
 void HttpSession::Close() noexcept {
     if (closed)
         return;
+    // issue #19：handler 已产出结果、DeliverResult 仍在 io 队列未写时，
+    // 立即关 socket 会让已排队响应在 `if(closed)` 被丢弃。改为标记
+    // close_after_write 让响应经 OnWritten 写完后回到这里真正关闭；
+    // DeliverResult 若发现 close_after_write 已置位则写完直接关。
+    if (reply_posted.load(std::memory_order_acquire) && !close_after_write) {
+        close_after_write = true;
+        return;
+    }
     closed = true;
     peer_watch_armed = false;
     try {
