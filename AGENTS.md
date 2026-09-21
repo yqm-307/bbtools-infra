@@ -73,6 +73,7 @@ docs/decisions/   依赖、边界与兼容取舍
 - 新模块先定义最小公共行为和契约测试，再实现一个真实后端；mock/fixture 仅作补充，不能替代真实连接、失败、取消、关闭和资源寿命验证。
 - 文档用中文，标识符/命令/错误原文保留。长期决策和必要摘要入仓；构建产物、原始日志、会话、凭据与私有路径不入仓。
 - 初始化文档运行 `git diff --check`；实现后必须给出真实 build/test/consume 命令。平台与依赖支持逐项验证，不从 Boost/第三方声明直接推定本仓支持。
+- 本地验证边界：必走冒烟 + 本次开发功能的单测 + 直接耦合功能的单测，三者全过；本地不跑全量测试，全量走 PR 的 CI（以 `gh pr checks` 为准）。同机多 agent 并行时：新 configure 加 `-DCMAKE_CXX_COMPILER_LAUNCHER=ccache`；本地并发取 `JOBS=$(( $(nproc) / 4 ))`（最小2，8核→2），增量用 `--target <t> --parallel $JOBS`；确需本地全量时串行（`flock /tmp/bbt-build.lock`，一次一个，`--parallel $(( $(nproc) / 2 ))`，8核→4）；禁止 bare `--parallel` / bare `ninja` / `make -j$(nproc)`。
 - 新依赖、公共接口破坏、CI/发布、系统安装和运行基础设施先确认。经用户授权后 commit/push，代码走 PR，不直推 main、不自行合并/发布。
 - 关键契约、依赖和生命周期变更独立审查；远端写入回读。缺环境/授权时 BLOCKED，不用 stub、放宽检查或扩大权限伪装完成。
 
