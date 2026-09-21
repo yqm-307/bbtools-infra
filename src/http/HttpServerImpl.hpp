@@ -101,6 +101,15 @@ public:
     bool                                     closed{false};
     bool                                     registered{false};
     std::atomic_int                          inflight{0};
+    // 关闭期在途响应保护（issue #19 根因）：
+    // RunHandler 在协程线程把结果 TryPost 进 io 队列后置 reply_posted；
+    // RequestClose→Abort→Close 与 DeliverResult 跨线程竞争进同一 io 队列，
+    // 若 teardown 抢先执行会 closed=true 使已排队的 DeliverResult 在
+    // `if(closed) return` 丢弃响应。reply_posted 标记「结果已产出待写」，
+    // Close 见到它时改为置 close_after_write 延迟到 OnWritten 真正关闭。
+    // 协程线程写、io 域读 → atomic；close_after_write 仅 io 域触碰。
+    std::atomic_bool                         reply_posted{false};
+    bool                                     close_after_write{false};
 };
 
 class HttpServerImpl : public HttpServer,
