@@ -66,6 +66,18 @@ namespace {
 
 constexpr int kBudgetMs = 45000;
 
+MongoClientConfig MakeUriCfg(std::string uri) {
+    MongoClientConfig cfg;
+    cfg.uri                      = std::move(uri);
+    cfg.worker_threads           = 2;
+    cfg.max_queue                = 8;
+    cfg.server_selection_timeout = std::chrono::milliseconds(15000);
+    cfg.connect_timeout          = std::chrono::milliseconds(2000);
+    cfg.socket_timeout           = std::chrono::milliseconds(2000);
+    cfg.wait_queue_timeout       = std::chrono::milliseconds(2000);
+    return cfg;
+}
+
 // 127.0.0.1:1 惯例无监听：server selection 必然在 serverSelectionTimeoutMS
 // 后失败——driver 侧阻塞有确定上界，且期间 worker 被物理占用。
 MongoClientConfig MakeDeadCfg(std::size_t workers = 2,
@@ -167,6 +179,52 @@ struct SuiteTeardown {
 BOOST_GLOBAL_FIXTURE(SuiteTeardown);
 
 BOOST_AUTO_TEST_SUITE(mongo_unit)
+
+BOOST_AUTO_TEST_CASE(t_effective_uri_decoy_in_value) {
+    // 参数值中含诱饵子串（connectTimeoutMS=/socketTimeoutMS）：真实 query
+    // key 未出现，仍须按序注入全部缺省项，且诱饵值原样保留。
+    const auto out = mongo_detail::EffectiveUri(MakeUriCfg(
+        "mongodb://host/db?replicaSet=connectTimeoutMS=999&foo=socketTimeoutMS"));
+    BOOST_CHECK_EQUAL(
+        out,
+        "mongodb://host/db?replicaSet=connectTimeoutMS=999&foo=socketTimeoutMS"
+        "&serverselectiontimeoutms=15000&connecttimeoutms=2000"
+        "&sockettimeoutms=2000&waitqueuetimeoutms=2000&maxpoolsize=2");
+}
+
+BOOST_AUTO_TEST_CASE(t_effective_uri_case_insensitive_existing) {
+    // 已有同名 key（任意大小写）不重复追加；其余按既有 append 顺序以
+    // '&' 追加；URI 原有大小写保留。
+    const auto out = mongo_detail::EffectiveUri(MakeUriCfg(
+        "mongodb://host/db?CONNECTTIMEOUTMS=4000&ServerSelectionTimeoutMS=9000"));
+    BOOST_CHECK_EQUAL(
+        out,
+        "mongodb://host/db?CONNECTTIMEOUTMS=4000&ServerSelectionTimeoutMS=9000"
+        "&sockettimeoutms=2000&waitqueuetimeoutms=2000&maxpoolsize=2");
+}
+
+BOOST_AUTO_TEST_CASE(t_effective_uri_no_query_uses_question) {
+    // 无 query：首个注入项接 '?'，其余以 '&' 分隔。
+    const auto out = mongo_detail::EffectiveUri(
+        MakeUriCfg("mongodb://host:27017/bbt_ut"));
+    BOOST_CHECK_EQUAL(
+        out,
+        "mongodb://host:27017/bbt_ut?serverselectiontimeoutms=15000"
+        "&connecttimeoutms=2000&sockettimeoutms=2000"
+        "&waitqueuetimeoutms=2000&maxpoolsize=2");
+}
+
+BOOST_AUTO_TEST_CASE(t_effective_uri_userinfo_decoy) {
+    // userinfo 与参数值中的 "connectTimeoutMS=" 诱饵不得误判为真实 key：
+    // 仍以 '?' 追加注入项，诱饵原样保留。
+    const auto out = mongo_detail::EffectiveUri(MakeUriCfg(
+        "mongodb://connectTimeoutMS=999:pw999@host/bb?t=connectTimeoutMS"));
+    BOOST_CHECK_EQUAL(
+        out,
+        "mongodb://connectTimeoutMS=999:pw999@host/bb?t=connectTimeoutMS"
+        "&serverselectiontimeoutms=15000&connecttimeoutms=2000"
+        "&sockettimeoutms=2000&waitqueuetimeoutms=2000&maxpoolsize=2");
+}
 
 BOOST_AUTO_TEST_CASE(t_create_before_scheduler) {
     auto c = CoMongoCli::Create(MakeDeadCfg());
