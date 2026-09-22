@@ -197,8 +197,12 @@ jobs:
           cd "$BUILD_DIR"
           echo "=== bbt 源码依赖产物 ==="
           find . \( -name 'libbbt_core.so*' -o -name 'libbbt_coroutine.so*' \) -exec ls -la {} \;
-          test -n "$(find . -name 'libbbt_core.so*' -print -quit)"
+          # P2（core-split）后 coroutine 已自闭环、不再产出 libbbt_core.so（首轮真实 run 实证）：
+          # libbbt_coroutine.so 必检，libbbt_core.so 仅告警，不再卡门禁。
           test -n "$(find . -name 'libbbt_coroutine.so*' -print -quit)"
+          if [ -z "$(find . -name 'libbbt_core.so*' -print -quit)" ]; then
+            echo "WARN: 未见 libbbt_core.so（P2 后预期内）"
+          fi
           echo "=== test 二进制 ldd（关键依赖） ==="
           for bin in tests/Test_contract_basics tests/Test_http_loopback tests/Test_http_lifecycle; do
             [ -x "$bin" ] || continue
