@@ -209,22 +209,56 @@ Error ClassifyBsonError(const bsoncxx::v1::exception& e, const char* what) {
 
 std::string EffectiveUri(const MongoClientConfig& cfg) {
     std::string uri = cfg.uri;
-    std::string lowered = uri;
-    std::transform(lowered.begin(), lowered.end(), lowered.begin(),
-                   [](unsigned char c) {
-                       return static_cast<char>(std::tolower(c));
-                   });
-    auto append = [&](const char* key, long long value) {
+    // 只认 '?' 之后的 query：按 '&' 分段，每段取第一个 '=' 之前的参数名，
+    // 大小写不敏感比较。避免 URI 其他位置（userinfo、参数值）中的
+    // "connectTimeoutMS=" 等子串被误判为真实 query key。
+    auto has_key = [&](const char* key) {
+        const std::size_t q = uri.find('?');
+        if (q == std::string::npos)
+            return false;
         std::string needle = key;
         std::transform(needle.begin(), needle.end(), needle.begin(),
                        [](unsigned char c) {
                            return static_cast<char>(std::tolower(c));
                        });
-        needle += '=';
-        if (lowered.find(needle) != std::string::npos)
+        std::size_t pos = q + 1;
+        while (pos <= uri.size()) {
+            const std::size_t amp = uri.find('&', pos);
+            const std::size_t end =
+                (amp == std::string::npos) ? uri.size() : amp;
+            const std::size_t eq = uri.find('=', pos);
+            const std::size_t name_end =
+                (eq == std::string::npos || eq > end) ? end : eq;
+            if (name_end - pos == needle.size()) {
+                bool match = true;
+                for (std::size_t i = 0; i < needle.size(); ++i)
+                    if (std::tolower(static_cast<unsigned char>(uri[pos + i])) !=
+                        needle[i])
+                        { match = false; break; }
+                if (match)
+                    return true;
+            }
+            if (amp == std::string::npos)
+                break;
+            pos = amp + 1;
+        }
+        return false;
+    };
+    auto append = [&](const char* key, long long value) {
+        if (has_key(key))
             return;   // URI 已显式给出：不覆盖调用方取值
-        uri += (uri.find('?') == std::string::npos) ? '?' : '&';
-        uri += needle + std::to_string(value);
+        // 无 query 时首参用 '?'；query 已存在时用 '&' 分隔，
+        // URI 以 '?'/'&' 结尾（空 query/空段）则不再追加分隔符。
+        if (uri.find('?') == std::string::npos)
+            uri += '?';
+        else if (uri.back() != '?' && uri.back() != '&')
+            uri += '&';
+        std::string needle = key;
+        std::transform(needle.begin(), needle.end(), needle.begin(),
+                       [](unsigned char c) {
+                           return static_cast<char>(std::tolower(c));
+                       });
+        uri += needle + '=' + std::to_string(value);
     };
     append("serverSelectionTimeoutMS",
            static_cast<long long>(cfg.server_selection_timeout.count()));
