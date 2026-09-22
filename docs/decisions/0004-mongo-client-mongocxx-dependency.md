@@ -8,6 +8,10 @@ worker bridge）、父任务 #3、契约文档 `0002-co-network-contract-v1.md`�
 最小 CRUD、mongocxx 同步 driver + 固定上限 worker 桥接、进程级
 `mongocxx::v1::pool` 共享。不引入通用命令接口。
 
+### 后续目标规格
+
+[0005：CoTCP/CoUDP 与第三方 Binding](0005-co-io-adapter-contract-v1.md) 将 worker bridge 作为显式兼容例外保留。本文“只能在专用 worker”是当前切片选型，不是 mongocxx 永远不能协程化的证明。是否能采用直接绑定或非阻塞 owner 驱动，由独立兼容调查裁决；PR 合并不代替真实后端、关闭及下游消费验收。
+
 ## 固定依赖
 
 | 项 | 值 |
