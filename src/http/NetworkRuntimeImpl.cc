@@ -12,16 +12,9 @@ namespace http_detail {
 namespace {
 
 // CreateObjectInfo / CompletionSignal 构造需要有效运行时代际；
-// 抛出的 logic_error 统一映射为 RuntimeUnavailable。
+// 实现已收敛到 detail（Issue #6 起与 Redis 模块共用）。
 result<bbt::coroutine::CoObjectInfo> NewObjectInfo(std::string kind) {
-    try {
-        return result<bbt::coroutine::CoObjectInfo>::ok(
-            bbt::coroutine::CreateObjectInfo(std::move(kind), ""));
-    } catch (const std::logic_error&) {
-        return result<bbt::coroutine::CoObjectInfo>::err(MakeError(
-            ErrorCode::RuntimeUnavailable,
-            "coroutine runtime generation unavailable"));
-    }
+    return bbt::infra::detail::NewObjectInfo(std::move(kind));
 }
 
 } // namespace

@@ -6,9 +6,6 @@
 #include <boost/beast/http/error.hpp>
 
 #include <bbt/coroutine/detail/Define.hpp>
-#include <bbt/coroutine/detail/LocalThread.hpp>
-#include <bbt/coroutine/detail/Processer.hpp>
-#include <bbt/coroutine/object/CoObject.hpp>
 
 namespace bbt::infra::http_detail {
 
@@ -307,41 +304,6 @@ Error ClassifyBackendError(const boost::system::error_code& ec,
     return e;
 }
 
-Error WaitStatusToError(bbt::coroutine::WaitStatus status) {
-    using bbt::coroutine::WaitStatus;
-    switch (status) {
-    case WaitStatus::TimedOut:
-        return MakeError(ErrorCode::TimedOut, "request deadline exceeded");
-    case WaitStatus::Cancelled:
-        return MakeError(ErrorCode::Cancelled, "request cancelled");
-    case WaitStatus::InvalidContext:
-        return MakeError(ErrorCode::InvalidContext,
-            "Request must run in coroutine context");
-    case WaitStatus::AlreadyWaiting:
-        return MakeError(ErrorCode::InternalError,
-            "internal: duplicate waiter on request signal");
-    case WaitStatus::RuntimeUnavailable:
-        return MakeError(ErrorCode::RuntimeUnavailable,
-            "coroutine runtime unavailable for request wait");
-    case WaitStatus::Completed:
-        break;
-    }
-    return MakeError(ErrorCode::InternalError, "internal: unexpected wait status");
-}
-
-CloseStatus WaitStatusToCloseStatus(bbt::coroutine::WaitStatus status) noexcept {
-    using bbt::coroutine::WaitStatus;
-    switch (status) {
-    case WaitStatus::Completed:          return CloseStatus::Closed;
-    case WaitStatus::TimedOut:           return CloseStatus::TimedOut;
-    case WaitStatus::Cancelled:          return CloseStatus::Cancelled;
-    case WaitStatus::InvalidContext:     return CloseStatus::InvalidContext;
-    case WaitStatus::AlreadyWaiting:     return CloseStatus::AlreadyWaiting;
-    case WaitStatus::RuntimeUnavailable: return CloseStatus::RuntimeUnavailable;
-    }
-    return CloseStatus::RuntimeUnavailable;
-}
-
 unsigned ErrorCodeToHttpStatus(ErrorCode code) noexcept {
     switch (code) {
     case ErrorCode::InvalidArgument:   return 400;
@@ -353,23 +315,6 @@ unsigned ErrorCodeToHttpStatus(ErrorCode code) noexcept {
     case ErrorCode::Closed:            return 503;
     default:                           return 500;
     }
-}
-
-CloseStatus ManagedCloseState::WaitClosed(
-    bbt::coroutine::Deadline          deadline,
-    bbt::coroutine::CancellationToken cancel,
-    bbt::coroutine::RuntimeGeneration generation) {
-    if (g_bbt_tls_coroutine_co == nullptr)
-        return CloseStatus::InvalidContext;
-    const auto gen = bbt::coroutine::CurrentRuntimeGeneration();
-    if (gen == 0 || gen != generation)
-        return CloseStatus::RuntimeUnavailable;
-    if (IsClosed())
-        return CloseStatus::Closed;
-    bbt::coroutine::WaitOptions opt;
-    opt.deadline = deadline;
-    opt.cancel   = std::move(cancel);
-    return WaitStatusToCloseStatus(m_sig->Wait(opt));
 }
 
 } // namespace bbt::infra::http_detail
