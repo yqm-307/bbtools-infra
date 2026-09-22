@@ -4,6 +4,10 @@
 
 日期：2026-09-19。关联 Issue：#6（拆分 #3：CoRedisCli 协程客户端与真实 Redis 验收）、父任务 #3、契约文档 `0002-co-network-contract-v1.md`。本决策只覆盖 `CoRedisCli` 首版切片：固定最小命令集、hiredis asynchronous API、共享 coroutine executor。不引入万能命令 DSL。
 
+### 后续目标规格
+
+[0005：CoTCP/CoUDP 与第三方 Binding](0005-co-io-adapter-contract-v1.md) 提出 hiredis transport 函数表直接协程绑定的候选路径。本文 async + strand 仍描述当前实现；下文“同步 API + Hook 被明确禁止”限定于旧 async context 不得混用同步调用，不是禁止独立构建并验证新的 transport Binding。目标路径需验证锁、线程局部状态、Stop 不展开栈与关闭时序，未验收前不得写成已迁移。
+
 ## 固定依赖
 
 | 项 | 值 |
