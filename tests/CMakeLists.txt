@@ -41,3 +41,29 @@ if(TARGET bbt_infra_redis)
     add_test(NAME redis.live COMMAND Test_redis_live)
     set_tests_properties(redis.live PROPERTIES TIMEOUT 120)
 endif()
+
+# --- Mongo 模块测试（Issue #7）：仅在构建 bbt_infra_mongo 时注册。
+# 单元套件不依赖外部 MongoDB（不可达地址 + 驱动超时上界驱动确定性
+# 失败路径；worker 并发/容量经 impl 观测钩子核验）；live 套件按
+# BBT_TEST_MONGO_URI 环境变量驱动真实容器验收，未提供时整件跳过。
+if(TARGET bbt_infra_mongo)
+    add_executable(Test_mongo_unit Test_mongo_unit.cc)
+    target_include_directories(Test_mongo_unit PRIVATE
+        ${CMAKE_SOURCE_DIR}/src)
+    # mongo::mongocxx_shared 只为 impl 内部头（src/mongo/）的 include
+    # 路径与符号；测试不直接调 driver API。
+    target_link_libraries(Test_mongo_unit PRIVATE
+        bbt_infra_mongo bbt::infra_common Boost::boost Threads::Threads
+        mongo::mongocxx_shared)
+    target_compile_options(Test_mongo_unit PRIVATE -Wall -Wextra)
+    add_test(NAME mongo.unit COMMAND Test_mongo_unit)
+    set_tests_properties(mongo.unit PROPERTIES TIMEOUT 300)
+
+    add_executable(Test_mongo_live Test_mongo_live.cc)
+    target_link_libraries(Test_mongo_live PRIVATE
+        bbt_infra_mongo bbt::infra_common Boost::boost Threads::Threads
+        mongo::bsoncxx_shared)
+    target_compile_options(Test_mongo_live PRIVATE -Wall -Wextra)
+    add_test(NAME mongo.live COMMAND Test_mongo_live)
+    set_tests_properties(mongo.live PROPERTIES TIMEOUT 120)
+endif()
