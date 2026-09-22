@@ -3,6 +3,16 @@ target_link_libraries(Test_contract_basics PRIVATE bbt::infra_common)
 target_compile_options(Test_contract_basics PRIVATE -Wall -Wextra)
 add_test(NAME contract.basics COMMAND Test_contract_basics)
 
+# --- Issue #20 组合等待能力探针（probe only） --------------------------------
+# 实测 detail::CoPollEvent 单事件上 FD readable + custom wakeup + timeout
+# 组合的确定性四场景。使用 detail 非稳定头与非公开组合路径，仅用于能力裁决，
+# 不作为生产 IoWait 实现依据；不涉及 Stop 安全断言。
+add_executable(Test_iowait_probe Test_iowait_probe.cc)
+target_link_libraries(Test_iowait_probe PRIVATE bbt::infra_common)
+target_compile_options(Test_iowait_probe PRIVATE -Wall -Wextra)
+add_test(NAME iowait.probe COMMAND Test_iowait_probe)
+set_tests_properties(iowait.probe PROPERTIES TIMEOUT 60)
+
 # N1b-1：真实 HTTP/1.1 loopback 闭环（Boost.Beast + Asio）。
 # 与上游单测一致：Boost.Test 经 included/unit_test.hpp 静态内嵌。
 find_package(Boost REQUIRED)
