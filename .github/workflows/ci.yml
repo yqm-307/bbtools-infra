@@ -1,13 +1,16 @@
-# CI：bbtools-infra 最小构建门禁（#4）
+# CI：bbtools-infra 构建门禁（#4）
 #
 # 范围：
-#   - C++17 Release 构建（cmake + ninja）
+#   - C++17 Release 构建（cmake + ninja，JOBS=3 + ccache，无裸 nproc 并发）
 #   - 固定 coroutine 依赖到 main HEAD、core 依赖到 master HEAD（每次取最新默认分支）
 #   - ctest -j1：contract.basics、http.loopback、http.lifecycle
+#   - docs-only 变更检测：纯文档 PR/push 直接上报 success，required check 不会因
+#     paths-ignore 整体跳过而悬空（模板：bbtools-coroutine unit_test.yml changes job）
 #   - 干净 runner 验证：无 /usr/local 旧产物兜底（依赖只来自 runner 镜像 + checkout 源码树）
 #
 # 非目标（#4 明确不做）：
-#   - sanitizer、性能门禁、平台矩阵
+#   - sanitizer、性能门禁、平台矩阵、redis/mongo 模块接入（需显式依赖前缀，
+#     runner 镜像未提供，接入另行评审）
 #
 # Runner：arc-s4-infra（ARC scale set 绑定 yqm-307/bbtools-infra）
 #   Pod 模板已固定 bbtools-runner:v1 镜像（g++14 + cmake 3.31 + ninja + Boost 1.90）
@@ -25,33 +28,87 @@ permissions:
 on:
   pull_request:
     branches: [main]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSE'
   push:
     branches: [main]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSE'
 
 env:
   BUILD_DIR: ${{ github.workspace }}/build
   COROUTINE_DIR: ${{ github.workspace }}/coroutine
   CORE_DIR: ${{ github.workspace }}/bbtools-core
+  # 同机 3 槽共享 12c：构建并发固定 3，不按 nproc 抢占
+  JOBS: 3
+  # ARC Pod 可能是每 job 一生的临时 runner；目录固定在 workspace 内，
+  # 镜像/模板若挂载持久缓存可改为持久路径，重复构建自动受益
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
 
+# 同一 ref 的 run 排队而不是互相取消：PR 的新 push 取消旧 run 以省 runner，
+# main 保留排队，避免集成验证结果被后续 push 吞掉。
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # docs-only 变更检测：纯文档/LICENSE PR 时 required check 直接上报 success，
+  # 避免 paths-ignore 与 ruleset required check 冲突导致无法 merge。
+  changes:
+    name: "变更类型检测"
+    runs-on: arc-s4-infra
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - name: "拉取代码库"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: "判断是否含代码变更"
+        id: filter
+        run: |
+          BEFORE="${{ github.event.before }}"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # checkout 已全量拉取（fetch-depth: 0），直接用现有的 origin/<base>，
+            # 不再额外浅抓（浅边界会改变三点 diff 的 merge-base 解析）。
+            RANGE="origin/${{ github.base_ref }}...HEAD"
+          elif [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            # 新分支首推：before 为空/全零，改用 HEAD^ 对比；根提交保守视为代码变更
+            if git rev-parse --verify --quiet HEAD^ >/dev/null; then
+              RANGE="HEAD^..HEAD"
+            else
+              echo "code=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            # force-push 或 before 提交被 GC/不可达时保守视为代码变更，
+            # 避免 git diff 报 unknown revision 导致 changes job 失败、
+            # 下游被 needs 跳过而 required check 挂起。
+            if git rev-parse --verify --quiet "$BEFORE^{commit}" >/dev/null; then
+              RANGE="$BEFORE..${{ github.sha }}"
+            else
+              echo "code=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          # 非文档路径模式：命中任一即视为代码变更
+          if git diff --name-only $RANGE | grep -vE '\.md$|^docs/|^LICENSE$' | grep -q .; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build-and-test:
     name: "编译 & ctest"
+    needs: [changes]
     runs-on: arc-s4-infra
     timeout-minutes: 15
     steps:
+      - name: "docs-only 变更直接通过"
+        if: needs.changes.outputs.code == 'false'
+        run: echo "docs-only change, skipping build/test; check reports success."
+
       - name: "拉取 bbtools-infra"
+        if: needs.changes.outputs.code == 'true'
         uses: actions/checkout@v4
         with:
           path: infra
@@ -59,6 +116,7 @@ jobs:
           persist-credentials: false
 
       - name: "拉取 bbtools-coroutine @ main"
+        if: needs.changes.outputs.code == 'true'
         uses: actions/checkout@v4
         with:
           repository: yqm-307/bbtools-coroutine
@@ -68,6 +126,7 @@ jobs:
           persist-credentials: false
 
       - name: "拉取 bbtools-core @ master"
+        if: needs.changes.outputs.code == 'true'
         uses: actions/checkout@v4
         with:
           repository: yqm-307/bbtools-core
@@ -77,6 +136,7 @@ jobs:
           persist-credentials: false
 
       - name: "记录上游依赖版本"
+        if: needs.changes.outputs.code == 'true'
         run: |
           cd coroutine
           echo "coroutine_ref=$(git rev-parse HEAD)" | tee "$GITHUB_OUTPUT"
@@ -86,6 +146,7 @@ jobs:
           git log -1 --format='core master HEAD: %h %s (%ci)'
 
       - name: "干净性预检：无 /usr/local 兜底产物"
+        if: needs.changes.outputs.code == 'true'
         run: |
           echo "=== /usr/local 下的 bbt 痕迹（应为空）==="
           find /usr/local/include/bbt /usr/local/lib -name '*bbt*' 2>/dev/null || true
@@ -94,24 +155,44 @@ jobs:
           g++ --version | head -1
           ninja --version
 
-      - name: "编译（Release）"
+      - name: "编译（Release，JOBS=3 + ccache）"
+        if: needs.changes.outputs.code == 'true'
         run: |
           rm -rf "$BUILD_DIR" && mkdir -p "$BUILD_DIR"
+          if command -v ccache >/dev/null 2>&1; then
+            LAUNCHER="-DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+            ccache -z || true
+            echo "ccache: $(ccache --version | head -1)"
+          else
+            # bbtools-runner:v1 镜像未列 ccache 时直接编译；镜像补装后自动启用
+            LAUNCHER=""
+            echo "ccache 不可用：跳过编译缓存"
+          fi
           cd "$BUILD_DIR"
           cmake ../infra -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_TESTING=ON \
+            $LAUNCHER \
             -DBBT_COROUTINE_SOURCE_DIR="$COROUTINE_DIR" \
             -DBBT_CORE_SOURCE_DIR="$CORE_DIR"
-          ninja -j"$(nproc)"
+          cmake --build . --parallel "$JOBS"
+          if command -v ccache >/dev/null 2>&1; then
+            echo "=== ccache 统计 ==="
+            ccache --show-stats || true
+          fi
 
       - name: "ctest -j1"
+        if: needs.changes.outputs.code == 'true'
         run: |
           cd "$BUILD_DIR"
+          # --timeout 只作用于无 TIMEOUT 属性的测试（contract.basics）；
+          # http.loopback/http.lifecycle 的 TIMEOUT 60/120 测试属性优先级更高，保持不变。
+          # 保持与原门禁一致的 180：contract.basics 无实测耗时证据就收紧会造成门禁 flake。
           ctest -j1 --output-on-failure --timeout 180
         timeout-minutes: 5
 
       - name: "依赖来源核查"
+        if: needs.changes.outputs.code == 'true'
         run: |
           cd "$BUILD_DIR"
           echo "=== bbt 源码依赖产物 ==="
