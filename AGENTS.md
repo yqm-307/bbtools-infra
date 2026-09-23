@@ -2,10 +2,11 @@
 
 ## 定位与权威
 
-- 本仓是统一的现代 C++ 第三方能力接入与服务基础设施层，首批负责 HTTP、RPC、MCP 及其 adapters。
-- 它不是 IaC/运维配置仓，不承载业务领域、Agent 工作流或 bbt-framework 的 App/Service/业务扩展类型。
+- 本仓是统一的现代 C++ 工具层与基础接入层，负责第三方适配、执行域、错误映射、连接/资源生命周期，以及面向分布式 framework 的基础动态配置机制。
+- 它不是 IaC/运维配置仓，也不承载 bbt-framework 的 App、Service、业务配置 schema、服务发现治理、灰度发布或业务级热更新编排；这些由 framework 层负责。
 - README 描述现状与使用入口，`docs/decisions/` 保存稳定取舍，GitHub Issue/PR/Review 记录需求、进度和验收；模块公开契约随本仓维护。
-- 本仓已经包含 HTTP、Redis、Mongo 客户端切片及其构建和测试入口；RPC/MCP 与本文新增的 transport/Binding 目标仍按对应 Issue 推进。未完成能力不能写成已交付事实。
+- 本仓已经包含 HTTP、Redis、Mongo 客户端切片及其构建和测试入口；RPC/MCP 与 transport/Binding 目标仍按对应 Issue 推进。未完成能力不能写成已交付事实。
+- 基础动态配置只提供版本化快照、配置源适配、watch、重连、去重和关闭语义；不绑定具体配置中心，不替代 framework 的 schema 校验和配置生效策略。
 
 ## 依赖方向
 
@@ -19,9 +20,9 @@
 
 以下六条为三仓（bbtools-core / bbtools-coroutine / bbtools-infra）统一约束，作为代码审查门禁；与本仓「第三方依赖策略」配合执行。
 
-1. **namespace 不超过三层**：形态为 `bbt::{大模块}::{小模块}`；禁止新增四层及以上嵌套，出现更深层级优先重新划分模块。
+1. **namespace 不超过三层**：形态为 `bbt::{大模块}::{小模块}`；Redis/Mongo 新公共 API 固定使用 `bbt::infra::redis` 与 `bbt::infra::mongo`，配置基础模块使用 `bbt::infra::config`。
 2. **Boost 1.90 优先**：标准库与 Boost 已有成熟上位能力时禁止重复造轮子；保留自研实现须有可复核的差异理由（语义、性能、平台或生命周期）。
-3. **C++17**：新增与迁移代码以 C++17 为基线，不静默提升标准。
+3. **C++17**：新增与迁移代码以 C++17 为基线，不静默提升标准；公共示例和契约不得使用 C++20 `co_await`/`Task<T>`，必须基于 bbtools-coroutine 现有模型。
 4. **模板适度**：用模板提升类型安全与复用；禁止为技巧性引入难理解、难诊断、难维护的元编程。
 5. **基础库尽量 header-only**：纯算法、类型工具、无状态小组件优先 header-only；有稳定 ABI、重状态、I/O、平台隔离或明显编译成本的模块可保留编译单元并说明理由。
 6. **依赖方向**：`bbtools-infra → bbtools-coroutine`，禁止 `bbtools-coroutine → bbtools-infra`；core 拆分后，其基础模块迁入本仓并遵守同一方向。
@@ -86,7 +87,7 @@ docs/decisions/   依赖、边界与兼容取舍
 - 同机新 worktree 和云端 clone 都不会带入未提交规范。开工核对实际拿到的规范版本；未发布时由授权交接者提供明确候选快照/差异及适用范围，不把旧暂存版当最新版。长期结论保留于本仓规定文档/PR，原始 `.state`/会话不作唯一公共依据；不要求读取 Alice 历史或私有记忆。
 
 - 首个实现任务先明确模块/协议范围与契约负责人；可先做依赖评估和最小契约草案，不默认三模块同时实现或全部互为前置。历史消费者/许可盘点是迁移任务的输入，由该任务指定产出者与接收者，不阻塞无迁移需求的协议研究。
-- 本仓接入与依赖政策以 [决策 0002](docs/decisions/0002-co-network-contract-v1.md) 和本文件为入口；team 的跨仓分工及其他仓摘要不替代本仓契约。使用协程时从 [bbtools-coroutine](https://github.com/yqm-307/bbtools-coroutine) 的 `agent-docs/2026-09-07-core-runtime-contract.md`、`api-reference.md`、`user-guide.md` 找依据，按实际消费 SHA 读取，不把本地 `.sdd` 或旧 README 当唯一真源。
+- 本仓接入与依赖政策以 [决策 0001](docs/decisions/0001-unified-infra.md) 和本文件为入口；team 的跨仓分工及其他仓摘要不替代本仓契约。使用协程时从 [bbtools-coroutine](https://github.com/yqm-307/bbtools-coroutine) 的 `agent-docs/2026-09-07-core-runtime-contract.md`、`api-reference.md`、`user-guide.md` 找依据，按实际消费 SHA 读取，不把本地 `.sdd` 或旧 README 当唯一真源。
 - 向 core/coroutine 报支撑缺口，附双方 SHA、最小复现/测试标识、期望契约位置、真实命令和失败/寿命时序证据。运行时拥有者先与既有任务去重；没有实证缺口不要求底层重写，不用改变 Stop 掩盖 adapter 资源错误。发布交接附模块公开目标/契约引用与验证，消费者仍须验证实际链接版本及自身集成。
 
 ## 任务入口

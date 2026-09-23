@@ -2,11 +2,7 @@
 
 ## 状态与范围
 
-日期：2026-09-19。关联 Issue：#7（拆分 #3：CoMongoCli 协程客户端与有界
-worker bridge）、父任务 #3、契约文档 `0002-co-network-contract-v1.md`。
-本决策覆盖 `CoMongoCli` 首版切片：InsertOne/FindOne/UpdateOne/DeleteOne
-最小 CRUD、mongocxx 同步 driver + 固定上限 worker 桥接、进程级
-`mongocxx::v1::pool` 共享。不引入通用命令接口。
+日期：2026-09-19。关联 Issue：#7（拆分 #3：CoMongoCli 协程客户端与有界 worker bridge）、父任务 #3、契约文档 `0002-co-network-contract-v1.md`。本决策记录当前 Mongo 最小切片，不限制后续主流 API 扩展。后续公共 API 应迁移到 `bbt::infra::mongo` 与 `include/bbt/infra/mongo/`；实现必须基于 bbtools-coroutine 现有等待/恢复模型，不使用 C++20 `co_await`/`Task<T>` 作为公共接口示例。配置读取、动态 watch 和分布式配置治理不属于本客户端决策，基础配置机制见 `0006-infra-foundation-and-dynamic-config.md`。
 
 ### 后续目标规格
 
