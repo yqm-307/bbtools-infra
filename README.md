@@ -21,6 +21,10 @@ Redis 为 hiredis async + strand，Mongo 为同步 driver + worker bridge。
 - `bbt::infra::config` — 分布式 framework 使用的基础动态配置机制：版本化 snapshot、配置源适配、watch、重连、版本去重和关闭；不实现 framework 的配置中心治理、业务 schema 或动态生效策略。
 
 当前 Redis/Mongo 已交付切片仍是最小能力，不代表上述后续主流 API 已全部实现。
+
+## 示例
+
+最小真实消费示例见 [examples/README.md](examples/README.md)：HTTP loopback 完整生命周期（无外部依赖）与 Redis/Mongo 调用形态演示，以及基于 bbtools-coroutine 现有等待/恢复模型的兼容说明（C++17，不使用 `co_await`/`Task<T>`）。Redis/Mongo live 容器验收未纳入 CI，仅按环境变量驱动、未提供时跳过。
 ### Redis 模块构建
 
 ```bash
