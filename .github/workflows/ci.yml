@@ -8,6 +8,24 @@
 #     paths-ignore 整体跳过而悬空（模板：bbtools-coroutine unit_test.yml changes job）
 #   - 干净 runner 验证：无 /usr/local 旧产物兜底（依赖只来自 runner 镜像 + checkout 源码树）
 #
+# 构建模式（#29 第一阶段，仅 workflow_dispatch 可选）：
+#   - clean（默认）：删 BUILD_DIR 全量重建，等价 PR/push 门禁路径
+#   - cache-bypass：忽略 ccache 与外部缓存，直接编译，用于缓存故障诊断/可信基线
+#   PR/push 恒为 clean + ctest，门禁语义不变；所有模式均运行 ctest。
+#   incremental/reconfigure/target/dependency-refresh 暂不支持：构建树跨 run 复用
+#   被本阶段明确禁止（ARC workspace 每 job 销毁，无受控持久构建目录），
+#   待受控持久化方案单独评审后再引入。
+#
+# ccache 缓存（actions/cache@v4，GitHub cache 服务）：
+#   - key 按 runner os/arch、编译器/ccache 版本摘要、构建类型、coroutine/core 依赖 HEAD
+#     组合；GitHub cache 本身按仓库隔离，restore-keys 前缀回退只影响速度，不改变结果，
+#     miss 即直编
+#   - 容量：CCACHE_MAXSIZE=500M，超限 ccache 自身 LRU 淘汰；GitHub 侧 10GB/仓 上限、
+#     未访问 7 天逐出（平台策略，非本 workflow 控制）
+#   - fork PR 完全跳过恢复与保存（不读不写）；同仓 PR 可恢复同仓其他分支缓存，
+#     依赖 ccache 内容寻址和仓库边界，不把它表述为只读主分支缓存
+#   - 缓存 miss/损坏/恢复失败 → 空缓存直编，门禁只变慢不改变通过标准
+#
 # 非目标（#4 明确不做）：
 #   - sanitizer、性能门禁、平台矩阵、redis/mongo 模块接入（需显式依赖前缀，
 #     runner 镜像未提供，接入另行评审）
@@ -30,6 +48,20 @@ on:
     branches: [main]
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      # 仅手动触发可切换；PR/push 忽略 inputs，恒走 clean 全量门禁路径。
+      build-mode:
+        description: "构建模式（全部运行 ctest；不影响 required 门禁语义）"
+        type: choice
+        default: clean
+        options:
+          - clean
+          - cache-bypass
+      cache-enabled:
+        description: "启用 ccache 缓存恢复/保存（clean 模式下仍全量重建，仅复用编译缓存）"
+        type: boolean
+        default: true
 
 env:
   BUILD_DIR: ${{ github.workspace }}/build
@@ -40,6 +72,10 @@ env:
   # ARC Pod 可能是每 job 一生的临时 runner；目录固定在 workspace 内，
   # 镜像/模板若挂载持久缓存可改为持久路径，重复构建自动受益
   CCACHE_DIR: ${{ github.workspace }}/.ccache
+  # ccache 容量上限：超出 LRU 淘汰，缓存大小可审计（ccache --show-stats）
+  CCACHE_MAXSIZE: 500M
+  # 缓存是否参与本次 run：cache-bypass 或显式关闭时为空串（跳过 restore/save）
+  CACHE_ENABLED: ${{ github.event_name == 'workflow_dispatch' && inputs.cache-enabled == false && 'false' || inputs.build-mode == 'cache-bypass' && 'false' || 'true' }}
 
 # 同一 ref 的 run 排队而不是互相取消：PR 的新 push 取消旧 run 以省 runner，
 # main 保留排队，避免集成验证结果被后续 push 吞掉。
@@ -136,6 +172,7 @@ jobs:
           persist-credentials: false
 
       - name: "记录上游依赖版本"
+        id: deps
         if: needs.changes.outputs.code == 'true'
         run: |
           cd coroutine
@@ -144,6 +181,43 @@ jobs:
           cd "$CORE_DIR"
           echo "core_ref=$(git rev-parse HEAD)" | tee -a "$GITHUB_OUTPUT"
           git log -1 --format='core master HEAD: %h %s (%ci)'
+
+      # 缓存 key：repo + runner 平台 + 编译器/ccache 版本摘要 + 构建类型 + 依赖 HEAD。
+      # 依赖 HEAD 变化即换 key，不会命中旧依赖的编译缓存；restore-keys 仅按前缀
+      # 回退到同平台旧缓存（增量复用，结果不依赖缓存内容）。
+      - name: "解析缓存开关与 key"
+        id: cache-meta
+        if: needs.changes.outputs.code == 'true'
+        run: |
+          GXX=$(g++ -dumpversion 2>/dev/null || echo unknown-gxx)
+          CCV=$(ccache --version 2>/dev/null | head -1 | awk '{print $NF}' || echo no-ccache)
+          echo "gxx=$GXX" >> "$GITHUB_OUTPUT"
+          echo "ccv=$CCV" >> "$GITHUB_OUTPUT"
+          # fork PR 不读不写缓存：head 仓库 ≠ 本仓时跳过 restore 与 save
+          if [ "${{ github.event_name }}" = "pull_request" ] && \
+             [ "${{ github.event.pull_request.head.repo.full_name }}" != "${{ github.repository }}" ]; then
+            echo "fork PR：跳过缓存 restore/save（不可信缓存隔离）"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          elif [ "${{ env.CACHE_ENABLED }}" != "true" ]; then
+            echo "cache-bypass / cache-enabled=false：跳过缓存 restore/save"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+          PREFIX="ccache-${{ runner.os }}-${{ runner.arch }}-g++${GXX}-${CCV}-Release"
+          echo "prefix=$PREFIX" >> "$GITHUB_OUTPUT"
+          echo "key=${PREFIX}-co-${{ steps.deps.outputs.coroutine_ref }}-core-${{ steps.deps.outputs.core_ref }}" >> "$GITHUB_OUTPUT"
+
+      - name: "恢复 ccache（GitHub cache）"
+        id: ccache-restore
+        if: needs.changes.outputs.code == 'true' && steps.cache-meta.outputs.enabled == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.cache-meta.outputs.key }}
+          restore-keys: |
+            ${{ steps.cache-meta.outputs.prefix }}-
+          # 恢复失败/miss 由 actions/cache 自身安全跳过，不失败 job；空缓存直编
 
       - name: "干净性预检：无 /usr/local 兜底产物"
         if: needs.changes.outputs.code == 'true'
@@ -159,14 +233,22 @@ jobs:
         if: needs.changes.outputs.code == 'true'
         run: |
           rm -rf "$BUILD_DIR" && mkdir -p "$BUILD_DIR"
-          if command -v ccache >/dev/null 2>&1; then
+          # 三级降级：cache-bypass/禁用 → 无 ccache 直编 → 有 ccache 直编（缓存内容
+          # 只影响速度）。构建恒为 clean（rm -rf BUILD_DIR），任何模式都不改变 ctest 门禁。
+          if [ "${{ steps.cache-meta.outputs.enabled }}" = "true" ] && command -v ccache >/dev/null 2>&1; then
             LAUNCHER="-DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
             ccache -z || true
             echo "ccache: $(ccache --version | head -1)"
+            echo "=== ccache 观测（编译前） ==="
+            ccache --show-stats || true
+            echo "cache-hit=${{ steps.ccache-restore.outputs.cache-hit || 'miss' }}" >> "$GITHUB_ENV"
+            echo "CACHE_HIT_REPORTED=${{ steps.ccache-restore.outputs.cache-hit || 'miss' }}" >> "$GITHUB_ENV"
           else
-            # bbtools-runner:v1 镜像未列 ccache 时直接编译；镜像补装后自动启用
+            # 无 ccache / cache-bypass / fork PR：直接编译
             LAUNCHER=""
-            echo "ccache 不可用：跳过编译缓存"
+            echo "ccache 未启用（bypass/禁用/不可用）：跳过编译缓存，直接编译"
+            echo "cache-hit=disabled" >> "$GITHUB_ENV"
+            echo "CACHE_HIT_REPORTED=disabled" >> "$GITHUB_ENV"
           fi
           cd "$BUILD_DIR"
           cmake ../infra -G Ninja \
@@ -176,8 +258,8 @@ jobs:
             -DBBT_COROUTINE_SOURCE_DIR="$COROUTINE_DIR" \
             -DBBT_CORE_SOURCE_DIR="$CORE_DIR"
           cmake --build . --parallel "$JOBS"
-          if command -v ccache >/dev/null 2>&1; then
-            echo "=== ccache 统计 ==="
+          if command -v ccache >/dev/null 2>&1 && [ "${{ steps.cache-meta.outputs.enabled }}" = "true" ]; then
+            echo "=== ccache 统计（编译后） ==="
             ccache --show-stats || true
           fi
 
@@ -190,6 +272,20 @@ jobs:
           # 保持与原门禁一致的 180：contract.basics 无实测耗时证据就收紧会造成门禁 flake。
           ctest -j1 --output-on-failure --timeout 180
         timeout-minutes: 5
+
+      - name: "缓存观测汇总"
+        # 保存本身由 actions/cache@v4 post 步骤自动执行（key 未命中时才写）；
+        # 此步骤只输出 hit/miss、模式与缓存大小，供 run 页面审计。
+        if: needs.changes.outputs.code == 'true'
+        run: |
+          echo "=== 缓存观测汇总 ==="
+          echo "cache-hit: ${CACHE_HIT_REPORTED:-unknown}"
+          echo "build-mode: ${{ github.event_name == 'workflow_dispatch' && inputs.build-mode || 'default(clean)' }}"
+          echo "cache-enabled: ${{ steps.cache-meta.outputs.enabled }}"
+          if command -v ccache >/dev/null 2>&1 && [ -d "$CCACHE_DIR" ]; then
+            du -sh "$CCACHE_DIR" || true
+            ccache --show-stats || true
+          fi
 
       - name: "依赖来源核查"
         if: needs.changes.outputs.code == 'true'
