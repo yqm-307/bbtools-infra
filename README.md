@@ -1,5 +1,9 @@
 # bbtools-infra
-统一的现代 C++ 第三方能力接入层：MCP、RPC、HTTP 与基础设施适配
+统一的现代 C++ 工具层与基础接入层：MCP、RPC、HTTP、Redis、Mongo 及分布式运行时基础能力。
+
+本仓不承载 `bbt-framework` 的 App、Service 或业务配置编排。infra 提供可独立消费的第三方适配、执行域、错误映射、资源生命周期和基础动态配置机制；上层分布式服务框架负责配置治理、服务发现、灰度、业务 schema 与动态变更编排。
+
+稳定架构边界见 [0006：infra 基础层与动态配置边界](docs/decisions/0006-infra-foundation-and-dynamic-config.md)。新增 Redis/Mongo 公共 API 使用 `bbt::infra::redis` 与 `bbt::infra::mongo`，不使用新的扁平模块命名空间；公共头不泄漏 hiredis、mongocxx、bsoncxx 或底层线程类型。
 
 ## I/O 执行边界
 
@@ -12,20 +16,11 @@ Redis 为 hiredis async + strand，Mongo 为同步 driver + worker bridge。
 ## 模块
 
 - `bbt::infra_http` — 协程原生 HTTP（Issue #5）
-- `bbt::infra_redis` — `CoRedisCli` 协程原生 Redis 客户端（Issue #6）：
-  Ping / 二进制安全 Get·Set / Exists / Delete，hiredis asynchronous API +
-  共享 coroutine executor，显式 `max_inflight`/`max_queue` 与确定性
-  `Overloaded`。依赖与执行域决策见
-  `docs/decisions/0003-redis-client-hiredis-dependency.md`。
+- `bbt::infra::redis` — Redis 客户端基础接入（当前兼容入口仍记录于现有 Redis 决策）：后续公共 API 按 `include/bbt/infra/redis/` 拆分，覆盖最新 hiredis/Redis 的主流数据结构和控制能力；不把 hiredis 类型、连接线程或底层 context 暴露给消费者。
+- `bbt::infra::mongo` — MongoDB 客户端基础接入：后续公共 API 按 `include/bbt/infra/mongo/` 拆分，覆盖主流 CRUD、查询、索引、聚合、事务和 change stream 能力；不把 mongocxx/bsoncxx、worker 线程或 pool 暴露给消费者。
+- `bbt::infra::config` — 分布式 framework 使用的基础动态配置机制：版本化 snapshot、配置源适配、watch、重连、版本去重和关闭；不实现 framework 的配置中心治理、业务 schema 或动态生效策略。
 
-- `bbt::infra_mongo` — `CoMongoCli` 协程原生 MongoDB 客户端（Issue #7）：
-  InsertOne / FindOne / UpdateOne / DeleteOne，BSON 以 infra 自有字节载体
-  （`MongoDocument`）进出，公共头不泄漏 mongocxx/bsoncxx；mongocxx 同步
-  driver + 固定上限 worker bridge + 有界队列（确定性 `Overloaded`），
-  完成回投共享 coroutine executor；`deadline/cancel/close` 只发布一次
-  逻辑终态，`WaitClosed` 等待在途 driver 调用物理归零。依赖与执行域
-  决策见 `docs/decisions/0004-mongo-client-mongocxx-dependency.md`。
-
+当前 Redis/Mongo 已交付切片仍是最小能力，不代表上述后续主流 API 已全部实现。
 ### Redis 模块构建
 
 ```bash
