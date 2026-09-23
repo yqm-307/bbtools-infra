@@ -199,6 +199,9 @@ endif()
 
 add_subdirectory(src)
 
+# Issue #27：最小真实消费示例（examples/）；不影响库目标与测试注册。
+add_subdirectory(examples)
+
 # 每个公共头单独编译 TU，验证头文件自给
 set(BBT_INFRA_PUBLIC_HEADERS
     Result.hpp
