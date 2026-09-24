@@ -65,6 +65,27 @@ struct RpcAddress {
     std::string endpoint;
 };
 
+// co-io-adapter/v1 §4：非拥有缓冲视图与传输结果值类型。
+struct MutableBytes { void* data; std::size_t size; };
+struct ConstBytes { const void* data; std::size_t size; };
+struct TcpEndpoint {
+    std::string   host;   // 数值 IP 或主机名；主机名经 transport 接管解析
+    std::uint16_t port = 0;
+};
+struct SocketAddress {
+    std::string ip;
+    std::uint16_t port = 0;
+};
+enum class IoState { Ok, WouldBlock, Eof };
+struct IoProgress { IoState state; std::size_t bytes; };
+using IoResult = result<IoProgress>;
+struct DatagramRead {
+    IoState state;
+    std::size_t bytes = 0;
+    SocketAddress peer;
+    bool truncated = false;
+};
+
 struct RpcEnvelope {
     std::string service;
     std::string method;

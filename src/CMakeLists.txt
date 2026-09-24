@@ -17,6 +17,28 @@ target_link_libraries(bbt_infra_http
     PRIVATE Boost::boost Threads::Threads)
 target_compile_options(bbt_infra_http PRIVATE -Wall -Wextra)
 
+# --- CoTCP 基础传输（Issue #31）----------------------------------------------
+add_library(bbt_infra_tcp STATIC
+    tcp/CoTCP.cc)
+add_library(bbt::infra_tcp ALIAS bbt_infra_tcp)
+
+target_include_directories(bbt_infra_tcp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(bbt_infra_tcp
+    PUBLIC bbt::infra_common)
+target_compile_options(bbt_infra_tcp PRIVATE -Wall -Wextra)
+
+# CoUDP：POSIX 非阻塞 datagram + coroutine 组合等待。
+add_library(bbt_infra_udp STATIC udp/CoUDP.cc)
+add_library(bbt::infra_udp ALIAS bbt_infra_udp)
+target_include_directories(bbt_infra_udp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(bbt_infra_udp PUBLIC bbt::infra_common)
+target_compile_options(bbt_infra_udp PRIVATE -Wall -Wextra)
+
+# NetworkRuntimeImpl 的受管 TCP/UDP 工厂由 HTTP runtime 对外装配；静态库
+# 必须显式传播 CoTCP/CoUDP，避免下游 example/test 链接时出现未定义符号
+# （TCP 侧 DialTCP/ListenTCP、UDP 侧 BindUDP/RequestClose）。
+target_link_libraries(bbt_infra_http PUBLIC bbt::infra_tcp bbt::infra_udp)
+
 # --- Redis 模块（Issue #6）---------------------------------------------------
 # hiredis 只允许经显式前缀接入：find_package 限定 NO_DEFAULT_PATH，
 # 不可能误链 /usr/local 等系统位置的同名库。未给前缀时跳过本模块

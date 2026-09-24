@@ -214,7 +214,9 @@ set(BBT_INFRA_PUBLIC_HEADERS
     HttpServer.hpp
     NetworkRuntime.hpp
     CoRedisCli.hpp
-    CoMongoCli.hpp)
+    CoMongoCli.hpp
+    CoTCP.hpp
+    CoUDP.hpp)
 set(_selfcheck_dir "${CMAKE_CURRENT_BINARY_DIR}/header_selfcheck")
 file(MAKE_DIRECTORY "${_selfcheck_dir}")
 set(_selfcheck_srcs "")
