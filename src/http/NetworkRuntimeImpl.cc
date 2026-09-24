@@ -1,6 +1,11 @@
 #include "http/NetworkRuntimeImpl.hpp"
 
+#include <limits>
+
 #include <bbt/coroutine/object/CoObject.hpp>
+
+#include <bbt/infra/CoTCP.hpp>
+#include <bbt/infra/CoUDP.hpp>
 
 #include "http/HttpClientImpl.hpp"
 #include "http/HttpServerImpl.hpp"
@@ -64,6 +69,210 @@ result<void> NetworkRuntimeImpl::CheckUsableForFactory() const {
         return result<void>::err(
             MakeError(ErrorCode::Closed, "runtime is closing or closed"));
     return result<void>::ok();
+}
+
+namespace {
+
+// co-io-adapter/v1 §4.0.1.7：容量原子预留，失败回退、物理关闭后释放。
+// 超限返回 Overloaded，不静默排队。
+void ReleaseTransportSlot(std::mutex& mtx, std::size_t& count) noexcept {
+    std::lock_guard<std::mutex> lk(mtx);
+    if (count > 0) --count;
+}
+
+} // namespace
+
+result<std::shared_ptr<CoTCP>> NetworkRuntimeImpl::DialTCP(
+    TcpEndpoint endpoint, const CallOptions& options) {
+    auto usable = CheckUsableForFactory();
+    if (!usable)
+        return result<std::shared_ptr<CoTCP>>::err(std::move(usable).error());
+    if (endpoint.host.empty())
+        return result<std::shared_ptr<CoTCP>>::err(MakeError(
+            ErrorCode::InvalidArgument, "DialTCP: endpoint.host must not be empty"));
+    if (endpoint.port == 0)
+        return result<std::shared_ptr<CoTCP>>::err(MakeError(
+            ErrorCode::InvalidArgument, "DialTCP: endpoint.port must not be 0"));
+
+    {
+        std::lock_guard<std::mutex> lk(m_transport_mtx);
+        if (m_transport_sealed)
+            return result<std::shared_ptr<CoTCP>>::err(MakeError(
+                ErrorCode::Closed, "runtime is closing"));
+        if (m_transport_count >= m_limits.max_connections)
+            return result<std::shared_ptr<CoTCP>>::err(MakeError(
+                ErrorCode::Overloaded, "DialTCP: max_connections exceeded"));
+        ++m_transport_count;
+    }
+
+    auto dialed = tcp::CoTCP::DialTCP(std::move(endpoint.host), endpoint.port, options);
+    if (!dialed) {
+        ReleaseTransportSlot(m_transport_mtx, m_transport_count);
+        MaybeFinalize();
+        return result<std::shared_ptr<CoTCP>>::err(std::move(dialed).error());
+    }
+    auto connection = std::move(dialed).value();
+    bool sealed = false;
+    {
+        std::lock_guard<std::mutex> lk(m_transport_mtx);
+        sealed = m_transport_sealed;
+        if (!sealed) {
+            std::weak_ptr<NetworkRuntimeImpl> weak =
+                std::static_pointer_cast<NetworkRuntimeImpl>(shared_from_this());
+            std::weak_ptr<CoTCP> child = connection;
+            connection->SetClosedHook([weak, child] {
+                auto rt = weak.lock();
+                auto object = child.lock();
+                if (rt && object)
+                    rt->OnTransportClosed(object.get());
+            });
+            m_tcp_children.push_back(connection);
+        }
+    }
+    if (sealed) {
+        connection->RequestClose();
+        ReleaseTransportSlot(m_transport_mtx, m_transport_count);
+        MaybeFinalize();
+        return result<std::shared_ptr<CoTCP>>::err(MakeError(
+            ErrorCode::Closed, "runtime closed during TCP dial"));
+    }
+    return result<std::shared_ptr<CoTCP>>::ok(std::move(connection));
+}
+
+result<std::shared_ptr<CoTCPListener>> NetworkRuntimeImpl::ListenTCP(
+    SocketAddress local, unsigned backlog) {
+    auto usable = CheckUsableForFactory();
+    if (!usable)
+        return result<std::shared_ptr<CoTCPListener>>::err(
+            std::move(usable).error());
+    if (local.ip.empty())
+        return result<std::shared_ptr<CoTCPListener>>::err(MakeError(
+            ErrorCode::InvalidArgument,
+            "ListenTCP: SocketAddress.ip must not be empty (use explicit wildcard)"));
+    if (backlog == 0 || backlog > static_cast<unsigned>(std::numeric_limits<int>::max()))
+        return result<std::shared_ptr<CoTCPListener>>::err(MakeError(
+            ErrorCode::InvalidArgument, "ListenTCP: backlog must be 1..INT_MAX"));
+
+    {
+        std::lock_guard<std::mutex> lk(m_transport_mtx);
+        if (m_transport_sealed)
+            return result<std::shared_ptr<CoTCPListener>>::err(MakeError(
+                ErrorCode::Closed, "runtime is closing"));
+        if (m_transport_count >= m_limits.max_connections)
+            return result<std::shared_ptr<CoTCPListener>>::err(MakeError(
+                ErrorCode::Overloaded, "ListenTCP: max_connections exceeded"));
+        ++m_transport_count;
+    }
+
+    auto bound = tcp::CoTCPListener::ListenTCP(
+        std::move(local.ip), local.port, static_cast<int>(backlog));
+    if (!bound) {
+        ReleaseTransportSlot(m_transport_mtx, m_transport_count);
+        MaybeFinalize();
+        return result<std::shared_ptr<CoTCPListener>>::err(std::move(bound).error());
+    }
+    auto listener = std::move(bound).value();
+    std::unique_lock<std::mutex> transport_lock(m_transport_mtx);
+    if (m_transport_sealed) {
+        transport_lock.unlock();
+        listener->RequestClose();
+        ReleaseTransportSlot(m_transport_mtx, m_transport_count);
+        MaybeFinalize();
+        return result<std::shared_ptr<CoTCPListener>>::err(MakeError(
+            ErrorCode::Closed, "runtime closed during TCP listen"));
+    }
+    std::weak_ptr<NetworkRuntimeImpl> weak =
+        std::static_pointer_cast<NetworkRuntimeImpl>(shared_from_this());
+    std::weak_ptr<CoTCPListener> child = listener;
+    listener->SetClosedHook([weak, child] {
+        auto rt = weak.lock();
+        auto object = child.lock();
+        if (rt && object)
+            rt->OnTransportClosed(object.get());
+    });
+    listener->SetAcceptHooks(
+        [weak] {
+            auto rt = weak.lock();
+            if (!rt) return false;
+            std::lock_guard<std::mutex> lk(rt->m_transport_mtx);
+            if (rt->m_transport_sealed ||
+                rt->m_transport_count >= rt->m_limits.max_connections)
+                return false;
+            ++rt->m_transport_count;
+            return true;
+        },
+        [weak] {
+            if (auto rt = weak.lock()) {
+                ReleaseTransportSlot(rt->m_transport_mtx, rt->m_transport_count);
+                rt->MaybeFinalize();
+            }
+        },
+        [weak](std::shared_ptr<CoTCP> accepted) {
+            auto rt = weak.lock();
+            if (!rt) return false;
+            std::lock_guard<std::mutex> lk(rt->m_transport_mtx);
+            if (rt->m_transport_sealed) return false;
+            std::weak_ptr<CoTCP> child = accepted;
+            accepted->SetClosedHook([weak, child] {
+                auto rt_locked = weak.lock();
+                auto child_locked = child.lock();
+                if (rt_locked && child_locked)
+                    rt_locked->OnTransportClosed(child_locked.get());
+            });
+            rt->m_tcp_children.push_back(std::move(accepted));
+            return true;
+        });
+    m_tcp_children.push_back(listener);
+    transport_lock.unlock();
+    return result<std::shared_ptr<CoTCPListener>>::ok(std::move(listener));
+}
+
+result<std::shared_ptr<CoUDP>> NetworkRuntimeImpl::BindUDP(SocketAddress local) {
+    auto usable = CheckUsableForFactory();
+    if (!usable)
+        return result<std::shared_ptr<CoUDP>>::err(std::move(usable).error());
+    {
+        std::lock_guard<std::mutex> lk(m_transport_mtx);
+        if (m_transport_sealed)
+            return result<std::shared_ptr<CoUDP>>::err(MakeError(
+                ErrorCode::Closed, "runtime is closing"));
+        if (m_transport_count >= m_limits.max_connections)
+            return result<std::shared_ptr<CoUDP>>::err(MakeError(
+                ErrorCode::Overloaded, "BindUDP: max_connections exceeded"));
+        ++m_transport_count;
+    }
+    auto bound = udp::CoUDP::BindUDP(std::move(local));
+    if (!bound) {
+        ReleaseTransportSlot(m_transport_mtx, m_transport_count);
+        MaybeFinalize();
+        return result<std::shared_ptr<CoUDP>>::err(std::move(bound).error());
+    }
+    auto socket = std::move(bound).value();
+    bool sealed = false;
+    {
+        std::lock_guard<std::mutex> lk(m_transport_mtx);
+        sealed = m_transport_sealed;
+        if (!sealed) {
+            std::weak_ptr<NetworkRuntimeImpl> weak =
+                std::static_pointer_cast<NetworkRuntimeImpl>(shared_from_this());
+            std::weak_ptr<CoUDP> child = socket;
+            socket->SetClosedHook([weak, child] {
+                auto rt = weak.lock();
+                auto object = child.lock();
+                if (rt && object)
+                    rt->OnTransportClosed(object.get());
+            });
+            m_tcp_children.push_back(socket);
+        }
+    }
+    if (sealed) {
+        socket->RequestClose();
+        ReleaseTransportSlot(m_transport_mtx, m_transport_count);
+        MaybeFinalize();
+        return result<std::shared_ptr<CoUDP>>::err(MakeError(
+            ErrorCode::Closed, "runtime closed during UDP bind"));
+    }
+    return result<std::shared_ptr<CoUDP>>::ok(std::move(socket));
 }
 
 result<void> NetworkRuntimeImpl::CheckAndAdoptLocked(
@@ -158,6 +367,14 @@ void NetworkRuntimeImpl::RequestClose() noexcept {
     if (!m_close.BeginClose())
         return;
     m_state.store(kClosingOrClosed);
+    std::vector<std::shared_ptr<ICoCloseable>> transports;
+    {
+        std::lock_guard<std::mutex> lk(m_transport_mtx);
+        m_transport_sealed = true;
+        transports = m_tcp_children;
+    }
+    for (auto& transport : transports)
+        transport->RequestClose();
     if (!m_engine->Started()) {
         // 未 Start：无 io 资源，直接落定。
         m_close.MarkClosed();
@@ -174,60 +391,72 @@ void NetworkRuntimeImpl::TeardownOnIoDomain() noexcept {
         std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
         m_sealed = true;
         children = m_children;
+        m_teardown = true;
     }
     // 锁外逐个收口：子对象 teardown 完成时其 MarkClosed 会经
     // ClosedHook 回到 OnChildClosed 再拿本锁——持锁调用会死锁。
     for (auto& child : children)
         child->TeardownOnIoDomain();
-    bool fin = false;
-    {
-        std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
-        m_teardown = true;
-        if (m_unclosed == 0 && !m_finalize_started) {
-            m_finalize_started = true;
-            fin = true;
-        }
-    }
-    if (fin)
-        FinalizeEngine();
+    MaybeFinalize();
 }
 
 void NetworkRuntimeImpl::TeardownOffDomain() noexcept {
     std::vector<std::shared_ptr<IIoTeardown>> children;
-    bool fin = false;
     {
         std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
         m_sealed = true;
         children = m_children;
         m_teardown = true;
-        if (m_unclosed == 0 && !m_finalize_started) {
-            m_finalize_started = true;
-            fin = true;
-        }
     }
     for (auto& child : children)
         child->TeardownOffDomain();
-    if (fin)
-        FinalizeEngine();
+    MaybeFinalize();
 }
 
 void NetworkRuntimeImpl::OnChildClosed() noexcept {
-    bool fin = false;
     {
         std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
         if (m_unclosed > 0)
             --m_unclosed;
-        if (m_teardown && m_unclosed == 0 && !m_finalize_started) {
-            m_finalize_started = true;
-            fin = true;
-        }
     }
-    if (fin) {
-        auto self = shared_from_this();
-        // 引擎封口必须在 io 域；投递失败说明引擎已封（finalize 已发生）。
-        if (!m_engine->TryPost([self] { self->FinalizeEngine(); }))
-            FinalizeEngine();
+    MaybeFinalize();
+}
+
+void NetworkRuntimeImpl::OnTransportClosed(const ICoCloseable* child) noexcept {
+    {
+        std::lock_guard<std::mutex> lk(m_transport_mtx);
+        if (m_transport_count > 0)
+            --m_transport_count;
+        m_tcp_children.erase(
+            std::remove_if(m_tcp_children.begin(), m_tcp_children.end(),
+                           [child](const auto& item) {
+                               return item.get() == child;
+                           }),
+            m_tcp_children.end());
     }
+    MaybeFinalize();
+}
+
+void NetworkRuntimeImpl::MaybeFinalize() noexcept {
+    {
+        std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
+        if (!m_teardown || m_unclosed != 0 || m_finalize_started)
+            return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(m_transport_mtx);
+        if (m_transport_count != 0)
+            return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
+        if (!m_teardown || m_unclosed != 0 || m_finalize_started)
+            return;
+        m_finalize_started = true;
+    }
+    auto self = shared_from_this();
+    if (!m_engine->TryPost([self] { self->FinalizeEngine(); }))
+        FinalizeEngine();
 }
 
 void NetworkRuntimeImpl::FinalizeEngine() noexcept {

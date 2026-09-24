@@ -3,7 +3,31 @@ target_link_libraries(Test_contract_basics PRIVATE bbt::infra_common)
 target_compile_options(Test_contract_basics PRIVATE -Wall -Wextra)
 add_test(NAME contract.basics COMMAND Test_contract_basics)
 
-# --- Issue #20 组合等待能力探针（probe only） --------------------------------
+# --- CoTCP loopback（Issue #31）----------------------------------------------
+add_executable(Test_tcp_loopback Test_tcp_loopback.cc)
+target_link_libraries(Test_tcp_loopback
+    PRIVATE bbt::infra_tcp)
+target_compile_options(Test_tcp_loopback PRIVATE -Wall -Wextra)
+add_test(NAME tcp.loopback COMMAND Test_tcp_loopback)
+set_tests_properties(tcp.loopback PROPERTIES TIMEOUT 30)
+
+# CoTCP Runtime 托管工厂（co-io-adapter/v1 §4.0.1）：需要 bbt_infra_http
+# （NetworkRuntime 实现在 HTTP 切片内）。覆盖未 Start 拒绝、容量门禁
+# Overloaded、数值直连闭环与关闭后容量释放。
+add_executable(Test_tcp_runtime_factory Test_tcp_runtime_factory.cc)
+target_link_libraries(Test_tcp_runtime_factory
+    PRIVATE bbt::infra_http bbt::infra_tcp Boost::boost Threads::Threads)
+target_compile_options(Test_tcp_runtime_factory PRIVATE -Wall -Wextra)
+add_test(NAME tcp.runtime_factory COMMAND Test_tcp_runtime_factory)
+set_tests_properties(tcp.runtime_factory PROPERTIES TIMEOUT 60)
+
+# CoUDP：loopback、截断、取消与关闭生命周期。
+add_executable(Test_udp_loopback Test_udp_loopback.cc)
+target_link_libraries(Test_udp_loopback PRIVATE bbt::infra_udp)
+target_compile_options(Test_udp_loopback PRIVATE -Wall -Wextra)
+add_test(NAME udp.loopback COMMAND Test_udp_loopback)
+set_tests_properties(udp.loopback PROPERTIES TIMEOUT 30)
+
 # 实测 detail::CoPollEvent 单事件上 FD readable + custom wakeup + timeout
 # 组合的确定性四场景。使用 detail 非稳定头与非公开组合路径，仅用于能力裁决，
 # 不作为生产 IoWait 实现依据；不涉及 Stop 安全断言。

@@ -191,7 +191,7 @@ result<std::shared_ptr<CoUDP>> BindUDP(SocketAddress local);
 4. **ListenTCP**：`bind` + `listen(backlog)`；绑定只接受 `SocketAddress` 数值地址（`ip` 不得为空，通配必须显式写 `0.0.0.0` 或 `::`；端口 0 表示动态分配）；`LocalAddress()` 返回实际绑定地址。`Accept` 挂起等待可读，Linux 使用 `accept4` 或等价非阻塞设置交付新 `CoTCP`，其他平台不得把此 syscall 名当公共契约；listener `RequestClose` 唤醒等待中的 `Accept` 并返回 `Closed`，不关闭已交付的连接。
 5. **BindUDP**：`socket` + `bind`，同样只接受数值地址；`LocalAddress()` 返回实际绑定地址；未 bind 显式地址的组合发送路径不在首版公共 API。
 6. **失败即无对象**：工厂失败返回 Error 且不产出半成品对象；`ListenTCP`/`BindUDP` 失败时内部负责 `close` 已创建的 FD。
-7. **资源限额**：首版复用 `NetworkLimits.max_connections` 作为每个 Runtime 同时拥有的 transport socket 容量（含 listener、UDP socket、accepted TCP、连接中的候选 socket；协议 Conn 引用同一 socket 不重复计数）。`max_inflight` 限制等待中的拨号、Accept 和数据操作，`Try*` 不建排队任务。创建/接纳前原子预留容量，失败回退、物理关闭后释放；超限返回 `Overloaded`，不静默排队。`backlog` 必须为 1..INT_MAX，非法返回 `InvalidArgument`，内核实际队列上限可能更小。
+7. **资源限额**：首版复用 `NetworkLimits.max_connections` 作为每个 Runtime 同时拥有的 transport socket 容量（含 listener、UDP socket、accepted TCP、连接中的候选 socket；协议 Conn 引用同一 socket 不重复计数）。创建/接纳前原子预留容量，失败回退、物理关闭后释放；超限返回 `Overloaded`，不静默排队。`backlog` 必须为 1..INT_MAX，非法返回 `InvalidArgument`，内核实际队列上限可能更小。目标契约另要求 `max_inflight` 限制等待中的拨号、Accept 和数据操作，`Try*` 不建排队任务；**CoTCP/CoUDP 首版暂缓此项传输在途门禁**，配置校验及 HTTP handler 已使用 `max_inflight` 不代表传输层已限流。由 [#32](https://github.com/yqm-307/bbtools-infra/issues/32) 跟进：在 Runtime 范围内实现跨挂起占用、所有终态/强制 Stop 安全释放与超限回归后，才移除此例外并关闭 Issue。
 
 ### 4.1 CoTCP 语义
 

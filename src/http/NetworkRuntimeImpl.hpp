@@ -20,7 +20,12 @@
 #include "http/HttpDetail.hpp"
 #include "http/HttpIoEngine.hpp"
 
-namespace bbt::infra::http_detail {
+namespace bbt::infra {
+
+class CoTCP;
+class CoTCPListener;
+
+namespace http_detail {
 
 class NetworkRuntimeImpl : public NetworkRuntime,
                            public std::enable_shared_from_this<NetworkRuntimeImpl> {
@@ -38,6 +43,11 @@ public:
     result<std::shared_ptr<HttpClient>> CreateHttpClient() override;
     result<std::shared_ptr<HttpServer>> ListenHttp(ListenAddress address,
                                                    HttpHandler handler) override;
+    result<std::shared_ptr<CoTCP>> DialTCP(
+        TcpEndpoint endpoint, const CallOptions& options) override;
+    result<std::shared_ptr<CoTCPListener>> ListenTCP(
+        SocketAddress local, unsigned backlog) override;
+    result<std::shared_ptr<CoUDP>> BindUDP(SocketAddress local) override;
 
     void RequestClose() noexcept override;
     bool IsClosed() const noexcept override { return m_close.IsClosed(); }
@@ -52,12 +62,14 @@ public:
 
     // 子对象物理清理落定回调（任意线程，经各子对象 ClosedHook 触发）。
     void OnChildClosed() noexcept;
+    void OnTransportClosed(const ICoCloseable* child) noexcept;
 
 private:
     enum State : int { kCreated = 0, kRunning = 1, kClosingOrClosed = 2 };
 
     // io 域：全部子对象 Closed 后封口引擎并落定 runtime Closed。
     void FinalizeEngine() noexcept;
+    void MaybeFinalize() noexcept;
 
     // io 域：封口子对象注册 → 逐个 teardown → 全部物理关闭后封口引擎。
     void TeardownOnIoDomain() noexcept;
@@ -87,6 +99,18 @@ private:
     bool                                           m_sealed{false};
     bool                                           m_teardown{false};
     bool                                           m_finalize_started{false};
+
+    // co-io-adapter/v1 §4.0.1.7 容量门禁：m_transport_count 记录 Runtime
+    // 同时拥有的 transport socket（listener/accepted/dialed TCP；协议 Conn
+    // 引用同一 socket 不重复计数）。m_transport_mtx 与 m_lifecycle_mtx 分离，
+    // 避免 DialTCP 协程内路径与 HTTP 生命周期锁相互阻塞。
+    std::mutex                                     m_transport_mtx;
+    std::size_t                                    m_transport_count{0};
+    bool                                           m_transport_sealed{false};
+    // 已交付 TCP transport 的强持有（Runtime 托管引用；对象 Closed 后经
+    // ClosedHook 回调释放）。由 m_transport_mtx 保护。
+    std::vector<std::shared_ptr<ICoCloseable>>     m_tcp_children;
 };
 
-} // namespace bbt::infra::http_detail
+} // namespace http_detail
+} // namespace bbt::infra
