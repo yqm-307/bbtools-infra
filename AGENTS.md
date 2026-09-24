@@ -3,6 +3,7 @@
 ## 定位与权威
 
 - 本仓是统一的现代 C++ 工具层与基础接入层，负责第三方适配、执行域、错误映射、连接/资源生命周期，以及面向分布式 framework 的基础动态配置机制。
+- 分布式服务端框架的跨仓架构基调真源位于 `bbt-framework/docs/architecture/distributed-framework-baseline.md`；本地并列检出时对应 `../bbt-framework/bbt-framework/docs/architecture/distributed-framework-baseline.md`。本仓只实现其中属于 infra 的机制与契约，不复制 framework 的服务语义。
 - 它不是 IaC/运维配置仓，也不承载 bbt-framework 的 App、Service、业务配置 schema、服务发现治理、灰度发布或业务级热更新编排；这些由 framework 层负责。
 - README 描述现状与使用入口，`docs/decisions/` 保存稳定取舍，GitHub Issue/PR/Review 记录需求、进度和验收；模块公开契约随本仓维护。
 - 本仓已经包含 HTTP、Redis、Mongo 客户端切片及其构建和测试入口；RPC/MCP 与 transport/Binding 目标仍按对应 Issue 推进。未完成能力不能写成已交付事实。
@@ -39,7 +40,7 @@
 ## 首批模块和职责
 
 - HTTP：协议消息、客户端/服务端和流式能力的稳定契约与后端适配；不得把协程停止等待冒充底层 I/O 已完成。
-- RPC：底层传输、协议、编解码和客户端/服务端能力。框架 Stub 接入归 framework/扩展，业务接口与生成 Stub 归 fork 应用。
+- RPC：底层传输、协议、编解码和客户端/服务端能力；framework 承载 `CallContext`、deadline 合并、重试预算、错误分类、未知结果、发现订阅与负载均衡策略，Stub 接入归 framework/扩展，业务接口与生成 Stub 归 fork 应用。
 - MCP：协议、transport 与 client/server 基础能力；具体业务工具归应用仓，不能把 Workbench 领域模型下沉。
 - Adapter：负责第三方操作、取消/关闭、错误映射、线程/执行域、请求/连接/缓冲生命周期；coroutine 只负责运行时等待/唤醒和自身对象安全。
 - 首批不建设任意协议插件平台、统一万能网络抽象或一开始支持所有后端。共享机制由真实重复和契约测试驱动。
