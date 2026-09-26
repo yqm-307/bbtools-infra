@@ -2,3 +2,6 @@ build/
 # 本机增量验证目录（CI 用 workspace 内 build/；本地用 build-ci 避免与共享 build/ 互踩，
 # 见 AGENTS.md 本地验证边界；CI 侧无消费者，仅防误提交）
 build-ci/
+# Issue #34 本机验证用的临时构建目录（build-g1=GREEN、build-red=RED 负向），不入仓。
+build-g*/
+build-r*/
