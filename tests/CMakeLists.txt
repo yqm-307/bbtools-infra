@@ -57,6 +57,21 @@ target_compile_options(Test_http_lifecycle PRIVATE -Wall -Wextra)
 add_test(NAME http.lifecycle COMMAND Test_http_lifecycle)
 set_tests_properties(http.lifecycle PROPERTIES TIMEOUT 120)
 
+# Issue #37：HTTP 出站连接/在途配额的原子接纳与物理归还。
+# 与 transport #32 不同入口：覆盖 HttpClientImpl::Request 的 owner
+# 预算门禁（max_connections/max_inflight）、Overloaded 确定性、
+# 各结束路径名额归还与多 client 共享作用域。
+add_executable(Test_http_outbound_quota Test_http_outbound_quota.cc)
+# 复审回归用例直接驱动 impl 层（注入配额钩子、io 域顺序探针、并发收口），
+# 需要 src/ 内部头 include 路径——仅本目标可见，不扩散到其他测试。
+target_include_directories(Test_http_outbound_quota PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(Test_http_outbound_quota
+    PRIVATE bbt::infra_http Boost::boost Threads::Threads)
+target_compile_options(Test_http_outbound_quota PRIVATE -Wall -Wextra)
+add_test(NAME http.outbound_quota COMMAND Test_http_outbound_quota)
+set_tests_properties(http.outbound_quota PROPERTIES TIMEOUT 120)
+
 # Issue #38：子对象物理关闭后从 Runtime 托管集合反登记——弱引用失效、
 # 调用者提前释放仍托管、并发/重复 close 与工厂竞争、handler 捕获资源
 # 析构计数。

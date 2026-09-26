@@ -97,6 +97,18 @@ private:
     result<void> CheckAndAdoptLocked(
         const std::shared_ptr<IIoTeardown>& child);
 
+    // Issue #37：HTTP 出站配额。与 transport m_transport_count 并列、
+    // 由 m_lifecycle_mtx 保护；作用域是整个 Runtime（同一 runtime 下
+    // 所有 HttpClient 共享同一预算），不是单个 client——多 client
+    // 不能各自绕过 owner 总量。
+    //   m_http_conn_count    在途/已建立出站连接名额（max_connections）
+    //   m_http_inflight_count 已接纳未物理收口的请求名额（max_inflight）
+    // 两者都在「资源发起之前」原子预留，不足即 Overloaded；名额由
+    // ClientOp 持有，在 UnregisterOp（finished 且 in-flight 归零 =
+    // 后端不再触碰 op）后才归还，所有结束路径只归还一次。
+    result<void> TryAdmitHttpRequest() noexcept;
+    void ReleaseHttpRequest() noexcept;
+
     NetworkLimits                  m_limits;
     std::shared_ptr<HttpIoEngine>  m_engine;
     bbt::coroutine::CoObjectInfo   m_info;
@@ -130,6 +142,13 @@ private:
     // 已交付 TCP transport 的强持有（Runtime 托管引用；对象 Closed 后经
     // ClosedHook 回调释放）。由 m_transport_mtx 保护。
     std::vector<std::shared_ptr<ICoCloseable>>     m_tcp_children;
+
+    // Issue #37：HTTP 出站配额计数，由 m_lifecycle_mtx 保护。
+    // 与 m_transport_count 分离：transport 计量真实 socket 对象，
+    // HTTP 出站这里计量「已接纳的出站请求/连接」这一逻辑名额，
+    // 归还发生在 op 物理收口（UnregisterOp）而非协程栈析构。
+    std::size_t                                    m_http_conn_count{0};
+    std::size_t                                    m_http_inflight_count{0};
 };
 
 } // namespace http_detail
