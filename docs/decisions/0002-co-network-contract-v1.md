@@ -201,6 +201,8 @@ void StopAccepting() noexcept;
 
 NetworkLimits 各项显式、大于零且校验上限，incoming_timeout 必须有限，header/body 限制也用于 RPC 元数据/payload。Server.StopAccepting 幂等且可从控制线程调用：停止新连接及既有连接上的新请求接纳，不取消已接纳 handler，不关闭其回复路径；不等价于 RequestClose。Create/Start/工厂在启动控制线程使用，不挂起协程；Start 要求 Scheduler 已启动且同一 runtime 只成功启动一次，关闭后不重开。工厂返回的 shared_ptr 是受托管对象引用，Runtime 的强所有权保证清理，不能互相强引用成环。监听绑定只接受调用者明确给出的地址，测试用动态端口；LocalAddress 返回实际绑定地址。Listen 成功后可以接纳，框架只有在方法/路由配置验证完成后才调用它。业务 handler 在已接纳的受管协程调用，异常由边界捕获并转换为 InternalError。
 
+**HTTP 出站配额（Issue #37）**：`max_connections` 与 `max_inflight` 由 `NetworkRuntime`（资源 owner）统一持有，作用域是整个 Runtime——同一 runtime 下所有 `HttpClient` 共享同一预算，多 client 不各自独立计量。`Request` 在登记底层 operation、发起任何 `async_*` 之前原子预留名额；名额不足立即返回 `Overloaded`，此时不创建 socket/resolver、不向 io 域投递，也不引入排队。名额由堆上 operation 持有，在物理收口（`finished && in-flight==0`，后端不再访问该 op）时准确归还一次，覆盖正常完成、发起失败、deadline、cancel、RequestClose 与强制 Stop；不依赖挂起协程的栈析构，不把「调用者超时返回」当作 socket 已回收。本项只覆盖 HTTP 出站路径，与 #32 的 CoTCP/CoUDP 在途门禁（`m_transport_count` 计量真实 socket）是不同入口，互不替代。
+
 RPC 服务分发不强迫 infra 依赖 Service：RpcHandler 由 framework 适配器提供，它收到 IncomingCallContext 与 owning envelope 后决定服务/Actor 入队和响应；网络执行域不会等待阻塞业务 handler。生产绑定、TLS、鉴权仍需对应配置/授权，不由这些工厂默认开放。
 
 HTTP 模块与 RPC 模块按需链接；未构建 RPC 时不导出能假成功的 Rpc 工厂。后续新增可选工厂参数不得改变本版无线程/后端类型泄漏的形态。

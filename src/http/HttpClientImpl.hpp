@@ -9,6 +9,7 @@
 // 不新造事件状态机，不依赖 Linux Hook。
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -73,6 +74,17 @@ struct ClientOp : std::enable_shared_from_this<ClientOp> {
     // completion 落定路径上变化，两处都必须调用。
     void MaybeUnregister();
 
+    // Issue #37：物理收口归还钩子。op 离开 m_ops（= 后端不再访问
+    // 本 op 资源）的瞬间由 UnregisterOp 调一次。TryAdmit 成功才
+    // 登记该钩，所以严格配对、每条路径只归还一次。
+    std::function<void()> on_unregister;
+
+    // 测试 seam：OnWritten 发起 async_read 成功后、handler 返回前在
+    // io 域内调用一次。Request 在 TryPost(Begin) 前注入（写先于对 io
+    // 域的同步派发），故本字段只在 io 域被读、无并发写；默认空即不
+    // 通知。测试用它在冻结 strand 前确认 read 已真实在途。
+    std::function<void()> on_read_armed;
+
 private:
     void OnResolve(boost::system::error_code ec,
                    boost::asio::ip::tcp::resolver::results_type results);
@@ -91,6 +103,16 @@ public:
         : m_engine(std::move(engine)),
           m_info(std::move(info)),
           m_close(std::move(close_sig)) {}
+
+    // Issue #37：配额钩子由 owner（NetworkRuntimeImpl）在创建时注入。
+    // admit 在「登记 op / 发起 I/O 之前」原子预留名额；release 在 op
+    // 物理收口（UnregisterOp）时被调一次。两者都允许为空（空 = 不
+    // 计量），便于在不接 owner 预算的上下文构造 client。
+    void SetQuotaHooks(std::function<result<void>()> admit,
+                       std::function<void()>        release) {
+        m_admit  = std::move(admit);
+        m_release = std::move(release);
+    }
 
     result<HttpResponse> Request(HttpRequest request,
                                  const CallOptions& options) override;
@@ -122,6 +144,13 @@ public:
     }
 
     const std::shared_ptr<HttpIoEngine>& Engine() const { return m_engine; }
+
+    // 测试 seam：给后续新建的 op 注入 read-armed 通知（io 域内、
+    // OnWritten 发起 async_read 成功后触发）。空 = 不通知。
+    void SetReadArmedHookForTest(std::function<void()> hook) {
+        m_read_armed_hook = std::move(hook);
+    }
+
     // m_ops 跨线程（调用线程登记、io 域反登记/teardown），一律持锁访问。
     // 集合持 op 强引用：快照后可跨线程安全收口，不会迭代到悬垂指针。
     // 返回 false 表示 teardown 已快照（io 域已封或将封），调用方按 Closed 拒绝——
@@ -136,13 +165,26 @@ public:
     // op 在 finished 且 in-flight 归零后才调用本方法离开 m_ops：
     // teardown 之后 m_ops 清空即「后端不再访问任何 op 资源」，
     // 此时才 MarkClosed。
+    // Issue #37：这里同时是出站配额的「物理收口」归还点——op 一旦
+    // 离开 m_ops，其占用的 max_connections/max_inflight 名额立即
+    // 经 op->on_unregister 归还给 owner，晚于此才允许名额复用。
+    // 原子一次性：erase 的返回值是本 op 是否「真正从集合移除」的判定。
+    // Finish 可跨线程、IoAsyncDone 在 io 域，两条收口路径可并发进入
+    // 本方法——只有抢到 erase 成功（返回 1）的一方才执行归还并参与
+    // fin 判定；另一方看到已不在集合，直接返回，绝不二次归还。
     void UnregisterOp(std::shared_ptr<ClientOp> op) {
+        bool erased = false;
         bool fin = false;
         {
             std::lock_guard<std::mutex> lk(m_ops_mtx);
-            m_ops.erase(op);
-            fin = m_io_dead && m_ops.empty();
+            erased = (m_ops.erase(op) != 0);
+            if (erased)
+                fin = m_io_dead && m_ops.empty();
         }
+        if (!erased)
+            return;                  // 已被并发收口路径移除：不重复归还
+        if (op->on_unregister)
+            op->on_unregister();
         if (fin)
             m_close.MarkClosed();
     }
@@ -157,6 +199,14 @@ private:
     // 归零后才离开——m_io_dead 置位后集合清空是 MarkClosed 的必要条件。
     std::unordered_set<std::shared_ptr<ClientOp>> m_ops;
     bool                          m_io_dead{false}; // m_ops_mtx 保护
+
+    // Issue #37：owner 注入的配额钩子；空表示不计量。
+    std::function<result<void>()> m_admit;
+    std::function<void()>         m_release;
+
+    // 测试 seam：注入到每个新 op 的 on_read_armed（Request 在 TryPost
+    // 前复制给 op）；默认空 = 不通知。仅测试设置，生产路径保持空。
+    std::function<void()>         m_read_armed_hook;
 };
 
 } // namespace bbt::infra::http_detail

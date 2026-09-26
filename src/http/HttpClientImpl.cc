@@ -127,6 +127,11 @@ void ClientOp::OnWritten(boost::system::error_code ec, std::size_t) {
                       "http request: read initiate failed")));
         return;
     }
+    // async_read 已真实发起（发起函数未抛）：此刻 read 完成项必然在途，
+    // 只会被 Abort/close/对端写响应催出。测试 seam 在此刻通知，让测试
+    // 能在冻结 strand 前确认「物理收口前名额仍占」的前提确实成立。
+    if (on_read_armed)
+        on_read_armed();
 }
 
 void ClientOp::OnRead(boost::system::error_code ec, std::size_t) {
@@ -198,6 +203,32 @@ result<HttpResponse> HttpClientImpl::Request(HttpRequest request,
     if (!parsed)
         return result<HttpResponse>::err(std::move(parsed).error());
 
+    // Issue #37：在登记 op / 发起任何 async_* 之前，向 owner 原子预留
+    // max_connections/max_inflight 名额。名额不足立即 Overloaded——
+    // 此时还没建 socket/resolver，也没向 io 域投递，满足「拒绝路径
+    // 不建活跃连接」。admit 为空表示本 client 不接 owner 预算。
+    // 异常安全：归还钩子在 admit 之前先备好——std::function 复制可抛
+    // bad_alloc，若把它放到 admit 成功后执行，名额会在「已占用、无
+    // 归还责任者」的窗口中泄漏。release 先于 admit 落定后，admit
+    // 成功才 armed 武装：此后任何在「op 接管名额」（on_unregister
+    // 挂到 op 且 RegisterOp 成功）之前抛出的异常，都由 guard 析构
+    // 归还；admit 失败/抛出时 armed=false，名额未占、guard 不误归还。
+    struct AdmitGuard {
+        std::function<void()> release;
+        bool                  armed{false};
+        ~AdmitGuard() { if (armed && release) release(); }
+        void Arm()    { armed = true; }
+        void Disarm() { armed = false; }
+    };
+    AdmitGuard slot;
+    slot.release = m_release;           // 可抛复制先于 admit 完成
+    if (m_admit) {
+        auto admitted = m_admit();
+        if (!admitted)
+            return result<HttpResponse>::err(std::move(admitted).error());
+        slot.Arm();                     // admit 成功：guard 接管归还责任
+    }
+
     std::shared_ptr<bbt::coroutine::CompletionSignal> sig;
     try {
         sig = std::make_shared<bbt::coroutine::CompletionSignal>();
@@ -210,6 +241,13 @@ result<HttpResponse> HttpClientImpl::Request(HttpRequest request,
         std::static_pointer_cast<HttpClientImpl>(shared_from_this()),
         m_engine);
     op->sig = sig;
+    // op 与 guard 持有同一份 release：RegisterOp 成功后 Disarm 解除
+    // guard 兜底责任，op 物理收口时经 on_unregister 归还；admit 为空
+    // （不接 owner 预算）时 release 恒空，行为与基线一致。
+    op->on_unregister = slot.release;
+    // 测试 seam：把注入的 read-armed 通知交给本 op；写发生在 TryPost
+    // （向 io 域派发 Begin）之前，io 域读到的必然是最新值。
+    op->on_read_armed = m_read_armed_hook;
 
     http::request<http::string_body>& breq = op->request;
     breq.version(11);
@@ -225,9 +263,14 @@ result<HttpResponse> HttpClientImpl::Request(HttpRequest request,
     // 登记先于 post：与 RequestClose 竞态的提交也能被 teardown 明确拒绝，
     // 不会因 io 域已封而漏通知等待者（见 TeardownOnIoDomain 的 io_dead）。
     auto self = std::static_pointer_cast<HttpClientImpl>(shared_from_this());
-    if (!self->RegisterOp(op))
+    if (!self->RegisterOp(op)) {
+        // op 未进 m_ops，不会经 UnregisterOp 归还名额——guard 析构归还。
         return result<HttpResponse>::err(
             MakeError(ErrorCode::Closed, "http client closed"));
+    }
+    // RegisterOp 成功：名额所有权转交 op->on_unregister（物理收口时归还），
+    // 解除本作用域的回退责任。
+    slot.Disarm();
     const std::string host = parsed.value().host;
     const std::uint16_t port = parsed.value().port;
     if (!m_engine->TryPost([op, host, port]() mutable {
