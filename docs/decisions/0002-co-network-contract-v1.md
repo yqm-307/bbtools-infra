@@ -73,7 +73,7 @@ result 是本仓网络结果表面，优先复用 core 的 `Result<T,E>`，必�
 
 ICoObject 只提供身份，关闭能力独立；ICoNetwork 不承诺任意派生类都可监听或按字节读取。第一版不新增全局 CoHandle/CoScope/动态插件系统；继承本身不提供安全沙箱或任意对象生命周期接管。
 
-Error.details 是错误分支的结构化详情，RPC 错误信封必须无损携带 code/domain/domain_code/details，不以成功 envelope 冒充错误。详情最多 16 项，键最多 64 个 UTF-8 字节，值最多 256 个 UTF-8 字节；重复键、非法编码、未知保留键拒绝为 ProtocolError，不能截断后继续。`framework.actor` 域保留 `expected_sequence`（无符号十进制字符串）供顺序错误使用；客户端不得写入响应错误详情。公开错误文本脱敏，不携带堆栈、凭据或原始请求。
+Error.details 是错误分支的结构化详情，RPC 错误信封必须无损携带 code/domain/domain_code/details，不以成功 envelope 冒充错误。详情最多 16 项，键最多 64 个 UTF-8 字节，值最多 256 个 UTF-8 字节；重复键、非法编码拒绝为 ProtocolError，不能截断后继续。域专属保留键的归属与格式校验不由 infra 通用层承担，改由该域拥有者在错误构造/消费边界落实：`framework.actor` 域保留 `expected_sequence`（无符号十进制字符串）供顺序错误使用，其域归属与格式由 bbt-framework 侧校验（infra #39）；其他上层域声明自身保留键时同样自行校验，infra 不登记跨域键表。客户端不得写入响应错误详情。公开错误文本脱敏，不携带堆栈、凭据或原始请求。
 
 ### 关闭规则
 
