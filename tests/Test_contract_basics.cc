@@ -141,23 +141,29 @@ void TestErrorDetails() {
     CHECK(!r);
     if (!r) CHECK(ErrCodeOf(r) == ErrorCode::ProtocolError);
 
-    // 保留键 expected_sequence：仅 framework.actor 域可写且为无符号十进制
-    e = MakeDomainError(std::string(kErrorDomainFrameworkActor),
-                      {{std::string(kErrorDetailExpectedSequence), "12"}});
+    // 上层域专属键不再是 infra 保留键：infra 只做结构校验，接受任意
+    // 域+键组合（结构合法时）；expected_sequence 的域归属/数字格式校验
+    // 已由 framework 侧 ErrorDomainRule 接管（见 decisions/0002 第 76 行）。
+    e = MakeDomainError("framework.actor",
+                        {{"expected_sequence", "12"}});
     r = ValidateErrorDetails(e);
     CHECK(r);
 
-    e = MakeDomainError(std::string(kErrorDomainFrameworkActor),
-                      {{std::string(kErrorDetailExpectedSequence), "x12"}});
+    e = MakeDomainError("framework.actor",
+                        {{"expected_sequence", "x12"}});
     r = ValidateErrorDetails(e);
-    CHECK(!r);
-    if (!r) CHECK(ErrCodeOf(r) == ErrorCode::ProtocolError);
+    CHECK(r);  // infra 层不再拒绝；framework 边界负责拒绝
 
     e = MakeDomainError(std::string(kErrorDomainInfra),
-                      {{std::string(kErrorDetailExpectedSequence), "12"}});
+                        {{"expected_sequence", "12"}});
     r = ValidateErrorDetails(e);
-    CHECK(!r);
-    if (!r) CHECK(ErrCodeOf(r) == ErrorCode::ProtocolError);
+    CHECK(r);  // 同上：infra 层结构合法即通过
+
+    // 非 actor 合法扩展键：上层自定义域 + 自定义键照常通过结构校验
+    e = MakeDomainError("app.billing",
+                        {{"invoice_id", "INV-2026-001"}, {"retry_after", "30"}});
+    r = ValidateErrorDetails(e);
+    CHECK(r);
 }
 
 void TestNetworkLimits() {

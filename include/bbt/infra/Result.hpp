@@ -32,11 +32,10 @@ inline constexpr std::size_t kMaxValueBytes   = 256;
 
 using ErrorDetails = std::vector<std::pair<std::string, std::string>>;
 
-// 稳定错误域与已知保留键。expected_sequence 保留给 framework.actor 域的顺序错误，
-// 值为无符号十进制字符串；其他域写入该键按未知保留键拒绝。
-inline constexpr std::string_view kErrorDomainInfra          = "infra";
-inline constexpr std::string_view kErrorDomainFrameworkActor = "framework.actor";
-inline constexpr std::string_view kErrorDetailExpectedSequence = "expected_sequence";
+// 稳定错误域：infra 自身错误的默认域。上层域（如 framework.actor）及其保留键
+// 语义归各自上层边界拥有（见 decisions/0002 第 76 行的分工说明），本头不再
+// 硬编码任何上层专属字段语义。
+inline constexpr std::string_view kErrorDomainInfra = "infra";
 
 struct Error {
     ErrorCode   code = ErrorCode::InternalError;
@@ -86,13 +85,6 @@ inline bool IsValidUtf8(std::string_view s) noexcept {
     return true;
 }
 
-inline bool IsUnsignedDecimal(std::string_view s) noexcept {
-    if (s.empty()) return false;
-    for (char ch : s)
-        if (ch < '0' || ch > '9') return false;
-    return true;
-}
-
 } // namespace detail
 
 template <class T>
@@ -101,8 +93,9 @@ class result;
 template <>
 class result<void>;
 
-// details 结构校验：条目/键/值上限、UTF-8 良构、重复键与保留键域归属。
+// details 结构校验：条目/键/值上限、UTF-8 良构与重复键。
 // 任何违规整体拒绝为 ProtocolError，不截断后继续。
+// 上层域专属语义（保留键归属/值格式）不在此校验，由上层 ErrorDomainRule 负责。
 inline result<void> ValidateErrorDetails(const Error& error);
 
 template <class T>
@@ -182,15 +175,10 @@ inline result<void> ValidateErrorDetails(const Error& error) {
             if (details[j].first == key)
                 return result<void>::err(MakeError(ErrorCode::ProtocolError,
                     "error.details duplicate key"));
-        if (key == kErrorDetailExpectedSequence) {
-            if (error.domain != kErrorDomainFrameworkActor)
-                return result<void>::err(MakeError(ErrorCode::ProtocolError,
-                    "reserved key expected_sequence outside framework.actor domain"));
-            if (!detail::IsUnsignedDecimal(val))
-                return result<void>::err(MakeError(ErrorCode::ProtocolError,
-                    "expected_sequence must be unsigned decimal"));
-        }
     }
+    // 注意：上层域的保留键归属与格式（如 framework.actor 的
+    // expected_sequence）由上层边界的 ErrorDomainRule 校验负责；
+    // infra 通用层只保证本函数之上的结构规则，见 decisions/0002。
     return result<void>::ok();
 }
 
