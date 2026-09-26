@@ -287,6 +287,38 @@ result<void> NetworkRuntimeImpl::CheckAndAdoptLocked(
     return result<void>::ok();
 }
 
+// Issue #37：HTTP 出站原子接纳。检查与递增在同一 m_lifecycle_mtx
+// 临界区内，与 CheckAndAdoptLocked 共用一把锁——接纳判定与「runtime
+// 正在关闭」互斥，保证超额判定不被并发请求或 teardown 穿透。
+// 不引入排队：名额不足立即 Overloaded，此时还没有创建 socket/resolver，
+// 也没有向 io 域投递任何 async_*，满足「拒绝路径不建活跃连接」。
+result<void> NetworkRuntimeImpl::TryAdmitHttpRequest() noexcept {
+    std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
+    if (m_sealed || m_state.load() != kRunning || !m_close.IsOpen())
+        return result<void>::err(MakeError(
+            ErrorCode::Closed, "runtime is closing or closed"));
+    if (m_http_inflight_count >= m_limits.max_inflight)
+        return result<void>::err(MakeError(
+            ErrorCode::Overloaded, "http outbound: max_inflight exceeded"));
+    if (m_http_conn_count >= m_limits.max_connections)
+        return result<void>::err(MakeError(
+            ErrorCode::Overloaded, "http outbound: max_connections exceeded"));
+    ++m_http_inflight_count;
+    ++m_http_conn_count;
+    return result<void>::ok();
+}
+
+// 归还只在 op 物理收口（finished && inflight==0 → UnregisterOp）后经
+// 本钩子发生一次。TryAdmit/Release 严格配对：接纳成功才注册归还钩，
+// 所以这里只需防下限，不会出现负数/重复归还。HTTP 出站名额不参与
+// runtime finalize 门控（finalize 等的是子对象 Closed），无需在此
+// 触发 MaybeFinalize。
+void NetworkRuntimeImpl::ReleaseHttpRequest() noexcept {
+    std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
+    if (m_http_inflight_count > 0) --m_http_inflight_count;
+    if (m_http_conn_count > 0)    --m_http_conn_count;
+}
+
 result<std::shared_ptr<HttpClient>> NetworkRuntimeImpl::CreateHttpClient() {
     auto usable = CheckUsableForFactory();
     if (!usable)
@@ -305,6 +337,21 @@ result<std::shared_ptr<HttpClient>> NetworkRuntimeImpl::CreateHttpClient() {
         m_engine, std::move(info).value(), std::move(sig).value());
     std::weak_ptr<NetworkRuntimeImpl> weak =
         std::static_pointer_cast<NetworkRuntimeImpl>(shared_from_this());
+    // Issue #37：HTTP 出站配额挂到 Runtime owner——同一 runtime 下所有
+    // HttpClient 共享同一预算，避免多 client 各自绕过总量。admit 在
+    // 登记 op 之前原子预留；release 在 op 物理收口时被调一次。
+    impl->SetQuotaHooks(
+        [weak] {
+            auto rt = weak.lock();
+            if (!rt)
+                return result<void>::err(MakeError(
+                    ErrorCode::Closed, "runtime gone"));
+            return rt->TryAdmitHttpRequest();
+        },
+        [weak] {
+            if (auto rt = weak.lock())
+                rt->ReleaseHttpRequest();
+        });
     impl->SetClosedHook([weak] {
         if (auto rt = weak.lock())
             rt->OnChildClosed();
