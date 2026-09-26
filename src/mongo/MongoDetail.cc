@@ -207,7 +207,7 @@ Error ClassifyBsonError(const bsoncxx::v1::exception& e, const char* what) {
     return err;
 }
 
-std::string EffectiveUri(const MongoClientConfig& cfg) {
+std::string EffectiveUri(const mongo::MongoRuntimeConfig& cfg) {
     std::string uri = cfg.uri;
     // 只认 '?' 之后的 query：按 '&' 分段，每段取第一个 '=' 之前的参数名，
     // 大小写不敏感比较。避免 URI 其他位置（userinfo、参数值）中的

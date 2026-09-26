@@ -38,9 +38,11 @@ struct MongoUpdateResult {
     std::int64_t upserted = 0;
 };
 
-// CoMongoCli 装配参数。本切片一个 client 绑定一个 db.collection；多集合
-// 由调用方建多个 client 实例聚合（进程内共享 mongocxx::instance 与按
-// 生效 URI 划分的 mongocxx::pool）。
+// CoMongoCli 装配参数（Issue #7 旧契约，保留兼容）。本切片一个
+// client 绑定一个 db.collection，内部由独占的 mongo owner
+// （src/mongo/MongoRuntime）承载 worker/队列/pool——资源归属与
+// Issue #40 的 bbt::infra::mongo::CoMongoDb 同构；需要多集合共享
+// 一组 worker 的新代码应直接用 mongo::CoMongoDb + 集合句柄。
 //   - worker_threads：执行阻塞 driver 调用的 worker 线程数上限
 //     （<=8；测试默认 <=2）；每项 operation 在同一 worker 上
 //     acquire/use/release pooled client；
@@ -102,9 +104,12 @@ inline result<void> ValidateMongoClientConfig(const MongoClientConfig& cfg) {
     return result<void>::ok();
 }
 
-// CoMongoCli：出站 MongoDB 组件（mongocxx 同步 driver + 有界 worker
-// bridge；mongocxx::client 单线程亲和由「同一 worker 上 acquire/use/
-// release」满足；进程级 mongocxx::pool 跨 client 共享）。
+// CoMongoCli：出站 MongoDB 组件（Issue #7 旧契约，兼容保留；新代码
+// 优先用 bbt::infra::mongo::CoMongoDb + CoMongoColl，见
+// include/bbt/infra/mongo/Client.hpp）。实现为「独占 mongo owner +
+// 单个集合句柄」：mongocxx 同步 driver + 有界 worker bridge，
+// mongocxx::client 单线程亲和由「同一 worker 上 acquire/use/
+// release」满足；进程级 mongocxx::pool 按生效 URI 共享。
 //
 // 命令语义边界：
 //   - 全部命令只能在协程上下文调用，否则返回 Error(InvalidContext)；

@@ -54,9 +54,10 @@
 
 #include <bbt/infra/CoMongoCli.hpp>
 
-// impl 观测钩子（RunningDriverCallsForTest/PeakDriverCallsForTest）用于
-// worker 并发上限与「逻辑返回≠物理收口」的确定性核验。
-#include "mongo/CoMongoCliImpl.hpp"
+// impl 观测钩子（LiveWorkersForTest/RunningDriverCallsForTest/
+// PeakDriverCallsForTest）用于 worker 并发上限与「逻辑返回≠物理
+// 收口」的确定性核验；MongoRuntime 是 Issue #40 的资源 owner。
+#include "mongo/MongoRuntime.hpp"
 
 using namespace bbt::infra;
 using bbt::coroutine::Deadline;
@@ -66,8 +67,8 @@ namespace {
 
 constexpr int kBudgetMs = 45000;
 
-MongoClientConfig MakeUriCfg(std::string uri) {
-    MongoClientConfig cfg;
+mongo::MongoRuntimeConfig MakeUriCfg(std::string uri) {
+    mongo::MongoRuntimeConfig cfg;
     cfg.uri                      = std::move(uri);
     cfg.worker_threads           = 2;
     cfg.max_queue                = 8;
@@ -346,6 +347,34 @@ BOOST_AUTO_TEST_CASE(t_invalid_context_plain) {
     }));
 }
 
+BOOST_AUTO_TEST_CASE(t_invalid_context_precedence_legacy) {
+    // 旧 API 错误优先级回归：协程外调用一律 InvalidContext，不区分
+    // 未 Start / 已关——旧 PreCheck 首行即查 g_bbt_tls_coroutine_co。
+    // 未 Start：m_coll 为空也不能短路成 RuntimeUnavailable。
+    auto c1 = CoMongoCli::Create(MakeDeadCfg());
+    BOOST_REQUIRE(c1);
+    auto not_started = std::move(c1).value();
+    auto r1 = not_started->FindOne(EmptyDoc(), Opt());
+    BOOST_REQUIRE(!r1);
+    BOOST_CHECK(r1.error().code == ErrorCode::InvalidContext);
+    not_started->RequestClose();
+
+    // 已关（Start 后 RequestClose）：协程外仍 InvalidContext 而非
+    // Closed——与旧 PreCheck 的协程外优先一致。
+    auto c2 = NewClient(MakeDeadCfg());
+    BOOST_REQUIRE(c2);
+    auto closed = std::move(c2).value();
+    closed->RequestClose();
+    BOOST_REQUIRE(RunInCoroutine([&] {
+        return closed->WaitClosed(
+            std::chrono::steady_clock::now() + std::chrono::seconds(10),
+            {});
+    }));
+    auto r2 = closed->FindOne(EmptyDoc(), Opt());
+    BOOST_REQUIRE(!r2);
+    BOOST_CHECK(r2.error().code == ErrorCode::InvalidContext);
+}
+
 BOOST_AUTO_TEST_CASE(t_invalid_bson) {
     auto c = NewClient(MakeDeadCfg());
     BOOST_REQUIRE(c);
@@ -404,7 +433,7 @@ BOOST_AUTO_TEST_CASE(t_capacity_overloaded) {
     auto submit = [&](int budget_ms) {
         bool succ = false;
         g_scheduler->RegistCoroutineTask(
-            [&] {
+            [&, budget_ms] {
                 auto r = cli->FindOne(EmptyDoc(), Opt(budget_ms));
                 if (!r && r.error().code == ErrorCode::Overloaded)
                     overloaded.fetch_add(1);
@@ -631,6 +660,341 @@ BOOST_AUTO_TEST_CASE(t_waitclosed_contention) {
     BOOST_REQUIRE(WaitUntil([&] { return a_done.load(); }));
     BOOST_CHECK(a_status.load() == CloseStatus::Closed);
     BOOST_CHECK(cli->IsClosed());
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// ==================== Issue #40：owner/句柄归属 ====================
+//
+// 资源归属不变式（确定性探针，不靠压测）：
+//   - 同一 owner 的多个集合句柄共享同一 worker 组：句柄数增长时
+//     LiveWorkers 不变；
+//   - 不同 owner 各自持有 worker 组/队列/ops 表：互不可见；
+//   - max_queue=1 时跨集合共享背压：一个集合占住队列后，另一集合
+//     确定性 Overloaded；
+//   - 句柄关闭只停自身接纳，不动兄弟与 owner；owner 关闭等物理
+//     drain（WaitClosed 不提前宣告）。
+
+BOOST_AUTO_TEST_SUITE(mongo_owner)
+
+namespace {
+
+mongo::MongoRuntimeConfig MakeRtCfg(std::size_t workers = 2,
+                                    std::size_t queue   = 8,
+                                    int         sst_ms  = 15000) {
+    mongo::MongoRuntimeConfig cfg;
+    cfg.uri                      = "mongodb://127.0.0.1:1/bbt_ut";
+    cfg.worker_threads           = workers;
+    cfg.max_queue                = queue;
+    cfg.server_selection_timeout = std::chrono::milliseconds(sst_ms);
+    cfg.connect_timeout          = std::chrono::milliseconds(2000);
+    cfg.socket_timeout           = std::chrono::milliseconds(2000);
+    cfg.wait_queue_timeout       = std::chrono::milliseconds(2000);
+    return cfg;
+}
+
+std::shared_ptr<mongo::CoMongoDb> NewOwner(
+    const mongo::MongoRuntimeConfig& cfg) {
+    auto d = mongo::CoMongoDb::Create(cfg);
+    BOOST_REQUIRE(d);
+    auto db = std::move(d).value();
+    BOOST_REQUIRE(db->Start());
+    return db;
+}
+
+// owner 对象 → 内部 runtime（观测 worker/计数）。CoMongoDbImpl 定义在
+// MongoRuntime.cc 匿名命名空间，测试经 GetObjectInfo 拿不到 runtime；
+// 这里用 Collection 的 impl 反查 owner runtime。
+std::shared_ptr<mongo_detail::MongoRuntime> RuntimeOf(
+    const std::shared_ptr<mongo::CoMongoDb>& db) {
+    auto h = db->Collection({"bbt_ut", "probe"});
+    BOOST_REQUIRE(h);
+    auto impl = std::static_pointer_cast<mongo_detail::MongoCollImpl>(
+        h.value());
+    return impl->Runtime();
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(t_owner_config_validation) {
+    mongo::MongoRuntimeConfig base = MakeRtCfg();
+    auto bad_uri = base;  bad_uri.uri = "http://127.0.0.1:1/";
+    BOOST_CHECK(mongo::CoMongoDb::Create(bad_uri).error().code ==
+                ErrorCode::InvalidArgument);
+    auto zero_workers = base;  zero_workers.worker_threads = 0;
+    BOOST_CHECK(mongo::CoMongoDb::Create(zero_workers).error().code ==
+                ErrorCode::InvalidArgument);
+    auto zero_queue = base;  zero_queue.max_queue = 0;
+    BOOST_CHECK(mongo::CoMongoDb::Create(zero_queue).error().code ==
+                ErrorCode::InvalidArgument);
+    auto bad_target = mongo::MongoTarget{"", "c"};
+    auto db = NewOwner(MakeRtCfg(1, 4));
+    BOOST_CHECK(db->Collection(bad_target).error().code ==
+                ErrorCode::InvalidArgument);
+    db->RequestClose();
+    std::atomic<CloseStatus> st{};
+    BOOST_REQUIRE(RunInCoroutine([&] {
+        st.store(db->WaitClosed(
+            std::chrono::steady_clock::now() + std::chrono::seconds(10),
+            {}));
+    }));
+    BOOST_CHECK(st.load() == CloseStatus::Closed);
+}
+
+BOOST_AUTO_TEST_CASE(t_owner_multi_handles_share_workers) {
+    // 同一 owner 建 3 个集合句柄：worker 数恒等于配置值（2），
+    // 不随句柄数增长。
+    auto db = NewOwner(MakeRtCfg(2, 8, 8000));
+    auto rt = RuntimeOf(db);
+    BOOST_REQUIRE(WaitUntil(
+        [&] { return rt->LiveWorkersForTest() == 2; }, 10000));
+
+    std::vector<std::shared_ptr<mongo::CoMongoColl>> handles;
+    for (const char* coll : {"c1", "c2", "c3"}) {
+        auto h = db->Collection({"bbt_ut", coll});
+        BOOST_REQUIRE(h);
+        handles.push_back(std::move(h).value());
+    }
+    // 句柄建立后 worker 数仍 = 2。
+    BOOST_CHECK_EQUAL(rt->LiveWorkersForTest(), 2);
+
+    // 三个集合各发一个在途 op（不可达地址 server selection 占住），
+    // worker 峰值仍 ≤ 2——集合数不放大执行资源。
+    std::atomic_int submitted{0};
+    for (auto& h : handles) {
+        bool succ = false;
+        auto* hp = h.get();
+        g_scheduler->RegistCoroutineTask(
+            [hp, &submitted] {
+                auto r = hp->FindOne(EmptyDoc(), Opt(30000));
+                (void)r;
+                submitted.fetch_add(1);
+            },
+            succ);
+        BOOST_REQUIRE(succ);
+    }
+    BOOST_REQUIRE(WaitUntil(
+        [&] { return rt->RunningDriverCallsForTest() == 2; }, 10000));
+    BOOST_CHECK(rt->PeakDriverCallsForTest() <= 2);
+    BOOST_CHECK_EQUAL(rt->LiveWorkersForTest(), 2);
+
+    for (auto& h : handles)
+        h->RequestClose();
+    db->RequestClose();
+    BOOST_REQUIRE(WaitUntil(
+        [&] { return submitted.load() == 3; }, 30000));
+    std::atomic<CloseStatus> st{};
+    BOOST_REQUIRE(RunInCoroutine([&] {
+        st.store(db->WaitClosed(
+            std::chrono::steady_clock::now() + std::chrono::seconds(30),
+            {}));
+    }));
+    BOOST_CHECK(st.load() == CloseStatus::Closed);
+    BOOST_CHECK_EQUAL(rt->RunningDriverCallsForTest(), 0);
+}
+
+BOOST_AUTO_TEST_CASE(t_owner_isolation) {
+    // 两个 owner 各自 1 worker：资源隔离可验证。
+    auto db1 = NewOwner(MakeRtCfg(1, 4, 8000));
+    auto db2 = NewOwner(MakeRtCfg(1, 4, 8000));
+    auto rt1 = RuntimeOf(db1);
+    auto rt2 = RuntimeOf(db2);
+    BOOST_REQUIRE(WaitUntil(
+        [&] { return rt1->LiveWorkersForTest() == 1; }, 10000));
+    BOOST_REQUIRE(WaitUntil(
+        [&] { return rt2->LiveWorkersForTest() == 1; }, 10000));
+    BOOST_CHECK(rt1 != rt2);
+
+    auto h1 = db1->Collection({"bbt_ut", "a"});
+    auto h2 = db2->Collection({"bbt_ut", "a"});
+    BOOST_REQUIRE(h1 && h2);
+    BOOST_CHECK(std::static_pointer_cast<mongo_detail::MongoCollImpl>(
+                    h1.value())->Runtime() == rt1);
+    BOOST_CHECK(std::static_pointer_cast<mongo_detail::MongoCollImpl>(
+                    h2.value())->Runtime() == rt2);
+
+    db1->RequestClose();
+    db2->RequestClose();
+    std::atomic<CloseStatus> s1{}, s2{};
+    BOOST_REQUIRE(RunInCoroutine([&] {
+        s1.store(db1->WaitClosed(
+            std::chrono::steady_clock::now() + std::chrono::seconds(20),
+            {}));
+    }));
+    BOOST_REQUIRE(RunInCoroutine([&] {
+        s2.store(db2->WaitClosed(
+            std::chrono::steady_clock::now() + std::chrono::seconds(20),
+            {}));
+    }));
+    BOOST_CHECK(s1.load() == CloseStatus::Closed);
+    BOOST_CHECK(s2.load() == CloseStatus::Closed);
+}
+
+BOOST_AUTO_TEST_CASE(t_shared_backpressure_queue_one) {
+    // owner worker=1、max_queue=1：集合 A 占住唯一 worker 后，集合 B
+    // 的 op 进队列占满容量，集合 C 的 op 确定性 Overloaded——跨集合
+    // 共享背压而非句柄各自上限。
+    auto db = NewOwner(MakeRtCfg(1, 1, 8000));
+    auto rt = RuntimeOf(db);
+    auto ha = db->Collection({"bbt_ut", "a"});
+    auto hb = db->Collection({"bbt_ut", "b"});
+    auto hc = db->Collection({"bbt_ut", "c"});
+    BOOST_REQUIRE(ha && hb && hc);
+    auto* pa = ha.value().get();
+    auto* pb = hb.value().get();
+    auto* pc = hc.value().get();
+
+    std::atomic_int b_overloaded{0};
+    std::atomic_int c_overloaded{0};
+    std::atomic_int b_done{0};
+    std::atomic_int c_done{0};
+    auto submit = [&](mongo::CoMongoColl* h,
+                      std::atomic_int& overloaded,
+                      std::atomic_int& done, int budget_ms) {
+        bool succ = false;
+        g_scheduler->RegistCoroutineTask(
+            [h, budget_ms, &overloaded, &done] {
+                auto r = h->FindOne(EmptyDoc(), Opt(budget_ms));
+                if (!r && r.error().code == ErrorCode::Overloaded)
+                    overloaded.fetch_add(1);
+                done.fetch_add(1);
+            },
+            succ);
+        BOOST_REQUIRE(succ);
+    };
+
+    submit(pa, b_overloaded, b_done, 30000);  // 占住唯一 worker（server selection 8s）
+    BOOST_REQUIRE(WaitUntil(
+        [&] { return rt->RunningDriverCallsForTest() == 1; }, 10000));
+    submit(pb, b_overloaded, b_done, 30000);  // B：进队列占满容量 1
+    // 可观察地确认 B 已在队列（而非仅「某协程跑过」）：QueuedOpsForTest
+    // 读 m_queue_mtx 保护的 m_queue.size()，与接纳判定同临界区。
+    BOOST_REQUIRE(WaitUntil(
+        [&] { return rt->QueuedOpsForTest() == 1; }, 10000));
+    submit(pc, c_overloaded, c_done, 30000);  // C：确定性 Overloaded
+
+    // 队列容量=1 已被 B 占住：被拒的是 C 而不是 B。
+    BOOST_REQUIRE(WaitUntil([&] { return c_done.load() == 1; }, 10000));
+    BOOST_CHECK_EQUAL(c_overloaded.load(), 1);
+    BOOST_CHECK_EQUAL(b_overloaded.load(), 0);
+    BOOST_CHECK(rt->PeakDriverCallsForTest() <= 1);
+
+    ha.value()->RequestClose();
+    hb.value()->RequestClose();
+    hc.value()->RequestClose();
+    db->RequestClose();
+    BOOST_REQUIRE(WaitUntil(
+        [&] { return b_done.load() + c_done.load() == 3; }, 30000));
+    std::atomic<CloseStatus> st{};
+    BOOST_REQUIRE(RunInCoroutine([&] {
+        st.store(db->WaitClosed(
+            std::chrono::steady_clock::now() + std::chrono::seconds(30),
+            {}));
+    }));
+    BOOST_CHECK(st.load() == CloseStatus::Closed);
+}
+
+BOOST_AUTO_TEST_CASE(t_handle_close_scoped) {
+    // 句柄关闭：自身新命令 Closed，兄弟句柄与 owner 不受影响；
+    // 在途 op 保活到物理收口。
+    auto db = NewOwner(MakeRtCfg(1, 4, 8000));
+    auto rt = RuntimeOf(db);
+    auto h1 = db->Collection({"bbt_ut", "a"});
+    auto h2 = db->Collection({"bbt_ut", "b"});
+    BOOST_REQUIRE(h1 && h2);
+    auto c1 = h1.value();
+    auto c2 = h2.value();
+
+    // owner 已 Running（NewOwner 内 Start）；句柄创建后经命令路径校验，
+    // 不良构 BSON 在 worker 内、driver 调用前被拒 → InvalidArgument；
+    // 证明 owner 在正常工作。
+    std::optional<result<std::optional<MongoDocument>>> noop;
+    BOOST_REQUIRE(RunInCoroutine(
+        [&] { noop.emplace(c2->FindOne(BadDoc(), Opt(2000))); }));
+    BOOST_REQUIRE(!*noop);
+    BOOST_CHECK(noop->error().code == ErrorCode::InvalidArgument);
+
+    // h1 在途 op（server selection 中），随后关闭 h1：逻辑结果可以是
+    // Closed/TimedOut/Unavailable（首个落定者胜出），但不能悬挂。
+    std::atomic_bool h1_done{false};
+    bool succ = false;
+    g_scheduler->RegistCoroutineTask(
+        [&] {
+            auto r = c1->FindOne(EmptyDoc(), Opt(30000));
+            (void)r;
+            h1_done.store(true);
+        },
+        succ);
+    BOOST_REQUIRE(succ);
+    BOOST_REQUIRE(WaitUntil(
+        [&] { return rt->RunningDriverCallsForTest() == 1; }, 10000));
+
+    c1->RequestClose();
+    BOOST_CHECK(c1->IsClosed());
+    // 已关句柄的新命令 → Closed（不接触 owner 队列）。
+    std::optional<result<std::optional<MongoDocument>>> out;
+    BOOST_REQUIRE(RunInCoroutine(
+        [&] { out.emplace(c1->FindOne(EmptyDoc(), Opt())); }));
+    BOOST_REQUIRE(!*out);
+    BOOST_CHECK(out->error().code == ErrorCode::Closed);
+
+    // 兄弟句柄与 owner 仍可用：h2 命令进入同一 worker（排队等 h1 的
+    // 在途收口后正常执行）。
+    std::atomic_bool h2_done{false};
+    g_scheduler->RegistCoroutineTask(
+        [&] {
+            auto r = c2->FindOne(EmptyDoc(), Opt(30000));
+            (void)r;
+            h2_done.store(true);
+        },
+        succ);
+    BOOST_REQUIRE(succ);
+
+    c2->RequestClose();
+    db->RequestClose();
+    BOOST_REQUIRE(WaitUntil([&] {
+        return h1_done.load() && h2_done.load();
+    }, 30000));
+    std::atomic<CloseStatus> st{};
+    BOOST_REQUIRE(RunInCoroutine([&] {
+        st.store(db->WaitClosed(
+            std::chrono::steady_clock::now() + std::chrono::seconds(30),
+            {}));
+    }));
+    BOOST_CHECK(st.load() == CloseStatus::Closed);
+    BOOST_CHECK_EQUAL(rt->RunningDriverCallsForTest(), 0);
+}
+
+BOOST_AUTO_TEST_CASE(t_owner_collection_requires_running) {
+    // 公共契约「owner 必须 Running 才接纳句柄」的生命周期门禁：
+    //   Create 未 Start → Collection → RuntimeUnavailable；
+    //   Start 之后     → Collection 成功；
+    //   RequestClose   → Collection → Closed。
+    auto d = mongo::CoMongoDb::Create(MakeRtCfg(1, 4));
+    BOOST_REQUIRE(d);
+    auto db = std::move(d).value();
+
+    auto not_started = db->Collection({"bbt_ut", "x"});
+    BOOST_REQUIRE(!not_started);
+    BOOST_CHECK(not_started.error().code == ErrorCode::RuntimeUnavailable);
+
+    BOOST_REQUIRE(db->Start());
+    auto h = db->Collection({"bbt_ut", "x"});
+    BOOST_REQUIRE(h);
+
+    h.value()->RequestClose();
+    db->RequestClose();
+    std::atomic<CloseStatus> st{};
+    BOOST_REQUIRE(RunInCoroutine([&] {
+        st.store(db->WaitClosed(
+            std::chrono::steady_clock::now() + std::chrono::seconds(10),
+            {}));
+    }));
+    BOOST_CHECK(st.load() == CloseStatus::Closed);
+
+    auto after_close = db->Collection({"bbt_ut", "y"});
+    BOOST_REQUIRE(!after_close);
+    BOOST_CHECK(after_close.error().code == ErrorCode::Closed);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

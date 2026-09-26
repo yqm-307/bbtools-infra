@@ -17,7 +17,7 @@ Redis 为 hiredis async + strand，Mongo 为同步 driver + worker bridge。
 
 - `bbt::infra_http` — 协程原生 HTTP（Issue #5）
 - `bbt::infra::redis` — Redis 客户端基础接入（当前兼容入口仍记录于现有 Redis 决策）：后续公共 API 按 `include/bbt/infra/redis/` 拆分，覆盖最新 hiredis/Redis 的主流数据结构和控制能力；不把 hiredis 类型、连接线程或底层 context 暴露给消费者。
-- `bbt::infra::mongo` — MongoDB 客户端基础接入：后续公共 API 按 `include/bbt/infra/mongo/` 拆分，覆盖主流 CRUD、查询、索引、聚合、事务和 change stream 能力；不把 mongocxx/bsoncxx、worker 线程或 pool 暴露给消费者。
+- `bbt::infra::mongo` — MongoDB 客户端基础接入：公共 API 按 `include/bbt/infra/mongo/` 拆分。`mongo::CoMongoDb` 是显式资源 owner（连接配置、pool lease、worker 组、接纳队列与关闭排空）；`mongo::CoMongoColl` 是集合句柄（db.collection 目标值 + owner 引用），同一 owner 的多句柄共享同一组 worker 与队列，不同 owner 资源隔离。旧契约 `bbt::infra::CoMongoCli` 保留兼容，内部由独占 owner + 单句柄实现；不暴露 mongocxx/bsoncxx、worker 线程或 pool。
 - `bbt::infra::config` — 分布式 framework 使用的基础动态配置机制：版本化 snapshot、配置源适配、watch、重连、版本去重和关闭；不实现 framework 的配置中心治理、业务 schema 或动态生效策略。
 
 当前 Redis/Mongo 已交付切片仍是最小能力，不代表上述后续主流 API 已全部实现。

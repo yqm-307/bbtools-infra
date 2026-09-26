@@ -76,7 +76,7 @@ if(BBT_MONGOCXX_PREFIX)
     add_library(bbt_infra_mongo STATIC
         mongo/MongoDetail.cc
         mongo/MongoProcess.cc
-        mongo/CoMongoCliImpl.cc)
+        mongo/MongoRuntime.cc)
     add_library(bbt::infra_mongo ALIAS bbt_infra_mongo)
 
     target_include_directories(bbt_infra_mongo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

@@ -43,6 +43,7 @@
 #include <bbt/coroutine/syntax/SyntaxMacro.hpp>
 
 #include <bbt/infra/CoMongoCli.hpp>
+#include <bbt/infra/mongo/Client.hpp>
 
 using namespace bbt::infra;
 using bbt::coroutine::SCHE_START_OPT_SCHE_THREAD;
@@ -146,6 +147,23 @@ std::shared_ptr<CoMongoCli> NewLiveClient(std::size_t workers = 2) {
     auto cli = std::move(c).value();
     BOOST_REQUIRE(cli->Start());
     return cli;
+}
+
+// Issue #40 owner 配置的 live 形态：与 LiveConfig 相同的 URI/超时上界，
+// 但不含 database/collection（目标由集合句柄携带）。
+mongo::MongoRuntimeConfig LiveRuntimeConfig(std::size_t workers = 2,
+                                            std::size_t queue   = 32) {
+    const char* uri = EnvOr("BBT_TEST_MONGO_URI");
+    BOOST_REQUIRE(uri != nullptr);
+    mongo::MongoRuntimeConfig cfg;
+    cfg.uri                      = uri;
+    cfg.worker_threads           = workers;
+    cfg.max_queue                = queue;
+    cfg.server_selection_timeout = std::chrono::milliseconds(5000);
+    cfg.connect_timeout          = std::chrono::milliseconds(3000);
+    cfg.socket_timeout           = std::chrono::milliseconds(3000);
+    cfg.wait_queue_timeout       = std::chrono::milliseconds(3000);
+    return cfg;
 }
 
 void CloseAndWait(const std::shared_ptr<CoMongoCli>& cli) {
@@ -434,6 +452,76 @@ BOOST_AUTO_TEST_CASE(t_fresh_client_after_restart) {
     BOOST_REQUIRE(del && *del && del->value() == 1u);
 
     CloseAndWait(cli);
+}
+
+BOOST_AUTO_TEST_CASE(t_owner_multi_collection_live) {
+    if (!LiveEnabled() || !PhaseIs('A')) {
+        BOOST_TEST_MESSAGE("skip: 需要 BBT_TEST_MONGO_URI 且 PHASE=A");
+        return;
+    }
+    // Issue #40 live 验收：一个 owner（2 worker）上两个集合句柄并行
+    // 真实 CRUD，共享同一组执行资源。
+    auto d = mongo::CoMongoDb::Create(LiveRuntimeConfig(2, 16));
+    BOOST_REQUIRE(d);
+    auto db = std::move(d).value();
+    BOOST_REQUIRE(db->Start());
+    auto ha = db->Collection({"bbt_live", "c"});
+    auto hb = db->Collection({"bbt_live", "c2"});
+    BOOST_REQUIRE(ha && hb);
+    auto ca = ha.value();
+    auto cb = hb.value();
+
+    // 两个集合各做一次真实写读回：数据不串集合（c 写 "a"、c2 写 "b"）。
+    const MongoDocument da = JsonDoc(R"({"_id":"bbt:t:own:a","v":"a"})");
+    const MongoDocument db_ = JsonDoc(R"({"_id":"bbt:t:own:b","v":"b"})");
+    const MongoDocument fa = JsonDoc(R"({"_id":"bbt:t:own:a"})");
+    const MongoDocument fb = JsonDoc(R"({"_id":"bbt:t:own:b"})");
+
+    std::atomic_int ok{0};
+    std::atomic_int errs{0};
+    bool s1 = false, s2 = false;
+    g_scheduler->RegistCoroutineTask(
+        [&] {
+            if (ca->InsertOne(da, Opt(3000))) {
+                auto g = ca->FindOne(fa, Opt(3000));
+                if (g && g.value().has_value()) {
+                    auto fv = FieldString(*g.value(), "v");
+                    if (fv && *fv == "a") ok.fetch_add(1);
+                    else                errs.fetch_add(1);
+                } else errs.fetch_add(1);
+                auto d = ca->DeleteOne(fa, Opt(3000));
+                if (!d || d.value() != 1u) errs.fetch_add(1);
+            } else errs.fetch_add(1);
+        },
+        s1);
+    g_scheduler->RegistCoroutineTask(
+        [&] {
+            if (cb->InsertOne(db_, Opt(3000))) {
+                auto g = cb->FindOne(fb, Opt(3000));
+                if (g && g.value().has_value()) {
+                    auto fv = FieldString(*g.value(), "v");
+                    if (fv && *fv == "b") ok.fetch_add(1);
+                    else                errs.fetch_add(1);
+                } else errs.fetch_add(1);
+                auto d = cb->DeleteOne(fb, Opt(3000));
+                if (!d || d.value() != 1u) errs.fetch_add(1);
+            } else errs.fetch_add(1);
+        },
+        s2);
+    BOOST_REQUIRE(s1 && s2);
+    BOOST_REQUIRE(WaitUntil([&] { return ok.load() == 2; }, 20000));
+    BOOST_CHECK_EQUAL(errs.load(), 0);
+
+    ca->RequestClose();
+    cb->RequestClose();
+    db->RequestClose();
+    std::atomic<CloseStatus> st{};
+    BOOST_REQUIRE(RunInCoroutine([&] {
+        st.store(db->WaitClosed(
+            std::chrono::steady_clock::now() + std::chrono::seconds(10),
+            {}));
+    }));
+    BOOST_CHECK(st.load() == CloseStatus::Closed);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
