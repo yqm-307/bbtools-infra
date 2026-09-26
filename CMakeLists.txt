@@ -215,6 +215,7 @@ set(BBT_INFRA_PUBLIC_HEADERS
     NetworkRuntime.hpp
     CoRedisCli.hpp
     CoMongoCli.hpp
+    mongo/Client.hpp
     CoTCP.hpp
     CoUDP.hpp)
 set(_selfcheck_dir "${CMAKE_CURRENT_BINARY_DIR}/header_selfcheck")

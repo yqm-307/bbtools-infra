@@ -24,6 +24,7 @@
 #include <bbt/infra/CoMongoCli.hpp>
 #include <bbt/infra/CoRedisCli.hpp>
 #include <bbt/infra/Result.hpp>
+#include <bbt/infra/mongo/Client.hpp>
 
 using namespace bbt::infra;
 
@@ -105,35 +106,44 @@ void RedisShape() {
                       {});
 }
 
-// Mongo 形态：InsertOne → FindOne → UpdateOne → DeleteOne → 关闭。
-// MongoDocument.bytes 是一份完整良构 BSON；这里用最小合法文档
-// {"x":1}（BSON：int32 len + 0x10 int32 tag + "x\0" + int32 value + 0x00）。
-// 未连接真实 MongoDB 时按驱动超时上界返回 Error(Unavailable)。
+// Mongo 形态（Issue #40 owner + 集合句柄）：一个 CoMongoDb owner 承载
+// worker 组/接纳队列/pool lease，多个集合句柄共享同一组执行资源。
+// InsertOne → FindOne → 关闭。MongoDocument.bytes 是一份完整良构
+// BSON；这里用最小合法文档 {"x":1}（BSON：int32 len + 0x10 int32
+// tag + "x\0" + int32 value + 0x00）。未连接真实 MongoDB 时按驱动
+// 超时上界返回 Error(Unavailable)。
 void MongoShape() {
-    MongoClientConfig cfg;
-    cfg.uri                     = "mongodb://127.0.0.1:27017";
-    cfg.database                = "bbt_example";
-    cfg.collection              = "items";
-    cfg.worker_threads          = 1;
-    cfg.max_queue               = 64;
+    mongo::MongoRuntimeConfig cfg;
+    cfg.uri                      = "mongodb://127.0.0.1:27017";
+    cfg.worker_threads           = 1;
+    cfg.max_queue                = 64;
     cfg.server_selection_timeout = std::chrono::milliseconds{200};
-    cfg.connect_timeout         = std::chrono::milliseconds{200};
-    cfg.socket_timeout          = std::chrono::milliseconds{200};
-    cfg.wait_queue_timeout      = std::chrono::milliseconds{200};
-    if (!ValidateMongoClientConfig(cfg)) {
-        std::cerr << "mongo config invalid\n";
+    cfg.connect_timeout          = std::chrono::milliseconds{200};
+    cfg.socket_timeout           = std::chrono::milliseconds{200};
+    cfg.wait_queue_timeout       = std::chrono::milliseconds{200};
+    if (!mongo::ValidateMongoRuntimeConfig(cfg)) {
+        std::cerr << "mongo runtime config invalid\n";
         return;
     }
 
-    auto created = CoMongoCli::Create(cfg);
+    auto created = mongo::CoMongoDb::Create(cfg);
     if (!created) {
-        std::cerr << "CoMongoCli::Create failed: "
+        std::cerr << "CoMongoDb::Create failed: "
                   << created.error().message << "\n";
         return;
     }
-    auto mongo = std::move(created).value();
-    if (!mongo->Start()) {
-        std::cerr << "CoMongoCli::Start failed\n";
+    auto db = std::move(created).value();
+    if (!db->Start()) {
+        std::cerr << "CoMongoDb::Start failed\n";
+        return;
+    }
+
+    // 同一 owner 上的两个集合句柄：共享同一 worker 组与接纳队列，
+    // 不各自建线程。
+    auto items = db->Collection({"bbt_example", "items"});
+    auto logs  = db->Collection({"bbt_example", "logs"});
+    if (!items || !logs) {
+        std::cerr << "Collection() failed\n";
         return;
     }
 
@@ -142,22 +152,26 @@ void MongoShape() {
                  0x10, 'x',  0x00,        // int32 元素 "x"
                  0x01, 0x00, 0x00, 0x00,  // 值 = 1
                  0x00};                   // 结尾
-    auto ins = mongo->InsertOne(doc, Budget(1000));
+    auto ins = items.value()->InsertOne(doc, Budget(1000));
     if (!ins)
         std::cerr << "mongo InsertOne error (expected without live mongo): code="
                   << static_cast<int>(ins.error().code) << "\n";
 
-    auto find = mongo->FindOne(doc, Budget(1000));
+    auto find = logs.value()->FindOne(doc, Budget(1000));
     if (!find)
         std::cerr << "mongo FindOne error: code="
                   << static_cast<int>(find.error().code) << "\n";
     else if (!find.value())
         std::cout << "mongo FindOne miss (nullopt, distinct from error)\n";
 
-    mongo->RequestClose();
-    mongo->WaitClosed(std::chrono::steady_clock::now() +
-                          std::chrono::seconds{5},
-                      {});
+    // 句柄关闭只影响自身接纳，不关闭兄弟/owner；owner 关闭负责物理
+    // drain。
+    items.value()->RequestClose();
+    logs.value()->RequestClose();
+    db->RequestClose();
+    db->WaitClosed(std::chrono::steady_clock::now() +
+                       std::chrono::seconds{5},
+                   {});
 }
 
 } // namespace

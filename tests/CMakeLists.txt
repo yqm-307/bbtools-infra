@@ -103,10 +103,11 @@ if(TARGET bbt_infra_redis)
     set_tests_properties(redis.live PROPERTIES TIMEOUT 120)
 endif()
 
-# --- Mongo 模块测试（Issue #7）：仅在构建 bbt_infra_mongo 时注册。
-# 单元套件不依赖外部 MongoDB（不可达地址 + 驱动超时上界驱动确定性
-# 失败路径；worker 并发/容量经 impl 观测钩子核验）；live 套件按
-# BBT_TEST_MONGO_URI 环境变量驱动真实容器验收，未提供时整件跳过。
+# --- Mongo 模块测试（Issue #7 + #40 owner/句柄归属）：仅在构建
+# bbt_infra_mongo 时注册。单元套件不依赖外部 MongoDB（不可达地址 +
+# 驱动超时上界驱动确定性失败路径；worker 并发/容量/多句柄共享经 impl
+# 观测钩子核验）；live 套件按 BBT_TEST_MONGO_URI 环境变量驱动真实
+# 容器验收，未提供时整件跳过。
 if(TARGET bbt_infra_mongo)
     add_executable(Test_mongo_unit Test_mongo_unit.cc)
     target_include_directories(Test_mongo_unit PRIVATE

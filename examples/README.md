@@ -14,8 +14,9 @@ mongocxx、bsoncxx 或底层线程类型。
 `Example_redis_mongo_shape` 只在 `bbt::infra_redis` 与 `bbt::infra_mongo`
 两个 target 都存在（即同时配置了 `BBT_HIREDIS_PREFIX`、
 `BBT_MONGOCXX_PREFIX` 与 `BBT_MONGOC_PREFIX`）时注册，并同时链接两个模块
-target（`CoRedisCli::Create` 与 `CoMongoCli::Create` 分属两模块实现；
-`CoRedisCli.hpp`/`CoMongoCli.hpp` 是 header-only 公共契约）。
+target（`CoRedisCli::Create` 与 `mongo::CoMongoDb::Create` 分属两模块实现；
+公共契约均为 header-only）。Mongo 侧演示 Issue #40 的 owner + 集合句柄形态：
+一个 `mongo::CoMongoDb` 承载 worker/队列/pool，`Collection()` 取轻量句柄。
 
 ## 构建
 
