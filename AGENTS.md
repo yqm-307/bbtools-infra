@@ -88,7 +88,7 @@ docs/decisions/   依赖、边界与兼容取舍
 - 同机新 worktree 和云端 clone 都不会带入未提交规范。开工核对实际拿到的规范版本；未发布时由授权交接者提供明确候选快照/差异及适用范围，不把旧暂存版当最新版。长期结论保留于本仓规定文档/PR，原始 `.state`/会话不作唯一公共依据；不要求读取 Alice 历史或私有记忆。
 
 - 首个实现任务先明确模块/协议范围与契约负责人；可先做依赖评估和最小契约草案，不默认三模块同时实现或全部互为前置。历史消费者/许可盘点是迁移任务的输入，由该任务指定产出者与接收者，不阻塞无迁移需求的协议研究。
-- 本仓接入与依赖政策以 [决策 0001](docs/decisions/0001-unified-infra.md) 和本文件为入口；team 的跨仓分工及其他仓摘要不替代本仓契约。使用协程时从 [bbtools-coroutine](https://github.com/yqm-307/bbtools-coroutine) 的 `agent-docs/2026-09-07-core-runtime-contract.md`、`api-reference.md`、`user-guide.md` 找依据，按实际消费 SHA 读取，不把本地 `.sdd` 或旧 README 当唯一真源。
+- 本仓接入与依赖政策以 `docs/decisions/` 下已合入决策与本文件为入口（当前有效基线为 0002 起的序列；不存在单独的 `0001-unified-infra.md`）；team 的跨仓分工及其他仓摘要不替代本仓契约。使用协程时从 [bbtools-coroutine](https://github.com/yqm-307/bbtools-coroutine) 的 `agent-docs/2026-09-07-core-runtime-contract.md`、`api-reference.md`、`user-guide.md` 找依据，按实际消费 SHA 读取，不把本地 `.sdd` 或旧 README 当唯一真源。
 - 向 core/coroutine 报支撑缺口，附双方 SHA、最小复现/测试标识、期望契约位置、真实命令和失败/寿命时序证据。运行时拥有者先与既有任务去重；没有实证缺口不要求底层重写，不用改变 Stop 掩盖 adapter 资源错误。发布交接附模块公开目标/契约引用与验证，消费者仍须验证实际链接版本及自身集成。
 
 ## 任务入口
