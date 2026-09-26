@@ -1,7 +1,8 @@
 #pragma once
 // NetworkRuntimeImpl：HTTP 切片运行时实现。持有 HttpIoEngine（coroutine
 // 共享 executor 上的 strand 执行域，不拥有 io_context/线程）并强持有
-// 全部受管子对象。
+// 仍需托管的子对象（活跃/关闭中）；子对象物理关闭后经 ClosedHook 按
+// 稳定身份反登记，运行期间不积累历史对象（Issue #38）。
 //
 // 物理清理顺序（契约 §132 与「逻辑结果与物理清理分离」）：
 //   RequestClose → 投递到 io 域逐个执行子对象 teardown → 等所有子对象
@@ -11,6 +12,7 @@
 //   原样上报，infra 不伪造「清理完成」。
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -61,8 +63,20 @@ public:
     }
 
     // 子对象物理清理落定回调（任意线程，经各子对象 ClosedHook 触发）。
-    void OnChildClosed() noexcept;
+    // child 是稳定身份：登记/移除/计数按同一身份一次性配对。
+    void OnChildClosed(const IIoTeardown* child) noexcept;
     void OnTransportClosed(const ICoCloseable* child) noexcept;
+
+    // 测试接缝（Issue #38 竞态证据）：工厂在 CheckAndAdoptLocked 复检通过、
+    // 登记提交之前调用此钩子（持 m_lifecycle_mtx）。测试用它把 factory
+    // 调用停在「复检已过、登记未提交」的临界段内，再在同一线程外发起
+    // RequestClose——从而证明登记提交与 RequestClose 的真实调用窗口
+    // 重叠（不靠 sleep/时序推断）。生产路径不安装此钩子；为空时零开销。
+    // 钩子约定：必须 noexcept，不得回调本对象/再次取本锁/阻塞在锁内
+    // 等待由持锁线程释放的资源以外的事件。
+    void SetAdoptCommitGateForTest(std::function<void()> gate) noexcept {
+        m_adopt_commit_gate_for_test = std::move(gate);
+    }
 
 private:
     enum State : int { kCreated = 0, kRunning = 1, kClosingOrClosed = 2 };
@@ -102,7 +116,9 @@ private:
     std::atomic<int>               m_state{kCreated};
 
     // 生命周期记账（m_lifecycle_mtx 保护）：
-    //   m_children 强持有受管对象；m_sealed 由 teardown 置位后工厂拒绝；
+    //   m_children 强持有仍需托管的子对象（活跃/关闭中）；子对象物理
+    //   关闭落定后经 ClosedHook 按稳定身份一次性移除，运行期间不积累
+    //   历史对象（Issue #38）。m_sealed 由 teardown 置位后工厂拒绝；
     //   m_unclosed 计数未物理关闭的子对象；m_teardown/m_finalize_started
     //   与 OnChildClosed 的递减配对，防止丢最后一份关闭通知。
     std::mutex                                     m_lifecycle_mtx;
@@ -111,6 +127,10 @@ private:
     bool                                           m_sealed{false};
     bool                                           m_teardown{false};
     bool                                           m_finalize_started{false};
+
+    // 测试接缝钩子：仅在 CheckAndAdoptLocked 复检通过、登记提交前在持锁
+    // 状态下调用；生产路径不安装。见 SetAdoptCommitGateForTest 契约注释。
+    std::function<void()>                          m_adopt_commit_gate_for_test;
 
     // co-io-adapter/v1 §4.0.1.7 容量门禁：m_transport_count 记录 Runtime
     // 同时拥有的 transport socket（listener/accepted/dialed TCP；协议 Conn

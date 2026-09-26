@@ -1,5 +1,6 @@
 #include "http/NetworkRuntimeImpl.hpp"
 
+#include <algorithm>
 #include <limits>
 
 #include <bbt/coroutine/object/CoObject.hpp>
@@ -282,6 +283,11 @@ result<void> NetworkRuntimeImpl::CheckAndAdoptLocked(
     if (m_sealed || m_state.load() != kRunning || !m_close.IsOpen())
         return result<void>::err(
             MakeError(ErrorCode::Closed, "runtime is closing or closed"));
+    // 测试接缝：复检已过、登记未提交的临界点（仍持 m_lifecycle_mtx）。
+    // 用于证明「登记提交与 RequestClose 调用窗口重叠」的收口语义；
+    // 生产路径不安装，空钩子零额外语义。钩子契约见头文件注释。
+    if (m_adopt_commit_gate_for_test)
+        m_adopt_commit_gate_for_test();
     m_children.push_back(child);
     ++m_unclosed;
     return result<void>::ok();
@@ -352,9 +358,16 @@ result<std::shared_ptr<HttpClient>> NetworkRuntimeImpl::CreateHttpClient() {
             if (auto rt = weak.lock())
                 rt->ReleaseHttpRequest();
         });
-    impl->SetClosedHook([weak] {
-        if (auto rt = weak.lock())
-            rt->OnChildClosed();
+    // 关闭 hook 携带子对象弱引用：物理关闭后按稳定身份反登记；
+    // hook 内 lock 出的强引用兼作移除期间的保活，避免本回调成为
+    // 最后一个强引用时在持锁路径上析构自身（Issue #38）。
+    std::weak_ptr<IIoTeardown> child =
+        std::static_pointer_cast<IIoTeardown>(impl);
+    impl->SetClosedHook([weak, child] {
+        auto rt = weak.lock();
+        auto object = child.lock();
+        if (rt && object)
+            rt->OnChildClosed(object.get());
     });
     {
         std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
@@ -394,9 +407,14 @@ result<std::shared_ptr<HttpServer>> NetworkRuntimeImpl::ListenHttp(
             std::move(bound).error());
     std::weak_ptr<NetworkRuntimeImpl> weak =
         std::static_pointer_cast<NetworkRuntimeImpl>(shared_from_this());
-    impl->SetClosedHook([weak] {
-        if (auto rt = weak.lock())
-            rt->OnChildClosed();
+    // 与 CreateHttpClient 同一约定：hook 携带弱引用身份并兼任移除期保活。
+    std::weak_ptr<IIoTeardown> child =
+        std::static_pointer_cast<IIoTeardown>(impl);
+    impl->SetClosedHook([weak, child] {
+        auto rt = weak.lock();
+        auto object = child.lock();
+        if (rt && object)
+            rt->OnChildClosed(object.get());
     });
     {
         std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
@@ -460,11 +478,21 @@ void NetworkRuntimeImpl::TeardownOffDomain() noexcept {
     MaybeFinalize();
 }
 
-void NetworkRuntimeImpl::OnChildClosed() noexcept {
+void NetworkRuntimeImpl::OnChildClosed(const IIoTeardown* child) noexcept {
+    // 物理关闭落定（ClosedHook 经 MarkClosed 触发）：按稳定身份把子对象
+    // 移出托管集合并与计数一次性配对。调用方（ClosedHook lambda）在本
+    // 回调期间持有 child 的强引用——若 m_children 已是最后一个强持有者，
+    // 移除后的析构发生在锁外的 hook 返回路径上，不在持锁段内析构。
     {
         std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
         if (m_unclosed > 0)
             --m_unclosed;
+        m_children.erase(
+            std::remove_if(m_children.begin(), m_children.end(),
+                           [child](const auto& item) {
+                               return item.get() == child;
+                           }),
+            m_children.end());
     }
     MaybeFinalize();
 }
