@@ -57,6 +57,18 @@ target_compile_options(Test_http_lifecycle PRIVATE -Wall -Wextra)
 add_test(NAME http.lifecycle COMMAND Test_http_lifecycle)
 set_tests_properties(http.lifecycle PROPERTIES TIMEOUT 120)
 
+# Issue #38：子对象物理关闭后从 Runtime 托管集合反登记——弱引用失效、
+# 调用者提前释放仍托管、并发/重复 close 与工厂竞争、handler 捕获资源
+# 析构计数。
+add_executable(Test_http_child_unregister Test_http_child_unregister.cc)
+target_include_directories(Test_http_child_unregister PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)  # impl 测试接缝头（http/NetworkRuntimeImpl.hpp）
+target_link_libraries(Test_http_child_unregister
+    PRIVATE bbt::infra_http Boost::boost Threads::Threads)
+target_compile_options(Test_http_child_unregister PRIVATE -Wall -Wextra)
+add_test(NAME http.child_unregister COMMAND Test_http_child_unregister)
+set_tests_properties(http.child_unregister PROPERTIES TIMEOUT 120)
+
 # --- Redis 模块测试（Issue #6）：仅在构建 bbt_infra_redis 时注册。
 # 单元套件不依赖外部 Redis（内置 FakeRedis/静默对端）；live 套件按
 # BBT_TEST_REDIS_ADDR 环境变量驱动真实容器验收，未提供时整件跳过。
