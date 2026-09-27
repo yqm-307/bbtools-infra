@@ -1,0 +1,103 @@
+// bbtools-infra Issue #8：版本化 RpcEnvelope wire profile 单一真源。
+//
+// HTTP body 承载：POST 固定 path，Content-Type: application/x-protobuf。
+// 全部 RPC 元数据在 envelope 内，HTTP headers 仅承担标准传输语义，
+// 禁止 x-bbt-service / x-bbt-method / x-bbt-request-* / x-bbt-meta-* /
+// x-bbt-err-* 成为正式协议字段。
+//
+// 字段兼容规则（契约 decisions/0002 与本文件联合拥有）：
+//   - proto3；未知字段按 protobuf 标准忽略，不视为错误。
+//   - 字段号一经发布不得复用/改号；废弃字段用 reserved。
+//   - 接收端按本地规则校验业务必需字段，缺失返回 InvalidArgument；
+//     截断/非法 envelope 返回 ProtocolError。
+//   - 跨语言消费由 framework #4 决定业务 payload codec；本文件只固定
+//     transport/wire profile。
+//
+// protoc 与 C++ runtime 必须同源精确版本（本仓锁定 3.21.12，
+// 见根 CMakeLists.txt 中 BBT_PROTOBUF_PREFIX 接入与
+// docs/dependencies/protobuf-3.21.12.provenance.md）。
+// 跨版本保证见 https://protobuf.dev/support/cross-version-runtime-guarantee/
+
+syntax = "proto3";
+
+package bbt.infra.rpc.v1;
+
+option cc_enable_arenas = true;
+
+// ---------------------------------------------------------------------------
+// 错误分支
+// ---------------------------------------------------------------------------
+
+// ErrorCode 与 include/bbt/infra/Result.hpp 的 bbt::infra::ErrorCode 一一对应，
+// 序号固定，新增成员只能追加，不得插入/改序/复用。
+enum RpcErrorCode {
+    RPC_ERROR_CODE_UNSPECIFIED      = 0;  // 解码端视为 ProtocolError
+    RPC_ERROR_CODE_INVALID_ARGUMENT = 1;
+    RPC_ERROR_CODE_INVALID_CONTEXT  = 2;
+    RPC_ERROR_CODE_RUNTIME_UNAVAILABLE = 3;
+    RPC_ERROR_CODE_CLOSED           = 4;
+    RPC_ERROR_CODE_CANCELLED        = 5;
+    RPC_ERROR_CODE_TIMED_OUT        = 6;
+    RPC_ERROR_CODE_OVERLOADED       = 7;
+    RPC_ERROR_CODE_UNAVAILABLE      = 8;
+    RPC_ERROR_CODE_TRANSPORT_ERROR  = 9;
+    RPC_ERROR_CODE_PROTOCOL_ERROR   = 10;
+    RPC_ERROR_CODE_NOT_FOUND        = 11;
+    RPC_ERROR_CODE_TYPE_MISMATCH    = 12;
+    RPC_ERROR_CODE_UNSUPPORTED_ROUTE = 13;
+    RPC_ERROR_CODE_OUTCOME_UNKNOWN  = 14;
+    RPC_ERROR_CODE_REMOTE_ERROR     = 15;
+    RPC_ERROR_CODE_INTERNAL_ERROR   = 16;
+}
+
+message RpcError {
+    RpcErrorCode code            = 1;
+    string       domain          = 2;   // 默认 "infra"；上层域语义归上层
+    string       domain_code     = 3;
+    // 公开可传文本，发送端已脱敏，接收端不再二次清洗。
+    string       message         = 4;
+    string       backend_category = 5;
+    int32        backend_code    = 6;
+    uint64       transferred_bytes = 7;
+    // 结构化详情：最多 16 项，键 ≤64 UTF-8 字节，值 ≤256 UTF-8 字节，
+    // 不允许重复键。超出由发送端在编码前拒绝，接收端在解码后复检。
+    repeated MetadataEntry details = 8;
+}
+
+// ---------------------------------------------------------------------------
+// envelope
+// ---------------------------------------------------------------------------
+
+// 受限 metadata：仅允许 fw.* / route.* / trace.* 注册前缀；最多 32 项，
+// 键 ≤64 UTF-8 字节，值 ≤256 UTF-8 字节，无重复键。沿用 #2 契约。
+message MetadataEntry {
+    string key   = 1;
+    string value = 2;
+}
+
+message RpcEnvelopeMsg {
+    // wire profile 版本，当前固定为 1。接收端对非支持版本返回 ProtocolError。
+    uint32 profile_version     = 1;
+    // 关联标识：响应必须与请求同值；不允许由 metadata 同名键替代。
+    string request_id          = 2;
+    string service             = 3;
+    string method              = 4;
+    // 剩余预算毫秒，无符号上限由接收端本地配置 clamp；
+    // 0 / 越界 / 缺省由接收端按契约拒绝或取本地预算。
+    uint32 remaining_budget_ms = 5;
+    string request_schema      = 6;
+    string response_schema     = 7;
+    bytes  payload             = 8;
+    repeated MetadataEntry metadata = 9;
+
+    // 请求方向：success 尚未产生，本字段不出现；
+    // 响应方向：success / error 二选一。
+    oneof outcome {
+        bool success  = 10;
+        RpcError error = 11;
+    }
+
+    // 保留区间：未来 streaming/cancellation 扩展；当前版本禁止出现。
+    reserved 100 to 199;
+    reserved "extensions";
+}

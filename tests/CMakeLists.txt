@@ -142,3 +142,27 @@ if(TARGET bbt_infra_mongo)
         SKIP_REGULAR_EXPRESSION "skip:"
         SKIP_RETURN_CODE 77)
 endif()
+
+# --- RPC wire 模块测试（Issue #8）：仅在构建 bbt_infra_rpc 时注册。----------
+if(TARGET bbt_infra_rpc)
+    add_executable(Test_rpc_wire_contract Test_rpc_wire_contract.cc)
+    target_link_libraries(Test_rpc_wire_contract
+        PRIVATE bbt::infra_rpc bbt::infra_common Boost::boost Threads::Threads)
+    target_compile_options(Test_rpc_wire_contract PRIVATE -Wall -Wextra)
+    add_test(NAME rpc.wire_contract COMMAND Test_rpc_wire_contract)
+    set_tests_properties(rpc.wire_contract PROPERTIES TIMEOUT 60)
+
+    add_executable(Test_rpc_wire_roundtrip
+        Test_rpc_wire_roundtrip.cc)
+    target_link_libraries(Test_rpc_wire_roundtrip PRIVATE
+        bbt::infra_rpc bbt::infra_http Boost::boost Threads::Threads)
+    target_compile_options(Test_rpc_wire_roundtrip PRIVATE -Wall -Wextra)
+    add_test(NAME rpc.wire_roundtrip COMMAND Test_rpc_wire_roundtrip)
+    set_tests_properties(rpc.wire_roundtrip PROPERTIES TIMEOUT 120)
+
+    # 双进程 round-trip 的 server/client 对端（不经 Boost.Test）。
+    add_executable(bbt_rpc_wire_peer rpc_wire_peer.cc)
+    target_link_libraries(bbt_rpc_wire_peer PRIVATE
+        bbt::infra_rpc bbt::infra_http Boost::boost Threads::Threads)
+    target_compile_options(bbt_rpc_wire_peer PRIVATE -Wall -Wextra)
+endif()
