@@ -100,7 +100,14 @@ if(TARGET bbt_infra_redis)
         bbt_infra_redis bbt::infra_common Boost::boost Threads::Threads)
     target_compile_options(Test_redis_live PRIVATE -Wall -Wextra)
     add_test(NAME redis.live COMMAND Test_redis_live)
-    set_tests_properties(redis.live PROPERTIES TIMEOUT 120)
+    # 无 BBT_TEST_REDIS_ADDR/PHASE 时测试体以 "skip: ..." 打印后 return，
+    # 进程退出码仍是 0。没有 SKIP_REGULAR_EXPRESSION 时 CTest 会把它记为
+    # Passed——正是 Issue #34 要堵的「skip 冒充绿」。钉上 SKIP_* 让无环境
+    # 的 live 显式标为 Skipped，并给 distinct return code 供断言。
+    set_tests_properties(redis.live PROPERTIES
+        TIMEOUT 120
+        SKIP_REGULAR_EXPRESSION "skip:"
+        SKIP_RETURN_CODE 77)
 endif()
 
 # --- Mongo 模块测试（Issue #7 + #40 owner/句柄归属）：仅在构建
@@ -127,5 +134,11 @@ if(TARGET bbt_infra_mongo)
         mongo::bsoncxx_shared)
     target_compile_options(Test_mongo_live PRIVATE -Wall -Wextra)
     add_test(NAME mongo.live COMMAND Test_mongo_live)
-    set_tests_properties(mongo.live PROPERTIES TIMEOUT 120)
+    # 与 redis.live 相同：无 BBT_TEST_MONGO_URI 时测试体打印 "skip:" 后
+    # return 0，须经 SKIP_REGULAR_EXPRESSION/SKIP_RETURN_CODE 标为真正
+    # 的 Skipped，避免无容器环境下冒充「live 已通过」。
+    set_tests_properties(mongo.live PROPERTIES
+        TIMEOUT 120
+        SKIP_REGULAR_EXPRESSION "skip:"
+        SKIP_RETURN_CODE 77)
 endif()

@@ -3,10 +3,14 @@
 # 范围：
 #   - C++17 Release 构建（cmake + ninja，JOBS=3 + ccache，无裸 nproc 并发）
 #   - 固定 coroutine 依赖到 main HEAD、core 依赖到 master HEAD（每次取最新默认分支）
-#   - ctest -j1：contract.basics、http.loopback、http.lifecycle
+#   - ctest -j1：contract.basics、http/tcp/udp、redis.unit、mongo.unit；
+#     redis.unit/mongo.unit 先经 ctest -N 注册断言（缺前缀/target → 非零），
+#     断言通过后才跑全量 ctest
 #   - docs-only 变更检测：纯文档 PR/push 直接上报 success，required check 不会因
 #     paths-ignore 整体跳过而悬空（模板：bbtools-coroutine unit_test.yml changes job）
-#   - 干净 runner 验证：无 /usr/local 旧产物兜底（依赖只来自 runner 镜像 + checkout 源码树）
+#   - 干净 runner 验证：无 /usr/local 旧产物兜底；Redis/Mongo 私有依赖前缀
+#     在 runner workspace 内从源码钉死版本构建（decisions 0003/0004），不写镜像
+#     也不依赖 /usr/local
 #
 # 构建模式（#29 第一阶段，仅 workflow_dispatch 可选）：
 #   - clean（默认）：删 BUILD_DIR 全量重建，等价 PR/push 门禁路径
@@ -26,9 +30,12 @@
 #     依赖 ccache 内容寻址和仓库边界，不把它表述为只读主分支缓存
 #   - 缓存 miss/损坏/恢复失败 → 空缓存直编，门禁只变慢不改变通过标准
 #
-# 非目标（#4 明确不做）：
-#   - sanitizer、性能门禁、平台矩阵、redis/mongo 模块接入（需显式依赖前缀，
-#     runner 镜像未提供，接入另行评审）
+# 非目标（#4 明确不做，#34 收敛边界）：
+#   - sanitizer、性能门禁、平台矩阵、Redis/Mongo live 真实后端验收
+#     （live 测试保留注册但无容器时经 SKIP_REGULAR_EXPRESSION 标为 Skipped，
+#       不冒充已通过；live 阶段另行交付）
+#   - redis/mongo 模块接入所需依赖前缀：经源码构建落入 workspace，
+#     不改 runner 镜像、不写 /usr/local（遵守不动 runner/镜像 约束）
 #
 # Runner：arc-s4-infra（ARC scale set 绑定 yqm-307/bbtools-infra）
 #   Pod 模板已固定 bbtools-runner:v1 镜像（g++14 + cmake 3.31 + ninja + Boost 1.90）
@@ -182,6 +189,74 @@ jobs:
           echo "core_ref=$(git rev-parse HEAD)" | tee -a "$GITHUB_OUTPUT"
           git log -1 --format='core master HEAD: %h %s (%ci)'
 
+      # Issue #34 阶段一：在干净 runner 上以源码构建 Redis/Mongo 私有前缀，
+      # 钉死 docs/decisions/0003+0004 固定的版本；不改 runner 镜像、不写
+      # /usr/local。前缀落在 workspace 内，job 结束随 Pod 回收。
+      - name: "构建 hiredis 私有前缀（v1.4.1, commit 616f2286）"
+        if: needs.changes.outputs.code == 'true'
+        run: |
+          set -euo pipefail
+          DEPS="$PWD/deps-src"; PREFIX="$PWD/deps-prefix/hiredis"
+          mkdir -p "$DEPS" "$PREFIX"
+          cd "$DEPS"
+          git clone --depth 1 --branch v1.4.1 \
+            https://github.com/redis/hiredis hiredis
+          cd hiredis
+          test "$(git rev-parse HEAD)" = "616f2286ba5503f74ae96e720623fa11dbc690af"
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -DBUILD_SHARED_LIBS=ON \
+            -DDISABLE_TESTS=ON
+          cmake --build build --parallel "$JOBS"
+          cmake --install build
+          echo "=== hiredis 版本头 ==="
+          grep -E 'HIREDIS_(MAJOR|MINOR|PATCH|SONAME)' "$PREFIX/include/hiredis/hiredis.h"
+
+      - name: "构建 mongo-c-driver 前缀（2.5.4）"
+        if: needs.changes.outputs.code == 'true'
+        run: |
+          set -euo pipefail
+          DEPS="$PWD/deps-src"; PREFIX="$PWD/deps-prefix/mongoc"
+          mkdir -p "$DEPS" "$PREFIX"
+          cd "$DEPS"
+          git clone --depth 1 --branch 2.5.4 \
+            https://github.com/mongodb/mongo-c-driver mongoc
+          cd mongoc
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -DENABLE_MONGOC=ON \
+            -DBUILD_TESTING=OFF \
+            -DENABLE_EXAMPLES=OFF \
+            -DENABLE_AUTOMATIC_INIT_AND_CLEANUP=OFF \
+            -DENABLE_SSL=OFF \
+            -DENABLE_MONGODB_AWS_AUTH=OFF
+          cmake --build build --parallel "$JOBS"
+          cmake --install build
+
+      - name: "构建 mongo-cxx-driver 前缀（r4.6.0）"
+        if: needs.changes.outputs.code == 'true'
+        run: |
+          set -euo pipefail
+          DEPS="$PWD/deps-src"; PREFIX="$PWD/deps-prefix/mongocxx"
+          MONGOC_PREFIX="$PWD/deps-prefix/mongoc"
+          mkdir -p "$DEPS" "$PREFIX"
+          cd "$DEPS"
+          git clone --depth 1 --branch r4.6.0 \
+            https://github.com/mongodb/mongo-cxx-driver mongocxx
+          cd mongocxx
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -DCMAKE_PREFIX_PATH="$MONGOC_PREFIX" \
+            -DBUILD_TESTING=OFF \
+            -DENABLE_EXAMPLES=OFF \
+            -DBSONCXX_LINK_WITH_STATIC_MONGOC=OFF \
+            -DMONGOCXX_LINK_WITH_STATIC_MONGOC=OFF
+          cmake --build build --parallel "$JOBS"
+          cmake --install build
+
       # 缓存 key：repo + runner 平台 + 编译器/ccache 版本摘要 + 构建类型 + 依赖 HEAD。
       # 依赖 HEAD 变化即换 key，不会命中旧依赖的编译缓存；restore-keys 仅按前缀
       # 回退到同平台旧缓存（增量复用，结果不依赖缓存内容）。
@@ -256,7 +331,10 @@ jobs:
             -DBUILD_TESTING=ON \
             $LAUNCHER \
             -DBBT_COROUTINE_SOURCE_DIR="$COROUTINE_DIR" \
-            -DBBT_CORE_SOURCE_DIR="$CORE_DIR"
+            -DBBT_CORE_SOURCE_DIR="$CORE_DIR" \
+            -DBBT_HIREDIS_PREFIX="$PWD/../deps-prefix/hiredis" \
+            -DBBT_MONGOCXX_PREFIX="$PWD/../deps-prefix/mongocxx" \
+            -DBBT_MONGOC_PREFIX="$PWD/../deps-prefix/mongoc"
           cmake --build . --parallel "$JOBS"
           if command -v ccache >/dev/null 2>&1 && [ "${{ steps.cache-meta.outputs.enabled }}" = "true" ]; then
             echo "=== ccache 统计（编译后） ==="
@@ -267,6 +345,15 @@ jobs:
         if: needs.changes.outputs.code == 'true'
         run: |
           cd "$BUILD_DIR"
+          # Issue #34 A3：先断言两个 unit 已注册——若模块 target 缺失（前缀未
+          # 传递或 find_package 失败）导致 redis.unit/mongo.unit 没注册，这里
+          # 直接非零失败，不进入 ctest 漏判。
+          for t in redis.unit mongo.unit; do
+            if ! ctest -N -R "^${t}$" | grep -q "Test.*: ${t}$"; then
+              echo "FAIL: '${t}' 未注册（依赖前缀/模块 target 缺失）"
+              exit 1
+            fi
+          done
           # --timeout 只作用于无 TIMEOUT 属性的测试（contract.basics）；
           # http.loopback/http.lifecycle 的 TIMEOUT 60/120 测试属性优先级更高，保持不变。
           # 保持与原门禁一致的 180：contract.basics 无实测耗时证据就收紧会造成门禁 flake。
@@ -300,8 +387,9 @@ jobs:
             echo "WARN: 未见 libbbt_core.so（P2 后预期内）"
           fi
           echo "=== test 二进制 ldd（关键依赖） ==="
-          for bin in tests/Test_contract_basics tests/Test_http_loopback tests/Test_http_lifecycle; do
+          for bin in tests/Test_contract_basics tests/Test_http_loopback tests/Test_http_lifecycle \
+                     tests/Test_redis_unit tests/Test_mongo_unit; do
             [ -x "$bin" ] || continue
             echo "--- $bin ---"
-            ldd "$bin" | grep -E 'bbt|boost|libevent|hiredis|mysql' || echo "(静态/无外部依赖)"
+            ldd "$bin" | grep -E 'bbt|boost|libevent|hiredis|mongo|bson' || echo "(静态/无外部依赖)"
           done

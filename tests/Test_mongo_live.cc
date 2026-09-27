@@ -180,6 +180,24 @@ std::atomic_bool g_prepared{false};
 
 } // namespace
 
+// Issue #34：live 套件无 BBT_TEST_MONGO_URI 时必须显式标记 Skipped，不能
+// 以退出码 0 冒充通过（CTest 会把 0 记为 Passed）。套件内每个 case 用
+// BOOST_TEST_MESSAGE("skip: ...")+return 提前返回；Boost.Test 默认日志
+// 级别下该消息不打印，SKIP_REGULAR_EXPRESSION 匹配不到文本。故在全局
+// fixture 构造时检测环境，无环境直接 std::exit(77)——配合 CTest
+// SKIP_RETURN_CODE=77 标为 Skipped，同时不伪造通过、也不进入任何用例。
+struct RequireLiveEnv {
+    RequireLiveEnv() {
+        const char* a = std::getenv("BBT_TEST_MONGO_URI");
+        if (a == nullptr || a[0] == '\0') {
+            std::fputs("mongo.live: BBT_TEST_MONGO_URI 未设置，标记 Skipped\n",
+                       stderr);
+            std::exit(77);
+        }
+    }
+};
+BOOST_GLOBAL_FIXTURE(RequireLiveEnv);
+
 // ~Scheduler→Stop 命中 coroutine Hook 断言（上游基线竞态，测试侧不可
 // 修复）；release 走漏单例所有权，进程退出不再触发 Stop 路径。
 struct SuiteTeardown {
