@@ -5,3 +5,8 @@ build-ci/
 # Issue #34 本机验证用的临时构建目录（build-g1=GREEN、build-red=RED 负向），不入仓。
 build-g*/
 build-r*/
+# clean-consumer build 等独立验证目录也不入仓。
+build-*/
+
+# 本机私有依赖前缀（apt 解包的 protobuf/hiredis 等；不入库，不入 commit）
+.deps/

@@ -90,3 +90,22 @@ else()
         "接入 Mongo 客户端请传 -DBBT_MONGOCXX_PREFIX=<mongo-cxx-driver 安装前缀>"
         " 与 -DBBT_MONGOC_PREFIX=<mongo-c-driver 安装前缀>")
 endif()
+
+# --- RPC wire 模块（Issue #8）------------------------------------------------
+# 仅在 protoc/runtime 同源前缀给出时构建。proto 真源经 add_custom_command
+# 生成到 build/generated/；本模块编译生成物 + 公开面 adapter。
+if(TARGET bbt_infra_rpc_proto)
+    add_library(bbt_infra_rpc STATIC
+        rpc/RpcWire.cc)
+    add_library(bbt::infra_rpc ALIAS bbt_infra_rpc)
+
+    target_include_directories(bbt_infra_rpc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(bbt_infra_rpc
+        PUBLIC  bbt::infra_common
+        PRIVATE bbt_infra_rpc_proto Boost::boost Threads::Threads)
+    target_compile_options(bbt_infra_rpc PRIVATE -Wall -Wextra)
+else()
+    message(STATUS
+        "BBT_PROTOBUF_PREFIX 未设置：跳过 bbt_infra_rpc 模块。"
+        "接入 RPC wire profile 请传 -DBBT_PROTOBUF_PREFIX=<protobuf 前缀>")
+endif()
