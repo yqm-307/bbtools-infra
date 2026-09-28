@@ -29,6 +29,12 @@ using tcp::CoTCP;
 using tcp::CoTCPListener;
 using udp::CoUDP;
 
+// P2 归属说明：本入口是协议 owner + 兼容装配面。基础 TCP/UDP transport 的
+// 资源托管与配额 owner 是 TransportRuntime（include/bbt/infra/
+// TransportRuntime.hpp，target bbt_infra_transport）：DialTCP/ListenTCP/
+// BindUDP 在这里只做转发，容量名额与在途账本不在本类内实现，也不存在第二份。
+// 受管 TCP/UDP 消费者可以只链接 bbt::infra_transport，不依赖 HTTP。
+//
 // 正常生命周期：Scheduler::Start → NetworkRuntime::Create/Start → 使用
 // → server.StopAccepting → 等待 handler 结束 → Runtime.RequestClose/WaitClosed
 // → 释放已关闭网络对象 → Scheduler::Stop。

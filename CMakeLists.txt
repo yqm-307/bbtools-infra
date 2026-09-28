@@ -408,6 +408,7 @@ set(BBT_INFRA_PUBLIC_HEADERS
     HttpClient.hpp
     HttpServer.hpp
     NetworkRuntime.hpp
+    TransportRuntime.hpp
     CoRedisCli.hpp
     CoMongoCli.hpp
     mongo/Client.hpp

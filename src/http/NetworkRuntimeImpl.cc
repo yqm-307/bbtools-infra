@@ -1,7 +1,6 @@
 #include "http/NetworkRuntimeImpl.hpp"
 
 #include <algorithm>
-#include <limits>
 
 #include <bbt/coroutine/object/CoObject.hpp>
 
@@ -45,6 +44,13 @@ result<void> NetworkRuntimeImpl::Start() {
                                        : ErrorCode::Closed,
             m_state.load() == kRunning ? "runtime already started"
                                        : "runtime is closing or closed"));
+    // P2：transport owner 在同一次 Start 中启动（同一代际门禁）。失败回滚
+    // 状态，保留「待 scheduler 就绪后重试 Start」的既有语义。
+    auto transport_ready = m_transport->Start();
+    if (!transport_ready) {
+        m_state.store(kCreated);
+        return result<void>::err(std::move(transport_ready).error());
+    }
     return result<void>::ok();
 }
 
@@ -80,283 +86,38 @@ result<void> NetworkRuntimeImpl::CheckUsableForFactory() const {
     return result<void>::ok();
 }
 
-namespace {
-
-// co-io-adapter/v1 §4.0.1.7：容量原子预留，失败回退、物理关闭后释放。
-// 超限返回 Overloaded，不静默排队。
-void ReleaseTransportSlot(std::mutex& mtx, std::size_t& count) noexcept {
-    std::lock_guard<std::mutex> lk(mtx);
-    if (count > 0) --count;
+// P2 装配接缝实现：见头文件注释。transport 侧是唯一通知来源。
+void NetworkRuntimeImpl::AdoptTransportOwner() {
+    std::weak_ptr<NetworkRuntimeImpl> weak =
+        std::static_pointer_cast<NetworkRuntimeImpl>(shared_from_this());
+    m_transport->SetClosedHook([weak] {
+        if (auto rt = weak.lock())
+            rt->MaybeFinalize();
+    });
 }
 
-} // namespace
+// ---------------------------------------------------------------------------
+// P2：受管 TCP/UDP 工厂整体转发给 transport owner（bbt_infra_transport）。
+// 容量名额（max_connections）、在途账本（max_inflight）、受管对象强持有与
+// 物理关闭收口、受管 DialTCP 等待段的取消/归还都由该 owner 独占实现；
+// 本切片不保留第二份账本，也不重复 transport 的关闭实现。参数校验、
+// Overloaded/Closed 映射与「拒绝路径不建活跃连接」的语义随之移动到
+// src/transport/TransportRuntime.cc，行为不变（由既有
+// Test_tcp_runtime_factory 全套 + 新增 Test_transport_runtime 验收）。
+// ---------------------------------------------------------------------------
 
 result<std::shared_ptr<CoTCP>> NetworkRuntimeImpl::DialTCP(
     TcpEndpoint endpoint, const CallOptions& options) {
-    auto usable = CheckUsableForFactory();
-    if (!usable)
-        return result<std::shared_ptr<CoTCP>>::err(std::move(usable).error());
-    if (endpoint.host.empty())
-        return result<std::shared_ptr<CoTCP>>::err(MakeError(
-            ErrorCode::InvalidArgument, "DialTCP: endpoint.host must not be empty"));
-    if (endpoint.port == 0)
-        return result<std::shared_ptr<CoTCP>>::err(MakeError(
-            ErrorCode::InvalidArgument, "DialTCP: endpoint.port must not be 0"));
-
-    {
-        std::lock_guard<std::mutex> lk(m_transport_mtx);
-        if (m_transport_sealed)
-            return result<std::shared_ptr<CoTCP>>::err(MakeError(
-                ErrorCode::Closed, "runtime is closing"));
-        if (m_transport_count >= m_limits.max_connections)
-            return result<std::shared_ptr<CoTCP>>::err(MakeError(
-                ErrorCode::Overloaded, "DialTCP: max_connections exceeded"));
-        ++m_transport_count;
-    }
-
-    // §4.0.1.7（Issue #32）：受管 DialTCP 的等待段（DNS 解析 + 非阻塞
-    // connect 等待）占一个 Runtime 在途名额；容量满立即 Overloaded，
-    // 不排队不挂起。
-    if (!m_inflight_quota->TryAdmit()) {
-        ReleaseTransportSlot(m_transport_mtx, m_transport_count);
-        MaybeFinalize();
-        return result<std::shared_ptr<CoTCP>>::err(MakeError(
-            ErrorCode::Overloaded, "DialTCP: max_inflight exceeded"));
-    }
-
-    // Issue #32 F2：等待段名额不能依赖协程栈 RAII——Scheduler::Stop 对
-    // 挂起协程直接销毁、不展开栈，栈上任何局部对象都不会析构。因此
-    // 「未完成 dial」的归还职责放在 Runtime 侧堆对象上：permit 由
-    // m_dial_permits 强持有（不是栈上局部），正常终态（等待段落定、dial
-    // 返回）由协程返回后移除并归还；runtime->RequestClose() 由下方统一对
-    // 每个未完成 dial Fail() 归还并唤醒其等待段；Runtime 析构时成员
-    // 析构（~DialWaitPermit）归还剩余——硬 Stop 本身不归还，它只销毁协程
-    // （受管 dial 的等待段在 Stop 期间由 DNS 侧先落定 ⇒ 走正常归还路径）。
-    // 栈上只保留弱引用观察终态。
-    auto dial_cancel =
-        std::make_shared<bbt::coroutine::CancellationSource>();
-    auto permit = std::make_shared<tcp::DialWaitPermit>(
-        [quota = m_inflight_quota] { quota->Release(); });
-    {
-        std::lock_guard<std::mutex> lk(m_transport_mtx);
-        if (!m_transport_sealed) {
-            m_dial_cancels.push_back(dial_cancel);
-            m_dial_permits.push_back(permit);
-        }
-    }
-
-    tcp::DialWaitOptions dial_wait;
-    dial_wait.extra_cancel = dial_cancel->Token();
-    // 测试接缝：等待段挂起落定（协程已进入 parked 表）后回调一次，
-    // 用于确定性区分「等待中取消/Stop」与「未进入等待」。
-    if (m_dial_wait_entry_gate_for_test) {
-        auto gate = m_dial_wait_entry_gate_for_test;
-        dial_wait.dns_on_registered = gate;
-        dial_wait.connect_on_registered = std::move(gate);
-    }
-
-    auto dialed = tcp::CoTCP::DialTCP(std::move(endpoint.host), endpoint.port,
-                                      options, std::move(dial_wait));
-    // 等待段已结束（成功/失败/取消/超时）：正常路径归还名额并从登记簿
-    // 移除——归还与 permit->Fail 幂等互斥（released 原子位），不重复。
-    permit->Fail();
-    {
-        std::lock_guard<std::mutex> lk(m_transport_mtx);
-        auto& cans = m_dial_cancels;
-        cans.erase(std::remove(cans.begin(), cans.end(), dial_cancel),
-                   cans.end());
-        auto& perms = m_dial_permits;
-        perms.erase(std::remove(perms.begin(), perms.end(), permit),
-                    perms.end());
-    }
-
-    if (!dialed) {
-        ReleaseTransportSlot(m_transport_mtx, m_transport_count);
-        MaybeFinalize();
-        return result<std::shared_ptr<CoTCP>>::err(std::move(dialed).error());
-    }
-    auto connection = std::move(dialed).value();
-    bool sealed = false;
-    {
-        std::lock_guard<std::mutex> lk(m_transport_mtx);
-        sealed = m_transport_sealed;
-        if (!sealed) {
-            std::weak_ptr<NetworkRuntimeImpl> weak =
-                std::static_pointer_cast<NetworkRuntimeImpl>(shared_from_this());
-            std::weak_ptr<CoTCP> child = connection;
-            connection->SetClosedHook([weak, child] {
-                auto rt = weak.lock();
-                auto object = child.lock();
-                if (rt && object)
-                    rt->OnTransportClosed(object.get());
-            });
-            connection->SetInflightHooks(
-                [quota = m_inflight_quota] { return quota->TryAdmit(); },
-                [quota = m_inflight_quota] { quota->Release(); },
-                m_inflight_quota);
-            m_tcp_children.push_back(connection);
-        }
-    }
-    if (sealed) {
-        connection->RequestClose();
-        ReleaseTransportSlot(m_transport_mtx, m_transport_count);
-        MaybeFinalize();
-        return result<std::shared_ptr<CoTCP>>::err(MakeError(
-            ErrorCode::Closed, "runtime closed during TCP dial"));
-    }
-    return result<std::shared_ptr<CoTCP>>::ok(std::move(connection));
+    return m_transport->DialTCP(std::move(endpoint), options);
 }
 
 result<std::shared_ptr<CoTCPListener>> NetworkRuntimeImpl::ListenTCP(
     SocketAddress local, unsigned backlog) {
-    auto usable = CheckUsableForFactory();
-    if (!usable)
-        return result<std::shared_ptr<CoTCPListener>>::err(
-            std::move(usable).error());
-    if (local.ip.empty())
-        return result<std::shared_ptr<CoTCPListener>>::err(MakeError(
-            ErrorCode::InvalidArgument,
-            "ListenTCP: SocketAddress.ip must not be empty (use explicit wildcard)"));
-    if (backlog == 0 || backlog > static_cast<unsigned>(std::numeric_limits<int>::max()))
-        return result<std::shared_ptr<CoTCPListener>>::err(MakeError(
-            ErrorCode::InvalidArgument, "ListenTCP: backlog must be 1..INT_MAX"));
-
-    {
-        std::lock_guard<std::mutex> lk(m_transport_mtx);
-        if (m_transport_sealed)
-            return result<std::shared_ptr<CoTCPListener>>::err(MakeError(
-                ErrorCode::Closed, "runtime is closing"));
-        if (m_transport_count >= m_limits.max_connections)
-            return result<std::shared_ptr<CoTCPListener>>::err(MakeError(
-                ErrorCode::Overloaded, "ListenTCP: max_connections exceeded"));
-        ++m_transport_count;
-    }
-
-    auto bound = tcp::CoTCPListener::ListenTCP(
-        std::move(local.ip), local.port, static_cast<int>(backlog));
-    if (!bound) {
-        ReleaseTransportSlot(m_transport_mtx, m_transport_count);
-        MaybeFinalize();
-        return result<std::shared_ptr<CoTCPListener>>::err(std::move(bound).error());
-    }
-    auto listener = std::move(bound).value();
-    std::unique_lock<std::mutex> transport_lock(m_transport_mtx);
-    if (m_transport_sealed) {
-        transport_lock.unlock();
-        listener->RequestClose();
-        ReleaseTransportSlot(m_transport_mtx, m_transport_count);
-        MaybeFinalize();
-        return result<std::shared_ptr<CoTCPListener>>::err(MakeError(
-            ErrorCode::Closed, "runtime closed during TCP listen"));
-    }
-    std::weak_ptr<NetworkRuntimeImpl> weak =
-        std::static_pointer_cast<NetworkRuntimeImpl>(shared_from_this());
-    std::weak_ptr<CoTCPListener> child = listener;
-    listener->SetClosedHook([weak, child] {
-        auto rt = weak.lock();
-        auto object = child.lock();
-        if (rt && object)
-            rt->OnTransportClosed(object.get());
-    });
-    listener->SetAcceptHooks(
-        [weak] {
-            auto rt = weak.lock();
-            if (!rt) return false;
-            std::lock_guard<std::mutex> lk(rt->m_transport_mtx);
-            if (rt->m_transport_sealed ||
-                rt->m_transport_count >= rt->m_limits.max_connections)
-                return false;
-            ++rt->m_transport_count;
-            return true;
-        },
-        [weak] {
-            if (auto rt = weak.lock()) {
-                ReleaseTransportSlot(rt->m_transport_mtx, rt->m_transport_count);
-                rt->MaybeFinalize();
-            }
-        },
-        [weak](std::shared_ptr<CoTCP> accepted) {
-            auto rt = weak.lock();
-            if (!rt) return false;
-            std::lock_guard<std::mutex> lk(rt->m_transport_mtx);
-            if (rt->m_transport_sealed) return false;
-            std::weak_ptr<CoTCP> child = accepted;
-            accepted->SetClosedHook([weak, child] {
-                auto rt_locked = weak.lock();
-                auto child_locked = child.lock();
-                if (rt_locked && child_locked)
-                    rt_locked->OnTransportClosed(child_locked.get());
-            });
-            // §4.0.1.7：接纳的 socket 同样挂 Runtime 在途账本——其
-            // ReadSome/WriteSome/WriteAll 占用同一 max_inflight 预算。
-            accepted->SetInflightHooks(
-                [quota = rt->m_inflight_quota] { return quota->TryAdmit(); },
-                [quota = rt->m_inflight_quota] { quota->Release(); },
-                rt->m_inflight_quota);
-            rt->m_tcp_children.push_back(std::move(accepted));
-            return true;
-        });
-    // §4.0.1.7：listener 的 Accept 占用同一 max_inflight 账本。
-    listener->SetInflightHooks(
-        [quota = m_inflight_quota] { return quota->TryAdmit(); },
-        [quota = m_inflight_quota] { quota->Release(); },
-        m_inflight_quota);
-    m_tcp_children.push_back(listener);
-    transport_lock.unlock();
-    return result<std::shared_ptr<CoTCPListener>>::ok(std::move(listener));
+    return m_transport->ListenTCP(std::move(local), backlog);
 }
 
 result<std::shared_ptr<CoUDP>> NetworkRuntimeImpl::BindUDP(SocketAddress local) {
-    auto usable = CheckUsableForFactory();
-    if (!usable)
-        return result<std::shared_ptr<CoUDP>>::err(std::move(usable).error());
-    {
-        std::lock_guard<std::mutex> lk(m_transport_mtx);
-        if (m_transport_sealed)
-            return result<std::shared_ptr<CoUDP>>::err(MakeError(
-                ErrorCode::Closed, "runtime is closing"));
-        if (m_transport_count >= m_limits.max_connections)
-            return result<std::shared_ptr<CoUDP>>::err(MakeError(
-                ErrorCode::Overloaded, "BindUDP: max_connections exceeded"));
-        ++m_transport_count;
-    }
-    auto bound = udp::CoUDP::BindUDP(std::move(local));
-    if (!bound) {
-        ReleaseTransportSlot(m_transport_mtx, m_transport_count);
-        MaybeFinalize();
-        return result<std::shared_ptr<CoUDP>>::err(std::move(bound).error());
-    }
-    auto socket = std::move(bound).value();
-    bool sealed = false;
-    {
-        std::lock_guard<std::mutex> lk(m_transport_mtx);
-        sealed = m_transport_sealed;
-        if (!sealed) {
-            std::weak_ptr<NetworkRuntimeImpl> weak =
-                std::static_pointer_cast<NetworkRuntimeImpl>(shared_from_this());
-            std::weak_ptr<CoUDP> child = socket;
-            socket->SetClosedHook([weak, child] {
-                auto rt = weak.lock();
-                auto object = child.lock();
-                if (rt && object)
-                    rt->OnTransportClosed(object.get());
-            });
-            // §4.0.1.7：UDP 的 Receive/Send 挂起段占同一 max_inflight 账本。
-            socket->SetInflightHooks(
-                [quota = m_inflight_quota] { return quota->TryAdmit(); },
-                [quota = m_inflight_quota] { quota->Release(); },
-                m_inflight_quota);
-            m_tcp_children.push_back(socket);
-        }
-    }
-    if (sealed) {
-        socket->RequestClose();
-        ReleaseTransportSlot(m_transport_mtx, m_transport_count);
-        MaybeFinalize();
-        return result<std::shared_ptr<CoUDP>>::err(MakeError(
-            ErrorCode::Closed, "runtime closed during UDP bind"));
-    }
-    return result<std::shared_ptr<CoUDP>>::ok(std::move(socket));
+    return m_transport->BindUDP(std::move(local));
 }
 
 result<void> NetworkRuntimeImpl::CheckAndAdoptLocked(
@@ -515,25 +276,10 @@ void NetworkRuntimeImpl::RequestClose() noexcept {
     if (!m_close.BeginClose())
         return;
     m_state.store(kClosingOrClosed);
-    std::vector<std::shared_ptr<ICoCloseable>> transports;
-    std::vector<std::shared_ptr<bbt::coroutine::CancellationSource>> cancels;
-    std::vector<std::shared_ptr<tcp::DialWaitPermit>> permits;
-    {
-        std::lock_guard<std::mutex> lk(m_transport_mtx);
-        m_transport_sealed = true;
-        transports = m_tcp_children;
-        cancels.swap(m_dial_cancels);
-        permits.swap(m_dial_permits);
-    }
-    // Issue #32 F2：每个未完成的受管 DialTCP 等待段名额先归还（Fail 幂等，
-    // 与协程正常返回路径的 Fail 互斥），再经取消源唤醒挂起协程——协程走
-    // 正常返回路径到登记簿移除点（已清空，无重复），不依赖硬销毁兜底。
-    for (auto& permit : permits)
-        permit->Fail();
-    for (auto& cancel : cancels)
-        cancel->RequestCancel();
-    for (auto& transport : transports)
-        transport->RequestClose();
+    // P2：transport owner 自行封口工厂（拒绝新资源）、归还未完成受管 dial 的
+    // 等待段名额并唤醒其挂起协程、再对每个受管 transport 发起唯一一次物理
+    // 关闭。本切片不再持有 transport 计数、账本或 dial 登记簿。
+    m_transport->RequestClose();
     if (!m_engine->Started()) {
         // 未 Start：无 io 资源，直接落定。
         m_close.MarkClosed();
@@ -591,32 +337,17 @@ void NetworkRuntimeImpl::OnChildClosed(const IIoTeardown* child) noexcept {
     MaybeFinalize();
 }
 
-void NetworkRuntimeImpl::OnTransportClosed(const ICoCloseable* child) noexcept {
-    {
-        std::lock_guard<std::mutex> lk(m_transport_mtx);
-        if (m_transport_count > 0)
-            --m_transport_count;
-        m_tcp_children.erase(
-            std::remove_if(m_tcp_children.begin(), m_tcp_children.end(),
-                           [child](const auto& item) {
-                               return item.get() == child;
-                           }),
-            m_tcp_children.end());
-    }
-    MaybeFinalize();
-}
-
 void NetworkRuntimeImpl::MaybeFinalize() noexcept {
     {
         std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
         if (!m_teardown || m_unclosed != 0 || m_finalize_started)
             return;
     }
-    {
-        std::lock_guard<std::mutex> lk(m_transport_mtx);
-        if (m_transport_count != 0)
-            return;
-    }
+    // P2：transport 侧落定由 transport owner 自证（已封口且受管 transport 全部
+    // 物理关闭）。这里只读它的观察点，不再有第二份 transport 计数；该观察点的
+    // 事件来源是装配时安装的 SetClosedHook（见 AdoptTransportOwner）。
+    if (!m_transport->IsClosed())
+        return;
     {
         std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
         if (!m_teardown || m_unclosed != 0 || m_finalize_started)
@@ -656,8 +387,17 @@ NetworkRuntime::Create(NetworkLimits limits) {
             "coroutine runtime generation unavailable"));
     }
     auto engine = std::make_shared<http_detail::HttpIoEngine>(limits);
+    // P2：transport owner 独立创建——它的实现目标（bbt_infra_transport）不
+    // 链接 HTTP，也不引用 HTTP 的任何类型/符号；本入口只做组合。
+    auto transport = TransportRuntime::Create(limits);
+    if (!transport)
+        return result<std::shared_ptr<NetworkRuntime>>::err(
+            std::move(transport).error());
     auto impl = std::make_shared<http_detail::NetworkRuntimeImpl>(
-        limits, engine, std::move(info).value(), std::move(sig));
+        limits, engine, std::move(info).value(), std::move(sig),
+        std::move(transport).value());
+    // 装配完成后接通 transport 落定通知（需 shared_from_this 已可用）。
+    impl->AdoptTransportOwner();
     return result<std::shared_ptr<NetworkRuntime>>::ok(std::move(impl));
 }
 
