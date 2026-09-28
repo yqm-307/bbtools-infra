@@ -33,6 +33,26 @@ target_compile_options(Test_udp_loopback PRIVATE -Wall -Wextra)
 add_test(NAME udp.loopback COMMAND Test_udp_loopback)
 set_tests_properties(udp.loopback PROPERTIES TIMEOUT 30)
 
+# --- P2 transport owner：transport-only 消费者（无 HTTP 依赖）----------------
+# 本目标只链接 bbt::infra_transport，源文件不包含任何 HTTP 头：它是「受管
+# TCP/UDP 消费者无需 HTTP」的编译/链接证据。覆盖 owner 门禁与参数校验、
+# 容量名额与物理关闭后才归还、真实 loopback 收发 + 关闭生命周期、多 owner
+# 配额隔离、关闭期已接纳挂起 op 的唤醒与归还。
+add_executable(Test_transport_runtime Test_transport_runtime.cc)
+target_link_libraries(Test_transport_runtime
+    PRIVATE bbt::infra_transport Boost::boost Threads::Threads)
+target_compile_options(Test_transport_runtime PRIVATE -Wall -Wextra)
+add_test(NAME transport.runtime COMMAND Test_transport_runtime)
+set_tests_properties(transport.runtime PROPERTIES TIMEOUT 60)
+
+# P2 依赖门禁：transport-only 消费者的接口闭包不得含 HTTP target。
+get_target_property(_bbt_tr_links Test_transport_runtime LINK_LIBRARIES)
+if(_bbt_tr_links MATCHES "infra_http")
+    message(FATAL_ERROR
+        "P2 依赖方向破坏：transport-only 消费者不得链接 HTTP"
+        "（实际: ${_bbt_tr_links}）")
+endif()
+
 # 实测 detail::CoPollEvent 单事件上 FD readable + custom wakeup + timeout
 # 组合的确定性四场景。使用 detail 非稳定头与非公开组合路径，仅用于能力裁决，
 # 不作为生产 IoWait 实现依据；不涉及 Stop 安全断言。

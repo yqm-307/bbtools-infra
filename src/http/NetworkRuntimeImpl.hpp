@@ -4,6 +4,12 @@
 // 仍需托管的子对象（活跃/关闭中）；子对象物理关闭后经 ClosedHook 按
 // 稳定身份反登记，运行期间不积累历史对象（Issue #38）。
 //
+// P2：基础 transport 的资源托管与配额 owner 已移出本切片，改为组合一个
+// TransportRuntime（见 include/bbt/infra/TransportRuntime.hpp 与
+// src/transport/）。本运行时只保留 HTTP 协议 owner 职责——HTTP 请求/
+// 连接预算、handler drain、io 域封口——不再持有第二份 transport 账本、
+// 也不重复 transport 的关闭实现。
+//
 // 物理清理顺序（契约 §132 与「逻辑结果与物理清理分离」）：
 //   RequestClose → 投递到 io 域逐个执行子对象 teardown → 等所有子对象
 //   按 in-flight async 计数归零后 MarkClosed → 引擎 SealOnIoDomain
@@ -18,7 +24,9 @@
 #include <vector>
 
 #include <bbt/infra/NetworkRuntime.hpp>
-#include <bbt/infra/CoTCP.hpp>   // tcp::DialWaitPermit / DialWaitOptions
+// P2：TransportRuntime 是基础 transport 的资源/配额 owner（bbt::infra_transport
+// target，不链接 HTTP）。本运行时组合它，而不是自己再实现一份 transport 记账。
+#include <bbt/infra/TransportRuntime.hpp>
 
 #include "detail/IoSupport.hpp"
 #include "http/HttpDetail.hpp"
@@ -37,14 +45,13 @@ public:
     NetworkRuntimeImpl(NetworkLimits                  limits,
                        std::shared_ptr<HttpIoEngine>  engine,
                        bbt::coroutine::CoObjectInfo   info,
-                       std::shared_ptr<bbt::coroutine::CompletionSignal> close_sig)
+                       std::shared_ptr<bbt::coroutine::CompletionSignal> close_sig,
+                       std::shared_ptr<TransportRuntime> transport)
         : m_limits(limits),
           m_engine(std::move(engine)),
           m_info(std::move(info)),
           m_close(std::move(close_sig)),
-          m_inflight_quota(
-              std::make_shared<bbt::infra::detail::InflightLedger>(
-                  limits.max_inflight)) {}
+          m_transport(std::move(transport)) {}
 
     result<void> Start() override;
     result<std::shared_ptr<HttpClient>> CreateHttpClient() override;
@@ -70,7 +77,11 @@ public:
     // 子对象物理清理落定回调（任意线程，经各子对象 ClosedHook 触发）。
     // child 是稳定身份：登记/移除/计数按同一身份一次性配对。
     void OnChildClosed(const IIoTeardown* child) noexcept;
-    void OnTransportClosed(const ICoCloseable* child) noexcept;
+
+    // P2 装配接缝：把 transport owner 的「受管 transport 全部物理关闭」落定
+    // 并入本 runtime 的 finalize 门控（唯一通知来源，不轮询）。Create 构造
+    // 出对象后调用一次。
+    void AdoptTransportOwner();
 
     // 测试接缝（Issue #38 竞态证据）：工厂在 CheckAndAdoptLocked 复检通过、
     // 登记提交之前调用此钩子（持 m_lifecycle_mtx）。测试用它把 factory
@@ -83,19 +94,17 @@ public:
         m_adopt_commit_gate_for_test = std::move(gate);
     }
 
-    // 测试接缝（Issue #32）：直读 Runtime 共享在途账本当前名额数。
-    // 用于跨对象/跨 op 的确定性断言（e.g. Stop 后 DrainQuota 落定），
-    // 不替代公开语义——生产路径不使用。
+    // 测试接缝（Issue #32）：直读在途账本当前名额数。账本唯一真源在
+    // transport owner 侧，这里只转发——本切片不保留第二份计数。
     std::size_t InflightQuotaHeldForTest() const noexcept {
-        return m_inflight_quota->Held();
+        return m_transport->InflightQuotaHeldForTest();
     }
 
-    // 测试接缝（Issue #32 F2）：非空时，受管 DialTCP 的 DNS/connect
-    // 等待段在协程真正挂起（await event 注册进 parked 表）后回调一次，
-    // 用于确定性观察「dial 已进入等待」。生产路径不安装，空钩子零开销。
+    // 测试接缝（Issue #32 F2）：受管 DialTCP 等待段的挂起落定钩子。
+    // 受管 dial 的等待段现在归 transport owner，这里只转发（同一份实现）。
     // 约定：noexcept、不取锁不阻塞、不得回调本对象。
     void SetDialWaitEntryGateForTest(std::function<void()> gate) noexcept {
-        m_dial_wait_entry_gate_for_test = std::move(gate);
+        m_transport->SetDialWaitEntryGateForTest(std::move(gate));
     }
 
 private:
@@ -117,7 +126,7 @@ private:
     result<void> CheckAndAdoptLocked(
         const std::shared_ptr<IIoTeardown>& child);
 
-    // Issue #37：HTTP 出站配额。与 transport m_transport_count 并列、
+    // Issue #37：HTTP 出站配额。与 transport owner 的 socket 容量账本并列、
     // 由 m_lifecycle_mtx 保护；作用域是整个 Runtime（同一 runtime 下
     // 所有 HttpClient 共享同一预算），不是单个 client——多 client
     // 不能各自绕过 owner 总量。
@@ -151,47 +160,19 @@ private:
     // 测试接缝钩子：仅在 CheckAndAdoptLocked 复检通过、登记提交前在持锁
     // 状态下调用；生产路径不安装。见 SetAdoptCommitGateForTest 契约注释。
     std::function<void()>                          m_adopt_commit_gate_for_test;
-    // 测试接缝钩子（Issue #32 F2）：受管 DialTCP 挂起落定后回调；见
-    // SetDialWaitEntryGateForTest 契约注释。生产路径不安装。
-    std::function<void()>                          m_dial_wait_entry_gate_for_test;
-    // Issue #32 F2：未完成受管 DialTCP 的取消源登记簿。m_transport_mtx
-    // 保护；RequestClose 在 seal 之后统一 RequestCancel，唤醒仍挂起在
-    // DNS/connect 等待段的 dial 协程走正常归还路径（硬 Stop 的兜底归还
-    // 由 tcp::DialWaitPermit 承担）。名额不入本表：本表只管「唤醒」，
-    // 归还由账本 + 凭据配对完成。
-    std::vector<std::shared_ptr<bbt::coroutine::CancellationSource>>
-                                                   m_dial_cancels;
-    // Issue #32 F2：未完成受管 DialTCP 的归还凭据表（m_transport_mtx
-    // 保护）。permit 由本表强持有——挂起协程被 Scheduler::Stop 硬销毁
-    // （不展开栈）时栈上局部对象不析构，归还职责只能在 Runtime 侧。
-    // 正常终态：协程返回后 Fail + 移除；RequestClose：统一 Fail 归还
-    // 并唤醒等待段（经 m_dial_cancels）。两路径幂等互斥。
-    std::vector<std::shared_ptr<tcp::DialWaitPermit>> m_dial_permits;
-
-    // co-io-adapter/v1 §4.0.1.7 容量门禁：m_transport_count 记录 Runtime
-    // 同时拥有的 transport socket（listener/accepted/dialed TCP；协议 Conn
-    // 引用同一 socket 不重复计数）。m_transport_mtx 与 m_lifecycle_mtx 分离，
-    // 避免 DialTCP 协程内路径与 HTTP 生命周期锁相互阻塞。
-    std::mutex                                     m_transport_mtx;
-    std::size_t                                    m_transport_count{0};
-    bool                                           m_transport_sealed{false};
-    // 已交付 TCP transport 的强持有（Runtime 托管引用；对象 Closed 后经
-    // ClosedHook 回调释放）。由 m_transport_mtx 保护。
-    std::vector<std::shared_ptr<ICoCloseable>>     m_tcp_children;
 
     // Issue #37：HTTP 出站配额计数，由 m_lifecycle_mtx 保护。
-    // 与 m_transport_count 分离：transport 计量真实 socket 对象，
+    // 与 transport owner 的 socket 容量账本分离（后者由 TransportRuntime
+    // 独占实现）：transport 计量真实 socket 对象，
     // HTTP 出站这里计量「已接纳的出站请求/连接」这一逻辑名额，
     // 归还发生在 op 物理收口（UnregisterOp）而非协程栈析构。
     std::size_t                                    m_http_conn_count{0};
     std::size_t                                    m_http_inflight_count{0};
 
-    // Issue #32：Runtime 级传输在途账本（max_inflight）。覆盖受管
-    // DialTCP 等待段、CoTCPListener::Accept 与 TCP/UDP 可等待数据
-    // 操作；Try* 不占名额。账本经 shared_ptr 与各受管对象共享，
-    // 挂起协程被强制 Stop（不展开栈）时由对象侧 RequestClose/析构
-    // 归还剩余名额——见 detail::InflightLedger 契约注释。
-    std::shared_ptr<bbt::infra::detail::InflightLedger> m_inflight_quota;
+    // P2：基础 transport 的资源托管与配额 owner（容量名额、在途账本、受管
+    // 对象强持有、物理关闭收口、受管 DialTCP 等待段的取消/归还）都在这里，
+    // 本切片只组合引用，不再复制账本或关闭实现。
+    std::shared_ptr<TransportRuntime>              m_transport;
 };
 
 } // namespace http_detail

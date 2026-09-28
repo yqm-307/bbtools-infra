@@ -34,10 +34,33 @@ target_include_directories(bbt_infra_udp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(bbt_infra_udp PUBLIC bbt::infra_common)
 target_compile_options(bbt_infra_udp PRIVATE -Wall -Wextra)
 
-# NetworkRuntimeImpl 的受管 TCP/UDP 工厂由 HTTP runtime 对外装配；静态库
-# 必须显式传播 CoTCP/CoUDP，避免下游 example/test 链接时出现未定义符号
-# （TCP 侧 DialTCP/ListenTCP、UDP 侧 BindUDP/RequestClose）。
-target_link_libraries(bbt_infra_http PUBLIC bbt::infra_tcp bbt::infra_udp)
+# --- P2 基础 transport owner（资源托管 + 配额）-------------------------------
+# 只托管基础 TCP/UDP transport（容量名额、在途账本、受管对象强持有与物理
+# 关闭收口），不含任何协议工厂；不链接 bbt_infra_http。受管 TCP/UDP 消费者
+# 经本 target 即可构建，不再需要 HTTP。唯一的容量/账本实现位于
+# transport/TransportRuntime.cc（自 http/NetworkRuntimeImpl 移出）。
+add_library(bbt_infra_transport STATIC
+    transport/TransportRuntime.cc)
+add_library(bbt::infra_transport ALIAS bbt_infra_transport)
+
+target_include_directories(bbt_infra_transport PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(bbt_infra_transport
+    PUBLIC  bbt::infra_common bbt::infra_tcp bbt::infra_udp
+    PRIVATE Boost::boost Threads::Threads)
+target_compile_options(bbt_infra_transport PRIVATE -Wall -Wextra)
+
+# P2 依赖门禁：把「transport 不依赖 HTTP」钉成配置期可核验事实，而不是靠
+# 目录命名或注释。协议切片反向依赖 transport owner。
+get_target_property(_bbt_transport_links bbt_infra_transport LINK_LIBRARIES)
+if(_bbt_transport_links MATCHES "infra_http")
+    message(FATAL_ERROR
+        "P2 依赖方向破坏：bbt_infra_transport 不得链接 HTTP target"
+        "（实际: ${_bbt_transport_links}）")
+endif()
+
+# HTTP 协议切片组合 transport owner；受管 TCP/UDP 工厂的容量与账本不再由
+# 本 target 实现（CoTCP/CoUDP 符号经 transport owner 传递）。
+target_link_libraries(bbt_infra_http PUBLIC bbt::infra_transport)
 
 # --- Redis 模块（Issue #6）---------------------------------------------------
 # hiredis 只允许经显式前缀接入：find_package 限定 NO_DEFAULT_PATH，
