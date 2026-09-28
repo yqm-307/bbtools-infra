@@ -412,7 +412,13 @@ set(BBT_INFRA_PUBLIC_HEADERS
     CoMongoCli.hpp
     mongo/Client.hpp
     CoTCP.hpp
-    CoUDP.hpp)
+    CoUDP.hpp
+    config/Value.hpp
+    config/Snapshot.hpp
+    config/Source.hpp
+    config/MemorySource.hpp
+    config/FileSource.hpp
+    config/Watch.hpp)
 
 if(TARGET bbt_infra_rpc_proto)
     list(APPEND BBT_INFRA_PUBLIC_HEADERS rpc/RpcWire.hpp)

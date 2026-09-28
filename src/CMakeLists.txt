@@ -39,6 +39,22 @@ target_compile_options(bbt_infra_udp PRIVATE -Wall -Wextra)
 # （TCP 侧 DialTCP/ListenTCP、UDP 侧 BindUDP/RequestClose）。
 target_link_libraries(bbt_infra_http PUBLIC bbt::infra_tcp bbt::infra_udp)
 
+# --- Config 基础配置模块（Issue #35）------------------------------------------
+# 只依赖 bbt::infra_common（即 coroutine）；无第三方新依赖。公开面在
+# include/bbt/infra/config/，命名空间 bbt::infra::config。内存源、本地文件源、
+# watch 轮询均基于协程域，不新增 I/O 线程。
+add_library(bbt_infra_config STATIC
+    config/MemorySource.cc
+    config/FileSource.cc
+    config/Watch.cc)
+add_library(bbt::infra_config ALIAS bbt_infra_config)
+
+target_include_directories(bbt_infra_config PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(bbt_infra_config
+    PUBLIC bbt::infra_common
+    PRIVATE Threads::Threads)
+target_compile_options(bbt_infra_config PRIVATE -Wall -Wextra)
+
 # --- Redis 模块（Issue #6）---------------------------------------------------
 # hiredis 只允许经显式前缀接入：find_package 限定 NO_DEFAULT_PATH，
 # 不可能误链 /usr/local 等系统位置的同名库。未给前缀时跳过本模块

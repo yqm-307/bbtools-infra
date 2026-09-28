@@ -9,7 +9,13 @@ mongocxx、bsoncxx 或底层线程类型。
 | 示例 | 目标 | 外部依赖 | 说明 |
 | --- | --- | --- | --- |
 | `http_loopback.cc` | `Example_http_loopback` | 无（loopback） | NetworkRuntime 完整生命周期：装配 → HTTP loopback → 关闭边界 |
+| `config_consume.cc` | `Example_config_consume` | 无 | 配置首切片：本地文件/内存源读取 → 上层校验 → 接受/拒绝；格式错误不发布伪成功 |
 | `redis_mongo_shape.cc` | `Example_redis_mongo_shape` | 链接 hiredis + mongocxx（经 `bbt::infra_redis` + `bbt::infra_mongo`） | Redis/Mongo 命令调用形态与错误/缺失分支；不连真实服务 |
+
+`examples/config_consumer/` 是一个**独立 CMake 工程**（不被本仓构建引用），只 include
+`bbt/infra/config/` 公共头、只链接 `bbt::infra_config`，用于从仓外视角复核模块 target 可独立
+消费；命令、实测结果与覆盖边界见该目录 `README.md` 与 [docs/config-watch-v1.md](../docs/config-watch-v1.md)。
+watch 的关闭/去重/drain 与强制 Stop 资源边界不在示例中，由 `tests/Test_config_watch.cc`（`config.watch`）覆盖。
 
 `Example_redis_mongo_shape` 只在 `bbt::infra_redis` 与 `bbt::infra_mongo`
 两个 target 都存在（即同时配置了 `BBT_HIREDIS_PREFIX`、
