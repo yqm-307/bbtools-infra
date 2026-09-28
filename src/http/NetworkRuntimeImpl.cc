@@ -8,6 +8,7 @@
 #include <bbt/infra/CoTCP.hpp>
 #include <bbt/infra/CoUDP.hpp>
 
+#include "detail/IoSupport.hpp"
 #include "http/HttpClientImpl.hpp"
 #include "http/HttpServerImpl.hpp"
 
@@ -69,6 +70,13 @@ result<void> NetworkRuntimeImpl::CheckUsableForFactory() const {
     if (!m_close.IsOpen())
         return result<void>::err(
             MakeError(ErrorCode::Closed, "runtime is closing or closed"));
+    // §4.0.1.7（Issue #32）：工厂同样受运行时代际门禁——Stop→Start 后
+    // 旧代际 runtime 不得再产出新对象（对象钉住当前代际，跨代交付只会
+    // 产出入场即失败的对象）。
+    const auto gen = bbt::coroutine::CurrentRuntimeGeneration();
+    if (gen == 0 || gen != m_info.generation)
+        return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable,
+            "runtime belongs to another runtime generation"));
     return result<void>::ok();
 }
 
@@ -106,7 +114,62 @@ result<std::shared_ptr<CoTCP>> NetworkRuntimeImpl::DialTCP(
         ++m_transport_count;
     }
 
-    auto dialed = tcp::CoTCP::DialTCP(std::move(endpoint.host), endpoint.port, options);
+    // §4.0.1.7（Issue #32）：受管 DialTCP 的等待段（DNS 解析 + 非阻塞
+    // connect 等待）占一个 Runtime 在途名额；容量满立即 Overloaded，
+    // 不排队不挂起。
+    if (!m_inflight_quota->TryAdmit()) {
+        ReleaseTransportSlot(m_transport_mtx, m_transport_count);
+        MaybeFinalize();
+        return result<std::shared_ptr<CoTCP>>::err(MakeError(
+            ErrorCode::Overloaded, "DialTCP: max_inflight exceeded"));
+    }
+
+    // Issue #32 F2：等待段名额不能依赖协程栈 RAII——Scheduler::Stop 对
+    // 挂起协程直接销毁、不展开栈，栈上任何局部对象都不会析构。因此
+    // 「未完成 dial」的归还职责放在 Runtime 侧堆对象上：permit 由
+    // m_dial_permits 强持有（不是栈上局部），正常终态（等待段落定、dial
+    // 返回）由协程返回后移除并归还；runtime->RequestClose() 由下方统一对
+    // 每个未完成 dial Fail() 归还并唤醒其等待段；Runtime 析构时成员
+    // 析构（~DialWaitPermit）归还剩余——硬 Stop 本身不归还，它只销毁协程
+    // （受管 dial 的等待段在 Stop 期间由 DNS 侧先落定 ⇒ 走正常归还路径）。
+    // 栈上只保留弱引用观察终态。
+    auto dial_cancel =
+        std::make_shared<bbt::coroutine::CancellationSource>();
+    auto permit = std::make_shared<tcp::DialWaitPermit>(
+        [quota = m_inflight_quota] { quota->Release(); });
+    {
+        std::lock_guard<std::mutex> lk(m_transport_mtx);
+        if (!m_transport_sealed) {
+            m_dial_cancels.push_back(dial_cancel);
+            m_dial_permits.push_back(permit);
+        }
+    }
+
+    tcp::DialWaitOptions dial_wait;
+    dial_wait.extra_cancel = dial_cancel->Token();
+    // 测试接缝：等待段挂起落定（协程已进入 parked 表）后回调一次，
+    // 用于确定性区分「等待中取消/Stop」与「未进入等待」。
+    if (m_dial_wait_entry_gate_for_test) {
+        auto gate = m_dial_wait_entry_gate_for_test;
+        dial_wait.dns_on_registered = gate;
+        dial_wait.connect_on_registered = std::move(gate);
+    }
+
+    auto dialed = tcp::CoTCP::DialTCP(std::move(endpoint.host), endpoint.port,
+                                      options, std::move(dial_wait));
+    // 等待段已结束（成功/失败/取消/超时）：正常路径归还名额并从登记簿
+    // 移除——归还与 permit->Fail 幂等互斥（released 原子位），不重复。
+    permit->Fail();
+    {
+        std::lock_guard<std::mutex> lk(m_transport_mtx);
+        auto& cans = m_dial_cancels;
+        cans.erase(std::remove(cans.begin(), cans.end(), dial_cancel),
+                   cans.end());
+        auto& perms = m_dial_permits;
+        perms.erase(std::remove(perms.begin(), perms.end(), permit),
+                    perms.end());
+    }
+
     if (!dialed) {
         ReleaseTransportSlot(m_transport_mtx, m_transport_count);
         MaybeFinalize();
@@ -127,6 +190,10 @@ result<std::shared_ptr<CoTCP>> NetworkRuntimeImpl::DialTCP(
                 if (rt && object)
                     rt->OnTransportClosed(object.get());
             });
+            connection->SetInflightHooks(
+                [quota = m_inflight_quota] { return quota->TryAdmit(); },
+                [quota = m_inflight_quota] { quota->Release(); },
+                m_inflight_quota);
             m_tcp_children.push_back(connection);
         }
     }
@@ -220,9 +287,20 @@ result<std::shared_ptr<CoTCPListener>> NetworkRuntimeImpl::ListenTCP(
                 if (rt_locked && child_locked)
                     rt_locked->OnTransportClosed(child_locked.get());
             });
+            // §4.0.1.7：接纳的 socket 同样挂 Runtime 在途账本——其
+            // ReadSome/WriteSome/WriteAll 占用同一 max_inflight 预算。
+            accepted->SetInflightHooks(
+                [quota = rt->m_inflight_quota] { return quota->TryAdmit(); },
+                [quota = rt->m_inflight_quota] { quota->Release(); },
+                rt->m_inflight_quota);
             rt->m_tcp_children.push_back(std::move(accepted));
             return true;
         });
+    // §4.0.1.7：listener 的 Accept 占用同一 max_inflight 账本。
+    listener->SetInflightHooks(
+        [quota = m_inflight_quota] { return quota->TryAdmit(); },
+        [quota = m_inflight_quota] { quota->Release(); },
+        m_inflight_quota);
     m_tcp_children.push_back(listener);
     transport_lock.unlock();
     return result<std::shared_ptr<CoTCPListener>>::ok(std::move(listener));
@@ -263,6 +341,11 @@ result<std::shared_ptr<CoUDP>> NetworkRuntimeImpl::BindUDP(SocketAddress local) 
                 if (rt && object)
                     rt->OnTransportClosed(object.get());
             });
+            // §4.0.1.7：UDP 的 Receive/Send 挂起段占同一 max_inflight 账本。
+            socket->SetInflightHooks(
+                [quota = m_inflight_quota] { return quota->TryAdmit(); },
+                [quota = m_inflight_quota] { quota->Release(); },
+                m_inflight_quota);
             m_tcp_children.push_back(socket);
         }
     }
@@ -433,11 +516,22 @@ void NetworkRuntimeImpl::RequestClose() noexcept {
         return;
     m_state.store(kClosingOrClosed);
     std::vector<std::shared_ptr<ICoCloseable>> transports;
+    std::vector<std::shared_ptr<bbt::coroutine::CancellationSource>> cancels;
+    std::vector<std::shared_ptr<tcp::DialWaitPermit>> permits;
     {
         std::lock_guard<std::mutex> lk(m_transport_mtx);
         m_transport_sealed = true;
         transports = m_tcp_children;
+        cancels.swap(m_dial_cancels);
+        permits.swap(m_dial_permits);
     }
+    // Issue #32 F2：每个未完成的受管 DialTCP 等待段名额先归还（Fail 幂等，
+    // 与协程正常返回路径的 Fail 互斥），再经取消源唤醒挂起协程——协程走
+    // 正常返回路径到登记簿移除点（已清空，无重复），不依赖硬销毁兜底。
+    for (auto& permit : permits)
+        permit->Fail();
+    for (auto& cancel : cancels)
+        cancel->RequestCancel();
     for (auto& transport : transports)
         transport->RequestClose();
     if (!m_engine->Started()) {

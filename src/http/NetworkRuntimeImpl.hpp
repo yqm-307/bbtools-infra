@@ -18,7 +18,9 @@
 #include <vector>
 
 #include <bbt/infra/NetworkRuntime.hpp>
+#include <bbt/infra/CoTCP.hpp>   // tcp::DialWaitPermit / DialWaitOptions
 
+#include "detail/IoSupport.hpp"
 #include "http/HttpDetail.hpp"
 #include "http/HttpIoEngine.hpp"
 
@@ -39,7 +41,10 @@ public:
         : m_limits(limits),
           m_engine(std::move(engine)),
           m_info(std::move(info)),
-          m_close(std::move(close_sig)) {}
+          m_close(std::move(close_sig)),
+          m_inflight_quota(
+              std::make_shared<bbt::infra::detail::InflightLedger>(
+                  limits.max_inflight)) {}
 
     result<void> Start() override;
     result<std::shared_ptr<HttpClient>> CreateHttpClient() override;
@@ -76,6 +81,21 @@ public:
     // 等待由持锁线程释放的资源以外的事件。
     void SetAdoptCommitGateForTest(std::function<void()> gate) noexcept {
         m_adopt_commit_gate_for_test = std::move(gate);
+    }
+
+    // 测试接缝（Issue #32）：直读 Runtime 共享在途账本当前名额数。
+    // 用于跨对象/跨 op 的确定性断言（e.g. Stop 后 DrainQuota 落定），
+    // 不替代公开语义——生产路径不使用。
+    std::size_t InflightQuotaHeldForTest() const noexcept {
+        return m_inflight_quota->Held();
+    }
+
+    // 测试接缝（Issue #32 F2）：非空时，受管 DialTCP 的 DNS/connect
+    // 等待段在协程真正挂起（await event 注册进 parked 表）后回调一次，
+    // 用于确定性观察「dial 已进入等待」。生产路径不安装，空钩子零开销。
+    // 约定：noexcept、不取锁不阻塞、不得回调本对象。
+    void SetDialWaitEntryGateForTest(std::function<void()> gate) noexcept {
+        m_dial_wait_entry_gate_for_test = std::move(gate);
     }
 
 private:
@@ -131,6 +151,22 @@ private:
     // 测试接缝钩子：仅在 CheckAndAdoptLocked 复检通过、登记提交前在持锁
     // 状态下调用；生产路径不安装。见 SetAdoptCommitGateForTest 契约注释。
     std::function<void()>                          m_adopt_commit_gate_for_test;
+    // 测试接缝钩子（Issue #32 F2）：受管 DialTCP 挂起落定后回调；见
+    // SetDialWaitEntryGateForTest 契约注释。生产路径不安装。
+    std::function<void()>                          m_dial_wait_entry_gate_for_test;
+    // Issue #32 F2：未完成受管 DialTCP 的取消源登记簿。m_transport_mtx
+    // 保护；RequestClose 在 seal 之后统一 RequestCancel，唤醒仍挂起在
+    // DNS/connect 等待段的 dial 协程走正常归还路径（硬 Stop 的兜底归还
+    // 由 tcp::DialWaitPermit 承担）。名额不入本表：本表只管「唤醒」，
+    // 归还由账本 + 凭据配对完成。
+    std::vector<std::shared_ptr<bbt::coroutine::CancellationSource>>
+                                                   m_dial_cancels;
+    // Issue #32 F2：未完成受管 DialTCP 的归还凭据表（m_transport_mtx
+    // 保护）。permit 由本表强持有——挂起协程被 Scheduler::Stop 硬销毁
+    // （不展开栈）时栈上局部对象不析构，归还职责只能在 Runtime 侧。
+    // 正常终态：协程返回后 Fail + 移除；RequestClose：统一 Fail 归还
+    // 并唤醒等待段（经 m_dial_cancels）。两路径幂等互斥。
+    std::vector<std::shared_ptr<tcp::DialWaitPermit>> m_dial_permits;
 
     // co-io-adapter/v1 §4.0.1.7 容量门禁：m_transport_count 记录 Runtime
     // 同时拥有的 transport socket（listener/accepted/dialed TCP；协议 Conn
@@ -149,6 +185,13 @@ private:
     // 归还发生在 op 物理收口（UnregisterOp）而非协程栈析构。
     std::size_t                                    m_http_conn_count{0};
     std::size_t                                    m_http_inflight_count{0};
+
+    // Issue #32：Runtime 级传输在途账本（max_inflight）。覆盖受管
+    // DialTCP 等待段、CoTCPListener::Accept 与 TCP/UDP 可等待数据
+    // 操作；Try* 不占名额。账本经 shared_ptr 与各受管对象共享，
+    // 挂起协程被强制 Stop（不展开栈）时由对象侧 RequestClose/析构
+    // 归还剩余名额——见 detail::InflightLedger 契约注释。
+    std::shared_ptr<bbt::infra::detail::InflightLedger> m_inflight_quota;
 };
 
 } // namespace http_detail

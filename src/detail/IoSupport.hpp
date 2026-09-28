@@ -228,4 +228,35 @@ NewCompletionSignal() {
     }
 }
 
+// §4.0.1.7（Issue #32）：Runtime 级传输在途账本。覆盖受管 DialTCP
+// 等待段、CoTCPListener::Accept 与 TCP/UDP 可等待数据操作；Try* 不经
+// 账本。容量满立即拒绝（不排队），名额由对象在 op 结束时归还。
+//
+// Stop 安全：账本由 Runtime 与各受管对象经 shared_ptr 共享持有
+// （quota_scope）。Scheduler::Stop 对挂起协程直接销毁、不展开栈
+// （coroutine 契约 §6），因此归还不能依赖协程栈 RAII——对象侧用
+// m_quota_held 记录未归还名额，op 正常结束归还 1，RequestClose/析构
+// 经 DrainQuota 一次性归还剩余，两种路径互补且无重复归还。
+struct InflightLedger {
+    explicit InflightLedger(std::size_t cap_) : cap(cap_) {}
+    bool TryAdmit() noexcept {
+        std::lock_guard<std::mutex> lk(mtx);
+        if (count >= cap)
+            return false;
+        ++count;
+        return true;
+    }
+    void Release(std::size_t n = 1) noexcept {
+        std::lock_guard<std::mutex> lk(mtx);
+        count = n >= count ? 0 : count - n;
+    }
+    std::size_t Held() const noexcept {
+        std::lock_guard<std::mutex> lk(mtx);
+        return count;
+    }
+    const std::size_t   cap;
+    mutable std::mutex  mtx;
+    std::size_t         count{0};
+};
+
 } // namespace bbt::infra::detail
