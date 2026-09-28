@@ -16,6 +16,7 @@
 #include <limits>
 
 #include <bbt/coroutine/object/CoObject.hpp>
+#include <bbt/coroutine/sync/Cancellation.hpp>
 #include <bbt/coroutine/sync/CoWaiter.hpp>
 #include <bbt/coroutine/detail/Define.hpp>
 #include <bbt/coroutine/detail/DnsResolver.hpp>
@@ -23,6 +24,9 @@
 #include <bbt/coroutine/detail/Processer.hpp>
 
 #include <functional>
+#include <unordered_set>
+
+#include "detail/IoSupport.hpp"
 
 namespace bbt::infra::tcp {
 namespace {
@@ -64,7 +68,9 @@ struct _DnsResolution {
 };
 
 result<addrinfo*> _ResolveHost(const std::string& host, std::uint16_t port,
-                               const CallOptions& options) {
+                               const CallOptions& options,
+                               std::function<void()> on_registered = {},
+                               bbt::coroutine::CancellationToken extra_cancel = {}) {
     auto state = std::make_shared<_DnsResolution>();
     state->host = host;
     state->service = std::to_string(port);
@@ -72,10 +78,20 @@ result<addrinfo*> _ResolveHost(const std::string& host, std::uint16_t port,
     state->hints.ai_family = AF_UNSPEC;
     bbt::coroutine::sync::CombinedWaitOptions wait;
     wait.deadline = options.deadline;
-    wait.cancel = options.cancel;
+    // Issue #32 F2：runtime 关闭源与调用方 cancel 合成 OR 视图——受管
+    // DialTCP 等待段期间 runtime->RequestClose() 能唤醒本等待返回
+    // Closed/Cancelled 终态，而不是让协程留在 parked 表里被硬销毁。
+    wait.cancel = bbt::coroutine::CancellationToken::Combine(
+        extra_cancel, options.cancel);
     // 阻塞 libc 调用只在上游 DNS worker 上运行；state 延寿至 worker 完成。
-    const auto status = bbt::coroutine::detail::DnsResolver::GetInstance()->AwaitBounded(
-        [state]() {
+    // 确定性等待入口证据：AwaitBounded 把 job 入队发生在协程挂起落定后
+    // （on_registered 回调内），worker 开始执行 work 即证明协程已在等待。
+    // 因此在 work lambda 顶部触发可选接缝即可观察「dial 处于 DNS 等待」。
+    const auto status =
+        bbt::coroutine::detail::DnsResolver::GetInstance()->AwaitBounded(
+            [state, on_registered = std::move(on_registered)]() {
+        if (on_registered)
+            on_registered();   // worker 已起跑 ⇒ 调用方协程已挂起在等待
         addrinfo* resolved = nullptr;
         const int code = ::getaddrinfo(state->host.c_str(), state->service.c_str(),
                                        &state->hints, &resolved);
@@ -146,7 +162,8 @@ bool _TryNumericAddress(const std::string& host, sockaddr_storage& out,
 }
 
 result<void> _WaitFd(int fd, bool readable, const CallOptions& options,
-                     bbt::coroutine::CancellationToken close = {}) {
+                     bbt::coroutine::CancellationToken close = {},
+                     std::function<void()> on_registered = {}) {
     if (g_bbt_tls_coroutine_co == nullptr)
         return result<void>::err(MakeError(ErrorCode::InvalidContext,
             "CoTCP operation must run in coroutine context"));
@@ -158,7 +175,11 @@ result<void> _WaitFd(int fd, bool readable, const CallOptions& options,
     wait.want_writeable = !readable;
     wait.deadline = options.deadline;
     wait.cancel = bbt::coroutine::CancellationToken::Combine(close, options.cancel);
-    const auto status = waiter->Wait(wait);
+    const auto status = waiter->Wait(wait,
+        [on_registered = std::move(on_registered)]() -> bool {
+            if (on_registered) on_registered();
+            return true;
+        });
     switch (status) {
     case CombinedWaitStatus::FdReadable:
     case CombinedWaitStatus::FdWriteable:
@@ -184,10 +205,22 @@ CoTCP::CoTCP(int fd) noexcept
         bbt::coroutine::CurrentRuntimeGeneration(), "tcp", "CoTCP"} {}
 CoTCP::~CoTCP() {
     std::lock_guard<std::mutex> lock(m_mtx);
+    _DrainQuotaLocked();   // 未经 RequestClose 就析构时兜底归还（Stop 路径）
     _CloseFd();
 }
 
 bbt::coroutine::CoObjectInfo CoTCP::GetObjectInfo() const { return m_info; }
+
+result<void> CoTCP::_CheckEntry(bool in_coroutine_only) const {
+    if (in_coroutine_only && g_bbt_tls_coroutine_co == nullptr)
+        return result<void>::err(MakeError(ErrorCode::InvalidContext,
+            "CoTCP operation must run in coroutine context"));
+    const auto generation = bbt::coroutine::CurrentRuntimeGeneration();
+    if (generation == 0 || generation != m_info.generation)
+        return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable,
+            "CoTCP operation belongs to another runtime generation"));
+    return result<void>::ok();
+}
 
 IoResult CoTCP::TryReadSome(MutableBytes dst) {
     if (dst.size && !dst.data)
@@ -248,7 +281,8 @@ IoResult CoTCP::WriteAll(ConstBytes src, const CallOptions& options) {
 }
 
 result<CoTCP::SPtr> CoTCP::DialTCP(std::string host, std::uint16_t port,
-                                    const CallOptions& options) {
+                                    const CallOptions& options,
+                                    DialWaitOptions dial_wait) {
     sockaddr_storage numeric{};
     socklen_t numeric_len = 0;
     addrinfo* results = nullptr;
@@ -258,7 +292,9 @@ result<CoTCP::SPtr> CoTCP::DialTCP(std::string host, std::uint16_t port,
         else
             reinterpret_cast<sockaddr_in6*>(&numeric)->sin6_port = ::htons(port);
     } else {
-        auto resolved = _ResolveHost(host, port, options);
+        auto resolved = _ResolveHost(host, port, options,
+                                     std::move(dial_wait.dns_on_registered),
+                                     dial_wait.extra_cancel);
         if (!resolved)
             return result<SPtr>::err(std::move(resolved).error());
         results = std::move(resolved).value();
@@ -301,7 +337,9 @@ result<CoTCP::SPtr> CoTCP::DialTCP(std::string host, std::uint16_t port,
                 numeric_attempt = false;
             continue;
         }
-        auto wait = _WaitFd(fd, false, options);
+        auto wait = _WaitFd(fd, false, options,
+                            dial_wait.extra_cancel,
+                            dial_wait.connect_on_registered);
         if (!wait) {
             ::close(fd);
             output = result<SPtr>::err(std::move(wait).error());
@@ -337,20 +375,31 @@ result<std::size_t> CoTCP::_ReadSome(void* buffer, std::size_t size,
                                      const CallOptions& options) {
     if (size && !buffer)
         return result<std::size_t>::err(MakeError(ErrorCode::InvalidArgument, "null TCP read buffer"));
-    if (g_bbt_tls_coroutine_co == nullptr)
-        return result<std::size_t>::err(MakeError(ErrorCode::InvalidContext, "TCP read requires coroutine"));
-    const auto generation = bbt::coroutine::CurrentRuntimeGeneration();
-    if (generation == 0 || generation != m_info.generation)
-        return result<std::size_t>::err(MakeError(
-            ErrorCode::RuntimeUnavailable, "TCP runtime generation changed"));
+    auto entry = _CheckEntry(/*in_coroutine_only=*/true);
+    if (!entry)
+        return result<std::size_t>::err(std::move(entry).error());
+    // §4.0.1.7：Runtime 在途门禁——admit 先于 m_inflight 计数，拒绝即
+    // Overloaded 立即返回；名额登记在 m_quota_held（对象侧账本），
+    // op 结束归还 1，RequestClose/析构 DrainQuota 兜底（Stop 安全）。
+    if (m_inflight_admit && !m_inflight_admit())
+        return result<std::size_t>::err(MakeError(ErrorCode::Overloaded,
+            "TCP read: runtime max_inflight exceeded"));
     int fd;
     {
         std::lock_guard<std::mutex> lock(m_mtx);
-        if (m_closing)
+        if (m_closing) {
+            if (m_inflight_release) m_inflight_release();
             return result<std::size_t>::err(MakeError(ErrorCode::Closed, "TCP socket closed"));
+        }
         fd = m_fd;
         ++m_inflight;
+        if (m_inflight_admit)
+            ++m_quota_held;
     }
+    // §4.0.1.7 测试接缝：名额已登记（m_quota_held++），等待循环尚未进入。
+    // 测试据此断言「op 已占名额」而无需时间推断。
+    if (m_wait_entry_gate_for_test)
+        m_wait_entry_gate_for_test();
     auto run = [&]() -> result<std::size_t> {
       if (size == 0) return result<std::size_t>::ok(0);
       for (;;) {
@@ -362,7 +411,9 @@ result<std::size_t> CoTCP::_ReadSome(void* buffer, std::size_t size,
         if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
             return result<std::size_t>::err(_Errno(ErrorCode::TransportError, "TCP read failed"));
         if (errno == EINTR) continue;
-        auto wait = _WaitFd(fd, true, options, m_close_source->Token());
+        // F3：数据路径挂起落定回调——证明协程真实挂起在 fd 可读等待。
+        auto wait = _WaitFd(fd, true, options, m_close_source->Token(),
+                            m_io_wait_registered_gate_for_test);
         if (!wait) return result<std::size_t>::err(std::move(wait).error());
       }
     };
@@ -375,20 +426,26 @@ result<std::size_t> CoTCP::_WriteSome(const void* buffer, std::size_t size,
                                       const CallOptions& options) {
     if (size && !buffer)
         return result<std::size_t>::err(MakeError(ErrorCode::InvalidArgument, "null TCP write buffer"));
-    if (g_bbt_tls_coroutine_co == nullptr)
-        return result<std::size_t>::err(MakeError(ErrorCode::InvalidContext, "TCP write requires coroutine"));
-    const auto generation = bbt::coroutine::CurrentRuntimeGeneration();
-    if (generation == 0 || generation != m_info.generation)
-        return result<std::size_t>::err(MakeError(
-            ErrorCode::RuntimeUnavailable, "TCP runtime generation changed"));
+    auto entry = _CheckEntry(/*in_coroutine_only=*/true);
+    if (!entry)
+        return result<std::size_t>::err(std::move(entry).error());
+    if (m_inflight_admit && !m_inflight_admit())
+        return result<std::size_t>::err(MakeError(ErrorCode::Overloaded,
+            "TCP write: runtime max_inflight exceeded"));
     int fd;
     {
         std::lock_guard<std::mutex> lock(m_mtx);
-        if (m_closing)
+        if (m_closing) {
+            if (m_inflight_release) m_inflight_release();
             return result<std::size_t>::err(MakeError(ErrorCode::Closed, "TCP socket closed"));
+        }
         fd = m_fd;
         ++m_inflight;
+        if (m_inflight_admit)
+            ++m_quota_held;
     }
+    if (m_wait_entry_gate_for_test)
+        m_wait_entry_gate_for_test();
     auto run = [&]() -> result<std::size_t> {
       if (size == 0) return result<std::size_t>::ok(0);
       for (;;) {
@@ -400,7 +457,9 @@ result<std::size_t> CoTCP::_WriteSome(const void* buffer, std::size_t size,
         if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
             return result<std::size_t>::err(_Errno(ErrorCode::TransportError, "TCP write failed"));
         if (errno == EINTR) continue;
-        auto wait = _WaitFd(fd, false, options, m_close_source->Token());
+        // F3：数据路径挂起落定回调——证明协程真实挂起在 fd 可写等待。
+        auto wait = _WaitFd(fd, false, options, m_close_source->Token(),
+                            m_io_wait_registered_gate_for_test);
         if (!wait) return result<std::size_t>::err(std::move(wait).error());
       }
     };
@@ -424,13 +483,15 @@ result<std::size_t> CoTCP::WriteAll(const void* buffer, std::size_t size,
     if (size && !buffer)
         return result<std::size_t>::err(MakeError(ErrorCode::InvalidArgument,
             "null TCP write buffer"));
-    if (g_bbt_tls_coroutine_co == nullptr)
-        return result<std::size_t>::err(MakeError(ErrorCode::InvalidContext,
-            "TCP write requires coroutine"));
-    const auto generation = bbt::coroutine::CurrentRuntimeGeneration();
-    if (generation == 0 || generation != m_info.generation)
-        return result<std::size_t>::err(MakeError(ErrorCode::RuntimeUnavailable,
-            "TCP runtime generation changed"));
+    // §4.0.1.7：与 ReadSome/WriteSome 共用同一入口门禁（参数之外的协程上下文
+    // 与代际检查），不再自带一份等价副本。
+    auto entry = _CheckEntry(/*in_coroutine_only=*/true);
+    if (!entry)
+        return result<std::size_t>::err(std::move(entry).error());
+    // §4.0.1.7 在途粒度：WriteAll 是 _WriteSome 的重试循环，**不**在自身入口
+    // 占名额——在途粒度是每一轮内部单次写尝试（每轮 admit/归还）。轮间名额可
+    // 被其他 op 取走，故多轮 WriteAll 可能中途 Overloaded；已写字节数始终经
+    // error.transferred_bytes 回报（见下方 !part 分支）。
     const auto* bytes = static_cast<const std::uint8_t*>(buffer);
     std::size_t written = 0;
     while (written < size) {
@@ -461,6 +522,13 @@ void CoTCP::_EndIo() noexcept {
     {
         std::lock_guard<std::mutex> lock(m_mtx);
         --m_inflight;
+        // §4.0.1.7：op 落定归还本对象计入的一个在途名额；若对象已
+        // closing（RequestClose 先行 DrainQuota），m_quota_held 已清零，
+        // 此归还不会发生——两条归还路径互斥不重复。
+        if (m_quota_held > 0) {
+            --m_quota_held;
+            if (m_inflight_release) m_inflight_release();
+        }
         if (m_closing && m_inflight == 0 && !m_closed) {
             _CloseFd();
             closed_now = true;
@@ -478,6 +546,10 @@ void CoTCP::RequestClose() noexcept {
         std::lock_guard<std::mutex> lock(m_mtx);
         if (m_closing) return;
         m_closing = true;
+        // §4.0.1.7：挂起 op 可能不再返回（强制 Stop 不展开栈），此处
+        // 归还全部未归还名额；op 若仍返回，其 _EndIo 见 quota_held==0
+        // 不再重复归还。
+        _DrainQuotaLocked();
         if (m_inflight == 0) {
             _CloseFd();
             closed_now = true;
@@ -521,6 +593,17 @@ CoTCPListener::CoTCPListener(int fd) noexcept
 CoTCPListener::~CoTCPListener() { RequestClose(); }
 
 bbt::coroutine::CoObjectInfo CoTCPListener::GetObjectInfo() const { return m_info; }
+
+result<void> CoTCPListener::_CheckEntry() const {
+    if (g_bbt_tls_coroutine_co == nullptr)
+        return result<void>::err(MakeError(ErrorCode::InvalidContext,
+            "TCP accept requires coroutine"));
+    const auto generation = bbt::coroutine::CurrentRuntimeGeneration();
+    if (generation == 0 || generation != m_info.generation)
+        return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable,
+            "TCP accept belongs to another runtime generation"));
+    return result<void>::ok();
+}
 
 SocketAddress CoTCPListener::LocalAddress() const {
     std::lock_guard<std::mutex> lock(m_mtx);
@@ -593,27 +676,41 @@ result<CoTCPListener::SPtr> CoTCPListener::ListenTCP(std::string host,
 }
 
 result<std::shared_ptr<CoTCP>> CoTCPListener::Accept(const CallOptions& options) {
-    if (g_bbt_tls_coroutine_co == nullptr)
-        return result<std::shared_ptr<CoTCP>>::err(MakeError(
-            ErrorCode::InvalidContext, "TCP accept requires coroutine"));
-    const auto generation = bbt::coroutine::CurrentRuntimeGeneration();
-    if (generation == 0 || generation != m_info.generation)
-        return result<std::shared_ptr<CoTCP>>::err(MakeError(
-            ErrorCode::RuntimeUnavailable, "TCP runtime generation changed"));
-    if (m_accept_admit && !m_accept_admit())
+    auto entry = _CheckEntry();
+    if (!entry)
+        return result<std::shared_ptr<CoTCP>>::err(std::move(entry).error());
+    // §4.0.1.7：Runtime 在途门禁先于连接容量（m_accept_admit）。容量满
+    // 立即 Overloaded、不排队；名额计入 m_quota_held，op 结束经 _EndIo
+    // 归还，RequestClose/析构经 DrainQuota 兜底（Stop 安全）。
+    bool quota_admitted = false;
+    if (m_inflight_admit) {
+        if (!m_inflight_admit())
+            return result<std::shared_ptr<CoTCP>>::err(MakeError(
+                ErrorCode::Overloaded, "TCP accept: runtime max_inflight exceeded"));
+        quota_admitted = true;
+    }
+    if (m_accept_admit && !m_accept_admit()) {
+        if (quota_admitted && m_inflight_release) m_inflight_release();
         return result<std::shared_ptr<CoTCP>>::err(
             MakeError(ErrorCode::Overloaded, "TCP accept capacity exceeded"));
+    }
     int fd_to_wait;
     {
         std::lock_guard<std::mutex> lock(m_mtx);
         if (m_closing || m_fd < 0) {
             if (m_accept_release) m_accept_release();
+            if (quota_admitted && m_inflight_release) m_inflight_release();
             return result<std::shared_ptr<CoTCP>>::err(
                 MakeError(ErrorCode::Closed, "TCP listener closed"));
         }
         fd_to_wait = m_fd;
         ++m_inflight;
+        if (quota_admitted)
+            ++m_quota_held;
     }
+    // §4.0.1.7 测试接缝：名额登记完成、首次 accept4/等待前触发。
+    if (m_wait_entry_gate_for_test)
+        m_wait_entry_gate_for_test();
     auto run = [&]() -> result<std::shared_ptr<CoTCP>> {
       for (;;) {
         if (m_close_source->Token().IsCancellationRequested())
@@ -671,6 +768,10 @@ void CoTCPListener::_EndIo() noexcept {
     {
         std::lock_guard<std::mutex> lock(m_mtx);
         --m_inflight;
+        if (m_quota_held > 0) {
+            --m_quota_held;
+            if (m_inflight_release) m_inflight_release();
+        }
         if (m_closing && m_inflight == 0 && !m_closed) {
             _CloseFd();
             closed_now = true;
@@ -686,9 +787,9 @@ void CoTCPListener::RequestClose() noexcept {
     bool closed_now = false;
     {
         std::lock_guard<std::mutex> lock(m_mtx);
-        if (m_closing)
-            return;
+        if (m_closing) return;
         m_closing = true;
+        _DrainQuotaLocked();   // §4.0.1.7：挂起 Accept 被 Stop 销毁时兜底归还
         if (m_inflight == 0) {
             _CloseFd();
             closed_now = true;

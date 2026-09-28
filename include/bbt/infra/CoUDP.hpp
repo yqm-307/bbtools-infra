@@ -63,6 +63,26 @@ public:
         m_closed_hook = std::move(hook);
     }
 
+    // §4.0.1.7：Runtime 级在途配额注入（仅受管对象；未托管入口不装钩）。
+    // admit 在 _CheckEntry 通过、计入 m_inflight 之前调用——返回 false
+    // 即 Overloaded，立即返回不挂起；quota_scope 保活 Runtime 共享账本，
+    // Stop 不展开挂起协程栈时由对象侧归还，不依赖栈上 RAII。
+    void SetInflightHooks(std::function<bool()> admit,
+                          std::function<void()> release,
+                          std::shared_ptr<void> quota_scope) noexcept {
+        m_inflight_admit = std::move(admit);
+        m_inflight_release = std::move(release);
+        m_inflight_scope = std::move(quota_scope);
+    }
+
+    // 测试接缝（Issue #32）：可等待 op 在参数/上下文/代际检查与名额登记
+    // （m_quota_held++）完成后、进入首次等待循环之前在协程内触发一次；
+    // 生产路径不安装，为空零开销。约定：noexcept、不得回调本对象/取 m_mtx/
+    // 阻塞——持锁线程与同 scheduler 上其他协程依赖它快速返回。
+    void SetWaitEntryGateForTest(std::function<void()> gate) noexcept {
+        m_wait_entry_gate_for_test = std::move(gate);
+    }
+
 private:
     explicit CoUDP(int fd, bbt::coroutine::CoObjectInfo info) noexcept;
 
@@ -82,6 +102,9 @@ private:
     bool m_close_requested{false};
     bool m_physically_closed{false};
     int  m_inflight{0};
+    // §4.0.1.7：本对象尚未归还账本的名额数；op 正常收尾归还 1，
+    // RequestClose/析构一次性归还剩余——Stop 不展开栈时由后者兜底。
+    int  m_quota_held{0};
     SocketAddress m_local;
     bbt::coroutine::CoObjectInfo m_info;
     // 关闭源：RequestClose 置位；组合进每次等待的 cancel，实现任意线程
@@ -92,6 +115,13 @@ private:
         std::make_shared<bbt::coroutine::CancellationSource>()};
     std::atomic_bool m_close_waiting{false};
     std::function<void()> m_closed_hook;
+    // §4.0.1.7 在途配额（仅受管对象注入）：admit/release 与 Runtime
+    // 账本严格配对，scope 保活账本跨越 Stop→Start 代际。
+    std::function<bool()> m_inflight_admit;
+    std::function<void()> m_inflight_release;
+    std::shared_ptr<void> m_inflight_scope;
+    // §4.0.1.7 测试接缝：见 SetWaitEntryGateForTest。
+    std::function<void()> m_wait_entry_gate_for_test;
 };
 
 } // namespace bbt::infra::udp

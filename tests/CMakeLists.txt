@@ -14,7 +14,12 @@ set_tests_properties(tcp.loopback PROPERTIES TIMEOUT 30)
 # CoTCP Runtime 托管工厂（co-io-adapter/v1 §4.0.1）：需要 bbt_infra_http
 # （NetworkRuntime 实现在 HTTP 切片内）。覆盖未 Start 拒绝、容量门禁
 # Overloaded、数值直连闭环与关闭后容量释放。
+# Issue #32：另加 max_inflight 验收矩阵——共享账本跨 listener/UDP、
+# DialTCP 终态归还、Stop/Start 代际、未托管入口豁免；直接驱动 impl 层
+# 读取账本探针，需要 src/ 内部头 include 路径——仅本目标可见。
 add_executable(Test_tcp_runtime_factory Test_tcp_runtime_factory.cc)
+target_include_directories(Test_tcp_runtime_factory PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(Test_tcp_runtime_factory
     PRIVATE bbt::infra_http bbt::infra_tcp Boost::boost Threads::Threads)
 target_compile_options(Test_tcp_runtime_factory PRIVATE -Wall -Wextra)

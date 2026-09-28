@@ -124,6 +124,11 @@ CoUDP::CoUDP(int fd, bbt::coroutine::CoObjectInfo info) noexcept
 
 CoUDP::~CoUDP() {
     std::lock_guard<std::mutex> lock(m_mtx);
+    // §4.0.1.7：未走 RequestClose 的析构兜底归还剩余名额。
+    while (m_quota_held > 0) {
+        --m_quota_held;
+        if (m_inflight_release) m_inflight_release();
+    }
     _CloseFd();
 }
 
@@ -311,15 +316,33 @@ result<DatagramRead> CoUDP::Receive(MutableBytes dst, const CallOptions& options
         return result<DatagramRead>::err(MakeError(ErrorCode::InvalidArgument,
             "Receive: null buffer with non-zero size"));
 
+    // §4.0.1.7（Issue #32）：Runtime 在途门禁先于在途计数——容量满即
+    // Overloaded、立即返回不挂起；名额计入 m_quota_held，op 结束归还 1，
+    // RequestClose/析构 DrainQuota 兜底归还（Stop 不展开栈时安全）。
+    bool quota_admitted = false;
+    if (m_inflight_admit) {
+        if (!m_inflight_admit())
+            return result<DatagramRead>::err(MakeError(ErrorCode::Overloaded,
+                "UDP receive: runtime max_inflight exceeded"));
+        quota_admitted = true;
+    }
+
     // §6.4.3：在途计数先于等待登记，物理 close 在计数归零后才发生；
     // 封口后入口立即拒绝（Closed），等待中封口则由组合令牌唤醒 Closed。
     {
         std::lock_guard<std::mutex> lock(m_mtx);
-        if (m_close_requested || m_fd < 0)
+        if (m_close_requested || m_fd < 0) {
+            if (quota_admitted && m_inflight_release) m_inflight_release();
             return result<DatagramRead>::err(MakeError(ErrorCode::Closed,
                 "UDP socket closed"));
+        }
         ++m_inflight;
+        if (quota_admitted)
+            ++m_quota_held;
     }
+    // §4.0.1.7 测试接缝：名额已登记，等待循环尚未进入。
+    if (m_wait_entry_gate_for_test)
+        m_wait_entry_gate_for_test();
 
     result<DatagramRead> output = result<DatagramRead>::err(
         MakeError(ErrorCode::Closed, "UDP socket closed"));
@@ -381,6 +404,10 @@ result<DatagramRead> CoUDP::Receive(MutableBytes dst, const CallOptions& options
     {
         std::lock_guard<std::mutex> lock(m_mtx);
         --m_inflight;
+        if (m_quota_held > 0) {
+            --m_quota_held;
+            if (m_inflight_release) m_inflight_release();
+        }
         if (m_close_requested && m_inflight == 0 && !m_physically_closed) {
             _CloseFd();
             closed_now = true;
@@ -406,13 +433,27 @@ IoResult CoUDP::Send(ConstBytes packet, const SocketAddress& peer,
     if (!entry)
         return IoResult::err(std::move(entry).error());
 
+    bool quota_admitted = false;
+    if (m_inflight_admit) {
+        if (!m_inflight_admit())
+            return IoResult::err(MakeError(ErrorCode::Overloaded,
+                "UDP send: runtime max_inflight exceeded"));
+        quota_admitted = true;
+    }
+
     {
         std::lock_guard<std::mutex> lock(m_mtx);
-        if (m_close_requested || m_fd < 0)
+        if (m_close_requested || m_fd < 0) {
+            if (quota_admitted && m_inflight_release) m_inflight_release();
             return IoResult::err(MakeError(ErrorCode::Closed,
                 "UDP socket closed"));
+        }
         ++m_inflight;
+        if (quota_admitted)
+            ++m_quota_held;
     }
+    if (m_wait_entry_gate_for_test)
+        m_wait_entry_gate_for_test();
 
     IoResult output =
         IoResult::err(MakeError(ErrorCode::Closed, "UDP socket closed"));
@@ -464,6 +505,10 @@ IoResult CoUDP::Send(ConstBytes packet, const SocketAddress& peer,
     {
         std::lock_guard<std::mutex> lock(m_mtx);
         --m_inflight;
+        if (m_quota_held > 0) {
+            --m_quota_held;
+            if (m_inflight_release) m_inflight_release();
+        }
         if (m_close_requested && m_inflight == 0 && !m_physically_closed) {
             _CloseFd();
             closed_now = true;
@@ -500,6 +545,13 @@ void CoUDP::RequestClose() noexcept {
         if (m_close_requested)
             return;
         m_close_requested = true;
+        // §4.0.1.7：挂起协程被 Stop 强销时不再回到 op 收尾路径，剩余
+        // 名额由本对象在封口头一次性归还——与 op 归还路径互斥（由
+        // m_quota_held 计数保证不重复）。
+        while (m_quota_held > 0) {
+            --m_quota_held;
+            if (m_inflight_release) m_inflight_release();
+        }
         if (m_inflight == 0) {
             _CloseFd();
             closed_now = true;
