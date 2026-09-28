@@ -42,6 +42,9 @@
 #include <bbt/infra/CoUDP.hpp>
 #include <bbt/infra/TransportRuntime.hpp>
 
+// 内部装配面（src 内部头，不安装）：owner 测试探针与等待入口 gate。
+#include "detail/TransportWiring.hpp"
+
 using bbt::infra::CallOptions;
 using bbt::infra::CloseStatus;
 using bbt::infra::ConstBytes;
@@ -52,6 +55,8 @@ using bbt::infra::SocketAddress;
 using bbt::infra::TcpEndpoint;
 using bbt::infra::TransportRuntime;
 using bbt::coroutine::SCHE_START_OPT_SCHE_THREAD;
+
+using bbt::infra::detail::TransportWiring;
 
 namespace {
 
@@ -139,7 +144,7 @@ bool RunInCoroutine(F&& f, int budget_ms = kSeamBudgetMs) {
 template <class Listener>
 void InstallWaitEntryGate(const std::shared_ptr<Listener>& listener,
                           const WaiterPtr& waiter) {
-    listener->SetWaitEntryGateForTest([waiter] { waiter->entered.Down(); });
+    TransportWiring::SetWaitEntryGateForTest(*listener, [waiter] { waiter->entered.Down(); });
 }
 
 // 可等待 op 的结果码语义：-2 = 正常返回（未预期）。
@@ -250,7 +255,7 @@ BOOST_AUTO_TEST_CASE(t_capacity_gate_and_physical_release) {
     });
     BOOST_REQUIRE(ran);
     BOOST_CHECK(dial_overloaded);
-    BOOST_CHECK_EQUAL(owner->InflightQuotaHeldForTest(), 0u);
+    BOOST_CHECK_EQUAL(TransportWiring::InflightQuotaHeldForTest(*owner), 0u);
 
     // 物理关闭落定 → 名额归还 → 同一条路径再次成功（不是只读计数）。
     listen.value()->RequestClose();
@@ -299,11 +304,11 @@ BOOST_AUTO_TEST_CASE(t_loopback_data_path_and_close_lifecycle) {
         if (!acc) { probe->done.Down(); return; }
         auto accepted = std::move(acc).value();
         char request[5]{};
-        auto read = accepted->ReadSome(request, sizeof(request), Options());
-        if (!read || read.value() != 5) { probe->done.Down(); return; }
+        auto read = accepted->ReadSome(bbt::infra::MutableBytes{request, sizeof(request)}, Options());
+        if (!read || read.value().bytes != 5) { probe->done.Down(); return; }
         const char response[] = "world";
-        auto write = accepted->WriteAll(response, 5, Options());
-        probe->server_ok.store(write && write.value() == 5);
+        auto write = accepted->WriteAll(bbt::infra::ConstBytes{response, 5}, Options());
+        probe->server_ok.store(write && write.value().bytes == 5);
         probe->accepted = std::move(accepted);
         probe->done.Down();
     };
@@ -313,11 +318,11 @@ BOOST_AUTO_TEST_CASE(t_loopback_data_path_and_close_lifecycle) {
         if (!dialed) { probe->done.Down(); return; }
         auto client = std::move(dialed).value();
         const char request[] = "hello";
-        auto write = client->WriteAll(request, 5, Options());
+        auto write = client->WriteAll(bbt::infra::ConstBytes{request, 5}, Options());
         char response[5]{};
-        auto read = client->ReadSome(response, sizeof(response), Options());
-        probe->client_ok.store(write && write.value() == 5 && read &&
-                               read.value() == 5 &&
+        auto read = client->ReadSome(bbt::infra::MutableBytes{response, sizeof(response)}, Options());
+        probe->client_ok.store(write && write.value().bytes == 5 && read &&
+                               read.value().bytes == 5 &&
                                std::string(response, 5) == "world");
         // 受管引用在关闭后仍可用于查询（§4.0.1.2）。
         client->RequestClose();
@@ -332,7 +337,7 @@ BOOST_AUTO_TEST_CASE(t_loopback_data_path_and_close_lifecycle) {
     BOOST_CHECK(probe->client_ok.load());
     BOOST_REQUIRE(probe->accepted);
     // 数据面在途 op 已结束：账本归零，没有残留名额。
-    BOOST_CHECK_EQUAL(owner->InflightQuotaHeldForTest(), 0u);
+    BOOST_CHECK_EQUAL(TransportWiring::InflightQuotaHeldForTest(*owner), 0u);
 
     // owner 关闭：已接纳连接被收口（不仅停 listener）。
     std::weak_ptr<bbt::infra::CoTCP> accepted_weak = probe->accepted;
@@ -408,11 +413,11 @@ BOOST_AUTO_TEST_CASE(t_quota_isolated_between_owners) {
         wait_a->entered.WaitTimeout(kSeamBudgetMs) == 0,
         "case4/a: Accept 未在 " << kSeamBudgetMs
         << "ms 内进入等待（wait-entry gate 未落定）；"
-           "A 账本 inflight=" << a->InflightQuotaHeldForTest()
-        << " b 账本 inflight=" << b->InflightQuotaHeldForTest()
+           "A 账本 inflight=" << TransportWiring::InflightQuotaHeldForTest(*a)
+        << " b 账本 inflight=" << TransportWiring::InflightQuotaHeldForTest(*b)
         << "（未到达 = 未进入等待，或被 Overloaded 拒绝/参数或上下文校验失败）");
-    BOOST_CHECK_EQUAL(a->InflightQuotaHeldForTest(), 1u);
-    BOOST_CHECK_EQUAL(b->InflightQuotaHeldForTest(), 0u);
+    BOOST_CHECK_EQUAL(TransportWiring::InflightQuotaHeldForTest(*a), 1u);
+    BOOST_CHECK_EQUAL(TransportWiring::InflightQuotaHeldForTest(*b), 0u);
 
     // A 账本已满：A 上的第二个可等待 op 立即 Overloaded。
     auto a2 = std::make_shared<Waiter>();
@@ -441,8 +446,8 @@ BOOST_AUTO_TEST_CASE(t_quota_isolated_between_owners) {
         "case4/b: Accept 未在 " << kSeamBudgetMs
         << "ms 内进入等待（wait-entry gate 未落定；配额被误合并时 B 会 Overloaded）;"
            " code=" << wait_b->code.load());
-    BOOST_CHECK_EQUAL(b->InflightQuotaHeldForTest(), 1u);
-    BOOST_CHECK_EQUAL(a->InflightQuotaHeldForTest(), 1u);
+    BOOST_CHECK_EQUAL(TransportWiring::InflightQuotaHeldForTest(*b), 1u);
+    BOOST_CHECK_EQUAL(TransportWiring::InflightQuotaHeldForTest(*a), 1u);
 
     // 关闭 A 只归还 A 的名额，B 的挂起 op 不受影响（不误杀兄弟 owner）。
     listen_a.value()->RequestClose();
@@ -453,8 +458,8 @@ BOOST_AUTO_TEST_CASE(t_quota_isolated_between_owners) {
                           << wait_a->code.load());
     BOOST_CHECK_EQUAL(wait_a->code.load(),
                       static_cast<int>(ErrorCode::Closed));
-    BOOST_CHECK_EQUAL(a->InflightQuotaHeldForTest(), 0u);
-    BOOST_CHECK_EQUAL(b->InflightQuotaHeldForTest(), 1u);
+    BOOST_CHECK_EQUAL(TransportWiring::InflightQuotaHeldForTest(*a), 0u);
+    BOOST_CHECK_EQUAL(TransportWiring::InflightQuotaHeldForTest(*b), 1u);
 
     listen_b.value()->RequestClose();
     BOOST_REQUIRE_MESSAGE(wait_b->settled.WaitTimeout(kSeamBudgetMs) == 0,
@@ -464,7 +469,7 @@ BOOST_AUTO_TEST_CASE(t_quota_isolated_between_owners) {
                           << wait_b->code.load());
     BOOST_CHECK_EQUAL(wait_b->code.load(),
                       static_cast<int>(ErrorCode::Closed));
-    BOOST_CHECK_EQUAL(b->InflightQuotaHeldForTest(), 0u);
+    BOOST_CHECK_EQUAL(TransportWiring::InflightQuotaHeldForTest(*b), 0u);
 
     guard.Unwind();
 }
@@ -510,8 +515,8 @@ BOOST_AUTO_TEST_CASE(t_close_wakes_adopted_suspended_op) {
         << "ms 内进入等待（wait-entry gate 未落定）; op code="
         << waiter->code.load()
         << "（-1 = op 未落定且未进入等待；非 -1 = op 已被拒绝/提前返回）;"
-           " 名额 inflight=" << owner->InflightQuotaHeldForTest());
-    BOOST_CHECK_EQUAL(owner->InflightQuotaHeldForTest(), 1u);
+           " 名额 inflight=" << TransportWiring::InflightQuotaHeldForTest(*owner));
+    BOOST_CHECK_EQUAL(TransportWiring::InflightQuotaHeldForTest(*owner), 1u);
 
     owner->RequestClose();
     BOOST_REQUIRE_MESSAGE(waiter->settled.WaitTimeout(kSeamBudgetMs) == 0,
@@ -520,10 +525,10 @@ BOOST_AUTO_TEST_CASE(t_close_wakes_adopted_suspended_op) {
                           << "ms 内落定（关闭未唤醒）; code="
                           << waiter->code.load()
                           << " 名额 inflight="
-                          << owner->InflightQuotaHeldForTest());
+                          << TransportWiring::InflightQuotaHeldForTest(*owner));
     BOOST_CHECK_EQUAL(waiter->code.load(),
                       static_cast<int>(ErrorCode::Closed));
-    BOOST_CHECK_EQUAL(owner->InflightQuotaHeldForTest(), 0u);
+    BOOST_CHECK_EQUAL(TransportWiring::InflightQuotaHeldForTest(*owner), 0u);
     BOOST_CHECK(listen.value()->IsClosed());
     BOOST_CHECK(udp.value()->IsClosed());
 

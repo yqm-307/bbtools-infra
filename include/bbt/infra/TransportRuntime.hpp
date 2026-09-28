@@ -13,6 +13,11 @@
 // 组合一个 TransportRuntime 并把 transport 落定并入自身 finalize 门控，
 // 不复制账本、不重复关闭实现。
 //
+// 装配面归属：owner 与受管对象之间的装配接缝（ClosedHook 安装、在途账本
+// 注入、受管 dial 等待段接缝、测试探针）**不在**本公共头，而在 src 内部
+// 装配面 include 之外的 src/detail/TransportWiring.hpp（不安装）。协议
+// owner 与同仓测试经该内部头装配；公共消费者只使用下方工厂与生命周期方法。
+//
 // 资源归属（一个名额一个账本，同一事件只归还一次）：
 //   - max_connections：真实 socket 对象（listener/accepted/dialed TCP、UDP
 //     各算一个；协议侧连接对象引用同一 socket 不重复计数）。在「资源发起
@@ -35,6 +40,10 @@
 #include <bbt/infra/Result.hpp>
 
 namespace bbt::infra {
+
+namespace detail {
+struct TransportWiring;
+} // namespace detail
 
 namespace tcp {
 class CoTCP;
@@ -69,25 +78,6 @@ public:
         SocketAddress local, unsigned backlog) = 0;
     virtual result<std::shared_ptr<CoUDP>> BindUDP(SocketAddress local) = 0;
 
-    // P2 owner 组合接缝：本 owner 的受管 transport 全部物理关闭落定
-    // （IsClosed 观察点）后回调一次。协议 owner 用它把 transport 落定并入
-    // 自身 finalize 门控；发布前一次性安装，生产路径至多一个装配者。
-    // 约定：noexcept、不取本 owner 的锁、不阻塞。
-    void SetClosedHook(std::function<void()> hook) noexcept {
-        m_closed_hook = std::move(hook);
-    }
-
-    // 测试接缝（Issue #32）：直读共享在途账本当前名额数，用于跨对象/跨 op
-    // 的确定性断言。不替代公开语义——生产路径不使用。
-    virtual std::size_t InflightQuotaHeldForTest() const noexcept = 0;
-
-    // 测试接缝（Issue #32 F2）：非空时，受管 DialTCP 的 DNS/connect 等待段
-    // 在协程真正挂起（await event 注册进 parked 表）后回调一次，用于确定性
-    // 观察「dial 已进入等待」。生产路径不安装，空钩子零开销。
-    // 约定：noexcept、不取锁不阻塞、不得回调本对象。
-    virtual void SetDialWaitEntryGateForTest(
-        std::function<void()> gate) noexcept = 0;
-
 protected:
     TransportRuntime() = default;
 
@@ -98,6 +88,11 @@ protected:
     }
 
 private:
+    // 唯一装配者：src 内部装配面（detail::TransportWiring）安装
+    // 「受管 transport 全部物理关闭落定」回调，把落定并入协议 owner 的
+    // finalize 门控。见 src/detail/TransportWiring.hpp。
+    friend struct detail::TransportWiring;
+
     std::function<void()> m_closed_hook;
 };
 

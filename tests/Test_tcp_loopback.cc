@@ -54,14 +54,14 @@ BOOST_AUTO_TEST_CASE(t_tcp_real_loopback) {
             return;
         }
         char request[5]{};
-        auto read = accepted.value()->ReadSome(request, sizeof(request), Options());
-        if (!read || read.value() != 5 || std::string(request, 5) != "hello") {
+        auto read = accepted.value()->ReadSome(bbt::infra::MutableBytes{request, sizeof(request)}, Options());
+        if (!read || read.value().bytes != 5 || std::string(request, 5) != "hello") {
             done.Down();
             return;
         }
         const char response[] = "world";
-        auto write = accepted.value()->WriteAll(response, 5, Options());
-        server_ok.store(write && write.value() == 5);
+        auto write = accepted.value()->WriteAll(bbt::infra::ConstBytes{response, 5}, Options());
+        server_ok.store(write && write.value().bytes == 5);
         accepted.value()->RequestClose();
         done.Down();
     };
@@ -73,10 +73,10 @@ BOOST_AUTO_TEST_CASE(t_tcp_real_loopback) {
             return;
         }
         const char request[] = "hello";
-        auto write = client.value()->WriteAll(request, 5, Options());
+        auto write = client.value()->WriteAll(bbt::infra::ConstBytes{request, 5}, Options());
         char response[5]{};
-        auto read = client.value()->ReadSome(response, sizeof(response), Options());
-        client_ok.store(write && write.value() == 5 && read && read.value() == 5 &&
+        auto read = client.value()->ReadSome(bbt::infra::MutableBytes{response, sizeof(response)}, Options());
+        client_ok.store(write && write.value().bytes == 5 && read && read.value().bytes == 5 &&
                         std::string(response, 5) == "world");
         client.value()->RequestClose();
         done.Down();
@@ -138,7 +138,7 @@ BOOST_AUTO_TEST_CASE(t_tcp_read_deadline) {
         auto accepted = listener.value()->Accept(Options(500));
         if (accepted) {
             char byte{};
-            auto read = accepted.value()->ReadSome(&byte, 1, Options(80));
+            auto read = accepted.value()->ReadSome(bbt::infra::MutableBytes{&byte, 1}, Options(80));
             code.store(read ? -2 : static_cast<int>(read.error().code));
             accepted.value()->RequestClose();
         }
@@ -199,7 +199,7 @@ BOOST_AUTO_TEST_CASE(t_tcp_close_wakes_read) {
         connection = accepted.value();
         accepted_done.Down();
         char byte{};
-        auto read = connection->ReadSome(&byte, 1, Options(5000));
+        auto read = connection->ReadSome(bbt::infra::MutableBytes{&byte, 1}, Options(5000));
         code.store(read ? -2 : static_cast<int>(read.error().code));
         read_done.Down();
     };
@@ -290,13 +290,13 @@ BOOST_AUTO_TEST_CASE(t_tcp_rejects_old_runtime_generation) {
            &all_code, &zero_all_code, &accept_code]() {
         char byte{};
         const char payload[] = "x";
-        auto read = old_connection->ReadSome(&byte, 1, Options(80));
+        auto read = old_connection->ReadSome(bbt::infra::MutableBytes{&byte, 1}, Options(80));
         read_code.store(read ? -2 : static_cast<int>(read.error().code));
-        auto write = old_connection->WriteSome(payload, 1, Options(80));
+        auto write = old_connection->WriteSome(bbt::infra::ConstBytes{payload, 1}, Options(80));
         write_code.store(write ? -2 : static_cast<int>(write.error().code));
-        auto all = old_connection->WriteAll(payload, 1, Options(80));
+        auto all = old_connection->WriteAll(bbt::infra::ConstBytes{payload, 1}, Options(80));
         all_code.store(all ? -2 : static_cast<int>(all.error().code));
-        auto zero_all = old_connection->WriteAll(nullptr, 0, Options(80));
+        auto zero_all = old_connection->WriteAll(bbt::infra::ConstBytes{nullptr, 0}, Options(80));
         zero_all_code.store(zero_all ? -2 : static_cast<int>(zero_all.error().code));
         auto accepted = listener.value()->Accept(Options(80));
         accept_code.store(accepted ? -2 : static_cast<int>(accepted.error().code));

@@ -17,12 +17,15 @@
 #include <bbt/coroutine/detail/Scheduler.hpp>
 #include <bbt/coroutine/sync/Cancellation.hpp>
 #include <bbt/coroutine/syntax/SyntaxMacro.hpp>
+// 内部装配面（src 内部头，不安装）：受管对象/owner 的测试接缝。
+#include "detail/TransportWiring.hpp"
 #include <bbt/infra/CoTCP.hpp>
 #include <bbt/infra/CoUDP.hpp>
 #include <bbt/infra/NetworkRuntime.hpp>
 
 #include "http/NetworkRuntimeImpl.hpp"
 
+using bbt::infra::detail::TransportWiring;
 using bbt::infra::CallOptions;
 using bbt::infra::CloseStatus;
 using bbt::infra::ConstBytes;
@@ -200,11 +203,11 @@ BOOST_AUTO_TEST_CASE(t_runtime_dial_numeric_loopback) {
         auto accepted = listen.value()->Accept(Options());
         if (!accepted) { done.Down(); return; }
         char request[5]{};
-        auto read = accepted.value()->ReadSome(request, sizeof(request), Options());
-        if (!read || read.value() != 5) { done.Down(); return; }
+        auto read = accepted.value()->ReadSome(bbt::infra::MutableBytes{request, sizeof(request)}, Options());
+        if (!read || read.value().bytes != 5) { done.Down(); return; }
         const char response[] = "world";
-        auto write = accepted.value()->WriteAll(response, 5, Options());
-        server_ok.store(write && write.value() == 5);
+        auto write = accepted.value()->WriteAll(bbt::infra::ConstBytes{response, 5}, Options());
+        server_ok.store(write && write.value().bytes == 5);
         accepted.value()->RequestClose();
         done.Down();
     };
@@ -214,10 +217,10 @@ BOOST_AUTO_TEST_CASE(t_runtime_dial_numeric_loopback) {
         if (!dialed) { done.Down(); return; }
         auto client = dialed.value();
         const char request[] = "hello";
-        auto write = client->WriteAll(request, 5, Options());
+        auto write = client->WriteAll(bbt::infra::ConstBytes{request, 5}, Options());
         char response[5]{};
-        auto read = client->ReadSome(response, sizeof(response), Options());
-        client_ok.store(write && write.value() == 5 && read && read.value() == 5 &&
+        auto read = client->ReadSome(bbt::infra::MutableBytes{response, sizeof(response)}, Options());
+        client_ok.store(write && write.value().bytes == 5 && read && read.value().bytes == 5 &&
                         std::string(response, 5) == "world");
         client->RequestClose();
         // 受管引用：关闭后引用仍可用于查询（§4.0.1.2）。
@@ -258,8 +261,8 @@ BOOST_AUTO_TEST_CASE(t_dial_hostname_localhost_end_to_end) {
         auto accepted = listen.value()->Accept(Options());
         if (!accepted) { done.Down(); return; }
         char request[5]{};
-        auto read = accepted.value()->ReadSome(request, sizeof(request), Options());
-        server_ok.store(read && read.value() == 5);
+        auto read = accepted.value()->ReadSome(bbt::infra::MutableBytes{request, sizeof(request)}, Options());
+        server_ok.store(read && read.value().bytes == 5);
         accepted.value()->RequestClose();
         done.Down();
     };
@@ -272,8 +275,8 @@ BOOST_AUTO_TEST_CASE(t_dial_hostname_localhost_end_to_end) {
         auto dialed = runtime->DialTCP(TcpEndpoint{"localhost", port}, Options());
         if (!dialed) { done.Down(); return; }
         const char request[] = "hello";
-        auto write = dialed.value()->WriteAll(request, 5, Options());
-        client_ok.store(write && write.value() == 5);
+        auto write = dialed.value()->WriteAll(bbt::infra::ConstBytes{request, 5}, Options());
+        client_ok.store(write && write.value().bytes == 5);
         dialed.value()->RequestClose();
         done.Down();
     };
@@ -588,7 +591,7 @@ BOOST_AUTO_TEST_CASE(t_max_inflight_one_second_accept_overloaded) {
     // 接缝：第一笔 Accept 完成名额登记后放下 admitted latch——此后账本
     // 名额已被占满，第二个 Accept 的 Overloaded 是确定性的。
     bbt::core::thread::CountDownLatch admitted{1};
-    listen.value()->SetWaitEntryGateForTest(
+    TransportWiring::SetWaitEntryGateForTest(*listen.value(),
         [&admitted] { admitted.Down(); });
 
     bbt::core::thread::CountDownLatch first_done{1};
@@ -652,7 +655,7 @@ BOOST_AUTO_TEST_CASE(t_max_inflight_shared_across_listeners) {
     BOOST_REQUIRE(listen_b);
 
     bbt::core::thread::CountDownLatch admitted{1};
-    listen_a.value()->SetWaitEntryGateForTest(
+    TransportWiring::SetWaitEntryGateForTest(*listen_a.value(),
         [&admitted] { admitted.Down(); });
 
     bbt::core::thread::CountDownLatch a_done{1};
@@ -721,7 +724,7 @@ BOOST_AUTO_TEST_CASE(t_max_inflight_udp_receive_and_send_overloaded) {
     }
 
     bbt::core::thread::CountDownLatch admitted{1};
-    socket->SetWaitEntryGateForTest([&admitted] { admitted.Down(); });
+    TransportWiring::SetWaitEntryGateForTest(*socket, [&admitted] { admitted.Down(); });
 
     bbt::core::thread::CountDownLatch recv_done{1};
     std::atomic_int recv_code{-1};
@@ -870,7 +873,7 @@ BOOST_AUTO_TEST_CASE(t_max_inflight_dial_overload_and_release) {
 
     // 用挂起 Accept 占满唯一名额。
     bbt::core::thread::CountDownLatch admitted{1};
-    listen.value()->SetWaitEntryGateForTest(
+    TransportWiring::SetWaitEntryGateForTest(*listen.value(),
         [&admitted] { admitted.Down(); });
     bbt::core::thread::CountDownLatch accept_done{1};
     std::atomic_int accept_code{-1};
@@ -937,8 +940,8 @@ BOOST_AUTO_TEST_CASE(t_max_inflight_dial_overload_and_release) {
         if (!dialed) { handoff_done.Down(); return; }
         auto conn = std::move(dialed).value();
         const char msg[] = "hi";
-        auto w = conn->WriteAll(msg, 2, Options(3000));
-        echo_ok.store(w && w.value() == 2);
+        auto w = conn->WriteAll(bbt::infra::ConstBytes{msg, 2}, Options(3000));
+        echo_ok.store(w && w.value().bytes == 2);
         conn->RequestClose();
         handoff_done.Down();
     };
@@ -948,7 +951,7 @@ BOOST_AUTO_TEST_CASE(t_max_inflight_dial_overload_and_release) {
         auto acc = listen2.value()->Accept(Options(5000));
         if (acc) {
             char buf[4]{};
-            auto r = acc.value()->ReadSome(buf, sizeof(buf), Options(3000));
+            auto r = acc.value()->ReadSome(bbt::infra::MutableBytes{buf, sizeof(buf)}, Options(3000));
             (void)r;
             acc.value()->RequestClose();
         }
@@ -1194,13 +1197,13 @@ BOOST_AUTO_TEST_CASE(t_max_inflight_suspended_tcp_io_quota) {
 
     // c1 client 端挂起 ReadSome——名额登记后进入 fd 可读等待（对端不写）。
     bbt::core::thread::CountDownLatch read_registered{1};
-    c1_cli->SetIoWaitRegisteredGateForTest(
+    TransportWiring::SetIoWaitRegisteredGateForTest(*c1_cli,
         [&read_registered] { read_registered.Down(); });
     bbt::core::thread::CountDownLatch read_done{1};
     std::atomic_int read_code{-1};
     bbtco [c1_cli, &read_done, &read_code]() {
         char buf[8]{};
-        auto r = c1_cli->ReadSome(buf, sizeof(buf), Options(30000));
+        auto r = c1_cli->ReadSome(bbt::infra::MutableBytes{buf, sizeof(buf)}, Options(30000));
         read_code.store(r ? -2 : static_cast<int>(r.error().code));
         read_done.Down();
     };
@@ -1213,8 +1216,8 @@ BOOST_AUTO_TEST_CASE(t_max_inflight_suspended_tcp_io_quota) {
     // EAGAIN，须先把内核发送缓冲预填满，让 WriteSome 的首个 send 即
     // EAGAIN → 进入 _WaitFd(writeable) 真实挂起。TryWriteSome 不占账本
     // 名额，但要求协程上下文——故预填与 WriteSome 都放进同一协程。
-    const int sfd = c2_srv->NativeFdForTest();
-    const int cfd = c2_cli->NativeFdForTest();
+    const int sfd = TransportWiring::NativeFdForTest(*c2_srv);
+    const int cfd = TransportWiring::NativeFdForTest(*c2_cli);
     BOOST_REQUIRE_GE(sfd, 0);
     BOOST_REQUIRE_GE(cfd, 0);
     int small_buf = 4096;
@@ -1226,7 +1229,7 @@ BOOST_AUTO_TEST_CASE(t_max_inflight_suspended_tcp_io_quota) {
     std::vector<char> fill(64u << 10, 'f');
     std::vector<char> big_payload(4u << 10, 'x');
     bbt::core::thread::CountDownLatch write_registered{1};
-    c2_srv->SetIoWaitRegisteredGateForTest(
+    TransportWiring::SetIoWaitRegisteredGateForTest(*c2_srv,
         [&write_registered] { write_registered.Down(); });
     bbt::core::thread::CountDownLatch srv_w_done{1};
     std::atomic_int srv_w_code{-1};
@@ -1262,7 +1265,7 @@ BOOST_AUTO_TEST_CASE(t_max_inflight_suspended_tcp_io_quota) {
         std::atomic_int third_code{-1};
         bbtco [c1_cli, &third_done, &third_code]() {
             char buf[8]{};
-            auto r = c1_cli->ReadSome(buf, sizeof(buf), Options(5000));
+            auto r = c1_cli->ReadSome(bbt::infra::MutableBytes{buf, sizeof(buf)}, Options(5000));
             third_code.store(r ? -2 : static_cast<int>(r.error().code));
             third_done.Down();
         };
@@ -1353,8 +1356,8 @@ BOOST_AUTO_TEST_CASE(t_max_inflight_writeall_multiround_partial_failure) {
 
     // 发送侧缓冲缩到最小、接收侧不读 ⇒ WriteAll 前若干轮各写入部分字节，
     // 之后某一轮的首个 send 命中 EAGAIN 并真实挂起（首轮不可能挂起：缓冲空）。
-    const int sfd = srv->NativeFdForTest();
-    const int cfd = cli->NativeFdForTest();
+    const int sfd = TransportWiring::NativeFdForTest(*srv);
+    const int cfd = TransportWiring::NativeFdForTest(*cli);
     BOOST_REQUIRE_GE(sfd, 0);
     BOOST_REQUIRE_GE(cfd, 0);
     int small_buf = 4096;
@@ -1366,15 +1369,15 @@ BOOST_AUTO_TEST_CASE(t_max_inflight_writeall_multiround_partial_failure) {
     std::vector<char> payload(1u << 20, 'w');   // 1 MiB ≫ 发送缓冲
     std::atomic_int rounds{0};
     // 等待入口接缝在每轮名额登记之后、进入等待循环之前触发一次 ⇒ 轮计数。
-    srv->SetWaitEntryGateForTest([&rounds] { rounds.fetch_add(1); });
+    TransportWiring::SetWaitEntryGateForTest(*srv, [&rounds] { rounds.fetch_add(1); });
     bbt::core::thread::CountDownLatch parked{1};
-    srv->SetIoWaitRegisteredGateForTest([&parked] { parked.Down(); });
+    TransportWiring::SetIoWaitRegisteredGateForTest(*srv, [&parked] { parked.Down(); });
 
     bbt::core::thread::CountDownLatch write_done{1};
     std::atomic_int write_code{-1};
     std::atomic<unsigned long long> write_transferred{0};
     bbtco [srv, &payload, &write_done, &write_code, &write_transferred]() {
-        auto w = srv->WriteAll(payload.data(), payload.size(), Options(30000));
+        auto w = srv->WriteAll(bbt::infra::ConstBytes{payload.data(), payload.size()}, Options(30000));
         write_code.store(w ? -2 : static_cast<int>(w.error().code));
         if (!w)
             write_transferred.store(static_cast<unsigned long long>(
@@ -1393,7 +1396,7 @@ BOOST_AUTO_TEST_CASE(t_max_inflight_writeall_multiround_partial_failure) {
         std::atomic_int competitor_code{-1};
         bbtco [srv, &competitor_done, &competitor_code]() {
             char buf[8]{};
-            auto r = srv->ReadSome(buf, sizeof(buf), Options(5000));
+            auto r = srv->ReadSome(bbt::infra::MutableBytes{buf, sizeof(buf)}, Options(5000));
             competitor_code.store(r ? -2 : static_cast<int>(r.error().code));
             competitor_done.Down();
         };
@@ -1413,8 +1416,8 @@ BOOST_AUTO_TEST_CASE(t_max_inflight_writeall_multiround_partial_failure) {
                    static_cast<unsigned long long>(payload.size()));
     BOOST_CHECK_EQUAL(impl->InflightQuotaHeldForTest(), 0u);
 
-    srv->SetWaitEntryGateForTest({});
-    srv->SetIoWaitRegisteredGateForTest({});
+    TransportWiring::SetWaitEntryGateForTest(*srv, {});
+    TransportWiring::SetIoWaitRegisteredGateForTest(*srv, {});
     cli->RequestClose();
     srv->RequestClose();
     listen.value()->RequestClose();
@@ -1445,7 +1448,7 @@ BOOST_AUTO_TEST_CASE(t_max_inflight_stop_drains_and_generation_boundary) {
     auto socket = std::move(bound).value();
 
     bbt::core::thread::CountDownLatch admitted{1};
-    socket->SetWaitEntryGateForTest([&admitted] { admitted.Down(); });
+    TransportWiring::SetWaitEntryGateForTest(*socket, [&admitted] { admitted.Down(); });
     bbt::core::thread::CountDownLatch recv_done{1};
     bbtco [socket, &recv_done]() {
         char buf[16]{};
@@ -1496,7 +1499,7 @@ BOOST_AUTO_TEST_CASE(t_max_inflight_stop_drains_and_generation_boundary) {
     auto socket2 = std::move(bound2).value();
 
     bbt::core::thread::CountDownLatch admitted2{1};
-    socket2->SetWaitEntryGateForTest([&admitted2] { admitted2.Down(); });
+    TransportWiring::SetWaitEntryGateForTest(*socket2, [&admitted2] { admitted2.Down(); });
     bbt::core::thread::CountDownLatch recv2_done{1};
     std::atomic_int recv2_code{-1};
     bbtco [socket2, &recv2_done, &recv2_code]() {

@@ -14,56 +14,28 @@
 #include <bbt/infra/NetworkTypes.hpp>
 #include <bbt/infra/Result.hpp>
 
+// src 内部装配面（owner 装配 + 测试接缝）只在此前置声明，定义在
+// src/detail/TransportWiring.hpp（不安装、不进 INSTALL_INTERFACE）。
+// 公共头不承载其定义，也不把它们计入对外契约与 ABI。
+namespace bbt::infra::detail {
+struct TransportWiring;
+struct DialWaitOptions;
+} // namespace bbt::infra::detail
+
 namespace bbt::infra::tcp {
 
 class CoTCPListener;
-
-// Issue #32 F2：受管 DialTCP 的等待段接缝（仅 NetworkRuntime 托管路径
-// 装配；未托管静态入口以默认构造 DialWaitOptions 调用，零语义变化）。
-//   extra_cancel           —— Runtime 级关闭源合成的取消令牌：runtime
-//                            关闭时唤醒挂起在 DNS/connect 等待的 dial
-//                            协程走正常归还路径（先于硬销毁兜底）。
-//   dns_on_registered      —— 非空时，DNS 等待段在协程真正挂起（await
-//                            event 已注册入 parked 表）后回调一次。
-//   connect_on_registered  —— 非空时，connect 等待段（EINPROGRESS 的
-//                            fd 可写等待）在协程挂起后回调一次。
-// 约定：回调 noexcept、不得取锁/阻塞——其在 scheduler 恢复路径上执行，
-// 由调用方保证只用于测试同步或登记簿落账。
-struct DialWaitOptions {
-    bbt::coroutine::CancellationToken extra_cancel{};
-    std::function<void()>             dns_on_registered{};
-    std::function<void()>             connect_on_registered{};
-};
-
-// Issue #32 F2：受管 DialTCP 等待段的「未完成 dial」归还凭据（堆上持有，
-// 不依赖协程栈展开）。等待段名额在 Runtime 账本入账后由本凭据担保归还：
-//   - 协程正常返回（成功/失败/取消/超时）：调用方 OnSuccess 后统一归还，
-//     凭据失效；
-//   - runtime->RequestClose()：Runtime 经 extra_cancel 唤醒挂起的 dial
-//     协程走正常返回路径归还；
-//   - Scheduler::Stop 硬销毁挂起协程（不展开栈）：凭据析构 Fail 兜底归还。
-// 两路径经 released 原子标志互斥，不重复归还。
-struct DialWaitPermit {
-    std::function<void()> release;
-    std::atomic_bool      released{false};
-
-    explicit DialWaitPermit(std::function<void()> r) : release(std::move(r)) {}
-    ~DialWaitPermit() { Fail(); }
-    void Fail() noexcept {
-        if (release && !released.exchange(true))
-            release();
-    }
-    void OnSuccess() noexcept { released.store(true); }
-};
 
 class CoTCP final : public ICoNetwork, public ICoCloseable,
                     public std::enable_shared_from_this<CoTCP> {
 public:
     using SPtr = std::shared_ptr<CoTCP>;
 
+    // co-io-adapter/v1 §4.0.1：未受 Runtime 托管的直接 transport 入口
+    // （无 Capacity/在途账本语义）。受管路径另经 src 内部装配面
+    // （detail::TransportWiring）装配等待段取消/归还接缝。
     static result<SPtr> DialTCP(std::string host, std::uint16_t port,
-                                const CallOptions& options,
-                                DialWaitOptions dial_wait = {});
+                                const CallOptions& options);
 
     ~CoTCP() override;
 
@@ -78,67 +50,38 @@ public:
     IoResult WriteSome(ConstBytes src, const CallOptions& options);
     IoResult WriteAll(ConstBytes src, const CallOptions& options);
 
-    // Compatibility with the first transport slice; prefer IoResult overloads
-    // when EOF must be distinguished from a zero-length successful read.
-    result<std::size_t> ReadSome(void* buffer, std::size_t size,
-                                 const CallOptions& options);
-    result<std::size_t> WriteSome(const void* buffer, std::size_t size,
-                                  const CallOptions& options);
-    result<std::size_t> WriteAll(const void* buffer, std::size_t size,
-                                 const CallOptions& options);
-
     void RequestClose() noexcept override;
     bool IsClosed() const noexcept override;
     CloseStatus WaitClosed(bbt::coroutine::Deadline deadline,
                            bbt::coroutine::CancellationToken cancel) override;
 
-    // Runtime 托管登记（co-io-adapter/v1 §4.0.1.2）：工厂在交付前注册，
-    // 物理关闭落定（m_closed_source 触发处）时通知 Runtime 释放容量。
-    void SetClosedHook(std::function<void()> hook) noexcept {
-        m_closed_hook = std::move(hook);
-    }
-
-    // §4.0.1.7：Runtime 级在途配额注入（仅受管对象；未托管入口不装钩，
-    // 未托管入口亦无限额语义）。admit 在 _CheckEntry（参数/协程上下文/
-    // 代际）通过、计入 m_inflight 之前调用——false 即 Overloaded，立即
-    // 返回不挂起；admit 通过的操作在 m_mtx 内登记 m_quota_held++，op
-    // 结束归还 1，RequestClose/析构经 DrainQuota 归还剩余——Stop 不
-    // 展开挂起栈时由对象侧兜底归还，不依赖协程栈 RAII。quota_scope
-    // 强持有 Runtime 共享账本，保证归还发生时账本仍存活。
-    void SetInflightHooks(std::function<bool()> admit,
-                          std::function<void()> release,
-                          std::shared_ptr<void> quota_scope) noexcept {
-        m_inflight_admit = std::move(admit);
-        m_inflight_release = std::move(release);
-        m_inflight_scope = std::move(quota_scope);
-    }
-
-    // 测试接缝（Issue #32）：可等待 op 在参数/上下文/代际检查与名额登记
-    // （m_quota_held++）完成后、进入首次等待循环之前在协程内触发一次；
-    // 生产路径不安装，为空零开销。约定：noexcept、不得回调本对象/取 m_mtx/
-    // 阻塞——持锁线程与同 scheduler 上其他协程依赖它快速返回。
-    void SetWaitEntryGateForTest(std::function<void()> gate) noexcept {
-        m_wait_entry_gate_for_test = std::move(gate);
-    }
-
-    // 测试接缝（Issue #32 F3）：ReadSome/WriteSome 数据路径每次进入
-    // fd 等待（_WaitFd 内 CoWaiter::Wait 的 on_registered，即协程真正
-    // 挂起、事件已登记）后回调一次——与 wait-entry gate（等待循环入口）
-    // 区分，本接缝证明「op 已真实挂起在 fd 等待」。生产路径不安装。
-    // 约定同 SetWaitEntryGateForTest：noexcept、不取锁、不阻塞。
-    void SetIoWaitRegisteredGateForTest(std::function<void()> gate) noexcept {
-        m_io_wait_registered_gate_for_test = std::move(gate);
-    }
-
-    // 测试接缝（Issue #32 F3）：返回底层 fd 供测试调整 socket 选项
-    // （例如缩小 SO_SNDBUF 以确定性触发 EAGAIN/suspended write）。不持有
-    // m_mtx，返回的是对象生命周期内的原始 fd；测试须只在连接建立后、
-    // 关闭前使用，不得关闭/改向。生产路径不调用。
-    int NativeFdForTest() const noexcept { return m_fd; }
 
 private:
     friend class CoTCPListener;
+    friend struct bbt::infra::detail::TransportWiring;
+
+    /* P4-B 硬停强制物理关闭（I1/I3/I4）。**不是公共 API**：本入口是私有非虚成员，
+     * 普通消费者（协议 binding / 应用代码）不可调用，也不在 §4/§5 的契约签名与
+     * 文档契约里。唯一可达路径是内部装配面 detail::TransportWiring 的对象级转发器
+     * （friend 关系）——由 owner 的批量硬停入口逐对象调用，同仓测试亦经该装配面调用。
+     * 前置条件（调用方保证）：执行本对象 op 的调度器已静默——Scheduler::Stop()
+     * 已返回，此后不存在任何线程/回调会执行本对象的 op 或等待回调。
+     * 语义：不受门控，直接物理 close 并落定（close/closesource 取消 + closed_hook），
+     * 幂等（物理关闭恰好一次）；返回 true 表示本次调用完成了物理关闭。
+     * 唯一生产调用点是 owner 的批量硬停入口
+     * （detail::TransportWiring::ForceCloseAfterQuiescence，逐对象调用）：本入口
+     * 不参与运行期路径，运行期关闭仍必须走 RequestClose 的在途门控。
+     * 危险性：非静默状态下调用不安全——在途 op 持有裸 fd 且已注册给 poller，
+     * 立即关闭会让同一 fd 号被新 socket 复用（跨连接串写/UAF）。 */
+    bool ForceCloseAfterQuiescence() noexcept;
+
     explicit CoTCP(int fd) noexcept;
+
+    // 受管 DialTCP：等待段接缝（取消源 + 挂起落定回调）由 owner 经
+    // detail::TransportWiring 装配；公共静态入口以上述默认语义调用本函数。
+    static result<SPtr> _DialTcp(std::string host, std::uint16_t port,
+                                 const CallOptions& options,
+                                 const bbt::infra::detail::DialWaitOptions& dial_wait);
 
     result<void> _CheckEntry(bool in_coroutine_only) const;
 
@@ -146,6 +89,12 @@ private:
                                   const CallOptions& options);
     result<std::size_t> _WriteSome(const void* buffer, std::size_t size,
                                    const CallOptions& options);
+    // WriteAll 的重试循环主体：与 _ReadSome/_WriteSome 共用入口门禁，但
+    // **不**在自身入口占名额——在途粒度是每一轮内部单次写尝试（每轮
+    // admit/归还，见 0005 §4.0.1.7）；已写字节数经 error.transferred_bytes
+    // 回报。公共 WriteAll(ConstBytes) 只做 IoProgress 映射。
+    result<std::size_t> _WriteAll(const void* buffer, std::size_t size,
+                                  const CallOptions& options);
     result<void> _Wait(bool readable, const CallOptions& options);
     void _CloseFd() noexcept; // m_mtx held
     void _EndIo() noexcept;
@@ -175,6 +124,10 @@ private:
         std::make_shared<bbt::coroutine::CancellationSource>()};
     bbt::coroutine::CoObjectInfo m_info;
     std::shared_ptr<bbt::coroutine::sync::CoWaiter> m_waiter;
+    // 以下五组装配状态只经 detail::TransportWiring 读写（不安装到公共面）：
+    //   m_closed_hook / m_inflight_* 由 Runtime owner 装配（登记与账本归还）；
+    //   m_wait_entry_gate_for_test / m_io_wait_registered_gate_for_test 仅供
+    //   测试确定性观察，生产路径不安装（空 std::function 零开销）。
     std::function<void()> m_closed_hook;   // 物理关闭落定通知（Runtime 托管记账）
     // §4.0.1.7 在途配额（仅受管对象注入）：admit/release 经 shared_ptr
     // 账本与 Runtime 配对；scope 保活账本，Stop 不展开栈时由对象侧
@@ -182,10 +135,10 @@ private:
     std::function<bool()> m_inflight_admit;
     std::function<void()> m_inflight_release;
     std::shared_ptr<void> m_inflight_scope;
-    // §4.0.1.7 测试接缝：见 SetWaitEntryGateForTest。
+    // §4.0.1.7 测试接缝：名额登记完成、进入首次等待前回调一次。
     std::function<void()> m_wait_entry_gate_for_test;
-    // §4.0.1.7 F3 测试接缝：见 SetIoWaitRegisteredGateForTest。挂起落定
-    // 后回调（_WaitFd on_registered），证明 op 真实挂在 fd 等待上。
+    // §4.0.1.7 F3 测试接缝：数据路径挂起落定后回调（_WaitFd on_registered），
+    // 证明 op 真实挂在 fd 等待上。
     std::function<void()> m_io_wait_registered_gate_for_test;
 };
 
@@ -206,45 +159,33 @@ public:
 
     result<std::shared_ptr<CoTCP>> Accept(const CallOptions& options);
     SocketAddress LocalAddress() const;
-    void SetAcceptHooks(std::function<bool()> admit,
-                        std::function<void()> release,
-                        std::function<bool(std::shared_ptr<CoTCP>)> adopt) noexcept {
-        m_accept_admit = std::move(admit);
-        m_accept_release = std::move(release);
-        m_accept_adopt = std::move(adopt);
-    }
-
-    // Runtime 托管登记（co-io-adapter/v1 §4.0.1.2）：工厂在交付前注册，
-    // 物理关闭落定时通知 Runtime 释放容量。
-    void SetClosedHook(std::function<void()> hook) noexcept {
-        m_closed_hook = std::move(hook);
-    }
-
-    // §4.0.1.7：同 CoTCP::SetInflightHooks——Accept 的 admit 先于既有
-    // m_accept_admit（连接容量），在挂起等待前判定 Overloaded。
-    void SetInflightHooks(std::function<bool()> admit,
-                          std::function<void()> release,
-                          std::shared_ptr<void> quota_scope) noexcept {
-        m_inflight_admit = std::move(admit);
-        m_inflight_release = std::move(release);
-        m_inflight_scope = std::move(quota_scope);
-    }
-
-    // 测试接缝（Issue #32）：同 CoTCP::SetWaitEntryGateForTest——Accept
-    // 在名额登记完成、首次 accept4/等待前于协程内触发一次。
-    void SetWaitEntryGateForTest(std::function<void()> gate) noexcept {
-        m_wait_entry_gate_for_test = std::move(gate);
-    }
-
-    result<void> _CheckEntry() const;
 
     void RequestClose() noexcept override;
     bool IsClosed() const noexcept override;
     CloseStatus WaitClosed(bbt::coroutine::Deadline deadline,
                            bbt::coroutine::CancellationToken cancel) override;
 
+
 private:
+    friend struct bbt::infra::detail::TransportWiring;
+
+    /* P4-B 硬停强制物理关闭（I1/I3/I4）。**不是公共 API**：本入口是私有非虚成员，
+     * 普通消费者（协议 binding / 应用代码）不可调用，也不在 §4/§5 的契约签名与
+     * 文档契约里。唯一可达路径是内部装配面 detail::TransportWiring 的对象级转发器
+     * （friend 关系）——由 owner 的批量硬停入口逐对象调用，同仓测试亦经该装配面调用。
+     * 前置条件（调用方保证）：执行本对象 op 的调度器已静默——Scheduler::Stop()
+     * 已返回，此后不存在任何线程/回调会执行本对象的 op 或等待回调。
+     * 语义：不受门控，直接物理 close 并落定（close/closesource 取消 + closed_hook），
+     * 幂等（物理关闭恰好一次）；返回 true 表示本次调用完成了物理关闭。
+     * 唯一生产调用点是 owner 的批量硬停入口
+     * （detail::TransportWiring::ForceCloseAfterQuiescence，逐对象调用）：本入口
+     * 不参与运行期路径，运行期关闭仍必须走 RequestClose 的在途门控。
+     * 危险性：非静默状态下调用不安全——在途 op 持有裸 fd 且已注册给 poller，
+     * 立即关闭会让同一 fd 号被新 socket 复用（跨连接串写/UAF）。 */
+    bool ForceCloseAfterQuiescence() noexcept;
+
     explicit CoTCPListener(int fd) noexcept;
+    result<void> _CheckEntry() const;
     void _CloseFd() noexcept; // m_mtx held
     void _EndIo() noexcept;
     // §4.0.1.7：归还本 listener 仍持有的在途名额（m_mtx held；幂等）。
@@ -258,12 +199,31 @@ private:
         }
     }
 
+    // §4.0.1.7：归还本 listener 仍持有的「接纳容量预留」（m_mtx held；幂等）。
+    // Accept 在 m_accept_admit 成功后登记 1，正常终态（adopt 转移 / release
+    // 归还）出账；硬停致挂起 Accept 永不返回时不执行任何出账，只能由
+    // ForceCloseAfterQuiescence 一次性归还——否则 owner 的连接名额永不归零，
+    // 托管链在硬停后无法落定（与 _DrainQuotaLocked 同一 Stop 安全思路）。
+    void _DrainAcceptReservedLocked() noexcept {
+        while (m_accept_reserved > 0) {
+            --m_accept_reserved;
+            if (m_accept_release) m_accept_release();
+        }
+    }
+    // 正常终态出账一个预留（m_mtx held；幂等）。
+    void _ConsumeAcceptReservedLocked() noexcept {
+        if (m_accept_reserved > 0) --m_accept_reserved;
+    }
+
     int m_fd{-1};
     bool m_closed{false};
     bool m_closing{false};
     int m_inflight{0};
     // §4.0.1.7：已 admit 未归还的 Runtime 在途名额（m_mtx 保护）。
     std::size_t m_quota_held{0};
+    // §4.0.1.7：本 listener 已 m_accept_admit 未出账的连接容量预留数
+    // （m_mtx 保护）。见 _DrainAcceptReservedLocked。
+    std::size_t m_accept_reserved{0};
     mutable std::mutex m_mtx;
     std::atomic_bool m_close_waiting{false};
     std::shared_ptr<bbt::coroutine::CancellationSource> m_close_source{
@@ -272,6 +232,9 @@ private:
         std::make_shared<bbt::coroutine::CancellationSource>()};
     bbt::coroutine::CoObjectInfo m_info;
     std::shared_ptr<bbt::coroutine::sync::CoWaiter> m_waiter;
+    // 以下装配状态只经 detail::TransportWiring 读写（不安装到公共面）：
+    // ClosedHook（物理关闭落定记账）、Accept 容量/接纳收养钩、在途账本钩、
+    // 测试等待入口 gate。
     std::function<void()> m_closed_hook;   // 物理关闭落定通知（Runtime 托管记账）
     std::function<bool()> m_accept_admit;
     std::function<void()> m_accept_release;
@@ -281,7 +244,7 @@ private:
     std::function<bool()> m_inflight_admit;
     std::function<void()> m_inflight_release;
     std::shared_ptr<void> m_inflight_scope;
-    // §4.0.1.7 测试接缝：见 SetWaitEntryGateForTest。
+    // §4.0.1.7 测试接缝：名额登记完成、首次 accept4/等待前回调一次。
     std::function<void()> m_wait_entry_gate_for_test;
 };
 

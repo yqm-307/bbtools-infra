@@ -522,6 +522,27 @@ IoResult CoUDP::Send(ConstBytes packet, const SocketAddress& peer,
     return output;
 }
 
+bool CoUDP::ForceCloseAfterQuiescence() noexcept {
+    {
+        std::lock_guard<std::mutex> lock(m_mtx);
+        if (m_physically_closed)
+            return false;       // 幂等：物理关闭恰好一次
+        m_close_requested = true;
+        // §4.0.1.7：硬停致挂起协程不返回，剩余名额在封口头一次性归还。
+        while (m_quota_held > 0) {
+            --m_quota_held;
+            if (m_inflight_release) m_inflight_release();
+        }
+        // 硬停闸门：故意绕过 m_inflight 门控（前置条件由调用方保证）。
+        _CloseFd();
+    }
+    m_close_source->RequestCancel();
+    m_closed_source->RequestCancel();
+    if (m_closed_hook)
+        m_closed_hook();
+    return true;
+}
+
 void CoUDP::_CloseFd() noexcept {
     // 物理 close：仅析构与 RequestClose 的 in-flight 归零路径调用。
     if (m_fd >= 0) {

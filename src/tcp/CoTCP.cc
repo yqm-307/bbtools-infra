@@ -27,6 +27,7 @@
 #include <unordered_set>
 
 #include "detail/IoSupport.hpp"
+#include "detail/TransportWiring.hpp"
 
 namespace bbt::infra::tcp {
 namespace {
@@ -275,14 +276,22 @@ IoResult CoTCP::WriteSome(ConstBytes src, const CallOptions& options) {
 }
 
 IoResult CoTCP::WriteAll(ConstBytes src, const CallOptions& options) {
-    auto written = WriteAll(src.data, src.size, options);
+    auto written = _WriteAll(src.data, src.size, options);
     if (!written) return IoResult::err(std::move(written).error());
     return IoResult::ok(IoProgress{IoState::Ok, written.value()});
 }
 
 result<CoTCP::SPtr> CoTCP::DialTCP(std::string host, std::uint16_t port,
-                                    const CallOptions& options,
-                                    DialWaitOptions dial_wait) {
+                                   const CallOptions& options) {
+    // 未托管入口：不装配取消源与挂起落定接缝，语义等同于默认构造的
+    // DialWaitOptions（见 src/detail/TransportWiring.hpp）。
+    return _DialTcp(std::move(host), port, options,
+                    bbt::infra::detail::DialWaitOptions{});
+}
+
+result<CoTCP::SPtr> CoTCP::_DialTcp(
+    std::string host, std::uint16_t port, const CallOptions& options,
+    const bbt::infra::detail::DialWaitOptions& dial_wait) {
     sockaddr_storage numeric{};
     socklen_t numeric_len = 0;
     addrinfo* results = nullptr;
@@ -293,7 +302,7 @@ result<CoTCP::SPtr> CoTCP::DialTCP(std::string host, std::uint16_t port,
             reinterpret_cast<sockaddr_in6*>(&numeric)->sin6_port = ::htons(port);
     } else {
         auto resolved = _ResolveHost(host, port, options,
-                                     std::move(dial_wait.dns_on_registered),
+                                     dial_wait.dns_on_registered,
                                      dial_wait.extra_cancel);
         if (!resolved)
             return result<SPtr>::err(std::move(resolved).error());
@@ -468,18 +477,8 @@ result<std::size_t> CoTCP::_WriteSome(const void* buffer, std::size_t size,
     return output;
 }
 
-result<std::size_t> CoTCP::ReadSome(void* buffer, std::size_t size,
-                                    const CallOptions& options) {
-    return _ReadSome(buffer, size, options);
-}
-
-result<std::size_t> CoTCP::WriteSome(const void* buffer, std::size_t size,
+result<std::size_t> CoTCP::_WriteAll(const void* buffer, std::size_t size,
                                      const CallOptions& options) {
-    return _WriteSome(buffer, size, options);
-}
-
-result<std::size_t> CoTCP::WriteAll(const void* buffer, std::size_t size,
-                                    const CallOptions& options) {
     if (size && !buffer)
         return result<std::size_t>::err(MakeError(ErrorCode::InvalidArgument,
             "null TCP write buffer"));
@@ -561,6 +560,24 @@ void CoTCP::RequestClose() noexcept {
         if (m_closed_hook) m_closed_hook();
     }
 }
+bool CoTCP::ForceCloseAfterQuiescence() noexcept {
+    {
+        std::lock_guard<std::mutex> lock(m_mtx);
+        if (m_closed)
+            return false;      // 幂等：物理关闭恰好一次
+        m_closing = true;
+        _DrainQuotaLocked();
+        // 硬停闸门：此处故意绕过 m_inflight 门控。前置条件由调用方保证
+        // （仅 Scheduler::Stop() 返回后才允许），见头文件注释。
+        _CloseFd();
+    }
+    m_close_source->RequestCancel();
+    m_closed_source->RequestCancel();
+    if (m_closed_hook)
+        m_closed_hook();
+    return true;
+}
+
 bool CoTCP::IsClosed() const noexcept {
     std::lock_guard<std::mutex> lock(m_mtx);
     return m_closed;
@@ -585,6 +602,27 @@ CloseStatus CoTCP::WaitClosed(bbt::coroutine::Deadline deadline,
     if (status == CombinedWaitStatus::TimedOut) return CloseStatus::TimedOut;
     if (status == CombinedWaitStatus::InvalidContext) return CloseStatus::InvalidContext;
     return CloseStatus::RuntimeUnavailable;
+}
+
+bool CoTCPListener::ForceCloseAfterQuiescence() noexcept {
+    {
+        std::lock_guard<std::mutex> lock(m_mtx);
+        if (m_closed)
+            return false;      // 幂等：物理关闭恰好一次
+        m_closing = true;
+        _DrainQuotaLocked();
+        // §4.0.1.7：挂起的 Accept 永不返回 ⇒ 其连接容量预留必须在此归还，
+        // 否则 owner 的连接名额永不归零、托管链在硬停后无法落定。
+        _DrainAcceptReservedLocked();
+        // 硬停闸门：此处故意绕过 m_inflight 门控。前置条件由调用方保证
+        // （仅 Scheduler::Stop() 返回后才允许），见头文件注释。
+        _CloseFd();
+    }
+    m_close_source->RequestCancel();
+    m_closed_source->RequestCancel();
+    if (m_closed_hook)
+        m_closed_hook();
+    return true;
 }
 
 CoTCPListener::CoTCPListener(int fd) noexcept
@@ -689,10 +727,26 @@ result<std::shared_ptr<CoTCP>> CoTCPListener::Accept(const CallOptions& options)
                 ErrorCode::Overloaded, "TCP accept: runtime max_inflight exceeded"));
         quota_admitted = true;
     }
-    if (m_accept_admit && !m_accept_admit()) {
-        if (quota_admitted && m_inflight_release) m_inflight_release();
-        return result<std::shared_ptr<CoTCP>>::err(
-            MakeError(ErrorCode::Overloaded, "TCP accept capacity exceeded"));
+    bool capacity_reserved = false;
+    // §4.0.1.7：接纳容量预留的出账凭据。正常终态（adopt 转移 / release 归还）
+    // 由本 RAII 出账；硬停不展开协程栈、本 op 永不返回 ⇒ 凭据不执行，改由
+    // ForceCloseAfterQuiescence 经 _DrainAcceptReservedLocked 兜底归还。
+    struct ReservedLedger {
+        CoTCPListener* self{nullptr};
+        ~ReservedLedger() {
+            if (self) {
+                std::lock_guard<std::mutex> lock(self->m_mtx);
+                self->_ConsumeAcceptReservedLocked();
+            }
+        }
+    } reserved_ledger;
+    if (m_accept_admit) {
+        if (!m_accept_admit()) {
+            if (quota_admitted && m_inflight_release) m_inflight_release();
+            return result<std::shared_ptr<CoTCP>>::err(
+                MakeError(ErrorCode::Overloaded, "TCP accept capacity exceeded"));
+        }
+        capacity_reserved = true;
     }
     int fd_to_wait;
     {
@@ -705,6 +759,11 @@ result<std::shared_ptr<CoTCP>> CoTCPListener::Accept(const CallOptions& options)
         }
         fd_to_wait = m_fd;
         ++m_inflight;
+        // 本次 Accept 占用的连接容量预留登记在对象上，出账凭据随即生效。
+        if (capacity_reserved) {
+            ++m_accept_reserved;
+            reserved_ledger.self = this;
+        }
         if (quota_admitted)
             ++m_quota_held;
     }
