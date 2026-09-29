@@ -38,7 +38,11 @@ set_tests_properties(udp.loopback PROPERTIES TIMEOUT 30)
 # TCP/UDP 消费者无需 HTTP」的编译/链接证据。覆盖 owner 门禁与参数校验、
 # 容量名额与物理关闭后才归还、真实 loopback 收发 + 关闭生命周期、多 owner
 # 配额隔离、关闭期已接纳挂起 op 的唤醒与归还。
+# Issue #32/内部装配面：本目标直接驱动 transport owner 的测试探针与
+# 等待入口 gate（detail::TransportWiring，src 内部头）——仅本目标可见。
 add_executable(Test_transport_runtime Test_transport_runtime.cc)
+target_include_directories(Test_transport_runtime PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(Test_transport_runtime
     PRIVATE bbt::infra_transport Boost::boost Threads::Threads)
 target_compile_options(Test_transport_runtime PRIVATE -Wall -Wextra)
@@ -191,3 +195,28 @@ if(TARGET bbt_infra_rpc)
         bbt::infra_rpc bbt::infra_http Boost::boost Threads::Threads)
     target_compile_options(bbt_rpc_wire_peer PRIVATE -Wall -Wextra)
 endif()
+
+# --- P4-B 硬停 quiescence（对象级，未托管对象）：Scheduler::Stop() 返回后强制
+# 物理关闭与 closed_hook 一次性。装配接缝与测试 gate 经 src 内部装配面
+# （detail::TransportWiring）调用——公共头已不承载它们（P4-C）。
+add_executable(Test_hardstop_quiescence Test_hardstop_quiescence.cc)
+target_include_directories(Test_hardstop_quiescence PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)   # detail/TransportWiring.hpp
+target_link_libraries(Test_hardstop_quiescence
+    PRIVATE bbt::infra_tcp bbt::infra_udp Boost::boost Threads::Threads)
+target_compile_options(Test_hardstop_quiescence PRIVATE -Wall -Wextra)
+add_test(NAME hardstop.quiescence COMMAND Test_hardstop_quiescence)
+set_tests_properties(hardstop.quiescence PROPERTIES TIMEOUT 60)
+
+# --- P4 owner 硬停收口：协议 owner（NetworkRuntimeImpl）批量强制关闭受管
+# transport，并验证托管链在硬停后收敛（transport IsClosed + 协议 owner IsClosed）。
+# 覆盖 listener / accepted TCP / UDP 三种受管对象与 WaitClosed 的硬停后实测口径。
+add_executable(Test_hardstop_owner_convergence Test_hardstop_owner_convergence.cc)
+target_include_directories(Test_hardstop_owner_convergence PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)   # detail/TransportWiring.hpp、http/NetworkRuntimeImpl.hpp
+target_link_libraries(Test_hardstop_owner_convergence
+    PRIVATE bbt::infra_http bbt::infra_tcp bbt::infra_udp
+            Boost::boost Threads::Threads)
+target_compile_options(Test_hardstop_owner_convergence PRIVATE -Wall -Wextra)
+add_test(NAME hardstop.owner_convergence COMMAND Test_hardstop_owner_convergence)
+set_tests_properties(hardstop.owner_convergence PROPERTIES TIMEOUT 120)

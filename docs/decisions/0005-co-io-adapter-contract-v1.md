@@ -574,3 +574,83 @@ Mongo 维持 `0004` 的 C 级 worker bridge 例外：这是当前实现的兼容
 - [hiredis 固定版本函数表](https://github.com/redis/hiredis/blob/616f2286ba5503f74ae96e720623fa11dbc690af/hiredis.h#L242-L254)
 - [hiredis 同步缓冲与读取推进](https://github.com/redis/hiredis/blob/616f2286ba5503f74ae96e720623fa11dbc690af/hiredis.c#L983-L1096)
 - [KCP 接口](https://github.com/skywind3000/kcp/blob/master/ikcp.h)与 [output 调用点](https://github.com/skywind3000/kcp/blob/master/ikcp.c)：本次读取 master，仅作接口调查；实施前必须固定 commit，不将浮动来源用作可复现验收基线。
+
+
+---
+
+## 13. 公共面净删减记录（P4-C：实现回收，非契约变更）
+
+本节只记录把「实现比契约多」的部分回收回契约面的结果。§4/§5 的冻结签名**不变**，
+因此这不是契约修订，也不新增任何能力。
+
+- **删除首切片兼容壳**：`CoTCP::ReadSome/WriteSome/WriteAll(void*, size_t, const CallOptions&)`
+  三个 `result<std::size_t>` 重载已从公共头删除。它们在公共面上制造第二种 EOF 语义
+  （读回 0 与 EOF 不可分、零长度请求返回 `ok(0)`），与 §4 冻结的 `IoResult` 形态二义并存；
+  删除后绑定侧 `read`/`write` 的映射点唯一为 `IoResult`（§8.1「不伪造读到 0 字节等于 EOF」）。
+  重试循环降为私有 `_WriteAll`，在途粒度与语义不变（见 §4.0.1 第 7 条）。
+- **装配接缝移出公共头**：`SetClosedHook`、`SetInflightHooks`、`SetAcceptHooks`、受管 dial
+  等待段接缝（`DialWaitOptions`/`DialWaitPermit`）与测试接缝（`SetWaitEntryGateForTest`、
+  `SetIoWaitRegisteredGateForTest`、`NativeFdForTest`、`InflightQuotaHeldForTest`、
+  `SetDialWaitEntryGateForTest`）现位于 `src/detail/TransportWiring.hpp`——src 内部头，
+  不安装、不进 `INSTALL_INTERFACE`，只由 src 内 target 与同仓测试经 PRIVATE include 使用。
+  行为约束（谁在什么终态归还一次名额、admit 的门禁位置、`ClosedHook` 是唯一落定信号、
+  Stop 不展开栈时由对象侧兜底归还）仍以 §4.0.1 与 §6 为准；装配入口不再是公共 API。
+- **实现细节不再出现在公共可见成员面**：`CoTCPListener::_CheckEntry()` 与 listener 的
+  `Set*` 移入 private；`CoTCP::DialTCP` 只保留契约形态 `(host, port, options)`，受管等待段
+  经内部装配面装配。
+- **未新增（本节仅限 P4-C 公共面）**：无 readiness-only 就绪原语（§3.2 语义不变）、无万能协议抽象、无新 transport
+  层；`NetworkRuntime` 的 `DialTCP/ListenTCP/BindUDP` 转发面保留不变；`max_connections`/
+  `max_inflight`/**运行期**关闭门控未改动（`RequestClose`/`_EndIo` 的 `m_inflight` 物理关闭门控保留）；
+  同批集成新增的硬停入口见 §14——本节不覆盖硬停，也不得被读成「硬停未新增」。
+- **兼容影响**：这是公共头与 ABI 的破坏性收敛（删除公共重载与 owner 侧两个虚方法槽位）。
+  本仓消费者（`src/http/NetworkRuntimeImpl`、`tests/`）已全部迁移并通过验证；本仓**无法**
+  判定是否存在仓外消费者，故合入前仍须按 `0002` 走下游协调与影响记录。
+
+
+---
+
+## 14. P4-B / owner 硬停（hard-stop）收敛入口记录（实现新增，不新增公共契约能力）
+
+本节记录对象级与 owner 级强制物理关闭入口的现状、前置条件、可见性、ABI/下游影响与
+**当前协调状态**。§4/§5 的冻结签名（含 §4.0.1.7 容量/在途账本语义、`RequestClose`
+的关闭门控）一字未改；本节记录的是「调度器静默后协议 owner 如何把托管链收口」这一
+实现面事实，以及它对公共面的真实影响。
+
+### 14.1 入口清单与可见性
+
+| 入口 | 位置 | 可见性 | 语义 |
+|---|---|---|---|
+| `CoTCP::ForceCloseAfterQuiescence()` / `CoTCPListener::ForceCloseAfterQuiescence()` / `CoUDP::ForceCloseAfterQuiescence()` | 各自类定义的 **private** 段（`include/bbt/infra/CoTCP.hpp`、`CoUDP.hpp`） | **private、非虚、非 static**；消费者不可调用 | 不受在途门控，直接物理 close（close/closesource 取消 + `ClosedHook`），幂等；返回本次是否完成物理关闭 |
+| `detail::TransportWiring::ForceCloseAfterQuiescence(CoTCP& / CoTCPListener& / CoUDP&)` | `src/detail/TransportWiring.hpp`（不安装） | src 内部头 + friend 转发器 | 对象级私有入口的唯一可达路径；owner 对象分派与同仓测试都经它调用 |
+| `transport_detail::TransportRuntimeImpl::ForceCloseAfterQuiescence()` | `src/transport/TransportRuntimeImpl.hpp`（不安装） | src 内部头；公共抽象面**无**此槽位 | transport owner 批量硬停：封口 + 归还未完成受管 dial 名额 + 逐对象强制物理关闭 + `MaybeMarkClosed` |
+| `detail::TransportWiring::ForceCloseAfterQuiescence(TransportRuntime&)` | `src/detail/TransportWiring.hpp`（不安装） | src 内部头 | 上一行的 owner 侧唯一生产调用入口 |
+| `http_detail::NetworkRuntimeImpl::ForceCloseAfterQuiescence()` | `src/http/NetworkRuntimeImpl.hpp`（不安装） | src 内部头；`NetworkRuntime` 抽象面**无**此槽位 | 协议 owner 硬停：置硬停闸门 → 驱动 transport owner → off-domain 收口 HTTP 子对象 → 就地落定 |
+
+- 私有成员仍在安装头的类定义里（C++ 不能把非虚成员声明移出类），但**不可被消费者调用**，
+  也不出现在 §4/§5 契约签名、文档契约或任何安装接口中；这是「收回公共可见性」的实际含义。
+- `NetworkRuntime`（公共抽象面）没有硬停入口：生产宿主当前只能经上述 src 内部装配面/impl 头
+  调用。是否提升为公共契约入口需用户与接口负责人裁决——本切片未擅自扩大公共面。
+
+### 14.2 前置条件与误用危险
+
+- 前置条件（调用方保证）：执行这些对象/owner op 的调度器已静默——`Scheduler::Stop()`
+  已返回，此后不存在任何线程/回调会执行其 op 或等待回调。
+- 危险：非静默状态下调用不安全——在途 op 持有裸 fd 且已注册给 poller，立即关闭会让同一
+  fd 号被新 socket 复用（跨连接串写/UAF）。
+- 运行期关闭路径未变：`RequestClose` / `_EndIo` 的 `m_inflight` 门控保留；「立即关闭」只在
+  其前置条件成立时可用。
+- 落定口径（实测，不伪造）：硬停后 `WaitClosed` 返回 `CloseStatus::InvalidContext`——本线程
+  无协程上下文，且 `Stop()` 后代际消失的检查早于 `IsClosed()`；落定只能以 `IsClosed()` /
+  `ClosedHook` 计数 / owner 名额归零观测，该路径不得写成「`WaitClosed` 返回 Closed」。
+
+### 14.3 ABI 与下游影响
+
+- **ABI**：对象级入口是 private 非虚成员——不占虚表槽位、不改变类型布局，所以把它从 public
+  移到 private 不是二进制 ABI 变化；该名字只存在于 HEAD 之后的未发布候选，公开镜像中没有
+  可依赖它的已发布 ABI。owner 侧入口位于不安装的 src 内部头，同样不进公共 ABI。
+- **源码级影响**：`ForceCloseAfterQuiescence` 不再是可被消费者直接调用的对象方法。本仓内
+  消费者已全部迁移：owner 对象分派（`src/transport/TransportRuntime.cc`）与测试
+  （`tests/Test_hardstop_quiescence.cc`）经 `detail::TransportWiring` 转发器调用。
+- **下游协调状态（0002 要求，如实记录）**：本记录**没有**任何已完成的下游影响协调或用户确认
+  依据，因此状态为**待协调**，不得视为已完成；本仓无法判定是否存在仓外消费者。相关改动
+  （本节硬停入口 + §13 公共面收敛）在合入前仍须按 `0002` 记录影响、协调下游并取得用户确认。

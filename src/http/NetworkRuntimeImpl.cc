@@ -90,7 +90,7 @@ result<void> NetworkRuntimeImpl::CheckUsableForFactory() const {
 void NetworkRuntimeImpl::AdoptTransportOwner() {
     std::weak_ptr<NetworkRuntimeImpl> weak =
         std::static_pointer_cast<NetworkRuntimeImpl>(shared_from_this());
-    m_transport->SetClosedHook([weak] {
+    detail::TransportWiring::SetClosedHook(*m_transport, [weak] {
         if (auto rt = weak.lock())
             rt->MaybeFinalize();
     });
@@ -290,6 +290,30 @@ void NetworkRuntimeImpl::RequestClose() noexcept {
         TeardownOffDomain();
 }
 
+std::size_t NetworkRuntimeImpl::ForceCloseAfterQuiescence() noexcept {
+    // 前置条件：Scheduler::Stop() 已返回。本入口不复用 RequestClose 的
+    // BeginClose 早退——「已 RequestClose 但 teardown 落在已死 io 域上」的硬停
+    // 是必须能收口的形态，故各步骤幂等且不依赖调用顺序。
+    // 闸门先置位：随后任何 MaybeFinalize（含 transport 落定 hook 与本入口尾部
+    // 的 teardown 路径）都就地落定，不投递已死的 io 域——投递成功也会丢失落定。
+    m_hard_stop.store(true);
+    m_close.BeginClose();          // 幂等：已封口时无副作用
+    m_state.store(kClosingOrClosed);
+    // transport owner 自证落定：批量强制物理关闭使其 IsClosed 观察点在硬停后
+    // 可达（本切片不再持有第二份 transport 记账）。
+    const std::size_t forced =
+        detail::TransportWiring::ForceCloseAfterQuiescence(*m_transport);
+    if (!m_engine->Started()) {
+        // 未 Start：无 io 资源，直接落定（与 RequestClose 同一分支）。
+        m_close.MarkClosed();
+        return forced;
+    }
+    // 硬停后 io 域已无执行体：走 off-domain 收口（与 RequestClose 的 TryPost
+    // 失败降级路径同一实现），不尝试投递。
+    TeardownOffDomain();
+    return forced;
+}
+
 void NetworkRuntimeImpl::TeardownOnIoDomain() noexcept {
     std::vector<std::shared_ptr<IIoTeardown>> children;
     {
@@ -355,7 +379,9 @@ void NetworkRuntimeImpl::MaybeFinalize() noexcept {
         m_finalize_started = true;
     }
     auto self = shared_from_this();
-    if (!m_engine->TryPost([self] { self->FinalizeEngine(); }))
+    // 硬停闸门（I5）：Scheduler::Stop() 已返回后 io 域不再执行任何任务，投递成功
+    // 也会丢失落定 ⇒ 就地落定。运行期路径一字未改（闸门只由硬停入口置位）。
+    if (m_hard_stop.load() || !m_engine->TryPost([self] { self->FinalizeEngine(); }))
         FinalizeEngine();
 }
 

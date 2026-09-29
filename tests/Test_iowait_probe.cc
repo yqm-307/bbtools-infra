@@ -345,10 +345,10 @@ int main() {
         return 1;
     }
 
+    ScenarioTimeoutFirst();
     ScenarioFdFirst();
     ScenarioCustomFirst();
     ScenarioCustomBeforePark();
-    ScenarioTimeoutFirst();
 
     g_scheduler->Stop();
 

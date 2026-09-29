@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -12,6 +13,12 @@
 #include <bbt/infra/ICoNetwork.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
 #include <bbt/infra/Result.hpp>
+
+// src 内部装配面（owner 装配 + 测试接缝）前置声明；定义在
+// src/detail/TransportWiring.hpp（不安装、不进 INSTALL_INTERFACE）。
+namespace bbt::infra::detail {
+struct TransportWiring;
+} // namespace bbt::infra::detail
 
 namespace bbt::infra::udp {
 
@@ -59,31 +66,25 @@ public:
     CloseStatus WaitClosed(bbt::coroutine::Deadline deadline,
                            bbt::coroutine::CancellationToken cancel) override;
 
-    void SetClosedHook(std::function<void()> hook) noexcept {
-        m_closed_hook = std::move(hook);
-    }
-
-    // §4.0.1.7：Runtime 级在途配额注入（仅受管对象；未托管入口不装钩）。
-    // admit 在 _CheckEntry 通过、计入 m_inflight 之前调用——返回 false
-    // 即 Overloaded，立即返回不挂起；quota_scope 保活 Runtime 共享账本，
-    // Stop 不展开挂起协程栈时由对象侧归还，不依赖栈上 RAII。
-    void SetInflightHooks(std::function<bool()> admit,
-                          std::function<void()> release,
-                          std::shared_ptr<void> quota_scope) noexcept {
-        m_inflight_admit = std::move(admit);
-        m_inflight_release = std::move(release);
-        m_inflight_scope = std::move(quota_scope);
-    }
-
-    // 测试接缝（Issue #32）：可等待 op 在参数/上下文/代际检查与名额登记
-    // （m_quota_held++）完成后、进入首次等待循环之前在协程内触发一次；
-    // 生产路径不安装，为空零开销。约定：noexcept、不得回调本对象/取 m_mtx/
-    // 阻塞——持锁线程与同 scheduler 上其他协程依赖它快速返回。
-    void SetWaitEntryGateForTest(std::function<void()> gate) noexcept {
-        m_wait_entry_gate_for_test = std::move(gate);
-    }
 
 private:
+    friend struct bbt::infra::detail::TransportWiring;
+
+    /* P4-B 硬停强制物理关闭（I1/I3/I4）。**不是公共 API**：本入口是私有非虚成员，
+     * 普通消费者（协议 binding / 应用代码）不可调用，也不在 §4/§5 的契约签名与
+     * 文档契约里。唯一可达路径是内部装配面 detail::TransportWiring 的对象级转发器
+     * （friend 关系）——由 owner 的批量硬停入口逐对象调用，同仓测试亦经该装配面调用。
+     * 前置条件（调用方保证）：执行本对象 op 的调度器已静默——Scheduler::Stop()
+     * 已返回，此后不存在任何线程/回调会执行本对象的 op 或等待回调。
+     * 语义：不受门控，直接物理 close 并落定（close/closesource 取消 + closed_hook），
+     * 幂等（物理关闭恰好一次）；返回 true 表示本次调用完成了物理关闭。
+     * 唯一生产调用点是 owner 的批量硬停入口
+     * （detail::TransportWiring::ForceCloseAfterQuiescence，逐对象调用）：本入口
+     * 不参与运行期路径，运行期关闭仍必须走 RequestClose 的在途门控。
+     * 危险性：非静默状态下调用不安全——在途 op 持有裸 fd 且已注册给 poller，
+     * 立即关闭会让同一 fd 号被新 socket 复用（跨连接串写/UAF）。 */
+    bool ForceCloseAfterQuiescence() noexcept;
+
     explicit CoUDP(int fd, bbt::coroutine::CoObjectInfo info) noexcept;
 
     // §5.2 组合等待输入登记（readable/writable + deadline + cancel + close）
@@ -114,13 +115,15 @@ private:
     std::shared_ptr<bbt::coroutine::CancellationSource> m_closed_source{
         std::make_shared<bbt::coroutine::CancellationSource>()};
     std::atomic_bool m_close_waiting{false};
+    // 以下装配状态只经 detail::TransportWiring 读写（不安装到公共面）：
+    // ClosedHook（物理关闭落定记账）、在途账本钩、测试等待入口 gate。
     std::function<void()> m_closed_hook;
     // §4.0.1.7 在途配额（仅受管对象注入）：admit/release 与 Runtime
     // 账本严格配对，scope 保活账本跨越 Stop→Start 代际。
     std::function<bool()> m_inflight_admit;
     std::function<void()> m_inflight_release;
     std::shared_ptr<void> m_inflight_scope;
-    // §4.0.1.7 测试接缝：见 SetWaitEntryGateForTest。
+    // §4.0.1.7 测试接缝：名额登记完成、进入首次等待前回调一次。
     std::function<void()> m_wait_entry_gate_for_test;
 };
 

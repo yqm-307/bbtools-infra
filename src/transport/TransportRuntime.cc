@@ -20,6 +20,20 @@ void ReleaseTransportSlot(std::mutex& mtx, std::size_t& count) noexcept {
     if (count > 0) --count;
 }
 
+// P4 硬停批量关闭的对象分派：受管 child 集合只由三个工厂产生
+// （DialTCP / ListenTCP / BindUDP），故三个分支穷尽；返回是否在本次调用完成
+// 物理关闭。分派走 RTTI 而非新增公共虚槽位——硬停入口不是协议消费者的 API。
+bool ForceCloseChild(ICoCloseable& child) noexcept {
+    // 对象级入口是 private 内部装配面（见其注释），故经 friend 转发器调用。
+    if (auto* conn = dynamic_cast<tcp::CoTCP*>(&child))
+        return detail::TransportWiring::ForceCloseAfterQuiescence(*conn);
+    if (auto* listener = dynamic_cast<tcp::CoTCPListener*>(&child))
+        return detail::TransportWiring::ForceCloseAfterQuiescence(*listener);
+    if (auto* socket = dynamic_cast<udp::CoUDP*>(&child))
+        return detail::TransportWiring::ForceCloseAfterQuiescence(*socket);
+    return false;   // 受管集合不含其他类型（三个工厂是唯一来源）
+}
+
 } // namespace
 
 result<void> TransportRuntimeImpl::Start() {
@@ -109,7 +123,7 @@ result<std::shared_ptr<CoTCP>> TransportRuntimeImpl::DialTCP(
     // owner 析构时成员析构（~DialWaitPermit）归还剩余。栈上只保留弱引用观察
     // 终态。
     auto dial_cancel = std::make_shared<bbt::coroutine::CancellationSource>();
-    auto permit = std::make_shared<tcp::DialWaitPermit>(
+    auto permit = std::make_shared<detail::DialWaitPermit>(
         [quota = m_inflight_quota] { quota->Release(); });
     {
         std::lock_guard<std::mutex> lk(m_transport_mtx);
@@ -119,7 +133,7 @@ result<std::shared_ptr<CoTCP>> TransportRuntimeImpl::DialTCP(
         }
     }
 
-    tcp::DialWaitOptions dial_wait;
+    detail::DialWaitOptions dial_wait;
     dial_wait.extra_cancel = dial_cancel->Token();
     // 测试接缝：等待段挂起落定（协程已进入 parked 表）后回调一次，用于
     // 确定性区分「等待中取消/Stop」与「未进入等待」。
@@ -129,8 +143,8 @@ result<std::shared_ptr<CoTCP>> TransportRuntimeImpl::DialTCP(
         dial_wait.connect_on_registered = std::move(gate);
     }
 
-    auto dialed = tcp::CoTCP::DialTCP(std::move(endpoint.host), endpoint.port,
-                                      options, std::move(dial_wait));
+    auto dialed = detail::TransportWiring::DialTCP(
+        std::move(endpoint.host), endpoint.port, options, dial_wait);
     // 等待段已结束（成功/失败/取消/超时）：正常路径归还名额并从登记簿移除
     // ——归还与 permit->Fail 幂等互斥（released 原子位），不重复。
     permit->Fail();
@@ -159,13 +173,13 @@ result<std::shared_ptr<CoTCP>> TransportRuntimeImpl::DialTCP(
                 std::static_pointer_cast<TransportRuntimeImpl>(
                     shared_from_this());
             std::weak_ptr<CoTCP> child = connection;
-            connection->SetClosedHook([weak, child] {
+            detail::TransportWiring::SetClosedHook(*connection, [weak, child] {
                 auto rt = weak.lock();
                 auto object = child.lock();
                 if (rt && object)
                     rt->OnTransportClosed(object.get());
             });
-            connection->SetInflightHooks(
+            detail::TransportWiring::SetInflightHooks(*connection,
                 [quota = m_inflight_quota] { return quota->TryAdmit(); },
                 [quota = m_inflight_quota] { quota->Release(); },
                 m_inflight_quota);
@@ -222,13 +236,13 @@ result<std::shared_ptr<CoTCPListener>> TransportRuntimeImpl::ListenTCP(
     std::weak_ptr<TransportRuntimeImpl> weak =
         std::static_pointer_cast<TransportRuntimeImpl>(shared_from_this());
     std::weak_ptr<CoTCPListener> child = listener;
-    listener->SetClosedHook([weak, child] {
+    detail::TransportWiring::SetClosedHook(*listener, [weak, child] {
         auto rt = weak.lock();
         auto object = child.lock();
         if (rt && object)
             rt->OnTransportClosed(object.get());
     });
-    listener->SetAcceptHooks(
+    detail::TransportWiring::SetAcceptHooks(*listener,
         [weak] {
             auto rt = weak.lock();
             if (!rt) return false;
@@ -251,7 +265,7 @@ result<std::shared_ptr<CoTCPListener>> TransportRuntimeImpl::ListenTCP(
             std::lock_guard<std::mutex> lk(rt->m_transport_mtx);
             if (rt->m_transport_sealed) return false;
             std::weak_ptr<CoTCP> child = accepted;
-            accepted->SetClosedHook([weak, child] {
+            detail::TransportWiring::SetClosedHook(*accepted, [weak, child] {
                 auto rt_locked = weak.lock();
                 auto child_locked = child.lock();
                 if (rt_locked && child_locked)
@@ -259,7 +273,7 @@ result<std::shared_ptr<CoTCPListener>> TransportRuntimeImpl::ListenTCP(
             });
             // §4.0.1.7：接纳的 socket 同样挂本 owner 在途账本——其
             // ReadSome/WriteSome/WriteAll 占用同一 max_inflight 预算。
-            accepted->SetInflightHooks(
+            detail::TransportWiring::SetInflightHooks(*accepted,
                 [quota = rt->m_inflight_quota] { return quota->TryAdmit(); },
                 [quota = rt->m_inflight_quota] { quota->Release(); },
                 rt->m_inflight_quota);
@@ -267,7 +281,7 @@ result<std::shared_ptr<CoTCPListener>> TransportRuntimeImpl::ListenTCP(
             return true;
         });
     // §4.0.1.7：listener 的 Accept 占用同一 max_inflight 账本。
-    listener->SetInflightHooks(
+    detail::TransportWiring::SetInflightHooks(*listener,
         [quota = m_inflight_quota] { return quota->TryAdmit(); },
         [quota = m_inflight_quota] { quota->Release(); },
         m_inflight_quota);
@@ -302,14 +316,14 @@ result<std::shared_ptr<CoUDP>> TransportRuntimeImpl::BindUDP(
                 std::static_pointer_cast<TransportRuntimeImpl>(
                     shared_from_this());
             std::weak_ptr<CoUDP> child = socket;
-            socket->SetClosedHook([weak, child] {
+            detail::TransportWiring::SetClosedHook(*socket, [weak, child] {
                 auto rt = weak.lock();
                 auto object = child.lock();
                 if (rt && object)
                     rt->OnTransportClosed(object.get());
             });
             // §4.0.1.7：UDP 的 Receive/Send 挂起段占同一 max_inflight 账本。
-            socket->SetInflightHooks(
+            detail::TransportWiring::SetInflightHooks(*socket,
                 [quota = m_inflight_quota] { return quota->TryAdmit(); },
                 [quota = m_inflight_quota] { quota->Release(); },
                 m_inflight_quota);
@@ -332,7 +346,7 @@ void TransportRuntimeImpl::RequestClose() noexcept {
     m_state.store(kClosingOrClosed);
     std::vector<std::shared_ptr<ICoCloseable>> transports;
     std::vector<std::shared_ptr<bbt::coroutine::CancellationSource>> cancels;
-    std::vector<std::shared_ptr<tcp::DialWaitPermit>> permits;
+    std::vector<std::shared_ptr<detail::DialWaitPermit>> permits;
     {
         std::lock_guard<std::mutex> lk(m_transport_mtx);
         m_transport_sealed = true;
@@ -352,6 +366,36 @@ void TransportRuntimeImpl::RequestClose() noexcept {
     for (auto& transport : transports)
         transport->RequestClose();
     MaybeMarkClosed();
+}
+
+std::size_t TransportRuntimeImpl::ForceCloseAfterQuiescence() noexcept {
+    // 与 RequestClose 的唯一差别：对象的物理关闭不再等在途计数归零，而是走
+    // 对象级硬停入口。前置条件（Scheduler::Stop() 已返回）由调用方保证。
+    // 封口与 dial 名额归还序列与 RequestClose 相同（幂等），因此本入口在
+    // 「已 RequestClose 但未落定」的硬停下同样能收口。
+    m_close.BeginClose();          // 幂等：已封口时无副作用
+    m_state.store(kClosingOrClosed);
+    std::vector<std::shared_ptr<ICoCloseable>> transports;
+    std::vector<std::shared_ptr<bbt::coroutine::CancellationSource>> cancels;
+    std::vector<std::shared_ptr<detail::DialWaitPermit>> permits;
+    {
+        std::lock_guard<std::mutex> lk(m_transport_mtx);
+        m_transport_sealed = true;
+        transports = m_tcp_children;
+        cancels.swap(m_dial_cancels);
+        permits.swap(m_dial_permits);
+    }
+    for (auto& permit : permits)
+        permit->Fail();
+    for (auto& cancel : cancels)
+        cancel->RequestCancel();
+    std::size_t forced = 0;
+    for (auto& transport : transports) {
+        if (ForceCloseChild(*transport))
+            ++forced;
+    }
+    MaybeMarkClosed();
+    return forced;
 }
 
 void TransportRuntimeImpl::OnTransportClosed(const ICoCloseable* child) noexcept {
@@ -383,6 +427,37 @@ void TransportRuntimeImpl::MaybeMarkClosed() noexcept {
 }
 
 } // namespace transport_detail
+
+// 内部装配面（src/detail/TransportWiring.hpp）的 owner 侧实现：TransportRuntime
+// 的抽象面不再声明这两个测试接缝（公开面没有对应槽位/虚表条目），探针落在唯
+// 一实现 transport_detail::TransportRuntimeImpl 上。
+namespace detail {
+
+std::size_t TransportWiring::InflightQuotaHeldForTest(
+    TransportRuntime& owner) noexcept {
+    return static_cast<transport_detail::TransportRuntimeImpl&>(owner)
+        .InflightQuotaHeldForTest();
+}
+
+std::size_t TransportWiring::ForceCloseAfterQuiescence(
+    TransportRuntime& owner) noexcept {
+    return static_cast<transport_detail::TransportRuntimeImpl&>(owner)
+        .ForceCloseAfterQuiescence();
+}
+
+std::size_t TransportWiring::TransportsHeldForTest(
+    TransportRuntime& owner) noexcept {
+    return static_cast<transport_detail::TransportRuntimeImpl&>(owner)
+        .TransportsHeldForTest();
+}
+
+void TransportWiring::SetDialWaitEntryGateForTest(
+    TransportRuntime& owner, std::function<void()> gate) noexcept {
+    static_cast<transport_detail::TransportRuntimeImpl&>(owner)
+        .SetDialWaitEntryGateForTest(std::move(gate));
+}
+
+} // namespace detail
 
 // P2 公开装配入口：Create 只校验装配参数并建立身份；Start 才实际允许工厂
 // 产出资源。二者均在控制线程使用，不挂起协程。

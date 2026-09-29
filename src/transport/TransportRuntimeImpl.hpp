@@ -14,7 +14,7 @@
 #include <string_view>
 #include <vector>
 
-#include <bbt/infra/CoTCP.hpp>   // tcp::DialWaitPermit
+#include "detail/TransportWiring.hpp"   // 内部装配面（DialWaitPermit / TransportWiring）
 #include <bbt/infra/CoUDP.hpp>
 #include <bbt/infra/TransportRuntime.hpp>
 
@@ -55,11 +55,24 @@ public:
         return m_info;
     }
 
-    // 测试接缝见公开头契约注释（Issue #32）。
-    std::size_t InflightQuotaHeldForTest() const noexcept override {
+    // P4 硬停批量强制物理关闭（owner 侧唯一入口，公开面无此槽位；唯一调用点是
+    // src/detail/TransportWiring::ForceCloseAfterQuiescence，见其注释）。
+    // 前置条件：执行受管 transport op 的调度器已静默（Scheduler::Stop() 已返回）。
+    // 返回本次真正完成物理关闭的受管对象数。
+    std::size_t ForceCloseAfterQuiescence() noexcept;
+    // 测试探针：受管 transport 名额（m_transport_count）。收敛判据用它验证
+    // 「对象级 closed_hook 与名额归还一一配对」；生产路径不使用。
+    std::size_t TransportsHeldForTest() noexcept {
+        std::lock_guard<std::mutex> lk(m_transport_mtx);
+        return m_transport_count;
+    }
+
+    // 测试接缝（Issue #32）：公开面无这两个槽位；源码内与测试经
+    // detail::TransportWiring 转到本实现（见 src/detail/TransportWiring.hpp）。
+    std::size_t InflightQuotaHeldForTest() const noexcept {
         return m_inflight_quota->Held();
     }
-    void SetDialWaitEntryGateForTest(std::function<void()> gate) noexcept override {
+    void SetDialWaitEntryGateForTest(std::function<void()> gate) noexcept {
         m_dial_wait_entry_gate_for_test = std::move(gate);
     }
 
@@ -81,8 +94,8 @@ private:
     bbt::infra::detail::ManagedCloseState m_close;
     std::atomic<int>               m_state{kCreated};
 
-    // 测试接缝钩子（Issue #32 F2）：受管 DialTCP 挂起落定后回调；见公开头
-    // 契约注释。生产路径不安装。
+    // 测试接缝钩子（Issue #32 F2）：受管 DialTCP 挂起落定后回调；见
+    // src/detail/TransportWiring.hpp。生产路径不安装。
     std::function<void()>          m_dial_wait_entry_gate_for_test;
 
     // 受管 transport 记账，由 m_transport_mtx 保护：
@@ -100,7 +113,7 @@ private:
     bool                                           m_transport_sealed{false};
     std::vector<std::shared_ptr<bbt::coroutine::CancellationSource>>
                                                    m_dial_cancels;
-    std::vector<std::shared_ptr<tcp::DialWaitPermit>> m_dial_permits;
+    std::vector<std::shared_ptr<detail::DialWaitPermit>> m_dial_permits;
 
     // §4.0.1.7：本 owner 的在途账本（max_inflight）。覆盖受管 DialTCP 等待
     // 段、CoTCPListener::Accept 与 TCP/UDP 可等待数据操作；Try* 不占名额。

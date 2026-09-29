@@ -29,6 +29,7 @@
 #include <bbt/infra/TransportRuntime.hpp>
 
 #include "detail/IoSupport.hpp"
+#include "detail/TransportWiring.hpp"
 #include "http/HttpDetail.hpp"
 #include "http/HttpIoEngine.hpp"
 
@@ -74,6 +75,16 @@ public:
         return m_info;
     }
 
+    // P4 硬停收口（前置条件，调用方保证）：执行本 runtime 子对象 op 的调度器
+    // 已静默——Scheduler::Stop() 已返回，此后不存在可执行子对象 op 或等待回调
+    // 的执行体。语义：本切片封口（幂等）、驱动受管 transport owner 批量强制物理
+    // 关闭（唯一调用点，经 detail::TransportWiring），再在 off-domain 路径上
+    // 收口子对象并尝试落定（硬停后 io 域已无执行体，故不投递 TryPost）。
+    // 返回本次真正完成物理关闭的受管 transport 对象数。非静默状态下调用不安全
+    // （见对象级 ForceCloseAfterQuiescence 注释）。运行期关闭路径一字未改：
+    // RequestClose 仍是唯一运行期入口，门控保留。
+    std::size_t ForceCloseAfterQuiescence() noexcept;
+
     // 子对象物理清理落定回调（任意线程，经各子对象 ClosedHook 触发）。
     // child 是稳定身份：登记/移除/计数按同一身份一次性配对。
     void OnChildClosed(const IIoTeardown* child) noexcept;
@@ -94,17 +105,30 @@ public:
         m_adopt_commit_gate_for_test = std::move(gate);
     }
 
+    // 测试探针（托管链收敛的中间环节，仅 src 内部头；生产不使用）：
+    //   TransportClosedForTest —— 受管 transport owner 的落定观察点；
+    //   UnclosedChildrenForTest —— 本切片仍未物理关闭的子对象数（HTTP 侧）。
+    bool TransportClosedForTest() const noexcept {
+        return m_transport->IsClosed();
+    }
+    std::size_t UnclosedChildrenForTest() noexcept {
+        std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
+        return m_unclosed;
+    }
+
+
     // 测试接缝（Issue #32）：直读在途账本当前名额数。账本唯一真源在
     // transport owner 侧，这里只转发——本切片不保留第二份计数。
     std::size_t InflightQuotaHeldForTest() const noexcept {
-        return m_transport->InflightQuotaHeldForTest();
+        return detail::TransportWiring::InflightQuotaHeldForTest(*m_transport);
     }
 
     // 测试接缝（Issue #32 F2）：受管 DialTCP 等待段的挂起落定钩子。
     // 受管 dial 的等待段现在归 transport owner，这里只转发（同一份实现）。
     // 约定：noexcept、不取锁不阻塞、不得回调本对象。
     void SetDialWaitEntryGateForTest(std::function<void()> gate) noexcept {
-        m_transport->SetDialWaitEntryGateForTest(std::move(gate));
+        detail::TransportWiring::SetDialWaitEntryGateForTest(*m_transport,
+                                                            std::move(gate));
     }
 
 private:
@@ -156,6 +180,9 @@ private:
     bool                                           m_sealed{false};
     bool                                           m_teardown{false};
     bool                                           m_finalize_started{false};
+    // P4 硬停闸门：仅由 ForceCloseAfterQuiescence 置位（前置条件 Scheduler::Stop()
+    // 已返回）。置位后 MaybeFinalize 就地落定，不把 finalize 投递到已死的 io 域。
+    std::atomic_bool                               m_hard_stop{false};
 
     // 测试接缝钩子：仅在 CheckAndAdoptLocked 复检通过、登记提交前在持锁
     // 状态下调用；生产路径不安装。见 SetAdoptCommitGateForTest 契约注释。
