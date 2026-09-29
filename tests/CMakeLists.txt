@@ -141,6 +141,34 @@ if(TARGET bbt_infra_redis)
     add_test(NAME redis.unit COMMAND Test_redis_unit)
     set_tests_properties(redis.unit PROPERTIES TIMEOUT 120)
 
+    # B 级 owner binding 候选隔离验收：直接驱动 src/redis 候选实现与
+    # detail::TransportWiring 装配面探针（fd 读/强制物理关闭），故需要 src 内部头。
+    # 真实 Redis loopback 由 BBT_TEST_REDIS_ADDR 驱动；原始对端故障用例始终执行。
+    add_executable(Test_redis_cotcp_binding Test_redis_cotcp_binding.cc)
+    target_include_directories(Test_redis_cotcp_binding PRIVATE
+        ${CMAKE_SOURCE_DIR}/src)
+    # 候选内部头引用 hiredis 类型（RawReply 解码路径）：src 作用域解析出的
+    # IMPORTED target 不跨目录，故此处按同一显式前缀复现接入（仅测试目标可见）。
+    find_package(hiredis CONFIG REQUIRED PATHS "${BBT_HIREDIS_PREFIX}" NO_DEFAULT_PATH)
+    target_link_libraries(Test_redis_cotcp_binding PRIVATE
+        bbt_infra_redis bbt::infra_tcp bbt::infra_common hiredis::hiredis
+        Boost::boost Threads::Threads)
+    target_compile_options(Test_redis_cotcp_binding PRIVATE -Wall -Wextra)
+    add_test(NAME redis.cotcp_binding
+             COMMAND Test_redis_cotcp_binding
+                     --run_test=!redis_cotcp_binding/t_resp2_roundtrip_live)
+    set_tests_properties(redis.cotcp_binding PROPERTIES TIMEOUT 180)
+
+    # 真实 Redis round-trip：只以专用退出码 77 表示「环境不可用」。不使用
+    # SKIP_REGULAR_EXPRESSION —— 那会把整轮输出里（含原始对端用例）的真实断言失败
+    # 一并降级为 skipped；断言失败/崩溃的退出码不是 77，一律 Failed。
+    add_test(NAME redis.cotcp_binding.live
+             COMMAND Test_redis_cotcp_binding
+                     --run_test=redis_cotcp_binding/t_setup_scheduler:redis_cotcp_binding/t_resp2_roundtrip_live)
+    set_tests_properties(redis.cotcp_binding.live PROPERTIES
+        TIMEOUT 180
+        SKIP_RETURN_CODE 77)
+
     add_executable(Test_redis_live Test_redis_live.cc)
     target_link_libraries(Test_redis_live PRIVATE
         bbt_infra_redis bbt::infra_common Boost::boost Threads::Threads)

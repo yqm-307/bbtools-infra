@@ -89,13 +89,20 @@ if(BBT_HIREDIS_PREFIX)
     add_library(bbt_infra_redis STATIC
         redis/RedisDetail.cc
         redis/RedisConnection.cc
-        redis/CoRedisCliImpl.cc)
+        redis/CoRedisCliImpl.cc
+        # B 级 owner binding 候选（隔离实现）：hiredis 只做 RESP2 编解码，
+        # 字节 I/O/等待/取消/关闭经 CoTCP；不替换上面 async+strand 生产实现。
+        redis/RedisCotcpOwner.cc
+        redis/CoRedisCotcpCli.cc)
     add_library(bbt::infra_redis ALIAS bbt_infra_redis)
 
     target_include_directories(bbt_infra_redis PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    # 候选绑定经 CoTCP 收发：redis 依赖 tcp（tcp 不依赖 http，方向门禁不破）。
+    # B1 复审修正：tcp 依赖是**实现细节**，不得经 Redis 公共接口/安装接口传播，
+    # 故为 PRIVATE（静态库消费者仍由 CMake 的 LINK_ONLY 传递完成最终链接）。
     target_link_libraries(bbt_infra_redis
         PUBLIC  bbt::infra_common
-        PRIVATE Boost::boost Threads::Threads hiredis::hiredis)
+        PRIVATE bbt::infra_tcp Boost::boost Threads::Threads hiredis::hiredis)
     target_compile_options(bbt_infra_redis PRIVATE -Wall -Wextra)
 else()
     message(STATUS
