@@ -945,6 +945,15 @@ BOOST_AUTO_TEST_CASE(t_max_inflight_dial_overload_and_release) {
         conn->RequestClose();
         handoff_done.Down();
     };
+    // 先等待客户端完成 connect/write/close，再启动服务端 Accept。
+    // max_inflight=1 时 Accept 本身也占一个在途名额；若与 DialTCP
+    // 并发启动，二者会竞争同一名额并把成功 handoff 变成时序 flake。
+    // TCP listen backlog 会保留已完成握手的连接，随后 Accept 仍可读取数据。
+    BOOST_REQUIRE_EQUAL(handoff_done.WaitTimeout(8000), 0);
+    BOOST_CHECK(echo_ok.load());
+    // 交付即归还：dial 等待段名额在返回时已归零。
+    BOOST_CHECK_EQUAL(impl->InflightQuotaHeldForTest(), 0u);
+
     // 服务端：接受并读 2 字节，证明交付的连接可用。
     bbt::core::thread::CountDownLatch srv_done{1};
     bbtco [listen2, &srv_done]() {
@@ -957,10 +966,6 @@ BOOST_AUTO_TEST_CASE(t_max_inflight_dial_overload_and_release) {
         }
         srv_done.Down();
     };
-    BOOST_REQUIRE_EQUAL(handoff_done.WaitTimeout(8000), 0);
-    BOOST_CHECK(echo_ok.load());
-    // 交付即归还：dial 等待段名额在返回时已归零。
-    BOOST_CHECK_EQUAL(impl->InflightQuotaHeldForTest(), 0u);
     BOOST_REQUIRE_EQUAL(srv_done.WaitTimeout(8000), 0);
     listen2.value()->RequestClose();
 
