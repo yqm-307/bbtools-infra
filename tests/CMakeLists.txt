@@ -66,6 +66,23 @@ target_compile_options(Test_iowait_probe PRIVATE -Wall -Wextra)
 add_test(NAME iowait.probe COMMAND Test_iowait_probe)
 set_tests_properties(iowait.probe PROPERTIES TIMEOUT 60)
 
+# --- Config 基础配置模块测试（Issue #35）--------------------------------------
+# unit：Value 类型化读取/指纹、内存源版本、文件源读取/更新/格式错误（无需调度器）。
+add_executable(Test_config_unit Test_config_unit.cc)
+target_link_libraries(Test_config_unit PRIVATE
+    bbt::infra_config Boost::boost Threads::Threads)
+target_compile_options(Test_config_unit PRIVATE -Wall -Wextra)
+add_test(NAME config.unit COMMAND Test_config_unit)
+set_tests_properties(config.unit PROPERTIES TIMEOUT 60)
+
+# watch：初始/去重/更新、关闭后不再回调、失败/恢复、正常 drain 与强制 Stop 资源边界。
+add_executable(Test_config_watch Test_config_watch.cc)
+target_link_libraries(Test_config_watch PRIVATE
+    bbt::infra_config Boost::boost Threads::Threads)
+target_compile_options(Test_config_watch PRIVATE -Wall -Wextra)
+add_test(NAME config.watch COMMAND Test_config_watch)
+set_tests_properties(config.watch PROPERTIES TIMEOUT 120)
+
 # N1b-1：真实 HTTP/1.1 loopback 闭环（Boost.Beast + Asio）。
 # 与上游单测一致：Boost.Test 经 included/unit_test.hpp 静态内嵌。
 find_package(Boost REQUIRED)

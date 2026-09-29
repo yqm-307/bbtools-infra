@@ -14,7 +14,7 @@
 | CoTCP / CoUDP transport | `bbt::infra_tcp`、`bbt::infra_udp` | 已实现，行为验收未完成 | 基础收发与受管工厂可用；`max_inflight` 门禁、生命周期完整验收归 Issue #31/#32 |
 | Redis client | `bbt::infra_redis` | 已实现最小切片 | hiredis async + strand；单连接语义；`bbt::infra::redis` 公共 API 目录尚未拆分 |
 | Mongo client | `bbt::infra_mongo` | 已实现 owner + 句柄形态 | 同步 driver + worker bridge；`mongo::CoMongoDb` 为资源 owner，`mongo::CoMongoColl` 为集合句柄；`include/bbt/infra/mongo/` 公共目录已建，剩余 API 按决策 0006 逐步迁移 |
-| 基础动态配置 | `bbt::infra::config` | 规划中 | 版本化 snapshot、配置源适配、watch、重连、去重与关闭；具体实现待 Issue #35 |
+| 基础动态配置 | `bbt::infra_config` | 本工作树候选已实现最小切片（待提交） | `bbt::infra::config`；版本化不可变快照 + 内存源 + 真实本地文件源 + watch（初始/更新/重复去重、失败恢复、关闭与晚到通知、正常 drain 与强制 Stop 的资源边界）。**未交付**：远程 provider 与真实重连、业务 schema 校验、客户端资源热切换。契约/命令/未覆盖矩阵见 [docs/config-watch-v1.md](docs/config-watch-v1.md) |
 | RPC / MCP | — | 未开始 | 归对应 Issue 推进，当前无实现 |
 
 已实现能力的单测与示例均可独立构建运行，见下文「独立消费」与 [examples/README.md](examples/README.md)。
@@ -69,7 +69,11 @@ ctest --test-dir build --output-on-failure
 
 最小真实消费示例见 [examples/README.md](examples/README.md)：
 - `Example_http_loopback`：无外部依赖的 HTTP loopback 完整生命周期
+- `Example_config_consume`：配置读取 → 上层校验 → 接受/拒绝（含格式错误不发布伪成功）
 - `Example_redis_mongo_shape`：Redis/Mongo 调用形态与错误路径演示（不连真实服务）
+
+另有独立消费工程 `examples/config_consumer`（只链接 `bbt::infra_config`，不被本仓构建引用），
+用于从仓外视角复核模块 target 可独立消费；命令见该目录 README 与 [docs/config-watch-v1.md](docs/config-watch-v1.md)。
 
 ## CI 覆盖边界
 

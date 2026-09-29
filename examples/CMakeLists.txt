@@ -8,6 +8,12 @@ target_link_libraries(Example_http_loopback PRIVATE
     bbt::infra_http Threads::Threads)
 target_compile_options(Example_http_loopback PRIVATE -Wall -Wextra)
 
+# Config 模块消费示例（Issue #35）：读取 → 上层校验 → 接受/拒绝；无新依赖。
+add_executable(Example_config_consume config_consume.cc)
+target_link_libraries(Example_config_consume PRIVATE
+    bbt::infra_config Threads::Threads)
+target_compile_options(Example_config_consume PRIVATE -Wall -Wextra)
+
 # Redis/Mongo 调用形态示例：同时依赖两个模块 target；任一前缀未接入时
 # 对应模块 target 不存在，本示例随之跳过（公共头仍可独立编译）。
 # CoRedisCli::Create 与 CoMongoCli::Create 分属两模块实现，须同时链接。
