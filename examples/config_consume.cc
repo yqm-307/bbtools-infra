@@ -68,7 +68,9 @@ void Run(const char* label, const Snapshot& s) {
 int main() {
     // 1. 本地文件源：有效配置 → 读取 → 校验 → 接受
     const std::string path = MakeTempPath("cfg_example");
-    WriteFile(path, "version = 1\nserver.port = 8080\n");
+    WriteFile(path, R"(version = 1
+server.port = 8080
+)");
     auto fsrc = FileSource::Create(path, "app", "server");
     if (!fsrc) {
         std::fprintf(stderr, "create source failed: %s\n",
@@ -83,7 +85,9 @@ int main() {
     Run("valid", r.value());
 
     // 2. 覆盖为越界配置 → 读取成功，但上层校验拒绝
-    WriteFile(path, "version = 2\nserver.port = 99999\n");
+    WriteFile(path, R"(version = 2
+server.port = 99999
+)");
     auto r2 = fsrc.value()->Read();
     if (!r2) return 1;
     Run("invalid", r2.value());
