@@ -189,15 +189,34 @@ BOOST_AUTO_TEST_CASE(watch_waitclosed_single_waiter_and_drain) {
     std::atomic<int> first{-1};
     std::atomic<int> second{-1};
     bbtco [watcher, &first]() {
-        first.store(static_cast<int>(watcher->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(30), {})));
+        // 等待位只有一个：先注册不等于先占位，若被第二个协程抢到则重试，
+        // 直到本协程占住等待位（拿到 Closed 才返回）。原实现假定投递顺序
+        // 必为「先注册者先占位」，顺序反转时断言偶发失败。
+        const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+        while (std::chrono::steady_clock::now() < limit) {
+            const auto status = watcher->WaitClosed(
+                std::chrono::steady_clock::now() + std::chrono::seconds(30), {});
+            if (status == CloseStatus::Closed) {
+                first.store(static_cast<int>(status));
+                return;
+            }
+        }
     };
     bbtco [watcher, &second]() {
-        second.store(static_cast<int>(watcher->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::milliseconds(100), {})));
+        // 观察到一次 AlreadyWaiting 即证明等待位已被首个 waiter 占住；
+        // 有限重试只用于吸收两个协程的投递顺序竞争。
+        for (int i = 0; i < 200; ++i) {
+            const auto status = watcher->WaitClosed(
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(50), {});
+            second.store(static_cast<int>(status), std::memory_order_release);
+            if (status == CloseStatus::AlreadyWaiting)
+                return;
+        }
     };
-    BOOST_REQUIRE(WaitUntil([&] { return second.load() != -1; }, 3000));
-    BOOST_CHECK(second.load() == static_cast<int>(CloseStatus::AlreadyWaiting));
+    BOOST_REQUIRE(WaitUntil(
+        [&] { return second.load(std::memory_order_acquire) ==
+                     static_cast<int>(CloseStatus::AlreadyWaiting); },
+        3000));
     BOOST_CHECK(first.load() == -1); // 首个等待仍在途，未被 AlreadyWaiting 取消
 
     watcher->RequestClose();
@@ -492,15 +511,34 @@ BOOST_AUTO_TEST_CASE(watch_force_stop_inflight_waitclosed_releases_source) {
     std::atomic<int> first{-1};
     std::atomic<int> second{-1};
     bbtco [raw, &first]() {
-        first.store(static_cast<int>(raw->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(60), {})));
+        // 等待位只有一个：先注册不等于先占位，若被第二个协程抢到则重试，
+        // 直到本协程占住等待位（拿到 Closed 才返回）。原实现假定投递顺序
+        // 必为「先注册者先占位」，顺序反转时断言偶发失败。
+        const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+        while (std::chrono::steady_clock::now() < limit) {
+            const auto status = raw->WaitClosed(
+                std::chrono::steady_clock::now() + std::chrono::seconds(60), {});
+            if (status == CloseStatus::Closed) {
+                first.store(static_cast<int>(status));
+                return;
+            }
+        }
     };
     bbtco [raw, &second]() {
-        second.store(static_cast<int>(raw->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::milliseconds(100), {})));
+        // 观察到一次 AlreadyWaiting 即证明等待位已被首个 waiter 占住；
+        // 有限重试只用于吸收两个协程的投递顺序竞争。
+        for (int i = 0; i < 200; ++i) {
+            const auto status = raw->WaitClosed(
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(50), {});
+            second.store(static_cast<int>(status), std::memory_order_release);
+            if (status == CloseStatus::AlreadyWaiting)
+                return;
+        }
     };
-    BOOST_REQUIRE(WaitUntil([&] { return second.load() != -1; }, 3000));
-    BOOST_CHECK(second.load() == static_cast<int>(CloseStatus::AlreadyWaiting));
+    BOOST_REQUIRE(WaitUntil(
+        [&] { return second.load(std::memory_order_acquire) ==
+                     static_cast<int>(CloseStatus::AlreadyWaiting); },
+        3000));
     BOOST_CHECK(first.load() == -1); // 首个等待仍在途：挂起点已建立
 
     // 强制 Stop：直接销毁挂起协程，不做栈展开（契约 §6 显式例外）

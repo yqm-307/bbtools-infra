@@ -237,3 +237,22 @@ target_link_libraries(Test_hardstop_owner_convergence
 target_compile_options(Test_hardstop_owner_convergence PRIVATE -Wall -Wextra)
 add_test(NAME hardstop.owner_convergence COMMAND Test_hardstop_owner_convergence)
 set_tests_properties(hardstop.owner_convergence PROPERTIES TIMEOUT 120)
+
+# --- Issue #31 收尾验收缺口：此前无直接证据的两项。
+#   A. RequestClose 紧邻 Scheduler::Stop 后的收口不变量（fd 级关闭 / 容量归零 /
+#      owner 落定 / 幂等），并记录该竞态的落点。注意：本用例不保证构造出
+#      「owner 已封口且对象未落定」状态——被唤醒的 op 是否来得及恢复执行不受
+#      现有接缝控制（实测落点见运行输出 BOOST_TEST_MESSAGE）。
+#   B. DNS 在途到期（非调用前已过期）。晚到结果只能间接验证：名额不重复归还
+#      且 DNS 通道仍可用；本用例未直接观察 worker 侧「丢弃晚到结果」的分支。
+# 需要 src 内部装配面（等待段/DNS 扣持接缝）与协议 owner 的 dial 等待入口，
+# 故与 hardstop.owner_convergence 同形链接 infra_http + tcp + udp。
+add_executable(Test_transport_acceptance Test_transport_acceptance.cc)
+target_include_directories(Test_transport_acceptance PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(Test_transport_acceptance
+    PRIVATE bbt::infra_http bbt::infra_tcp bbt::infra_udp
+            Boost::boost Threads::Threads)
+target_compile_options(Test_transport_acceptance PRIVATE -Wall -Wextra)
+add_test(NAME transport.acceptance COMMAND Test_transport_acceptance)
+set_tests_properties(transport.acceptance PROPERTIES TIMEOUT 120)
