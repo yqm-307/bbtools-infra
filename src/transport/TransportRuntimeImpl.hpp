@@ -46,10 +46,9 @@ public:
     result<std::shared_ptr<CoUDP>> BindUDP(SocketAddress local) override;
 
     // owner 主动同步关闭：幂等、任意线程可调用。先封口（拒绝新资源）并唤醒
-    // owner 级挂起等待者（受管 DialTCP 的 connect 等待段），再逐对象 Close()
-    // （对象各自同步完成封口 → 唤醒挂起 op → 有界排空在途 → 物理释放），
-    // 最后在「已封口且受管 transport 名额归零」时落定并通知组合方。
-    // 并发/重复调用有界等待首次收口完成。见 src/detail/TransportWiring.hpp。
+    // owner 级挂起等待者（受管 DialTCP 的 connect 等待段），再逐对象 Close()。
+    // 所有调用者均等待在途工厂和受管 transport 名额归零、真实 Closed 后返回；
+    // 不以独立超时上限放弃收口。见 src/detail/TransportWiring.hpp。
     void Close() noexcept override;
     bool IsClosed() const noexcept override { return m_close.IsClosed(); }
     bbt::coroutine::CoObjectInfo GetObjectInfo() const override {

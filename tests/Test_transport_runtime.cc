@@ -18,16 +18,11 @@
 // 每个测试可执行文件只初始化一次 runtime，用例之间靠进程边界隔离；用例结束
 // 前显式 Close() 并断言物理收口（IsClosed / 名额归零），不再以 Stop 做隔离。
 //
-// 失败路径约定（独立复审 🔴-1 / 🟡-1 / 🟡-2 修复）：断言失败不得被放大成
-// SegFault，等待不得依赖脆弱的固定短预算。为此本文件遵守两条约束：
-//   a) 协程/回调触碰的一切共享状态都堆分配并按 shared_ptr 持有。Boost.Test 的
-//      BOOST_REQUIRE* 失败会抛异常展开用例栈；若协程仍按引用写这些栈对象，
-//      就是一个 use-after-free（记录中的 SegFault 即此机制）。
-//   b) 每个用例持有 CaseGuard：正常结束与断言失败走同一条收口路径（关闭本用例
-//      创建的受管对象）。
-// 等待预算：wait-entry gate 是确定性事件接缝（名额登记后由协程同步触发），
-// 实测重负载（load 14 / load 58，12 核）下延迟 ≤5ms，故 kSeamBudgetMs=5000
-// 作为兜底上限（约 1000x 观测上界）；仍超时则由断言信息区分两种原因。
+// 失败路径约定：断言失败不得被放大成 SegFault，等待不得依赖脆弱的固定短预算。
+// 协程/回调触碰的一切共享状态都堆分配并按 shared_ptr 持有；gate 自身也有
+// kSeamBudgetMs 上限，提前失败时由 CaseGuard 释放 gate，避免清理路径无界等待。
+// 每个用例持有 CaseGuard：正常结束与断言失败走同一条收口路径（关闭本用例
+// 创建的受管对象）。
 
 #include <atomic>
 #include <chrono>
@@ -44,6 +39,11 @@
 #include <bbt/infra/CoTCP.hpp>
 #include <bbt/infra/CoUDP.hpp>
 #include <bbt/infra/TransportRuntime.hpp>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 // 内部装配面（src 内部头，不安装）：owner 测试探针与等待入口 gate。
 #include "detail/TransportWiring.hpp"
@@ -90,7 +90,7 @@ CallOptions Options(int timeout_ms = 5000) {
     return options;
 }
 
-// 等待预算（见文件头「等待预算」）。
+// gate 与用例等待的兜底预算，不代表生产 Close 的超时上限。
 constexpr int kSeamBudgetMs = 5000;
 
 // 用例级观测点：整体堆分配，协程与 gate 回调按 shared_ptr 持有。断言失败
@@ -620,6 +620,125 @@ BOOST_AUTO_TEST_CASE(t_concurrent_close_tracks_inflight_factory) {
     BOOST_CHECK_MESSAGE(failures == 0,
                         "在途工厂聚合收口失败轮数=" << failures
                         << "（应为 0：Close 已封口并等在途工厂归零，无快照遗漏）");
+}
+
+BOOST_AUTO_TEST_CASE(t_accept_adopt_rejected_after_owner_close) {
+    EnsureRuntime();
+    CaseGuard guard;
+
+    auto created = TransportRuntime::Create(Limits(4, 4));
+    BOOST_REQUIRE(created);
+    auto owner = std::move(created).value();
+    auto close_started = std::make_shared<std::atomic_bool>(false);
+    auto close_finished = std::make_shared<std::atomic_bool>(false);
+    guard.OnUnwind([owner, close_started, close_finished] {
+        if (!close_started->load(std::memory_order_acquire) ||
+            close_finished->load(std::memory_order_acquire))
+            owner->Close();
+    });
+    BOOST_REQUIRE(owner->Start());
+
+    auto listener = owner->ListenTCP(SocketAddress{"127.0.0.1", 0}, 16);
+    BOOST_REQUIRE(listener);
+    const auto port = listener.value()->LocalAddress().port;
+    BOOST_REQUIRE_NE(port, 0);
+
+    auto adopt_entered = std::make_shared<bbt::core::thread::CountDownLatch>(1);
+    auto release_adopt = std::make_shared<std::atomic_bool>(false);
+    guard.OnUnwind([release_adopt] {
+        release_adopt->store(true, std::memory_order_release);
+    });
+    TransportWiring::SetAcceptAdoptGateForTest(*listener.value(),
+        [adopt_entered, release_adopt] {
+            adopt_entered->Down();
+            const auto deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::milliseconds(kSeamBudgetMs);
+            while (!release_adopt->load(std::memory_order_acquire) &&
+                   std::chrono::steady_clock::now() < deadline)
+                std::this_thread::yield();
+        });
+
+    auto accept_done = std::make_shared<bbt::core::thread::CountDownLatch>(1);
+    auto accept_code = std::make_shared<std::atomic_int>(-1);
+    bbtco [listener, accept_done, accept_code]() {
+        auto accepted = listener.value()->Accept(Options(30000));
+        accept_code->store(accepted ? kOpSucceeded
+                                    : static_cast<int>(accepted.error().code));
+        accept_done->Down();
+    };
+
+    const int peer = ::socket(AF_INET, SOCK_STREAM, 0);
+    BOOST_REQUIRE_NE(peer, -1);
+    guard.OnUnwind([peer] { ::close(peer); });
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(port);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    BOOST_REQUIRE_EQUAL(::connect(peer, reinterpret_cast<sockaddr*>(&address),
+                                  sizeof(address)), 0);
+
+    BOOST_REQUIRE_MESSAGE(adopt_entered->WaitTimeout(kSeamBudgetMs) == 0,
+        "Accept 未到达 child adopt 前 gate");
+
+    auto close_done = std::make_shared<bbt::core::thread::CountDownLatch>(1);
+    auto closed_at_return = std::make_shared<std::atomic_bool>(false);
+    auto pending_at_return = std::make_shared<std::atomic_int>(-1);
+    auto inflight_at_return = std::make_shared<std::atomic_int>(-1);
+    auto transports_at_return = std::make_shared<std::atomic_int>(-1);
+    std::thread closer([owner, close_done, closed_at_return, close_finished,
+                        pending_at_return, inflight_at_return,
+                        transports_at_return] {
+        owner->Close();
+        closed_at_return->store(owner->IsClosed(), std::memory_order_release);
+        pending_at_return->store(static_cast<int>(
+            TransportWiring::PendingFactoriesForTest(*owner)),
+            std::memory_order_release);
+        inflight_at_return->store(static_cast<int>(
+            TransportWiring::InflightQuotaHeldForTest(*owner)),
+            std::memory_order_release);
+        transports_at_return->store(static_cast<int>(
+            TransportWiring::TransportsHeldForTest(*owner)),
+            std::memory_order_release);
+        close_finished->store(true, std::memory_order_release);
+        close_done->Down();
+    });
+    close_started->store(true, std::memory_order_release);
+    const auto seal_deadline = std::chrono::steady_clock::now() +
+                               std::chrono::seconds(5);
+    while (!TransportWiring::CloseSealedForTest(*owner) &&
+           std::chrono::steady_clock::now() < seal_deadline)
+        std::this_thread::yield();
+    if (!TransportWiring::CloseSealedForTest(*owner)) {
+        release_adopt->store(true, std::memory_order_release);
+        if (close_done->WaitTimeout(kSeamBudgetMs) == 0)
+            closer.join();
+        else
+            closer.detach();
+        BOOST_FAIL("owner Close 未完成封口");
+        return;
+    }
+
+    release_adopt->store(true, std::memory_order_release);
+    if (close_done->WaitTimeout(kSeamBudgetMs) != 0) {
+        closer.detach();
+        BOOST_FAIL("放行 adopt gate 后 owner Close 未返回");
+        return;
+    }
+    closer.join();
+    BOOST_CHECK(closed_at_return->load(std::memory_order_acquire));
+    BOOST_CHECK_EQUAL(pending_at_return->load(std::memory_order_acquire), 0);
+    BOOST_CHECK_EQUAL(inflight_at_return->load(std::memory_order_acquire), 0);
+    BOOST_CHECK_EQUAL(transports_at_return->load(std::memory_order_acquire), 0);
+    BOOST_CHECK(listener.value()->IsClosed());
+
+    BOOST_REQUIRE_MESSAGE(accept_done->WaitTimeout(kSeamBudgetMs) == 0,
+        "放行 adopt gate 后 Accept 未落定");
+    BOOST_CHECK_EQUAL(accept_code->load(), static_cast<int>(ErrorCode::Closed));
+    BOOST_CHECK_EQUAL(TransportWiring::PendingFactoriesForTest(*owner), 0u);
+    BOOST_CHECK_EQUAL(TransportWiring::InflightQuotaHeldForTest(*owner), 0u);
+    BOOST_CHECK_EQUAL(TransportWiring::TransportsHeldForTest(*owner), 0u);
+    TransportWiring::SetAcceptAdoptGateForTest(*listener.value(), {});
+    guard.Unwind();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

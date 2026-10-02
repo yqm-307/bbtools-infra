@@ -851,6 +851,8 @@ result<std::shared_ptr<CoTCP>> CoTCPListener::Accept(const CallOptions& options)
     };
     auto output = run();
     _EndIo();
+    if (output && m_accept_adopt_gate_for_test)
+        m_accept_adopt_gate_for_test();
     if (output && m_accept_adopt && !m_accept_adopt(output.value())) {
         output.value()->Close();
         if (m_accept_release) m_accept_release();

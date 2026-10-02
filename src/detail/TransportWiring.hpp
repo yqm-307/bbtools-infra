@@ -137,6 +137,12 @@ struct TransportWiring {
                                         std::function<void()> gate) noexcept {
         owner.m_wait_entry_gate_for_test = std::move(gate);
     }
+    // Accept 成功取得 child、但交付给 Runtime adopt 之前触发一次；仅供测试
+    // 把 owner Close 与 adopt 拒绝的线性化点确定性重叠。生产路径为空钩子。
+    static void SetAcceptAdoptGateForTest(tcp::CoTCPListener& owner,
+                                          std::function<void()> gate) noexcept {
+        owner.m_accept_adopt_gate_for_test = std::move(gate);
+    }
 
     // —— CoUDP：关闭登记、在途账本与测试 gate ——
     static void SetClosedHook(udp::CoUDP& owner, std::function<void()> hook) noexcept {

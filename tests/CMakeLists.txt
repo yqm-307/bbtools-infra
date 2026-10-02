@@ -231,3 +231,17 @@ target_link_libraries(Test_transport_acceptance
 target_compile_options(Test_transport_acceptance PRIVATE -Wall -Wextra)
 add_test(NAME transport.acceptance COMMAND Test_transport_acceptance)
 set_tests_properties(transport.acceptance PROPERTIES TIMEOUT 120)
+
+# --- R1：NO_LOOP 自驱动边界 —— Close 唤醒在途受管 DialTCP 后，工厂必须在
+# 不依赖 Close 调用方继续驱动 poller 的情况下自行走到 EndFactory。本目标刻意
+# 以 SCHE_START_OPT_SCHE_NO_LOOP 启动运行时且全程不调用 LoopOnce。需要 src/
+# 内部装配面（detail::TransportWiring 的 R1 探针与 dial 等待入口 gate），
+# 仅本目标可见；只链接 transport（无 HTTP）。
+add_executable(Test_transport_runtime_no_loop Test_transport_runtime_no_loop.cc)
+target_include_directories(Test_transport_runtime_no_loop PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(Test_transport_runtime_no_loop
+    PRIVATE bbt::infra_transport Boost::boost Threads::Threads)
+target_compile_options(Test_transport_runtime_no_loop PRIVATE -Wall -Wextra)
+add_test(NAME transport.runtime_no_loop COMMAND Test_transport_runtime_no_loop)
+set_tests_properties(transport.runtime_no_loop PROPERTIES TIMEOUT 60)
