@@ -8,7 +8,6 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/types.h>
-#include <thread>
 #include <unistd.h>
 
 #include <algorithm>
@@ -21,6 +20,7 @@
 #include <bbt/coroutine/detail/Define.hpp>
 #include <bbt/coroutine/detail/LocalThread.hpp>
 #include <bbt/coroutine/detail/Processer.hpp>
+#include <bbt/coroutine/detail/Scheduler.hpp>   // g_scheduler->IsInitialized（运行时是否在跑）
 
 #include "detail/IoSupport.hpp"
 
@@ -43,6 +43,12 @@ Error _Errno(ErrorCode code, const char* message) {
     error.backend_category = "errno";
     error.backend_code = errno;
     return error;
+}
+
+// coroutine 运行时是否在跑：进程寿命运行时只有「已初始化」一种活态，
+// 不再有运行时代际（对象身份也不携带代际）。
+bool _RuntimeRunning() noexcept {
+    return g_scheduler != nullptr && g_scheduler->IsInitialized();
 }
 
 // 值类型 ⇄ sockaddr_in（最小切片仅 IPv4）。
@@ -120,23 +126,24 @@ RecvOutcome _SendOnce(int fd, ConstBytes packet, const sockaddr* addr,
 } // namespace
 
 CoUDP::CoUDP(int fd, bbt::coroutine::CoObjectInfo info) noexcept
-    : m_fd(fd), m_info(std::move(info)) {}
+    : m_fd(fd), m_info(std::move(info)),
+      m_close_waiters(std::make_shared<bbt::infra::detail::CloseWaiters>()) {}
 
 CoUDP::~CoUDP() {
     std::lock_guard<std::mutex> lock(m_mtx);
-    // §4.0.1.7：未走 RequestClose 的析构兜底归还剩余名额。
+    // §4.0.1.7：未走 Close 的析构兜底归还剩余名额，并物理释放。
     while (m_quota_held > 0) {
         --m_quota_held;
         if (m_inflight_release) m_inflight_release();
     }
-    _CloseFd();
+    _SettleClosedLocked();
 }
 
 bbt::coroutine::CoObjectInfo CoUDP::GetObjectInfo() const { return m_info; }
 
 result<CoUDP::SPtr> CoUDP::BindUDP(SocketAddress local) {
-    // §4.0.1：控制线程配置操作；要求 Scheduler 已 Start（对象身份与
-    // 关闭信号需要有效运行时代际）。
+    // §4.0.1：控制线程配置操作；要求 coroutine 运行时已初始化（对象身份
+    // 的前置条件是运行时已初始化，不再有代际）。
     if (local.ip.empty())
         return result<SPtr>::err(MakeError(ErrorCode::InvalidArgument,
             "BindUDP: SocketAddress.ip must not be empty (use explicit wildcard)"));
@@ -144,10 +151,9 @@ result<CoUDP::SPtr> CoUDP::BindUDP(SocketAddress local) {
     auto addr = _ToSockaddr(local);
     if (!addr)
         return result<SPtr>::err(std::move(addr).error());
-    const auto gen = bbt::coroutine::CurrentRuntimeGeneration();
-    if (gen == 0)
+    if (!_RuntimeRunning())
         return result<SPtr>::err(MakeError(ErrorCode::RuntimeUnavailable,
-            "BindUDP requires a started Scheduler"));
+            "BindUDP requires an initialized coroutine runtime"));
 
     const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0)
@@ -182,20 +188,16 @@ result<CoUDP::SPtr> CoUDP::BindUDP(SocketAddress local) {
     return result<SPtr>::ok(std::move(object));
 }
 
-// §4 入口检查：参数 → 受管协程上下文 → Runtime 代际；成立即返回，不挂起。
-// §4 的 Try* 规则：Try* 只检查参数、上下文、代际和关闭状态——代际门禁对
-// 两类入口都成立，但只有协程方法要求「当前处于受管协程内」。
+// §4 入口检查：参数 → 受管协程上下文 → coroutine 运行时是否已初始化；成立
+// 即返回，不挂起。§4 的 Try* 规则：Try* 只检查参数、上下文与关闭状态——只有
+// 协程方法要求「当前处于受管协程内」，运行时可用性对两类入口都成立。
 result<void> CoUDP::_CheckEntry(bool in_coroutine_only) const {
     if (in_coroutine_only && g_bbt_tls_coroutine_co == nullptr)
         return result<void>::err(MakeError(ErrorCode::InvalidContext,
             "CoUDP operation must run in coroutine context"));
-    // 代际检查两条路径共用：Runtime 未 Start 或对象归属其他运行代（例如
-    // Stop → Start 之后的旧引用）→ RuntimeUnavailable，立即返回，不挂起。
-    // 这同时是 §6.4.5 的 FD 代际防护入口：旧代对象不得再触碰旧 fd 数字。
-    const auto generation = bbt::coroutine::CurrentRuntimeGeneration();
-    if (generation == 0 || generation != m_info.generation)
+    if (!_RuntimeRunning())
         return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable,
-            "CoUDP operation belongs to another runtime generation"));
+            "coroutine runtime not initialized"));
     return result<void>::ok();
 }
 
@@ -267,37 +269,48 @@ IoResult CoUDP::TrySend(ConstBytes packet, const SocketAddress& peer) {
     return IoResult::err(std::move(error));
 }
 
-// §5.2 组合等待：readable/writable interest + 绝对 deadline + cancel +
-// close（经 m_close_source 组合令牌）单轮一次性挂起。等待注册由上游
-// CoWaiter 完成（先登记后挂起、已取消令牌同步触发，唤醒不丢失）；
-// infra 不复制等待状态机。fd 就绪只表示「可以重试」，不是操作成功。
+// §5.2 组合等待：readable/writable interest + 绝对 deadline + close（对象级
+// CloseWaiters）单轮一次性挂起。等待注册由上游 CoWaiter 完成（先登记后挂起，
+// 唤醒不丢失）；infra 不复制等待状态机。fd 就绪只表示「可以重试」，不是操作
+// 成功。封口唤醒以 Completed 抵达，本函数解释为 Closed。
 CoUDP::WaitOutcome CoUDP::_Wait(bool readable, const CallOptions& options) {
     if (g_bbt_tls_coroutine_co == nullptr)
         return WaitOutcome::InvalidContext;
 
     auto waiter = CoWaiter::Create();
+    // 关闭线性化：与对象级 Close 的封口原子配对（见 detail::CloseWaiters
+    // 「等待兴趣登记屏障」）。取得登记 ⇒ 尚未封口，物理 close 会等本登记释放后
+    // 才发生，故此后读 m_fd 有效；已封口即返回 Closed，绝不在已关/复用 fd 上
+    // 登记旧兴趣。RAII 配对保证异常/提前返回时不泄漏登记。
+    bbt::infra::detail::CloseRegisterClaim claim(m_close_waiters.get());
+    if (!claim.acquired())
+        return WaitOutcome::Closed;
+    const int fd = m_fd;
     CombinedWaitOptions wait;
-    wait.fd             = m_fd;
+    wait.fd             = fd;
     wait.want_readable  = readable;
     wait.want_writeable = !readable;
     wait.deadline       = options.deadline;
-    // close 条件：对象 close 源与调用方 cancel 组合成 OR 视图；
-    // RequestClose（任意线程）经 RequestCancel 走同一唤醒登记路径。
-    // 注意：读 m_fd 时对象由在途计数保护（RequestClose 等计数归零才
-    // 物理 close），等待期间 fd 不会被关闭，无 FD 复用风险。
-    wait.cancel = bbt::coroutine::CancellationToken::Combine(
-        m_close_source->Token(), options.cancel);
-    const auto status = waiter->Wait(wait);
+    // 读 m_fd 与物理 close 由登记屏障同步（见上）；登记在事件登记成功后、
+    // 真正挂起前完成；已封口时 Add 失败，自行 Notify 走 PENDING 路径，不丢唤醒。
+    bool registered = false;
+    const auto status = waiter->Wait(wait,
+        [&waiter, &registered, &claim, this]() -> bool {
+            claim.release();
+            registered = m_close_waiters->Add(waiter);
+            if (!registered)
+                waiter->Notify();
+            return true;
+        });
+    if (registered)
+        m_close_waiters->Remove(waiter.get());
     switch (status) {
     case CombinedWaitStatus::FdReadable:
     case CombinedWaitStatus::FdWriteable:
         return WaitOutcome::Ready;
-    case CombinedWaitStatus::Completed: // close 源触发（custom 唤醒）
-    case CombinedWaitStatus::Cancelled:
-        // Completed/Cancelled 同为 custom/cancel 唤醒位；复查关闭源
-        // 区分 close 与调用方 cancel，给出确定语义。
-        if (m_close_source->Token().IsCancellationRequested())
-            return WaitOutcome::Closed;
+    case CombinedWaitStatus::Completed: // 封口唤醒（CloseAndWakeAll）
+        return WaitOutcome::Closed;
+    case CombinedWaitStatus::Cancelled: // 协程级 RequestCancel
         return WaitOutcome::Cancelled;
     case CombinedWaitStatus::TimedOut:
         return WaitOutcome::TimedOut;
@@ -318,7 +331,7 @@ result<DatagramRead> CoUDP::Receive(MutableBytes dst, const CallOptions& options
 
     // §4.0.1.7（Issue #32）：Runtime 在途门禁先于在途计数——容量满即
     // Overloaded、立即返回不挂起；名额计入 m_quota_held，op 结束归还 1，
-    // RequestClose/析构 DrainQuota 兜底归还（Stop 不展开栈时安全）。
+    // Close/析构 DrainQuota 兜底归还。
     bool quota_admitted = false;
     if (m_inflight_admit) {
         if (!m_inflight_admit())
@@ -328,7 +341,7 @@ result<DatagramRead> CoUDP::Receive(MutableBytes dst, const CallOptions& options
     }
 
     // §6.4.3：在途计数先于等待登记，物理 close 在计数归零后才发生；
-    // 封口后入口立即拒绝（Closed），等待中封口则由组合令牌唤醒 Closed。
+    // 封口后入口立即拒绝（Closed），等待中封口则由 CloseWaiters 唤醒 Closed。
     {
         std::lock_guard<std::mutex> lock(m_mtx);
         if (m_close_requested || m_fd < 0) {
@@ -408,16 +421,14 @@ result<DatagramRead> CoUDP::Receive(MutableBytes dst, const CallOptions& options
             --m_quota_held;
             if (m_inflight_release) m_inflight_release();
         }
-        if (m_close_requested && m_inflight == 0 && !m_physically_closed) {
-            _CloseFd();
-            closed_now = true;
-        }
+        // 在途归零即物理落定：Close 的有界等待超时（或同线程恢复）后由最后
+        // 一个退出的 op 完成收口。
+        if (m_close_requested && m_inflight == 0)
+            closed_now = _SettleClosedLocked();
+        m_cv.notify_all();
     }
-    if (closed_now) {
-        m_closed_source->RequestCancel();
-        if (m_closed_hook)
-            m_closed_hook();
-    }
+    if (closed_now && m_closed_hook)
+        m_closed_hook();
     return output;
 }
 
@@ -509,134 +520,67 @@ IoResult CoUDP::Send(ConstBytes packet, const SocketAddress& peer,
             --m_quota_held;
             if (m_inflight_release) m_inflight_release();
         }
-        if (m_close_requested && m_inflight == 0 && !m_physically_closed) {
-            _CloseFd();
-            closed_now = true;
-        }
+        if (m_close_requested && m_inflight == 0)
+            closed_now = _SettleClosedLocked();
+        m_cv.notify_all();
     }
-    if (closed_now) {
-        m_closed_source->RequestCancel();
-        if (m_closed_hook)
-            m_closed_hook();
-    }
+    if (closed_now && m_closed_hook)
+        m_closed_hook();
     return output;
 }
 
-bool CoUDP::ForceCloseAfterQuiescence() noexcept {
-    {
-        std::lock_guard<std::mutex> lock(m_mtx);
-        if (m_physically_closed)
-            return false;       // 幂等：物理关闭恰好一次
-        m_close_requested = true;
-        // §4.0.1.7：硬停致挂起协程不返回，剩余名额在封口头一次性归还。
-        while (m_quota_held > 0) {
-            --m_quota_held;
-            if (m_inflight_release) m_inflight_release();
-        }
-        // 硬停闸门：故意绕过 m_inflight 门控（前置条件由调用方保证）。
-        _CloseFd();
-    }
-    m_close_source->RequestCancel();
-    m_closed_source->RequestCancel();
-    if (m_closed_hook)
-        m_closed_hook();
-    return true;
-}
-
 void CoUDP::_CloseFd() noexcept {
-    // 物理 close：仅析构与 RequestClose 的 in-flight 归零路径调用。
+    // 物理 close：只在收口路径调用（m_mtx held）。
     if (m_fd >= 0) {
         ::close(m_fd);
         m_fd = -1;
     }
-    m_physically_closed = true;
 }
 
-// §6.4.1：封口与通知（任意线程）：置关闭标志、使在途等待失效（唤醒等待者
-// 返回 Closed）、拒绝新调用；不等待物理完成。
-// §6.4.3：在途者退出时执行物理 close；调用线程不能自旋等待协程
-// （调用线程也可能恰是唯一的 scheduler worker）。
-// §6.4.5：FD 代际防护——等待期间 fd 受在途计数保护不被关闭，poller 注册
-// 的事件对象随等待者退出自然失效，不存在旧代际事件触达新资源的窗口。
-void CoUDP::RequestClose() noexcept {
-    // 幂等封口：仅首次执行 teardown。
-    bool closed_now = false;
+bool CoUDP::_SettleClosedLocked() noexcept {
+    if (m_physically_closed)
+        return false;
+    _CloseFd();
+    m_physically_closed = true;
+    m_cv.notify_all();
+    return true;
+}
+
+// §1（进程寿命运行时修订）：Close 幂等、任意线程可调用。序列：封口（拒绝新
+// 调用、归还已持有名额）→ 唤醒全部挂起等待者（CloseWaiters；封口后登记失败
+// 者自行 Notify）→ 等在途「fd 兴趣登记」排空（登记屏障，见 detail::CloseWaiters）
+// → 物理 close 并一次性跑 closed hook。不等待后端结果、不 flush。
+// 与 CoTCP 同一关闭线性化：物理 close 不早于任何已在途的 fd 兴趣登记完成，
+// 晚到 op 在 BeginRegister 处得到明确 Closed，不在已关/复用 fd 上登记；并发
+// Close 调用者无独立短上限地等首次调用者的真实物理落定事实（同一终态）。
+void CoUDP::Close() noexcept {
+    bool settled_now = false;
     {
-        std::lock_guard<std::mutex> lock(m_mtx);
-        if (m_close_requested)
-            return;
-        m_close_requested = true;
-        // §4.0.1.7：挂起协程被 Stop 强销时不再回到 op 收尾路径，剩余
-        // 名额由本对象在封口头一次性归还——与 op 归还路径互斥（由
-        // m_quota_held 计数保证不重复）。
-        while (m_quota_held > 0) {
-            --m_quota_held;
-            if (m_inflight_release) m_inflight_release();
-        }
-        if (m_inflight == 0) {
-            _CloseFd();
-            closed_now = true;
+        std::unique_lock<std::mutex> lock(m_mtx);
+        if (!m_close_requested) {
+            m_close_requested = true;
+            // §4.0.1.7：封口头归还本对象仍持有的全部名额；op 若仍返回，其
+            // 收尾见 m_quota_held==0 不再重复归还。
+            while (m_quota_held > 0) {
+                --m_quota_held;
+                if (m_inflight_release) m_inflight_release();
+            }
+            lock.unlock();
+            m_close_waiters->SealWakeAndDrainRegistrations();
+            lock.lock();
+            settled_now = _SettleClosedLocked();
+        } else {
+            // 并发/重复 Close：无独立短上限地等首次调用者的真实物理落定事实。
+            m_cv.wait(lock, [this] { return m_physically_closed; });
         }
     }
-    // 任意线程：唤醒所有经组合令牌登记的在途 I/O。
-    m_close_source->RequestCancel();
-    if (closed_now) {
-        m_closed_source->RequestCancel();
-        if (m_closed_hook)
-            m_closed_hook();
-    }
+    if (settled_now && m_closed_hook)
+        m_closed_hook();
 }
 
 bool CoUDP::IsClosed() const noexcept {
     std::lock_guard<std::mutex> lock(m_mtx);
     return m_physically_closed;
-}
-
-CloseStatus CoUDP::WaitClosed(bbt::coroutine::Deadline deadline,
-                              bbt::coroutine::CancellationToken cancel) {
-    if (g_bbt_tls_coroutine_co == nullptr)
-        return CloseStatus::InvalidContext;
-    const auto gen = bbt::coroutine::CurrentRuntimeGeneration();
-    if (gen == 0 || gen != m_info.generation)
-        return CloseStatus::RuntimeUnavailable;
-    if (IsClosed())
-        return CloseStatus::Closed;
-    if (m_close_waiting.exchange(true))
-        return CloseStatus::AlreadyWaiting;
-    struct WaitGuard {
-        std::atomic_bool& waiting;
-        ~WaitGuard() { waiting.store(false); }
-    } guard{m_close_waiting};
-
-    // 经组合令牌真实等待关闭（不读 bool）：close 源与调用方 cancel 任一
-    // 触发即唤醒。close 源触发早于物理 close（RequestClose 等 in-flight
-    // 归零才 close），故唤醒后循环复查 IsClosed 直至真实清理完成；调用方
-    // cancel 触发且未封口时才返回 Cancelled。deadline 为绝对时间点，
-    // 循环不重置超时。
-    for (;;) {
-        if (IsClosed())
-            return CloseStatus::Closed;
-        if (cancel.IsCancellationRequested())
-            return CloseStatus::Cancelled;
-        auto waiter = CoWaiter::Create();
-        CombinedWaitOptions wait;
-        wait.deadline = deadline;
-        wait.cancel   = bbt::coroutine::CancellationToken::Combine(
-            m_closed_source->Token(), cancel);
-        const auto status = waiter->Wait(wait);
-        switch (status) {
-        case CombinedWaitStatus::Completed:
-        case CombinedWaitStatus::Cancelled:
-            // close 或调用方 cancel：回循环复查（Close/Cancelled 分流）。
-            continue;
-        case CombinedWaitStatus::TimedOut:
-            return CloseStatus::TimedOut;
-        case CombinedWaitStatus::InvalidContext:
-            return CloseStatus::InvalidContext;
-        default:
-            return CloseStatus::RuntimeUnavailable;
-        }
-    }
 }
 
 } // namespace bbt::infra::udp

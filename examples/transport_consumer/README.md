@@ -24,16 +24,21 @@ cmake --build <build>/transport-consumer --target transport_consumer --parallel 
 ```
 
 退出码 0 且输出 `transport_consumer: ALL OK` 即全部检查通过；检查项覆盖
-`TransportRuntime::Create/Start`、未 Start 时工厂拒绝 `RuntimeUnavailable`、
-数值地址 `ListenTCP`/`BindUDP` 与 `LocalAddress()`、`RequestClose` →
-协程内 `WaitClosed` 返回 `CloseStatus::Closed`、以及受管对象随 runtime 关闭而落定。
+`TransportRuntime::Create/Start`、运行时未初始化时工厂拒绝 `RuntimeUnavailable`、
+数值地址 `ListenTCP`/`BindUDP` 与 `LocalAddress()`、资源 owner 主动同步 `Close()`
+（返回即物理收口）后 `IsClosed()` 为真，以及受管对象随 runtime 关闭而落定。
+**候选、未提交（2026-10-01）**：`main.cc` 的关闭调用点已迁到 `Close()`（旧 `RequestClose`/
+`WaitClosed`/`CloseStatus`/`Scheduler::Stop` 已删除），并在本批候选中真实构建与运行通过
+（`transport_consumer: ALL OK`）；候选未提交、未走独立 review 与 PR CI，不得把本文读作
+已发布契约或最终验收结论。
 
 ## 覆盖边界
 
-本 consumer 只覆盖同步配置面 + 关闭落定面（控制线程 + 一个等待协程），不覆盖
-数据路径读写、容量/在途配额矩阵、DNS、取消竞态与强制 Stop；这些在
+本 consumer 只覆盖同步配置面 + 关闭落定面（控制线程 + 关闭调用），不覆盖
+数据路径读写、容量/在途配额矩阵、DNS、取消竞态与 owner `Close()` 竞态；这些在
 `tests/Test_tcp_loopback.cc`（`tcp.loopback`）、`tests/Test_udp_loopback.cc`
 （`udp.loopback`）、`tests/Test_transport_runtime.cc`（`transport.runtime`）、
 `tests/Test_tcp_runtime_factory.cc`（`tcp.runtime_factory`）、
-`tests/Test_hardstop_*.cc` 与 `tests/Test_transport_acceptance.cc`
-（`transport.acceptance`）中覆盖，契约见 `docs/decisions/0005-co-io-adapter-contract-v1.md`。
+`tests/Test_transport_acceptance.cc`（`transport.acceptance`，DNS 在途到期）中覆盖，契约见
+`docs/decisions/0005-co-io-adapter-contract-v1.md`。旧硬停语义用例
+（`tests/Test_hardstop_*.cc`）已随 `Scheduler::Stop` 删除，不再是覆盖项。

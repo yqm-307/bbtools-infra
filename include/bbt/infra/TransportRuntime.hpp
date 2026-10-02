@@ -27,8 +27,11 @@
 //     CoTCPListener::Accept、TCP ReadSome/WriteSome/WriteAll、UDP
 //     Receive/Send）。Try* 不经账本。上层协议连接/请求预算由协议 owner
 //     另行管，两者不共用同一计数。
-// 一个 socket 只有一个物理关闭责任方：本 owner 只发起 RequestClose，
-// 关闭落定以对象侧 ClosedHook 为唯一信号。
+// 一个 socket 只有一个物理关闭责任方：本 owner 只主动调用对象 Close()（对象
+// 同步完成封口 → 唤醒挂起 op → 有界排空在途 → 物理释放），关闭落定以对象侧
+// ClosedHook 为唯一信号。owner 自己的 Close() 幂等、任意线程可调用：先封口
+// 并唤醒 owner 级挂起等待者（受管 DialTCP 的 connect 等待段），再逐对象
+// Close，最后在「已封口且受管名额归零」时落定并通知组合方。
 
 #include <cstddef>
 #include <functional>
@@ -60,12 +63,13 @@ using udp::CoUDP;
 
 class TransportRuntime : public ICoNetwork, public ICoCloseable {
 public:
-    // 只校验装配参数；网络资源在 Start 才实际占用。要求 Scheduler 已启动
-    // （对象身份与完成信号需要运行时代际），否则 Error(RuntimeUnavailable)。
+    // 只校验装配参数；网络资源在 Start 才实际占用。要求 coroutine 运行时已
+    // 初始化（对象身份的前置条件；不再有运行时代际），否则
+    // Error(RuntimeUnavailable)。
     static result<std::shared_ptr<TransportRuntime>> Create(NetworkLimits limits);
 
-    // 同一 owner 只成功启动一次；关闭后不重开。要求 Scheduler 处于与
-    // Create 相同的运行时代际。
+    // 同一 owner 只成功启动一次；关闭后不重开。要求 coroutine 运行时已
+    // 初始化。
     virtual result<void> Start() = 0;
 
     // 受管内建工厂。工厂返回的 shared_ptr 是受托管引用：owner 强持有交付

@@ -5,6 +5,15 @@
 状态：已实现候选（待独立审查）
 日期：2026-09-25。基线：remote main `562a14bc3e03315d994b4834e0c0a01b53287dc9`。
 
+### 修订记录（2026-10-01：进程寿命运行时 + 同步 Close）
+
+本文原依赖 `RequestClose`/`WaitClosed`/`CompletionSignal` 的表述已被 infra 的**同步 `Close()`**
+与 coroutine **进程寿命运行时**（候选 HEAD `03430a5`）取代：句柄关闭是接纳门禁（`Close()` 后
+新命令 → `Closed`）；owner 同步 `Close()` 返回即 ops 清空且 worker 全退；等待经
+`CoWaiter::WaitWithCallback` + `WaitOptions`（结果放 operation state），不再有 `CompletionSignal`。
+本文资源归属结论（owner 集中预算、句柄轻量、公共面不泄漏 mongocxx/线程）**继续有效**。superseded by
+[0002 修订记录](0002-co-network-contract-v1.md)。
+
 本文固定 Issue #40 的资源归属取舍：Mongo 模块由「一个 client 一组
 worker」改为「显式 owner + 轻量集合句柄」，保留 Issue #7 裁决的
 mongocxx 同步 driver + 有界 worker bridge 形态。
@@ -19,12 +28,12 @@ mongocxx 同步 driver + 有界 worker bridge 形态。
 2. **集合句柄是 `bbt::infra::mongo::CoMongoColl`**（实现实体
    `mongo_detail::MongoCollImpl`）：只携带 `MongoTarget{database,
    collection}` 与 owner 共享指针，不新建线程。句柄关闭是接纳
-   门禁（`RequestClose` 后新命令 → Closed），不影响兄弟句柄与
+   门禁（`Close()` 后新命令 → Closed），不影响兄弟句柄与
    owner 的物理收口。
 3. **每项 operation 仍在同一 worker 上 acquire/use/release**
    pooled client；driver 同步调用不可强杀，deadline/cancel/close
    只发布一次逻辑终态，op、client lease 与 payload 保活到物理
-   收口；`WaitClosed` 等 ops 清空且 worker 全退才 Closed，不提前
+   收口；owner 同步 `Close()` 返回即 ops 清空且 worker 全退，不提前
    宣告物理完成。
 4. **旧契约 `bbt::infra::CoMongoCli` 保留兼容**：内部实现为
    「独占 owner + 单个集合句柄」，公开 API 与命令语义不变；不
@@ -34,7 +43,7 @@ mongocxx 同步 driver + 有界 worker bridge 形态。
    infra/mongo/Client.hpp` 只出现 infra/标准库类型；mongocxx 只
    在 `src/mongo/` 内部头出现。
 6. **C++17**：不使用 `co_await`/`Task<T>`；等待经
-   `bbt::coroutine::CompletionSignal` + `WaitOptions`。
+   `CoWaiter::WaitWithCallback` + `WaitOptions`（结果放 operation state）。
 
 ## 非目标（本任务不做）
 

@@ -2,6 +2,7 @@
 
 #include <bbt/coroutine/detail/LocalThread.hpp>
 #include <bbt/coroutine/detail/Processer.hpp>
+#include <bbt/coroutine/detail/Scheduler.hpp>
 #include <bbt/coroutine/object/CoObject.hpp>
 
 #include <bsoncxx/v1/document/value.hpp>
@@ -31,18 +32,16 @@ Error InvalidArg(std::string msg) {
 
 MongoRuntime::~MongoRuntime() {
     // 外部引用归零才析构：worker 不经自身持 runtime（只经 op.runtime
-    // 间接保活），这里先收口再 join——driver 调用有超时上界，join 收敛。
-    Teardown();
-    for (auto& t : m_workers)
-        if (t.joinable())
-            t.join();
+    // 间接保活），这里走与 Close 同一 finalizer——先收口再 join。
+    // driver 调用有超时上界，join 收敛。
+    Finalize();
 }
 
 result<void> MongoRuntime::Start() {
-    const auto gen = bbt::coroutine::CurrentRuntimeGeneration();
-    if (gen == 0 || gen != m_info.generation)
+    // 「运行时是否在跑」用 IsInitialized：不再有运行时代际/重启用例。
+    if (!g_scheduler->IsInitialized())
         return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable,
-            "scheduler not running or runtime generation mismatch"));
+            "coroutine runtime not initialized"));
 
     // 先取得进程级 pool 与完成回投域；失败留在 kCreated，调用方可待
     // 条件就绪后重试 Start。
@@ -53,36 +52,76 @@ result<void> MongoRuntime::Start() {
     if (!ready)
         return result<void>::err(std::move(ready).error());
 
-    int expected = kCreated;
-    if (!m_state.compare_exchange_strong(expected, kRunning))
-        return result<void>::err(MakeError(
-            m_state.load() == kRunning ? ErrorCode::InvalidArgument
-                                       : ErrorCode::Closed,
-            m_state.load() == kRunning ? "mongo runtime already started"
-                                       : "mongo runtime is closing or closed"));
-    m_pool = std::move(pool).value();
+    // 状态迁移与 lease 发布在同一临界区：与 Close 取关闭权、finalizer 归还
+    // lease 互斥——消除同一 m_pool shared_ptr 对象的并发赋值/reset。
+    {
+        std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
+        if (m_state.load() != kCreated)
+            return result<void>::err(MakeError(
+                m_state.load() == kRunning ? ErrorCode::InvalidArgument
+                                           : ErrorCode::Closed,
+                m_state.load() == kRunning
+                    ? "mongo runtime already started"
+                    : "mongo runtime is closing or closed"));
+        m_state.store(kRunning);
+        m_pool = std::move(pool).value();
+    }
 
-    // 拉起固定上限的 worker 组；线程创建失败时按 stopping 收口已起
-    // 线程并 join（此时 op 队列尚空，无悬挂）。
-    try {
-        m_workers.reserve(m_config.worker_threads);
-        for (std::size_t i = 0; i < m_config.worker_threads; ++i)
-            m_workers.emplace_back([this] { WorkerLoop(); });
-    } catch (...) {
+    // 拉起固定上限的 worker 组；spawn 与 Close 的关闭权迁移同临界区：
+    // 「关闭权已被 Close 取得（state 不再 kRunning）则不再 spawn」。
+    // 线程创建失败按 stopping 收口已起线程——经同一 finalizer 完成。
+    bool spawn_failed = false;
+    bool closed_during_start = false;
+    {
+        std::lock_guard<std::mutex> llock(m_lifecycle_mtx);
+        std::lock_guard<std::mutex> wlock(m_workers_mtx);
+        if (m_state.load() != kRunning) {
+            closed_during_start = true;
+        } else {
+            try {
+                m_workers.reserve(m_config.worker_threads);
+                for (std::size_t i = 0; i < m_config.worker_threads; ++i)
+                    m_workers.emplace_back([this] { WorkerLoop(); });
+            } catch (...) {
+                spawn_failed = true;
+            }
+        }
+    }
+    if (closed_during_start) {
+        // 关闭权已被 Close 取得：本 owner lease 由该 Close 的 finalizer
+        // 统一归还，Start 不再零散 reset。
+        return result<void>::err(MakeError(ErrorCode::Closed,
+            "mongo runtime is closing or closed"));
+    }
+    if (spawn_failed) {
         {
             std::lock_guard<std::mutex> lk(m_queue_mtx);
             m_queue_stopping = true;
         }
         m_queue_cv.notify_all();
-        for (auto& t : m_workers)
-            if (t.joinable())
-                t.join();
-        m_workers.clear();
-        m_state.store(kClosingOrClosed);
-        m_pool.reset();
+        // 与 Close/析构走同一 finalizer：封口清队列、join 已起线程、归还
+        // lease、发布终态——不在 Start 内零散 join/reset。
+        Finalize();
         return result<void>::err(MakeError(ErrorCode::InternalError,
             "mongo: failed to spawn worker threads"));
     }
+    // 起跑闩：等全部 worker 完成入口登记后再返回，消除「worker 尚未起跑、
+    // live_workers 仍为 0 即被判定已收口」的窗口。m_started_workers 只增不减，
+    // 且 Close 抢跑时 worker 仍先完成入口登记（不依赖 live_workers==配置数，
+    // 不会自锁）；state 逃逸条件覆盖 Close 与 Start 并发。
+    {
+        std::unique_lock<std::mutex> lk(m_workers_mtx);
+        m_workers_cv.wait(lk, [this] {
+            return m_started_workers ==
+                       static_cast<int>(m_config.worker_threads) ||
+                   m_state.load() != kRunning;
+        });
+    }
+    // Close 抢跑并已收口：诚实返回 Closed，不把「线程已起但随即被关」
+    // 冒充成功启动（IsRunning 也为假）。
+    if (m_state.load() != kRunning)
+        return result<void>::err(MakeError(ErrorCode::Closed,
+            "mongo runtime is closing or closed"));
     return result<void>::ok();
 }
 
@@ -110,61 +149,98 @@ result<MongoOpOutcome> MongoRuntime::Submit(
     if (!pre)
         return result<MongoOpOutcome>::err(std::move(pre).error());
 
-    auto sig = NewCompletionSignal();
+    auto sig = bbt::coroutine::sync::CoWaiter::Create();
     if (!sig)
-        return result<MongoOpOutcome>::err(std::move(sig).error());
+        return result<MongoOpOutcome>::err(MakeError(
+            ErrorCode::RuntimeUnavailable,
+            "mongo: coroutine waiter unavailable"));
 
     auto op = std::make_shared<MongoOp>(shared_from_this(),
                                         std::move(handle), kind,
                                         std::move(doc), std::move(update));
-    op->sig = std::move(sig).value();
+    op->sig = sig;
 
-    // 登记先于入队：与 Teardown 竞态的提交也能被明确拒绝。
+    // 登记先于等待：与 Close 的 teardown 竞态的提交能被明确拒绝，且
+    // 「已登记必被终态收口」——等待者不会因 close 竞态挂住。
     if (!RegisterOp(op))
         return result<MongoOpOutcome>::err(
             MakeError(ErrorCode::Closed, "mongo runtime closed"));
 
-    // 队列接纳判定与入队同临界区：满则确定性 Overloaded，stopping 则
-    // Closed；接纳失败路径置 kDone 后 Finish，保证已登记 op 反登记。
-    {
-        std::lock_guard<std::mutex> lk(m_queue_mtx);
-        if (!m_queue_stopping &&
-            m_queue.size() < m_config.max_queue) {
-            m_queue.push_back(op);
-            m_queue_cv.notify_one();
-        } else {
-            const auto code = m_queue_stopping ? ErrorCode::Closed
-                                               : ErrorCode::Overloaded;
-            op->phase.store(MongoOp::Phase::kDone);
-            // Finish 内部 MaybeUnregister→UnregisterOp 取 m_ops_mtx，
-            // 与当前 m_queue_mtx 不构成回环（无路径持 ops_mtx 取
-            // queue_mtx）。
-            op->Finish(result<MongoOpOutcome>::err(MakeError(code,
-                m_queue_stopping ? "mongo runtime closed"
-                                 : "mongo: pending queue is full")));
-            return result<MongoOpOutcome>::err(MakeError(code,
-                m_queue_stopping ? "mongo runtime closed"
-                                 : "mongo: pending queue is full"));
-        }
-    }
-
     bbt::coroutine::WaitOptions wait;
     wait.deadline = options.deadline;
-    wait.cancel   = options.cancel;
-    const auto status = op->sig->Wait(wait);
-    if (status == bbt::coroutine::WaitStatus::Completed)
-        return std::move(*op->outcome);
 
-    // 逻辑终态先行发布一次：queued op 由 worker 跳过，running op 的
-    // driver 调用继续到自身超时——op/lease/payload 保活到物理收口。
-    op->Finish(result<MongoOpOutcome>::err(
-        WaitStatusToError(status)));
-    return result<MongoOpOutcome>::err(WaitStatusToError(status));
+    // 范式（契约 §2）：先登记等待事件 → 在 on_registered 内登记
+    // CloseWaiters 并做唯一一次入队投递 → 随后挂起。on_registered 只在
+    // 事件登记成功后执行，其内自唤醒走 CoPollEvent PENDING 不丢唤醒；
+    // 登记失败（deadline 已过/取消/上下文非法）则不执行投递，op 也就
+    // 从未进入队列。
+    bool dispatched = false;
+    const auto status = sig->WaitWithCallback(wait, [&]() -> bool {
+        // 1) 关闭期等待者登记：Close 已开始时自行唤醒一次并立即收口。
+        if (!m_waiters.Add(sig)) {
+            op->phase.store(MongoOp::Phase::kDone);
+            op->Finish(result<MongoOpOutcome>::err(
+                MakeError(ErrorCode::Closed, "mongo runtime closed")));
+            return true;
+        }
+        // 2) 唯一一次发起型投递。接纳判定与入队同临界区：满则确定性
+        //    Overloaded，stopping 则 Closed；接纳失败路径置 kDone 后
+        //    Finish，保证已登记 op 反登记。
+        std::optional<Error> fail;
+        {
+            std::lock_guard<std::mutex> lk(m_queue_mtx);
+            if (!m_queue_stopping && m_queue.size() < m_config.max_queue) {
+                m_queue.push_back(op);
+                m_queue_cv.notify_one();
+                dispatched = true;
+            } else {
+                fail = MakeError(
+                    m_queue_stopping ? ErrorCode::Closed
+                                     : ErrorCode::Overloaded,
+                    m_queue_stopping ? "mongo runtime closed"
+                                     : "mongo: pending queue is full");
+            }
+        }
+        if (fail) {
+            op->phase.store(MongoOp::Phase::kDone);
+            // Finish 内部 MaybeUnregister→UnregisterOp 取 m_ops_mtx，
+            // 与已释放的 m_queue_mtx 不构成回环。
+            op->Finish(result<MongoOpOutcome>::err(std::move(*fail)));
+        }
+        return true;
+    });
+
+    // 恢复即出账：等待位不再需要 Close 侧唤醒。
+    m_waiters.Remove(sig.get());
+
+    if (status == bbt::coroutine::WaitStatus::Completed) {
+        if (op->outcome)
+            return std::move(*op->outcome);
+        return result<MongoOpOutcome>::err(MakeError(
+            ErrorCode::InternalError,
+            "internal: mongo op completed without outcome"));
+    }
+
+    // deadline/取消首胜：未派发 op 直接摘除、不发送；已派发 op 先发布
+    // 一次逻辑终态，driver 调用继续到自身超时——op/lease/payload 保活到
+    // 物理收口，迟到 driver 结果只消费不交付（Finish CAS 保证唯一终态）。
+    if (!dispatched)
+        op->phase.store(MongoOp::Phase::kDone);
+    const auto wait_err = WaitStatusToError(status);
+    op->Finish(result<MongoOpOutcome>::err(wait_err));
+    return result<MongoOpOutcome>::err(wait_err);
 }
 
 // ---------------- worker 线程域 ----------------
 
 void MongoRuntime::WorkerLoop() noexcept {
+    // 起跑登记：在触碰任何 owner 状态之前完成，使 Start 的起跑闩可确定性
+    // 判定「全部线程已起跑」。仅此一处取 m_workers_mtx，之后不再需要。
+    {
+        std::lock_guard<std::mutex> lk(m_workers_mtx);
+        ++m_started_workers;
+    }
+    m_workers_cv.notify_all();
     m_live_workers.fetch_add(1);
     for (;;) {
         std::shared_ptr<MongoOp> op;
@@ -178,8 +254,8 @@ void MongoRuntime::WorkerLoop() noexcept {
             op = std::move(m_queue.front());
             m_queue.pop_front();
         }
-        // 已落定（超时/取消/close）仅清除占位：phase 置 kDone 后反登记。
-        // 二次检查覆盖「取出后恰被 close 落定」的竞态，不白跑 driver。
+        // 已落定（deadline/取消/close）仅清除占位：phase 置 kDone 后反
+        // 登记。二次检查覆盖「取出后恰被 close 落定」的竞态，不白跑 driver。
         if (op->finished.load()) {
             op->phase.store(MongoOp::Phase::kDone);
             op->MaybeUnregister();
@@ -196,7 +272,7 @@ void MongoRuntime::WorkerLoop() noexcept {
         Publish(std::move(op), std::move(r));
     }
     m_live_workers.fetch_sub(1);
-    DrainCheckClosed();
+    DrainNotify();
 }
 
 result<MongoOpOutcome> MongoRuntime::RunDriverCall(
@@ -310,17 +386,59 @@ void MongoRuntime::Publish(const std::shared_ptr<MongoOp>& op,
         }))
         return;
     // 执行域不可达（引擎未启动/已封/post 分配失败）：worker 线程直接
-    // 落定——CompletionSignal::Complete 允许任意线程调用。
+    // 落定——CoWaiter::Notify 允许任意线程调用。
     op->Finish(std::move(r));
 }
 
 // ---------------- 关闭链路 ----------------
 
-void MongoRuntime::RequestClose() noexcept {
-    if (!m_close.BeginClose())
-        return;
-    m_state.store(kClosingOrClosed);
-    Teardown();
+void MongoRuntime::Close() noexcept {
+    // 取关闭权与关闭态迁移在生命周期锁内：与 Start 的 pool 发布互斥。
+    // 仅首个取得关闭权者执行封口/唤醒；其余合法并发/重复调用直接进入
+    // 同一 finalizer 等待。
+    bool first = false;
+    {
+        std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
+        first = m_close.BeginClose();
+        if (first)
+            m_state.store(kClosingOrClosed);
+    }
+    if (first) {
+        Teardown();
+        // 兜底唤醒全部挂起业务等待者：teardown 已让每个在册 op 落定
+        // （结果先落地、再唤醒），此处覆盖在册但已不在 m_ops 的等待者。
+        m_waiters.CloseAndWakeAll();
+    }
+
+    // 同步收口：唯一配对 finalizer 等真实物理落定（在途 driver 调用返回
+    // + op 清空 + worker 全退）→ join → 归还本 owner lease → 发布终态
+    // Closed。并发后来者阻塞等待同一事实后返回，不重复 join/reset。
+    // 不用 kCloseDrainTimeout 的有界窗口冒充物理释放；driver 同步调用
+    // 自身的超时（socket_timeout / server_selection_timeout）才是其返回
+    // 上界，Close 随该上界等待。真正卡死的 driver 属 supervisor/部署层
+    // 范畴（关闭契约：异常不纳入下层兜底），故不新增超时或兜底分支。
+    Finalize();
+}
+
+void MongoRuntime::JoinWorkers() noexcept {
+    std::lock_guard<std::mutex> jl(m_join_mtx);
+    // 在 m_workers_mtx 下摘走线程组，避免与 Start 的 spawn 竞争同一向量；
+    // m_join_mtx 使并发 Close 串行、后来者观察到同一 join 事实。
+    std::vector<std::thread> workers;
+    {
+        std::lock_guard<std::mutex> lk(m_workers_mtx);
+        workers.swap(m_workers);
+    }
+    for (auto& t : workers) {
+        if (!t.joinable())
+            continue;
+        // owner 线程非 worker；若异常地从 worker 自身调用则不能 join 自己。
+        if (t.get_id() == std::this_thread::get_id()) {
+            t.detach();
+            continue;
+        }
+        t.join();
+    }
 }
 
 void MongoRuntime::Teardown() noexcept {
@@ -342,7 +460,7 @@ void MongoRuntime::Teardown() noexcept {
     m_engine.Seal();
 
     // 未派发 op：置 kDone 后以 Closed 落定（从未接触 driver）；
-    // 运行中 op：先发布逻辑 Closed，物理收口由 worker 完成路径继续
+    // 派发中 op：先发布逻辑 Closed，物理收口由 worker 完成路径继续
     // ——op、client lease 与 payload 保活到 driver 调用返回。
     for (auto& op : queued) {
         op->phase.store(MongoOp::Phase::kDone);
@@ -352,26 +470,62 @@ void MongoRuntime::Teardown() noexcept {
     for (auto& op : snapshot)
         op->Finish(result<MongoOpOutcome>::err(
             MakeError(ErrorCode::Closed, "mongo runtime closed")));
-    DrainCheckClosed();
+    DrainNotify();
 }
 
-void MongoRuntime::DrainCheckClosed() noexcept {
-    bool fin;
+void MongoRuntime::DrainNotify() noexcept {
+    bool drained;
     {
         std::lock_guard<std::mutex> lk(m_ops_mtx);
-        fin = m_io_dead && m_ops.empty() && m_live_workers.load() == 0;
+        drained = m_io_dead && m_ops.empty() && m_live_workers.load() == 0;
     }
-    if (fin)
-        m_close.MarkClosed();
+    if (drained)
+        m_drain_cv.notify_all();
+}
+
+void MongoRuntime::Finalize() noexcept {
+    // 唯一配对 finalizer：call_once 使首个调用者执行，并发后来者阻塞等待
+    // 同一事实——返回时 join、lease 归还、Closed 均已落定，不重复执行。
+    std::call_once(m_finalize_once, [this] { FinalizeOnce(); });
+}
+
+void MongoRuntime::FinalizeOnce() noexcept {
+    // 封口：保证在册/排队 op 被终态收口（幂等；Close 已封口则不重复动作，
+    // Start 失败/析构路径也从这里补齐）。关闭态先于排空发布，避免新提交。
+    m_close.BeginClose();
+    {
+        std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
+        m_state.store(kClosingOrClosed);
+    }
+    Teardown();
+
+    // 真实物理落定：在途 driver 调用返回（自身超时上界）+ op 清空 +
+    // worker 全退。条件满足只唤醒，不预先发布终态。
+    {
+        std::unique_lock<std::mutex> lk(m_ops_mtx);
+        m_drain_cv.wait(lk, [this] {
+            return m_io_dead && m_ops.empty() && m_live_workers.load() == 0;
+        });
+    }
+    // join：worker 线程真正退出后才返回；此后不再有触 this 的收尾。
+    JoinWorkers();
+    // 归还本 owner 的 pool lease：只释放本 owner 的引用；进程级 instance
+    // 强持于 ProcessState、同 URI 其他 owner 的 lease 引用不受影响。
+    {
+        std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
+        m_pool.reset();
+    }
+    // 终态发布：join 与 lease 归还之后才 Closed（一次性 closed hook）。
+    m_close.MarkClosed();
 }
 
 // ============================ MongoCollImpl ===========================
 
 namespace {
 
-// 句柄命令公共路径：句柄接纳态校验（Closed 不再收新命令）→ 目标集
-// 合由句柄携带进 op → runtime 提交。句柄关闭不取消在途 op：op 保活
-// handle 与 runtime，物理收口照常。
+// 句柄命令公共路径：句柄接纳态校验（封口后不再收新命令）→ 目标集合由
+// 句柄携带进 op → runtime 提交。句柄关闭不取消在途 op：op 保活 handle 与
+// runtime，物理收口照常。
 result<MongoOpOutcome> CollSubmit(
     const std::shared_ptr<MongoCollImpl>& self, MongoOp::Kind kind,
     MongoDocument doc, MongoDocument update, const CallOptions& options) {
@@ -452,12 +606,9 @@ namespace {
 class CoMongoDbImpl : public mongo::CoMongoDb {
 public:
     CoMongoDbImpl(std::shared_ptr<MongoRuntime> runtime,
-                  bbt::coroutine::CoObjectInfo  info,
-                  std::shared_ptr<bbt::coroutine::CompletionSignal> close_sig)
-        : m_runtime(std::move(runtime)),
-          m_info(std::move(info)),
-          m_close(std::move(close_sig)) {}
-    ~CoMongoDbImpl() override { RequestClose(); }
+                  bbt::coroutine::CoObjectInfo  info)
+        : m_runtime(std::move(runtime)), m_info(std::move(info)) {}
+    ~CoMongoDbImpl() override { Close(); }
 
     result<void> Start() override { return m_runtime->Start(); }
 
@@ -480,35 +631,23 @@ public:
         if (!info)
             return result<std::shared_ptr<mongo::CoMongoColl>>::err(
                 std::move(info).error());
-        auto sig = NewCompletionSignal();
-        if (!sig)
-            return result<std::shared_ptr<mongo::CoMongoColl>>::err(
-                std::move(sig).error());
         auto h = std::make_shared<MongoCollImpl>(
-            m_runtime, std::move(target), std::move(info).value(),
-            std::move(sig).value());
+            m_runtime, std::move(target), std::move(info).value());
         return result<std::shared_ptr<mongo::CoMongoColl>>::ok(
             std::move(h));
     }
 
-    void RequestClose() noexcept override {
-        if (!m_close.BeginClose())
-            return;
-        // owner 关闭只触发 runtime 收口（队列排空 + worker drain 在
-        // runtime 内进行）；不在此阻塞等 drain。
-        m_runtime->RequestClose();
+    // owner 关闭：先封自身接纳门禁，再让 runtime 同步收口（返回即 worker
+    // 全退、ops 清空或超过有界等待上限）。
+    void Close() noexcept override {
+        m_close.BeginClose();
+        m_runtime->Close();
+        m_close.MarkClosed();
     }
     // IsClosed 诚实反映物理收口：runtime 的 ops 清空 + worker 全退
     // 才 Closed，不把「已发起关闭」冒充「物理完成」。
     bool IsClosed() const noexcept override {
         return m_runtime->IsClosed();
-    }
-    CloseStatus WaitClosed(
-        bbt::coroutine::Deadline          deadline,
-        bbt::coroutine::CancellationToken cancel) override {
-        // 委托 runtime 的关闭态机：等的是同一个物理 drain；单等待位
-        // 约束（AlreadyWaiting）与超时/取消语义保持一致。
-        return m_runtime->WaitClosed(deadline, std::move(cancel));
     }
     bbt::coroutine::CoObjectInfo GetObjectInfo() const override {
         return m_info;
@@ -548,16 +687,24 @@ result<void> CliPrecheckNoColl(const ManagedCloseState& close) {
 } // namespace
 
 result<void> CoMongoCliImpl::Start() {
-    const auto gen = bbt::coroutine::CurrentRuntimeGeneration();
-    if (gen == 0 || gen != m_info.generation)
+    if (!g_scheduler->IsInitialized())
         return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable,
-            "scheduler not running or runtime generation mismatch"));
-    if (!m_close.IsOpen())
-        return result<void>::err(MakeError(ErrorCode::Closed,
-            "mongo client is closing or closed"));
-    if (m_runtime)
-        return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "mongo client already started"));
+            "coroutine runtime not initialized"));
+    // 与 Close 配对：关闭门禁、已启动检查与「启动在途」标志在同一临界区
+    // 判定——Close 取到关闭权后 Start 不得再进入发布路径。
+    {
+        std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
+        if (!m_close.IsOpen())
+            return result<void>::err(MakeError(ErrorCode::Closed,
+                "mongo client is closing or closed"));
+        if (m_runtime || m_starting)
+            return result<void>::err(MakeError(ErrorCode::InvalidArgument,
+                "mongo client already started"));
+        m_starting = true;
+    }
+    // 离开 Start 前必清在途标志并唤醒等待中的 Close（含全部失败/自清
+    // 路径），否则与 Close 配对会自锁。
+    StartingScope starting_scope{this};
 
     // 独占 runtime：资源预算照搬 MongoClientConfig 的 worker/queue/
     // 超时项；旧 client 语义保持「一个 client 一组 worker」，但资源
@@ -574,30 +721,38 @@ result<void> CoMongoCliImpl::Start() {
     auto rt_info = NewObjectInfo("infra.mongo_rt");
     if (!rt_info)
         return result<void>::err(std::move(rt_info).error());
-    auto rt_sig = NewCompletionSignal();
-    if (!rt_sig)
-        return result<void>::err(std::move(rt_sig).error());
     auto rt = std::make_shared<MongoRuntime>(
-        std::move(rcfg), std::move(rt_info).value(),
-        std::move(rt_sig).value());
+        std::move(rcfg), std::move(rt_info).value());
     auto started = rt->Start();
     if (!started)
         return result<void>::err(std::move(started).error());
 
     auto h_info = NewObjectInfo("infra.mongo_coll");
     if (!h_info) {
-        rt->RequestClose();
+        rt->Close();
         return result<void>::err(std::move(h_info).error());
     }
-    auto h_sig = NewCompletionSignal();
-    if (!h_sig) {
-        rt->RequestClose();
-        return result<void>::err(std::move(h_sig).error());
-    }
-    m_coll = std::make_shared<MongoCollImpl>(
+    auto coll = std::make_shared<MongoCollImpl>(
         rt, mongo::MongoTarget{m_config.database, m_config.collection},
-        std::move(h_info).value(), std::move(h_sig).value());
-    m_runtime = std::move(rt);
+        std::move(h_info).value());
+
+    // 发布与封口同临界区配对：Close 已封口则绝不发布 worker/lease，改由
+    // Start 自清该 runtime（自清完成后 StartingScope 才唤醒 Close，保证
+    // Close 返回当刻资源已收口、终态不回退）。
+    bool sealed = false;
+    {
+        std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
+        sealed = !m_close.IsOpen();
+        if (!sealed) {
+            m_coll    = std::move(coll);
+            m_runtime = std::move(rt);
+        }
+    }
+    if (sealed) {
+        rt->Close();
+        return result<void>::err(MakeError(ErrorCode::Closed,
+            "mongo client is closing or closed"));
+    }
     return result<void>::ok();
 }
 
@@ -605,12 +760,13 @@ result<void> CoMongoCliImpl::InsertOne(const MongoDocument& doc,
                                        const CallOptions&   options) {
     if (doc.bytes.empty())
         return result<void>::err(InvalidArg("mongo InsertOne: empty document"));
-    if (!m_coll) {
+    auto coll = CollSnapshot();
+    if (!coll) {
         auto pre = CliPrecheckNoColl(m_close);
         return result<void>::err(std::move(pre).error());
     }
-    auto r = m_coll->Runtime()->Submit(m_coll, MongoOp::Kind::InsertOne,
-                                       doc, {}, options);
+    auto r = coll->Runtime()->Submit(coll, MongoOp::Kind::InsertOne,
+                                     doc, {}, options);
     if (!r)
         return result<void>::err(std::move(r).error());
     return result<void>::ok();
@@ -621,13 +777,14 @@ result<std::optional<MongoDocument>> CoMongoCliImpl::FindOne(
     if (filter.bytes.empty())
         return result<std::optional<MongoDocument>>::err(
             InvalidArg("mongo FindOne: empty filter"));
-    if (!m_coll) {
+    auto coll = CollSnapshot();
+    if (!coll) {
         auto pre = CliPrecheckNoColl(m_close);
         return result<std::optional<MongoDocument>>::err(
             std::move(pre).error());
     }
-    auto r = m_coll->Runtime()->Submit(m_coll, MongoOp::Kind::FindOne,
-                                       filter, {}, options);
+    auto r = coll->Runtime()->Submit(coll, MongoOp::Kind::FindOne,
+                                     filter, {}, options);
     if (!r)
         return result<std::optional<MongoDocument>>::err(
             std::move(r).error());
@@ -644,12 +801,13 @@ result<MongoUpdateResult> CoMongoCliImpl::UpdateOne(
     if (update.bytes.empty())
         return result<MongoUpdateResult>::err(
             InvalidArg("mongo UpdateOne: empty update"));
-    if (!m_coll) {
+    auto coll = CollSnapshot();
+    if (!coll) {
         auto pre = CliPrecheckNoColl(m_close);
         return result<MongoUpdateResult>::err(std::move(pre).error());
     }
-    auto r = m_coll->Runtime()->Submit(m_coll, MongoOp::Kind::UpdateOne,
-                                       filter, update, options);
+    auto r = coll->Runtime()->Submit(coll, MongoOp::Kind::UpdateOne,
+                                     filter, update, options);
     if (!r)
         return result<MongoUpdateResult>::err(std::move(r).error());
     MongoUpdateResult out;
@@ -664,12 +822,13 @@ result<std::uint64_t> CoMongoCliImpl::DeleteOne(
     if (filter.bytes.empty())
         return result<std::uint64_t>::err(
             InvalidArg("mongo DeleteOne: empty filter"));
-    if (!m_coll) {
+    auto coll = CollSnapshot();
+    if (!coll) {
         auto pre = CliPrecheckNoColl(m_close);
         return result<std::uint64_t>::err(std::move(pre).error());
     }
-    auto r = m_coll->Runtime()->Submit(m_coll, MongoOp::Kind::DeleteOne,
-                                       filter, {}, options);
+    auto r = coll->Runtime()->Submit(coll, MongoOp::Kind::DeleteOne,
+                                     filter, {}, options);
     if (!r)
         return result<std::uint64_t>::err(std::move(r).error());
     return result<std::uint64_t>::ok(
@@ -677,23 +836,33 @@ result<std::uint64_t> CoMongoCliImpl::DeleteOne(
                                                         : r.value().deleted));
 }
 
-void CoMongoCliImpl::RequestClose() noexcept {
-    if (!m_close.BeginClose())
-        return;
-    if (m_coll)
-        m_coll->RequestClose();
-    if (m_runtime)
-        m_runtime->RequestClose();
-    else
-        // 未 Start：无 runtime 可 drain，本对象信号立即落定。
-        m_close.MarkClosed();
+void CoMongoCliImpl::Close() noexcept {
+    std::shared_ptr<MongoCollImpl> coll;
+    std::shared_ptr<MongoRuntime>  rt;
+    {
+        std::unique_lock<std::mutex> lk(m_lifecycle_mtx);
+        m_close.BeginClose();     // 封口：此后 Start 不得再发布资源
+        // 与在途 Start 配对：先封口，再等它完成（发布或自清）后才取快照
+        // 收口——不会出现「Close 已返回、Start 事后发布」；未 Start 时
+        // 该等待立即返回（本对象信号即刻落定）。
+        m_lifecycle_cv.wait(lk, [this] { return !m_starting; });
+        coll = m_coll;
+        rt   = m_runtime;
+    }
+    if (coll)
+        coll->Close();            // 句柄接纳封口（不影响 runtime 在途 op）
+    if (rt)
+        rt->Close();              // 同步收口：返回即在途归零
+    // 物理清理落定：Close 返回当刻本 wrapper 的 worker/lease 已收口，
+    // 终态不回退（重复 Close 幂等）。
+    m_close.MarkClosed();
 }
 
 } // namespace bbt::infra::mongo_detail
 
 namespace bbt::infra {
 
-// 旧契约装配入口：Create 只校验装配参数并取对象身份/完成信号，
+// 旧契约装配入口：Create 只校验装配参数并取对象身份，
 // Start 才真正占用资源；二者均在控制线程使用，不挂起协程。
 result<std::shared_ptr<CoMongoCli>>
 CoMongoCli::Create(MongoClientConfig config) {
@@ -705,12 +874,8 @@ CoMongoCli::Create(MongoClientConfig config) {
     if (!info)
         return result<std::shared_ptr<CoMongoCli>>::err(
             std::move(info).error());
-    auto sig = mongo_detail::NewCompletionSignal();
-    if (!sig)
-        return result<std::shared_ptr<CoMongoCli>>::err(
-            std::move(sig).error());
     auto impl = std::make_shared<mongo_detail::CoMongoCliImpl>(
-        std::move(config), std::move(info).value(), std::move(sig).value());
+        std::move(config), std::move(info).value());
     return result<std::shared_ptr<CoMongoCli>>::ok(std::move(impl));
 }
 
@@ -728,23 +893,14 @@ CoMongoDb::Create(MongoRuntimeConfig config) {
     if (!info)
         return result<std::shared_ptr<CoMongoDb>>::err(
             std::move(info).error());
-    auto sig = mongo_detail::NewCompletionSignal();
-    if (!sig)
-        return result<std::shared_ptr<CoMongoDb>>::err(
-            std::move(sig).error());
     auto rt_info = mongo_detail::NewObjectInfo("infra.mongo_rt");
     if (!rt_info)
         return result<std::shared_ptr<CoMongoDb>>::err(
             std::move(rt_info).error());
-    auto rt_sig = mongo_detail::NewCompletionSignal();
-    if (!rt_sig)
-        return result<std::shared_ptr<CoMongoDb>>::err(
-            std::move(rt_sig).error());
     auto rt = std::make_shared<mongo_detail::MongoRuntime>(
-        std::move(config), std::move(rt_info).value(),
-        std::move(rt_sig).value());
+        std::move(config), std::move(rt_info).value());
     auto impl = std::make_shared<mongo_detail::CoMongoDbImpl>(
-        std::move(rt), std::move(info).value(), std::move(sig).value());
+        std::move(rt), std::move(info).value());
     return result<std::shared_ptr<CoMongoDb>>::ok(std::move(impl));
 }
 

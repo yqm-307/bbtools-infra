@@ -2,42 +2,26 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 
-#include <bbt/coroutine/detail/Define.hpp>   // g_bbt_tls_coroutine_co
-#include <bbt/coroutine/detail/Hook.hpp>     // Hook_Sleep
+#include "detail/IoSupport.hpp" // ManagedCloseState / CloseWaiters / kCloseDrainTimeout
+
+#include <bbt/coroutine/detail/Define.hpp>      // g_scheduler / g_bbt_tls_coroutine_co
+#include <bbt/coroutine/detail/Hook.hpp>        // Hook_Sleep
 #include <bbt/coroutine/detail/LocalThread.hpp>
 #include <bbt/coroutine/detail/Processer.hpp>
-#include <bbt/coroutine/object/CoObject.hpp> // CurrentRuntimeGeneration / CreateObjectInfo
-#include <bbt/coroutine/sync/CompletionSignal.hpp>
+#include <bbt/coroutine/detail/Scheduler.hpp>   // IsInitialized
+#include <bbt/coroutine/object/CoObject.hpp>    // CreateObjectInfo
+#include <bbt/coroutine/sync/CoWaiter.hpp>      // 睡眠等待位 + 关闭唤醒
 #include <bbt/coroutine/syntax/SyntaxMacro.hpp> // bbtco_noexcept / bbtco_sleep
 
 namespace bbt::infra::config {
-namespace {
-
-// 关闭态机：Open → Closing → Closed，不重开（同 ICoCloseable 契约）。
-// Closing 只表示「已请求关闭」；Closed 表示轮询循环已 drain 完毕。
-constexpr int kPhaseOpen = 0;
-constexpr int kPhaseClosing = 1;
-constexpr int kPhaseClosed = 2;
-
-// WaitStatus → CloseStatus 固定映射（co-network/v1 §关闭规则）。
-bbt::infra::CloseStatus MapWaitStatus(bbt::coroutine::WaitStatus status) noexcept {
-    using bbt::coroutine::WaitStatus;
-    switch (status) {
-    case WaitStatus::Completed:          return bbt::infra::CloseStatus::Closed;
-    case WaitStatus::TimedOut:           return bbt::infra::CloseStatus::TimedOut;
-    case WaitStatus::Cancelled:          return bbt::infra::CloseStatus::Cancelled;
-    case WaitStatus::InvalidContext:     return bbt::infra::CloseStatus::InvalidContext;
-    case WaitStatus::AlreadyWaiting:     return bbt::infra::CloseStatus::AlreadyWaiting;
-    case WaitStatus::RuntimeUnavailable: return bbt::infra::CloseStatus::RuntimeUnavailable;
-    }
-    return bbt::infra::CloseStatus::RuntimeUnavailable;
-}
-
-} // namespace
 
 struct Watcher::Impl {
     SourcePtr source;
@@ -47,25 +31,43 @@ struct Watcher::Impl {
 
     bbt::coroutine::CoObjectInfo info;
 
-    // 关闭态与完成信号都由栈外持有者（Watcher/Impl）一侧拥有；等待路径
-    // 不把它们复制到协程栈上。协程契约 §6 的强制 Stop 直接销毁挂起协程、
-    // 不做栈展开，栈上的强引用会把配置源永久钉住（#35 已证实反例）。
-    std::atomic<int> phase{kPhaseOpen};
-    std::shared_ptr<bbt::coroutine::CompletionSignal> signal;
+    // 关闭态机由栈外持有者（Watcher/Impl）一侧拥有：Open→Closing→Closed，
+    // 不重开。IsOpen() 为真才读源/投递——Close() 封口后不再产生消费者回调。
+    detail::ManagedCloseState close;
 
-    bool Open() const noexcept {
-        return phase.load(std::memory_order_acquire) == kPhaseOpen;
-    }
-    bool Closed() const noexcept {
-        return phase.load(std::memory_order_acquire) == kPhaseClosed;
+    // 轮询协程的睡眠等待位（单等待者）+ 关闭期等待者登记。Close() 经
+    // close_waiters 唤醒正在睡眠的轮询协程，不必等满 poll_interval。
+    // 等待位与等待集合在 park 期间的保活见 RunWatchLoop：由协程帧上的
+    // lambda 捕获持强引用，恢复时协程会回到 CoWaiter::WaitWithCallback
+    // 内部继续执行，等待位在 park 期间不得析构。
+    bbt::coroutine::sync::CoWaiter::SPtr sleeper;
+    std::shared_ptr<detail::CloseWaiters> close_waiters;
+
+    // 轮询协程退出落定：Close 有界等待它。
+    std::mutex              exit_mtx;
+    std::condition_variable exit_cv;
+    bool                    loop_exit{false}; // exit_mtx 保护
+
+    // 轮询协程身份：首次进入 RunWatchLoop 时写入一次，此后只读比较、不解引用
+    // （协程可迁移线程，指针身份仍稳定）。Close 据此区分「回调内自关闭」与
+    // 「从其它线程/协程关闭」。
+    std::atomic<bbt::coroutine::detail::Coroutine*> loop_co{nullptr};
+
+    bool LoopStarted() const noexcept {
+        return loop_co.load(std::memory_order_acquire) != nullptr;
     }
 
-    // drain 完成（仅轮询循环协程调用）：置 Closed 并唤醒 WaitClosed 等待者。
-    // 强制 Stop 销毁循环协程时本函数不执行：态停留 Closing，IsClosed 保持
-    // false，不伪装已关闭。
-    void MarkClosed() noexcept {
-        phase.store(kPhaseClosed, std::memory_order_release);
-        if (signal) signal->Complete(); // one-shot：晚到/重复安全
+    bool IsLoopCoroutine() const noexcept {
+        auto* loop = loop_co.load(std::memory_order_acquire);
+        return loop != nullptr && loop == g_bbt_tls_coroutine_co;
+    }
+
+    void SignalLoopExit() noexcept {
+        {
+            std::lock_guard<std::mutex> lk(exit_mtx);
+            loop_exit = true;
+        }
+        exit_cv.notify_all();
     }
 
     void PollTick() {
@@ -115,15 +117,11 @@ struct Watcher::Impl {
     }
 
 private:
-    // 投递前检查关闭态：RequestClose 被观察到后不再发起新的消费者调用，
-    // 本次拍的读结果随之丢弃（「关闭与正在读取/待投递通知交错」的确定性
-    // 边界）。旧实现只在拍与拍之间检查，关闭请求落在 Read 与投递之间时
-    // 会多投递一个晚到事件。
-    // 不在回调内持锁：回调自身调用 RequestClose/IsClosed 不得自锁，因此
-    // 关闭请求与「刚通过检查、尚未进入回调」的单个事件允许并发，drain
-    // 完成（WaitClosed → Closed）后不再有任何消费者调用。
+    // 投递前检查封口态：Close()（含回调内自关闭）之后不再发起消费者调用，本次
+    // 拍已读出的结果随之丢弃。不在回调内持锁，回调自身调用 Close()/IsClosed()
+    // 不会自锁。
     void Deliver(const WatchEvent& event) {
-        if (!Open()) return;
+        if (!close.IsOpen()) return;
         callback(event);
     }
 
@@ -136,31 +134,57 @@ private:
 
 namespace {
 
-// 轮询循环：持有 weak_ptr，不依赖协程栈析构持有 Impl 强引用。
-// 关键：强引用只在本拍计算范围内持有，必须在 bbtco_sleep 挂起前释放——
-// 强制 Stop 销毁挂起协程时不做栈展开，若挂起期间栈上仍持有
-// shared_ptr<Impl>，其析构不执行，Impl 的强计数永不归零、耐久资源
-// （源/回调）泄漏。挂起前释放后，挂起期间只剩 lambda 捕获的 weak_ptr，
-// 强制 Stop 只残留一个控制块 weak 计数，源随外部句柄释放而析构。
-void RunWatchLoop(std::weak_ptr<Watcher::Impl> weak) {
+// 轮询循环。
+// sleeper 由协程帧强持有（bbtco_noexcept 的 lambda 捕获）：挂起期间协程栈上
+// 必须保有等待位与等待集合，恢复路径会回到 CoWaiter::WaitWithCallback 内部。
+// 该捕获不涉及 Impl，因此挂起期间不钉住 source/callback。
+void RunWatchLoop(std::weak_ptr<Watcher::Impl> weak,
+                  const bbt::coroutine::sync::CoWaiter::SPtr& sleeper) {
+    if (auto self = weak.lock())
+        self->loop_co.store(g_bbt_tls_coroutine_co, std::memory_order_release);
+
     for (;;) {
-        bool done = false;
-        int interval_ms = 0;
+        std::chrono::milliseconds interval{0};
+        std::shared_ptr<detail::CloseWaiters> waiters;
         {
             auto self = weak.lock();
-            if (!self) return; // Impl 已被外部释放，安全退出
-            if (self->Open()) {
-                self->PollTick();
-                interval_ms = static_cast<int>(self->poll_interval.count());
-            } else {
-                done = true;
-            }
-        } // self 在此释放：挂起期间不持有 Impl 强引用
-        if (done) break;
-        bbtco_sleep(interval_ms);
+            if (!self) return;                 // Impl 已释放：直接退出
+            if (!self->close.IsOpen()) break;  // 已封口：不再读源/投递
+            self->PollTick();
+            interval = self->poll_interval;
+            waiters = self->close_waiters;
+        } // 强引用在此释放：挂起期间不持有 Impl
+
+        // 有界睡眠：poll_interval 到点、或 Close 封口时唤醒。on_registered 在
+        // 等待事件登记成功后、真正 park 前执行——在此登记进关闭等待集合；
+        // Close 已开始时（Add 返回 false）自行 Notify 一次，走 PENDING 早到
+        // 路径，不丢唤醒。
+        const auto status = sleeper->WaitWithCallback(
+            bbt::coroutine::WaitOptions{std::chrono::steady_clock::now() + interval},
+            [waiters, sleeper]() {
+                if (!waiters->Add(sleeper)) sleeper->Notify();
+                return true; // 登记成功后照常 park；唤醒由 Add/Notify 两步决定
+            });
+        waiters->Remove(sleeper.get());
+
+        if (status == bbt::coroutine::WaitStatus::Cancelled) {
+            // 轮询协程被运行时取消（本模块从不发起）：停止轮询，不空转重试。
+            break;
+        }
+        if (status == bbt::coroutine::WaitStatus::InvalidContext ||
+            status == bbt::coroutine::WaitStatus::AlreadyWaiting ||
+            status == bbt::coroutine::WaitStatus::RuntimeUnavailable) {
+            // 未真正挂起（事件登记失败/等待位残留/上下文异常）：退化为一次
+            // Hook_Sleep，避免立即重试空转；下一拍照常重查封口态。
+            bbtco_sleep(static_cast<int>(interval.count()));
+        }
     }
-    // drain 完成：置 closed 并唤醒 WaitClosed。
-    if (auto self = weak.lock()) self->MarkClosed();
+
+    // 退出落定：置 Closed（幂等）并唤醒 Close 的有界等待。
+    if (auto self = weak.lock()) {
+        self->close.MarkClosed();
+        self->SignalLoopExit();
+    }
 }
 
 } // namespace
@@ -168,7 +192,8 @@ void RunWatchLoop(std::weak_ptr<Watcher::Impl> weak) {
 Watcher::Watcher(std::shared_ptr<Impl> impl) : m_impl(std::move(impl)) {}
 
 Watcher::~Watcher() {
-    if (m_impl) RequestClose();
+    // 句柄析构即收口：先停轮询协程，再释放 Impl（source/callback 随之释放）。
+    if (m_impl) Close();
 }
 
 bbt::coroutine::CoObjectInfo Watcher::GetObjectInfo() const {
@@ -186,29 +211,36 @@ result<Watcher::SPtr> Watcher::Create(SourcePtr source, WatchCallback callback,
     if (options.poll_interval.count() <= 0)
         return result<SPtr>::err(MakeError(ErrorCode::InvalidArgument,
             "config watcher: poll_interval must be positive"));
-    if (bbt::coroutine::CurrentRuntimeGeneration() == 0)
+    // 睡眠走协程定时器（int 毫秒口径）：超过上限不挂定时器、会永久挂起，
+    // 因此按非法参数拒绝，不静默退化。
+    if (options.poll_interval > std::chrono::milliseconds{
+            std::numeric_limits<int>::max()})
+        return result<SPtr>::err(MakeError(ErrorCode::InvalidArgument,
+            "config watcher: poll_interval exceeds coroutine timer range"));
+    if (!g_scheduler->IsInitialized())
         return result<SPtr>::err(MakeError(ErrorCode::RuntimeUnavailable,
-            "config watcher: scheduler not running"));
+            "config watcher: coroutine runtime not initialized"));
 
     auto impl = std::make_shared<Impl>();
     try {
         impl->info = bbt::coroutine::CreateObjectInfo("config", "Watcher");
-        // 完成信号与对象身份同受运行时代际约束：代际为 0（并发 Stop）时
-        // 构造函数抛 logic_error，按本仓先例（ManagedCloseState/NewObjectInfo）
-        // 映射为 RuntimeUnavailable，不泄漏异常。
-        impl->signal = std::make_shared<bbt::coroutine::CompletionSignal>();
     } catch (const std::logic_error&) {
+        // 运行时在检查与创建之间停止初始化：映射为 RuntimeUnavailable，
+        // 不泄漏异常（同 ManagedCloseState/NewObjectInfo 先例）。
         return result<SPtr>::err(MakeError(ErrorCode::RuntimeUnavailable,
-            "config watcher: runtime generation unavailable"));
+            "config watcher: coroutine runtime unavailable"));
     }
+    impl->sleeper = bbt::coroutine::sync::CoWaiter::Create();
+    impl->close_waiters = std::make_shared<detail::CloseWaiters>();
     impl->source = std::move(source);
     impl->callback = std::move(callback);
     impl->poll_interval = options.poll_interval;
     impl->deliver_initial = options.deliver_initial;
 
     const std::weak_ptr<Impl> weak = impl;
+    const auto sleeper = impl->sleeper;
     bool registered = false;
-    bbtco_noexcept(&registered) [weak]() { RunWatchLoop(weak); };
+    bbtco_noexcept(&registered) [weak, sleeper]() { RunWatchLoop(weak, sleeper); };
     if (!registered)
         return result<SPtr>::err(MakeError(ErrorCode::RuntimeUnavailable,
             "config watcher: failed to register poll coroutine"));
@@ -216,42 +248,41 @@ result<Watcher::SPtr> Watcher::Create(SourcePtr source, WatchCallback callback,
     return result<SPtr>::ok(SPtr(new Watcher(std::move(impl))));
 }
 
-void Watcher::RequestClose() noexcept {
+void Watcher::Close() noexcept {
     auto* impl = m_impl.get();
     if (impl == nullptr) return;
-    int expected = kPhaseOpen;
-    impl->phase.compare_exchange_strong(expected, kPhaseClosing); // 幂等
-    // 轮询循环在下一拍（≤ poll_interval）观察到非 Open 并退出；drain 完成后
-    // 由循环协程置 Closed 并唤醒 WaitClosed，无需在此显式唤醒。
+
+    // 幂等：仅首次调用执行封口与唤醒（CloseAndWakeAll 自带幂等，此处不再重复）。
+    if (impl->close.BeginClose())
+        impl->close_waiters->CloseAndWakeAll(); // 原子封口 + 唤醒在册等待者
+
+    if (impl->close.IsClosed()) return; // 已落定（含回调内自关闭）
+
+    // 回调内自关闭：本线程就是轮询协程，物理停止只能发生在本次回调返回之后，
+    // 不能在此等待自身退出。封口已完成（Deliver 不再投递），先落定 Closed；
+    // 循环在回调返回后的下一拍退出并补一次 SignalLoopExit。
+    if (impl->IsLoopCoroutine()) {
+        impl->close.MarkClosed();
+        return;
+    }
+
+    // 已注册但从未被调度过的轮询协程：无从等待，也不需要等——它首次运行的
+    // 第一拍就是「已封口 → 退出」，不读源、不回调；此刻封口已完成，落定
+    // Closed 不掩盖任何可观察的协程退出。
+    if (!impl->LoopStarted()) {
+        impl->close.MarkClosed();
+        return;
+    }
+
+    // 有界等待轮询协程退出并落定；超时即返回（IsClosed 保持 false）。
+    std::unique_lock<std::mutex> lk(impl->exit_mtx);
+    impl->exit_cv.wait_for(lk, detail::kCloseDrainTimeout,
+                           [impl] { return impl->loop_exit; });
 }
 
 bool Watcher::IsClosed() const noexcept {
     auto* impl = m_impl.get();
-    return impl == nullptr || impl->Closed();
-}
-
-bbt::infra::CloseStatus Watcher::WaitClosed(bbt::coroutine::Deadline deadline,
-                                            bbt::coroutine::CancellationToken cancel) {
-    // 关闭态与完成信号由 Impl（栈外持有者）拥有：本函数只经 m_impl 的
-    // 裸解引用访问它们，不把任何 shared_ptr 复制到协程栈上，恢复后也不
-    // 回访 Impl 以外的所有者。协程契约 §6 的强制 Stop 不展开挂起栈，
-    // 栈上的 shared_ptr<Impl> 会永久钉住配置源（#35 父探针反例）。
-    // 调用方须在等待期间保持 Watcher 存活（co-network/v1 §关闭规则）。
-    if (!m_impl) return bbt::infra::CloseStatus::Closed;
-    if (g_bbt_tls_coroutine_co == nullptr)
-        return bbt::infra::CloseStatus::InvalidContext;
-    const auto generation = bbt::coroutine::CurrentRuntimeGeneration();
-    if (generation == 0 || generation != m_impl->info.generation)
-        return bbt::infra::CloseStatus::RuntimeUnavailable;
-    if (m_impl->Closed()) return bbt::infra::CloseStatus::Closed;
-
-    bbt::coroutine::WaitOptions wait;
-    wait.deadline = deadline;
-    wait.cancel = std::move(cancel);
-    // 结果由等待竞争点一次定死（契约 §C1/#347③）：不在恢复后做第二遍
-    // 优先级重判。每个对象至多一个并发等待者，第二个返回 AlreadyWaiting
-    // （CompletionSignal 唯一等待位）。
-    return MapWaitStatus(m_impl->signal->Wait(wait));
+    return impl == nullptr || impl->close.IsClosed();
 }
 
 } // namespace bbt::infra::config

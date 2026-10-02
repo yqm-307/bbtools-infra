@@ -10,14 +10,17 @@
 // 连接预算、handler drain、io 域封口——不再持有第二份 transport 账本、
 // 也不重复 transport 的关闭实现。
 //
-// 物理清理顺序（契约 §132 与「逻辑结果与物理清理分离」）：
-//   RequestClose → 投递到 io 域逐个执行子对象 teardown → 等所有子对象
-//   按 in-flight async 计数归零后 MarkClosed → 引擎 SealOnIoDomain
-//   仅封死 TryPost，随后 runtime 自身 MarkClosed。
-//   任何一个环节未完成前 WaitClosed 不返回 Closed——TimedOut/Cancelled
-//   原样上报，infra 不伪造「清理完成」。
+// 关闭语义（进程寿命运行时修订，契约 §1）：Close() 幂等、任意线程可调用，
+// 返回即物理释放：
+//   封口（拒新子对象）→ 逐个同步 Close 子对象（各自有界收敛）→
+//   transport owner 同步收口 → 有界等待在途子对象归零（≤
+//   detail::kCloseDrainTimeout + condition_variable）→ 封口 io 域 →
+//   一次性 closed hook。
+// 无 RequestClose/WaitClosed、无运行时代际、无取消令牌、无 CompletionSignal；
+// 也没有「硬停/静默后收口」入口——运行时不再有 Stop。
 
 #include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -46,12 +49,10 @@ public:
     NetworkRuntimeImpl(NetworkLimits                  limits,
                        std::shared_ptr<HttpIoEngine>  engine,
                        bbt::coroutine::CoObjectInfo   info,
-                       std::shared_ptr<bbt::coroutine::CompletionSignal> close_sig,
                        std::shared_ptr<TransportRuntime> transport)
         : m_limits(limits),
           m_engine(std::move(engine)),
           m_info(std::move(info)),
-          m_close(std::move(close_sig)),
           m_transport(std::move(transport)) {}
 
     result<void> Start() override;
@@ -64,41 +65,22 @@ public:
         SocketAddress local, unsigned backlog) override;
     result<std::shared_ptr<CoUDP>> BindUDP(SocketAddress local) override;
 
-    void RequestClose() noexcept override;
+    // 幂等、任意线程；返回即物理释放（见文件头关闭语义）。
+    void Close() noexcept override;
     bool IsClosed() const noexcept override { return m_close.IsClosed(); }
-    CloseStatus WaitClosed(bbt::coroutine::Deadline          deadline,
-                           bbt::coroutine::CancellationToken cancel) override {
-        return m_close.WaitClosed(deadline, std::move(cancel),
-                                  m_info.generation);
-    }
     bbt::coroutine::CoObjectInfo GetObjectInfo() const override {
         return m_info;
     }
 
-    // P4 硬停收口（前置条件，调用方保证）：执行本 runtime 子对象 op 的调度器
-    // 已静默——Scheduler::Stop() 已返回，此后不存在可执行子对象 op 或等待回调
-    // 的执行体。语义：本切片封口（幂等）、驱动受管 transport owner 批量强制物理
-    // 关闭（唯一调用点，经 detail::TransportWiring），再在 off-domain 路径上
-    // 收口子对象并尝试落定（硬停后 io 域已无执行体，故不投递 TryPost）。
-    // 返回本次真正完成物理关闭的受管 transport 对象数。非静默状态下调用不安全
-    // （见对象级 ForceCloseAfterQuiescence 注释）。运行期关闭路径一字未改：
-    // RequestClose 仍是唯一运行期入口，门控保留。
-    std::size_t ForceCloseAfterQuiescence() noexcept;
-
     // 子对象物理清理落定回调（任意线程，经各子对象 ClosedHook 触发）。
     // child 是稳定身份：登记/移除/计数按同一身份一次性配对。
-    void OnChildClosed(const IIoTeardown* child) noexcept;
-
-    // P2 装配接缝：把 transport owner 的「受管 transport 全部物理关闭」落定
-    // 并入本 runtime 的 finalize 门控（唯一通知来源，不轮询）。Create 构造
-    // 出对象后调用一次。
-    void AdoptTransportOwner();
+    void OnChildClosed(const ICoCloseable* child) noexcept;
 
     // 测试接缝（Issue #38 竞态证据）：工厂在 CheckAndAdoptLocked 复检通过、
     // 登记提交之前调用此钩子（持 m_lifecycle_mtx）。测试用它把 factory
     // 调用停在「复检已过、登记未提交」的临界段内，再在同一线程外发起
-    // RequestClose——从而证明登记提交与 RequestClose 的真实调用窗口
-    // 重叠（不靠 sleep/时序推断）。生产路径不安装此钩子；为空时零开销。
+    // Close——从而证明登记提交与 Close 的真实调用窗口重叠（不靠 sleep/
+    // 时序推断）。生产路径不安装此钩子；为空时零开销。
     // 钩子约定：必须 noexcept，不得回调本对象/再次取本锁/阻塞在锁内
     // 等待由持锁线程释放的资源以外的事件。
     void SetAdoptCommitGateForTest(std::function<void()> gate) noexcept {
@@ -115,7 +97,6 @@ public:
         std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
         return m_unclosed;
     }
-
 
     // 测试接缝（Issue #32）：直读在途账本当前名额数。账本唯一真源在
     // transport owner 侧，这里只转发——本切片不保留第二份计数。
@@ -134,21 +115,11 @@ public:
 private:
     enum State : int { kCreated = 0, kRunning = 1, kClosingOrClosed = 2 };
 
-    // io 域：全部子对象 Closed 后封口引擎并落定 runtime Closed。
-    void FinalizeEngine() noexcept;
-    void MaybeFinalize() noexcept;
-
-    // io 域：封口子对象注册 → 逐个 teardown → 全部物理关闭后封口引擎。
-    void TeardownOnIoDomain() noexcept;
-    // TryPost 失败：逻辑封口 + 子对象 off-domain 收口，不提前 MarkClosed。
-    void TeardownOffDomain() noexcept;
     result<void> CheckUsableForFactory() const;
-    result<std::shared_ptr<bbt::coroutine::CompletionSignal>>
-        NewCloseSignal() const;
-    // 工厂在锁内完成「未关闭」复检 + 登记 + 计数，杜绝与 teardown 竞态
-    // 产生的孤儿子对象（登记了的必被 teardown 收口）。
+    // 工厂在锁内完成「未关闭」复检 + 登记 + 计数，杜绝与 Close 竞态
+    // 产生的孤儿子对象（登记了的必被 Close 收口）。
     result<void> CheckAndAdoptLocked(
-        const std::shared_ptr<IIoTeardown>& child);
+        const std::shared_ptr<ICoCloseable>& child);
 
     // Issue #37：HTTP 出站配额。与 transport owner 的 socket 容量账本并列、
     // 由 m_lifecycle_mtx 保护；作用域是整个 Runtime（同一 runtime 下
@@ -171,18 +142,14 @@ private:
     // 生命周期记账（m_lifecycle_mtx 保护）：
     //   m_children 强持有仍需托管的子对象（活跃/关闭中）；子对象物理
     //   关闭落定后经 ClosedHook 按稳定身份一次性移除，运行期间不积累
-    //   历史对象（Issue #38）。m_sealed 由 teardown 置位后工厂拒绝；
-    //   m_unclosed 计数未物理关闭的子对象；m_teardown/m_finalize_started
-    //   与 OnChildClosed 的递减配对，防止丢最后一份关闭通知。
+    //   历史对象（Issue #38）。m_sealed 由 Close 置位后工厂拒绝；
+    //   m_unclosed 计数未物理关闭的子对象；m_drain_cv 供 Close() 有界
+    //   等待在途归零（≤ detail::kCloseDrainTimeout）。
     std::mutex                                     m_lifecycle_mtx;
-    std::vector<std::shared_ptr<IIoTeardown>>      m_children;
+    std::condition_variable                        m_drain_cv;
+    std::vector<std::shared_ptr<ICoCloseable>>     m_children;
     std::size_t                                    m_unclosed{0};
     bool                                           m_sealed{false};
-    bool                                           m_teardown{false};
-    bool                                           m_finalize_started{false};
-    // P4 硬停闸门：仅由 ForceCloseAfterQuiescence 置位（前置条件 Scheduler::Stop()
-    // 已返回）。置位后 MaybeFinalize 就地落定，不把 finalize 投递到已死的 io 域。
-    std::atomic_bool                               m_hard_stop{false};
 
     // 测试接缝钩子：仅在 CheckAndAdoptLocked 复检通过、登记提交前在持锁
     // 状态下调用；生产路径不安装。见 SetAdoptCommitGateForTest 契约注释。
@@ -197,7 +164,7 @@ private:
     std::size_t                                    m_http_inflight_count{0};
 
     // P2：基础 transport 的资源托管与配额 owner（容量名额、在途账本、受管
-    // 对象强持有、物理关闭收口、受管 DialTCP 等待段的取消/归还）都在这里，
+    // 对象强持有、物理关闭收口、受管 DialTCP 等待段的归还）都在这里，
     // 本切片只组合引用，不再复制账本或关闭实现。
     std::shared_ptr<TransportRuntime>              m_transport;
 };

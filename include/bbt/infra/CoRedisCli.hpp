@@ -62,12 +62,12 @@ inline result<void> ValidateRedisClientConfig(const RedisClientConfig& cfg) {
 //   - 连接断开期间已在途命令不回滚也不迁移：报 Error(TransportError)；
 //     断开后新命令触发重连，连接建立前在队列内等待（受 max_queue 与
 //     各自 deadline 约束），不重发已断命令；
-//   - deadline/cancel/owner close 竞争只发布一次逻辑终态；逻辑返回
-//     与物理清理分离，WaitClosed 等在途 operation/connection 归零。
+//   - 命令 deadline/owner close 竞争只发布一次逻辑终态；逻辑返回与物理
+//     清理分离：Close() 在途 operation/connection 归零后物理回收连接。
 class CoRedisCli : public ICoNetwork, public ICoCloseable {
 public:
     // Create/Start 在启动控制线程使用，不挂起协程。
-    // Create 要求 Scheduler 已启动（对象身份与完成信号需要运行时代际），
+    // Create 要求 Scheduler 已启动（对象身份需要运行时已初始化），
     // 否则返回 Error(RuntimeUnavailable)。
     static result<std::shared_ptr<CoRedisCli>> Create(RedisClientConfig config);
 

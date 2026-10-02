@@ -1,11 +1,5 @@
 #include "redis/CoRedisCliImpl.hpp"
 
-#include <cerrno>
-
-#include <sys/syscall.h>
-#include <time.h>
-#include <unistd.h>
-
 #include <bbt/coroutine/detail/Define.hpp>
 #include <bbt/coroutine/detail/LocalThread.hpp>
 #include <bbt/coroutine/detail/Processer.hpp>
@@ -28,28 +22,13 @@ Error InvalidArg(std::string msg) {
     return MakeError(ErrorCode::InvalidArgument, std::move(msg));
 }
 
-// teardown 投递的有界重试参数：post 被拒多为瞬时分配失败，几次
-// 短间隔重试足以区分「瞬时」与「执行域不可达」，且不引入无限等待。
-constexpr int kTeardownPostRetries = 8;
-constexpr int kTeardownPostRetryMs = 4;
-
-// 任意线程上可调用的定长睡眠：必须直达内核 syscall。coroutine Hook
-// 全进程拦截 libc nanosleep 并在非协程线程断言——std::this_thread
-// ::sleep_for 在调用线程不是协程时命中即崩。
-void SleepUnhooked(int ms) noexcept {
-    timespec req{ms / 1000, static_cast<long>(ms % 1000) * 1000000L};
-    timespec rem{};
-    while (::syscall(SYS_nanosleep, &req, &rem) != 0 && errno == EINTR)
-        req = rem;
-}
-
 } // namespace
 
 result<void> CoRedisCliImpl::Start() {
-    const auto gen = bbt::coroutine::CurrentRuntimeGeneration();
-    if (gen == 0 || gen != m_info.generation)
+    // 进程寿命运行时：不再有运行时代际，「运行时是否在跑」只看 Scheduler。
+    if (!g_scheduler->IsInitialized())
         return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable,
-            "scheduler not running or runtime generation mismatch"));
+            "scheduler not running"));
 
     // 先取得共享 executor 并建立 io 域（不创建线程/context）；失败
     // 留在 kCreated，调用方可待 scheduler 就绪后重试 Start。
@@ -67,7 +46,7 @@ result<void> CoRedisCliImpl::Start() {
 
     // 首次连接在 io 域发起；投递失败不致命，首个命令会再触发。
     auto self = shared_from_this();
-    m_engine.TryPost([self] { self->EnsureConnOnIoDomain(); });
+    PostOnIoDomain([self] { self->EnsureConnOnIoDomain(); });
     return result<void>::ok();
 }
 
@@ -95,39 +74,69 @@ result<RawReply> CoRedisCliImpl::Submit(RedisOp::Kind kind,
     if (!pre)
         return result<RawReply>::err(std::move(pre).error());
 
-    auto sig = detail::NewCompletionSignal();
-    if (!sig)
-        return result<RawReply>::err(std::move(sig).error());
-
-    auto self = std::static_pointer_cast<CoRedisCliImpl>(shared_from_this());
+    auto self = shared_from_this();
     auto op   = std::make_shared<RedisOp>(self, kind, std::move(args));
-    op->sig   = std::move(sig).value();
+    op->waiter = bbt::coroutine::sync::CoWaiter::Create();
+    if (!op->waiter)
+        return result<RawReply>::err(MakeError(ErrorCode::InternalError,
+            "redis: failed to create request waiter"));
 
-    // 登记先于 post：与 RequestClose 竞态的提交也能被 teardown 明确拒绝。
+    // 登记先于等待：与 Close 竞态的提交也能被 teardown 明确拒绝。
     if (!RegisterOp(op))
         return result<RawReply>::err(
             MakeError(ErrorCode::Closed, "redis client closed"));
 
-    if (!m_engine.TryPost([self, op] { self->AdmitOnIoDomain(op); })) {
-        // io 域不可用：op 从未接触后端（kDone 允许即刻反登记），
-        // 与 teardown 收口竞争由 Finish CAS 兜底。
-        op->phase = RedisOp::Phase::kDone;
-        op->Finish(result<RawReply>::err(
-            MakeError(ErrorCode::Closed, "redis client closed")));
+    // 契约 §2：先登记等待事件，on_registered 内投递一次命令，随后挂起；
+    // 回包/连接/Close 到达时由 io 域路径 Notify 唤醒。
+    bbt::coroutine::WaitOptions wait;
+    wait.deadline = options.deadline;
+    const auto status = op->waiter->WaitWithCallback(
+        wait,
+        [self, op]() -> bool {
+            self->OnWaitRegisteredOnCoroutine(op);
+            return true;
+        });
+
+    if (status == bbt::coroutine::WaitStatus::Completed) {
+        auto out = op->TakeOutcome();
+        if (out)
+            return std::move(*out);
+        // Close 的唤醒先于 teardown 终态发布：按 Closed 交付，终态仍由
+        // teardown 收口（每个请求只交付一次终态）。
         return result<RawReply>::err(
             MakeError(ErrorCode::Closed, "redis client closed"));
     }
 
-    bbt::coroutine::WaitOptions wait;
-    wait.deadline = options.deadline;
-    wait.cancel   = options.cancel;
-    const auto status = op->sig->Wait(wait);
-    if (status == bbt::coroutine::WaitStatus::Completed)
-        return std::move(*op->outcome);
-
-    // 逻辑结果先行返回；物理清理继续：io 域摘出未发送命令。
-    m_engine.TryPost([self, op] { self->AbortOnIoDomain(op); });
+    // 逻辑结果先行返回；物理清理继续。登记失败（RuntimeUnavailable）时
+    // 命令从未投递，直接就地落定；其余（超时/取消）由 io 域摘出未发送
+    // 命令，已发送的等迟到回包自然消费（保持连接对齐，不再交付）。
+    if (status == bbt::coroutine::WaitStatus::RuntimeUnavailable) {
+        op->phase.store(RedisOp::Phase::kDone);
+        op->Finish(result<RawReply>::err(detail::WaitStatusToError(status)));
+    } else {
+        PostOnIoDomain([self, op] { self->AbortOnIoDomain(op); });
+    }
     return result<RawReply>::err(detail::WaitStatusToError(status));
+}
+
+void CoRedisCliImpl::OnWaitRegisteredOnCoroutine(std::shared_ptr<RedisOp> op) {
+    // 等待事件与唯一等待位均已就绪，此处登记关闭等待者并投递一次命令。
+    // Close 已封口：未发送命令直接丢弃，就地交付 Closed（此刻 Notify 命中
+    // 已登记等待位，走 CoPollEvent 的 PENDING 早到路径，不丢唤醒）。
+    if (!m_close_waiters.Add(op->waiter)) {
+        op->phase.store(RedisOp::Phase::kDone);
+        op->Finish(result<RawReply>::err(
+            MakeError(ErrorCode::Closed, "redis client closed")));
+        return;
+    }
+
+    auto self = shared_from_this();
+    if (!PostOnIoDomain([self, op] { self->AdmitOnIoDomain(op); })) {
+        // io 域不可用：op 从未接触后端（kDone 允许即刻反登记）。
+        op->phase.store(RedisOp::Phase::kDone);
+        op->Finish(result<RawReply>::err(
+            MakeError(ErrorCode::Closed, "redis client closed")));
+    }
 }
 
 result<void> CoRedisCliImpl::Ping(const CallOptions& options) {
@@ -213,6 +222,17 @@ result<std::uint64_t> CoRedisCliImpl::Delete(std::vector<std::string> keys,
 // ---------------- io 域内部流程 ----------------
 
 void CoRedisCliImpl::AdmitOnIoDomain(std::shared_ptr<RedisOp> op) {
+    // teardown 可能先于本 handler 执行（m_io_dead 已置位、队列已排空）：
+    // 此时命令绝不进队列，就地交付 Closed，避免等待者挂住。
+    {
+        std::lock_guard<std::mutex> lk(m_ops_mtx);
+        if (m_io_dead) {
+            op->phase.store(RedisOp::Phase::kDone);
+            op->Finish(result<RawReply>::err(
+                MakeError(ErrorCode::Closed, "redis client closed")));
+            return;
+        }
+    }
     if (m_pending.size() >= m_config.max_queue) {
         // 队列满：确定性 Overloaded，不进队列、不接触后端。
         op->phase = RedisOp::Phase::kDone;
@@ -233,7 +253,8 @@ void CoRedisCliImpl::EnsureConnOnIoDomain() {
     if (!m_conn)
         m_conn = std::make_shared<RedisConnection>(
             m_engine.Io(), m_config.host, m_config.port,
-            std::weak_ptr<CoRedisCliImpl>(shared_from_this()));
+            std::weak_ptr<CoRedisCliImpl>(shared_from_this()),
+            m_engine.IoGatePtr());
     m_conn->OpenOnIoDomain();   // 仅 kIdle 真正发起；其余状态幂等
 }
 
@@ -314,25 +335,27 @@ void CoRedisCliImpl::DrainPendingOnIoDomain(const Error& err) {
 
 // ---------------- 关闭链路 ----------------
 
-void CoRedisCliImpl::RequestClose() noexcept {
+void CoRedisCliImpl::Close() noexcept {
     if (!m_close.BeginClose())
         return;
     m_state.store(kClosingOrClosed);
-    auto self = std::static_pointer_cast<CoRedisCliImpl>(shared_from_this());
-    if (m_engine.TryPost([self] { self->TeardownOnIoDomain(); }))
-        return;
-    // TryPost 失败三种情形：引擎未启动（无 io 域、无连接资源）⇒ 直接
-    // 逻辑收口；引擎已封 ⇒ 此前的 teardown 已执行（m_io_dead 门拦在
-    // TeardownOffDomain 前）；已启动而 post 被拒 ⇒ 多为瞬时分配失败，
-    // 有界重试争取正常 io 域物理清理，持续被拒才落到逻辑收口。
-    if (m_engine.Started()) {
-        for (int i = 0; i < kTeardownPostRetries; ++i) {
-            SleepUnhooked(kTeardownPostRetryMs);
-            if (m_engine.TryPost([self] { self->TeardownOnIoDomain(); }))
-                return;
-        }
+
+    // (1) 封口并唤醒全部挂起等待者：Close 之后的提交被 PreCheck/RegisterOp
+    // 拒绝；在册等待者由下面的同步 teardown 交付 Closed 终态（终态发布本身
+    // 也会唤醒各自等待位），这里先唤醒保证它们不必等到 teardown 才恢复。
+    m_close_waiters.CloseAndWakeAll();
+
+    // (2) 在本调用线程内同步完成物理 teardown：持 owner 域门 ⇒ 与在途 io
+    // handler 配对（门内运行的 handler 先退出，之后的 handler 见 m_io_dead/
+    // ac==nullptr 直接返回），返回当刻 hiredis context/fd、在途命令的 NULL
+    // 回调与未发送队列都已收口，后端不再访问本对象拥有的操作资源。
+    // 不投递 teardown：投递只能由执行域驱动者兑现，手动 Tick 模式下 Close
+    // 会在 fd 仍存活时返回（父级真实 TCP 探针实测）；也不再用「有界等待窗口」
+    // 或投递重试充当物理完成证据。
+    {
+        std::lock_guard<std::recursive_mutex> gate(m_engine.IoGate());
+        TeardownOnIoDomain();
     }
-    TeardownOffDomain();
 }
 
 void CoRedisCliImpl::TeardownOnIoDomain() noexcept {
@@ -348,46 +371,27 @@ void CoRedisCliImpl::TeardownOnIoDomain() noexcept {
     // 此后 RegisterOp 一律失败，无漏网 op。
     DrainPendingOnIoDomain(
         MakeError(ErrorCode::Closed, "redis client closed"));
-    for (auto& op : snapshot)
+    for (auto& op : snapshot) {
+        // 本 handler 独占 io 域：此刻仍 kQueued 的命令已不在 m_pending
+        // （DrainPending 摘除，或 admission 尚未执行）且绝不会再发送，后端
+        // 不再访问，可就地落定物理终态；kSent 的等 redisAsyncFree 同步催出
+        // 的 NULL 回调置 kDone（OnReplyOnIoDomain）。
+        if (op->phase.load() == RedisOp::Phase::kQueued)
+            op->phase.store(RedisOp::Phase::kDone);
         op->Finish(result<RawReply>::err(
             MakeError(ErrorCode::Closed, "redis client closed")));
+    }
     // 回收连接：redisAsyncFree 同步催出在途命令的 NULL 回调——各 op
-    // 经 OnReplyOnIoDomain 置 kDone 后离开 m_ops。
+    // 经 OnReplyOnIoDomain 置 kDone 后离开 m_ops；hiredis 的 cleanup 钩子
+    // 归还 fd 所有权（desc.release），随后由 redisFree 关闭 fd。
     if (m_conn)
         m_conn->TeardownOnIoDomain();
     {
         std::lock_guard<std::mutex> lk(m_ops_mtx);
         m_conn_done = true;
     }
+    // 本函数在 owner 域门内执行（io handler 入口或 Close 的同步 teardown）。
     m_engine.SealOnIoDomain();
-    DrainCheckClosed();
-}
-
-void CoRedisCliImpl::TeardownOffDomain() noexcept {
-    // 投递失败的兜底：hiredis context/bridge 只许 io 域触碰，故不能
-    // free；仅逻辑收口已登记 op（Finish 本就支持跨线程），在途回包
-    // 若引擎仍活会自然落定并经计数门控汇合 MarkClosed。
-    std::vector<std::shared_ptr<RedisOp>> snapshot;
-    {
-        std::lock_guard<std::mutex> lk(m_ops_mtx);
-        if (m_io_dead)
-            return;
-        m_io_dead = true;
-        snapshot.assign(m_ops.begin(), m_ops.end());
-        // 连接簿记落定：能走到这里只有两种情形——
-        //   a) 引擎从未启动 ⇒ io 域从未运行 ⇒ 不可能存在连接资源；
-        //   b) 已启动引擎的投递有界重试后仍被拒 ⇒ 执行域不可达，teardown
-        //      永远无法送达 ⇒ conn 对象不可再管理，按「放弃即脱离簿记」
-        //      落定；其 fd 随 conn 对象在 impl 析构时由 desc 析构释放，
-        //      未释放的 hiredis context 视为放弃。
-        // 引擎已封（此前 teardown 已执行）的情形由上面 m_io_dead 早退
-        // 门拦截，不会到达这里。不置位会让 DrainCheckClosed 永远无法
-        // MarkClosed、WaitClosed 悬挂。
-        m_conn_done = true;
-    }
-    for (auto& op : snapshot)
-        op->Finish(result<RawReply>::err(
-            MakeError(ErrorCode::Closed, "redis client closed")));
     DrainCheckClosed();
 }
 
@@ -397,13 +401,14 @@ void CoRedisCliImpl::DrainCheckClosed() noexcept {
         std::lock_guard<std::mutex> lk(m_ops_mtx);
         fin = m_io_dead && m_ops.empty() && m_conn_done;
     }
-    if (fin)
+    if (fin) {
         m_close.MarkClosed();
+    }
 }
 
 } // namespace redis_detail
 
-// 契约装配入口：Create 只校验装配参数并取对象身份/完成信号，
+// 契约装配入口：Create 只校验装配参数并取对象身份，
 // Start 才真正占用资源；二者均在控制线程使用，不挂起协程。
 result<std::shared_ptr<CoRedisCli>>
 CoRedisCli::Create(RedisClientConfig config) {
@@ -415,12 +420,8 @@ CoRedisCli::Create(RedisClientConfig config) {
     if (!info)
         return result<std::shared_ptr<CoRedisCli>>::err(
             std::move(info).error());
-    auto sig = detail::NewCompletionSignal();
-    if (!sig)
-        return result<std::shared_ptr<CoRedisCli>>::err(
-            std::move(sig).error());
     auto impl = std::make_shared<redis_detail::CoRedisCliImpl>(
-        std::move(config), std::move(info).value(), std::move(sig).value());
+        std::move(config), std::move(info).value());
     return result<std::shared_ptr<CoRedisCli>>::ok(std::move(impl));
 }
 

@@ -16,7 +16,8 @@ public:
     virtual ListenAddress LocalAddress() const = 0;
 
     // 幂等、可从控制线程调用：停止新连接及既有连接上的新请求接纳；
-    // 不取消已接纳 handler、不关闭其回复路径；不等价于 RequestClose。
+    // 不取消已接纳 handler、不关闭其回复路径；不等价于 Close()（后者
+    // 同步完成物理释放并让在途 handler 的回复按只交付一次终态收口）。
     virtual void StopAccepting() noexcept = 0;
 };
 

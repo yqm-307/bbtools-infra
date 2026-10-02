@@ -119,19 +119,25 @@ inline result<void> ValidateMongoClientConfig(const MongoClientConfig& cfg) {
 //     为原始服务端错误码；driver 侧失败（server selection/socket/stream/
 //     pool）映射为 Error(Unavailable)，无效 BSON/参数为
 //     InvalidArgument，pool wait queue 超时为 Overloaded；
-//   - deadline/cancel/owner close 竞争只发布一次逻辑终态；已进入
-//     driver 的同步调用不可强杀，继续到 driver timeout 或完成——
-//     operation state、client lease 与 payload 保活到物理收口，
-//     WaitClosed 等待在途 driver 调用与队列真正归零。
+//   - 已派发（进入 driver）的调用不可强杀，继续到 driver timeout 或完成
+//     ——operation state、client lease 与 payload 保活到物理收口；
+//     每个请求只向业务交付一次终态，迟到 driver 结果只消费不交付。
+//   - 关闭由 owner 主动发起：Close() 幂等、任意线程可调用，返回即接纳
+//     封口、挂起等待者已收到终态、在途计数已在有界窗口内归零（或超过
+//     上限后由 worker 完成路径补跑物理落定）。Close 与在途 Start 并发时
+//     先封口、再等该次 Start 完成：已被封口的 Start 不发布资源并返回
+//     Closed，否则其已建资源由本次 Close 同步收口。因此 Close 返回当刻
+//     本 client 的 worker/lease 已收口、终态不回退，此后 Start 一律 Closed。
 class CoMongoCli : public ICoNetwork, public ICoCloseable {
 public:
     // Create/Start 在启动控制线程使用，不挂起协程。
-    // Create 要求 Scheduler 已启动（对象身份与完成信号需要运行时代际），
-    // 否则返回 Error(RuntimeUnavailable)。
+    // Create 只校验装配参数并取对象身份；Start 要求协程运行时已初始化
+    // （未初始化返回 Error(RuntimeUnavailable)），否则返回对应错误。
     static result<std::shared_ptr<CoMongoCli>> Create(MongoClientConfig config);
 
-    // 同一 client 只成功启动一次；要求与 Create 同一运行时代际。
-    // Start 建立 worker 线程组并接入进程级 pool；关闭后不重开。
+    // 同一 client 只成功启动一次；关闭后不重开。
+    // Start 建立 worker 线程组并接入进程级 pool；与 Close 并发时封口优先，
+    // Start 不发布资源并返回 Error(Closed)。
     virtual result<void> Start() = 0;
 
     // 插入一份文档；bytes 必须是完整良构 BSON，非法 → InvalidArgument。

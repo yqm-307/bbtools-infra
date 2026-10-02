@@ -51,7 +51,7 @@ void RedisConnection::EvCleanup(void* priv) {
 
 void RedisConnection::EvScheduleTimer(void*, struct timeval) {
     // 本切片不设 hiredis connect/command timeout（deadline 由调用侧
-    // CompletionSignal 承担），refreshTimeout 因此不会调到本 thunk。
+    // CoWaiter 等待承担），refreshTimeout 因此不会调到本 thunk。
 }
 
 void RedisConnection::OnConnectThunk(const redisAsyncContext* ac,
@@ -78,6 +78,9 @@ void RedisConnection::ArmRead(RedisEvBridge& bridge) {
     bridge.desc.async_wait(
         boost::asio::posix::stream_descriptor::wait_read,
         [sb](const boost::system::error_code& ec) {
+            // 持 owner 域门：本 handler 触碰 hiredis context 与 descriptor，
+            // 必须与 owner 线程在调用线程内同步执行的 teardown 配对。
+            std::lock_guard<std::recursive_mutex> gate(*sb->gate);
             OnFdReadable(*sb, ec);
         });
 }
@@ -88,6 +91,7 @@ void RedisConnection::ArmWrite(RedisEvBridge& bridge) {
     bridge.desc.async_wait(
         boost::asio::posix::stream_descriptor::wait_write,
         [sb](const boost::system::error_code& ec) {
+            std::lock_guard<std::recursive_mutex> gate(*sb->gate);
             OnFdWritable(*sb, ec);
         });
 }
@@ -142,7 +146,7 @@ void RedisConnection::OpenOnIoDomain() {
         return;
     }
 
-    auto bridge = std::make_shared<RedisEvBridge>(m_io);
+    auto bridge = std::make_shared<RedisEvBridge>(m_io, m_gate);
     bridge->ac    = ac;
     bridge->owner = weak_from_this();
     ac->ev.data          = bridge.get();

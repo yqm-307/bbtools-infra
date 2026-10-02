@@ -8,6 +8,36 @@
 
 本文发布前，实施 Issue 的完整 v1 快照为可访问依据；合入后由 Issue 指向本文已发布版本。公共签名/语义变化需记录影响、协调下游并获用户确认；后端实现选择不得改变接口承诺。关联主 PRD：[#1](https://github.com/yqm-307/bbtools-infra/issues/1)。首个真实切片为 HTTP；RPC 是其后的独立切片，MCP 不在本任务实现范围。
 
+### 修订记录（2026-10-01：进程寿命运行时 + owner 同步 Close 契约）
+
+上游 coroutine 已按**进程寿命运行时**收敛（候选 HEAD `03430a5`：删除 `Scheduler::Stop()`/restart
+与运行时代际，`Scheduler` 稳定入口只剩 `GetInstance`/`Start`/`LoopOnce`/`RegistCoroutineTask`/
+`IsInitialized`，`CoObjectInfo` 身份不再携带 generation）。infra 关闭契约随之改为**资源
+owner/framework manager 主动调用的同步 `Close()`**。本记录为准，**推翻**本文原 N0 关闭规则、
+`CallOptions`/`IncomingCallContext` 形态、正常关闭顺序与附记中基于 `RequestClose`/`WaitClosed`/
+`CloseStatus`/运行时代际的结论；原结论保留在下方正文，以本记录为 supersede 标记，避免同仓
+两个未标状态的真源并存。
+
+- `ICoCloseable` 只保留 `void Close() noexcept` 与 `bool IsClosed() const noexcept`。
+  `RequestClose`、`WaitClosed`、`ReleaseClosed` 与 `CloseStatus` 枚举**已删除，不保留兼容壳**
+  （无别名、无隐藏转发）。
+- `Close()` 同步完成物理释放并返回：**返回即该对象拥有的物理资源已释放、后端不会再访问它们**；
+  未发送数据直接丢弃、不做 flush；不重开；**没有「等待关闭完成」的入口**。关闭时机由
+  owner/framework manager 决定。
+- coroutine 运行时**不参与**业务资源收口；「运行时是否在跑」改用初始化状态
+  （`bbt::coroutine::detail::Scheduler::GetInstance()->IsInitialized()`），不再有代际语义。
+- `CallOptions` 只保留 `deadline`；`IncomingCallContext` 去掉 cancel。`CompletionSignal`、
+  `CancellationToken`/`CancellationSource`、`RuntimeGeneration`/`CurrentRuntimeGeneration`
+  不再是 infra 的公共依赖。
+- 请求完成改为基础设施内部使用 `CoWaiter::WaitWithCallback`（登记等待 → 一次投递回调 → 挂起）
+  + adapter 路径 `Notify`（可带载荷）唤醒；**结果与通知分离**，业务结果放各模块自己的
+  operation state（详见下方「请求完成」）。
+
+superseded by：本修订记录 + [0005 §6.3/§6.4](0005-co-io-adapter-contract-v1.md)（跨线程同步
+`Close()` 的实现口径）。本仓当前处于**候选、未提交**状态：`ICoCloseable.hpp`、`NetworkTypes.hpp`、
+`src/detail/IoSupport.hpp` 已按本契约修订，其余模块头/实现的迁移仍在同批候选内进行（见 §附记），
+本记录不宣称任何实现已交付或已通过验收。
+
 ### 后续目标规格
 
 [0005：CoTCP/CoUDP 与第三方 Binding](0005-co-io-adapter-contract-v1.md) 补充目标 I/O 执行边界：proc 执行实际收发和协议，sche 只检测等待条件并唤醒。本文的公共错误、逻辑终态、关闭和资源寿命契约继续有效；末尾 Asio/Beast 实现附记描述旧实现，不代表新模型已完成迁移。0005 已通过独立只读规格终审，但仍是未实现、未完成兼容验收的目标规格。
@@ -54,18 +84,14 @@ public:
     ~ICoNetwork() override = default;
 };
 
-enum class CloseStatus {
-    Closed, TimedOut, Cancelled, InvalidContext,
-    AlreadyWaiting, RuntimeUnavailable
-};
+// 关闭契约（见本记录「修订记录」）：同步、幂等、无等待结果枚举。
 class ICoCloseable {
 public:
     virtual ~ICoCloseable() = default;
-    virtual void RequestClose() noexcept = 0;
+    // 返回即本对象拥有的物理资源已释放、后端不会再访问它们；
+    // 未发送数据直接丢弃、不 flush、不重开。
+    virtual void Close() noexcept = 0;
     virtual bool IsClosed() const noexcept = 0;
-    virtual CloseStatus WaitClosed(
-        bbt::coroutine::Deadline deadline,
-        bbt::coroutine::CancellationToken cancel) = 0;
 };
 ```
 
@@ -75,13 +101,21 @@ ICoObject 只提供身份，关闭能力独立；ICoNetwork 不承诺任意派�
 
 Error.details 是错误分支的结构化详情，RPC 错误信封必须无损携带 code/domain/domain_code/details，不以成功 envelope 冒充错误。详情最多 16 项，键最多 64 个 UTF-8 字节，值最多 256 个 UTF-8 字节；重复键、非法编码拒绝为 ProtocolError，不能截断后继续。域专属保留键的归属与格式校验不由 infra 通用层承担，改由该域拥有者在错误构造/消费边界落实：`framework.actor` 域保留 `expected_sequence`（无符号十进制字符串）供顺序错误使用，其域归属与格式由 bbt-framework 侧校验（infra #39）；其他上层域声明自身保留键时同样自行校验，infra 不登记跨域键表。客户端不得写入响应错误详情。公开错误文本脱敏，不携带堆栈、凭据或原始请求。
 
-### 关闭规则
+### 关闭规则（修订见「修订记录」）
 
-Open → Closing → Closed，不重开。RequestClose 可从普通线程调用，幂等，不等待 I/O/业务处理完成；允许内部短临界区。线性化之后的新提交必须拒绝，正在竞态的提交要么被接纳并纳入清理，要么明确拒绝，不能遗漏。
+Open → Closing → Closed，不重开。`Close()` 由资源 owner/framework manager 主动调用，**幂等**、
+同步完成物理释放后返回；未发送数据直接丢弃、不做 flush。没有 `RequestClose`/`WaitClosed`/
+`CloseStatus` 的等待结果：没有「等待关闭完成」的入口，也没有部分关闭结果枚举。跨线程同步
+`Close()` 的实现口径见 [0005 §6.4](0005-co-io-adapter-contract-v1.md)：封口并唤醒挂起等待者 →
+在自身锁上以 `std::condition_variable` **有界**等待在途计数归零 → 物理释放并跑一次 closed hook。
 
-WaitClosed 只在协程里等待；每个对象最多一个并发等待者，第二个明确返回 AlreadyWaiting，不影响第一个。映射固定：WaitStatus::Completed → Closed；TimedOut/Cancelled/InvalidContext/AlreadyWaiting/RuntimeUnavailable 一一映射为同名 CloseStatus。先校验上下文和代际，已关闭对象在合法上下文立即返回 Closed；普通线程可用 IsClosed 查询。超时/取消不撤销关闭、不表示资源已释放。Closed 表示后端不会再访问该组件拥有的操作资源；独立业务调用者仍须结束并释放自身引用，不能据此推断所有调用方栈已消失。
+`IsClosed()` 为真（`Closed`）表示后端不会再访问该组件拥有的操作资源；独立业务调用者仍须结束
+并释放自身引用，不能据此推断所有调用方栈已消失。已关闭对象上的新调用按各协议映射返回
+`Closed`。pending（未发送）请求遇关闭直接丢弃、不发送；已发送请求遇关闭/取消立即向业务返回
+一次终态，迟到响应继续被消费以保持连接对齐但不再交付。
 
-析构不能在任意线程隐式阻塞等待。组件由 Runtime/宿主持有到真正清理完成；所有晚到回调指向栈外 operation state，不能借用调用者栈或裸 Service。资源保活不靠协程栈上的 shared_ptr 析构。
+析构不能在任意线程隐式阻塞等待。组件由 Runtime/宿主持有到真正清理完成；所有晚到回调指向栈外
+operation state，不能借用调用者栈或裸 Service。资源保活不靠协程栈上的 shared_ptr 析构。
 
 ## N1：HTTP 第一真实切片
 
@@ -89,8 +123,7 @@ WaitClosed 只在协程里等待；每个对象最多一个并发等待者，第
 
 ```cpp
 struct CallOptions {
-    bbt::coroutine::Deadline deadline;
-    bbt::coroutine::CancellationToken cancel;
+    bbt::coroutine::Deadline deadline;   // 只保留单调时钟绝对期限，无 cancel 令牌
 };
 struct HttpRequest {
     std::string method;
@@ -109,7 +142,6 @@ result<HttpResponse> Request(HttpRequest request, const CallOptions& options);
 // HttpServer : ICoNetwork, ICoCloseable
 struct IncomingCallContext {
     bbt::coroutine::Deadline deadline;
-    bbt::coroutine::CancellationToken cancel;
     std::string peer_principal;
 };
 using HttpHandler = std::function<result<HttpResponse>(
@@ -121,7 +153,7 @@ using HttpHandler = std::function<result<HttpResponse>(
 
 正常的 4xx/5xx 是有效 HttpResponse，不是网络异常。非法 framing/超限/断连为 Error；不足一条消息不能被当作成功响应。URL、头名/值、长度和体积边界由协议库与 adapter 明确校验，禁止 CRLF 注入。HTTPS 若不在首切片交付，必须显式拒绝且限定本地测试用途，不能降级明文；一旦支持，默认校验证书与主机名，TLS 依赖另行确认。
 
-IncomingCallContext 是本次入站请求的拥有型上下文，infra 负责构造；取消 token 由在途请求状态持有，直到 handler 真正退出，不能响应超时后就释放。deadline 为 min(本地接纳时刻 + listener 有限预算, 经协议验证的远端剩余预算换算结果)，排队也消耗该期限。HTTP 首切片不信任任意自定义 deadline 头，只使用 listener 本地预算；RPC 协议 profile 必须定义有上限的 remaining-budget 字段及单位，未定义不得开始 N2。取消由本地期限、连接断开、owner close 或后端支持的协议取消触发；取消帧若协议不支持就明确不支持，不承诺远端取消必达。peer_principal 来自验证过的连接身份，未认证为空；不得从业务 metadata 直接复制认证身份。首闭环仅限隔离 loopback 测试，不能当作公网鉴权已完成。
+IncomingCallContext 是本次入站请求的拥有型上下文，infra 负责构造。取消与关闭由在途请求状态与 owner 主动 `Close()` 表达，不再有取消令牌：等待中的取消来自协程级 `RequestCancel`（`WaitStatus::Cancelled`），业务级取消经上层带载荷 `Notify` 表达（不再有 `CallOptions.cancel`/`IncomingCallContext.cancel` 字段）。deadline 为 min(本地接纳时刻 + listener 有限预算, 经协议验证的远端剩余预算换算结果)，排队也消耗该期限。HTTP 首切片不信任任意自定义 deadline 头，只使用 listener 本地预算；RPC 协议 profile 必须定义有上限的 remaining-budget 字段及单位，未定义不得开始 N2。取消由本地期限、连接断开、owner `Close()` 触发；取消帧若协议不支持就明确不支持，不承诺远端取消必达。peer_principal 来自验证过的连接身份，未认证为空；不得从业务 metadata 直接复制认证身份。首闭环仅限隔离 loopback 测试，不能当作公网鉴权已完成。
 
 首版 handler 在 infra 提供的协程执行环境调用；网络库 I/O 回调不直接运行可能挂起的业务 handler。接纳失败有可观察错误/响应，禁止无界创建协程。实际回调、线程、io_context 隐藏于实现，不要求依赖 Linux Hook 才正确。
 
@@ -129,11 +161,24 @@ IncomingCallContext 是本次入站请求的拥有型上下文，infra 负责构
 
 底层 operation 由 runtime 的在途集合和后端回调持有自己的请求/响应/缓冲。逻辑结果与后端清理进度分别记录。
 
-完成、取消、deadline、owner close 竞争时，首次成功发布的逻辑终态不可覆盖。超时或取消可以使调用方及时返回，但底层清理可继续，必须保留所有仍被后端访问的资源，直到完成确认；WaitClosed 负责等待物理清理。保留后端错误和已知部分传输信息，不把未完整的响应变成成功。
+完成、取消、deadline、owner `Close()` 竞争时，首次成功发布的逻辑终态不可覆盖。超时或取消可以使调用方及时返回，但底层清理可继续，必须保留所有仍被后端访问的资源，直到完成确认；物理清理由资源 owner 主动同步 `Close()` 落定——返回即后端不再访问。保留后端错误和已知部分传输信息，不把未完整的响应变成成功。
 
 这明确替代早期讨论中“所有 Request 超时也必须等到物理清理才返回”的示意承诺，避免不可取消 DNS 等操作无限拖住业务截止时间。取消不等于业务回滚；请求可能已到达远端时不能声称“未执行”。
 
-协程强制 Stop 后不保证函数返回，但 operation 清理不得依赖被销毁的栈。Runtime 必须由宿主强持有；正常顺序为 Scheduler::Start → NetworkRuntime::Create/Start → 使用 → server.StopAccepting → 等待 handler 结束 → Runtime.RequestClose/WaitClosed → 释放已关闭网络对象 → Scheduler::Stop。不默认让全局静态析构承担关闭。若任何等待超时，宿主必须继续强持有 Runtime/操作并保持驱动可用；不得按正常栈退出析构它们，超时处理由 framework 的 run 契约收口。
+### 请求完成（CoWaiter + op state，修订见「修订记录」）
+
+Redis/HTTP/Mongo/TCP/UDP 共用同一请求完成口径：
+
+- 一次业务调用内部使用 `CoWaiter::WaitWithCallback(WaitOptions, on_registered[, value])` 范式：**先登记等待事件 → 再执行一次投递回调 → 随后挂起**；响应到达后由 adapter 路径 `Notify`（可带载荷 `CoEventValue`）唤醒，业务协程恢复后读 operation state 的结果。`on_registered` 在登记成功后、协程真正 park 前调用，登记失败不投递。
+- **结果与通知分离**：`CoWaiter` 只等/唤醒，不承载协议 payload；协议结果、终态、迟到响应处理放各模块自己的 operation state。
+- **早到响应**：响应在协程真正 park 前到达时复用 `CoPollEvent::PENDING` 状态机（带载荷 `Notify` 同样兑现），不新增通用粘滞完成语义到 `CoWaiter`。
+- **每个请求只交付一次终态**。pending（未发送）请求遇 `Close()`/timeout 可直接从队列移除、不发送；已发送请求 `Close()`/timeout 后业务立即返回终态，adapter 继续消费迟到响应保持连接对齐，但不再交付。连接/上下文关闭时，所有未完成请求只交付一次关闭/transport 终态并唤醒等待者。
+- **事件回调不得阻塞**：不做挂起，只做一次异步唤醒或投递。不在 infra 内重试。
+- `WaitStatus`→`ErrorCode` 映射沿用 `detail::WaitStatusToError`（已移除 `WaitStatusToCloseStatus`）。
+
+### 关闭顺序与宿主装配（修订见「修订记录」）
+
+coroutine 运行时按进程寿命存在，**不参与业务资源收口**，也不再有 `Scheduler::Stop()`：由宿主强持有 Runtime，正常顺序为 运行时初始化（`Scheduler::IsInitialized()`）→ NetworkRuntime::Create/Start → 使用 → server.StopAccepting → 等待 handler 结束 → framework manager 主动同步 `Runtime.Close()`（返回即物理收口）→ 释放已关闭网络对象。operation 清理不得依赖协程栈。不默认让全局静态析构承担关闭。若在途 drain 达到实现上限（[0005 §6.4](0005-co-io-adapter-contract-v1.md) 的有界等待）仍未归零，宿主必须继续强持有 Runtime/操作并保持驱动可用；不得按正常栈退出析构它们，收尾由 framework 的 run 契约决定。
 
 ## N2：RPC 编解码与定址传输，不含服务治理
 
@@ -199,9 +244,9 @@ ListenAddress LocalAddress() const;
 void StopAccepting() noexcept;
 ```
 
-NetworkLimits 各项显式、大于零且校验上限，incoming_timeout 必须有限，header/body 限制也用于 RPC 元数据/payload。Server.StopAccepting 幂等且可从控制线程调用：停止新连接及既有连接上的新请求接纳，不取消已接纳 handler，不关闭其回复路径；不等价于 RequestClose。Create/Start/工厂在启动控制线程使用，不挂起协程；Start 要求 Scheduler 已启动且同一 runtime 只成功启动一次，关闭后不重开。工厂返回的 shared_ptr 是受托管对象引用，Runtime 的强所有权保证清理，不能互相强引用成环。监听绑定只接受调用者明确给出的地址，测试用动态端口；LocalAddress 返回实际绑定地址。Listen 成功后可以接纳，框架只有在方法/路由配置验证完成后才调用它。业务 handler 在已接纳的受管协程调用，异常由边界捕获并转换为 InternalError。
+NetworkLimits 各项显式、大于零且校验上限，incoming_timeout 必须有限，header/body 限制也用于 RPC 元数据/payload。Server.StopAccepting 幂等且可从控制线程调用：停止新连接及既有连接上的新请求接纳，不取消已接纳 handler，不关闭其回复路径；不等价于 owner 的同步 `Close()`。Create/Start/工厂在启动控制线程使用，不挂起协程；Start 要求运行时已初始化（`Scheduler::IsInitialized()`）且同一 runtime 只成功启动一次，关闭后不重开。工厂返回的 shared_ptr 是受托管对象引用，Runtime 的强所有权保证清理，不能互相强引用成环。监听绑定只接受调用者明确给出的地址，测试用动态端口；LocalAddress 返回实际绑定地址。Listen 成功后可以接纳，框架只有在方法/路由配置验证完成后才调用它。业务 handler 在已接纳的受管协程调用，异常由边界捕获并转换为 InternalError。
 
-**HTTP 出站配额（Issue #37）**：`max_connections` 与 `max_inflight` 由 `NetworkRuntime`（资源 owner）统一持有，作用域是整个 Runtime——同一 runtime 下所有 `HttpClient` 共享同一预算，多 client 不各自独立计量。`Request` 在登记底层 operation、发起任何 `async_*` 之前原子预留名额；名额不足立即返回 `Overloaded`，此时不创建 socket/resolver、不向 io 域投递，也不引入排队。名额由堆上 operation 持有，在物理收口（`finished && in-flight==0`，后端不再访问该 op）时准确归还一次，覆盖正常完成、发起失败、deadline、cancel、RequestClose 与强制 Stop；不依赖挂起协程的栈析构，不把「调用者超时返回」当作 socket 已回收。本项只覆盖 HTTP 出站路径，与 #32 的 CoTCP/CoUDP 在途门禁（`m_transport_count` 计量真实 socket）是不同入口，互不替代。
+**HTTP 出站配额（Issue #37）**：`max_connections` 与 `max_inflight` 由 `NetworkRuntime`（资源 owner）统一持有，作用域是整个 Runtime——同一 runtime 下所有 `HttpClient` 共享同一预算，多 client 不各自独立计量。`Request` 在登记底层 operation、发起任何 `async_*` 之前原子预留名额；名额不足立即返回 `Overloaded`，此时不创建 socket/resolver、不向 io 域投递，也不引入排队。名额由堆上 operation 持有，在物理收口（`finished && in-flight==0`，后端不再访问该 op）时准确归还一次，覆盖正常完成、发起失败、deadline、cancel 与 owner `Close()`；不依赖挂起协程的栈析构，不把「调用者超时返回」当作 socket 已回收。本项只覆盖 HTTP 出站路径，与 #32 的 CoTCP/CoUDP 在途门禁（`m_transport_count` 计量真实 socket）是不同入口，互不替代。
 
 RPC 服务分发不强迫 infra 依赖 Service：RpcHandler 由 framework 适配器提供，它收到 IncomingCallContext 与 owning envelope 后决定服务/Actor 入队和响应；网络执行域不会等待阻塞业务 handler。生产绑定、TLS、鉴权仍需对应配置/授权，不由这些工厂默认开放。
 
@@ -220,7 +265,7 @@ RPC 后端和 wire profile 未锁定时，N2 状态为 BLOCKED，不妨碍 N1 HT
 | N-01 | C++17 独立消费公共头与隔离构建/安装前缀，依赖来源固定，不污染全局库 |
 | N-02 | HTTP 真实 loopback client/server，成功、4xx/5xx、坏消息、限长、断连、并发；非协程调用明确拒绝 |
 | N-03 | 提前/重复/晚到完成、超时/取消/关闭竞争；逻辑结果唯一；物理清理完成后在途资源归零 |
-| N-04 | Scheduler 正常关闭与强制 Stop 分开验证；无用户栈析构承诺，晚到 handler 不触及旧栈/协程 |
+| N-04 | 资源 owner 主动同步 `Close()` 的物理收口（返回后后端不再访问）；无用户栈析构承诺，晚到 handler 不触及旧栈/协程 |
 | N-05 | RPC 两个独立进程、多个 service/method 与请求关联、schema 不匹配、错误结果、断连 OutcomeUnknown |
 | N-06 | 关键失败/取消/关闭路径使用真实后端，mock 仅补充可控时序；支持矩阵不越过实际平台证据 |
 
@@ -235,5 +280,5 @@ HTTP 切片已实现为「无专用 I/O 线程」模型，与早期草案中"inf
 - infra 不再拥有 `io_context` 或任何线程。所有 Asio/Beast I/O 对象（socket、resolver、acceptor、steady_timer）构造在 `bbt::coroutine::io::GetExecutor()` 返回的共享 executor 派生的 strand 上；`GetExecutor` 指向 coroutine 全局 CoPoller/EventLoop 所持的同一 `io_context`。
 - 实际驱动线程是 Scheduler 既有的事件循环线程（`PollOnce`），不随 runtime 数量增加；业务 `HttpHandler` 仍只在受管协程内执行，经 `Scheduler::RegistCoroutineTask` 派生、经 strand 回投结果，两域纪律不变。
 - 串行化由 strand 承担：runtime/client/server 共享一份 `HttpIoEngine`，其 `TryPost` 经互斥封口后投递到 strand，等价于旧单 io 线程的执行域语义；`strand` 仅串行化调度，不新增线程。
-- 关闭链路不 `stop`/`restart` 共享 context：teardown 在 io 域内中止在途操作；各受管对象按 in-flight async 计数归零后才 `MarkClosed`。引擎 `SealOnIoDomain` 只封死 `TryPost`，不再用 strand marker 冒充 Asio 排空。runtime 在全部子对象 Closed 之后封口引擎并 `MarkClosed`。`Scheduler::Stop` 不代替网络对象的 `RequestClose`/`WaitClosed`，正常顺序仍是先关网络对象再停调度器。
-- executor 获取失败或运行时代际不匹配统一返回 `RuntimeUnavailable`；`Request`/`WaitClosed` 的 InvalidContext、TimedOut、Cancelled、Closed、ProtocolError/InternalError 等既有映射不变。
+- 关闭链路不 `stop`/`restart` 共享 context：teardown 在 io 域内中止在途操作；各受管对象按 in-flight async 计数归零后才 `MarkClosed`，owner 调用的 `Close()` 同步完成封口 → 唤醒挂起等待者 → 有界等在途归零 → 物理释放（返回即后端不再访问）。引擎 `SealOnIoDomain` 只封死 `TryPost`，不再用 strand marker 冒充 Asio 排空。runtime 在全部子对象 Closed 之后封口引擎并 `MarkClosed`。没有运行时代际与 `Scheduler::Stop()`，运行时随进程寿命存在。
+- executor 获取失败或运行时未初始化统一返回 `RuntimeUnavailable`；`Request` 与关闭路径的 InvalidContext、TimedOut、Cancelled、Closed、ProtocolError/InternalError 等既有映射不变。

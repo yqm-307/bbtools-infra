@@ -1,24 +1,33 @@
 // Issue #38：HTTP 子对象物理关闭后从 NetworkRuntime 托管集合安全反登记。
 //
+// 关闭面按进程寿命运行时修订（契约 §1）：ICoCloseable 只有
+// Close()/IsClosed()。已删除语义不保留旧断言：RequestClose/WaitClosed、
+// CloseStatus、取消令牌、CompletionSignal 都不再使用；每个用例的 runtime
+// 在用例内显式 Close() 并断言物理收口（IsClosed + 托管集合/transport
+// 落定探针 + weak_ptr 失效），不用 Scheduler::Stop()。
+//
 // 验收映射（infra-review-issues-20260924/02-http-owner.md）：
 //   t_children_released_while_runtime_alive
 //       — Runtime 存活期间反复创建/关闭/释放有限数量 client 与 server；
 //         关闭回调排空且外部引用退出后 weak_ptr 失效，不等 Runtime 析构。
-//   t_caller_early_release_still_managed
-//       — 调用者提前释放外部引用时对象仍被强托管到真实清理完成；
-//         清理落定前不提前 Closed，落定后经 weak_ptr 可观察到失效。
+//   t_close_midflight_unregisters_child
+//       — 在途请求 + owner 同步 Close()：已发送请求立即拿终态；物理关闭
+//         后从托管集合反登记（外部引用释放即 weak 失效）；已接纳 handler
+//         不被抢占，其回复只消费不交付。
 //   t_idle_client_released_still_managed
-//       — 空闲活跃对象（无在途 op、未 RequestClose）释放唯一外部引用
-//         后仍由 Runtime 强托管；隔离 ClientOp::owner 反向强引用，
-//         Runtime teardown 落定后 weak_ptr 失效（client 与 server 双侧）。
+//       — 空闲活跃对象（无在途 op、未 Close）释放唯一外部引用后仍由
+//         Runtime 强托管；隔离 ClientOp::owner 反向强引用，Runtime
+//         teardown 落定后 weak_ptr 失效（client 与 server 双侧）。
 //   t_runtime_close_with_early_released_children
 //       — 子对象先关、Runtime 后关、外部引用提前释放的组合路径：
 //         计数不丢、不双删、不 UAF。
 //   t_repeat_and_factory_race_close
-//       — 重复 close、并发 close、工厂与 close 竞争：RequestClose 幂等，
+//       — 重复 Close、并发 Close、工厂与 Close 竞争：Close 幂等，
 //         关闭中/后的工厂调用一律拒绝，已登记对象必被收口。
 //   t_handler_captured_resource_released
 //       — server handler 捕获资源以析构计数证明可释放，不靠 RSS 判断。
+//   t_end_runtime_convergence
+//       — 收尾：Runtime 显式 Close() + 托管集合/transport 物理落定。
 //
 // 同步纪律：跨线程/跨协程一律原子标志 + WaitUntil（有界预算）与
 // CountDownLatch；handler 内等待用 bbtco_sleep 轮询真实事件标志。
@@ -49,8 +58,8 @@
 #include <bbt/infra/NetworkTypes.hpp>
 #include <bbt/infra/Result.hpp>
 
-// 竞态证据所需的 impl 内测试接缝（SetAdoptCommitGateForTest），
-// 与 tests/Test_mongo_unit.cc 消费 src/ 内 impl 头同一约定。
+// 竞态证据所需的 impl 内测试接缝（SetAdoptCommitGateForTest）、托管集合
+// 落定探针，与 tests/Test_mongo_unit.cc 消费 src/ 内 impl 头同一约定。
 #include "http/NetworkRuntimeImpl.hpp"
 
 using namespace bbt::infra;
@@ -70,6 +79,7 @@ std::shared_ptr<std::atomic_int> g_captured;
 std::atomic_bool                 g_hold_entered{false};
 std::atomic_bool                 g_hold_release{false};
 std::atomic_bool                 g_hold_exited{false};
+std::atomic_int                  g_hold_deliveries{0};
 
 NetworkLimits MakeLimits() {
     NetworkLimits limits{};
@@ -131,26 +141,21 @@ result<HttpResponse> TestHandler(IncomingCallContext, HttpRequest req) {
         return result<HttpResponse>::ok(HttpResponse{200, {}, "ok"});
     if (req.url == "/hold") {
         g_hold_entered.store(true);
-        for (int i = 0; i < 5000 && !g_hold_release.load(); ++i)
+        for (int i = 0; i < 8000 && !g_hold_release.load(); ++i)
             bbtco_sleep(2);
         g_hold_exited.store(true);
+        g_hold_deliveries.fetch_add(1);
         return result<HttpResponse>::ok(HttpResponse{200, {}, "hold done"});
     }
     return result<HttpResponse>::ok(HttpResponse{404, {}, "not found"});
 }
 
-// 关闭并等待一个子对象落定；返回 CloseStatus 供断言。
-CloseStatus CloseAndWait(const std::shared_ptr<ICoCloseable>& obj,
-                         int wait_ms = 10000) {
-    obj->RequestClose();
-    std::atomic<CloseStatus> st{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        st.store(obj->WaitClosed(
-            std::chrono::steady_clock::now() +
-                std::chrono::milliseconds(wait_ms),
-            {}));
-    }));
-    return st.load();
+// owner 主动同步 Close()：幂等、任意线程，返回即物理释放（IsClosed）。
+// 旧口径的 RequestClose + WaitClosed 已删除，不再有「同步等待关闭完成」
+// 的独立入口。
+bool CloseAndAssert(const std::shared_ptr<ICoCloseable>& obj) {
+    obj->Close();
+    return obj->IsClosed();
 }
 
 } // namespace
@@ -162,7 +167,8 @@ BOOST_AUTO_TEST_CASE(t_begin_start_runtime) {
     cfg->m_cfg_static_thread_num = 2;
     cfg->m_cfg_stack_size        = 1024 * 256;
     g_scheduler->Start(SCHE_START_OPT_SCHE_THREAD);
-    BOOST_REQUIRE(g_scheduler->IsRunning());
+    // 进程寿命运行时：只有 IsInitialized，没有 Stop/代际。
+    BOOST_REQUIRE(g_scheduler->IsInitialized());
 
     g_captured = std::make_shared<std::atomic_int>(0);
     struct Guard {
@@ -193,8 +199,8 @@ BOOST_AUTO_TEST_CASE(t_begin_start_runtime) {
 }
 
 BOOST_AUTO_TEST_CASE(t_children_released_while_runtime_alive) {
-    // Runtime 存活：循环创建 client→真实请求→RequestClose→WaitClosed→
-    // 释放外部引用；weak_ptr 必须在 Runtime 析构前失效。
+    // Runtime 存活：循环创建 client→真实请求→Close→释放外部引用；
+    // weak_ptr 必须在 Runtime 析构前失效。
     for (int i = 0; i < 4; ++i) {
         auto cl = g_runtime->CreateHttpClient();
         BOOST_REQUIRE(cl);
@@ -205,13 +211,13 @@ BOOST_AUTO_TEST_CASE(t_children_released_while_runtime_alive) {
         BOOST_REQUIRE(res);
         BOOST_CHECK_EQUAL(res.value().status, 200u);
 
-        BOOST_CHECK(CloseAndWait(client) == CloseStatus::Closed);
+        BOOST_CHECK(CloseAndAssert(client));
         client.reset();
         // 关闭回调排空 + 外部引用退出：反登记后 weak_ptr 失效。
         BOOST_REQUIRE(WaitUntil([&] { return weak.expired(); }));
     }
 
-    // server 同样覆盖：ListenHttp→StopAccepting→RequestClose→释放。
+    // server 同样覆盖：ListenHttp→StopAccepting→Close→释放。
     for (int i = 0; i < 2; ++i) {
         auto srv = g_runtime->ListenHttp({"127.0.0.1", 0}, TestHandler);
         BOOST_REQUIRE(srv);
@@ -219,7 +225,7 @@ BOOST_AUTO_TEST_CASE(t_children_released_while_runtime_alive) {
         std::weak_ptr<HttpServer> weak = server;
 
         server->StopAccepting();
-        BOOST_CHECK(CloseAndWait(server) == CloseStatus::Closed);
+        BOOST_CHECK(CloseAndAssert(server));
         server.reset();
         BOOST_REQUIRE(WaitUntil([&] { return weak.expired(); }));
     }
@@ -230,74 +236,77 @@ BOOST_AUTO_TEST_CASE(t_children_released_while_runtime_alive) {
     auto client = std::move(cl).value();
     auto res = RoundTrip(client, "/ok");
     BOOST_REQUIRE(res);
-    BOOST_CHECK(CloseAndWait(client) == CloseStatus::Closed);
+    BOOST_CHECK(CloseAndAssert(client));
+    client.reset();
 }
 
-BOOST_AUTO_TEST_CASE(t_caller_early_release_still_managed) {
-    // 在途请求 + 外部引用提前释放：对象必须由 Runtime 强托管至真实
-    // 清理完成；清理落定前不得提前 Closed。
+BOOST_AUTO_TEST_CASE(t_close_midflight_unregisters_child) {
+    // 在途请求 + owner 主动同步 Close()：已发送请求立即拿终态；client
+    // 物理关闭后从 Runtime 托管集合反登记（外部引用释放即 weak 失效，
+    // 不等 Runtime 析构）；已接纳 handler 不被抢占，其后回复只消费不交付。
     auto cl = g_runtime->CreateHttpClient();
     BOOST_REQUIRE(cl);
-    std::weak_ptr<HttpClient> weak;
+    auto client = std::move(cl).value();
+    std::weak_ptr<HttpClient> weak = client;
+
+    std::optional<result<HttpResponse>> out;
     std::atomic_bool out_ready{false};
-    {
-        auto client = std::move(cl).value();
-        weak = client;
+    // 协程按值捕获 client 的 shared_ptr 副本：与主线程的 client 变量不
+    // 共享同一份 shared_ptr 变量，无并发读写；对象有效性由「在途期间
+    // Runtime/op 必强托管」的被测契约保证。
+    std::shared_ptr<HttpClient> in_flight = client;
+    bool succ = false;
+    g_scheduler->RegistCoroutineTask(
+        [&out, &out_ready, in_flight] {
+            CallOptions opt;
+            opt.deadline = std::chrono::steady_clock::now() +
+                           std::chrono::seconds(20);
+            HttpRequest req{
+                "GET",
+                "http://127.0.0.1:" + std::to_string(g_port) + "/hold",
+                {}, ""};
+            out.emplace(in_flight->Request(std::move(req), opt));
+            out_ready.store(true, std::memory_order_release);
+        },
+        succ);
+    BOOST_REQUIRE(succ);
+    BOOST_REQUIRE(WaitUntil([&] { return g_hold_entered.load(); }));
 
-        bool succ = false;
-        // 同步生命周期交接：裸指针在注册前于主线程取出并随 lambda
-        // 按值传递，协程不再引用 client 变量本身——主线程随后的
-        // client.reset() 与协程对对象的使用之间不存在对同一
-        // shared_ptr 变量的并发读写，也不产生悬垂引用。
-        // 指针有效性由被测契约保证：Request 在途期间对象必须由
-        // Runtime 托管（m_children / 在途 op 强引用）；若实现丢失
-        // 托管，raw 失效会以崩溃而非静默数据竞争暴露缺陷。
-        HttpClient* raw = client.get();
-        g_scheduler->RegistCoroutineTask(
-            [raw, &out_ready] {
-                CallOptions opt;
-                opt.deadline = std::chrono::steady_clock::now() +
-                               std::chrono::seconds(20);
-                HttpRequest req{
-                    "GET",
-                    "http://127.0.0.1:" + std::to_string(g_port) + "/hold",
-                    {}, ""};
-                raw->Request(std::move(req), opt);
-                out_ready.store(true, std::memory_order_release);
-            },
-            succ);
-        BOOST_REQUIRE(succ);
-        BOOST_REQUIRE(WaitUntil([&] { return g_hold_entered.load(); }));
+    // owner 同步 Close()：在途已发送请求立即以终态返回（返回即物理收口）。
+    client->Close();
+    BOOST_CHECK(client->IsClosed());
+    BOOST_REQUIRE(
+        WaitUntil([&] { return out_ready.load(std::memory_order_acquire); }));
+    BOOST_REQUIRE(out.has_value());
+    BOOST_REQUIRE(!out.value());
+    BOOST_CHECK(out->error().code == ErrorCode::Closed);
 
-        // 请求在途时调用方释放外部引用：不立即触发物理清理。
-        client->RequestClose();
-        client.reset();   // 唯一外部强引用释放；Runtime 仍托管
-        BOOST_CHECK(!weak.expired());   // m_children 仍持有
-    }
-    // 清理落定前 IsClosed 不成立也观察不到 weak 失效；放行 handler。
-    BOOST_CHECK(!weak.expired());
+    // 放行 handler：它不被抢占，照常退出并产出唯一一次终态；连接已中止，
+    // 回复只被消费不再交付。
     g_hold_release.store(true);
     BOOST_REQUIRE(WaitUntil([&] { return g_hold_exited.load(); }));
-    // teardown 完成后 MarkClosed→hook→反登记：weak_ptr 失效，
-    // 说明捕获的 op/handler 资源随 impl 释放（不等 Runtime 析构）。
+    BOOST_CHECK_EQUAL(g_hold_deliveries.load(), 1);
+    BOOST_CHECK(client->IsClosed());
+
+    // 物理关闭落定后反登记：外部引用释放即 weak 失效（不等 Runtime 析构）。
+    client.reset();
+    in_flight.reset();
     BOOST_REQUIRE(WaitUntil([&] { return weak.expired(); }));
-    BOOST_REQUIRE(WaitUntil(
-        [&] { return out_ready.load(std::memory_order_acquire); }));
 }
 
 BOOST_AUTO_TEST_CASE(t_idle_client_released_still_managed) {
-    // 空闲活跃 client（无在途 op、未 RequestClose）释放唯一外部引用：
+    // 空闲活跃 client（无在途 op、未 Close）释放唯一外部引用：
     // 必须由 Runtime m_children 强托管——若实现退化为不托管，weak 立即
     // 失效。隔离 ClientOp::owner 路径：本用例全程无 Request，不存在
     // op 对 impl 的反向强引用。
     auto rt = NetworkRuntime::Create(MakeLimits());
     BOOST_REQUIRE(rt);
-    auto rtp = std::move(rt).value();
-    BOOST_REQUIRE(rtp->Start());
+    auto runtime = std::move(rt).value();
+    BOOST_REQUIRE(runtime->Start());
 
     std::weak_ptr<HttpClient> weak;
     {
-        auto cl = rtp->CreateHttpClient();
+        auto cl = runtime->CreateHttpClient();
         BOOST_REQUIRE(cl);
         auto client = std::move(cl).value();
         weak = client;
@@ -311,134 +320,119 @@ BOOST_AUTO_TEST_CASE(t_idle_client_released_still_managed) {
         BOOST_CHECK(!held->IsClosed());
     }
 
-    // Runtime 关闭：teardown 物理关闭空闲 child → MarkClosed → hook →
+    // Runtime Close()：teardown 物理关闭空闲 child → MarkClosed → hook →
     // 反登记移除最后一个强引用，weak 随之失效。
-    rtp->RequestClose();
-    std::atomic<CloseStatus> st{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        st.store(rtp->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(10),
-            {}));
-    }));
-    BOOST_CHECK(st.load() == CloseStatus::Closed);
+    runtime->Close();
+    BOOST_CHECK(runtime->IsClosed());
     BOOST_REQUIRE(WaitUntil([&] { return weak.expired(); }));
 
     // server 变体：ListenHttp 后立即释放外部引用（accept 已在跑但无
     // 连接），同样由 Runtime 托管到 teardown 落定。
     auto rt2 = NetworkRuntime::Create(MakeLimits());
     BOOST_REQUIRE(rt2);
-    auto rtp2 = std::move(rt2).value();
-    BOOST_REQUIRE(rtp2->Start());
+    auto runtime2 = std::move(rt2).value();
+    BOOST_REQUIRE(runtime2->Start());
     std::weak_ptr<HttpServer> weak_srv;
     {
-        auto srv = rtp2->ListenHttp({"127.0.0.1", 0}, TestHandler);
+        auto srv = runtime2->ListenHttp({"127.0.0.1", 0}, TestHandler);
         BOOST_REQUIRE(srv);
         auto server = std::move(srv).value();
         weak_srv = server;
         server.reset();
     }
     BOOST_REQUIRE(!weak_srv.expired());
-    rtp2->RequestClose();
-    std::atomic<CloseStatus> st2{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        st2.store(rtp2->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(10),
-            {}));
-    }));
-    BOOST_CHECK(st2.load() == CloseStatus::Closed);
+    runtime2->Close();
+    BOOST_CHECK(runtime2->IsClosed());
     BOOST_REQUIRE(WaitUntil([&] { return weak_srv.expired(); }));
 }
 
 BOOST_AUTO_TEST_CASE(t_runtime_close_with_early_released_children) {
-    // 独立 runtime：子对象先 RequestClose、外部引用提前释放，随后
-    // Runtime 再关；验证计数配对、不双删、不 UAF。
+    // 独立 runtime：子对象先 Close、外部引用提前释放，随后 Runtime
+    // 再关；验证计数配对、不双删、不 UAF。
     auto rt = NetworkRuntime::Create(MakeLimits());
     BOOST_REQUIRE(rt);
-    auto rtp = std::move(rt).value();
-    BOOST_REQUIRE(rtp->Start());
+    auto runtime = std::move(rt).value();
+    BOOST_REQUIRE(runtime->Start());
 
     std::vector<std::weak_ptr<HttpClient>> clients;
     for (int i = 0; i < 3; ++i) {
-        auto cl = rtp->CreateHttpClient();
+        auto cl = runtime->CreateHttpClient();
         BOOST_REQUIRE(cl);
         auto client = std::move(cl).value();
         clients.push_back(client);
-        client->RequestClose();       // 子对象先关
+        client->Close();              // 子对象先关（同步物理收口）
+        BOOST_CHECK(client->IsClosed());
         client.reset();               // 外部引用提前释放
     }
     // 重复 close 幂等：再次对已关闭对象发起不崩溃不双计。
     {
-        auto cl = rtp->CreateHttpClient();
+        auto cl = runtime->CreateHttpClient();
         BOOST_REQUIRE(cl);
         auto client = std::move(cl).value();
-        client->RequestClose();
-        client->RequestClose();
-        client->RequestClose();
+        client->Close();
+        client->Close();
+        client->Close();
+        BOOST_CHECK(client->IsClosed());
         client.reset();
     }
-    rtp->RequestClose();
-    std::atomic<CloseStatus> st{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        st.store(rtp->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(10), {}));
-    }));
-    BOOST_CHECK(st.load() == CloseStatus::Closed);
+    runtime->Close();
+    BOOST_CHECK(runtime->IsClosed());
     for (auto& w : clients)
-        BOOST_CHECK(w.expired());
+        BOOST_REQUIRE(WaitUntil([&] { return w.expired(); }));
 }
 
 BOOST_AUTO_TEST_CASE(t_repeat_and_factory_race_close) {
-    // 并发 close：多线程同时 RequestClose 同一对象，幂等且不丢计数。
+    // 并发 close：多线程同时 Close 同一对象，幂等且不丢计数。
     auto rt = NetworkRuntime::Create(MakeLimits());
     BOOST_REQUIRE(rt);
-    auto rtp = std::move(rt).value();
-    BOOST_REQUIRE(rtp->Start());
-    auto cl = rtp->CreateHttpClient();
+    auto runtime = std::move(rt).value();
+    BOOST_REQUIRE(runtime->Start());
+    auto cl = runtime->CreateHttpClient();
     BOOST_REQUIRE(cl);
     auto client = std::move(cl).value();
     std::weak_ptr<HttpClient> weak = client;
 
     std::vector<std::thread> closers;
     for (int i = 0; i < 4; ++i)
-        closers.emplace_back([&] { client->RequestClose(); });
+        closers.emplace_back([&] { client->Close(); });
     for (auto& t : closers)
         t.join();
-    BOOST_CHECK(CloseAndWait(client) == CloseStatus::Closed);
+    BOOST_CHECK(CloseAndAssert(client));
     client.reset();
     BOOST_REQUIRE(WaitUntil([&] { return weak.expired(); }));
 
     // 工厂与 close 真竞态：两个子段分别真实命中 adopt/rejected 分支，
-    // 两侧胜出者都来自与 RequestClose 同一并发窗口的竞态线程结果，
+    // 两侧胜出者都来自与 Close 同一并发窗口的竞态线程结果，
     // 不使用任何在屏障前预登记的对象充当成功样本。
     // 线性化点在 CheckAndAdoptLocked 的锁内复检（m_state/m_sealed/IsOpen）：
-    //   adopt 成功 ⇒ 对象登记早于 RequestClose 的 m_state 提交点 ⇒
-    //     必在 teardown 快照中被收口：WaitClosed 后 IsClosed 成立、
+    //   adopt 成功 ⇒ 对象登记早于 Close 的 m_state 提交点 ⇒
+    //     必在 teardown 快照中被收口：Close 后 IsClosed 成立、
     //     外部引用释放后 weak 失效；
     //   adopt 失败 ⇒ Closed 错误，不假成功、不产生孤儿。
     int saw_adopted  = 0;
     int saw_rejected = 0;
 
-    // 子段 A：adopt 胜出必须来自与 RequestClose 的真实重叠调用窗口，
+    // 子段 A：adopt 胜出必须来自与 Close 的真实重叠调用窗口，
     // 不靠 sleep/时序推断。确定性构造（不碰运气）：
     //   1) 经 impl 测试接缝 SetAdoptCommitGateForTest 把 factory 的
     //      CreateHttpClient 停在「CheckAndAdoptLocked 复检已过、
     //      登记提交未发生」的临界段内（此时仍持 m_lifecycle_mtx）；
     //   2) 主线程观察到 factory 停在调用内部后，才发起
-    //      rtp2->RequestClose()——factory 调用窗口 ⊃ RequestClose
+    //      runtime2->Close()——factory 调用窗口 ⊃ Close
     //      调用窗口，重叠是构造保证的，不是时序猜测；
-    //   3) 放行 gate：登记在 RequestClose 已提交 BeginClose/
-    //      m_state、io 域 teardown 正等 m_lifecycle_mtx 时提交——
+    //   3) 放行 gate：登记在 Close 已提交 BeginClose/
+    //      m_state、io 域/关闭线程正等 m_lifecycle_mtx 时提交——
     //      sealed 尚未置位 ⇒ 登记先于 sealed ⇒ teardown 快照必含
-    //      此对象 ⇒ WaitClosed 后必 IsClosed、外部引用释放后 weak
+    //      此对象 ⇒ Close 后必 IsClosed、外部引用释放后 weak
     //      失效。若实现丢这份通知，saw_adopted 断言失败。
     {
         auto rt2 = NetworkRuntime::Create(MakeLimits());
         BOOST_REQUIRE(rt2);
-        auto rtp2 = std::move(rt2).value();
-        BOOST_REQUIRE(rtp2->Start());
+        auto runtime2 = std::move(rt2).value();
+        BOOST_REQUIRE(runtime2->Start());
         auto impl2 =
             std::static_pointer_cast<http_detail::NetworkRuntimeImpl>(
-                rtp2);
+                runtime2);
 
         std::atomic<bool> adopt_gate_entered{false};
         std::atomic<bool> release_adopt_gate{false};
@@ -451,7 +445,7 @@ BOOST_AUTO_TEST_CASE(t_repeat_and_factory_race_close) {
         std::optional<result<std::shared_ptr<HttpClient>>> res;
         std::weak_ptr<HttpClient>                        res_weak;
         std::thread factory([&] {
-            res = rtp2->CreateHttpClient();   // 内部停在 adopt gate
+            res = runtime2->CreateHttpClient();   // 内部停在 adopt gate
             if (res && *res)
                 res_weak = res->value();
         });
@@ -461,16 +455,16 @@ BOOST_AUTO_TEST_CASE(t_repeat_and_factory_race_close) {
             [&] { return adopt_gate_entered.load(
                        std::memory_order_acquire); }));
 
-        // 此刻发起 RequestClose：closer 在紧贴调用点置 close_entered；
-        // 观察到该标志后再放行 gate——factory 调用在 RequestClose
-        // 发起时仍在飞，登记提交也必然晚于 RequestClose 发起点：
+        // 此刻发起 Close：closer 在紧贴调用点置 close_entered；
+        // 观察到该标志后再放行 gate——factory 调用在 Close
+        // 发起时仍在飞，登记提交也必然晚于 Close 发起点：
         // 两次调用真实重叠，不依赖任何 sleep/时序推断。
-        // （不先 join closer：若 TryPost 失败，TeardownOffDomain 会在
-        //   closer 线程上阻塞等待 factory 所持的锁，先 join 将死锁。）
+        // （不先 join closer：Close 会阻塞在 factory 所持的
+        //   m_lifecycle_mtx 上，先 join 将死锁。）
         std::atomic<bool> close_entered{false};
         std::thread closer([&] {
             close_entered.store(true, std::memory_order_release);
-            rtp2->RequestClose();
+            runtime2->Close();
         });
         BOOST_REQUIRE(WaitUntil(
             [&] { return close_entered.load(
@@ -479,14 +473,7 @@ BOOST_AUTO_TEST_CASE(t_repeat_and_factory_race_close) {
         closer.join();
         factory.join();
 
-        std::atomic<CloseStatus> st{};
-        BOOST_REQUIRE(RunInCoroutine([&] {
-            st.store(rtp2->WaitClosed(
-                std::chrono::steady_clock::now() +
-                    std::chrono::seconds(10),
-                {}));
-        }));
-        BOOST_CHECK(st.load() == CloseStatus::Closed);
+        BOOST_CHECK(runtime2->IsClosed());
 
         BOOST_REQUIRE(res.has_value());
         BOOST_REQUIRE(*res);   // adopt gate 放行 ⇒ 必为成功结果
@@ -498,7 +485,7 @@ BOOST_AUTO_TEST_CASE(t_repeat_and_factory_race_close) {
     }
 
     // 子段 B：rejected 分支——sealed 后的 factory 一律拒绝。
-    // closer 与 factory 同屏障零延迟起跑，RequestClose 的 CAS 先提交，
+    // closer 与 factory 同屏障零延迟起跑，Close 的 CAS 先提交，
     // 竞态 factory 的 CheckAndAdoptLocked 复检必然观察到
     // m_state != kRunning 或 !IsOpen()——返回 Closed 不假成功。
     {
@@ -507,8 +494,8 @@ BOOST_AUTO_TEST_CASE(t_repeat_and_factory_race_close) {
         for (int round = 0; round < kRejectRounds; ++round) {
             auto rt2 = NetworkRuntime::Create(MakeLimits());
             BOOST_REQUIRE(rt2);
-            auto rtp2 = std::move(rt2).value();
-            BOOST_REQUIRE(rtp2->Start());
+            auto runtime2 = std::move(rt2).value();
+            BOOST_REQUIRE(runtime2->Start());
 
             std::atomic<int>  ready{0};
             std::atomic<bool> go{false};
@@ -522,7 +509,7 @@ BOOST_AUTO_TEST_CASE(t_repeat_and_factory_race_close) {
                     ready.fetch_add(1, std::memory_order_release);
                     while (!go.load(std::memory_order_acquire))
                         std::this_thread::yield();
-                    results[i] = rtp2->CreateHttpClient();
+                    results[i] = runtime2->CreateHttpClient();
                     if (results[i] && *results[i])
                         weaks[i] = results[i]->value();
                 });
@@ -533,7 +520,7 @@ BOOST_AUTO_TEST_CASE(t_repeat_and_factory_race_close) {
                 ready.fetch_add(1, std::memory_order_release);
                 while (!go.load(std::memory_order_acquire))
                     std::this_thread::yield();
-                rtp2->RequestClose();
+                runtime2->Close();
             });
             BOOST_REQUIRE(WaitUntil([&] {
                 return ready.load(std::memory_order_acquire) ==
@@ -543,15 +530,8 @@ BOOST_AUTO_TEST_CASE(t_repeat_and_factory_race_close) {
             for (auto& t : workers)
                 t.join();
 
-            rtp2->RequestClose();  // 幂等；覆盖 closer 未取胜的轮次
-            std::atomic<CloseStatus> st{};
-            BOOST_REQUIRE(RunInCoroutine([&] {
-                st.store(rtp2->WaitClosed(
-                    std::chrono::steady_clock::now() +
-                        std::chrono::seconds(10),
-                    {}));
-            }));
-            BOOST_CHECK(st.load() == CloseStatus::Closed);
+            runtime2->Close();   // 幂等；覆盖 closer 未取胜的轮次
+            BOOST_CHECK(runtime2->IsClosed());
 
             for (int i = 0; i < kFactories; ++i) {
                 BOOST_REQUIRE(results[i].has_value());
@@ -581,16 +561,12 @@ BOOST_AUTO_TEST_CASE(t_repeat_and_factory_race_close) {
     BOOST_CHECK_GT(saw_rejected, 0);
 
     // 关闭后拒绝：sealed 后工厂一律 Closed 拒绝，不假成功。
-    rtp->RequestClose();
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        rtp->WaitClosed(std::chrono::steady_clock::now() +
-                            std::chrono::seconds(10),
-                        {});
-    }));
-    auto late_cl = rtp->CreateHttpClient();
+    runtime->Close();
+    BOOST_CHECK(runtime->IsClosed());
+    auto late_cl = runtime->CreateHttpClient();
     BOOST_REQUIRE(!late_cl);
     BOOST_CHECK(late_cl.error().code == ErrorCode::Closed);
-    auto late_srv = rtp->ListenHttp({"127.0.0.1", 0}, TestHandler);
+    auto late_srv = runtime->ListenHttp({"127.0.0.1", 0}, TestHandler);
     BOOST_REQUIRE(!late_srv);
     BOOST_CHECK(late_srv.error().code == ErrorCode::Closed);
 }
@@ -600,22 +576,34 @@ BOOST_AUTO_TEST_CASE(t_handler_captured_resource_released) {
     // 反登记缺失时 Runtime 存活期间 impl 不析构，计数保持 1。
     BOOST_CHECK_EQUAL(g_captured->load(), 1);
     g_server->StopAccepting();
-    BOOST_CHECK(CloseAndWait(g_server) == CloseStatus::Closed);
+    BOOST_CHECK(CloseAndAssert(g_server));
     g_server.reset();
     // 物理关闭 + 反登记后：handler 捕获资源随 impl 析构释放。
     BOOST_REQUIRE(WaitUntil([&] { return g_captured->load() == 0; }));
 }
 
-BOOST_AUTO_TEST_CASE(t_end_stop_scheduler) {
-    g_server.reset();
-    g_runtime->RequestClose();
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        g_runtime->WaitClosed(std::chrono::steady_clock::now() +
-                                  std::chrono::seconds(10),
-                              {});
-    }));
+BOOST_AUTO_TEST_CASE(t_end_runtime_convergence) {
+    // 进程寿命运行时没有 Scheduler::Stop：收尾靠显式 Close() + 物理落定
+    // 探针（托管集合归零、transport owner 已落定）。
+    auto impl = std::static_pointer_cast<http_detail::NetworkRuntimeImpl>(
+        g_runtime);
+    BOOST_CHECK_EQUAL(impl->UnclosedChildrenForTest(), 0u);
+
+    g_runtime->Close();
+    BOOST_CHECK(g_runtime->IsClosed());
+    BOOST_CHECK(impl->TransportClosedForTest());
+    BOOST_CHECK_EQUAL(impl->UnclosedChildrenForTest(), 0u);
+
+    g_runtime->Close();   // 幂等
+    BOOST_CHECK(g_runtime->IsClosed());
+    BOOST_CHECK_EQUAL(impl->UnclosedChildrenForTest(), 0u);
+
+    // 关闭后不再产出子对象（收口即封口，不重开）。
+    auto late_cl = g_runtime->CreateHttpClient();
+    BOOST_REQUIRE(!late_cl);
+    BOOST_CHECK(late_cl.error().code == ErrorCode::Closed);
+
     g_runtime.reset();
-    g_scheduler->Stop();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

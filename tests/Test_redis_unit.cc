@@ -1,10 +1,11 @@
 // Issue #6 单元验收（不依赖真实 Redis/容器）：
 //
+//   t_create_before_scheduler     — 运行时未初始化（从未 Start）时 Create →
+//                                   RuntimeUnavailable（对象身份需要已
+//                                   初始化的运行时）。
 //   t_setup_scheduler             — 启动 Scheduler（共享 executor 来源）。
-//   t_create_before_scheduler     — 基线差异固定：Scheduler 未 Start 时
-//                                   IsRunning/generation 已就绪，Create
-//                                   成功；RuntimeUnavailable 由未 Start
-//                                   client 路径覆盖。
+//                                  进程寿命运行时：整个可执行文件只 Start
+//                                  一次，无 Stop/重启。
 //   t_config_validation           — 非法装配逐项 InvalidArgument。
 //   t_command_prechecks           — 非协程 InvalidContext；未 Start
 //                                   RuntimeUnavailable；空键/空表
@@ -14,18 +15,20 @@
 //                                   解码与服务端错误映射（RemoteError）。
 //   t_capacity_overloaded         — 静默服务端占满 inflight 与 pending：
 //                                   确定性 Overloaded。
-//   t_deadline_and_cancel         — 静默服务端下超时 TimedOut、取消
-//                                   Cancelled；取消后再 close 不覆盖
+//   t_deadline_only               — 静默服务端下超时 TimedOut；Close 不覆盖
 //                                   首个逻辑终态。
 //   t_refused_connect             — 连接拒绝 → TransportError，连接失败
 //                                   后队列命令统一失败。
-//   t_close_during_inflight       — 在途命令随 owner close 落定 Closed，
-//                                   WaitClosed → Closed（operation/
-//                                   connection 归零）。
-//   t_waitclosed_contention       — 单等待位：并发第二个 AlreadyWaiting。
+//   t_close_during_inflight       — 在途命令随 owner Close() 落定 Closed；
+//                                   Close() 返回即封口且在途 operation/
+//                                   connection 归零（IsClosed）。
 //   t_thread_count_stable         — 4 个 client 不新增线程（共享
 //                                   executor，无 io_thread）。
 //   t_invalid_context_plain       — 普通线程直接调命令 → InvalidContext。
+//
+// 关闭语义（进程寿命修订）：RequestClose/WaitClosed/CloseStatus/取消令牌
+// 全部删除——Close() 幂等、任意线程可调用，返回即在途归零、连接物理回收；
+// IsClosed() 只读查询。每个用例结束显式 Close() 并断言 IsClosed()。
 //
 // 同步纪律与 http 套件一致：CountDownLatch + WaitUntil 有界等待，
 // 不 sleep 假设时序；FakeRedis/静默服务端在协程内经 Hook 驱动，
@@ -36,7 +39,6 @@
 #include <boost/test/included/unit_test.hpp>
 
 #include <atomic>
-#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <deque>
@@ -52,8 +54,6 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
-#include <sys/syscall.h>
-#include <time.h>
 #include <unistd.h>
 
 #include <bbt/core/thread/Lock.hpp>
@@ -67,7 +67,6 @@
 #include <bbt/infra/CoRedisCli.hpp>
 
 using namespace bbt::infra;
-using bbt::coroutine::Deadline;
 using bbt::coroutine::SCHE_START_OPT_SCHE_THREAD;
 
 namespace {
@@ -117,16 +116,6 @@ bool WaitUntil(const std::function<bool()>& pred, int budget_ms = kBudgetMs) {
         std::this_thread::yield();
     }
     return true;
-}
-
-// 非协程线程上的定长睡眠：必须直达内核 syscall。std::this_thread::sleep_for
-// 在本工具链上经 libc nanosleep，而 coroutine Hook 全进程拦截 nanosleep 并
-// 断言“必须在协程上下文”——测试线程命中即断言+空指针解引用（基线行为）。
-void SleepMs(int ms) {
-    timespec req{ms / 1000, static_cast<long>(ms % 1000) * 1000000L};
-    timespec rem{};
-    while (::syscall(SYS_nanosleep, &req, &rem) != 0 && errno == EINTR)
-        req = rem;
 }
 
 // 极简 RESP multibulk 应答机：accept 一条连接后按预置队列逐命令弹出
@@ -284,24 +273,27 @@ result<std::shared_ptr<CoRedisCli>> NewClient(const RedisClientConfig& cfg,
     return result<std::shared_ptr<CoRedisCli>>::ok(std::move(cli));
 }
 
+// 显式 Close 并断言物理收口：redis 的迟到 NULL 回包在 redisAsyncFree 内
+// 同步催出，teardown 在 kCloseDrainTimeout 内必完成，Close 返回后 IsClosed
+// 即为真（在途 operation 与连接均已归零）。
+void CloseClient(const std::shared_ptr<CoRedisCli>& cli) {
+    cli->Close();
+    BOOST_CHECK(cli->IsClosed());
+}
+
 std::atomic_bool g_prepared{false};
 
 } // namespace
 
-// 套件收尾把 Scheduler 单例的所有权释放走漏：~Scheduler 会经 Stop()→
-// Processer::Stop→sleep_for→nanosleep 命中 coroutine 自身导出的 Hook 符号，
-// 在非协程线程上断言后空指针解引用（上游基线竞态，测试侧不可修复）。
-// release 后静态 UPtr 为空，进程退出不再触发 Stop 路径。
-struct SuiteTeardown {
-    ~SuiteTeardown() { g_scheduler.release(); }
-};
-BOOST_GLOBAL_FIXTURE(SuiteTeardown);
+// 进程寿命运行时：无 Stop/restart，实例持有者被 coroutine 故意泄漏，
+// 静态退出期不析构 Scheduler——测试侧无需（也不得）用 Stop 做收尾。
+// 资源收口由每个 client 自己的 Close() 承担。
 
 BOOST_AUTO_TEST_SUITE(redis_unit)
 
-// Scheduler 未启动时 Create → RuntimeUnavailable（CompletionSignal/executor
-// 需要已启动的运行时）。注意基线差异：m_is_running 默认即为 true，IsRunning()
-// 不能用来区分“已启动”，故本用例只断言 Create 的失败结果。
+// 运行时未初始化（从未 Start）时 Create → RuntimeUnavailable（对象身份
+// 需要已初始化的运行时）。进程寿命契约下「未初始化」只有「从未 Start」
+// 一种，故本用例只断言 Create 的失败结果。
 BOOST_AUTO_TEST_CASE(t_create_before_scheduler) {
     auto c = CoRedisCli::Create(MakeConfig("127.0.0.1", 6379));
     BOOST_REQUIRE(!c);
@@ -313,7 +305,7 @@ BOOST_AUTO_TEST_CASE(t_setup_scheduler) {
     cfg->m_cfg_static_thread_num = 2;
     cfg->m_cfg_stack_size        = 1024 * 256;
     g_scheduler->Start(SCHE_START_OPT_SCHE_THREAD);
-    BOOST_REQUIRE(g_scheduler->IsRunning());
+    BOOST_REQUIRE(g_scheduler->IsInitialized());
     g_prepared.store(true);
 }
 
@@ -360,13 +352,7 @@ BOOST_AUTO_TEST_CASE(t_command_prechecks) {
     BOOST_REQUIRE(!*del_out);
     BOOST_CHECK(del_out->error().code == ErrorCode::InvalidArgument);
 
-    cli->RequestClose();
-    std::atomic<CloseStatus> st{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        st.store(cli->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(10), {}));
-    }));
-    BOOST_CHECK(st.load() == CloseStatus::Closed);
+    CloseClient(cli);
 
     // 已关闭：新命令 → Closed。
     BOOST_REQUIRE(RunInCoroutine(
@@ -383,11 +369,8 @@ BOOST_AUTO_TEST_CASE(t_invalid_context_plain) {
     auto res = cli->Ping(Opt());
     BOOST_REQUIRE(!res);
     BOOST_CHECK(res.error().code == ErrorCode::InvalidContext);
-    cli->RequestClose();
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        return cli->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(10), {});
-    }));
+    // Close 可在任意线程调用（含非协程线程）。
+    CloseClient(cli);
 }
 
 BOOST_AUTO_TEST_CASE(t_fake_redis_commands) {
@@ -440,13 +423,7 @@ BOOST_AUTO_TEST_CASE(t_fake_redis_commands) {
     BOOST_CHECK(bad->error().code == ErrorCode::RemoteError);
     BOOST_CHECK_EQUAL(bad->error().domain_code, "WRONGTYPE");
 
-    cli->RequestClose();
-    std::atomic<CloseStatus> st{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        st.store(cli->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(10), {}));
-    }));
-    BOOST_CHECK(st.load() == CloseStatus::Closed);
+    CloseClient(cli);
 }
 
 BOOST_AUTO_TEST_CASE(t_capacity_overloaded) {
@@ -487,22 +464,15 @@ BOOST_AUTO_TEST_CASE(t_capacity_overloaded) {
     BOOST_REQUIRE(WaitUntil([&] { return overloaded.load() == 1; }, 12000));
     BOOST_CHECK_EQUAL(overloaded.load(), 1);
 
-    // 其余命令仍在等回包/排队：以 owner close 收口，应全部 Closed。
-    cli->RequestClose();
+    // 其余命令仍在等回包/排队：以 owner Close() 收口，应全部 Closed。
+    cli->Close();
     BOOST_REQUIRE(WaitUntil([&] { return done.load() == 4; }));
     BOOST_CHECK_EQUAL(overloaded.load(), 1);
     BOOST_CHECK_EQUAL(other_err.load(), 3);
-
-    std::atomic<CloseStatus> st{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        st.store(cli->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(10), {}));
-    }));
-    BOOST_CHECK(st.load() == CloseStatus::Closed);
     BOOST_CHECK(cli->IsClosed());
 }
 
-BOOST_AUTO_TEST_CASE(t_deadline_and_cancel) {
+BOOST_AUTO_TEST_CASE(t_deadline_only) {
     FakeRedis silent({}, /*silent=*/true);
     auto c = NewClient(MakeConfig("127.0.0.1", silent.port, 4, 4));
     BOOST_REQUIRE(c);
@@ -515,37 +485,11 @@ BOOST_AUTO_TEST_CASE(t_deadline_and_cancel) {
     BOOST_REQUIRE(!*out);
     BOOST_CHECK(out->error().code == ErrorCode::TimedOut);
 
-    // cancel：首个逻辑终态 Cancelled；随后的 owner close 不覆盖。
-    bbt::coroutine::CancellationSource src;
-    CallOptions opt = Opt(10000);
-    opt.cancel      = src.Token();
-    std::optional<result<void>> out2;
-    std::atomic_bool out2_ready{false};
-    bool succ = false;
-    g_scheduler->RegistCoroutineTask(
-        [&] {
-            out2.emplace(cli->Ping(opt));
-            out2_ready.store(true, std::memory_order_release);
-        },
-        succ);
-    BOOST_REQUIRE(succ);
-    SleepMs(50);
-    src.RequestCancel();
-    BOOST_REQUIRE(WaitUntil(
-        [&] { return out2_ready.load(std::memory_order_acquire); }));
-    BOOST_REQUIRE(!*out2);
-    BOOST_CHECK(out2->error().code == ErrorCode::Cancelled);
-
-    cli->RequestClose();
-    std::atomic<CloseStatus> st{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        st.store(cli->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(10), {}));
-    }));
-    BOOST_CHECK(st.load() == CloseStatus::Closed);
-    // 首个逻辑终态不被晚到的 close 覆盖。
-    BOOST_REQUIRE(!*out2);
-    BOOST_CHECK(out2->error().code == ErrorCode::Cancelled);
+    // 随后的 owner Close 不覆盖首个逻辑终态。
+    cli->Close();
+    BOOST_CHECK(cli->IsClosed());
+    BOOST_REQUIRE(!*out);
+    BOOST_CHECK(out->error().code == ErrorCode::TimedOut);
 }
 
 BOOST_AUTO_TEST_CASE(t_refused_connect) {
@@ -566,13 +510,7 @@ BOOST_AUTO_TEST_CASE(t_refused_connect) {
     BOOST_REQUIRE(!*out);
     BOOST_CHECK(out->error().code == ErrorCode::TransportError);
 
-    cli->RequestClose();
-    std::atomic<CloseStatus> st{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        st.store(cli->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(10), {}));
-    }));
-    BOOST_CHECK(st.load() == CloseStatus::Closed);
+    CloseClient(cli);
 }
 
 BOOST_AUTO_TEST_CASE(t_close_during_inflight) {
@@ -595,74 +533,13 @@ BOOST_AUTO_TEST_CASE(t_close_during_inflight) {
     BOOST_REQUIRE(
         WaitUntil([&] { return silent.saw_data->load(); }, 10000));
 
-    cli->RequestClose();
+    cli->Close();
     BOOST_REQUIRE(WaitUntil(
         [&] { return out_ready.load(std::memory_order_acquire); }));
     BOOST_REQUIRE(!*out);
     BOOST_CHECK(out->error().code == ErrorCode::Closed);
 
-    std::atomic<CloseStatus> st{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        st.store(cli->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(10), {}));
-    }));
-    // WaitClosed → Closed：在途 operation 与连接均已归零。
-    BOOST_CHECK(st.load() == CloseStatus::Closed);
-    BOOST_CHECK(cli->IsClosed());
-}
-
-BOOST_AUTO_TEST_CASE(t_waitclosed_contention) {
-    auto c = NewClient(MakeConfig("127.0.0.1", 1));
-    BOOST_REQUIRE(c);
-    auto cli = std::move(c).value();
-
-    std::atomic_bool        a_waiting{false};
-    std::atomic_bool        a_done{false};
-    std::atomic<CloseStatus> a_status{};
-    bool succ = false;
-    g_scheduler->RegistCoroutineTask(
-        [&] {
-            a_waiting.store(true);
-            for (;;) {
-                const auto st = cli->WaitClosed(
-                    std::chrono::steady_clock::now() +
-                        std::chrono::seconds(5),
-                    {});
-                if (st != CloseStatus::Closed)
-                    continue;
-                a_status.store(st);
-                break;
-            }
-            a_done.store(true);
-        },
-        succ);
-    BOOST_REQUIRE(succ);
-    BOOST_REQUIRE(WaitUntil([&] { return a_waiting.load(); }));
-
-    std::atomic_bool b_saw_already_waiting{false};
-    std::atomic_bool b_done{false};
-    g_scheduler->RegistCoroutineTask(
-        [&] {
-            for (int i = 0; i < 200 && !b_saw_already_waiting.load(); ++i) {
-                const auto st = cli->WaitClosed(
-                    std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(50),
-                    {});
-                if (st == CloseStatus::AlreadyWaiting)
-                    b_saw_already_waiting.store(true);
-                else if (st == CloseStatus::Closed)
-                    break;
-            }
-            b_done.store(true);
-        },
-        succ);
-    BOOST_REQUIRE(succ);
-    BOOST_REQUIRE(WaitUntil([&] { return b_done.load(); }));
-    BOOST_CHECK(b_saw_already_waiting.load());
-
-    cli->RequestClose();
-    BOOST_REQUIRE(WaitUntil([&] { return a_done.load(); }));
-    BOOST_CHECK(a_status.load() == CloseStatus::Closed);
+    // Close 返回 = 在途 operation 与连接均已归零。
     BOOST_CHECK(cli->IsClosed());
 }
 
@@ -677,17 +554,8 @@ BOOST_AUTO_TEST_CASE(t_thread_count_stable) {
     }
     // client/strand/连接管理不新增线程：线程数与 Scheduler 启动时一致。
     BOOST_CHECK_EQUAL(ThreadCount(), before);
-    for (auto& cli : clients) {
-        cli->RequestClose();
-        std::atomic<CloseStatus> st{};
-        BOOST_REQUIRE(RunInCoroutine([&] {
-            st.store(cli->WaitClosed(
-                std::chrono::steady_clock::now() +
-                    std::chrono::seconds(10),
-                {}));
-        }));
-        BOOST_CHECK(st.load() == CloseStatus::Closed);
-    }
+    for (auto& cli : clients)
+        CloseClient(cli);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

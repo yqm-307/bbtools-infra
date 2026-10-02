@@ -1,6 +1,12 @@
 // N0 公共契约最小验证：result 表面、Error.details 校验、NetworkLimits 校验、
 // Codec<void>/Codec<std::string>、ICoObject/ICoNetwork/ICoCloseable 可派生。
 // 无第三方测试框架依赖，失败时输出到 stderr 并以非零退出。
+//
+// 关闭面按进程寿命运行时修订（契约 §1）：ICoCloseable 只有
+// Close()/IsClosed()。RequestClose/WaitClosed/ReleaseClosed/CloseStatus、
+// CancellationToken、运行时代际都不再存在，本件不保留任何旧断言。
+// CallOptions / IncomingCallContext / WaitOptions 只携带 deadline——
+// 用 sizeof 直接钉住「已删的取消令牌没有留下兼容字段」。
 
 #include <cstdio>
 #include <memory>
@@ -253,23 +259,23 @@ void TestCodec() {
 
 struct FakeObject : bbt::coroutine::ICoObject {
     bbt::coroutine::CoObjectInfo GetObjectInfo() const override {
-        return bbt::coroutine::CoObjectInfo{1, 1, "fake", "fakeobj"};
+        // CoObjectInfo 无代际字段：{id, kind, name}
+        return bbt::coroutine::CoObjectInfo{1, "fake", "fakeobj"};
     }
 };
 
 struct FakeNet : ICoNetwork {
     bbt::coroutine::CoObjectInfo GetObjectInfo() const override {
-        return bbt::coroutine::CoObjectInfo{2, 1, "net", "fakenet"};
+        return bbt::coroutine::CoObjectInfo{2, "net", "fakenet"};
     }
 };
 
+// 关闭面最小实现：只给出 Close()/IsClosed() 即可满足 ICoCloseable——
+// 这本身就是「接口只剩两个纯虚函数」的编译期证据（旧面还需实现
+// RequestClose/WaitClosed，缺一个就无法实例化）。
 struct FakeCloseable : ICoCloseable {
-    void RequestClose() noexcept override { closed = true; }
+    void Close() noexcept override { closed = true; }
     bool IsClosed() const noexcept override { return closed; }
-    CloseStatus WaitClosed(bbt::coroutine::Deadline,
-                           bbt::coroutine::CancellationToken) override {
-        return CloseStatus::Closed;
-    }
     bool closed = false;
 };
 
@@ -281,24 +287,36 @@ void TestInterfaces() {
     bbt::coroutine::ICoObject& base = net;
     CHECK(base.GetObjectInfo().kind == "net");
 
+    // Close() 幂等、返回即终态；IsClosed() 只读查询，不重开。
     FakeCloseable c;
     CHECK(!c.IsClosed());
-    c.RequestClose();
+    c.Close();
     CHECK(c.IsClosed());
-    CHECK(c.WaitClosed(bbt::coroutine::Deadline{},
-                       bbt::coroutine::CancellationToken{}) ==
-          CloseStatus::Closed);
+    c.Close();
+    CHECK(c.IsClosed());
 
-    // CloseStatus 六枚举齐备
-    CHECK(CloseStatus::TimedOut != CloseStatus::Closed);
-    CHECK(CloseStatus::Cancelled != CloseStatus::InvalidContext);
-    CHECK(CloseStatus::AlreadyWaiting != CloseStatus::RuntimeUnavailable);
+    // 已删取消令牌不留兼容字段：调用选项/等待选项的尺寸就是 deadline
+    // 的尺寸（多一个 token 成员即失败）。
+    static_assert(std::is_same<decltype(CallOptions::deadline),
+                               bbt::coroutine::Deadline>::value,
+                  "CallOptions 只应携带 deadline");
+    static_assert(sizeof(CallOptions) == sizeof(bbt::coroutine::Deadline),
+                  "CallOptions 不得保留 cancel/令牌字段");
+    static_assert(std::is_same<decltype(IncomingCallContext::deadline),
+                               bbt::coroutine::Deadline>::value,
+                  "IncomingCallContext 只应携带 deadline");
+    static_assert(std::is_same<decltype(bbt::coroutine::WaitOptions::deadline),
+                               bbt::coroutine::Deadline>::value,
+                  "WaitOptions 只应携带 deadline");
+    static_assert(sizeof(bbt::coroutine::WaitOptions) ==
+                      sizeof(bbt::coroutine::Deadline),
+                  "WaitOptions 不得保留 cancel 字段");
 
-    // CallOptions / IncomingCallContext 聚合可构造
-    CallOptions opts{bbt::coroutine::Deadline{},
-                     bbt::coroutine::CancellationToken{}};
-    IncomingCallContext ctx{opts.deadline, opts.cancel, "peer"};
+    // CallOptions / IncomingCallContext 聚合可构造（仅 deadline + 身份）。
+    CallOptions opts{bbt::coroutine::Deadline{}};
+    IncomingCallContext ctx{opts.deadline, "peer"};
     CHECK(ctx.peer_principal == "peer");
+    CHECK(ctx.deadline == opts.deadline);
 
     // Handler 别名可用
     HttpHandler hh = [](IncomingCallContext, HttpRequest) {

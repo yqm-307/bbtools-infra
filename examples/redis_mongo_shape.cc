@@ -1,7 +1,7 @@
 // Issue #27：Redis/Mongo 调用形态示例（静态形态演示）。
 //
 // 本文件演示 CoRedisCli / CoMongoCli 的真实公开 API 调用形态：装配校验 →
-// Scheduler 内 Create/Start → 协程内命令（deadline/cancel）→ 关闭边界。
+// Scheduler 内 Create/Start → 协程内命令（deadline）→ 关闭边界。
 // 它只做参数校验与错误路径（不连接真实服务），因此无外部 Redis/Mongo
 // 依赖即可编译运行；真实服务调用形态与语义见 README「示例与兼容说明」。
 //
@@ -100,10 +100,9 @@ void RedisShape() {
         std::cerr << "redis Delete error: code="
                   << static_cast<int>(del.error().code) << "\n";
 
-    redis->RequestClose();
-    redis->WaitClosed(std::chrono::steady_clock::now() +
-                          std::chrono::seconds{5},
-                      {});
+    // 关闭边界：owner 主动同步 Close()——幂等、返回即物理释放（在途
+    // operation/connection 归零后回收连接；未发送数据直接丢弃、不 flush）。
+    redis->Close();
 }
 
 // Mongo 形态（Issue #40 owner + 集合句柄）：一个 CoMongoDb owner 承载
@@ -164,14 +163,12 @@ void MongoShape() {
     else if (!find.value())
         std::cout << "mongo FindOne miss (nullopt, distinct from error)\n";
 
-    // 句柄关闭只影响自身接纳，不关闭兄弟/owner；owner 关闭负责物理
-    // drain。
-    items.value()->RequestClose();
-    logs.value()->RequestClose();
-    db->RequestClose();
-    db->WaitClosed(std::chrono::steady_clock::now() +
-                       std::chrono::seconds{5},
-                   {});
+    // 句柄关闭（同步、幂等）只封该句柄的接纳与新命令校验，不关闭兄弟/
+    // owner；owner Close() 负责物理收口——封口停止接纳、唤醒全部挂起业务
+    // 等待者、在途 operation 归零后回收 worker/队列/pool lease。
+    items.value()->Close();
+    logs.value()->Close();
+    db->Close();
 }
 
 } // namespace
@@ -185,10 +182,11 @@ int main() {
     scheduler->Start(bbt::coroutine::SCHE_START_OPT_SCHE_THREAD);
 
     // 命令只能在协程上下文调用，否则返回 Error(InvalidContext)。
+    // 两个形态各自在协程内显式 Close() 自己的资源 owner；Scheduler 没有
+    // 停机入口（已删除 Stop），runtime 按进程寿命存在，不参与资源收口。
     const bool ran = RunInCoroutine([&] {
         RedisShape();
         MongoShape();
     });
-    scheduler->Stop();
     return ran ? 0 : 1;
 }

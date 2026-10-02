@@ -1,13 +1,13 @@
 // Issue #7 单元验收（不依赖真实 MongoDB/容器）：
 //
 //   t_setup_scheduler             — 启动 Scheduler（共享 executor 来源）。
-//   t_create_before_scheduler     — Scheduler 未 Start 时 Create →
-//                                   RuntimeUnavailable（CompletionSignal/
-//                                   对象身份需要运行时代际）。
+//   t_create_before_scheduler     — 运行时未初始化（从未 Start）时 Create →
+//                                   RuntimeUnavailable（对象身份需要已
+//                                   初始化的运行时）。
 //   t_config_validation           — 非法装配逐项 InvalidArgument。
 //   t_command_prechecks           — 未 Start RuntimeUnavailable；空文档/
 //                                   空 filter 空 update InvalidArgument；
-//                                   close 后 Closed。
+//                                   Close 后 Closed。
 //   t_invalid_context_plain       — 普通线程直接调命令 → InvalidContext。
 //   t_invalid_bson                — 不良构 BSON → InvalidArgument（校验在
 //                                   worker 内、driver 调用之前，不需要服务端）。
@@ -16,18 +16,19 @@
 //   t_capacity_overloaded         — worker_threads=1 时一个 op 占住 worker
 //                                   （RunningDriverCalls 观测），queue=2 占满
 //                                   后第 4 个命令确定性 Overloaded。
-//   t_deadline_and_cancel         — 不可达地址下 deadline → TimedOut、
-//                                   cancel → Cancelled；逻辑返回时物理
-//                                   driver 调用仍在进行（计数不变）。
-//   t_close_during_inflight       — 在途 driver 调用随 owner close 落定
-//                                   Closed；WaitClosed 等物理调用归零才
-//                                   返回 Closed。
+//   t_deadline_only               — 不可达地址下 deadline → TimedOut；逻辑
+//                                   返回时物理 driver 调用仍在进行（计数
+//                                   不变），不冒充物理收口。
+//   t_close_during_inflight       — 在途 driver 调用随 owner Close() 落定
+//                                   Closed；物理收口（driver 返回 + worker
+//                                   退出）才 IsClosed。
 //   t_worker_threads_bound        — 4 个并发 op 峰值 driver 调用 ≤ 2。
-//   t_waitclosed_contention       — 单等待位：并发第二个 AlreadyWaiting。
 //
-// 同步纪律与 redis/http 套件一致：CountDownLatch + WaitUntil 有界等待 +
-// impl 运行计数观测，不 sleep 假设时序；不可达地址的 server selection
-// 受 serverSelectionTimeoutMS 上界约束，用例预算均大于该上界。
+// 关闭语义（进程寿命修订）：RequestClose/WaitClosed/CloseStatus/取消令牌
+// 全部删除——Close() 幂等、任意线程可调用，封口 + 唤醒等待者 + 有界等待在途
+// 归零；driver 同步调用不可强杀，超过 kCloseDrainTimeout 的配置下 Close 提前
+// 返回、IsClosed() 在 driver 返回后才成立。用例统一经 CloseClientDrained()
+// 在有界窗口内确认真实收口。
 
 #define BOOST_TEST_DYN_LINK
 #define BOOST_TEST_MAIN
@@ -41,6 +42,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 
@@ -166,18 +168,20 @@ std::shared_ptr<mongo_detail::CoMongoCliImpl> ImplOf(
     return std::static_pointer_cast<mongo_detail::CoMongoCliImpl>(cli);
 }
 
+// 显式 Close 并断言「返回即物理落定」：Close 同步等待在途 driver 调用返回
+// 与 worker 全退，返回时 IsClosed() 必须已为真。不再用「Close 后轮询
+// IsClosed」的隐性两阶段替身掩盖同步承诺。
+void CloseClientDrained(const std::shared_ptr<CoMongoCli>& cli) {
+    cli->Close();
+    BOOST_REQUIRE(cli->IsClosed());
+}
+
 std::atomic_bool g_prepared{false};
 
 } // namespace
 
-// 套件收尾把 Scheduler 单例的所有权释放走漏：~Scheduler 会经 Stop()→
-// Processer::Stop→sleep_for→nanosleep 命中 coroutine 自身导出的 Hook 符号，
-// 在非协程线程上断言后空指针解引用（上游基线竞态，测试侧不可修复）。
-// release 后静态 UPtr 为空，进程退出不再触发 Stop 路径。
-struct SuiteTeardown {
-    ~SuiteTeardown() { g_scheduler.release(); }
-};
-BOOST_GLOBAL_FIXTURE(SuiteTeardown);
+// 进程寿命运行时：无 Stop/restart；实例持有者被 coroutine 故意泄漏，
+// 静态退出期不析构 Scheduler，测试侧不做任何 Stop 收尾。
 
 BOOST_AUTO_TEST_SUITE(mongo_unit)
 
@@ -238,7 +242,7 @@ BOOST_AUTO_TEST_CASE(t_setup_scheduler) {
     cfg->m_cfg_static_thread_num = 2;
     cfg->m_cfg_stack_size        = 1024 * 256;
     g_scheduler->Start(SCHE_START_OPT_SCHE_THREAD);
-    BOOST_REQUIRE(g_scheduler->IsRunning());
+    BOOST_REQUIRE(g_scheduler->IsInitialized());
     g_prepared.store(true);
 }
 
@@ -317,13 +321,7 @@ BOOST_AUTO_TEST_CASE(t_command_prechecks) {
     BOOST_REQUIRE(!*d);
     BOOST_CHECK(d->error().code == ErrorCode::InvalidArgument);
 
-    cli->RequestClose();
-    std::atomic<CloseStatus> st{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        st.store(cli->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(10), {}));
-    }));
-    BOOST_CHECK(st.load() == CloseStatus::Closed);
+    CloseClientDrained(cli);
 
     // 已关闭：新命令 → Closed。
     BOOST_REQUIRE(RunInCoroutine(
@@ -340,11 +338,8 @@ BOOST_AUTO_TEST_CASE(t_invalid_context_plain) {
     auto res = cli->FindOne(EmptyDoc(), Opt());
     BOOST_REQUIRE(!res);
     BOOST_CHECK(res.error().code == ErrorCode::InvalidContext);
-    cli->RequestClose();
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        return cli->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(10), {});
-    }));
+    cli->Close();
+    BOOST_CHECK(cli->IsClosed());
 }
 
 BOOST_AUTO_TEST_CASE(t_invalid_context_precedence_legacy) {
@@ -357,19 +352,15 @@ BOOST_AUTO_TEST_CASE(t_invalid_context_precedence_legacy) {
     auto r1 = not_started->FindOne(EmptyDoc(), Opt());
     BOOST_REQUIRE(!r1);
     BOOST_CHECK(r1.error().code == ErrorCode::InvalidContext);
-    not_started->RequestClose();
+    not_started->Close();
 
-    // 已关（Start 后 RequestClose）：协程外仍 InvalidContext 而非
-    // Closed——与旧 PreCheck 的协程外优先一致。
+    // 已关（Start 后 Close）：协程外仍 InvalidContext 而非 Closed
+    // ——与前置校验「协程外优先」一致。
     auto c2 = NewClient(MakeDeadCfg());
     BOOST_REQUIRE(c2);
     auto closed = std::move(c2).value();
-    closed->RequestClose();
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        return closed->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(10),
-            {});
-    }));
+    closed->Close();
+    BOOST_REQUIRE(closed->IsClosed());
     auto r2 = closed->FindOne(EmptyDoc(), Opt());
     BOOST_REQUIRE(!r2);
     BOOST_CHECK(r2.error().code == ErrorCode::InvalidContext);
@@ -388,13 +379,7 @@ BOOST_AUTO_TEST_CASE(t_invalid_bson) {
     BOOST_REQUIRE(!*ins);
     BOOST_CHECK(ins->error().code == ErrorCode::InvalidArgument);
 
-    cli->RequestClose();
-    std::atomic<CloseStatus> st{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        st.store(cli->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(10), {}));
-    }));
-    BOOST_CHECK(st.load() == CloseStatus::Closed);
+    CloseClientDrained(cli);
 }
 
 BOOST_AUTO_TEST_CASE(t_server_unreachable) {
@@ -410,13 +395,7 @@ BOOST_AUTO_TEST_CASE(t_server_unreachable) {
     BOOST_CHECK(out->error().code == ErrorCode::Unavailable);
     BOOST_CHECK_EQUAL(out->error().backend_category, "mongocxx");
 
-    cli->RequestClose();
-    std::atomic<CloseStatus> st{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        st.store(cli->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(20), {}));
-    }));
-    BOOST_CHECK(st.load() == CloseStatus::Closed);
+    CloseClientDrained(cli);
 }
 
 BOOST_AUTO_TEST_CASE(t_capacity_overloaded) {
@@ -456,20 +435,16 @@ BOOST_AUTO_TEST_CASE(t_capacity_overloaded) {
     // 运行中 driver 调用峰值不超 worker_threads。
     BOOST_CHECK(impl->PeakDriverCallsForTest() <= 1);
 
-    cli->RequestClose();
+    cli->Close();
     BOOST_REQUIRE(WaitUntil([&] { return done.load() == 4; }, 30000));
     BOOST_CHECK_EQUAL(overloaded.load(), 1);
 
-    std::atomic<CloseStatus> st{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        st.store(cli->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(30), {}));
-    }));
-    BOOST_CHECK(st.load() == CloseStatus::Closed);
+    BOOST_REQUIRE(cli->IsClosed());
     BOOST_CHECK(cli->IsClosed());
+    BOOST_CHECK_EQUAL(impl->RunningDriverCallsForTest(), 0);
 }
 
-BOOST_AUTO_TEST_CASE(t_deadline_and_cancel) {
+BOOST_AUTO_TEST_CASE(t_deadline_only) {
     auto c = NewClient(MakeDeadCfg(1, 4, 10000));
     BOOST_REQUIRE(c);
     auto cli = std::move(c).value();
@@ -496,44 +471,18 @@ BOOST_AUTO_TEST_CASE(t_deadline_and_cancel) {
     BOOST_CHECK(out->error().code == ErrorCode::TimedOut);
     BOOST_CHECK_EQUAL(impl->RunningDriverCallsForTest(), 1);
 
-    // cancel：首个逻辑终态 Cancelled；物理调用继续到 driver 超时。
-    bbt::coroutine::CancellationSource src;
-    CallOptions opt = Opt(30000);
-    opt.cancel      = src.Token();
-    std::optional<result<std::optional<MongoDocument>>> out2;
-    std::atomic_bool out2_ready{false};
-    bool succ = false;
-    g_scheduler->RegistCoroutineTask(
-        [&] {
-            out2.emplace(cli->FindOne(EmptyDoc(), opt));
-            out2_ready.store(true, std::memory_order_release);
-        },
-        succ);
-    BOOST_REQUIRE(succ);
-    BOOST_REQUIRE(WaitUntil(
-        [&] { return impl->RunningDriverCallsForTest() >= 1; }, 10000));
-    src.RequestCancel();
-    BOOST_REQUIRE(WaitUntil(
-        [&] { return out2_ready.load(std::memory_order_acquire); }));
-    BOOST_REQUIRE(!*out2);
-    BOOST_CHECK(out2->error().code == ErrorCode::Cancelled);
-
-    cli->RequestClose();
-    std::atomic<CloseStatus> st{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        st.store(cli->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(30), {}));
-    }));
-    BOOST_CHECK(st.load() == CloseStatus::Closed);
-    // 首个逻辑终态不被晚到的 close 覆盖。
-    BOOST_REQUIRE(!*out2);
-    BOOST_CHECK(out2->error().code == ErrorCode::Cancelled);
+    // Close：首个逻辑终态（TimedOut）不被晚到的关闭覆盖；物理调用继续到
+    // driver 超时，收口后 IsClosed 成立、运行中调用归零。
+    cli->Close();
+    BOOST_REQUIRE(!*out);
+    BOOST_CHECK(out->error().code == ErrorCode::TimedOut);
+    BOOST_REQUIRE(cli->IsClosed());
     BOOST_CHECK_EQUAL(impl->RunningDriverCallsForTest(), 0);
 }
 
 BOOST_AUTO_TEST_CASE(t_close_during_inflight) {
-    // server selection 上界 15s：close 发生在 driver 调用进行中——
-    // WaitClosed 必须等物理调用返回才 Closed（不得提前假收口）。
+    // server selection 上界 15s：Close 发生在 driver 调用进行中——Close
+    // 不得提前宣告 Closed；物理收口（driver 返回 + worker 全退）才 IsClosed。
     auto c = NewClient(MakeDeadCfg(1, 4, 15000));
     BOOST_REQUIRE(c);
     auto cli = std::move(c).value();
@@ -553,20 +502,15 @@ BOOST_AUTO_TEST_CASE(t_close_during_inflight) {
     BOOST_REQUIRE(WaitUntil(
         [&] { return impl->RunningDriverCallsForTest() == 1; }, 10000));
 
-    cli->RequestClose();
+    cli->Close();
     BOOST_REQUIRE(WaitUntil(
         [&] { return out_ready.load(std::memory_order_acquire); }));
     BOOST_REQUIRE(!*out);
     BOOST_CHECK(out->error().code == ErrorCode::Closed);
-    // 物理调用尚未返回（15s server selection 上界内）→ 不得已 Closed。
-    BOOST_CHECK(!cli->IsClosed());
-
-    std::atomic<CloseStatus> st{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        st.store(cli->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(40), {}));
-    }));
-    BOOST_CHECK(st.load() == CloseStatus::Closed);
+    // 同步契约：Close 返回即物理收口（在途 driver 调用返回 + worker 全退），
+    // 因此返回时 IsClosed() 必须为真；不再断言「Close 提前返回、IsClosed
+    // 仍为 false」的旧有界窗口行为。
+    BOOST_REQUIRE(cli->IsClosed());
     BOOST_CHECK(cli->IsClosed());
     BOOST_CHECK_EQUAL(impl->RunningDriverCallsForTest(), 0);
 }
@@ -598,68 +542,56 @@ BOOST_AUTO_TEST_CASE(t_worker_threads_bound) {
     BOOST_CHECK(all.WaitTimeout(30000) == 0);
     BOOST_CHECK(impl->PeakDriverCallsForTest() <= 2);
 
-    cli->RequestClose();
-    std::atomic<CloseStatus> st{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        st.store(cli->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(30), {}));
-    }));
-    BOOST_CHECK(st.load() == CloseStatus::Closed);
+    CloseClientDrained(cli);
 }
 
-BOOST_AUTO_TEST_CASE(t_waitclosed_contention) {
-    auto c = NewClient(MakeDeadCfg());
-    BOOST_REQUIRE(c);
-    auto cli = std::move(c).value();
+BOOST_AUTO_TEST_CASE(t_client_start_close_publish_pairing) {
+    // M2 回归：旧公开 client 的 Start 发布与 Close 封口必须配对。Start 与
+    // Close 并发时不得出现「Close 已返回、Start 事后发布 worker/lease、
+    // IsClosed 回退」；Close 返回当刻无本 wrapper 资源，关闭后 Start 一律
+    // Closed、重复 Close 幂等。（带 spawn 握手与独立放行方的确定性版本见
+    // scratch deliver-infra/mongo-public/mongo-public-start-close-probe.cc。）
+    for (int i = 0; i < 200; ++i) {
+        auto c = CoMongoCli::Create(MakeDeadCfg(1, 2, 3000));
+        BOOST_REQUIRE(c);
+        auto cli  = std::move(c).value();
+        auto impl = ImplOf(cli);
 
-    std::atomic_bool         a_waiting{false};
-    std::atomic_bool         a_done{false};
-    std::atomic<CloseStatus> a_status{};
-    bool succ = false;
-    g_scheduler->RegistCoroutineTask(
-        [&] {
-            a_waiting.store(true);
-            for (;;) {
-                const auto st = cli->WaitClosed(
-                    std::chrono::steady_clock::now() +
-                        std::chrono::seconds(5),
-                    {});
-                if (st != CloseStatus::Closed)
-                    continue;
-                a_status.store(st);
-                break;
-            }
-            a_done.store(true);
-        },
-        succ);
-    BOOST_REQUIRE(succ);
-    BOOST_REQUIRE(WaitUntil([&] { return a_waiting.load(); }));
+        std::atomic_int  start_code{-2};   // -1 = Start 成功
+        std::atomic_bool start_returned{false};
+        std::atomic_bool close_returned{false};
+        std::thread starter([&] {
+            auto r = cli->Start();
+            start_code.store(r ? -1 : static_cast<int>(r.error().code),
+                             std::memory_order_relaxed);
+            start_returned.store(true, std::memory_order_release);
+        });
+        std::thread closer([&] {
+            cli->Close();
+            close_returned.store(true, std::memory_order_release);
+        });
+        starter.join();
+        closer.join();
+        BOOST_REQUIRE(start_returned.load() && close_returned.load());
 
-    std::atomic_bool b_saw_already_waiting{false};
-    std::atomic_bool b_done{false};
-    g_scheduler->RegistCoroutineTask(
-        [&] {
-            for (int i = 0; i < 200 && !b_saw_already_waiting.load(); ++i) {
-                const auto st = cli->WaitClosed(
-                    std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(50),
-                    {});
-                if (st == CloseStatus::AlreadyWaiting)
-                    b_saw_already_waiting.store(true);
-                else if (st == CloseStatus::Closed)
-                    break;
-            }
-            b_done.store(true);
-        },
-        succ);
-    BOOST_REQUIRE(succ);
-    BOOST_REQUIRE(WaitUntil([&] { return b_done.load(); }));
-    BOOST_CHECK(b_saw_already_waiting.load());
-
-    cli->RequestClose();
-    BOOST_REQUIRE(WaitUntil([&] { return a_done.load(); }));
-    BOOST_CHECK(a_status.load() == CloseStatus::Closed);
-    BOOST_CHECK(cli->IsClosed());
+        // Close 返回后：终态不回退、本 wrapper 无 worker 残留。
+        BOOST_CHECK(cli->IsClosed());
+        BOOST_CHECK_EQUAL(impl->LiveWorkersForTest(), 0);
+        // 关闭后 Start 一律 Closed，不重开、不产生新资源。
+        auto again = cli->Start();
+        BOOST_REQUIRE(!again);
+        BOOST_CHECK(again.error().code == ErrorCode::Closed);
+        BOOST_CHECK(cli->IsClosed());
+        BOOST_CHECK_EQUAL(impl->LiveWorkersForTest(), 0);
+        // 并发 Start 只允许两种合法结局：成功（随即被 Close 同步收口）或
+        // 被封口明确拒绝为 Closed；不得有第三种「事后发布」。
+        const int code = start_code.load(std::memory_order_relaxed);
+        BOOST_CHECK(code == -1 || code == static_cast<int>(ErrorCode::Closed));
+        // 重复 Close 幂等。
+        cli->Close();
+        BOOST_CHECK(cli->IsClosed());
+        BOOST_CHECK_EQUAL(impl->LiveWorkersForTest(), 0);
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()
@@ -672,8 +604,8 @@ BOOST_AUTO_TEST_SUITE_END()
 //   - 不同 owner 各自持有 worker 组/队列/ops 表：互不可见；
 //   - max_queue=1 时跨集合共享背压：一个集合占住队列后，另一集合
 //     确定性 Overloaded；
-//   - 句柄关闭只停自身接纳，不动兄弟与 owner；owner 关闭等物理
-//     drain（WaitClosed 不提前宣告）。
+//   - 句柄关闭只停自身接纳，不动兄弟与 owner；owner Close() 在有界窗口
+//     内等物理收口（ops 清空 + worker 全退），不提前宣告 IsClosed。
 
 BOOST_AUTO_TEST_SUITE(mongo_owner)
 
@@ -714,6 +646,15 @@ std::shared_ptr<mongo_detail::MongoRuntime> RuntimeOf(
     return impl->Runtime();
 }
 
+// owner Close + 有界等待物理收口，并断言 worker/在途看板归零。
+void CloseOwnerAndDrain(const std::shared_ptr<mongo::CoMongoDb>& db,
+                        const std::shared_ptr<mongo_detail::MongoRuntime>& rt) {
+    db->Close();
+    BOOST_REQUIRE(db->IsClosed());
+    BOOST_CHECK_EQUAL(rt->RunningDriverCallsForTest(), 0);
+    BOOST_CHECK_EQUAL(rt->LiveWorkersForTest(), 0);
+}
+
 } // namespace
 
 BOOST_AUTO_TEST_CASE(t_owner_config_validation) {
@@ -731,14 +672,8 @@ BOOST_AUTO_TEST_CASE(t_owner_config_validation) {
     auto db = NewOwner(MakeRtCfg(1, 4));
     BOOST_CHECK(db->Collection(bad_target).error().code ==
                 ErrorCode::InvalidArgument);
-    db->RequestClose();
-    std::atomic<CloseStatus> st{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        st.store(db->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(10),
-            {}));
-    }));
-    BOOST_CHECK(st.load() == CloseStatus::Closed);
+    auto rt = RuntimeOf(db);
+    CloseOwnerAndDrain(db, rt);
 }
 
 BOOST_AUTO_TEST_CASE(t_owner_multi_handles_share_workers) {
@@ -779,17 +714,11 @@ BOOST_AUTO_TEST_CASE(t_owner_multi_handles_share_workers) {
     BOOST_CHECK_EQUAL(rt->LiveWorkersForTest(), 2);
 
     for (auto& h : handles)
-        h->RequestClose();
-    db->RequestClose();
+        h->Close();
+    db->Close();
     BOOST_REQUIRE(WaitUntil(
         [&] { return submitted.load() == 3; }, 30000));
-    std::atomic<CloseStatus> st{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        st.store(db->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(30),
-            {}));
-    }));
-    BOOST_CHECK(st.load() == CloseStatus::Closed);
+    BOOST_REQUIRE(db->IsClosed());
     BOOST_CHECK_EQUAL(rt->RunningDriverCallsForTest(), 0);
 }
 
@@ -813,21 +742,8 @@ BOOST_AUTO_TEST_CASE(t_owner_isolation) {
     BOOST_CHECK(std::static_pointer_cast<mongo_detail::MongoCollImpl>(
                     h2.value())->Runtime() == rt2);
 
-    db1->RequestClose();
-    db2->RequestClose();
-    std::atomic<CloseStatus> s1{}, s2{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        s1.store(db1->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(20),
-            {}));
-    }));
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        s2.store(db2->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(20),
-            {}));
-    }));
-    BOOST_CHECK(s1.load() == CloseStatus::Closed);
-    BOOST_CHECK(s2.load() == CloseStatus::Closed);
+    CloseOwnerAndDrain(db1, rt1);
+    CloseOwnerAndDrain(db2, rt2);
 }
 
 BOOST_AUTO_TEST_CASE(t_shared_backpressure_queue_one) {
@@ -879,19 +795,14 @@ BOOST_AUTO_TEST_CASE(t_shared_backpressure_queue_one) {
     BOOST_CHECK_EQUAL(b_overloaded.load(), 0);
     BOOST_CHECK(rt->PeakDriverCallsForTest() <= 1);
 
-    ha.value()->RequestClose();
-    hb.value()->RequestClose();
-    hc.value()->RequestClose();
-    db->RequestClose();
+    ha.value()->Close();
+    hb.value()->Close();
+    hc.value()->Close();
+    db->Close();
     BOOST_REQUIRE(WaitUntil(
         [&] { return b_done.load() + c_done.load() == 3; }, 30000));
-    std::atomic<CloseStatus> st{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        st.store(db->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(30),
-            {}));
-    }));
-    BOOST_CHECK(st.load() == CloseStatus::Closed);
+    BOOST_REQUIRE(db->IsClosed());
+    BOOST_CHECK_EQUAL(rt->RunningDriverCallsForTest(), 0);
 }
 
 BOOST_AUTO_TEST_CASE(t_handle_close_scoped) {
@@ -929,7 +840,7 @@ BOOST_AUTO_TEST_CASE(t_handle_close_scoped) {
     BOOST_REQUIRE(WaitUntil(
         [&] { return rt->RunningDriverCallsForTest() == 1; }, 10000));
 
-    c1->RequestClose();
+    c1->Close();
     BOOST_CHECK(c1->IsClosed());
     // 已关句柄的新命令 → Closed（不接触 owner 队列）。
     std::optional<result<std::optional<MongoDocument>>> out;
@@ -950,18 +861,12 @@ BOOST_AUTO_TEST_CASE(t_handle_close_scoped) {
         succ);
     BOOST_REQUIRE(succ);
 
-    c2->RequestClose();
-    db->RequestClose();
+    c2->Close();
+    db->Close();
     BOOST_REQUIRE(WaitUntil([&] {
         return h1_done.load() && h2_done.load();
     }, 30000));
-    std::atomic<CloseStatus> st{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        st.store(db->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(30),
-            {}));
-    }));
-    BOOST_CHECK(st.load() == CloseStatus::Closed);
+    BOOST_REQUIRE(db->IsClosed());
     BOOST_CHECK_EQUAL(rt->RunningDriverCallsForTest(), 0);
 }
 
@@ -969,7 +874,7 @@ BOOST_AUTO_TEST_CASE(t_owner_collection_requires_running) {
     // 公共契约「owner 必须 Running 才接纳句柄」的生命周期门禁：
     //   Create 未 Start → Collection → RuntimeUnavailable；
     //   Start 之后     → Collection 成功；
-    //   RequestClose   → Collection → Closed。
+    //   Close          → Collection → Closed。
     auto d = mongo::CoMongoDb::Create(MakeRtCfg(1, 4));
     BOOST_REQUIRE(d);
     auto db = std::move(d).value();
@@ -982,19 +887,140 @@ BOOST_AUTO_TEST_CASE(t_owner_collection_requires_running) {
     auto h = db->Collection({"bbt_ut", "x"});
     BOOST_REQUIRE(h);
 
-    h.value()->RequestClose();
-    db->RequestClose();
-    std::atomic<CloseStatus> st{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        st.store(db->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(10),
-            {}));
-    }));
-    BOOST_CHECK(st.load() == CloseStatus::Closed);
+    auto rt = RuntimeOf(db);
+    h.value()->Close();
+    CloseOwnerAndDrain(db, rt);
 
     auto after_close = db->Collection({"bbt_ut", "y"});
     BOOST_REQUIRE(!after_close);
     BOOST_CHECK(after_close.error().code == ErrorCode::Closed);
+}
+
+// ==================== 关闭 finalizer 确定性回归 ====================
+//
+// 覆盖 r4 未闭合的「提前 Closed / finalize 并发」：
+//   - Close 取关闭权但 driver 仍在途时不得提前 IsClosed；
+//   - 两个线程并发 Close 都在同一真实终态（join + lease 归还）之后返回，
+//     不重复 join/reset、不互相破坏；
+//   - Start 后立即 Close（无在途）可收口且不再接纳；
+//   - 同 URI 关闭其一不破坏兄弟 owner 仍持有的进程级 pool lease。
+
+BOOST_AUTO_TEST_CASE(t_owner_close_not_premature_during_inflight) {
+    auto db = NewOwner(MakeRtCfg(1, 8, 3000));
+    auto rt = RuntimeOf(db);
+    auto h  = db->Collection({"bbt_ut", "c"});
+    BOOST_REQUIRE(h);
+    auto* hp = h.value().get();
+
+    bool succ = false;
+    g_scheduler->RegistCoroutineTask(
+        [hp] {
+            auto r = hp->FindOne(EmptyDoc(), Opt(30000));
+            (void)r;
+        },
+        succ);
+    BOOST_REQUIRE(succ);
+    BOOST_REQUIRE(WaitUntil(
+        [&] { return rt->RunningDriverCallsForTest() == 1; }, 10000));
+
+    std::atomic_bool closer_done{false};
+    std::atomic_bool closed_at_return{false};
+    std::thread closer([&] {
+        db->Close();
+        closed_at_return.store(db->IsClosed());
+        closer_done.store(true);
+    });
+    // Close 已取关闭权（IsRunning 转假）但 driver 调用仍在途：此刻
+    // IsClosed 必须仍为假——终态只在 join + lease 归还之后发布。
+    BOOST_REQUIRE(WaitUntil([&] { return !rt->IsRunning(); }, 10000));
+    BOOST_CHECK_EQUAL(rt->RunningDriverCallsForTest(), 1);
+    BOOST_CHECK(!closer_done.load());
+    BOOST_CHECK(!db->IsClosed());
+    closer.join();
+    BOOST_CHECK(closer_done.load());
+    BOOST_CHECK(closed_at_return.load());
+    BOOST_REQUIRE(db->IsClosed());
+    BOOST_CHECK_EQUAL(rt->LiveWorkersForTest(), 0);
+    BOOST_CHECK_EQUAL(rt->RunningDriverCallsForTest(), 0);
+}
+
+BOOST_AUTO_TEST_CASE(t_owner_concurrent_close_two_threads) {
+    auto db = NewOwner(MakeRtCfg(2, 8, 2000));
+    auto rt = RuntimeOf(db);
+    auto h  = db->Collection({"bbt_ut", "c"});
+    BOOST_REQUIRE(h);
+    auto* hp = h.value().get();
+
+    for (int i = 0; i < 2; ++i) {   // 占住 2 worker
+        bool succ = false;
+        g_scheduler->RegistCoroutineTask(
+            [hp] {
+                auto r = hp->FindOne(EmptyDoc(), Opt(30000));
+                (void)r;
+            },
+            succ);
+        BOOST_REQUIRE(succ);
+    }
+    BOOST_REQUIRE(WaitUntil(
+        [&] { return rt->RunningDriverCallsForTest() == 2; }, 10000));
+
+    std::atomic_int returns{0};
+    std::atomic_int closed_observed{0};
+    auto close_once = [&] {
+        db->Close();
+        if (db->IsClosed())
+            closed_observed.fetch_add(1);
+        returns.fetch_add(1);
+    };
+    std::thread a(close_once);
+    std::thread b(close_once);
+    a.join();
+    b.join();
+    // 两个并发 Close 都返回，且都观察到同一真实终态（同一 finalizer 事实）。
+    BOOST_CHECK_EQUAL(returns.load(), 2);
+    BOOST_CHECK_EQUAL(closed_observed.load(), 2);
+    BOOST_REQUIRE(db->IsClosed());
+    BOOST_CHECK_EQUAL(rt->LiveWorkersForTest(), 0);
+    BOOST_CHECK_EQUAL(rt->RunningDriverCallsForTest(), 0);
+}
+
+BOOST_AUTO_TEST_CASE(t_owner_start_then_immediate_close) {
+    auto d = mongo::CoMongoDb::Create(MakeRtCfg(2, 4));
+    BOOST_REQUIRE(d);
+    auto db = std::move(d).value();
+    BOOST_REQUIRE(db->Start());
+    auto rt = RuntimeOf(db);   // 经句柄反查 runtime（须在 Close 前）
+    db->Close();               // 无在途 op：直接收口
+    BOOST_REQUIRE(db->IsClosed());
+    BOOST_CHECK_EQUAL(rt->LiveWorkersForTest(), 0);
+    BOOST_CHECK_EQUAL(rt->RunningDriverCallsForTest(), 0);
+    auto after_close = db->Collection({"bbt_ut", "x"});
+    BOOST_REQUIRE(!after_close);
+    BOOST_CHECK(after_close.error().code == ErrorCode::Closed);
+}
+
+BOOST_AUTO_TEST_CASE(t_owner_same_uri_sibling_lease_preserved) {
+    // 同 URI 两 owner 共享进程级 pool lease：关闭其一不得归还/销毁兄弟
+    // 仍持有的 lease（其他 owner 保持 Running 且 worker/pool 正常工作）。
+    auto db1 = NewOwner(MakeRtCfg(1, 4, 2000));
+    auto rt1 = RuntimeOf(db1);
+    auto db2 = NewOwner(MakeRtCfg(1, 4, 2000));
+    auto rt2 = RuntimeOf(db2);
+    BOOST_REQUIRE(rt1 != rt2);
+
+    CloseOwnerAndDrain(db1, rt1);
+
+    BOOST_CHECK(!db2->IsClosed());
+    auto h2 = db2->Collection({"bbt_ut", "sibling"});
+    BOOST_REQUIRE(h2);
+    // 兄弟 owner 的 worker/pool 路径仍可用：良构校验在 worker 内、driver
+    // 之前确定性拒绝不良构 BSON → InvalidArgument（证明未触碰已归还 lease）。
+    std::optional<result<std::optional<MongoDocument>>> out;
+    BOOST_REQUIRE(RunInCoroutine(
+        [&] { out.emplace(h2.value()->FindOne(BadDoc(), Opt(2000))); }));
+    BOOST_REQUIRE(!*out);
+    BOOST_CHECK(out->error().code == ErrorCode::InvalidArgument);
+    CloseOwnerAndDrain(db2, rt2);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

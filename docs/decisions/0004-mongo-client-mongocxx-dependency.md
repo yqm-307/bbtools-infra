@@ -8,6 +8,17 @@
 
 [0005：CoTCP/CoUDP 与第三方 Binding](0005-co-io-adapter-contract-v1.md) 将 worker bridge 作为显式兼容例外保留。本文“只能在专用 worker”是当前切片选型，不是 mongocxx 永远不能协程化的证明。是否能采用直接绑定或非阻塞 owner 驱动，由独立兼容调查裁决；PR 合并不代替真实后端、关闭及下游消费验收。
 
+### 修订记录（2026-10-01：进程寿命运行时 + owner 同步 Close）
+
+本文原 §执行域决策与 §超时与取消的真实语义中依赖 `CompletionSignal`/`WaitClosed`/`CloseStatus`
+的表述已被上游 coroutine 的**进程寿命运行时**（候选 HEAD `03430a5`）与 infra 的**同步 `Close()`**
+契约取代。**保留**：mongocxx 同步 driver + 有界 worker bridge、`worker_threads` 上限、
+`max_queue` 背压、URI 超时注入、错误映射与“同步 driver 调用不可强杀”；**取代**：完成回投不再
+用 `CompletionSignal`，改由 adapter 路径 `Notify`（可带载荷）唤醒 `CoWaiter`；关闭不再有
+`WaitClosed`——owner 同步 `Close()` 返回即表示在途 driver 调用与队列归零、worker 全退。
+superseded by [0002 修订记录](0002-co-network-contract-v1.md)。本仓处于**候选、未提交**状态，
+不宣称已迁移或已通过新契约验收。
+
 ## 固定依赖
 
 | 项 | 值 |
@@ -43,8 +54,9 @@
   单线程亲和。
 - `max_queue` 有界；队列满新命令立即 `Overloaded`，不无限排队。
 - 完成回投：`boost::asio::post` 到共享 executor 派生 strand 后
-  `CompletionSignal::Complete()` 唤醒等待协程；executor 不可达时
-  worker 线程直接 Complete（CompletionSignal 允许任意线程）。
+  经 adapter 路径 `Notify`（可带载荷 `CoEventValue`）唤醒等待协程
+  （`CoWaiter` 跨线程安全，允许任意线程 `Notify`）；executor 不可达时
+  worker 线程直接 `Notify`（不再有 `CompletionSignal`）。
 - 进程级 `mongocxx::v1::instance` + 按生效 URI 划分的共享 pool
   （上限 8 个 distinct URI）；lease 内 instance 成员先于 pool 声明，
   保证 instance 晚于全部 pool 析构。
@@ -58,9 +70,9 @@
 - 同步 driver 调用**不可强杀**：`deadline/cancel/close` 只发布一次
   逻辑终态（TimedOut/Cancelled/Closed），已进入 driver 的调用继续到
   自身超时；op、client lease 与 payload 保活到物理收口。
-- `WaitClosed` 只在「在途 driver 调用与队列真正归零且 worker 全退」
-  后返回 `Closed`——CloseStatus::Closed 表示后端不再访问本组件资源，
-  而非仅收到关闭意图。
+- owner 主动同步 `Close()` 返回即表示「在途 driver 调用与队列真正归零且 worker 全退」——
+  `IsClosed()` 表示后端不再访问本组件资源，而非仅收到关闭意图（不再有 `WaitClosed`/
+  `CloseStatus::Closed`）。
 
 ## 错误映射
 
@@ -94,8 +106,9 @@
   总时长 ≤30s）；PHASE=B 停止态命令必须 `Unavailable`；PHASE=C
   重启后新 client 恢复。
 - coroutine Hook 对非协程线程的 `nanosleep` 断言：测试线程睡眠一律
-  `SYS_nanosleep`；套件收尾 `g_scheduler.release()` 绕过
-  `~Scheduler→Stop` 同类断言（上游基线竞态，测试侧不可修复）。
+  `SYS_nanosleep`；套件收尾不再经 `Scheduler::Stop()`/`~Scheduler→Stop`
+  停机路径（进程寿命运行时），旧版 `g_scheduler.release()` 绕过断言的做法
+  随修订作废，测试侧按新契约重验。
 
 ## 退出/替换路径
 

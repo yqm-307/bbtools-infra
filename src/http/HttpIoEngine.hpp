@@ -8,6 +8,8 @@
 // 线程是 Scheduler 现有 PollOnce 事件循环线程。runtime 与其派生的
 // client/server 经 shared_ptr 共享持有本对象；业务 handler 永不进入此域。
 
+#include <mutex>
+
 #include <bbt/infra/NetworkTypes.hpp>
 
 #include "detail/IoSupport.hpp"
@@ -21,6 +23,12 @@ public:
     explicit HttpIoEngine(const NetworkLimits& limits) : m_limits(limits) {}
 
     const NetworkLimits& Limits() const noexcept { return m_limits; }
+
+    // io 域门（IoGate/IoGatePtr）来自基类 detail::IoEngine：HTTP 不再自持
+    // 第二把门，「本引擎下属哪些 fd 触碰持门」只有一份口径（覆盖边界见基类
+    // 注释）。server 的 acceptor/session socket/timer 与 client 的
+    // resolver/socket/timer 的发起、完成回调与同步 teardown 全部落在同一把
+    // 门上，因此 owner 可在调用线程内完成物理释放。
 
 private:
     NetworkLimits m_limits;

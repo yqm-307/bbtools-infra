@@ -1,27 +1,34 @@
 #pragma once
 // infra 内部共享 I/O 支撑（Issue #6 抽取）：strand 执行域封装、
-// 受管对象关闭态机、WaitStatus 映射与对象身份工厂。
+// 受管对象关闭态机、同步关闭的挂起等待者登记、WaitStatus 映射与对象身份工厂。
 // HTTP（http_detail）与 Redis（redis_detail）模块共用一份实现，
 // 不拥有 io_context 或线程；本头仅供 src/ 内部使用，不安装、不进公开面。
 //
 // 统一执行域：bbt::coroutine::io::GetExecutor() 返回的共享 executor
 // 派生 strand，实际驱动线程是 Scheduler 现有 PollOnce 事件循环线程。
-// 物理清理约定（契约 §逻辑结果与物理清理分离）：
+// 物理清理约定（进程寿命运行时修订）：
 //  - SealOnIoDomain（只能在 io 域内调用）在 m_post_mtx 内置 m_stopped
 //    封死 TryPost，此后不再接纳新的发起型投递。它只是封口，不是排空
 //    原语：fd/定时器事件催出的 reactor 完成项不经 TryPost，不能拿
 //    「最后一个 handler」充当物理清理落定信号。
 //  - 因此各受管对象按 in-flight async 计数自行判定落定——计数归零
 //    才 MarkClosed；owner 聚合子对象 MarkClosed 之后才封口引擎。
+//  - owner 主动调用的 Close() 是同步的：封口 → 唤醒挂起等待者 →
+//    有界等待在途归零 → 物理释放。跨线程调用经 CloseWaiters（Notify
+//    跨线程安全）+ std::condition_variable 状态等待实现，不引入通用
+//    完成信号或取消令牌。
 //  - 共享 context 由 coroutine 全局 EventLoop 拥有并持续推进；关闭
 //    链路不得 stop/restart 共享 context。
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/post.hpp>
@@ -30,7 +37,7 @@
 #include <bbt/coroutine/detail/LocalThread.hpp>
 #include <bbt/coroutine/detail/Processer.hpp>
 #include <bbt/coroutine/object/CoObject.hpp>
-#include <bbt/coroutine/sync/CompletionSignal.hpp>
+#include <bbt/coroutine/sync/CoWaiter.hpp>
 #include <bbt/coroutine/io/IoExecutor.hpp>
 
 #include <bbt/infra/ICoCloseable.hpp>
@@ -87,7 +94,8 @@ public:
         return true;
     }
 
-    // 只能在 io 域内调用：封死 TryPost，此后新投递一律拒绝。
+    // 只能在 owner 域门内调用（io 域 handler 入口，或 Close 的同步
+    // teardown）：封死 TryPost，此后新投递一律拒绝。
     // 不承诺任何已受理 handler 已落定。
     void SealOnIoDomain() noexcept {
         std::lock_guard<std::mutex> lk(m_post_mtx);
@@ -103,10 +111,32 @@ public:
         return m_stopped;
     }
 
+    // owner 域门：本引擎下属全部后端资源触碰（Asio 对象与第三方 context 的
+    // 发起、完成回调、同步 teardown）持同一把门串行。strand 只保证「同域
+    // handler 不并发」；本门额外覆盖「owner 从其它线程同步执行物理释放」这
+    // 一跨域情形，使各模块 Close() 能在调用线程内完成资源释放，而不与在途
+    // io handler 竞争同一后端对象。HTTP 与 Redis 共用本支撑层，因此「门覆盖
+    // 了什么」只有一份口径。可重入：同线程内的嵌套（teardown → 对象 Close）
+    // 由递归门承接，不会等待自身。
+    // 持有纪律：门内只做同步、非阻塞的发起/关闭，绝不跨挂起点持有。
+    // 覆盖边界（不夸大）：只覆盖「本模块自己的执行入口」——投递到 strand 的
+    // handler 与由本模块提供的 Asio 完成回调。Asio/Beast composed operation
+    // 的内部中间步骤不经过任何模块入口，其与跨线程 teardown 的条件性并发是
+    // 已知残留，各模块须按实际调用链另有声明，不算作本门承诺。
+    std::recursive_mutex& IoGate() const noexcept { return *m_gate; }
+
+    // 门的共享持有形式：需要把门带进 Asio 完成 handler 的长寿对象（如 Redis
+    // 的 ev bridge）以 shared_ptr 持有，避免引用在对象析构后悬挂。
+    const std::shared_ptr<std::recursive_mutex>& IoGatePtr() const noexcept {
+        return m_gate;
+    }
+
 private:
     std::optional<IoStrand> m_io;
     mutable std::mutex      m_post_mtx;
     bool                    m_stopped{false};   // m_post_mtx 保护
+    const std::shared_ptr<std::recursive_mutex> m_gate{
+        std::make_shared<std::recursive_mutex>()};
 };
 
 // WaitStatus → 请求侧 Error 的固定映射（Completed 不出现）。
@@ -132,43 +162,156 @@ inline Error WaitStatusToError(bbt::coroutine::WaitStatus status) {
     return MakeError(ErrorCode::InternalError, "internal: unexpected wait status");
 }
 
-// WaitStatus → CloseStatus 固定映射（契约 §关闭规则）。
-inline CloseStatus WaitStatusToCloseStatus(
-    bbt::coroutine::WaitStatus status) noexcept {
-    using bbt::coroutine::WaitStatus;
-    switch (status) {
-    case WaitStatus::Completed:          return CloseStatus::Closed;
-    case WaitStatus::TimedOut:           return CloseStatus::TimedOut;
-    case WaitStatus::Cancelled:          return CloseStatus::Cancelled;
-    case WaitStatus::InvalidContext:     return CloseStatus::InvalidContext;
-    case WaitStatus::AlreadyWaiting:     return CloseStatus::AlreadyWaiting;
-    case WaitStatus::RuntimeUnavailable: return CloseStatus::RuntimeUnavailable;
+// 同步 Close() 的在途排空上限：Close 在其调用线程有界等待在途计数归零，
+// 超时即放弃等待并继续物理释放（调用方可据此记录告警，不无限阻塞）。
+inline constexpr std::chrono::milliseconds kCloseDrainTimeout{5000};
+
+// 关闭期挂起等待者登记（Close() 的唤醒侧，跨线程安全）。
+// 语义：
+//  - 挂起 op 在等待事件登记成功后（on_registered 内）经 Add 登记；Close 已
+//    开始时返回 false，调用方必须在此刻自行 Notify 一次——事件与等待位均已
+//    就绪，Notify 走 CoPollEvent 的 PENDING 路径，不会丢唤醒。
+//  - CloseAndWakeAll 原子封口并唤醒全部在册等待者（幂等）；此后 Add 一律
+//    false，新 op 按「已封口」立即返回 Closed，不再挂起。
+//  - 唤醒用 shared_ptr 快照：Close 侧复制后即使 op 先恢复并解绑也不会悬垂；
+//    晚到的 Notify 对已决议等待者返回 -1，无副作用。
+//  - 本类型只负责「登记 + 唤醒」；物理排空判据仍是各对象自己的在途计数。
+//
+// 等待兴趣登记屏障（关闭线性化，修复「已过最后封口检查、尚未完成 fd 兴趣
+// 登记」的窗口）：
+//  - op 在**建立等待事件前**经 BeginRegister 声明「本次 fd 兴趣登记进行中」：
+//    未封口则计数 +1 返回 true，已封口返回 false（调用方按 Closed 立即返回，
+//    绝不在已关/将关 fd 上登记旧兴趣）；
+//  - EndRegister 在 fd 兴趣登记完成后（co-io-adapter 的 on_registered，即事件
+//    已挂到 fd、等待者已在册之后）释放计数；
+//  - SealWakeAndDrainRegistrations 供对象级 Close：原子封口、唤醒在册等待者，
+//    再等待「登记进行中」计数归零后才返回。BeginRegister/EndRegister 之间只含
+//    非阻塞的 fd 事件建立（dup + epoll ADD），不含等待点，故该等待必然有界；
+//    它把「最后一次封口检查」与「fd 兴趣登记」拉成同一线性化协议，物理 close
+//    不会早于登记完成，晚到 op 也不会在已关 fd 上登记。
+class CloseWaiters {
+public:
+    bool Add(const bbt::coroutine::sync::CoWaiter::SPtr& waiter) {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        if (m_closed)
+            return false;
+        m_waiters.push_back(waiter);
+        return true;
     }
-    return CloseStatus::RuntimeUnavailable;
-}
+
+    void Remove(const bbt::coroutine::sync::CoWaiter* waiter) noexcept {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        for (auto it = m_waiters.begin(); it != m_waiters.end(); ++it) {
+            if (it->get() == waiter) {
+                m_waiters.erase(it);
+                return;
+            }
+        }
+    }
+
+    void CloseAndWakeAll() noexcept {
+        std::vector<bbt::coroutine::sync::CoWaiter::SPtr> wake;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            m_closed = true;
+            wake.swap(m_waiters);
+        }
+        for (auto& waiter : wake)
+            waiter->Notify();
+    }
+
+    // 对象级 Close 的收口原语：封口 + 唤醒在册等待者 + 等待在途 fd 兴趣登记
+    // 排空（见类头「等待兴趣登记屏障」）。幂等；已封口后新 BeginRegister 一律
+    // false，故等待必然收敛。
+    void SealWakeAndDrainRegistrations() noexcept {
+        std::vector<bbt::coroutine::sync::CoWaiter::SPtr> wake;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            m_closed = true;
+            wake.swap(m_waiters);
+        }
+        for (auto& waiter : wake)
+            waiter->Notify();
+        std::unique_lock<std::mutex> lk(m_mtx);
+        m_reg_drained.wait(lk, [this] { return m_registrations == 0; });
+    }
+
+    // 见类头：未封口则登记一个「进行中的 fd 兴趣登记」，返回 true；已封口返回
+    // false（调用方按 Closed 立即返回，不登记旧 fd）。
+    bool BeginRegister() noexcept {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        if (m_closed)
+            return false;
+        ++m_registrations;
+        return true;
+    }
+
+    // 与 BeginRegister 配对，幂等安全（多余调用不会把计数压到负）。
+    void EndRegister() noexcept {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        if (m_registrations > 0)
+            --m_registrations;
+        if (m_registrations == 0)
+            m_reg_drained.notify_all();
+    }
+
+    bool Closed() const noexcept {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        return m_closed;
+    }
+
+private:
+    mutable std::mutex                                m_mtx;
+    std::condition_variable                           m_reg_drained;
+    bool                                              m_closed{false};
+    std::size_t                                       m_registrations{0};  // m_mtx 保护
+    std::vector<bbt::coroutine::sync::CoWaiter::SPtr> m_waiters;
+};
+
+// BeginRegister/EndRegister 的 RAII 配对（异常安全）：析构时若仍持有登记则释放，
+// 避免 fd 事件建立途中抛出把登记计数泄漏、令对象级 Close 的排空等待永挂。
+class CloseRegisterClaim {
+public:
+    CloseRegisterClaim() = default;
+    explicit CloseRegisterClaim(CloseWaiters* waiters) noexcept : m_waiters(waiters) {
+        if (m_waiters != nullptr && !m_waiters->BeginRegister())
+            m_waiters = nullptr;   // 已封口：未取得登记
+    }
+    ~CloseRegisterClaim() { release(); }
+    CloseRegisterClaim(const CloseRegisterClaim&) = delete;
+    CloseRegisterClaim& operator=(const CloseRegisterClaim&) = delete;
+
+    bool acquired() const noexcept { return m_waiters != nullptr; }
+    void release() noexcept {
+        if (m_waiters != nullptr) {
+            m_waiters->EndRegister();
+            m_waiters = nullptr;
+        }
+    }
+
+private:
+    CloseWaiters* m_waiters{nullptr};
+};
 
 // 每个受管对象一份的关闭态机：Open→Closing→Closed，不重开。
-// RequestClose 幂等可由任意线程发起；teardown 完成（io 域）后
-// MarkClosed 使 WaitClosed 观察者返回 Closed。
+// 关闭由 owner 主动同步发起（Close）；物理清理落定（in-flight 归零）后
+// MarkClosed 跑一次 closed hook。没有「等待关闭完成」的公共入口。
 class ManagedCloseState {
 public:
     enum Phase : int { kOpen = 0, kClosing = 1, kClosed = 2 };
 
-    explicit ManagedCloseState(
-        std::shared_ptr<bbt::coroutine::CompletionSignal> sig)
-        : m_sig(std::move(sig)) {}
+    ManagedCloseState() = default;
 
     // Open→Closing；仅首次返回 true，调用方据此执行一次性 teardown。
     bool BeginClose() noexcept {
         int expected = kOpen;
         return m_phase.compare_exchange_strong(expected, kClosing);
     }
-    // 物理清理落定：幂等（仅首次落实者发信号与回调）。
+    // 物理清理落定：幂等（仅首次落实者跑回调）。
     // 「Closed = 后端不会再访问本组件拥有的操作资源」，而非仅收到关闭意图。
     void MarkClosed() noexcept {
         if (m_phase.exchange(kClosed) == kClosed)
             return;
-        m_sig->Complete(); // one-shot：晚到/重复安全
         if (m_hook)
             m_hook();
     }
@@ -179,31 +322,12 @@ public:
     bool IsClosed() const noexcept { return m_phase.load() == kClosed; }
     bool IsOpen()    const noexcept { return m_phase.load() == kOpen; }
 
-    // 契约顺序：先校验协程上下文与运行时代际，已关闭对象在合法上下文
-    // 立即返回 Closed；否则经 CompletionSignal 挂起等待并按固定映射返回。
-    CloseStatus WaitClosed(bbt::coroutine::Deadline          deadline,
-                           bbt::coroutine::CancellationToken cancel,
-                           bbt::coroutine::RuntimeGeneration generation) {
-        if (g_bbt_tls_coroutine_co == nullptr)
-            return CloseStatus::InvalidContext;
-        const auto gen = bbt::coroutine::CurrentRuntimeGeneration();
-        if (gen == 0 || gen != generation)
-            return CloseStatus::RuntimeUnavailable;
-        if (IsClosed())
-            return CloseStatus::Closed;
-        bbt::coroutine::WaitOptions opt;
-        opt.deadline = deadline;
-        opt.cancel   = std::move(cancel);
-        return WaitStatusToCloseStatus(m_sig->Wait(opt));
-    }
-
 private:
-    std::shared_ptr<bbt::coroutine::CompletionSignal> m_sig;
     std::atomic<int> m_phase{kOpen};
     std::function<void()> m_hook;   // 仅发布前写一次，此后只读
 };
 
-// CreateObjectInfo / CompletionSignal 构造需要有效运行时代际；
+// CreateObjectInfo 的前置条件是「运行时已初始化」（不再有运行时代际）；
 // 抛出的 logic_error 统一映射为 RuntimeUnavailable。
 inline result<bbt::coroutine::CoObjectInfo> NewObjectInfo(std::string kind) {
     try {
@@ -212,19 +336,7 @@ inline result<bbt::coroutine::CoObjectInfo> NewObjectInfo(std::string kind) {
     } catch (const std::logic_error&) {
         return result<bbt::coroutine::CoObjectInfo>::err(MakeError(
             ErrorCode::RuntimeUnavailable,
-            "coroutine runtime generation unavailable"));
-    }
-}
-
-inline result<std::shared_ptr<bbt::coroutine::CompletionSignal>>
-NewCompletionSignal() {
-    try {
-        return result<std::shared_ptr<bbt::coroutine::CompletionSignal>>::ok(
-            std::make_shared<bbt::coroutine::CompletionSignal>());
-    } catch (const std::logic_error&) {
-        return result<std::shared_ptr<bbt::coroutine::CompletionSignal>>::err(
-            MakeError(ErrorCode::RuntimeUnavailable,
-                "coroutine runtime generation unavailable"));
+            "coroutine runtime not initialized"));
     }
 }
 
@@ -235,7 +347,7 @@ NewCompletionSignal() {
 // Stop 安全：账本由 Runtime 与各受管对象经 shared_ptr 共享持有
 // （quota_scope）。Scheduler::Stop 对挂起协程直接销毁、不展开栈
 // （coroutine 契约 §6），因此归还不能依赖协程栈 RAII——对象侧用
-// m_quota_held 记录未归还名额，op 正常结束归还 1，RequestClose/析构
+// m_quota_held 记录未归还名额，op 正常结束归还 1，Close/析构
 // 经 DrainQuota 一次性归还剩余，两种路径互补且无重复归还。
 struct InflightLedger {
     explicit InflightLedger(std::size_t cap_) : cap(cap_) {}
