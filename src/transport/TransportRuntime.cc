@@ -345,7 +345,7 @@ void TransportRuntimeImpl::Close() noexcept {
         transports = m_tcp_children;
     }
     // 先唤醒本 owner 级挂起等待者（受管 DialTCP 的 connect 等待段），再逐对象
-    // 同步 Close：对象各自封口 → 唤醒自身挂起 op → 有界排空在途计数 → 物理
+    // 同步 Close：对象各自封口 → 唤醒自身挂起 op → 等待在途计数归零 → 物理
     // 释放。一个 socket 只有一个物理关闭责任方（对象自己），本 owner 只调用。
     m_close_waiters->CloseAndWakeAll();
     // R1：等待在途工厂排空后才收口——工厂要么已把 child 交接进 m_tcp_children
@@ -359,6 +359,13 @@ void TransportRuntimeImpl::Close() noexcept {
     for (auto& transport : transports)
         transport->Close();
     MaybeMarkClosed();
+    // 首次 Close 也必须等到所有在途工厂/受管对象完成物理收口；
+    // 不能仅调用 MaybeMarkClosed 后提前返回，否则交付期 adopt 拒绝
+    // 仍可能持有 transport 名额，违反同步 Close 的返回后置条件。
+    {
+        std::unique_lock<std::mutex> lk(m_transport_mtx);
+        m_close_cv.wait(lk, [this] { return m_close.IsClosed(); });
+    }
 }
 
 void TransportRuntimeImpl::OnTransportClosed(const ICoCloseable* child) noexcept {

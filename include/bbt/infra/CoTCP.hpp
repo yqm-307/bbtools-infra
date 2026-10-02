@@ -225,6 +225,8 @@ private:
     std::shared_ptr<void> m_inflight_scope;
     // §4.0.1.7 测试接缝：名额登记完成、首次 accept4/等待前回调一次。
     std::function<void()> m_wait_entry_gate_for_test;
+    // 测试接缝：Accept 已成功取得 child、尚未执行 owner adopt 前回调一次。
+    std::function<void()> m_accept_adopt_gate_for_test;
 };
 
 } // namespace bbt::infra::tcp

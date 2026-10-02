@@ -34,6 +34,12 @@
   adapter 路径 `Notify`（可带载荷）实现；结果放各模块 operation state，`CoWaiter` 只等/唤醒。
 - §14 的 `ForceCloseAfterQuiescence`「调度器已静默（`Scheduler::Stop()` 已返回）」前置条件
   随 `Stop` 删除而失效；该入口的现状与去向**待按新契约重验**，本节其余文本保留为历史记录。
+- transport owner 的 `Close()` 收口细则已按本修订落定：`TransportRuntime` 必须等待
+  `pending factories == 0`、受管 transport 数归零并发布真实 `Closed` 后返回；该路径不使用
+  `kCloseDrainTimeout` 作为“放弃等待并继续释放”的上限。原因是 transport owner 能通过
+  close-waiter 唤醒和进程寿命 coroutine runtime 推进在途操作；超时物理释放会违反“返回即后端
+  不再访问”。不能证明物理归零的第三方 Binding 仍须采用自己的 worker/有界策略，且不得冒充
+  已 `Closed`。
 
 superseded by：本文修订记录 + [0002 修订记录](0002-co-network-contract-v1.md)。
 本仓当前处于**候选、未提交**状态，本记录不宣称任何实现已交付或已通过验收。
@@ -331,7 +337,11 @@ Runtime 必须在栈外持有 operation、Binding、连接和 transport，直至
 1. **封口与通知**：`Close()` 幂等、可在任意线程调用；它置关闭标志、使在途等待失效（唤醒挂起等待者返回 `Closed`）、拒绝新调用。
 2. **解除监视**：owner 或关闭协调者把 FD 从 poller 解除注册，晚到就绪事件不再发布给该对象。
 3. **同步退出**：物理 `close` 必须与正在进行的 syscall 和协议库调用同步——确认没有线程/协程正持有该 FD 做 read/write/recvfrom/send 或处于第三方协议调用内部。实现方式由 Binding 决定（等待 in-flight 计数归零、owner 串行化关闭步骤、或 worker bridge 的物理归零），但“封口后立即 close”不满足本契约。
-4. **物理 close 与释放**：唯一 owner 执行 `close` 和 context 释放。**`Close()` 返回后保证后端不会再访问资源**；infra 侧的有界等在途归零口径为 —— 在自身锁 + `std::condition_variable` 上以 `detail::kCloseDrainTimeout` 为上限等待在途计数归零，超时即放弃等待并继续物理释放（调用方可据此记录告警，不无限阻塞）。
+4. **物理 close 与释放**：唯一 owner 执行 `close` 和 context 释放。**`Close()` 返回后保证后端不会再访问资源**。
+   对 transport owner（`TransportRuntime`）而言，进程寿命 runtime 能通过 close-waiter 推进在途
+   操作，因此必须等待 `pending factories == 0`、受管 transport 数归零并发布真实 `Closed` 后返回；
+   该 owner 收口路径不以 `detail::kCloseDrainTimeout` 放弃等待。第三方 Binding 若无法证明同样的
+   物理归零，必须保留自己的 worker/有界策略，并且超时后不得宣称对象已 `Closed`。
 5. **FD 复用防护**：close 之后 FD 数字可能被其他组件复用。解除监视必须先于物理 close 完成；poller 侧对每个注册事件持有代际/身份标识，旧身份事件（含已入队未派发的就绪通知）不得触达新资源。该防护的具体机制是 transport 实现责任，不得依赖“解除与 close 之间不会有事件”的时序假设。
 
 反例（明确禁止）：Binding 在收到 close 通知后，一边让第三方协议调用（如 `redisCommandArgv`）仍悬停在库栈内部，一边立刻 `close(fd)`——协议库内部可能正持有该 fd 的缓冲、TLS 状态或重试逻辑，且晚到事件可能触达复用后的 FD。
@@ -539,7 +549,7 @@ output callback 不应直接调用可能挂起的 `CoUDP::Send`。KCP owner coro
 
 A 级（直接 coroutine binding）意味着第三方协议调用会在库栈内部挂起。由于 coroutine 运行时按进程寿命存在、不再有 `Scheduler::Stop()`，infra **不得**依赖协程栈展开回收第三方库栈内资源；任何 A 级 Binding 必须证明：**在 owner 主动 `Close()` 时（含关闭与库调用竞争），第三方库栈内的资源不会泄漏或悬空**。库栈内的临时分配（缓冲、锁、内部 lease）没有栈外 `shared_ptr` 能替它释放（§6.3）。
 
-- 优先路径是 graceful drain：`Close()` 由宿主/owner 排空在途调用、不再发起新调用，让库栈自然退出后再执行物理 close。A 级文档必须给出 drain 顺序与超时行为（infra 侧有界等待上限见 §6.4 的 `detail::kCloseDrainTimeout`）。
+- 优先路径是 graceful drain：`Close()` 由宿主/owner 排空在途调用、不再发起新调用，让库栈自然退出后再执行物理 close。A 级文档必须给出 drain 顺序；transport owner 依赖进程寿命 runtime 的 close-waiter 推进并等待真实归零，不能以超时释放冒充 `Closed`。无法证明物理归零的第三方 Binding 才采用 worker/有界策略，并明确超时后的非 `Closed` 状态。
 - 若无法证明关闭竞争下资源安全，该 Binding 降级为 B（非阻塞步进：库调用退出后才等待/关闭）或 C（worker bridge），不得以“有 Hook”维持 A 级。
 - `Close()` 有界等待超时后，Runtime 与相关对象仍由宿主持有；若资源未能安全回收，不得宣称该连接/对象已达 `Closed` 语义（物理清理完成）。遗留缺口转为对上游 runtime/库的验证任务，不虚构“Stop 回调”或“资源回收回调”等当前上游不存在的能力。
 
