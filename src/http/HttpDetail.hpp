@@ -1,6 +1,6 @@
 #pragma once
 // infra http 内部工具：URL 解析、method/header 注入校验、
-// beast/asio 错误码到契约 Error 的分类、WaitStatus→CloseStatus 映射。
+// beast/asio 错误码到契约 Error 的分类、WaitStatus→Error 映射。
 // 仅供 src/http/ 实现使用，不安装、不进公开面。
 //
 // 通用执行域/关闭态机/WaitStatus 映射在 src/detail/IoSupport.hpp
@@ -18,7 +18,6 @@
 #include <bbt/infra/NetworkTypes.hpp>
 #include <bbt/infra/Result.hpp>
 #include <bbt/infra/ICoCloseable.hpp>
-#include <bbt/coroutine/sync/CompletionSignal.hpp>
 
 #include "detail/IoSupport.hpp"
 
@@ -27,7 +26,6 @@ namespace bbt::infra::http_detail {
 // 通用机制别名（实现在 bbt::infra::detail）。
 using bbt::infra::detail::ManagedCloseState;
 using bbt::infra::detail::WaitStatusToError;
-using bbt::infra::detail::WaitStatusToCloseStatus;
 
 // 首切片 origin-form URL 解析结果；port 缺省 80。
 struct ParsedUrl {
@@ -76,16 +74,5 @@ Error ClassifyBackendError(const boost::system::error_code& ec,
 
 // handler 返回 err 分支 → HTTP 状态码（服务端边界，err 不暴露内部细节）。
 unsigned ErrorCodeToHttpStatus(ErrorCode code) noexcept;
-
-// Runtime teardown 驱动点：实现方保证只在 io 域（engine strand，由共享
-// executor 驱动线程执行）内执行一次性回收（acceptor/socket 关闭、会话
-// 中止），完成后自行 MarkClosed。
-class IIoTeardown {
-public:
-    virtual ~IIoTeardown() = default;
-    virtual void TeardownOnIoDomain() noexcept = 0;
-    // TryPost 失败：逻辑封口 + 子对象 off-domain 收口，不提前 MarkClosed。
-    virtual void TeardownOffDomain() noexcept = 0;
-};
 
 } // namespace bbt::infra::http_detail

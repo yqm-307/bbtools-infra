@@ -134,10 +134,11 @@ void CommonRuntimeSetup() {
 }
 
 void CommonTeardown() {
-    if (g_server) { g_server->RequestClose(); g_server.reset(); }
+    // 进程寿命运行时：Close() 同步收口各对象（幂等、任意线程）；没有
+    // Stop/重启，进程退出即可，无 Scheduler::Stop 收尾路径。
+    if (g_server) { g_server->Close(); g_server.reset(); }
     if (g_client) { g_client.reset(); }
-    if (g_runtime) { g_runtime->RequestClose(); g_runtime.reset(); }
-    g_scheduler->Stop();
+    if (g_runtime) { g_runtime->Close(); g_runtime.reset(); }
 }
 
 } // namespace

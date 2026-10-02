@@ -15,9 +15,11 @@
 
 namespace bbt::infra {
 
+// 调用选项只携带单调时钟绝对期限。业务取消不由 infra 令牌表达：等待中的
+// 取消来自协程级 RequestCancel（WaitStatus::Cancelled），业务级取消由上层
+// 经带载荷 Notify（CoEventValue）表达，再把 Completed 解释成业务终态。
 struct CallOptions {
     bbt::coroutine::Deadline          deadline;
-    bbt::coroutine::CancellationToken cancel;
 };
 
 // 各项必须显式、大于零且不超过下列上限；incoming_timeout 必须有限。
@@ -43,7 +45,6 @@ struct ListenAddress {
 
 struct IncomingCallContext {
     bbt::coroutine::Deadline          deadline;
-    bbt::coroutine::CancellationToken cancel;
     std::string                       peer_principal;
 };
 

@@ -35,18 +35,18 @@ using udp::CoUDP;
 // BindUDP 在这里只做转发，容量名额与在途账本不在本类内实现，也不存在第二份。
 // 受管 TCP/UDP 消费者可以只链接 bbt::infra_transport，不依赖 HTTP。
 //
-// 正常生命周期：Scheduler::Start → NetworkRuntime::Create/Start → 使用
-// → server.StopAccepting → 等待 handler 结束 → Runtime.RequestClose/WaitClosed
-// → 释放已关闭网络对象 → Scheduler::Stop。
+// 正常生命周期（进程寿命运行时）：Scheduler::Start → NetworkRuntime::Create/
+// Start → 使用 → server.StopAccepting → Runtime.Close()（同步；返回即
+// 物理释放：子对象逐个收口、transport 收口、io 域封口）。没有 Stop/
+// 重启，也没有 RequestClose/WaitClosed。
 class NetworkRuntime : public ICoNetwork, public ICoCloseable {
 public:
     // Create/Start/工厂在启动控制线程使用，不挂起协程。
-    // Create 要求 Scheduler 已启动（对象身份与完成信号需要运行时代际），
+    // Create 要求 Scheduler 已初始化（对象身份需要运行时已初始化），
     // 否则返回 Error(RuntimeUnavailable)。
     static result<std::shared_ptr<NetworkRuntime>> Create(NetworkLimits limits);
 
     // 同一 runtime 只成功启动一次；关闭后不重开。
-    // 要求 Scheduler 处于与 Create 相同的运行时代际。
     virtual result<void> Start() = 0;
 
     virtual result<std::shared_ptr<HttpClient>> CreateHttpClient() = 0;

@@ -8,6 +8,16 @@
 
 本文定义 `bbtools-infra` 作为 bbt-framework 分布式框架底层工具层时的职责边界，以及基础动态配置模块的最小能力。本文不定义 framework 的服务发现、配置治理、灰度发布或业务配置模型。
 
+### 修订记录（2026-10-01：进程寿命运行时 + 同步 Close）
+
+本文原 §协程与执行域 中“使用项目已有的 CompletionSignal”表述已被上游 coroutine 的**进程寿命
+运行时**（候选 HEAD `03430a5`）取代：coroutine 已删除 `CompletionSignal`、`CancellationToken`/
+`CancellationSource` 与运行时代际/`Scheduler::Stop()`，请求完成统一为 `CoWaiter::WaitWithCallback`
+（登记等待 → 一次投递回调 → 挂起）+ adapter 路径 `Notify`（可带载荷），结果放 operation state；
+「运行时是否在跑」用 `Scheduler::IsInitialized()`。本文其余职责边界结论（infra 只提供基础机制、
+schema/热切换归 framework、不新增隐藏 io context/线程）**继续有效**。superseded by
+[0002 修订记录](0002-co-network-contract-v1.md)。
+
 ## 定位
 
 `bbtools-infra` 是工具层和基础接入层：
@@ -124,7 +134,7 @@ Redis/Mongo 客户端只接受已经解析并校验的客户端配置。配置�
 所有异步等待和变更通知必须基于 `bbtools-coroutine` 的现有模型：
 
 - 不使用 C++20 `co_await`、`Task<T>` 作为公共示例或公共契约；
-- 使用项目已有的 CompletionSignal、executor、协程等待/恢复和取消语义；
+- 使用项目已有的 `CoWaiter`（`WaitWithCallback`/`Notify`）、executor 与协程等待/恢复语义，以及协程级取消（`RequestCancel`）与带载荷 `Notify`；不再有 `CompletionSignal`/`CancellationToken`/运行时代际；
 - Redis 的 hiredis async 回调只负责推进 adapter 状态并唤醒等待者；
 - Mongo 的同步 driver 调用运行在有界 worker bridge，完成后回投共享 coroutine executor；
 - 配置 watch 的第三方回调不得直接切入业务协程。

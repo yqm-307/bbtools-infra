@@ -12,10 +12,14 @@
 // Coroutine::RegistCustom + CoPollEvent::InitFdEvent 的非公开组合路径，
 // 均为非稳定 API；结论仅用于 IoWait 组合等待能力裁决，
 // 不得作为生产 IoWait 实现依据。该路径不经 Coroutine::_RegistAwaitEvent
-//（无 parked 登记），因此本探针不能用于 Stop 安全断言（明确不在本切片）。
+//（无 parked 登记），因此本探针不能用于关闭/Stop 安全断言（明确不在本切片；
+// 新契约下运行时常驻、无 Stop 入口）。
 //
 // 无第三方测试框架依赖，失败输出到 stderr 并以非零退出。
 // 同步全部使用有界条件屏障（10s 上限），无猜测时序的 sleep。
+//
+// 运行时按新契约只初始化一次（进程寿命）：不再有 Start→Stop→Start 隔离，
+// 探针结束不关闭 runtime，靠进程边界收尾。
 
 #include <sys/socket.h>
 #include <unistd.h>
@@ -340,7 +344,7 @@ void ScenarioTimeoutFirst() {
 
 int main() {
     g_scheduler->Start(bbt::coroutine::SCHE_START_OPT_SCHE_THREAD);
-    if (!g_scheduler->IsRunning()) {
+    if (!g_scheduler->IsInitialized()) {
         std::fprintf(stderr, "FAIL: scheduler start failed\n");
         return 1;
     }
@@ -349,8 +353,6 @@ int main() {
     ScenarioFdFirst();
     ScenarioCustomFirst();
     ScenarioCustomBeforePark();
-
-    g_scheduler->Stop();
 
     std::printf("iowait.probe: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

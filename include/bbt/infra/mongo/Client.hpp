@@ -8,7 +8,7 @@
 //     接纳队列：worker 数不随句柄数增长，跨集合共享背压；
 //   - 不同 owner 各自持有 worker 组/队列/ops 表，资源相互隔离；
 //   - 每项 operation 在同一 worker 上 acquire/use/release pooled
-//     client；driver 同步调用不可强杀，deadline/cancel/close 只发布
+//     client；driver 同步调用不可强杀，deadline/close 只发布
 //     一次逻辑终态，物理收口由 worker 完成路径继续；
 //   - mongocxx/bsoncxx/pool/thread 细节全部隐藏于 src/mongo/ 实现，
 //     本头只出现 infra/标准库类型。
@@ -98,8 +98,8 @@ inline result<void> ValidateMongoTarget(const MongoTarget& t) {
 }
 
 // CoMongoColl：集合句柄（轻量目标值 + owner 引用）。句柄不拥有
-// worker/队列/pool；关闭句柄只停止该句柄的接纳与新命令前置校验，
-// 不影响同 owner 的兄弟句柄，也不等待 owner drain。
+// worker/队列/pool；Close() 只封该句柄的接纳与新命令前置校验（幂等、
+// 任意线程），不影响同 owner 的兄弟句柄，也不等待 owner 在途归零。
 class CoMongoColl : public ICoNetwork, public ICoCloseable {
 public:
     // 句柄级命令：语义与 CoMongoCli 同名方法一致，差别只在目标集合
@@ -117,12 +117,13 @@ public:
 
 // CoMongoDb：mongo 资源 owner（连接配置 + pool lease + worker 组 +
 // 接纳队列 + 关闭排空）。Create/Start 在启动控制线程使用，不挂起
-// 协程；Create 要求 Scheduler 已启动。
+// 协程；Start 要求协程运行时已初始化。
 //
-// 关闭语义：RequestClose 停止接纳并触发 drain（未派发 op 落定
-// Closed，已进入 driver 的调用继续到自身超时上界后收口）；
-// IsClosed/WaitClosed 反映物理收口——ops 清空且 worker 全退才
-// Closed，不提前宣告。句柄关闭（CoMongoColl::RequestClose）是接纳
+// 关闭语义：Close() 由 owner 主动同步发起（幂等、任意线程可调用）——
+// 封口停止接纳、唤醒全部挂起业务等待者（未派发 op 立即落定 Closed，
+// 已进入 driver 的调用继续到自身超时上界，迟到结果只消费不交付），
+// 然后在有界窗口内等 in-flight 归零；ops 清空且 worker 全退才
+// IsClosed()==true，不提前宣告。句柄关闭（CoMongoColl::Close）是接纳
 // 门禁，只停该句柄的新命令，不动兄弟句柄与 owner。
 //
 // 命令语义边界（与 CoMongoCli 相同）：
@@ -130,16 +131,15 @@ public:
 //   - 服务端错误回复映射为 Error(RemoteError)；driver 侧失败映射为
 //     Error(Unavailable)；无效 BSON/参数为 InvalidArgument；pool wait
 //     queue 超时为 Overloaded；
-//   - deadline/cancel/owner close 竞争只发布一次逻辑终态；已进入
-//     driver 的同步调用不可强杀，op/lease/payload 保活到物理收口，
-//     WaitClosed 等待在途 driver 调用与队列真正归零。
+//   - deadline/owner close 竞争只发布一次逻辑终态；已进入 driver 的
+//     同步调用不可强杀，op/lease/payload 保活到物理收口。
 class CoMongoDb : public ICoNetwork, public ICoCloseable {
 public:
     static result<std::shared_ptr<CoMongoDb>> Create(
         MongoRuntimeConfig config);
 
-    // 同一 owner 只成功启动一次；要求与 Create 同一运行时代际。
-    // Start 建立 worker 线程组并接入进程级 pool；关闭后不重开。
+    // 同一 owner 只成功启动一次；Start 要求协程运行时已初始化，
+    // 建立 worker 线程组并接入进程级 pool；关闭后不重开。
     virtual result<void> Start() = 0;
 
     // 创建集合句柄：owner 必须 Running；target.database/.collection

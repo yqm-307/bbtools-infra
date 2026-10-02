@@ -5,15 +5,23 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <thread>
 
 #include <bbt/core/thread/Lock.hpp>
+#include <bbt/coroutine/detail/Coroutine.hpp>
+#include <bbt/coroutine/detail/Define.hpp>   // g_bbt_tls_coroutine_co（协程级取消）
 #include <bbt/coroutine/detail/GlobalConfig.hpp>
+#include <bbt/coroutine/detail/LocalThread.hpp>  // g_bbt_tls_processer 完整类型
+#include <bbt/coroutine/detail/Processer.hpp>    // GetCurrentCoroutine 接收者完整类型
 #include <bbt/coroutine/detail/Scheduler.hpp>
 #include <bbt/coroutine/syntax/SyntaxMacro.hpp>
 #include <bbt/infra/CoUDP.hpp>
 
+// 新契约（进程寿命运行时）：没有 Scheduler::Stop/restart，也没有取消令牌。
+// 每个测试可执行文件只初始化一次 runtime，用例之间靠进程边界隔离；用例结束
+// 前显式 Close() 并断言物理收口（IsClosed）。
 using bbt::infra::CallOptions;
 using bbt::infra::ConstBytes;
 using bbt::infra::DatagramRead;
@@ -25,6 +33,17 @@ using bbt::infra::udp::CoUDP;
 using bbt::coroutine::SCHE_START_OPT_SCHE_THREAD;
 
 namespace {
+
+// 运行时只初始化一次（函数局部静态保证线程安全且恰好一次）。
+void EnsureRuntime() {
+    static const bool initialized = [] {
+        auto& scheduler = bbt::coroutine::detail::Scheduler::GetInstance();
+        if (!scheduler->IsInitialized())
+            scheduler->Start(SCHE_START_OPT_SCHE_THREAD);
+        return scheduler->IsInitialized();
+    }();
+    BOOST_REQUIRE(initialized);
+}
 
 // 动态端口：bind port=0 后经 LocalAddress 取实际端口，避免同机多 agent
 // 与重复运行时的固定端口冲突（AGENTS.md 测试规约）。
@@ -56,9 +75,7 @@ SocketAddress LocalOf(const CoUDP::SPtr& sock) {  // 传 .value() 解包后的 S
 
 // §5 真实双端 loopback：datagram 边界、peer 地址、回发、LocalAddress。
 BOOST_AUTO_TEST_CASE(t_udp_real_loopback) {
-    auto& scheduler = bbt::coroutine::detail::Scheduler::GetInstance();
-    scheduler->Start(SCHE_START_OPT_SCHE_THREAD);
-    BOOST_REQUIRE(scheduler->IsRunning());
+    EnsureRuntime();
 
     auto receiver = CoUDP::BindUDP(Loopback(0));
     BOOST_REQUIRE(receiver);
@@ -116,19 +133,17 @@ BOOST_AUTO_TEST_CASE(t_udp_real_loopback) {
     BOOST_CHECK(recv_ok.load());
     BOOST_CHECK(send_ok.load());
 
-    receiver.value()->RequestClose();
-    receiver.value()->RequestClose(); // 幂等
+    receiver.value()->Close();
+    receiver.value()->Close(); // 幂等
     BOOST_CHECK(receiver.value()->IsClosed());
-    sender.value()->RequestClose();
-    scheduler->Stop();
+    sender.value()->Close();
+    BOOST_CHECK(sender.value()->IsClosed());
 }
 
 // §5 截断语义：大报文 + 小 buffer → bytes=容量、truncated=true；
 // 恰好等于容量 → truncated=false；size=0 buffer 读到报文 → truncated=true。
 BOOST_AUTO_TEST_CASE(t_udp_truncation) {
-    auto& scheduler = bbt::coroutine::detail::Scheduler::GetInstance();
-    scheduler->Start(SCHE_START_OPT_SCHE_THREAD);
-    BOOST_REQUIRE(scheduler->IsRunning());
+    EnsureRuntime();
 
     auto receiver = CoUDP::BindUDP(Loopback(0));
     BOOST_REQUIRE(receiver);
@@ -176,16 +191,15 @@ BOOST_AUTO_TEST_CASE(t_udp_truncation) {
     BOOST_CHECK_EQUAL(zero.value().bytes, 0u);
     BOOST_CHECK_EQUAL(zero.value().truncated, true);
 
-    sender.value()->RequestClose();
-    receiver.value()->RequestClose();
-    scheduler->Stop();
+    sender.value()->Close();
+    receiver.value()->Close();
+    BOOST_CHECK(sender.value()->IsClosed());
+    BOOST_CHECK(receiver.value()->IsClosed());
 }
 
 // 零长度 datagram（合法、非 EOF）与无数据 deadline 到点。
 BOOST_AUTO_TEST_CASE(t_udp_zero_length_datagram_and_timeout) {
-    auto& scheduler = bbt::coroutine::detail::Scheduler::GetInstance();
-    scheduler->Start(SCHE_START_OPT_SCHE_THREAD);
-    BOOST_REQUIRE(scheduler->IsRunning());
+    EnsureRuntime();
 
     auto receiver = CoUDP::BindUDP(Loopback(0));
     BOOST_REQUIRE(receiver);
@@ -227,16 +241,15 @@ BOOST_AUTO_TEST_CASE(t_udp_zero_length_datagram_and_timeout) {
     BOOST_CHECK_EQUAL(timeout_done.WaitTimeout(5000), 0);
     BOOST_CHECK_EQUAL(timeout_code.load(), static_cast<int>(ErrorCode::TimedOut));
 
-    sender.value()->RequestClose();
-    receiver.value()->RequestClose();
-    scheduler->Stop();
+    sender.value()->Close();
+    receiver.value()->Close();
+    BOOST_CHECK(sender.value()->IsClosed());
+    BOOST_CHECK(receiver.value()->IsClosed());
 }
 
 // §5 Try*：无数据 WouldBlock、有数据立即成功、TrySend 正常；Try* 不挂起。
 BOOST_AUTO_TEST_CASE(t_udp_try_operations) {
-    auto& scheduler = bbt::coroutine::detail::Scheduler::GetInstance();
-    scheduler->Start(SCHE_START_OPT_SCHE_THREAD);
-    BOOST_REQUIRE(scheduler->IsRunning());
+    EnsureRuntime();
 
     auto receiver = CoUDP::BindUDP(Loopback(0));
     BOOST_REQUIRE(receiver);
@@ -273,55 +286,39 @@ BOOST_AUTO_TEST_CASE(t_udp_try_operations) {
     BOOST_REQUIRE(!bad_addr);
     BOOST_CHECK(SameCode(bad_addr.error(), ErrorCode::InvalidArgument));
 
-    sender.value()->RequestClose();
-    receiver.value()->RequestClose();
-    scheduler->Stop();
+    sender.value()->Close();
+    receiver.value()->Close();
+    BOOST_CHECK(sender.value()->IsClosed());
+    BOOST_CHECK(receiver.value()->IsClosed());
 }
 
-// §6.4 关闭协议：跨线程 RequestClose 唤醒在途 Receive（Closed）、
-// WaitClosed 真实等待清理完成、封口后新调用立即 Closed、FD 复用防护。
+// §1 关闭协议：跨线程 Close 先封口并唤醒在途 Receive（Closed）、Close 返回即
+// 物理收口（IsClosed）、封口后新调用立即 Closed、FD 数字复用后旧对象不再触达。
 BOOST_AUTO_TEST_CASE(t_udp_close_lifecycle) {
-    auto& scheduler = bbt::coroutine::detail::Scheduler::GetInstance();
-    scheduler->Start(SCHE_START_OPT_SCHE_THREAD);
-    BOOST_REQUIRE(scheduler->IsRunning());
+    EnsureRuntime();
 
     auto victim = CoUDP::BindUDP(Loopback(0));
     BOOST_REQUIRE(victim);
     const auto victim_port = LocalOf(victim.value()).port;
 
-    // 在途 Receive 由控制线程 close 唤醒：返回 Closed 而非悬挂到 deadline。
+    // 在途 Receive 由控制线程 Close 唤醒：返回 Closed 而非悬挂到 deadline。
     bbt::core::thread::CountDownLatch inflight_done{1};
     std::atomic_int inflight_code{-1};
     bbtco [vx = victim.value(), &inflight_code, &inflight_done]() {
         char buffer[8]{};
         auto got = vx->Receive(MutableBytes{buffer, sizeof(buffer)},
-                                   Options(10000)); // 长 deadline：靠 close 唤醒
+                                   Options(10000)); // 长 deadline：靠 Close 唤醒
         inflight_code.store(got ? 0 : static_cast<int>(got.error().code));
         inflight_done.Down();
     };
 
-    // WaitClosed 在另一协程等待真实清理；close 由控制线程发起。
-    bbt::core::thread::CountDownLatch wait_done{1};
-    std::atomic_int wait_result{-1};
-    bbtco [vx = victim.value(), &wait_result, &wait_done]() {
-        const auto deadline = std::chrono::steady_clock::now() +
-                              std::chrono::milliseconds(5000);
-        wait_result.store(static_cast<int>(
-            vx->WaitClosed(deadline, /*cancel=*/{})));
-        wait_done.Down();
-    };
-
-    // 控制线程（非协程线程）跨线程 RequestClose。
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    victim.value()->RequestClose();
+    victim.value()->Close();   // 控制线程（非协程线程）跨线程关闭
+    BOOST_CHECK(victim.value()->IsClosed());   // Close 返回即物理收口
 
     BOOST_CHECK_EQUAL(inflight_done.WaitTimeout(5000), 0);
     BOOST_CHECK_EQUAL(inflight_code.load(),
                       static_cast<int>(ErrorCode::Closed));
-    BOOST_CHECK_EQUAL(wait_done.WaitTimeout(5000), 0);
-    BOOST_CHECK_EQUAL(wait_result.load(),
-                      static_cast<int>(bbt::infra::CloseStatus::Closed));
-    BOOST_CHECK(victim.value()->IsClosed());
 
     // 控制线程的可挂起调用先被协程上下文门禁拒绝。
     char buffer[8]{};
@@ -337,7 +334,8 @@ BOOST_AUTO_TEST_CASE(t_udp_close_lifecycle) {
     BOOST_CHECK(SameCode(closed_try.error(), ErrorCode::Closed));
 
     // FD 数字复用防护：close 后立即新建 socket（大概率复用同一 fd 数字），
-    // 旧对象的等待者已全部退出（上文 WaitClosed=Closed），新对象可正常收发。
+    // 旧对象的等待者已全部退出（上文 inflight Receive 已落定 Closed），新对象
+    // 可正常收发。
     auto recycled = CoUDP::BindUDP(Loopback(victim_port));
     BOOST_REQUIRE(recycled); // 同端口重绑成功即旧 FD 已真实关闭
     char probe[8]{};
@@ -349,37 +347,38 @@ BOOST_AUTO_TEST_CASE(t_udp_close_lifecycle) {
     BOOST_REQUIRE(!stale);
     BOOST_CHECK(SameCode(stale.error(), ErrorCode::Closed));
 
-    recycled.value()->RequestClose();
-    scheduler->Stop();
+    recycled.value()->Close();
+    BOOST_CHECK(recycled.value()->IsClosed());
 }
 
-// cancel 令牌唤醒在途 Receive；CloseStatus 语义（未关闭对象上
-// WaitClosed 被 cancel 唤醒 → Cancelled）。
-BOOST_AUTO_TEST_CASE(t_udp_cancel_wakeup) {
-    auto& scheduler = bbt::coroutine::detail::Scheduler::GetInstance();
-    scheduler->Start(SCHE_START_OPT_SCHE_THREAD);
-    BOOST_REQUIRE(scheduler->IsRunning());
+// 协程级取消（RequestCancel）唤醒组合等待中的在途 Receive：Cancel 不是唤醒
+// 令牌，业务取消由协程级取消表达；对象本身不受影响（仍可用）。
+BOOST_AUTO_TEST_CASE(t_udp_coroutine_cancel_wakes_receive) {
+    EnsureRuntime();
 
     auto receiver = CoUDP::BindUDP(Loopback(0));
     BOOST_REQUIRE(receiver);
 
-    bbt::coroutine::CancellationSource source;
+    auto self = std::make_shared<std::atomic<bbt::coroutine::detail::Coroutine*>>(
+        nullptr);
+    bbt::core::thread::CountDownLatch entered{1};
     bbt::core::thread::CountDownLatch cancel_done{1};
     std::atomic_int cancel_code{-1};
-    bbtco [rx = receiver.value(), source, &cancel_code, &cancel_done]() {
+    bbtco [rx = receiver.value(), self, &entered, &cancel_done, &cancel_code]() {
+        self->store(g_bbt_tls_coroutine_co);
+        entered.Down();
         char buffer[8]{};
-        CallOptions options;
-        options.deadline = std::chrono::steady_clock::now() +
-                           std::chrono::milliseconds(10000);
-        options.cancel = source.Token();
-        auto got = rx->Receive(MutableBytes{buffer, sizeof(buffer)},
-                                     options);
+        auto got = rx->Receive(MutableBytes{buffer, sizeof(buffer)}, Options(10000));
         cancel_code.store(got ? 0 : static_cast<int>(got.error().code));
         cancel_done.Down();
     };
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    source.RequestCancel();
+    // 取消请求先于挂起或落在挂起中，两条路径都收敛到 Cancelled（见
+    // Coroutine::_RegistAwaitEvent 的预取消分支）。
+    BOOST_REQUIRE_EQUAL(entered.WaitTimeout(2000), 0);
+    auto* co = self->load();
+    BOOST_REQUIRE(co != nullptr);
+    co->RequestCancel();
     BOOST_CHECK_EQUAL(cancel_done.WaitTimeout(5000), 0);
     BOOST_CHECK_EQUAL(cancel_code.load(), static_cast<int>(ErrorCode::Cancelled));
 
@@ -388,12 +387,16 @@ BOOST_AUTO_TEST_CASE(t_udp_cancel_wakeup) {
     auto idle = receiver.value()->TryReceive(MutableBytes{probe, sizeof(probe)});
     BOOST_REQUIRE(idle && idle.value().state == IoState::WouldBlock);
 
-    receiver.value()->RequestClose();
-    scheduler->Stop();
+    receiver.value()->Close();
+    BOOST_CHECK(receiver.value()->IsClosed());
 }
 
-// BindUDP 参数校验：空 ip / 非数值 ip 拒绝；Scheduler 未 Start 拒绝。
+// BindUDP 参数校验：空 ip / 非数值 ip 拒绝。
+// 注：运行时常驻（进程寿命）后「运行时未初始化 → RuntimeUnavailable」不再可由
+// 本进程内的用例构造，该分支已无可测入口。
 BOOST_AUTO_TEST_CASE(t_udp_bind_validation) {
+    EnsureRuntime();
+
     // 空 ip：通配必须显式。
     auto empty = CoUDP::BindUDP(SocketAddress{"", 0});
     BOOST_REQUIRE(!empty);
@@ -402,52 +405,4 @@ BOOST_AUTO_TEST_CASE(t_udp_bind_validation) {
     auto hostname = CoUDP::BindUDP(SocketAddress{"no-such-host.invalid", 0});
     BOOST_REQUIRE(!hostname);
     BOOST_CHECK(SameCode(hostname.error(), ErrorCode::InvalidArgument));
-}
-
-// §4 入口代际检查：Runtime 未 Start 或对象归属其他运行代时，Try* 与协程
-// 方法都必须立即 RuntimeUnavailable——不挂起、不下发 syscall 到旧 fd。
-// Try* 不要求协程上下文（非协程线程可照常调用），但同样受代际门禁
-// （§4「Try* 只检查参数、上下文、代际和关闭状态」）。
-BOOST_AUTO_TEST_CASE(t_udp_generation_guard) {
-    auto& scheduler = bbt::coroutine::detail::Scheduler::GetInstance();
-    scheduler->Start(SCHE_START_OPT_SCHE_THREAD);
-    BOOST_REQUIRE(scheduler->IsRunning());
-
-    auto socket = CoUDP::BindUDP(Loopback(0));
-    BOOST_REQUIRE(socket);
-    const auto addr = LocalOf(socket.value());
-
-    // 运行时代际归 0：Try* 在控制线程立即 RuntimeUnavailable。
-    scheduler->Stop();
-    BOOST_CHECK(!scheduler->IsRunning());
-    char buffer[8]{};
-    auto after_stop = socket.value()->TryReceive(MutableBytes{buffer, sizeof(buffer)});
-    BOOST_REQUIRE(!after_stop);
-    BOOST_CHECK(SameCode(after_stop.error(), ErrorCode::RuntimeUnavailable));
-    auto after_stop_send = socket.value()->TrySend(ConstBytes{"x", 1}, addr);
-    BOOST_REQUIRE(!after_stop_send);
-    BOOST_CHECK(SameCode(after_stop_send.error(), ErrorCode::RuntimeUnavailable));
-
-    // 重启进入新代际：旧对象在协程内同样被拒（不触碰可能已复用的旧 fd）。
-    scheduler->Start(SCHE_START_OPT_SCHE_THREAD);
-    BOOST_REQUIRE(scheduler->IsRunning());
-    bbt::core::thread::CountDownLatch done{1};
-    std::atomic_int code{-1};
-    bbtco [sx = socket.value(), addr, &done, &code]() {
-        char buf[8]{};
-        auto got = sx->Receive(MutableBytes{buf, sizeof(buf)}, Options());
-        code.store(got ? -2 : static_cast<int>(got.error().code));
-        auto sent = sx->Send(ConstBytes{"y", 1}, addr, Options());
-        if (sent)
-            code.store(-3);
-        done.Down();
-    };
-    BOOST_REQUIRE_EQUAL(done.WaitTimeout(5000), 0);
-    BOOST_CHECK_EQUAL(code.load(), static_cast<int>(ErrorCode::RuntimeUnavailable));
-
-    // 代际门禁只拒绝操作、不改关闭状态：对象仍可正常收口，不泄漏 FD。
-    BOOST_CHECK(!socket.value()->IsClosed());
-    socket.value()->RequestClose();
-    BOOST_CHECK(socket.value()->IsClosed());
-    scheduler->Stop();
 }

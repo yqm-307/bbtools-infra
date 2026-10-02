@@ -10,9 +10,13 @@
 // 覆盖（P2 验收要求：不只测静态容量超限）：
 //   1. owner 门禁与参数校验（Start 前拒绝、Start 后参数非法）
 //   2. 容量名额（max_connections）超限与「物理关闭后才归还」
-//   3. 真实 loopback 收发 + 完整关闭生命周期（WaitClosed 诚实落定）
+//   3. 真实 loopback 收发 + 完整关闭生命周期（Close 同步物理收口）
 //   4. 多 owner 配额隔离（同一进程两个 TransportRuntime 各自 max_inflight）
-//   5. 关闭期已接纳但未落定的 op（挂起 Accept）——名额归还 + 落定
+//   5. 关闭期已接纳但未落定的 op（挂起 Accept）——名额归还 + 物理收口
+//
+// 新契约（进程寿命运行时）：没有 Scheduler::Stop/restart、没有 WaitClosed。
+// 每个测试可执行文件只初始化一次 runtime，用例之间靠进程边界隔离；用例结束
+// 前显式 Close() 并断言物理收口（IsClosed / 名额归零），不再以 Stop 做隔离。
 //
 // 失败路径约定（独立复审 🔴-1 / 🟡-1 / 🟡-2 修复）：断言失败不得被放大成
 // SegFault，等待不得依赖脆弱的固定短预算。为此本文件遵守两条约束：
@@ -20,8 +24,7 @@
 //      BOOST_REQUIRE* 失败会抛异常展开用例栈；若协程仍按引用写这些栈对象，
 //      就是一个 use-after-free（记录中的 SegFault 即此机制）。
 //   b) 每个用例持有 CaseGuard：正常结束与断言失败走同一条收口路径（关闭本用例
-//      创建的受管对象 → Stop scheduler）。原先 scheduler->Stop() 是最后一条
-//      语句，断言失败时会被跳过。
+//      创建的受管对象）。
 // 等待预算：wait-entry gate 是确定性事件接缝（名额登记后由协程同步触发），
 // 实测重负载（load 14 / load 58，12 核）下延迟 ≤5ms，故 kSeamBudgetMs=5000
 // 作为兜底上限（约 1000x 观测上界）；仍超时则由断言信息区分两种原因。
@@ -31,12 +34,12 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include <bbt/core/thread/Lock.hpp>
 #include <bbt/coroutine/detail/Scheduler.hpp>
-#include <bbt/coroutine/sync/Cancellation.hpp>
 #include <bbt/coroutine/syntax/SyntaxMacro.hpp>
 #include <bbt/infra/CoTCP.hpp>
 #include <bbt/infra/CoUDP.hpp>
@@ -46,7 +49,6 @@
 #include "detail/TransportWiring.hpp"
 
 using bbt::infra::CallOptions;
-using bbt::infra::CloseStatus;
 using bbt::infra::ConstBytes;
 using bbt::infra::ErrorCode;
 using bbt::infra::MutableBytes;
@@ -59,6 +61,17 @@ using bbt::coroutine::SCHE_START_OPT_SCHE_THREAD;
 using bbt::infra::detail::TransportWiring;
 
 namespace {
+
+// 运行时只初始化一次（函数局部静态保证线程安全且恰好一次）。
+void EnsureRuntime() {
+    static const bool initialized = [] {
+        auto& scheduler = bbt::coroutine::detail::Scheduler::GetInstance();
+        if (!scheduler->IsInitialized())
+            scheduler->Start(SCHE_START_OPT_SCHE_THREAD);
+        return scheduler->IsInitialized();
+    }();
+    BOOST_REQUIRE(initialized);
+}
 
 NetworkLimits Limits(std::size_t max_connections, std::size_t max_inflight) {
     NetworkLimits limits{};
@@ -90,10 +103,10 @@ struct Waiter {
 using WaiterPtr = std::shared_ptr<Waiter>;
 
 // 用例级收口：正常返回与断言失败（Boost fatal error 抛出）走同一条路径。
+// 新契约没有 runtime 停机入口，只做本用例受管对象的 Close。
 class CaseGuard {
 public:
-    explicit CaseGuard(bbt::coroutine::detail::Scheduler* scheduler) noexcept
-        : m_scheduler(scheduler) {}
+    CaseGuard() = default;
     CaseGuard(const CaseGuard&) = delete;
     CaseGuard& operator=(const CaseGuard&) = delete;
 
@@ -106,15 +119,11 @@ public:
         if (m_unwound)
             return;
         m_unwound = true;
-        // 逆序：先关本用例创建的受管对象，再停 scheduler（与声明顺序相反）。
         for (auto it = m_on_unwind.rbegin(); it != m_on_unwind.rend(); ++it)
             (*it)();
-        if (m_scheduler != nullptr && m_scheduler->IsRunning())
-            m_scheduler->Stop();
     }
 
 private:
-    bbt::coroutine::detail::Scheduler* m_scheduler;
     std::vector<std::function<void()>> m_on_unwind;
     bool m_unwound{false};
 };
@@ -159,16 +168,14 @@ BOOST_AUTO_TEST_SUITE(transport_runtime)
 //    快返 InvalidArgument，且发生在容量预留之前。
 // ---------------------------------------------------------------------------
 BOOST_AUTO_TEST_CASE(t_owner_gate_and_param_validation) {
-    auto& scheduler = bbt::coroutine::detail::Scheduler::GetInstance();
-    scheduler->Start(SCHE_START_OPT_SCHE_THREAD);
-    BOOST_REQUIRE(scheduler->IsRunning());
-    CaseGuard guard{scheduler.get()};
+    EnsureRuntime();
+    CaseGuard guard;
 
     auto created = TransportRuntime::Create(Limits(1, 4));
     BOOST_REQUIRE(created);
     auto owner = std::move(created).value();
     BOOST_REQUIRE(owner);
-    guard.OnUnwind([owner] { owner->RequestClose(); });
+    guard.OnUnwind([owner] { owner->Close(); });
 
     // 未 Start：不产出半成品对象。
     auto before = owner->ListenTCP(SocketAddress{"127.0.0.1", 0}, 16);
@@ -211,8 +218,11 @@ BOOST_AUTO_TEST_CASE(t_owner_gate_and_param_validation) {
     BOOST_CHECK(host_checked);
     BOOST_CHECK(port_checked);
 
-    // 收口由 guard 统一负责（正常路径与断言失败路径同一条）。
+    // 显式收口 + 物理收口断言（Close 返回即资源已释放）。
+    numeric.value()->Close();
+    BOOST_CHECK(numeric.value()->IsClosed());
     guard.Unwind();
+    BOOST_CHECK(owner->IsClosed());
 }
 
 // ---------------------------------------------------------------------------
@@ -220,15 +230,13 @@ BOOST_AUTO_TEST_CASE(t_owner_gate_and_param_validation) {
 //    超限 Overloaded、不排队；**物理关闭落定后才归还**，逻辑超时不提前归还。
 // ---------------------------------------------------------------------------
 BOOST_AUTO_TEST_CASE(t_capacity_gate_and_physical_release) {
-    auto& scheduler = bbt::coroutine::detail::Scheduler::GetInstance();
-    scheduler->Start(SCHE_START_OPT_SCHE_THREAD);
-    BOOST_REQUIRE(scheduler->IsRunning());
-    CaseGuard guard{scheduler.get()};
+    EnsureRuntime();
+    CaseGuard guard;
 
     auto created = TransportRuntime::Create(Limits(2, 8));
     BOOST_REQUIRE(created);
     auto owner = std::move(created).value();
-    guard.OnUnwind([owner] { owner->RequestClose(); });
+    guard.OnUnwind([owner] { owner->Close(); });
     BOOST_REQUIRE(owner->Start());
 
     auto listen = owner->ListenTCP(SocketAddress{"127.0.0.1", 0}, 16);
@@ -258,31 +266,32 @@ BOOST_AUTO_TEST_CASE(t_capacity_gate_and_physical_release) {
     BOOST_CHECK_EQUAL(TransportWiring::InflightQuotaHeldForTest(*owner), 0u);
 
     // 物理关闭落定 → 名额归还 → 同一条路径再次成功（不是只读计数）。
-    listen.value()->RequestClose();
+    listen.value()->Close();
     BOOST_REQUIRE(listen.value()->IsClosed());
     auto udp = owner->BindUDP(SocketAddress{"127.0.0.1", 0});
     BOOST_REQUIRE(udp);
     BOOST_REQUIRE_NE(udp.value()->LocalAddress().port, 0);
-    udp.value()->RequestClose();
+    udp.value()->Close();
     BOOST_REQUIRE(udp.value()->IsClosed());
 
+    listen2.value()->Close();
+    BOOST_CHECK(listen2.value()->IsClosed());
     guard.Unwind();
+    BOOST_CHECK(owner->IsClosed());
 }
 
 // ---------------------------------------------------------------------------
-// 3. 真实 loopback 收发 + 完整关闭生命周期：受管连接可读写，owner 关闭后
-//    交付对象物理关闭、WaitClosed 诚实返回 Closed、工厂随后拒绝。
+// 3. 真实 loopback 收发 + 完整关闭生命周期：受管连接可读写，owner Close 后
+//    交付对象物理关闭（IsClosed）、托管引用随物理关闭释放、工厂随后拒绝。
 // ---------------------------------------------------------------------------
 BOOST_AUTO_TEST_CASE(t_loopback_data_path_and_close_lifecycle) {
-    auto& scheduler = bbt::coroutine::detail::Scheduler::GetInstance();
-    scheduler->Start(SCHE_START_OPT_SCHE_THREAD);
-    BOOST_REQUIRE(scheduler->IsRunning());
-    CaseGuard guard{scheduler.get()};
+    EnsureRuntime();
+    CaseGuard guard;
 
     auto created = TransportRuntime::Create(Limits(4, 8));
     BOOST_REQUIRE(created);
     auto owner = std::move(created).value();
-    guard.OnUnwind([owner] { owner->RequestClose(); });
+    guard.OnUnwind([owner] { owner->Close(); });
     BOOST_REQUIRE(owner->Start());
 
     auto listen = owner->ListenTCP(SocketAddress{"127.0.0.1", 0}, 16);
@@ -325,7 +334,7 @@ BOOST_AUTO_TEST_CASE(t_loopback_data_path_and_close_lifecycle) {
                                read.value().bytes == 5 &&
                                std::string(response, 5) == "world");
         // 受管引用在关闭后仍可用于查询（§4.0.1.2）。
-        client->RequestClose();
+        client->Close();
         probe->done.Down();
     };
 
@@ -339,24 +348,11 @@ BOOST_AUTO_TEST_CASE(t_loopback_data_path_and_close_lifecycle) {
     // 数据面在途 op 已结束：账本归零，没有残留名额。
     BOOST_CHECK_EQUAL(TransportWiring::InflightQuotaHeldForTest(*owner), 0u);
 
-    // owner 关闭：已接纳连接被收口（不仅停 listener）。
+    // owner 关闭：已接纳连接被收口（不仅停 listener），Close 返回即物理收口。
     std::weak_ptr<bbt::infra::CoTCP> accepted_weak = probe->accepted;
-    owner->RequestClose();
-    auto closed_wait = std::make_shared<Waiter>();
-    bbtco [owner, closed_wait]() {
-        closed_wait->code.store(static_cast<int>(
-            owner->WaitClosed(Options().deadline, {})));
-        closed_wait->settled.Down();
-    };
-    BOOST_REQUIRE_MESSAGE(closed_wait->settled.WaitTimeout(kSeamBudgetMs) == 0,
-                          "case3: owner RequestClose 后 WaitClosed 未在 "
-                          << kSeamBudgetMs
-                          << "ms 内落定（关闭未落定）; code="
-                          << closed_wait->code.load());
-    BOOST_CHECK_EQUAL(closed_wait->code.load(),
-                      static_cast<int>(CloseStatus::Closed));
-    BOOST_CHECK(owner->IsClosed());
+    owner->Close();
     BOOST_CHECK(probe->accepted->IsClosed());
+    BOOST_CHECK(owner->IsClosed());
     // 托管引用随物理关闭释放（不是靠外部 reset 才消失）。
     probe->accepted.reset();
     BOOST_CHECK(accepted_weak.expired());
@@ -375,10 +371,8 @@ BOOST_AUTO_TEST_CASE(t_loopback_data_path_and_close_lifecycle) {
 //    （Issue #37「多 Runtime 配额隔离」在 transport 侧的直接证据。）
 // ---------------------------------------------------------------------------
 BOOST_AUTO_TEST_CASE(t_quota_isolated_between_owners) {
-    auto& scheduler = bbt::coroutine::detail::Scheduler::GetInstance();
-    scheduler->Start(SCHE_START_OPT_SCHE_THREAD);
-    BOOST_REQUIRE(scheduler->IsRunning());
-    CaseGuard guard{scheduler.get()};
+    EnsureRuntime();
+    CaseGuard guard;
 
     auto a_created = TransportRuntime::Create(Limits(4, 1));
     auto b_created = TransportRuntime::Create(Limits(4, 1));
@@ -386,8 +380,8 @@ BOOST_AUTO_TEST_CASE(t_quota_isolated_between_owners) {
     BOOST_REQUIRE(b_created);
     auto a = std::move(a_created).value();
     auto b = std::move(b_created).value();
-    guard.OnUnwind([a] { a->RequestClose(); });
-    guard.OnUnwind([b] { b->RequestClose(); });
+    guard.OnUnwind([a] { a->Close(); });
+    guard.OnUnwind([b] { b->Close(); });
     BOOST_REQUIRE(a->Start());
     BOOST_REQUIRE(b->Start());
 
@@ -450,7 +444,8 @@ BOOST_AUTO_TEST_CASE(t_quota_isolated_between_owners) {
     BOOST_CHECK_EQUAL(TransportWiring::InflightQuotaHeldForTest(*a), 1u);
 
     // 关闭 A 只归还 A 的名额，B 的挂起 op 不受影响（不误杀兄弟 owner）。
-    listen_a.value()->RequestClose();
+    listen_a.value()->Close();
+    BOOST_CHECK(listen_a.value()->IsClosed());
     BOOST_REQUIRE_MESSAGE(wait_a->settled.WaitTimeout(kSeamBudgetMs) == 0,
                           "case4/a: listener 关闭后挂起 Accept 未在 "
                           << kSeamBudgetMs
@@ -461,7 +456,8 @@ BOOST_AUTO_TEST_CASE(t_quota_isolated_between_owners) {
     BOOST_CHECK_EQUAL(TransportWiring::InflightQuotaHeldForTest(*a), 0u);
     BOOST_CHECK_EQUAL(TransportWiring::InflightQuotaHeldForTest(*b), 1u);
 
-    listen_b.value()->RequestClose();
+    listen_b.value()->Close();
+    BOOST_CHECK(listen_b.value()->IsClosed());
     BOOST_REQUIRE_MESSAGE(wait_b->settled.WaitTimeout(kSeamBudgetMs) == 0,
                           "case4/b: listener 关闭后挂起 Accept 未在 "
                           << kSeamBudgetMs
@@ -472,25 +468,24 @@ BOOST_AUTO_TEST_CASE(t_quota_isolated_between_owners) {
     BOOST_CHECK_EQUAL(TransportWiring::InflightQuotaHeldForTest(*b), 0u);
 
     guard.Unwind();
+    BOOST_CHECK(a->IsClosed());
+    BOOST_CHECK(b->IsClosed());
 }
 
 // ---------------------------------------------------------------------------
-// 5. 关闭期已接纳但未落定的 op：挂起的 Accept 在 owner RequestClose 时被唤醒
-//    走正常归还路径（名额归零），且 owner 的 WaitClosed 只在物理落定后返回
-//    Closed——不靠「逻辑封口」冒充清理完成。
+// 5. 关闭期已接纳但未落定的 op：挂起的 Accept 在 owner Close 时被唤醒走正常
+//    归还路径（名额归零），且对象在 Close 返回时已物理收口（IsClosed）。
 // ---------------------------------------------------------------------------
 BOOST_AUTO_TEST_CASE(t_close_wakes_adopted_suspended_op) {
-    auto& scheduler = bbt::coroutine::detail::Scheduler::GetInstance();
-    scheduler->Start(SCHE_START_OPT_SCHE_THREAD);
-    BOOST_REQUIRE(scheduler->IsRunning());
-    CaseGuard guard{scheduler.get()};
+    EnsureRuntime();
+    CaseGuard guard;
 
     // max_connections=4：listener + UDP 各占一个名额，Accept 仍有容量
     // （Accept 的容量判定也走同一 max_connections 门禁）。
     auto created = TransportRuntime::Create(Limits(4, 1));
     BOOST_REQUIRE(created);
     auto owner = std::move(created).value();
-    guard.OnUnwind([owner] { owner->RequestClose(); });
+    guard.OnUnwind([owner] { owner->Close(); });
     BOOST_REQUIRE(owner->Start());
 
     auto listen = owner->ListenTCP(SocketAddress{"127.0.0.1", 0}, 16);
@@ -518,9 +513,9 @@ BOOST_AUTO_TEST_CASE(t_close_wakes_adopted_suspended_op) {
            " 名额 inflight=" << TransportWiring::InflightQuotaHeldForTest(*owner));
     BOOST_CHECK_EQUAL(TransportWiring::InflightQuotaHeldForTest(*owner), 1u);
 
-    owner->RequestClose();
+    owner->Close();
     BOOST_REQUIRE_MESSAGE(waiter->settled.WaitTimeout(kSeamBudgetMs) == 0,
-                          "case5: owner RequestClose 后挂起 Accept 未在 "
+                          "case5: owner Close 后挂起 Accept 未在 "
                           << kSeamBudgetMs
                           << "ms 内落定（关闭未唤醒）; code="
                           << waiter->code.load()
@@ -529,23 +524,102 @@ BOOST_AUTO_TEST_CASE(t_close_wakes_adopted_suspended_op) {
     BOOST_CHECK_EQUAL(waiter->code.load(),
                       static_cast<int>(ErrorCode::Closed));
     BOOST_CHECK_EQUAL(TransportWiring::InflightQuotaHeldForTest(*owner), 0u);
+    // Close 同步物理收口：owner 自身与全部受管对象都已关闭。
+    BOOST_CHECK(listen.value()->IsClosed());
+    BOOST_CHECK(udp.value()->IsClosed());
+    BOOST_CHECK(owner->IsClosed());
+
+    guard.Unwind();
+    BOOST_CHECK(owner->IsClosed());
+}
+
+// ---------------------------------------------------------------------------
+// 6. 并发 Close：两个线程同时关闭同一 owner，两个调用者返回当刻都必须观察到
+//    同一真实终态（IsClosed），不得让后来者以独立 kCloseDrainTimeout 提前返回
+//    而聚合尚未物理收口。
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(t_concurrent_close_both_observe_closed) {
+    EnsureRuntime();
+    CaseGuard guard;
+
+    auto created = TransportRuntime::Create(Limits(4, 2));
+    BOOST_REQUIRE(created);
+    auto owner = std::move(created).value();
+    guard.OnUnwind([owner] { owner->Close(); });
+    BOOST_REQUIRE(owner->Start());
+
+    auto listen = owner->ListenTCP(SocketAddress{"127.0.0.1", 0}, 16);
+    BOOST_REQUIRE(listen);
+    auto udp = owner->BindUDP(SocketAddress{"127.0.0.1", 0});
+    BOOST_REQUIRE(udp);
+
+    std::atomic_int closed_at_return_a{-1};
+    std::atomic_int closed_at_return_b{-1};
+    std::thread a([&] {
+        owner->Close();
+        closed_at_return_a.store(owner->IsClosed() ? 1 : 0);
+    });
+    std::thread b([&] {
+        owner->Close();
+        closed_at_return_b.store(owner->IsClosed() ? 1 : 0);
+    });
+    a.join();
+    b.join();
+
+    // 两个调用者返回当刻都观察到同一 Closed 终态。
+    BOOST_CHECK_EQUAL(closed_at_return_a.load(), 1);
+    BOOST_CHECK_EQUAL(closed_at_return_b.load(), 1);
+    BOOST_CHECK(owner->IsClosed());
     BOOST_CHECK(listen.value()->IsClosed());
     BOOST_CHECK(udp.value()->IsClosed());
 
-    auto closed_wait = std::make_shared<Waiter>();
-    bbtco [owner, closed_wait]() {
-        closed_wait->code.store(static_cast<int>(
-            owner->WaitClosed(Options().deadline, {})));
-        closed_wait->settled.Down();
-    };
-    BOOST_REQUIRE_MESSAGE(closed_wait->settled.WaitTimeout(kSeamBudgetMs) == 0,
-                          "case5: owner WaitClosed 未在 " << kSeamBudgetMs
-                          << "ms 内落定（物理关闭未落定）; code="
-                          << closed_wait->code.load());
-    BOOST_CHECK_EQUAL(closed_wait->code.load(),
-                      static_cast<int>(CloseStatus::Closed));
-
     guard.Unwind();
+}
+
+// ---------------------------------------------------------------------------
+// 7. 并发 Close + 在途工厂（R1 聚合根因）：工厂（ListenTCP）与两个 Close 调用
+//    者竞争时，Close 封口后必须等「在途工厂」归零才收口——工厂要么把 child 交接
+//    进托管集合（随即被 Close 物理关闭），要么在 sealed 路径自行物理关闭刚创建的
+//    fd 并归还容量。断言：两个 Close 调用者返回当刻都观察同一 Closed 终态、无在途
+//    工厂残留、任何被产出的 listener 都已物理关闭。多轮覆盖两种交错。
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(t_concurrent_close_tracks_inflight_factory) {
+    EnsureRuntime();
+    int failures = 0;
+    for (int iter = 0; iter < 30; ++iter) {
+        auto created = TransportRuntime::Create(Limits(4, 4));
+        if (!created) { ++failures; continue; }
+        auto owner = std::move(created).value();
+        if (!owner->Start()) { ++failures; continue; }
+
+        auto produced =
+            std::make_shared<std::shared_ptr<bbt::infra::CoTCPListener>>();
+        std::thread factory([&owner, produced] {
+            auto listener = owner->ListenTCP(SocketAddress{"127.0.0.1", 0}, 16);
+            if (listener) *produced = std::move(listener).value();
+        });
+        std::atomic_int closed_a{-1};
+        std::atomic_int closed_b{-1};
+        std::thread a([&owner, &closed_a] {
+            owner->Close();
+            closed_a.store(owner->IsClosed() ? 1 : 0);
+        });
+        std::thread b([&owner, &closed_b] {
+            owner->Close();
+            closed_b.store(owner->IsClosed() ? 1 : 0);
+        });
+        factory.join();
+        a.join();
+        b.join();
+
+        if (!owner->IsClosed()) ++failures;
+        if (TransportWiring::PendingFactoriesForTest(*owner) != 0) ++failures;
+        if (closed_a.load() != 1 || closed_b.load() != 1) ++failures;
+        if (*produced && !(*produced)->IsClosed()) ++failures;
+    }
+    BOOST_CHECK_MESSAGE(failures == 0,
+                        "在途工厂聚合收口失败轮数=" << failures
+                        << "（应为 0：Close 已封口并等在途工厂归零，无快照遗漏）");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

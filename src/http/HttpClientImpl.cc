@@ -1,7 +1,10 @@
 #include "http/HttpClientImpl.hpp"
 
+#include <sys/socket.h>
+
 #include <vector>
 
+#include <boost/asio/buffer.hpp>
 #include <boost/asio/connect.hpp>
 
 #include <bbt/coroutine/detail/Define.hpp>
@@ -16,6 +19,11 @@ namespace beast = boost::beast;
 namespace http  = boost::beast::http;
 using tcp       = asio::ip::tcp;
 
+namespace {
+// 每次非阻塞读的探测块大小（与读就绪等待配对，不做预读放大）。
+constexpr std::size_t kReadChunk = 4096;
+} // namespace
+
 ClientOp::ClientOp(const std::shared_ptr<HttpClientImpl>& owner_,
                    const std::shared_ptr<HttpIoEngine>&   engine_)
     : owner(owner_),
@@ -23,19 +31,23 @@ ClientOp::ClientOp(const std::shared_ptr<HttpClientImpl>& owner_,
       resolver(engine_->Io()),
       socket(engine_->Io()) {}
 
+// ------------------------------------------------------------------ 请求链
+
 void ClientOp::Begin(std::string host, std::uint16_t port) {
+    std::lock_guard<std::recursive_mutex> io_gate(engine->IoGate());
     if (finished || !owner->IsOpenForIo()) {
         Finish(result<HttpResponse>::err(
             MakeError(ErrorCode::Closed, "http client is closing")));
         return;
     }
-    parser.header_limit(
-        static_cast<std::uint32_t>(engine->Limits().max_header_bytes));
-    parser.body_limit(engine->Limits().max_body_bytes);
+    // 用户非阻塞态不在此建立：socket 尚未 open 时 non_blocking() 返回
+    // bad_descriptor 且不置位（B1）；真正 connect 成功后 socket 会被
+    // range async_connect close/reopen，位也必须在那之后重建，见 OnConnect。
 
     auto self = shared_from_this();
     // 先记账再发起：completion 可能同步回调。发起抛异常则立刻冲销。
     try {
+        op_armed = true;
         IoAsyncStart();
         resolver.async_resolve(
             std::move(host), std::to_string(port),
@@ -44,6 +56,7 @@ void ClientOp::Begin(std::string host, std::uint16_t port) {
                 self->OnResolve(ec, std::move(results));
             });
     } catch (...) {
+        op_armed = false;
         IoAsyncDone();
         Finish(result<HttpResponse>::err(
             MakeError(ErrorCode::InternalError,
@@ -54,6 +67,12 @@ void ClientOp::Begin(std::string host, std::uint16_t port) {
 
 void ClientOp::OnResolve(boost::system::error_code ec,
                          tcp::resolver::results_type  results) {
+    std::lock_guard<std::recursive_mutex> io_gate(engine->IoGate());
+    if (!op_armed) {
+        // Abort/Close 已在返回当刻记账：晚到空壳，不触碰 socket/资源。
+        return;
+    }
+    op_armed = false;
     IoAsyncDone();
     // resolver 完成项可能晚于 Abort/Finish 落定：已收口不再推进。
     if (finished)
@@ -65,12 +84,14 @@ void ClientOp::OnResolve(boost::system::error_code ec,
     }
     auto self = shared_from_this();
     try {
+        op_armed = true;
         IoAsyncStart();
         asio::async_connect(socket, results,
             [self](boost::system::error_code ec, const tcp::endpoint&) {
                 self->OnConnect(ec);
             });
     } catch (...) {
+        op_armed = false;
         IoAsyncDone();
         Finish(result<HttpResponse>::err(
             MakeError(ErrorCode::InternalError,
@@ -80,23 +101,54 @@ void ClientOp::OnResolve(boost::system::error_code ec,
 }
 
 void ClientOp::OnConnect(boost::system::error_code ec) {
+    std::lock_guard<std::recursive_mutex> io_gate(engine->IoGate());
+    if (!op_armed) {
+        // Abort/Close 已在返回当刻记账：晚到空壳。
+        return;
+    }
+    op_armed = false;
     IoAsyncDone();
     if (finished)
         return;
     if (ec) {
+        // B1-r2 共同根因：失败收口必须先物理释放再注销。range async_connect
+        // 在最后一个 endpoint 失败后 socket 仍处于 open 状态，request body 也
+        // 仍被本 op 持有；若直接 Finish，MaybeUnregister 会先把 op 移出
+        // owner m_ops，owner Close 的快照随即为空，socket/body 只能等 op 析构
+        // 才释放——违反「不能依赖析构」。故先同步 Abort（IoGate 递归可重入：
+        // 关 socket/resolver + ReleaseBuffers），再 Finish 落定逻辑终态。
+        Abort();
         Finish(result<HttpResponse>::err(
             ClassifyBackendError(ec, "http request: connect failed")));
         return;
     }
-    auto self = shared_from_this();
+    // B1 根因修复：range async_connect 会对每个 endpoint close/reopen
+    // socket，令 socket_ops 的 user_set_non_blocking 位丢失；Begin 里在
+    // 未 open 时设的位同样无效。真正连接成功后在此重建用户非阻塞态，
+    // 并检查失败——否则 send/receive(MSG_DONTWAIT) 拿到的 EAGAIN 会被
+    // Asio 在应用可见前吸收为阻塞 poll(-1) 并持 IoGate，ArmWait 不可达、
+    // Close 被阻塞。设置失败即安全收口，不进入写/读泵。
+    boost::system::error_code nb;
+    socket.non_blocking(true, nb);
+    if (nb) {
+        // B1-r2 父验收实证路径：此处 connect completion 已把 op_armed 清零、
+        // inflight 归零；若直接 Finish，MaybeUnregister 会先把 op 移出
+        // owner m_ops，owner Close 快照为空，fd 与 8MiB body 无人物理释放
+        // （实测 fd_result=0、body_bytes=8388608）。先在同一失败分支内同步
+        // Abort（关 socket/resolver + ReleaseBuffers），再 Finish：保证 op
+        // 离开 m_ops 前资源已物理释放。不进入 PumpWrite/PumpRead，错误码与
+        // 消息语义不变。
+        Abort();
+        Finish(result<HttpResponse>::err(
+            ClassifyBackendError(nb, "http request: set non-blocking failed")));
+        return;
+    }
     try {
-        IoAsyncStart();
-        http::async_write(socket, request,
-            [self](boost::system::error_code ec, std::size_t bytes) {
-                self->OnWritten(ec, bytes);
-            });
+        // 序列化器引用本 op 的 request：只在本门内、本次写生命周期内有效，
+        // 绝不借给任何 async_* 操作（Abort 可同步 reset）。
+        serializer.emplace(request);
+        PumpWrite();
     } catch (...) {
-        IoAsyncDone();
         Finish(result<HttpResponse>::err(
             MakeError(ErrorCode::InternalError,
                       "http request: write initiate failed")));
@@ -104,66 +156,180 @@ void ClientOp::OnConnect(boost::system::error_code ec) {
     }
 }
 
-void ClientOp::OnWritten(boost::system::error_code ec, std::size_t) {
-    IoAsyncDone();
+void ClientOp::PumpWrite() {
+    std::lock_guard<std::recursive_mutex> io_gate(engine->IoGate());
+    if (finished || !serializer)
+        return;
+    while (!serializer->is_done()) {
+        boost::system::error_code ec;
+        std::size_t             written = 0;
+        serializer->next(ec, [this, &written](boost::system::error_code& error,
+                                              const auto& buffers) {
+            written = socket.send(buffers, MSG_DONTWAIT | MSG_NOSIGNAL, error);
+        });
+        if (written != 0)
+            serializer->consume(written);
+        if (ec == asio::error::interrupted)
+            continue;
+        if (ec == asio::error::would_block || ec == asio::error::try_again) {
+            ArmWait(tcp::socket::wait_write);
+            return;
+        }
+        if (ec) {
+            Finish(result<HttpResponse>::err(
+                ClassifyBackendError(ec, "http request: send failed")));
+            return;
+        }
+        if (written == 0) {
+            // 无进展也无错误：等下一次可写就绪，不空转。
+            ArmWait(tcp::socket::wait_write);
+            return;
+        }
+    }
+    ArmRead();
+}
+
+void ClientOp::ArmRead() {
+    std::lock_guard<std::recursive_mutex> io_gate(engine->IoGate());
     if (finished)
         return;
-    if (ec) {
-        Finish(result<HttpResponse>::err(
-            ClassifyBackendError(ec, "http request: send failed")));
-        return;
-    }
-    auto self = shared_from_this();
-    try {
-        IoAsyncStart();
-        http::async_read(socket, buffer, parser,
-            [self](boost::system::error_code ec, std::size_t bytes) {
-                self->OnRead(ec, bytes);
-            });
-    } catch (...) {
-        IoAsyncDone();
-        Finish(result<HttpResponse>::err(
-            MakeError(ErrorCode::InternalError,
-                      "http request: read initiate failed")));
-        return;
-    }
-    // async_read 已真实发起（发起函数未抛）：此刻 read 完成项必然在途，
+    // 每条响应一份新解析器：上一份（若有）随上次落定丢弃。
+    parser.emplace();
+    parser->header_limit(
+        static_cast<std::uint32_t>(engine->Limits().max_header_bytes));
+    parser->body_limit(engine->Limits().max_body_bytes);
+    parser->eager(true);
+    ArmWait(tcp::socket::wait_read);
+    // 读就绪等待已真实武装（发起函数未抛）：此刻 read 完成项必然在途，
     // 只会被 Abort/close/对端写响应催出。测试 seam 在此刻通知，让测试
     // 能在冻结 strand 前确认「物理收口前名额仍占」的前提确实成立。
-    if (on_read_armed)
+    if (!finished && op_armed && on_read_armed)
         on_read_armed();
 }
 
-void ClientOp::OnRead(boost::system::error_code ec, std::size_t) {
+void ClientOp::ArmWait(tcp::socket::wait_type type) {
+    std::lock_guard<std::recursive_mutex> io_gate(engine->IoGate());
+    if (finished || op_armed)
+        return;
+    auto self = shared_from_this();
+    op_armed = true;
+    IoAsyncStart();
+    try {
+        socket.async_wait(type, [self, type](boost::system::error_code ec) {
+            self->OnIoReady(ec, type);
+        });
+    } catch (...) {
+        op_armed = false;
+        IoAsyncDone();
+        Finish(result<HttpResponse>::err(MakeError(ErrorCode::InternalError,
+            type == tcp::socket::wait_read ? "http request: read initiate failed"
+                                           : "http request: write initiate failed")));
+    }
+}
+
+void ClientOp::OnIoReady(boost::system::error_code ec,
+                         tcp::socket::wait_type     type) {
+    std::lock_guard<std::recursive_mutex> io_gate(engine->IoGate());
+    if (!op_armed) {
+        // Abort/Close 已在返回当刻记账：晚到空壳，不再触碰 socket/资源。
+        return;
+    }
+    op_armed = false;
     IoAsyncDone();
     if (finished)
         return;
     if (ec) {
-        // 不足一条完整消息：eof/reset/partial 一律为 Error，不伪造成成功。
-        Finish(result<HttpResponse>::err(
-            ClassifyBackendError(ec, "http request: incomplete or bad response")));
+        Finish(result<HttpResponse>::err(ClassifyBackendError(ec,
+            type == tcp::socket::wait_read
+                ? "http request: incomplete or bad response"
+                : "http request: send failed")));
         return;
     }
-    const auto& res = parser.get();
-    HttpResponse out;
-    out.status = res.result_int();
-    for (const auto& f : res.base())   // fields 按序枚举，重复头不折叠
-        out.headers.emplace_back(std::string(f.name_string()),
-                                 std::string(f.value()));
-    out.body = res.body();
-    boost::system::error_code ignored;
-    socket.close(ignored);
-    Finish(result<HttpResponse>::ok(std::move(out)));
+    try {
+        if (type == tcp::socket::wait_read)
+            PumpRead();
+        else
+            PumpWrite();
+    } catch (...) {
+        Finish(result<HttpResponse>::err(
+            MakeError(ErrorCode::InternalError,
+                      "http request: io pump failed")));
+    }
 }
 
+void ClientOp::PumpRead() {
+    std::lock_guard<std::recursive_mutex> io_gate(engine->IoGate());
+    if (finished || !parser)
+        return;
+    for (;;) {
+        if (buffer.size() != 0) {
+            boost::system::error_code ec;
+            const auto consumed = parser->put(buffer.data(), ec);
+            buffer.consume(consumed);
+            if (ec == http::error::need_more)
+                ec.clear();
+            if (ec) {
+                // 不足一条完整消息：eof/reset/partial 一律为 Error，
+                // 不伪造成成功。
+                Finish(result<HttpResponse>::err(ClassifyBackendError(
+                    ec, "http request: incomplete or bad response")));
+                return;
+            }
+            if (parser->is_done()) {
+                HttpResponse out;
+                const auto&  res = parser->get();
+                out.status = res.result_int();
+                for (const auto& f : res.base())   // fields 按序枚举
+                    out.headers.emplace_back(std::string(f.name_string()),
+                                             std::string(f.value()));
+                out.body = res.body();
+                boost::system::error_code ignored;
+                socket.close(ignored);
+                Finish(result<HttpResponse>::ok(std::move(out)));
+                return;
+            }
+        }
+        boost::system::error_code ec;
+        const auto space = buffer.prepare(kReadChunk);
+        if (asio::buffer_size(space) == 0) {
+            Finish(result<HttpResponse>::err(
+                MakeError(ErrorCode::InternalError,
+                          "http request: read buffer limit")));
+            return;
+        }
+        const auto received = socket.receive(space, MSG_DONTWAIT, ec);
+        buffer.commit(received);
+        if (ec == asio::error::would_block || ec == asio::error::try_again) {
+            ArmWait(tcp::socket::wait_read);
+            return;
+        }
+        if (ec == asio::error::interrupted)
+            continue;
+        if (ec) {
+            Finish(result<HttpResponse>::err(ClassifyBackendError(
+                ec, "http request: incomplete or bad response")));
+            return;
+        }
+        if (received == 0) {
+            // 对端 FIN 且无完整消息：按不完整响应收口（不伪造成成功）。
+            Finish(result<HttpResponse>::err(ClassifyBackendError(
+                asio::error::eof,
+                "http request: incomplete or bad response")));
+            return;
+        }
+    }
+}
+
+// ------------------------------------------------------------------ 收口
+
 void ClientOp::Finish(result<HttpResponse> r) noexcept {
-    // 首个落定者独占 outcome 写入与 Complete；完成/取消/deadline/
+    // 首个落定者独占 outcome 写入与 Notify；完成/取消/deadline/
     // owner close 竞争时先到者的逻辑终态不被覆盖（契约 §128）。
     if (finished.exchange(true))
         return;
     outcome = std::move(r);
     MaybeUnregister();
-    sig->Complete();
+    waiter->Notify();
 }
 
 void ClientOp::IoAsyncDone() {
@@ -178,7 +344,28 @@ void ClientOp::MaybeUnregister() {
         owner->UnregisterOp(shared_from_this());
 }
 
+void ClientOp::ReleaseBuffers() noexcept {
+    // 冻结契约 §6：丢弃未发送数据并同步释放本 op 载荷。
+    // 顺序：serializer（引用 request）→ request body → parser → flat_buffer。
+    // 以上都不被任何在途完成项引用（在途的只有 socket/resolver 的就绪/组合
+    // 操作壳），因此此处释放不会造成悬垂。
+    serializer.reset();
+    // 与空串交换：O(1) 且确定性地把旧缓冲交还给临时对象析构释放
+    // （clear()+shrink_to_fit() 的容量回收是实现自定义的非绑定请求）。
+    std::string().swap(request.body());
+    parser.reset();
+    buffer.clear();
+    buffer.shrink_to_fit();
+}
+
 void ClientOp::Abort() noexcept {
+    std::lock_guard<std::recursive_mutex> io_gate(engine->IoGate());
+    // 返回当刻记账被中止的完成项：它们的完成项仍会到达一次，但只消费空壳
+    // （OnResolve/OnConnect/OnIoReady 的 !op_armed 分支），不再触碰资源。
+    if (op_armed) {
+        op_armed = false;
+        IoAsyncDone();
+    }
     boost::system::error_code ec;
     // resolver::cancel 无 error_code 重载且未标 noexcept：
     // noexcept 边界内必须兜底，避免异常逃逸成 terminate。
@@ -187,11 +374,14 @@ void ClientOp::Abort() noexcept {
     } catch (...) {
     }
     socket.close(ec);
+    ReleaseBuffers();
 }
+
+// ------------------------------------------------------------------ Client
 
 result<HttpResponse> HttpClientImpl::Request(HttpRequest request,
                                              const CallOptions& options) {
-    // N-02：非协程上下文明确拒绝；完成信号只支持协程内等待。
+    // N-02：非协程上下文明确拒绝；请求等待只在协程上下文有意义。
     if (g_bbt_tls_coroutine_co == nullptr)
         return result<HttpResponse>::err(MakeError(ErrorCode::InvalidContext,
             "HttpClient::Request must run in coroutine context"));
@@ -229,18 +419,11 @@ result<HttpResponse> HttpClientImpl::Request(HttpRequest request,
         slot.Arm();                     // admit 成功：guard 接管归还责任
     }
 
-    std::shared_ptr<bbt::coroutine::CompletionSignal> sig;
-    try {
-        sig = std::make_shared<bbt::coroutine::CompletionSignal>();
-    } catch (const std::logic_error&) {
-        return result<HttpResponse>::err(MakeError(ErrorCode::RuntimeUnavailable,
-            "coroutine runtime generation unavailable"));
-    }
-
+    auto waiter = bbt::coroutine::sync::CoWaiter::Create();
     auto op = std::make_shared<ClientOp>(
         std::static_pointer_cast<HttpClientImpl>(shared_from_this()),
         m_engine);
-    op->sig = sig;
+    op->waiter = waiter;
     // op 与 guard 持有同一份 release：RegisterOp 成功后 Disarm 解除
     // guard 兜底责任，op 物理收口时经 on_unregister 归还；admit 为空
     // （不接 owner 预算）时 release 恒空，行为与基线一致。
@@ -260,66 +443,98 @@ result<HttpResponse> HttpClientImpl::Request(HttpRequest request,
     breq.keep_alive(false);
     breq.prepare_payload();
 
-    // 登记先于 post：与 RequestClose 竞态的提交也能被 teardown 明确拒绝，
-    // 不会因 io 域已封而漏通知等待者（见 TeardownOnIoDomain 的 io_dead）。
     auto self = std::static_pointer_cast<HttpClientImpl>(shared_from_this());
-    if (!self->RegisterOp(op)) {
-        // op 未进 m_ops，不会经 UnregisterOp 归还名额——guard 析构归还。
-        return result<HttpResponse>::err(
-            MakeError(ErrorCode::Closed, "http client closed"));
-    }
-    // RegisterOp 成功：名额所有权转交 op->on_unregister（物理收口时归还），
-    // 解除本作用域的回退责任。
-    slot.Disarm();
-    const std::string host = parsed.value().host;
+    const std::string   host = parsed.value().host;
     const std::uint16_t port = parsed.value().port;
-    if (!m_engine->TryPost([op, host, port]() mutable {
-            op->Begin(std::move(host), port);
-        })) {
-        // io 域已封：op 已被 teardown 收口（Finish 幂等），直接落定 Closed。
-        op->Finish(result<HttpResponse>::err(
-            MakeError(ErrorCode::Closed, "http client closed")));
-        return result<HttpResponse>::err(
-            MakeError(ErrorCode::Closed, "http client closed"));
-    }
 
+    // 契约 §2 请求完成范式：先登记等待事件 → 再执行一次投递回调 → 随后挂起。
+    // on_registered 在事件登记成功后、协程真正 park 前调用：其内同步登记
+    // op 并投递 Begin（登记先于 post，Close 与提交竞态也能被明确拒绝）。
+    // Begin 若在该窗口内落定，Notify 走 PENDING 早到路径，不丢唤醒。
     bbt::coroutine::WaitOptions wait;
     wait.deadline = options.deadline;
-    wait.cancel   = options.cancel;
-    const auto status = sig->Wait(wait);
+    const auto status = waiter->WaitWithCallback(
+        wait, [this, &slot, self, op, host, port]() mutable -> bool {
+            if (!self->RegisterOp(op)) {
+                // op 未进 m_ops，不会经 UnregisterOp 归还名额——guard
+                // 析构归还（slot 未 Disarm）。
+                op->Finish(result<HttpResponse>::err(
+                    MakeError(ErrorCode::Closed, "http client closed")));
+                // 仍返回 true：事件已登记，Finish 的 Notify 走 PENDING
+                // 早到路径立即兑现，恢复后按 Completed 读 Closed 终态。
+                return true;
+            }
+            // RegisterOp 成功：名额所有权转交 op->on_unregister（物理
+            // 收口时归还），解除本作用域的回退责任。
+            slot.Disarm();
+            if (!m_engine->TryPost([op, host, port]() mutable {
+                    op->Begin(std::move(host), port);
+                })) {
+                // io 域已封：op 由收口路径接管（Finish 幂等），直接落定 Closed。
+                op->Finish(result<HttpResponse>::err(
+                    MakeError(ErrorCode::Closed, "http client closed")));
+            }
+            return true;
+        });
     if (status == bbt::coroutine::WaitStatus::Completed) {
-        // outcome 已由 Finish 写入；Complete/Wait 经同一互斥建立可见性。
+        // outcome 已由 Finish 写入；Notify 与 Wait 经等待位建立可见性。
         return std::move(*op->outcome);
     }
     // 逻辑结果先行返回；物理清理继续：io 域中止后端 op。
-    // TryPost 失败说明引擎已封，op 已由 teardown 收口，无需再投递。
-    m_engine->TryPost([op] { op->Abort(); });
+    // Abort 在返回当刻记账被中止的等待项并同步释放 op 载荷，故必须同时落定
+    // 逻辑终态，否则 op 会以 finished=false 留在 m_ops（配额与账面无法归还）；
+    // 终态与旧实现经「被中止完成项 → Finish(Cancelled)」得到的语义一致。
+    // TryPost 失败说明引擎已封，op 已由收口路径落定，无需再投递。
+    m_engine->TryPost([op] {
+        op->Abort();
+        op->Finish(result<HttpResponse>::err(
+            MakeError(ErrorCode::Cancelled,
+                      "request wait ended before completion")));
+    });
     return result<HttpResponse>::err(WaitStatusToError(status));
 }
 
-void HttpClientImpl::RequestClose() noexcept {
-    if (!m_close.BeginClose())
-        return;
-    auto self = std::static_pointer_cast<HttpClientImpl>(shared_from_this());
-    // TryPost 失败两种情形：引擎已封 ⇒ teardown 必然已执行过（引擎只有
-    // 在全部子对象 Closed 后才封口），兜底路径幂等无害；post 抛异常/
-    // 引擎未启动 ⇒ 无法再进 io 域，改走逻辑收口 + 计数门控。
-    if (!m_engine->TryPost([self] { self->TeardownOnIoDomain(); }))
-        self->TeardownOffDomain();
+void HttpClientImpl::Close() noexcept {
+    // 先封口再投递 teardown：任何线程进入 Close 都立即拒绝新 op，
+    // 「Close 返回后不再有新 I/O 发起」不依赖 io 域的调度时延。
+    // 封口先于 teardown：任何线程进入 Close 都立即拒绝新 op，「Close
+    // 返回后不再有新 I/O 发起」不依赖 io 域的调度时延。
+    m_close.BeginClose();
+    {
+        std::lock_guard<std::mutex> lk(m_ops_mtx);
+        m_io_dead = true;
+    }
+    // 物理 teardown 必须在返回前真实发生（契约：返回即 op 的 socket/
+    // resolver 已释放、后端不再访问）。不再「投递到 strand 并信任调度」：
+    // 手动 Tick 模式下 strand 无独立驱动线程，投递的 teardown 不会被执行。
+    // 本调用经 Engine()->IoGate() 与 io 域 handler 串行，故可安全地在调用
+    // 线程内同步执行；同线程嵌套由可递归门承接，不等待自身推进。
+    TeardownOnIoDomain();
+    // 有界等待在途 op 归零（≤ detail::kCloseDrainTimeout）：计数由 completion
+    // 落定驱动，本线程只在自身锁 + condition_variable 上等，让返回时尽量
+    // 安静。这不是物理释放判据——teardown 已 Abort 掉 op 的 socket/resolver，
+    // 并同步释放了 op 载荷。
+    {
+        std::unique_lock<std::mutex> lk(m_ops_mtx);
+        m_drain_cv.wait_for(lk, bbt::infra::detail::kCloseDrainTimeout,
+                            [this] { return m_ops.empty(); });
+    }
+    // 物理释放落定：判据是 teardown 已在返回前真实执行（不再依赖 post 成功
+    // 或逻辑计数为 0）；不因等待超时假造 Closed。
+    m_close.MarkClosed();
 }
 
 void HttpClientImpl::TeardownOnIoDomain() noexcept {
-    if (m_close.IsClosed())
-        return;
-    // 快照后在锁外逐个收口：Abort 催在途完成项落定；Finish 让可能仍
-    // 在 Wait 的调用者以 Closed 落定。io_dead 先于快照置位，此后
-    // RegisterOp 一律失败，无漏网 op。
-    // 注意：Abort/Finish 都不等于后端完成项已执行——MarkClosed 由
-    // 「m_io_dead 且 m_ops 空」门控，在途完成项经 IoAsyncDone 归零后
-    // 才允许落定（§Closed 契约：后端不再访问 op 资源）。
+    // 域门内执行：与 io 域 handler 串行（Abort 触碰 socket/resolver）。
+    std::lock_guard<std::recursive_mutex> io_gate(m_engine->IoGate());
+    // 快照后在锁外逐个收口：Abort 计入被中止的等待项并同步释放 op 载荷，
+    // 使计数在返回当刻归零（§Closed 契约：后端不再访问 op 资源）。
     std::vector<std::shared_ptr<ClientOp>> snapshot;
     {
         std::lock_guard<std::mutex> lk(m_ops_mtx);
+        if (m_teardown_snapshotted)
+            return;
+        m_teardown_snapshotted = true;
         m_io_dead = true;
         snapshot.assign(m_ops.begin(), m_ops.end());
     }
@@ -328,37 +543,7 @@ void HttpClientImpl::TeardownOnIoDomain() noexcept {
         op->Finish(result<HttpResponse>::err(
             MakeError(ErrorCode::Closed, "http client closed")));
     }
-    DrainCheckClosed();
-}
-
-void HttpClientImpl::TeardownOffDomain() noexcept {
-    // 投递失败的兜底：socket/resolver 只许 io 域触碰，故不能 Abort；
-    // 仅逻辑收口已登记 op（Finish 本就支持跨线程），在途完成项自然
-    // 落定后经计数门控汇合 MarkClosed。
-    std::vector<std::shared_ptr<ClientOp>> snapshot;
-    {
-        std::lock_guard<std::mutex> lk(m_ops_mtx);
-        if (m_io_dead) {
-            // teardown 已执行（io 域或本路径重复进入），不再重复收口。
-            return;
-        }
-        m_io_dead = true;
-        snapshot.assign(m_ops.begin(), m_ops.end());
-    }
-    for (auto& op : snapshot)
-        op->Finish(result<HttpResponse>::err(
-            MakeError(ErrorCode::Closed, "http client closed")));
-    DrainCheckClosed();
-}
-
-void HttpClientImpl::DrainCheckClosed() noexcept {
-    bool fin;
-    {
-        std::lock_guard<std::mutex> lk(m_ops_mtx);
-        fin = m_io_dead && m_ops.empty();
-    }
-    if (fin)
-        m_close.MarkClosed();
+    m_drain_cv.notify_all();
 }
 
 } // namespace bbt::infra::http_detail

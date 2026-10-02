@@ -15,7 +15,7 @@ set_tests_properties(tcp.loopback PROPERTIES TIMEOUT 30)
 # （NetworkRuntime 实现在 HTTP 切片内）。覆盖未 Start 拒绝、容量门禁
 # Overloaded、数值直连闭环与关闭后容量释放。
 # Issue #32：另加 max_inflight 验收矩阵——共享账本跨 listener/UDP、
-# DialTCP 终态归还、Stop/Start 代际、未托管入口豁免；直接驱动 impl 层
+# 受管 DialTCP 等待段在途/终态归还、未托管入口豁免；直接驱动 impl 层
 # 读取账本探针，需要 src/ 内部头 include 路径——仅本目标可见。
 add_executable(Test_tcp_runtime_factory Test_tcp_runtime_factory.cc)
 target_include_directories(Test_tcp_runtime_factory PRIVATE
@@ -59,7 +59,7 @@ endif()
 
 # 实测 detail::CoPollEvent 单事件上 FD readable + custom wakeup + timeout
 # 组合的确定性四场景。使用 detail 非稳定头与非公开组合路径，仅用于能力裁决，
-# 不作为生产 IoWait 实现依据；不涉及 Stop 安全断言。
+# 不作为生产 IoWait 实现依据；不涉及关闭/Stop 安全断言（新契约已无 Stop）。
 add_executable(Test_iowait_probe Test_iowait_probe.cc)
 target_link_libraries(Test_iowait_probe PRIVATE bbt::infra_common)
 target_compile_options(Test_iowait_probe PRIVATE -Wall -Wextra)
@@ -75,7 +75,7 @@ target_compile_options(Test_config_unit PRIVATE -Wall -Wextra)
 add_test(NAME config.unit COMMAND Test_config_unit)
 set_tests_properties(config.unit PROPERTIES TIMEOUT 60)
 
-# watch：初始/去重/更新、关闭后不再回调、失败/恢复、正常 drain 与强制 Stop 资源边界。
+# watch：初始/去重/更新、关闭后不再回调、失败/恢复、Close 停止轮询并释放源。
 add_executable(Test_config_watch Test_config_watch.cc)
 target_link_libraries(Test_config_watch PRIVATE
     bbt::infra_config Boost::boost Threads::Threads)
@@ -94,8 +94,9 @@ target_compile_options(Test_http_loopback PRIVATE -Wall -Wextra)
 add_test(NAME http.loopback COMMAND Test_http_loopback)
 set_tests_properties(http.loopback PROPERTIES TIMEOUT 60)
 
-# N1b-2：取消与关闭完整语义（在途 token 寿命、取消源、逻辑/物理
-# 清理分离、诚实 WaitClosed、drain 顺序）。
+# N1b-2：关闭与终态交付语义（owner 主动同步 Close()；未发送请求丢弃；
+# 已发送请求在 Close 后立即终态；迟到响应只消费不再交付；每请求只交付一次
+# 终态；已接纳 handler 不被抢占；不用 Scheduler::Stop 做隔离或验收）。
 add_executable(Test_http_lifecycle Test_http_lifecycle.cc)
 target_link_libraries(Test_http_lifecycle
     PRIVATE bbt::infra_http Boost::boost Threads::Threads)
@@ -213,40 +214,14 @@ if(TARGET bbt_infra_rpc)
     target_compile_options(bbt_rpc_wire_peer PRIVATE -Wall -Wextra)
 endif()
 
-# --- P4-B 硬停 quiescence（对象级，未托管对象）：Scheduler::Stop() 返回后强制
-# 物理关闭与 closed_hook 一次性。装配接缝与测试 gate 经 src 内部装配面
-# （detail::TransportWiring）调用——公共头已不承载它们（P4-C）。
-add_executable(Test_hardstop_quiescence Test_hardstop_quiescence.cc)
-target_include_directories(Test_hardstop_quiescence PRIVATE
-    ${CMAKE_SOURCE_DIR}/src)   # detail/TransportWiring.hpp
-target_link_libraries(Test_hardstop_quiescence
-    PRIVATE bbt::infra_tcp bbt::infra_udp Boost::boost Threads::Threads)
-target_compile_options(Test_hardstop_quiescence PRIVATE -Wall -Wextra)
-add_test(NAME hardstop.quiescence COMMAND Test_hardstop_quiescence)
-set_tests_properties(hardstop.quiescence PROPERTIES TIMEOUT 60)
+# --- 硬停 quiescence / owner 收口两项旧语义用例（Scheduler::Stop 之后经
+# ForceCloseAfterQuiescence 强制收口）随 Stop 语义一起删除：新契约下 runtime
+# 进程寿命常驻、Close 同步收口，已无「硬停后强制关闭」入口，不再保留目标。
 
-# --- P4 owner 硬停收口：协议 owner（NetworkRuntimeImpl）批量强制关闭受管
-# transport，并验证托管链在硬停后收敛（transport IsClosed + 协议 owner IsClosed）。
-# 覆盖 listener / accepted TCP / UDP 三种受管对象与 WaitClosed 的硬停后实测口径。
-add_executable(Test_hardstop_owner_convergence Test_hardstop_owner_convergence.cc)
-target_include_directories(Test_hardstop_owner_convergence PRIVATE
-    ${CMAKE_SOURCE_DIR}/src)   # detail/TransportWiring.hpp、http/NetworkRuntimeImpl.hpp
-target_link_libraries(Test_hardstop_owner_convergence
-    PRIVATE bbt::infra_http bbt::infra_tcp bbt::infra_udp
-            Boost::boost Threads::Threads)
-target_compile_options(Test_hardstop_owner_convergence PRIVATE -Wall -Wextra)
-add_test(NAME hardstop.owner_convergence COMMAND Test_hardstop_owner_convergence)
-set_tests_properties(hardstop.owner_convergence PROPERTIES TIMEOUT 120)
-
-# --- Issue #31 收尾验收缺口：此前无直接证据的两项。
-#   A. RequestClose 紧邻 Scheduler::Stop 后的收口不变量（fd 级关闭 / 容量归零 /
-#      owner 落定 / 幂等），并记录该竞态的落点。注意：本用例不保证构造出
-#      「owner 已封口且对象未落定」状态——被唤醒的 op 是否来得及恢复执行不受
-#      现有接缝控制（实测落点见运行输出 BOOST_TEST_MESSAGE）。
-#   B. DNS 在途到期（非调用前已过期）。晚到结果只能间接验证：名额不重复归还
-#      且 DNS 通道仍可用；本用例未直接观察 worker 侧「丢弃晚到结果」的分支。
-# 需要 src 内部装配面（等待段/DNS 扣持接缝）与协议 owner 的 dial 等待入口，
-# 故与 hardstop.owner_convergence 同形链接 infra_http + tcp + udp。
+# --- Issue #31 收尾验收缺口剩余项：DNS 在途到期（非调用前已过期）。
+# 晚到结果只能间接验证：名额不重复归还且 DNS 通道仍可用；本用例未直接观察
+# worker 侧「丢弃晚到结果」的分支。需要 src 内部装配面（DNS 扣持接缝）与协议
+# owner 的 dial 等待入口，故链接 infra_http + tcp + udp。
 add_executable(Test_transport_acceptance Test_transport_acceptance.cc)
 target_include_directories(Test_transport_acceptance PRIVATE
     ${CMAKE_SOURCE_DIR}/src)

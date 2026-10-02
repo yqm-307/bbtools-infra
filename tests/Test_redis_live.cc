@@ -11,6 +11,10 @@
 //   BBT_REDIS_RCLI='... exec -T redis redis-cli' 容器内 redis-cli 命令
 //     前缀（WRONGTYPE 种子用），缺省则跳过 t_server_error。
 //
+// 关闭语义（进程寿命修订）：Close() 幂等、任意线程可调用，返回即封口且
+// 在途 operation/connection 归零；IsClosed() 只读查询。无 RequestClose/
+// WaitClosed/CloseStatus。
+//
 // 并发上限 32、单命令 deadline <=2s、套件总预算有界。
 
 #define BOOST_TEST_DYN_LINK
@@ -139,6 +143,12 @@ std::shared_ptr<CoRedisCli> NewLiveClient() {
     return cli;
 }
 
+// 显式 Close 并断言物理收口（封口 + 在途归零 + 连接回收）。
+void CloseAndCheck(const std::shared_ptr<CoRedisCli>& cli) {
+    cli->Close();
+    BOOST_CHECK(cli->IsClosed());
+}
+
 // 生成二进制安全 payload：含 NUL、0xFF、多字节与可变长度。
 std::string BinaryPayload(int seed) {
     std::string v;
@@ -173,13 +183,8 @@ struct RequireLiveEnv {
 };
 BOOST_GLOBAL_FIXTURE(RequireLiveEnv);
 
-// 与 redis.unit 同理：~Scheduler→Stop 会经 Processer::Stop→sleep_for→
-// nanosleep 命中 coroutine 自身 Hook 断言（基线竞态）。套件收尾释放单例
-// 所有权，使进程退出不再触发 Stop 路径。
-struct SuiteTeardown {
-    ~SuiteTeardown() { g_scheduler.release(); }
-};
-BOOST_GLOBAL_FIXTURE(SuiteTeardown);
+// 进程寿命运行时：无 Stop/restart；实例持有者被 coroutine 故意泄漏，
+// 静态退出期不析构 Scheduler，测试侧不做任何 Stop 收尾。
 
 BOOST_AUTO_TEST_SUITE(redis_live)
 
@@ -188,7 +193,7 @@ BOOST_AUTO_TEST_CASE(t_setup_scheduler) {
     cfg->m_cfg_static_thread_num = 4;
     cfg->m_cfg_stack_size        = 1024 * 256;
     g_scheduler->Start(SCHE_START_OPT_SCHE_THREAD);
-    BOOST_REQUIRE(g_scheduler->IsRunning());
+    BOOST_REQUIRE(g_scheduler->IsInitialized());
     g_prepared.store(true);
 }
 
@@ -242,13 +247,7 @@ BOOST_AUTO_TEST_CASE(t_ping_and_binary_kv) {
         [&] { ex2.emplace(cli->Exists(key, Opt())); }));
     BOOST_REQUIRE(ex2 && *ex2 && !ex2->value());
 
-    cli->RequestClose();
-    std::atomic<CloseStatus> st{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        st.store(cli->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(10), {}));
-    }));
-    BOOST_CHECK(st.load() == CloseStatus::Closed);
+    CloseAndCheck(cli);
 }
 
 BOOST_AUTO_TEST_CASE(t_server_error) {
@@ -272,13 +271,7 @@ BOOST_AUTO_TEST_CASE(t_server_error) {
     BOOST_CHECK_EQUAL(bad->error().domain_code, "WRONGTYPE");
     Sys(EnvOr("BBT_REDIS_RCLI"), "DEL bbt:test:wrongtype");
 
-    cli->RequestClose();
-    std::atomic<CloseStatus> st{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        st.store(cli->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(10), {}));
-    }));
-    BOOST_CHECK(st.load() == CloseStatus::Closed);
+    CloseAndCheck(cli);
 }
 
 BOOST_AUTO_TEST_CASE(t_concurrent_smoke_32) {
@@ -327,13 +320,7 @@ BOOST_AUTO_TEST_CASE(t_concurrent_smoke_32) {
     BOOST_CHECK_EQUAL(errors.load(), 0);
     BOOST_CHECK_EQUAL(mismatches.load(), 0);
 
-    cli->RequestClose();
-    std::atomic<CloseStatus> st{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        st.store(cli->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(10), {}));
-    }));
-    BOOST_CHECK(st.load() == CloseStatus::Closed);
+    CloseAndCheck(cli);
 }
 
 BOOST_AUTO_TEST_CASE(t_reconnect) {
@@ -392,13 +379,7 @@ BOOST_AUTO_TEST_CASE(t_reconnect) {
         [&] { del.emplace(cli->Delete({key}, Opt())); }));
     BOOST_REQUIRE(del && *del && del->value() == 1u);
 
-    cli->RequestClose();
-    std::atomic<CloseStatus> st{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        st.store(cli->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(10), {}));
-    }));
-    BOOST_CHECK(st.load() == CloseStatus::Closed);
+    CloseAndCheck(cli);
 }
 
 BOOST_AUTO_TEST_CASE(t_server_down_fails) {
@@ -413,7 +394,7 @@ BOOST_AUTO_TEST_CASE(t_server_down_fails) {
     BOOST_REQUIRE(!*out);
     BOOST_CHECK(out->error().code == ErrorCode::TransportError ||
                 out->error().code == ErrorCode::Unavailable);
-    cli->RequestClose();
+    CloseAndCheck(cli);
 }
 
 BOOST_AUTO_TEST_CASE(t_close_drains_inflight) {
@@ -423,8 +404,8 @@ BOOST_AUTO_TEST_CASE(t_close_drains_inflight) {
     }
     auto cli = NewLiveClient();
 
-    // 16 个并发命令在途时 owner close：全部落定且 WaitClosed→Closed，
-    // 逻辑结果只能是 ok/Closed 之一，不得悬挂。
+    // 16 个并发命令在途时 owner Close()：全部落定，逻辑结果只能是
+    // ok/Closed 之一，不得悬挂；Close 返回即在途归零。
     constexpr int   kOps = 16;
     std::atomic_int done{0};
     std::atomic_int settled{0};
@@ -442,16 +423,10 @@ BOOST_AUTO_TEST_CASE(t_close_drains_inflight) {
         BOOST_REQUIRE(succ);
     }
     SleepMs(30);
-    cli->RequestClose();
+    cli->Close();
     BOOST_REQUIRE(WaitUntil([&] { return done.load() == kOps; }));
     BOOST_CHECK_EQUAL(settled.load(), kOps);
 
-    std::atomic<CloseStatus> st{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        st.store(cli->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(10), {}));
-    }));
-    BOOST_CHECK(st.load() == CloseStatus::Closed);
     BOOST_CHECK(cli->IsClosed());
 }
 
@@ -482,13 +457,7 @@ BOOST_AUTO_TEST_CASE(t_fresh_client_after_restart) {
         [&] { del.emplace(cli->Delete({key}, Opt())); }));
     BOOST_REQUIRE(del && *del && del->value() == 1u);
 
-    cli->RequestClose();
-    std::atomic<CloseStatus> st{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        st.store(cli->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(10), {}));
-    }));
-    BOOST_CHECK(st.load() == CloseStatus::Closed);
+    CloseAndCheck(cli);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

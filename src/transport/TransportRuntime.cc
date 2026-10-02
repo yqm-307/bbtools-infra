@@ -5,6 +5,8 @@
 #include <utility>
 
 #include <bbt/coroutine/object/CoObject.hpp>
+#include <bbt/coroutine/detail/Define.hpp>
+#include <bbt/coroutine/detail/Scheduler.hpp>   // g_scheduler->IsInitialized（运行时是否在跑）
 
 #include "detail/IoSupport.hpp"
 
@@ -20,29 +22,20 @@ void ReleaseTransportSlot(std::mutex& mtx, std::size_t& count) noexcept {
     if (count > 0) --count;
 }
 
-// P4 硬停批量关闭的对象分派：受管 child 集合只由三个工厂产生
-// （DialTCP / ListenTCP / BindUDP），故三个分支穷尽；返回是否在本次调用完成
-// 物理关闭。分派走 RTTI 而非新增公共虚槽位——硬停入口不是协议消费者的 API。
-bool ForceCloseChild(ICoCloseable& child) noexcept {
-    // 对象级入口是 private 内部装配面（见其注释），故经 friend 转发器调用。
-    if (auto* conn = dynamic_cast<tcp::CoTCP*>(&child))
-        return detail::TransportWiring::ForceCloseAfterQuiescence(*conn);
-    if (auto* listener = dynamic_cast<tcp::CoTCPListener*>(&child))
-        return detail::TransportWiring::ForceCloseAfterQuiescence(*listener);
-    if (auto* socket = dynamic_cast<udp::CoUDP*>(&child))
-        return detail::TransportWiring::ForceCloseAfterQuiescence(*socket);
-    return false;   // 受管集合不含其他类型（三个工厂是唯一来源）
+// coroutine 运行时是否在跑：进程寿命运行时只有「已初始化」一种活态，不再有
+// 运行时代际。
+bool RuntimeRunning() noexcept {
+    return g_scheduler != nullptr && g_scheduler->IsInitialized();
 }
 
 } // namespace
 
 result<void> TransportRuntimeImpl::Start() {
-    // 对象身份、完成信号与工厂门禁都要绑运行时代际：Scheduler 未启动或
-    // 属于其他代际时本 owner 不可用。
-    const auto gen = bbt::coroutine::CurrentRuntimeGeneration();
-    if (gen == 0 || gen != m_info.generation)
+    // 对象身份与工厂门禁的前置条件是「coroutine 运行时已初始化」（不再有
+    // 运行时代际）。
+    if (!RuntimeRunning())
         return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable,
-            "scheduler not running or runtime generation mismatch"));
+            "coroutine runtime not initialized"));
 
     int expected = kCreated;
     if (!m_state.compare_exchange_strong(expected, kRunning))
@@ -64,13 +57,11 @@ result<void> TransportRuntimeImpl::CheckUsableForFactory() const {
     if (!m_close.IsOpen())
         return result<void>::err(
             MakeError(ErrorCode::Closed, "transport runtime is closing or closed"));
-    // §4.0.1.7（Issue #32）：工厂同样受运行时代际门禁——Stop→Start 后旧代际
-    // owner 不得再产出新对象（对象钉住当前代际，跨代交付只会产出入场即失败的
-    // 对象）。
-    const auto gen = bbt::coroutine::CurrentRuntimeGeneration();
-    if (gen == 0 || gen != m_info.generation)
+    // §4.0.1.7（Issue #32）：工厂同样受运行时可用性门禁——运行时未初始化时
+    // 不再产出新对象（对象钉住运行时的等待基础设施）。
+    if (!RuntimeRunning())
         return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable,
-            "transport runtime belongs to another runtime generation"));
+            "coroutine runtime not initialized"));
     return result<void>::ok();
 }
 
@@ -86,7 +77,23 @@ result<void> TransportRuntimeImpl::ReserveConnectionSlot(
         return result<void>::err(MakeError(ErrorCode::Overloaded,
             std::string(factory) + ": max_connections exceeded"));
     ++m_transport_count;
+    // R1：与容量名额同临界区登记「在途工厂」。此后到 EndFactory 之间 fd 可能
+    // 已创建但尚未交接 child，Close 必须等该计数归零才收口，不能快照遗漏。
+    ++m_pending_factories;
     return result<void>::ok();
+}
+
+// R1：工厂每一条返回路径注销在途工厂（与 ReserveConnectionSlot 配对），随后
+// 重判终态。仅注销，不释放容量名额——名额由 ReleaseTransportSlot 或 child
+// 物理关闭落定（ClosedHook）负责。
+void TransportRuntimeImpl::EndFactory() noexcept {
+    {
+        std::lock_guard<std::mutex> lk(m_transport_mtx);
+        if (m_pending_factories > 0)
+            --m_pending_factories;
+        m_pending_cv.notify_all();
+    }
+    MaybeMarkClosed();
 }
 
 result<std::shared_ptr<CoTCP>> TransportRuntimeImpl::DialTCP(
@@ -110,33 +117,17 @@ result<std::shared_ptr<CoTCP>> TransportRuntimeImpl::DialTCP(
     // connect 等待）占一个在途名额；容量满立即 Overloaded，不排队不挂起。
     if (!m_inflight_quota->TryAdmit()) {
         ReleaseTransportSlot(m_transport_mtx, m_transport_count);
-        MaybeMarkClosed();
+        EndFactory();
         return result<std::shared_ptr<CoTCP>>::err(MakeError(
             ErrorCode::Overloaded, "DialTCP: max_inflight exceeded"));
     }
 
-    // Issue #32 F2：等待段名额不能依赖协程栈 RAII——Scheduler::Stop 对挂起
-    // 协程直接销毁、不展开栈，栈上任何局部对象都不会析构。因此「未完成 dial」
-    // 的归还职责放在本 owner 的堆对象上：permit 由 m_dial_permits 强持有
-    // （不是栈上局部），正常终态（等待段落定、dial 返回）由协程返回后移除并
-    // 归还；RequestClose() 对每个未完成 dial Fail() 归还并唤醒其等待段；
-    // owner 析构时成员析构（~DialWaitPermit）归还剩余。栈上只保留弱引用观察
-    // 终态。
-    auto dial_cancel = std::make_shared<bbt::coroutine::CancellationSource>();
-    auto permit = std::make_shared<detail::DialWaitPermit>(
-        [quota = m_inflight_quota] { quota->Release(); });
-    {
-        std::lock_guard<std::mutex> lk(m_transport_mtx);
-        if (!m_transport_sealed) {
-            m_dial_cancels.push_back(dial_cancel);
-            m_dial_permits.push_back(permit);
-        }
-    }
-
+    // 等待段接缝：owner 级关闭唤醒登记——owner->Close() 唤醒挂起的 connect
+    // 等待段，使 dial 尽快走正常返回路径归还容量/名额；等待段挂起落定回调
+    // 仅供测试确定性观察。DNS 等待段的封口响应由调用方 deadline 界定（上游
+    // AwaitBounded 内部 waiter 外部不可 Notify）。
     detail::DialWaitOptions dial_wait;
-    dial_wait.extra_cancel = dial_cancel->Token();
-    // 测试接缝：等待段挂起落定（协程已进入 parked 表）后回调一次，用于
-    // 确定性区分「等待中取消/Stop」与「未进入等待」。
+    dial_wait.close_waiters = m_close_waiters;
     if (m_dial_wait_entry_gate_for_test) {
         auto gate = m_dial_wait_entry_gate_for_test;
         dial_wait.dns_on_registered = gate;
@@ -145,22 +136,14 @@ result<std::shared_ptr<CoTCP>> TransportRuntimeImpl::DialTCP(
 
     auto dialed = detail::TransportWiring::DialTCP(
         std::move(endpoint.host), endpoint.port, options, dial_wait);
-    // 等待段已结束（成功/失败/取消/超时）：正常路径归还名额并从登记簿移除
-    // ——归还与 permit->Fail 幂等互斥（released 原子位），不重复。
-    permit->Fail();
-    {
-        std::lock_guard<std::mutex> lk(m_transport_mtx);
-        auto& cans = m_dial_cancels;
-        cans.erase(std::remove(cans.begin(), cans.end(), dial_cancel),
-                   cans.end());
-        auto& perms = m_dial_permits;
-        perms.erase(std::remove(perms.begin(), perms.end(), permit),
-                    perms.end());
-    }
+    // 等待段已结束（成功/失败/超时/被 owner 关闭唤醒）：归还在途名额的唯一
+    // 归还点——此后所有返回路径都已归还，不需要跨栈的兜底凭据（运行时不再硬
+    // 销毁挂起协程）。
+    m_inflight_quota->Release();
 
     if (!dialed) {
         ReleaseTransportSlot(m_transport_mtx, m_transport_count);
-        MaybeMarkClosed();
+        EndFactory();
         return result<std::shared_ptr<CoTCP>>::err(std::move(dialed).error());
     }
     auto connection = std::move(dialed).value();
@@ -188,12 +171,13 @@ result<std::shared_ptr<CoTCP>> TransportRuntimeImpl::DialTCP(
     }
     if (sealed) {
         // 交付即已封口：不再托管，物理关闭并归还容量。
-        connection->RequestClose();
+        connection->Close();
         ReleaseTransportSlot(m_transport_mtx, m_transport_count);
-        MaybeMarkClosed();
+        EndFactory();
         return result<std::shared_ptr<CoTCP>>::err(MakeError(
             ErrorCode::Closed, "transport runtime closed during TCP dial"));
     }
+    EndFactory();
     return result<std::shared_ptr<CoTCP>>::ok(std::move(connection));
 }
 
@@ -220,16 +204,17 @@ result<std::shared_ptr<CoTCPListener>> TransportRuntimeImpl::ListenTCP(
         std::move(local.ip), local.port, static_cast<int>(backlog));
     if (!bound) {
         ReleaseTransportSlot(m_transport_mtx, m_transport_count);
-        MaybeMarkClosed();
+        EndFactory();
         return result<std::shared_ptr<CoTCPListener>>::err(std::move(bound).error());
     }
     auto listener = std::move(bound).value();
     std::unique_lock<std::mutex> transport_lock(m_transport_mtx);
     if (m_transport_sealed) {
         transport_lock.unlock();
-        listener->RequestClose();
+        // 交付即已封口：不再托管，物理关闭（含刚创建的 fd）并归还容量。
+        listener->Close();
         ReleaseTransportSlot(m_transport_mtx, m_transport_count);
-        MaybeMarkClosed();
+        EndFactory();
         return result<std::shared_ptr<CoTCPListener>>::err(MakeError(
             ErrorCode::Closed, "transport runtime closed during TCP listen"));
     }
@@ -287,6 +272,7 @@ result<std::shared_ptr<CoTCPListener>> TransportRuntimeImpl::ListenTCP(
         m_inflight_quota);
     m_tcp_children.push_back(listener);
     transport_lock.unlock();
+    EndFactory();
     return result<std::shared_ptr<CoTCPListener>>::ok(std::move(listener));
 }
 
@@ -303,7 +289,7 @@ result<std::shared_ptr<CoUDP>> TransportRuntimeImpl::BindUDP(
     auto bound = udp::CoUDP::BindUDP(std::move(local));
     if (!bound) {
         ReleaseTransportSlot(m_transport_mtx, m_transport_count);
-        MaybeMarkClosed();
+        EndFactory();
         return result<std::shared_ptr<CoUDP>>::err(std::move(bound).error());
     }
     auto socket = std::move(bound).value();
@@ -331,71 +317,48 @@ result<std::shared_ptr<CoUDP>> TransportRuntimeImpl::BindUDP(
         }
     }
     if (sealed) {
-        socket->RequestClose();
+        socket->Close();
         ReleaseTransportSlot(m_transport_mtx, m_transport_count);
-        MaybeMarkClosed();
+        EndFactory();
         return result<std::shared_ptr<CoUDP>>::err(MakeError(
             ErrorCode::Closed, "transport runtime closed during UDP bind"));
     }
+    EndFactory();
     return result<std::shared_ptr<CoUDP>>::ok(std::move(socket));
 }
 
-void TransportRuntimeImpl::RequestClose() noexcept {
-    if (!m_close.BeginClose())
+void TransportRuntimeImpl::Close() noexcept {
+    if (!m_close.BeginClose()) {
+        // 并发/重复 Close：无独立短上限地等首次调用者的真实物理落定事实
+        // （子对象 Close 均同步物理收口，落定事实由 MaybeMarkClosed 经
+        // m_close_cv 通知），使每个合法调用者返回当刻都观察到同一 Closed 终态，
+        // 不再各自以 kCloseDrainTimeout 冒充收口。
+        std::unique_lock<std::mutex> lk(m_transport_mtx);
+        m_close_cv.wait(lk, [this] { return m_close.IsClosed(); });
         return;
+    }
     m_state.store(kClosingOrClosed);
     std::vector<std::shared_ptr<ICoCloseable>> transports;
-    std::vector<std::shared_ptr<bbt::coroutine::CancellationSource>> cancels;
-    std::vector<std::shared_ptr<detail::DialWaitPermit>> permits;
     {
         std::lock_guard<std::mutex> lk(m_transport_mtx);
         m_transport_sealed = true;
         transports = m_tcp_children;
-        cancels.swap(m_dial_cancels);
-        permits.swap(m_dial_permits);
     }
-    // Issue #32 F2：每个未完成的受管 DialTCP 等待段名额先归还（Fail 幂等，
-    // 与协程正常返回路径的 Fail 互斥），再经取消源唤醒挂起协程——协程走正常
-    // 返回路径到登记簿移除点（已清空，无重复），不依赖硬销毁兜底。
-    for (auto& permit : permits)
-        permit->Fail();
-    for (auto& cancel : cancels)
-        cancel->RequestCancel();
-    // 一个 socket 只有一个物理关闭责任方：本 owner 只发起关闭，落定以对象侧
-    // ClosedHook 为唯一信号（容量归还与该信号配对）。
+    // 先唤醒本 owner 级挂起等待者（受管 DialTCP 的 connect 等待段），再逐对象
+    // 同步 Close：对象各自封口 → 唤醒自身挂起 op → 有界排空在途计数 → 物理
+    // 释放。一个 socket 只有一个物理关闭责任方（对象自己），本 owner 只调用。
+    m_close_waiters->CloseAndWakeAll();
+    // R1：等待在途工厂排空后才收口——工厂要么已把 child 交接进 m_tcp_children
+    // （此时也已被上面快照之外的「sealed 路径」自行物理关闭），要么在途 fd 尚未
+    // 交接；两者都在 EndFactory 前完成物理关闭/交接，故 Close 返回当刻不可能有
+    // 遗漏的 pending fd。谓词与通知同用 m_transport_mtx。
+    {
+        std::unique_lock<std::mutex> lk(m_transport_mtx);
+        m_pending_cv.wait(lk, [this] { return m_pending_factories == 0; });
+    }
     for (auto& transport : transports)
-        transport->RequestClose();
+        transport->Close();
     MaybeMarkClosed();
-}
-
-std::size_t TransportRuntimeImpl::ForceCloseAfterQuiescence() noexcept {
-    // 与 RequestClose 的唯一差别：对象的物理关闭不再等在途计数归零，而是走
-    // 对象级硬停入口。前置条件（Scheduler::Stop() 已返回）由调用方保证。
-    // 封口与 dial 名额归还序列与 RequestClose 相同（幂等），因此本入口在
-    // 「已 RequestClose 但未落定」的硬停下同样能收口。
-    m_close.BeginClose();          // 幂等：已封口时无副作用
-    m_state.store(kClosingOrClosed);
-    std::vector<std::shared_ptr<ICoCloseable>> transports;
-    std::vector<std::shared_ptr<bbt::coroutine::CancellationSource>> cancels;
-    std::vector<std::shared_ptr<detail::DialWaitPermit>> permits;
-    {
-        std::lock_guard<std::mutex> lk(m_transport_mtx);
-        m_transport_sealed = true;
-        transports = m_tcp_children;
-        cancels.swap(m_dial_cancels);
-        permits.swap(m_dial_permits);
-    }
-    for (auto& permit : permits)
-        permit->Fail();
-    for (auto& cancel : cancels)
-        cancel->RequestCancel();
-    std::size_t forced = 0;
-    for (auto& transport : transports) {
-        if (ForceCloseChild(*transport))
-            ++forced;
-    }
-    MaybeMarkClosed();
-    return forced;
 }
 
 void TransportRuntimeImpl::OnTransportClosed(const ICoCloseable* child) noexcept {
@@ -414,22 +377,32 @@ void TransportRuntimeImpl::OnTransportClosed(const ICoCloseable* child) noexcept
 }
 
 void TransportRuntimeImpl::MaybeMarkClosed() noexcept {
+    bool publish = false;
     {
         std::lock_guard<std::mutex> lk(m_transport_mtx);
-        // 物理清理落定 = 已封口（不再接纳新资源）且受管 transport 名额归零。
-        // 未封口时对象正常关闭不触发落定。
-        if (!m_transport_sealed || m_transport_count != 0)
-            return;
+        // 物理清理落定 = 已封口（不再接纳新资源）、受管 transport 名额归零、
+        // 且无在途工厂。未封口时对象正常关闭不触发落定。
+        if (m_transport_sealed && m_transport_count == 0 &&
+            m_pending_factories == 0 && !m_closed_published) {
+            m_closed_published = true;
+            publish = true;
+            // 谓词发布（m_close → Closed）与 notify 在同一临界区：并发 Close
+            // 的后来者在同一把 m_transport_mtx 下检查 m_close.IsClosed() 并入队
+            // condition_variable::wait，谓词更新与通知同锁配对 ⇒ 不丢唤醒（修复
+            // 「谓词检查与入队之间通知丢失 → 无限 wait 永挂」）。
+            m_close.MarkClosed();
+            m_close_cv.notify_all();
+        }
     }
-    // 幂等：MarkClosed 只首次落实（重复调用不重复通知）。
-    m_close.MarkClosed();
-    NotifyClosed();
+    // closed hook 在锁外跑一次（装配约定：hook 不取本 owner 的锁）。
+    if (publish)
+        NotifyClosed();
 }
 
 } // namespace transport_detail
 
 // 内部装配面（src/detail/TransportWiring.hpp）的 owner 侧实现：TransportRuntime
-// 的抽象面不再声明这两个测试接缝（公开面没有对应槽位/虚表条目），探针落在唯
+// 的抽象面不再声明这些测试接缝（公开面没有对应槽位/虚表条目），探针落在唯
 // 一实现 transport_detail::TransportRuntimeImpl 上。
 namespace detail {
 
@@ -439,10 +412,15 @@ std::size_t TransportWiring::InflightQuotaHeldForTest(
         .InflightQuotaHeldForTest();
 }
 
-std::size_t TransportWiring::ForceCloseAfterQuiescence(
+std::size_t TransportWiring::PendingFactoriesForTest(
     TransportRuntime& owner) noexcept {
     return static_cast<transport_detail::TransportRuntimeImpl&>(owner)
-        .ForceCloseAfterQuiescence();
+        .PendingFactoriesForTest();
+}
+
+bool TransportWiring::CloseSealedForTest(TransportRuntime& owner) noexcept {
+    return static_cast<transport_detail::TransportRuntimeImpl&>(owner)
+        .CloseSealedForTest();
 }
 
 std::size_t TransportWiring::TransportsHeldForTest(
@@ -471,16 +449,8 @@ TransportRuntime::Create(NetworkLimits limits) {
     if (!info)
         return result<std::shared_ptr<TransportRuntime>>::err(
             std::move(info).error());
-    std::shared_ptr<bbt::coroutine::CompletionSignal> sig;
-    try {
-        sig = std::make_shared<bbt::coroutine::CompletionSignal>();
-    } catch (const std::logic_error&) {
-        return result<std::shared_ptr<TransportRuntime>>::err(MakeError(
-            ErrorCode::RuntimeUnavailable,
-            "coroutine runtime generation unavailable"));
-    }
     auto impl = std::make_shared<transport_detail::TransportRuntimeImpl>(
-        limits, std::move(info).value(), std::move(sig));
+        limits, std::move(info).value());
     return result<std::shared_ptr<TransportRuntime>>::ok(std::move(impl));
 }
 

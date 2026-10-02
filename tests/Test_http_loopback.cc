@@ -1,7 +1,12 @@
 // N1b-1：真实 HTTP/1.1 loopback 闭环验收。
-// 覆盖契约 §118 行边界：200/404 为有效响应、4xx/5xx 不是网络错误、
+// 覆盖契约边界：200/404 为有效响应、4xx/5xx 不是网络错误、
 // 超限/畸形 framing/断连为 Error、重复 header 保留、https 显式拒绝、
-// 非协程调用 InvalidContext、deadline/cancel 映射、关闭顺序与幂等。
+// 非协程调用 InvalidContext、本地期限映射。
+//
+// 关闭口径（进程寿命运行时修订）：owner 主动同步 Close()——任意线程、
+// 幂等，返回即物理释放；没有 RequestClose/WaitClosed/CloseStatus，
+// 也没有 Scheduler::Stop()：本进程只初始化一次 runtime，收尾用显式
+// Close() + 物理收敛断言（IsClosed / handler 配平 / 工厂与请求拒绝）。
 //
 // 与上游单测一致：Boost.Test 经 included/unit_test.hpp 静态内嵌，
 // 不链接 libboost_unit_test_framework.so。
@@ -44,7 +49,6 @@
 #include <bbt/infra/Result.hpp>
 
 using namespace bbt::infra;
-using bbt::coroutine::Deadline;
 using bbt::coroutine::SCHE_START_OPT_SCHE_THREAD;
 
 namespace {
@@ -242,7 +246,8 @@ BOOST_AUTO_TEST_CASE(t_begin_start_runtime) {
     auto* cfg = bbt::coroutine::detail::GlobalConfig::GetInstance().get();
     cfg->m_cfg_static_thread_num = 2;
     g_scheduler->Start(SCHE_START_OPT_SCHE_THREAD);
-    BOOST_REQUIRE(g_scheduler->IsRunning());
+    // 进程寿命运行时：只有「已初始化」，没有代际也没有 Stop。
+    BOOST_REQUIRE(g_scheduler->IsInitialized());
 
     NetworkLimits limits{};
     limits.max_connections = 64;
@@ -256,10 +261,12 @@ BOOST_AUTO_TEST_CASE(t_begin_start_runtime) {
     g_runtime = std::move(rt).value();
     auto started = g_runtime->Start();
     BOOST_REQUIRE(started);
+    BOOST_CHECK(!g_runtime->IsClosed());
 
     auto cl = g_runtime->CreateHttpClient();
     BOOST_REQUIRE(cl);
     g_client = std::move(cl).value();
+    BOOST_CHECK(!g_client->IsClosed());
 }
 
 BOOST_AUTO_TEST_CASE(t_listen_and_get_200) {
@@ -450,76 +457,32 @@ BOOST_AUTO_TEST_CASE(t_expired_deadline_is_timeout) {
     BOOST_CHECK(res.error().code == ErrorCode::TimedOut);
 }
 
-BOOST_AUTO_TEST_CASE(t_cancel_pre_cancelled) {
-    bbt::coroutine::CancellationSource src;
-    src.RequestCancel();
-    CallOptions opt = DefaultOptions();
-    opt.cancel = src.Token();
-    HttpRequest req{"GET", Url("/ok"), {}, ""};
-    auto res = CallApi(std::move(req), opt);
-    BOOST_REQUIRE(!res);
-    BOOST_CHECK(res.error().code == ErrorCode::Cancelled);
-}
-
-BOOST_AUTO_TEST_CASE(t_cancel_inflight) {
-    const int done_before = g_handler_done.load();
-    bbt::coroutine::CancellationSource src;
-    CallOptions opt = DefaultOptions(20000);
-    opt.cancel = src.Token();
-
-    std::optional<result<HttpResponse>> out;
-    std::atomic_bool out_ready{false};
-    bool succ = false;
-    g_scheduler->RegistCoroutineTask(
-        [&] {
-            HttpRequest req{"GET", Url("/slow"), {}, ""};
-            out.emplace(g_client->Request(std::move(req), opt));
-            out_ready.store(true, std::memory_order_release);
-        },
-        succ);
-    BOOST_REQUIRE(succ);
-    // handler 需 800ms；100ms 后取消必在决议前到达 → Cancelled。
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    src.RequestCancel();
-    BOOST_REQUIRE(WaitUntil(
-        [&] { return out_ready.load(std::memory_order_acquire); }));
-    BOOST_REQUIRE(!*out);
-    BOOST_CHECK(out->error().code == ErrorCode::Cancelled);
-    // 等 handler 协程真正退出再进关闭用例（在途 token 生命周期）。
-    BOOST_REQUIRE(WaitUntil(
-        [&] { return g_handler_done.load() > done_before; }));
-}
-
-BOOST_AUTO_TEST_CASE(t_wait_closed_off_coroutine_is_invalid_context) {
-    BOOST_CHECK(g_server->WaitClosed(Deadline{},
-                                     bbt::coroutine::CancellationToken{}) ==
-                CloseStatus::InvalidContext);
-}
-
-BOOST_AUTO_TEST_CASE(t_close_sequence) {
+// 关闭：owner（本测试线程）主动同步 Close()——任意线程可调用、幂等，
+// 返回即物理释放（listener 已关、会话中止、在途归零）。没有
+// RequestClose/WaitClosed、没有 CloseStatus、也没有 Scheduler::Stop。
+BOOST_AUTO_TEST_CASE(t_owner_close_is_synchronous_and_idempotent) {
     g_server->StopAccepting();
     g_server->StopAccepting();   // 幂等
+    BOOST_CHECK(!g_server->IsClosed());
 
-    std::atomic<CloseStatus> server_status{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        g_server->RequestClose();
-        server_status.store(g_server->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(10),
-            {}));
-    }));
-    BOOST_CHECK(server_status.load() == CloseStatus::Closed);
+    g_server->Close();
+    BOOST_CHECK(g_server->IsClosed());   // 返回即终态，不等任何信号
+    g_server->Close();                   // 幂等
     BOOST_CHECK(g_server->IsClosed());
 
-    std::atomic<CloseStatus> rt_status{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        g_runtime->RequestClose();
-        rt_status.store(g_runtime->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(10),
-            {}));
-    }));
-    BOOST_CHECK(rt_status.load() == CloseStatus::Closed);
+    g_runtime->Close();   // 子对象逐个同步收口 + transport owner 收口
     BOOST_CHECK(g_runtime->IsClosed());
     BOOST_CHECK(g_client->IsClosed());
+    g_runtime->Close();   // 幂等
+    BOOST_CHECK(g_runtime->IsClosed());
+
+    // 关闭后不重开：工厂一律拒绝，不产出假成功对象。
+    auto cl = g_runtime->CreateHttpClient();
+    BOOST_REQUIRE(!cl);
+    BOOST_CHECK(cl.error().code == ErrorCode::Closed);
+    auto srv = g_runtime->ListenHttp({"127.0.0.1", 0}, TestHandler);
+    BOOST_REQUIRE(!srv);
+    BOOST_CHECK(srv.error().code == ErrorCode::Closed);
 }
 
 BOOST_AUTO_TEST_CASE(t_request_after_close_is_closed) {
@@ -529,11 +492,18 @@ BOOST_AUTO_TEST_CASE(t_request_after_close_is_closed) {
     BOOST_CHECK(res.error().code == ErrorCode::Closed);
 }
 
-BOOST_AUTO_TEST_CASE(t_end_stop_scheduler) {
+BOOST_AUTO_TEST_CASE(t_end_runtime_physical_convergence) {
+    // 进程寿命运行时没有 Stop：收尾靠显式 Close() + 物理收敛断言。
+    BOOST_CHECK(g_scheduler->IsInitialized());   // 运行时仍在跑，不被停
+    g_runtime->Close();
+    BOOST_CHECK(g_runtime->IsClosed());
+    BOOST_CHECK(g_server->IsClosed());
+    BOOST_CHECK(g_client->IsClosed());
+    // handler 全部退出：调用数与退出数配平，无在途 handler 遗留。
+    BOOST_CHECK_EQUAL(g_handler_done.load(), g_handler_calls.load());
     g_client.reset();
     g_server.reset();
     g_runtime.reset();
-    g_scheduler->Stop();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

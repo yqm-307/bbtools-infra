@@ -5,15 +5,12 @@
 // 运行：退出码 0 且打印 `transport_consumer: ALL OK` 表示全部检查通过。
 // 用法见同目录 README.md。
 
-#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
 
-#include <bbt/core/thread/Lock.hpp>
 #include <bbt/coroutine/detail/Scheduler.hpp>
-#include <bbt/coroutine/syntax/SyntaxMacro.hpp>
 
 #include <bbt/infra/CoTCP.hpp>
 #include <bbt/infra/CoUDP.hpp>
@@ -53,24 +50,21 @@ bbt::infra::NetworkLimits Limits() {
 
 int main() {
     using bbt::coroutine::SCHE_START_OPT_SCHE_THREAD;
-    using bbt::infra::CloseStatus;
     using bbt::infra::ErrorCode;
     using bbt::infra::SocketAddress;
     using bbt::infra::TransportRuntime;
 
     auto& scheduler = bbt::coroutine::detail::Scheduler::GetInstance();
     scheduler->Start(SCHE_START_OPT_SCHE_THREAD);
-    if (!scheduler->IsRunning()) {
+    if (!scheduler->IsInitialized()) {
         std::printf("FAIL: scheduler did not start\n");
         return 1;
     }
 
     auto created = TransportRuntime::Create(Limits());
     Check(static_cast<bool>(created), "TransportRuntime::Create");
-    if (!created) {
-        scheduler->Stop();
+    if (!created)
         return 1;
-    }
     auto runtime = std::move(created).value();
     Check(static_cast<bool>(runtime->Start()), "TransportRuntime::Start");
 
@@ -84,7 +78,8 @@ int main() {
     auto udp_socket = runtime->BindUDP(SocketAddress{"127.0.0.1", 0});
     Check(static_cast<bool>(udp_socket), "BindUDP numeric loopback");
 
-    // 未 Start 的 Runtime 必须拒绝工厂（不产出半成品对象）。
+    // 未 Start 的 Runtime 必须拒绝工厂（不产出半成品对象）；其收口同样
+    // 是显式同步 Close()，不依赖析构或停机入口。
     auto pre_start = TransportRuntime::Create(Limits());
     if (pre_start) {
         auto rejected =
@@ -92,31 +87,21 @@ int main() {
         Check(!rejected &&
                   rejected.error().code == ErrorCode::RuntimeUnavailable,
               "factory rejected before Start (RuntimeUnavailable)");
+        pre_start.value()->Close();
+        Check(pre_start.value()->IsClosed(),
+              "unstarted runtime IsClosed after Close()");
     }
 
-    // 关闭落定只能在协程内等待。
-    auto settled = std::make_shared<bbt::core::thread::CountDownLatch>(1);
-    auto status  = std::make_shared<std::atomic_int>(-1);
-    runtime->RequestClose();
-    bool registered = false;
-    scheduler->RegistCoroutineTask(
-        [runtime, settled, status]() {
-            const auto deadline = std::chrono::steady_clock::now() +
-                                  std::chrono::milliseconds{3000};
-            status->store(static_cast<int>(runtime->WaitClosed(deadline, {})));
-            settled->Down();
-        },
-        registered);
-    Check(registered, "RegistCoroutineTask accepted the waiter");
-    Check(settled->WaitTimeout(5000) == 0, "WaitClosed settled within budget");
-    Check(status->load() == static_cast<int>(CloseStatus::Closed),
-          "runtime WaitClosed == Closed");
+    // 资源 owner 主动同步 Close()：封口 → 唤醒挂起等待者 → 有界排空在途 →
+    // 物理释放。返回即受管对象与 transport 全部落定，没有「等待关闭完成」
+    // 入口（WaitClosed 已删除）；Scheduler 无停机入口（Stop 已删除）。
+    Check(!runtime->IsClosed(), "runtime not closed before Close()");
+    runtime->Close();
+    Check(runtime->IsClosed(), "runtime IsClosed after Close()");
     if (listener)
-        Check(listener.value()->IsClosed(), "listener IsClosed after RequestClose");
+        Check(listener.value()->IsClosed(), "listener IsClosed after runtime Close()");
     if (udp_socket)
-        Check(udp_socket.value()->IsClosed(), "udp IsClosed after RequestClose");
-
-    scheduler->Stop();
+        Check(udp_socket.value()->IsClosed(), "udp IsClosed after runtime Close()");
 
     if (g_failures == 0) {
         std::printf("transport_consumer: ALL OK\n");

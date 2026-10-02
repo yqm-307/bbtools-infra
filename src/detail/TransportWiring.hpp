@@ -18,7 +18,6 @@
 // 访问方式：TransportWiring 是 CoTCP/CoTCPListener/CoUDP/TransportRuntime
 // 的 friend，直接读写其私有装配状态（不额外增加公共/受保护成员）。
 
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -30,44 +29,30 @@
 #include <bbt/infra/CoUDP.hpp>
 #include <bbt/infra/TransportRuntime.hpp>
 
+#include "detail/IoSupport.hpp"   // detail::CloseWaiters（受管 dial 等待段的关闭唤醒登记）
+
 namespace bbt::infra::detail {
 
 // Issue #32 F2：受管 DialTCP 的等待段接缝（仅 TransportRuntime 托管路径
 // 装配；未托管静态入口以默认构造调用，零语义变化）。
-//   extra_cancel           —— Runtime 级关闭源合成的取消令牌：runtime
-//                            关闭时唤醒挂起在 DNS/connect 等待的 dial
-//                            协程走正常归还路径（先于硬销毁兜底）。
-//   dns_on_registered      —— 非空时，DNS 等待段在协程真正挂起（await
-//                            event 已注册入 parked 表）后回调一次。
-//   connect_on_registered  —— 非空时，connect 等待段（EINPROGRESS 的
-//                            fd 可写等待）在协程挂起后回调一次。
-// 约定：回调 noexcept、不得取锁/阻塞——其在 scheduler 恢复路径上执行，
-// 由调用方保证只用于测试同步或登记簿落账。
+//   close_waiters         —— owner 级关闭唤醒登记：受管 dial 的 connect
+//                           等待段在事件登记成功后挂上它，owner->Close()
+//                           经 CloseAndWakeAll 唤醒该等待段，使挂起的 dial
+//                           尽快走正常返回路径归还容量（不再有取消令牌）。
+//   dns_on_registered     —— 非空时，DNS 等待段在协程真正挂起（await
+//                           event 已注册入 parked 表）后回调一次。
+//   connect_on_registered —— 非空时，connect 等待段（EINPROGRESS 的
+//                           fd 可写等待）在协程挂起后回调一次。
+// 约定：回调 noexcept、不得取锁/阻塞——其在 scheduler 恢复路径上执行，由调用
+// 方保证只用于测试同步或登记簿落账。
+//
+// 已知边界（新语义下的残余）：上游 AwaitBounded 内部自建 waiter，外部无法
+// Notify，因此 DNS 等待段不挂 close_waiters——该段的封口响应只由调用方
+// CallOptions::deadline 界定。owner 的在途账本/连接名额在该 dial 返回时归还。
 struct DialWaitOptions {
-    bbt::coroutine::CancellationToken extra_cancel{};
-    std::function<void()>             dns_on_registered{};
-    std::function<void()>             connect_on_registered{};
-};
-
-// Issue #32 F2：受管 DialTCP 等待段的「未完成 dial」归还凭据（堆上持有，
-// 不依赖协程栈展开）。等待段名额在 Runtime 账本入账后由本凭据担保归还：
-//   - 协程正常返回（成功/失败/取消/超时）：调用方 OnSuccess 后统一归还，
-//     凭据失效；
-//   - runtime->RequestClose()：Runtime 经 extra_cancel 唤醒挂起的 dial
-//     协程走正常返回路径归还；
-//   - Scheduler::Stop 硬销毁挂起协程（不展开栈）：凭据析构 Fail 兜底归还。
-// 两路径经 released 原子标志互斥，不重复归还。
-struct DialWaitPermit {
-    std::function<void()> release;
-    std::atomic_bool      released{false};
-
-    explicit DialWaitPermit(std::function<void()> r) : release(std::move(r)) {}
-    ~DialWaitPermit() { Fail(); }
-    void Fail() noexcept {
-        if (release && !released.exchange(true))
-            release();
-    }
-    void OnSuccess() noexcept { released.store(true); }
+    std::shared_ptr<detail::CloseWaiters> close_waiters{};
+    std::function<void()>                 dns_on_registered{};
+    std::function<void()>                 connect_on_registered{};
 };
 
 // 内部装配面：owner↔对象的装配接缝与测试探针。
@@ -80,17 +65,16 @@ struct TransportWiring {
     }
 
     // —— CoTCP：Runtime 托管登记与在途账本装配 ——
-    // 物理关闭落定（m_closed_source 触发处）时通知 Runtime 释放容量。
+    // 物理关闭落定（对象侧收口完成处）时通知 Runtime 释放容量。
     static void SetClosedHook(tcp::CoTCP& owner, std::function<void()> hook) noexcept {
         owner.m_closed_hook = std::move(hook);
     }
     // §4.0.1.7：Runtime 级在途配额注入（仅受管对象；未托管入口不装钩，
-    // 亦无限额语义）。admit 在 _CheckEntry（参数/协程上下文/代际）通过、
-    // 计入 m_inflight 之前调用——false 即 Overloaded，立即返回不挂起；
+    // 亦无限额语义）。admit 在 _CheckEntry（参数/协程上下文/运行时可用性）
+    // 通过、计入 m_inflight 之前调用——false 即 Overloaded，立即返回不挂起；
     // admit 通过的操作在 m_mtx 内登记 m_quota_held++，op 结束归还 1，
-    // RequestClose/析构经 DrainQuota 归还剩余——Stop 不展开挂起栈时由对象
-    // 侧兜底归还，不依赖协程栈 RAII。quota_scope 强持有 Runtime 共享账本，
-    // 保证归还发生时账本仍存活。
+    // Close/析构经 DrainQuota 归还剩余名额。quota_scope 强持有 Runtime 共享
+    // 账本，保证归还发生时账本仍存活。
     static void SetInflightHooks(tcp::CoTCP& owner,
                                  std::function<bool()> admit,
                                  std::function<void()> release,
@@ -101,7 +85,7 @@ struct TransportWiring {
     }
 
     // —— CoTCP：测试接缝（生产路径不安装，空钩子零开销）——
-    // 可等待 op 在参数/上下文/代际检查与名额登记（m_quota_held++）完成后、
+    // 可等待 op 在参数/上下文/运行时检查与名额登记（m_quota_held++）完成后、
     // 进入首次等待循环之前在协程内触发一次。约定：noexcept、不得回调本
     // 对象/取 m_mtx/阻塞——持锁线程与同 scheduler 上其他协程依赖它快速返回。
     static void SetWaitEntryGateForTest(tcp::CoTCP& owner,
@@ -160,7 +144,7 @@ struct TransportWiring {
     }
     // §4.0.1.7：admit 在 _CheckEntry 通过、计入 m_inflight 之前调用——
     // 返回 false 即 Overloaded，立即返回不挂起；quota_scope 保活 Runtime
-    // 共享账本，Stop 不展开挂起协程栈时由对象侧归还，不依赖栈上 RAII。
+    // 共享账本，对象侧 Close/析构归还，不依赖协程栈 RAII。
     static void SetInflightHooks(udp::CoUDP& owner,
                                  std::function<bool()> admit,
                                  std::function<void()> release,
@@ -183,32 +167,7 @@ struct TransportWiring {
                               std::function<void()> hook) noexcept {
         owner.m_closed_hook = std::move(hook);
     }
-    // —— CoTCP / CoTCPListener / CoUDP：对象级硬停转发器 ——
-    // 对象级 ForceCloseAfterQuiescence 是 private + 本类型为 friend 的内部入口
-    // （不在公共声明面，也不进任何安装契约）。owner 侧（src/transport 的对象分派）
-    // 与同仓测试一律经这三个转发器调用，不再直接写对象方法名——「谁被允许强制物理
-    // 关闭」在编译期收束到装配面一处。
-    static bool ForceCloseAfterQuiescence(tcp::CoTCP& owner) noexcept {
-        return owner.ForceCloseAfterQuiescence();
-    }
-    static bool ForceCloseAfterQuiescence(tcp::CoTCPListener& owner) noexcept {
-        return owner.ForceCloseAfterQuiescence();
-    }
-    static bool ForceCloseAfterQuiescence(udp::CoUDP& owner) noexcept {
-        return owner.ForceCloseAfterQuiescence();
-    }
-
-    // —— TransportRuntime / NetworkRuntime（owner）：硬停批量强制物理关闭 ——
-    // 前置条件（调用方保证，与对象级同一条）：执行这些 transport op 的调度器
-    // 已静默（Scheduler::Stop() 已返回）。语义：先把本 owner 封口（拒绝新资源、
-    // 归还未完成受管 dial 的等待段名额），再对每个受管 transport 调对象级
-    // ForceCloseAfterQuiescence()（不受在途门控），最后按「已封口且受管名额归零」
-    // 落定并通知组合方。返回本次真正完成物理关闭的对象数（重复调用返回 0）。
-    // 唯一生产调用点：协议 owner 的硬停入口（NetworkRuntimeImpl::
-    // ForceCloseAfterQuiescence）。非静默状态下调用不安全（见对象级注释：FD 复用
-    // 受害）；运行期关闭路径一字未改。
-    static std::size_t ForceCloseAfterQuiescence(TransportRuntime& owner) noexcept;
-    // 测试探针：本 owner 当前记账的受管 transport 名额（硬停收敛判据：对象级
+    // 测试探针：本 owner 当前记账的受管 transport 名额（收敛判据：对象级
     // closed_hook 与名额归还一一配对后该值必须归零）。生产路径不使用。
     static std::size_t TransportsHeldForTest(TransportRuntime& owner) noexcept;
 
@@ -218,6 +177,11 @@ struct TransportWiring {
     // （唯一实现是 transport_detail::TransportRuntimeImpl，本头不暴露实现
     // 类型）。
     static std::size_t InflightQuotaHeldForTest(TransportRuntime& owner) noexcept;
+    // R1 探针：owner 在途工厂装配计数（容量已预留、child 尚未交接/自行关闭）。
+    static std::size_t PendingFactoriesForTest(TransportRuntime& owner) noexcept;
+    // R1 探针：owner 级关闭唤醒登记是否已封口。受控交错回归据此在「Close 已
+    // 封口、尚未返回」处确定性放行被暂停的工厂线程。
+    static bool CloseSealedForTest(TransportRuntime& owner) noexcept;
     // 受管 DialTCP 的 DNS/connect 等待段在协程真正挂起后回调一次，用于确定性
     // 观察「dial 已进入等待」；生产路径不安装。约定：noexcept、不取锁不阻塞、
     // 不得回调本对象。

@@ -166,14 +166,13 @@ mongo::MongoRuntimeConfig LiveRuntimeConfig(std::size_t workers = 2,
     return cfg;
 }
 
-void CloseAndWait(const std::shared_ptr<CoMongoCli>& cli) {
-    cli->RequestClose();
-    std::atomic<CloseStatus> st{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        st.store(cli->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(10), {}));
-    }));
-    BOOST_CHECK(st.load() == CloseStatus::Closed);
+// 显式 Close 并在有界窗口内确认真实收口（driver 同步调用不可强杀：
+// socket_timeout/server_selection_timeout 接近 kCloseDrainTimeout 时 Close
+// 可能提前返回，收口由 worker 完成路径补齐，故以有界轮询断言）。
+void CloseAndCheck(const std::shared_ptr<CoMongoCli>& cli) {
+    cli->Close();
+    BOOST_REQUIRE(WaitUntil([&] { return cli->IsClosed(); }, 15000));
+    BOOST_CHECK(cli->IsClosed());
 }
 
 std::atomic_bool g_prepared{false};
@@ -198,12 +197,8 @@ struct RequireLiveEnv {
 };
 BOOST_GLOBAL_FIXTURE(RequireLiveEnv);
 
-// ~Scheduler→Stop 命中 coroutine Hook 断言（上游基线竞态，测试侧不可
-// 修复）；release 走漏单例所有权，进程退出不再触发 Stop 路径。
-struct SuiteTeardown {
-    ~SuiteTeardown() { g_scheduler.release(); }
-};
-BOOST_GLOBAL_FIXTURE(SuiteTeardown);
+// 进程寿命运行时：无 Stop/restart；实例持有者被 coroutine 故意泄漏，
+// 静态退出期不析构 Scheduler，测试侧不做任何 Stop 收尾。
 
 BOOST_AUTO_TEST_SUITE(mongo_live)
 
@@ -212,7 +207,7 @@ BOOST_AUTO_TEST_CASE(t_setup_scheduler) {
     cfg->m_cfg_static_thread_num = 4;
     cfg->m_cfg_stack_size        = 1024 * 256;
     g_scheduler->Start(SCHE_START_OPT_SCHE_THREAD);
-    BOOST_REQUIRE(g_scheduler->IsRunning());
+    BOOST_REQUIRE(g_scheduler->IsInitialized());
     g_prepared.store(true);
 }
 
@@ -270,7 +265,7 @@ BOOST_AUTO_TEST_CASE(t_crud_cycle) {
     BOOST_REQUIRE(miss && *miss);
     BOOST_CHECK(!miss->value().has_value());
 
-    CloseAndWait(cli);
+    CloseAndCheck(cli);
 }
 
 BOOST_AUTO_TEST_CASE(t_duplicate_key) {
@@ -300,7 +295,7 @@ BOOST_AUTO_TEST_CASE(t_duplicate_key) {
         [&] { del.emplace(cli->DeleteOne(filter, Opt())); }));
     BOOST_REQUIRE(del && *del && del->value() == 1u);
 
-    CloseAndWait(cli);
+    CloseAndCheck(cli);
 }
 
 BOOST_AUTO_TEST_CASE(t_driver_error_mapping) {
@@ -324,7 +319,7 @@ BOOST_AUTO_TEST_CASE(t_driver_error_mapping) {
     BOOST_REQUIRE(!*out);
     BOOST_CHECK(out->error().code == ErrorCode::Unavailable);
 
-    CloseAndWait(cli);
+    CloseAndCheck(cli);
 }
 
 BOOST_AUTO_TEST_CASE(t_concurrent_smoke_16) {
@@ -385,7 +380,7 @@ BOOST_AUTO_TEST_CASE(t_concurrent_smoke_16) {
     BOOST_CHECK_EQUAL(errors.load(), 0);
     BOOST_CHECK_EQUAL(mismatches.load(), 0);
 
-    CloseAndWait(cli);
+    CloseAndCheck(cli);
 }
 
 BOOST_AUTO_TEST_CASE(t_close_drains_inflight) {
@@ -395,8 +390,8 @@ BOOST_AUTO_TEST_CASE(t_close_drains_inflight) {
     }
     auto cli = NewLiveClient(2);
 
-    // 并发在途时 owner close：全部落定且 WaitClosed→Closed，
-    // 逻辑结果只能是 ok/Closed 之一，不得悬挂。
+    // 并发在途时 owner Close()：全部落定，逻辑结果只能是 ok/Closed
+    // 之一，不得悬挂；Close 返回后在有界窗口内物理收口。
     constexpr int   kOps = 16;
     std::atomic_int done{0};
     std::atomic_int settled{0};
@@ -416,16 +411,11 @@ BOOST_AUTO_TEST_CASE(t_close_drains_inflight) {
         BOOST_REQUIRE(succ);
     }
     SleepMs(30);
-    cli->RequestClose();
+    cli->Close();
     BOOST_REQUIRE(WaitUntil([&] { return done.load() == kOps; }));
     BOOST_CHECK_EQUAL(settled.load(), kOps);
 
-    std::atomic<CloseStatus> st{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        st.store(cli->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(10), {}));
-    }));
-    BOOST_CHECK(st.load() == CloseStatus::Closed);
+    BOOST_REQUIRE(WaitUntil([&] { return cli->IsClosed(); }, 15000));
     BOOST_CHECK(cli->IsClosed());
 }
 
@@ -441,7 +431,8 @@ BOOST_AUTO_TEST_CASE(t_server_down_fails) {
     }));
     BOOST_REQUIRE(!*out);
     BOOST_CHECK(out->error().code == ErrorCode::Unavailable);
-    cli->RequestClose();
+    cli->Close();
+    BOOST_CHECK(cli->IsClosed());
 }
 
 BOOST_AUTO_TEST_CASE(t_fresh_client_after_restart) {
@@ -469,7 +460,7 @@ BOOST_AUTO_TEST_CASE(t_fresh_client_after_restart) {
         [&] { del.emplace(cli->DeleteOne(filter, Opt())); }));
     BOOST_REQUIRE(del && *del && del->value() == 1u);
 
-    CloseAndWait(cli);
+    CloseAndCheck(cli);
 }
 
 BOOST_AUTO_TEST_CASE(t_owner_multi_collection_live) {
@@ -530,16 +521,11 @@ BOOST_AUTO_TEST_CASE(t_owner_multi_collection_live) {
     BOOST_REQUIRE(WaitUntil([&] { return ok.load() == 2; }, 20000));
     BOOST_CHECK_EQUAL(errs.load(), 0);
 
-    ca->RequestClose();
-    cb->RequestClose();
-    db->RequestClose();
-    std::atomic<CloseStatus> st{};
-    BOOST_REQUIRE(RunInCoroutine([&] {
-        st.store(db->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds(10),
-            {}));
-    }));
-    BOOST_CHECK(st.load() == CloseStatus::Closed);
+    ca->Close();
+    cb->Close();
+    db->Close();
+    BOOST_REQUIRE(WaitUntil([&] { return db->IsClosed(); }, 15000));
+    BOOST_CHECK(db->IsClosed());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

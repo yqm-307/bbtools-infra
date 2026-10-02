@@ -4,11 +4,16 @@
 //
 //   Scheduler::Start → NetworkRuntime::Create/Start → ListenHttp/CreateHttpClient
 //   → 协程内 HttpClient::Request（deadline 预算）→ server.StopAccepting
-//   → runtime.RequestClose/WaitClosed → 释放网络对象 → Scheduler::Stop
+//   → 各资源 owner 显式同步 Close()（返回即物理释放）→ 进程退出
 //
 // 全部调用基于 bbtools-coroutine 自有模型（C++17，无 co_await/Task<T>）：
-// 挂起/恢复由 Scheduler 驱动，等待型 API（Request/WaitClosed）只在协程
-// 上下文调用，返回 bbt::infra::result<T>，不用异常传错误。
+// 挂起/恢复由 Scheduler 驱动，等待型 API（Request）只在协程上下文调用，
+// 返回 bbt::infra::result<T>，不用异常传错误。
+//
+// 正常退出不依赖 Scheduler::Stop（已删除）与 RequestClose/WaitClosed（已
+// 删除）：先停止接纳新请求，再让资源 owner 主动同步 Close()（幂等、任意
+// 线程可调用）各资源，进程退出；coroutine runtime 按进程寿命存在，不参与
+// 资源收口。
 //
 // 运行：./Example_http_loopback，期望打印一次 loopback 响应并以 0 退出。
 
@@ -33,8 +38,8 @@ using namespace bbt::infra;
 
 namespace {
 
-// handler 在 infra 提供的受管协程中被调用；ctx 携带 listener 本地预算与
-// 取消令牌，本示例只回显，不消费 ctx。
+// handler 在 infra 提供的受管协程中被调用；ctx 携带 listener 本地预算
+//（deadline）与 peer 身份，本示例只回显，不消费 ctx。
 result<HttpResponse> EchoHandler(IncomingCallContext /*ctx*/, HttpRequest req) {
     HttpResponse resp;
     resp.status = 200;
@@ -127,27 +132,24 @@ int main() {
                       << " body=" << reply.value().body << "\n";
         }
 
-        // 关闭边界：RequestClose 幂等，可在协程或普通线程调用；
-        // WaitClosed 只能在协程内等待，等在途操作真正归零。
-        client->RequestClose();
-        client->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds{5}, {});
+        // 关闭边界：Request 已返回（写入已完成），此处显式同步 Close()。
+        // Close() 幂等、返回即物理释放（未发送数据直接丢弃、不 flush），
+        // 不再有 RequestClose/WaitClosed 两段式等待。
+        client->Close();
     });
     if (!ran) {
         std::cerr << "coroutine did not finish in budget\n";
         exit_code = 1;
     }
 
-    // 正常关闭顺序：先停止接纳新请求 → 关闭 runtime 并等待在途清理。
+    // 正常关闭顺序：先停止接纳新请求（不取消已接纳 handler，也不关闭其
+    // 回复路径）→ 资源 owner 逐层同步 Close()：runtime 封口后逐个收口
+    // 子对象（含 server 与 client）与 transport，返回即物理释放。没有
+    // Scheduler::Stop：coroutine runtime 按进程寿命存在，不参与资源收口。
     server->StopAccepting();
-    runtime->RequestClose();
-    RunInCoroutine([&] {
-        runtime->WaitClosed(
-            std::chrono::steady_clock::now() + std::chrono::seconds{5}, {});
-    });
+    runtime->Close();
 
     server.reset();
     runtime.reset();
-    scheduler->Stop();
     return exit_code;
 }

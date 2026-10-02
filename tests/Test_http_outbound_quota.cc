@@ -1,4 +1,8 @@
 // Issue #37：HTTP 出站连接与在途配额的原子接纳及物理归还回归。
+// 关闭面按进程寿命运行时修订（契约 §1）：owner 主动同步 Close()，
+// 没有 RequestClose/WaitClosed/CloseStatus、没有取消令牌、没有
+// CompletionSignal，也没有 Scheduler::Stop()。每个用例的 runtime 在
+// 用例内显式 Close() 并以 IsClosed/账本归零断言物理收口。
 //
 // 与 transport #32 的 CoTCP/CoUDP 在途门禁是不同入口：本套件只覆盖
 // HTTP 出站路径（HttpClientImpl::Request → ClientOp），不复用传输层
@@ -19,19 +23,19 @@
 //                                          归还发生在等待完成项物理收口后
 //                                          才允许再接纳，不在调用方超时返回
 //                                          的瞬间。
-//   t_released_on_cancel                — 取消路径名额归还。
-//   t_released_on_client_close          — client RequestClose 中止在途
-//                                          请求后名额归还。
+//   t_released_on_client_close          — client Close() 中止在途请求后
+//                                          名额归还。
+//   t_runtime_close_releases            — Runtime Close() 中止在途后名额
+//                                          归还，不依赖协程栈析构。
 //   t_no_reuse_before_physical_close    — 名额在 op 物理收口（UnregisterOp，
 //                                          finished && inflight==0）前不
 //                                          复用：裸对端 accept 后持有不响应
 //                                          压住 client 真实 async_read 完成
-//                                          项；逻辑超时返回后先经 io 域
-//                                          FIFO 探针确认 Abort 已执行、
-//                                          OnRead 完成项仍在途，此时真实
+//                                          项；io 域冻结期间直读注入账本
+//                                          （held==1 / releases==0）且真实
 //                                          TryAdmitHttpRequest 必须拒绝
-//                                          （Overloaded），随后该完成项
-//                                          落定归还名额、新物理连接可建立。
+//                                          （Overloaded），放行后 Close()
+//                                          收口，名额恰好归还一次。
 //   t_unregister_exactly_once           — 并发 Finish/IoAsyncDone 与重复
 //                                          UnregisterOp 对同一 op 恰好归还
 //                                          一次（erase 守门回归）。
@@ -41,11 +45,9 @@
 //   t_admit_failure_no_leak_no_double_release — release 复制先于 admit：
 //                                          admit 拒绝/抛异常时 guard 不误
 //                                          归还，覆盖 m_release 复制窗口两侧。
-//   t_runtime_close_releases            — Runtime RequestClose 中止在途后
-//                                          名额归还，不依赖协程栈析构。
 //
 // 同步纪律：跨线程/协程一律原子标志 + WaitUntil（带总预算）与
-// CountDownLatch；handler 内的等待用 bbtco_sleep 轮询真实事件标志，
+// CountDownLatch；handler 内的等待用 CoWaiter（等待位 + 跨线程 Notify），
 // 不靠 sleep 假设时序。所有等待都有超时上限，不会无限挂起。
 
 #define BOOST_TEST_DYN_LINK
@@ -72,7 +74,7 @@
 #include <bbt/coroutine/detail/GlobalConfig.hpp>
 #include <bbt/coroutine/detail/Hook.hpp>
 #include <bbt/coroutine/detail/Scheduler.hpp>
-#include <bbt/coroutine/sync/CompletionSignal.hpp>
+#include <bbt/coroutine/sync/CoWaiter.hpp>
 #include <bbt/coroutine/syntax/SyntaxMacro.hpp>
 
 #include <bbt/infra/HttpClient.hpp>
@@ -89,10 +91,8 @@
 #include "http/HttpIoEngine.hpp"
 
 using namespace bbt::infra;
-using bbt::coroutine::Deadline;
 using bbt::coroutine::SCHE_START_OPT_SCHE_THREAD;
-using Latch  = bbt::core::thread::CountDownLatch;
-using Signal = bbt::coroutine::CompletionSignal;
+using Latch = bbt::core::thread::CountDownLatch;
 
 namespace {
 
@@ -141,40 +141,44 @@ bool WaitUntil(const std::function<bool()>& pred, int budget_ms = kBudgetMs) {
     return true;
 }
 
+// owner 主动同步 Close()：幂等、任意线程，返回即物理释放。旧口径的
+// RequestClose + WaitClosed(CloseStatus) 已删除，这里只断言返回后
+// IsClosed 成立（物理收口由调用点各自的账本/对端观察断言）。
 bool Close(const std::shared_ptr<ICoCloseable>& obj) {
-    obj->RequestClose();
-    auto done = std::make_shared<Latch>(1);
-    auto status = std::make_shared<std::atomic<int>>(-1);
-    if (!Spawn([obj, done, status] {
-            status->store(static_cast<int>(
-                obj->WaitClosed(std::chrono::steady_clock::now() +
-                                    std::chrono::seconds(8),
-                                {})));
-            done->Down();
-        }))
-        return false;
-    return done->WaitTimeout(9000) == 0 &&
-           status->load() == static_cast<int>(CloseStatus::Closed);
+    obj->Close();
+    return obj->IsClosed();
 }
 
 // ---------------------------------------------------------------------------
-// 可控门闩服务端：handler 进入时 arrived 计数 +1，每个请求持有独立
-// CompletionSignal，测试侧统一放行。auto_release=true 时 handler 立即
-// 放行（用于「名额归还后可再接纳」的后续请求，不再压门闩）。
+// 可控门闩服务端：handler 进入时 active 计数 +1，每个请求持有独立等待位
+// （CoWaiter：只等/唤醒，无取消令牌），测试侧统一放行。
+// auto_release=true 时 handler 立即放行（用于「名额归还后可再接纳」的后续
+// 请求，不再压门闩）。
 // 服务端 Runtime 给足容量，瓶颈只可能出在 client 出站侧——这是接纳
 // 缺口测试，不是服务端压测。
 // ---------------------------------------------------------------------------
+struct GateSignal {
+    std::atomic_bool released{false};
+    bbt::coroutine::sync::CoWaiter::SPtr waiter{
+        bbt::coroutine::sync::CoWaiter::Create()};
+
+    void Release() {
+        released.store(true, std::memory_order_release);
+        waiter->Notify();   // 跨线程安全；未挂起时是安全的空操作
+    }
+};
+
 struct Gate {
     std::mutex                                mutex;
-    std::vector<std::shared_ptr<Signal>>      signals;
+    std::vector<std::shared_ptr<GateSignal>>  signals;
     std::atomic_int                           active{0};
     std::atomic_int                           total{0};
     std::atomic_bool                          auto_release{false};
     std::shared_ptr<Latch>                    arrived;   // 由用例按 N 构造
 
-    // 返回该请求专属 signal；auto_release 模式下立即 Complete（不压门闩）。
-    std::shared_ptr<Signal> Hold() {
-        auto sig = std::make_shared<Signal>();
+    // 返回该请求专属等待位；auto_release 模式下立即放行（不压门闩）。
+    std::shared_ptr<GateSignal> Hold() {
+        auto sig = std::make_shared<GateSignal>();
         {
             std::lock_guard<std::mutex> lk(mutex);
             signals.push_back(sig);
@@ -184,24 +188,31 @@ struct Gate {
         if (arrived)
             arrived->Down();
         if (auto_release.load())
-            sig->Complete();
+            sig->Release();
         return sig;
     }
     void ReleaseAll() {
         std::lock_guard<std::mutex> lk(mutex);
         for (auto& s : signals)
-            s->Complete();
+            s->Release();
     }
 };
 
-// 每个请求独立 signal：释放只对已到达者生效，未到达的不占名额。
+// 每个请求独立等待位：释放只对已到达者生效，未到达的不占名额。
 HttpHandler MakeGateHandler(const std::shared_ptr<Gate>& gate) {
     return [gate](IncomingCallContext, HttpRequest) {
         auto sig = gate->Hold();
         bbt::coroutine::WaitOptions wait;
         wait.deadline = std::chrono::steady_clock::now() +
                         std::chrono::seconds(10);
-        sig->Wait(wait);
+        // 放行可能发生在 Hold 之后、真正 park 之前：on_registered 内复查
+        // 并同步 Notify（登记成功后立即兑现，走 PENDING 早到路径），
+        // 不丢唤醒也不靠 sleep 假设时序。
+        sig->waiter->WaitWithCallback(wait, [sig]() -> bool {
+            if (sig->released.load(std::memory_order_acquire))
+                sig->waiter->Notify();
+            return true;
+        });
         --gate->active;
         return result<HttpResponse>::ok(HttpResponse{200, {}, "ok"});
     };
@@ -327,7 +338,8 @@ BOOST_AUTO_TEST_CASE(t_begin_start_scheduler) {
     cfg->m_cfg_static_thread_num = 2;
     cfg->m_cfg_stack_size        = 256 * 1024;
     g_scheduler->Start(SCHE_START_OPT_SCHE_THREAD);
-    BOOST_REQUIRE(g_scheduler->IsRunning());
+    // 进程寿命运行时：只有 IsInitialized，没有 Stop/代际。
+    BOOST_REQUIRE(g_scheduler->IsInitialized());
 }
 
 // 验收主线：上限=1 时第二个在途请求确定性 Overloaded，服务端不接到
@@ -354,7 +366,7 @@ BOOST_AUTO_TEST_CASE(t_overloaded_when_inflight_full) {
 
     // 放行第一个：它应正常完成，名额归还后第三个请求能再被接纳。
     // 先开 auto_release，让第三个请求的 handler 立即放行（不再压门闩），
-    // 再统一 Complete 已压住的 signal。
+    // 再统一放行已压住的等待位。
     server.gate->auto_release.store(true);
     server.gate->ReleaseAll();
     BOOST_REQUIRE(WaitUntil([&] {
@@ -554,50 +566,7 @@ BOOST_AUTO_TEST_CASE(t_released_on_deadline) {
     BOOST_REQUIRE(Close(rt));
 }
 
-// cancel 路径归还：预取消 token 使请求在接纳前就失败，不占名额；
-// 再验证 in-flight 取消后名额归还。
-BOOST_AUTO_TEST_CASE(t_released_on_cancel) {
-    auto server = StartServer([](std::shared_ptr<Gate> g){ return MakeGateHandler(g); });
-    auto rt = StartClientRuntime(MakeLimits(/*max_conn=*/1, /*max_inflight=*/1));
-    auto client = NewClient(rt);
-    const std::string url = server.base_url + "/x";
-
-    // 预取消：请求在 Wait 前就见到取消，不占名额（admit 在 cancel 检查
-    // 之前完成，但本用例验证取消返回后名额可用）。
-    auto out1 = std::make_shared<std::optional<result<HttpResponse>>>();
-    auto rdy1 = std::make_shared<std::atomic_bool>(false);
-    bbt::coroutine::CancellationSource src;
-    CallOptions opt = DefaultOptions(20000);
-    opt.cancel = src.Token();
-    SpawnHeld(client, url, out1, rdy1, opt);
-    BOOST_REQUIRE(WaitUntil([&] { return server.gate->active.load() == 1; }));
-    src.RequestCancel();
-    BOOST_REQUIRE(WaitUntil([&] {
-        return rdy1->load(std::memory_order_acquire);
-    }));
-    BOOST_REQUIRE((*out1).has_value());
-    BOOST_REQUIRE(!(*out1).value());
-    BOOST_CHECK((*out1)->error().code == ErrorCode::Cancelled);
-
-    server.gate->auto_release.store(true);
-    server.gate->ReleaseAll();
-    BOOST_REQUIRE(WaitUntil([&] { return server.gate->active.load() == 0; }));
-
-    // 名额归还绑定 client op 物理收口而非服务端 handler 退出瞬间；
-    // 轮询直至真实 Request 被接纳（Overloaded=名额仍占，继续等）。
-    bool admitted = false;
-    auto res2 = CallApiUntilAdmitted(client, url, DefaultOptions(), admitted);
-    BOOST_REQUIRE(admitted);
-    BOOST_REQUIRE(res2);
-    BOOST_CHECK_EQUAL(res2.value().status, 200u);
-
-    BOOST_REQUIRE(Close(client));
-    server.server->StopAccepting();
-    BOOST_REQUIRE(Close(server.rt));
-    BOOST_REQUIRE(Close(rt));
-}
-
-// client RequestClose 中止在途请求后名额归还（物理收口触发）。
+// client Close() 中止在途请求后名额归还（物理收口触发）。
 BOOST_AUTO_TEST_CASE(t_released_on_client_close) {
     auto server = StartServer([](std::shared_ptr<Gate> g){ return MakeGateHandler(g); });
     auto rt = StartClientRuntime(MakeLimits(/*max_conn=*/1, /*max_inflight=*/1));
@@ -609,13 +578,15 @@ BOOST_AUTO_TEST_CASE(t_released_on_client_close) {
     SpawnHeld(client, url, out1, rdy1);
     BOOST_REQUIRE(WaitUntil([&] { return server.gate->active.load() == 1; }));
 
-    // client close：在途 op 被 Abort+Finish，物理收口后名额归还。
+    // client Close()：在途 op 被 Abort + Finish(Closed)，物理收口后名额
+    // 归还；返回即 IsClosed。
     BOOST_REQUIRE(Close(client));
     BOOST_REQUIRE(WaitUntil([&] {
         return rdy1->load(std::memory_order_acquire);
     }));
     BOOST_REQUIRE((*out1).has_value());
     BOOST_CHECK(!(*out1).value());   // 被中止的请求是 error
+    BOOST_CHECK((*out1)->error().code == ErrorCode::Closed);
 
     server.gate->auto_release.store(true);
     server.gate->ReleaseAll();
@@ -633,9 +604,8 @@ BOOST_AUTO_TEST_CASE(t_released_on_client_close) {
     BOOST_REQUIRE(Close(rt));
 }
 
-// Runtime RequestClose（强制 Stop 等价路径）中止在途后名额归还；
-// 不依赖挂起协程的栈析构（runtime 拥有 op 集合，teardown 在 io 域
-// 物理收口）。
+// Runtime Close() 中止在途后名额归还；不依赖挂起协程的栈析构（runtime
+// 拥有 op 集合，teardown 在 io 域物理收口）。
 BOOST_AUTO_TEST_CASE(t_runtime_close_releases) {
     auto server = StartServer([](std::shared_ptr<Gate> g){ return MakeGateHandler(g); });
     auto rt = StartClientRuntime(MakeLimits(/*max_conn=*/1, /*max_inflight=*/1));
@@ -647,7 +617,7 @@ BOOST_AUTO_TEST_CASE(t_runtime_close_releases) {
     SpawnHeld(client, url, out1, rdy1);
     BOOST_REQUIRE(WaitUntil([&] { return server.gate->active.load() == 1; }));
 
-    BOOST_REQUIRE(Close(rt));   // runtime close 收口所有子对象
+    BOOST_REQUIRE(Close(rt));   // runtime close 同步收口所有子对象
     BOOST_CHECK(client->IsClosed());
     BOOST_REQUIRE(WaitUntil([&] {
         return rdy1->load(std::memory_order_acquire);
@@ -700,6 +670,7 @@ struct FakeBudget {
 
 // 直接构造 HttpClientImpl + 独立 HttpIoEngine（测试侧可 TryPost blocker
 // 占住同一 strand 执行域）。返回 (impl, engine)；budget 由调用方注入。
+// 构造函数不再接收 CompletionSignal：等待位由 op 自己持有（CoWaiter）。
 std::pair<std::shared_ptr<http_detail::HttpClientImpl>,
           std::shared_ptr<http_detail::HttpIoEngine>>
 NewImplClient(const std::shared_ptr<FakeBudget>& budget,
@@ -708,10 +679,8 @@ NewImplClient(const std::shared_ptr<FakeBudget>& budget,
     BOOST_REQUIRE(engine->Start());
     auto info = bbt::infra::detail::NewObjectInfo("infra.http_client");
     BOOST_REQUIRE(info);
-    auto sig = bbt::infra::detail::NewCompletionSignal();
-    BOOST_REQUIRE(sig);
     auto impl = std::make_shared<http_detail::HttpClientImpl>(
-        engine, std::move(info).value(), std::move(sig).value());
+        engine, std::move(info).value());
     impl->SetQuotaHooks(
         [budget] { return budget->Admit(); },
         [budget] { budget->Release(); });
@@ -725,35 +694,23 @@ NewImplClient(const std::shared_ptr<FakeBudget>& budget,
 // 用真实 HttpClientImpl::Request 驱动完整 async 链，而非手工模拟
 // inflight——裸对端 accept 后挂起不写响应，client 发起真实
 // async_resolve/connect/write/read，read 完成项确实在途未落定。
-// 确定性时序（R5：把屏障建立在「OnRead 完成项不可能被派发」的真实
-// 机制上，替代依赖 FIFO 排序推断的事后投递）：
+// 新契约下不再有取消令牌：窗口的确定性靠「冻结 io 域」而不是「唤醒
+// 调用方」——调用方在窗口内保持挂起即可，不需要它先返回。
 //   1. 裸对端 accept 后持有不响应 → client 的连接/写已完成，async_read
-//      在途。socket.close 是唯一会催出 OnRead 完成项的动作，而它只在
-//      Request 尾路径的 TryPost(Abort) 里发生；
-//   2. caller 仍在 sig->Wait 挂起时（Abort 尚未 post），先把一个「等待
-//      放行」的 io_hold 投递进同一 io 域并等它开始执行——此刻 strand 被
-//      冻结在 io_hold 内，其后任何完成项/投递都不可能被派发；
-//   3. 在冻结期间向 caller 的 CancellationSource 发 RequestCancel：caller
-//      以 Cancelled 返回，并在返回前把 Abort 经 TryPost 排进同一 strand
-//      ——Abort 只能排在 io_hold 之后，但 socket.close 催出的 OnRead
-//      完成项同样只能排在 io_hold 之后，io 域仍冻结；
-//   4. rdy1（caller 已返回 → Abort 已 post）后窗口确定成立：read 完成项
-//      必然在途（要么 reactor 已把它催出、排在 io_hold 之后；要么 close
-//      仍在 io_hold 之后排队）。窗口内第二个真实 Request 的 TryAdmit
-//      必须看到名额仍占 → Overloaded；
-//   5. 放行 io_hold：Abort 执行 → socket.close → OnRead 完成项派发 →
-//      IoAsyncDone 归零 → UnregisterOp 归还名额。轮询到名额复用且
-//      accept 计数 =2 证明新物理连接建成。
-// 与 R4 的差别：rdy1 只证明 Abort 已 post，不证明 io_hold 排在 Abort
-// 之前；abort→close→OnRead→IoAsyncDone→UnregisterOp 的整链都在 io 域
-// 串行执行，若 OnRead 先于 io_hold 被派发，名额可能已归还，旧断言不可证。
-// 本版在 caller 返回前就冻结 strand：close 连被发起的机会都没有，完成项
-// 不可能越过 io_hold。
-// 同步纪律：CancellationSource 由测试线程写、caller 协程读（token 本就
-// 跨线程设计）；io_hold 用 RAII 保证断言失败时仍放行、peer 线程仍 join。
+//      在途（SetReadArmedHookForTest 直接观测到「read 已真实发起」）；
+//   2. 把 io_hold 投进同一 strand 并等它开始执行——strand 串行派发，
+//      此后任何完成项/投递都不可能被派发，物理收口（UnregisterOp→
+//      归还名额）在窗口内不可能发生；
+//   3. 窗口内直读注入账本：held==1 且 releases==0（未物理收口 ⇒ 名额
+//      仍占、未归还），且第二个真实 Request 必须 Overloaded
+//      （TryAdmitHttpRequest 看到的仍是占用中的名额）；
+//   4. 放行 io_hold → Close()：teardown 在 io 域 Abort/Finish 催出 read
+//      完成项 → IoAsyncDone 归零 → UnregisterOp 恰好归还一次；Close
+//      返回即 m_ops 空，账本 held==0、releases==1。
+// 同步纪律：io_hold 用 RAII 保证断言失败时仍放行、peer 线程仍 join。
 BOOST_AUTO_TEST_CASE(t_no_reuse_before_physical_close) {
     // 裸对端：listen/accept，accept 后不写响应也不 close，让 client
-    // 的 async_read 长时间在途（由 client 侧 Abort 催完成项落定）。
+    // 的 async_read 长时间在途（由 client 侧 Close 的 Abort 催完成项落定）。
     std::atomic_int  accepted{0};
     std::atomic_bool peer_stop{false};
     int lfd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -775,9 +732,7 @@ BOOST_AUTO_TEST_CASE(t_no_reuse_before_physical_close) {
         "http://127.0.0.1:" + std::to_string(port) + "/x";
 
     // accept 线程：接受后保持连接不响应，直到 peer_stop。线程持有
-    // conn_fds 引用，用例收尾统一 close。peer_guard 保证断言失败
-    // （BOOST_REQUIRE 长跳）时仍 join 线程并关闭 fd，不遗留 30s
-    // 占位或 joinable 线程进入析构。
+    // conn_fds 引用，用例收尾统一 close。
     std::vector<int> conn_fds;
     std::mutex       fds_mtx;
     std::thread peer([&] {
@@ -798,7 +753,7 @@ BOOST_AUTO_TEST_CASE(t_no_reuse_before_physical_close) {
         }
     });
     // peer_guard 保证断言失败（BOOST_REQUIRE 长跳）时仍 join 线程并
-    // 关闭 fd，不遗留 30s 占位或 joinable 线程进入析构。
+    // 关闭 fd，不遗留占位或 joinable 线程进入析构。
     struct PeerGuard {
         std::thread&             peer;
         std::atomic_bool&        peer_stop;
@@ -816,54 +771,35 @@ BOOST_AUTO_TEST_CASE(t_no_reuse_before_physical_close) {
         }
     } peer_guard{peer, peer_stop, fds_mtx, conn_fds, lfd};
 
-    // max_inflight=1：单一名额观察「物理收口前不归还」。
-    auto rt = StartClientRuntime(MakeLimits(/*max_conn=*/8, /*max_inflight=*/1));
-    auto client = NewClient(rt);
-    auto impl = std::static_pointer_cast<http_detail::HttpClientImpl>(client);
+    // max_inflight=1：单一名额观察「物理收口前不归还」。注入式账本给出
+    // 名额持有/归还的直接读数，不依赖「第二个请求是否被拒」的间接推断。
+    auto budget = std::make_shared<FakeBudget>(/*cap=*/1);
+    NetworkLimits limits = MakeLimits(/*max_conn=*/8, /*max_inflight=*/1);
+    auto [impl, engine] = NewImplClient(budget, limits);
+    std::shared_ptr<HttpClient> client = impl;
 
-    // read-armed 屏障（本版修复点）：OnWritten 发起 async_read 成功后
-    // 在 io 域内 Down 本 latch。等到它才冻结 strand，即可确定第一个
-    // op 的 read 完成项已真实在途——这是「物理收口前名额仍占」成立的
-    // 必要前提。R5 仅用 accepted==1 推断，accept 只证明对端已收连接，
-    // 不证明 OnWritten/async_read 已执行；本 latch 把该前提变成直接
-    // 观察。钩子只写给第一个 op（在 SpawnHeld 前注入，写先于 io 域
-    // 派发，且测试只触发这一次真实 async_read）。
+    // read-armed 屏障：OnWritten 发起 async_read 成功后在 io 域内 Down
+    // 本 latch。等到它才冻结 strand，即可确定 op 的 read 完成项已真实
+    // 在途——这是「物理收口前名额仍占」成立的直接前提。钩子只写给第一个
+    // op（在 SpawnHeld 前注入，写先于 io 域派发）。
     auto read_armed = std::make_shared<Latch>(1);
     impl->SetReadArmedHookForTest(
         [read_armed] { read_armed->Down(); });
 
-    // 第一个真实 Request：连接 + 发出请求后对端不响应，read 在途。
-    // caller 用 CancellationSource（而非 deadline）由测试线程在窗口内
-    // 确定唤醒——cancel 走到与 timeout 相同的尾路径（TryPost(Abort) 后
-    // 返回 Cancelled），但唤醒时机由测试侧控制而非时钟，屏障才能建在
-    // caller 返回之前。
+    // 第一个真实 Request：连接 + 发出请求后对端不响应，read 在途；
+    // 调用方在窗口内一直挂起（deadline 兜底），窗口不依赖它先返回。
     auto out1 = std::make_shared<std::optional<result<HttpResponse>>>();
     auto rdy1 = std::make_shared<std::atomic_bool>(false);
-    auto cancel_src =
-        std::make_shared<bbt::coroutine::CancellationSource>();
-    {
-        CallOptions opt = DefaultOptions(20000);   // 兜底 deadline
-        opt.cancel = cancel_src->Token();
-        SpawnHeld(client, url, out1, rdy1, opt);
-    }
+    SpawnHeld(client, url, out1, rdy1, DefaultOptions(20000));
 
-    // 连接确实建立且 OnWritten 已发起 async_read（read 完成项真实在途）。
-    // read_armed 在 io 域内、OnWritten 尾部触发：它先于 io_hold 进入
-    // strand，故到达时 io_hold 尚未冻结；此刻冻结 strand，read 完成项
-    // 只能排在 io_hold 之后被派发（ Abort close 催出后亦然 ），名额在
-    // 窗口内必然仍占。
     BOOST_REQUIRE(read_armed->WaitTimeout(5000) == 0);
     BOOST_REQUIRE(WaitUntil([&] {
         return accepted.load(std::memory_order_acquire) == 1;
     }));
-    // 在 caller 仍在挂起/未返回前把 io_hold 排进 io 域并等它开始执行：
-    // strand 串行派发，io_hold 运行期间其后的 Abort 与 OnRead 完成项
-    // 都不可能越过它。屏障成立的时刻是「io_hold 已开始执行」，与 Abort
-    // 是否已 post 无关——Abort 若尚未 post，socket.close 甚至还没发起，
-    // OnRead 完成项连被催出的机会都没有。
+    // 在 caller 仍挂起时把 io_hold 排进 io 域并等它开始执行：strand
+    // 串行派发，io_hold 运行期间其后的 Abort/完成项都不可能越过它。
     auto io_hold  = std::make_shared<Latch>(1);   // 放行占位 handler
     auto io_held  = std::make_shared<Latch>(1);   // 占位 handler 已进入 io 域
-    // RAII：断言失败也必须放行 io 域（否则 io_hold 占住 strand 30s）。
     struct HoldGuard {
         std::shared_ptr<Latch> io_hold;
         ~HoldGuard() { io_hold->Down(); }
@@ -873,60 +809,31 @@ BOOST_AUTO_TEST_CASE(t_no_reuse_before_physical_close) {
         io_hold->WaitTimeout(30000);   // 占住 strand，冻结后续完成项派发
     }));
     BOOST_REQUIRE(io_held->WaitTimeout(5000) == 0);
+    BOOST_CHECK_EQUAL(budget->admits.load(), 1);
 
-    // 窗口已确定成立（strand 冻结在 io_hold 内）。此刻 caller 仍挂在
-    // sig->Wait：发 cancel 让它以 Cancelled 落定返回，尾路径
-    // TryPost(Abort) 把 Abort 排在 io_hold 之后——Abort 与 OnRead 完成项
-    // 都只能在 io_hold 放行后派发，物理收口（UnregisterOp→归还名额）
-    // 在窗口内不可能发生。
-    cancel_src->RequestCancel();
+    // 关键断言 A：io 域冻结、read 完成项在途 ⇒ 未物理收口 ⇒ 名额仍占、
+    // 一次都没归还。任何「物理收口前复用名额」的回归都会在这里失败。
+    BOOST_CHECK_EQUAL(budget->Held(), 1u);
+    BOOST_CHECK_EQUAL(budget->releases.load(), 0);
+    // 第二个真实 Request 必须 Overloaded（接纳判定看到名额仍占）。
+    auto res2 = CallApi(client, url, DefaultOptions(1500));
+    BOOST_REQUIRE(!res2);
+    BOOST_CHECK(res2.error().code == ErrorCode::Overloaded);
+
+    // 放行真实完成项链：io_hold 返回 → teardown Abort/Finish → 完成项
+    // 落定 → IoAsyncDone 归零 → UnregisterOp 归还名额（恰好一次）。
+    io_hold->Down();
+    BOOST_REQUIRE(Close(client));
+    BOOST_CHECK(client->IsClosed());
+    BOOST_CHECK_EQUAL(budget->Held(), 0u);
+    BOOST_CHECK_EQUAL(budget->releases.load(), 1);
     BOOST_REQUIRE(WaitUntil([&] {
         return rdy1->load(std::memory_order_acquire);
     }));
     BOOST_REQUIRE((*out1).has_value());
     BOOST_REQUIRE(!(*out1).value());
-    BOOST_CHECK((*out1)->error().code == ErrorCode::Cancelled);
+    BOOST_CHECK((*out1)->error().code == ErrorCode::Closed);
 
-    // 关键断言 A：caller 已返回、Abort 已 post、io 域仍冻结——名额必然
-    // 仍占（完成项连被派发的机会都没有）。第二个真实 Request 必须
-    // Overloaded；接纳成功说明名额在物理收口前被误复用（回归）。
-    auto res2 = CallApi(client, url, DefaultOptions(1500));
-    BOOST_REQUIRE(!res2);
-    BOOST_CHECK(res2.error().code == ErrorCode::Overloaded);
-
-    // 放行真实完成项链：io_hold 返回 → Abort 执行 → socket.close 催出
-    // OnRead 完成项 → IoAsyncDone 归零 → UnregisterOp 归还名额。
-    io_hold->Down();
-    // hold_release_guard 析构时再次 Down：对同一 Latch 幂等，无副作用。
-
-    // 轮询直至第二个真实 Request 不再被 Overloaded 拒绝——即名额已归还。
-    // 对端持有不响应：被接纳的请求会建第二个物理连接后 read 在途，
-    // caller 侧 1500ms 超时返回 TimedOut。因此「非 Overloaded 的落定」
-    // （无论 ok 还是 TimedOut）都证明名额已复用；Overloaded 则说明完成项
-    // 仍未落定、名额仍占，继续等。accepted>=2 证明新物理连接确实建成。
-    bool admitted = false;   // 名额已归还（第二次请求不再 Overloaded）
-    const auto retry_deadline = std::chrono::steady_clock::now() +
-                                std::chrono::seconds(10);
-    result<HttpResponse> res3 = result<HttpResponse>::err(
-        MakeError(ErrorCode::InternalError, "not run"));
-    while (std::chrono::steady_clock::now() < retry_deadline) {
-        res3 = CallApi(client, url, DefaultOptions(1500));
-        if (!res3 && res3.error().code == ErrorCode::Overloaded) {
-            // 名额仍占（完成项未落定）：正确行为，继续等。
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-            continue;
-        }
-        // 名额已归还，请求被接纳并走真实链路：对端不响应 → 通常
-        // TimedOut（read 在途超时）；若对端此刻已放行则 ok。两者都
-        // 证明名额可复用。
-        admitted = true;
-        break;
-    }
-    BOOST_REQUIRE(admitted);                 // 名额在物理收口后已复用
-    BOOST_CHECK_GE(accepted.load(std::memory_order_acquire), 2);
-
-    BOOST_REQUIRE(Close(client));
-    BOOST_REQUIRE(Close(rt));
     // peer_guard 析构统一收尾：peer_stop + join + close fds/lfd。
 }
 
@@ -938,10 +845,10 @@ BOOST_AUTO_TEST_CASE(t_unregister_exactly_once) {
     auto [impl, engine] = NewImplClient(budget, limits);
 
     auto mk_op = [&]() -> std::shared_ptr<http_detail::ClientOp> {
-        auto sig = bbt::infra::detail::NewCompletionSignal();
-        BOOST_REQUIRE(sig);
         auto op = std::make_shared<http_detail::ClientOp>(impl, engine);
-        op->sig = std::move(sig).value();
+        // 每个 op 自带等待位（构造时不带 signal）；Finish 会经它唤醒
+        // 等待者，未挂起的等待位收到 Notify 是安全的空操作。
+        op->waiter = bbt::coroutine::sync::CoWaiter::Create();
         op->on_unregister = [budget] { budget->Release(); };
         return op;
     };
@@ -981,17 +888,16 @@ BOOST_AUTO_TEST_CASE(t_unregister_exactly_once) {
 }
 
 // admit 成功后 RegisterOp 拒绝（teardown 已置 io_dead）→ guard 归还名额：
-// 在 admit 钩子内发起 client RequestClose 并协程让出，等 io_dead 落定后
-// admit 返回 ok——此时 IsOpen() 检查已过、RegisterOp 必失败，名额经
-// AdmitGuard 析构归还，不泄漏。
+// 在 admit 钩子内同步发起 client Close()（已收口的 client 不再接纳新 op），
+// admit 返回 ok 后 RegisterOp 必失败，名额经 AdmitGuard 析构归还，不泄漏。
 BOOST_AUTO_TEST_CASE(t_register_op_failure_releases) {
     auto budget = std::make_shared<FakeBudget>(/*cap=*/1);
     NetworkLimits limits = MakeLimits(8, 8);
     auto [impl, engine] = NewImplClient(budget, limits);
     std::shared_ptr<HttpClient> client = impl;
 
-    // admit 内触发 close 并等待 teardown 落定（协程内 bbtco_sleep 让出，
-    // 不阻塞 scheduler 线程）。
+    // admit 内触发 Close()：此刻尚无登记 op（m_ops 为空），同步 Close 的
+    // 在途等待立即返回，不阻塞调度线程。
     impl->SetQuotaHooks(
         [&budget, client] {
             budget->admits.fetch_add(1);
@@ -999,14 +905,7 @@ BOOST_AUTO_TEST_CASE(t_register_op_failure_releases) {
                 std::lock_guard<std::mutex> lk(budget->mtx);
                 ++budget->held;
             }
-            client->RequestClose();
-            const auto dl = std::chrono::steady_clock::now() +
-                            std::chrono::seconds(8);
-            while (!client->IsClosed()) {
-                if (std::chrono::steady_clock::now() > dl)
-                    break;
-                bbtco_sleep(5);
-            }
+            client->Close();
             return result<void>::ok();
         },
         [&budget] { budget->Release(); });
@@ -1026,6 +925,7 @@ BOOST_AUTO_TEST_CASE(t_register_op_failure_releases) {
     BOOST_CHECK_EQUAL(budget->releases.load(), 1);
     BOOST_CHECK_EQUAL(budget->Held(), 0u);
     BOOST_CHECK(client->IsClosed());
+    BOOST_CHECK(Close(client));   // 幂等
 }
 
 // 异常窗口回归（t_434bb4d5 指出的 m_release 复制窗口）：
@@ -1082,8 +982,352 @@ BOOST_AUTO_TEST_CASE(t_admit_failure_no_leak_no_double_release) {
     BOOST_REQUIRE(Close(impl));
 }
 
-BOOST_AUTO_TEST_CASE(t_end_stop_scheduler) {
-    g_scheduler->Stop();
+// ---------------------------------------------------------------------------
+// B1 根因回归（实际 connect 后的用户非阻塞态）。
+// 修复前：Begin 在 socket 未 open 时 non_blocking(true) 无效；range
+// async_connect 会对每个 endpoint close/reopen socket，令
+// user_set_non_blocking 位丢失；写/读的 MSG_DONTWAIT 拿到 EAGAIN 时被
+// Asio 在应用可见前吸收为阻塞 poll(-1)，全程持 IoGate → ArmWait 不可达、
+// Close 阻塞。修复：OnConnect 连接成功后重建并检查该位。
+// 判别：对端制造 EAGAIN（写背压 / 读部分响应）后，并发 Close 必须有界
+// 返回；修复前 io 线程卡在 poll(-1) 持门，Close 永不返回。断言同时覆盖
+// 物理资源（对端观测 FIN、注入账本归还）与等待/终态（Closed 落定），
+// 不只看 IsClosed 或耗时。
+// ---------------------------------------------------------------------------
+namespace {
+
+std::pair<int, std::uint16_t> MakeRawListener(int backlog) {
+    int lfd = ::socket(AF_INET, SOCK_STREAM, 0);
+    BOOST_REQUIRE(lfd >= 0);
+    int one = 1;
+    ::setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port        = htons(0);
+    BOOST_REQUIRE(::bind(lfd, reinterpret_cast<sockaddr*>(&addr),
+                         sizeof(addr)) == 0);
+    BOOST_REQUIRE(::listen(lfd, backlog) == 0);
+    socklen_t len = sizeof(addr);
+    BOOST_REQUIRE(::getsockname(lfd, reinterpret_cast<sockaddr*>(&addr),
+                                &len) == 0);
+    return {lfd, ntohs(addr.sin_port)};
+}
+
+// r1 的 CloseBounded（起线程 + 超时 detach）已删除：超时分支 detach 后线程
+// 仍会写已退出的调用者栈帧（父级 ASan 实证 stack-use-after-return），且无限
+// 残留被卡线程。两个 B1 用例现在直接同步调用 Close()：真实卡住时整进程由
+// CTest http.outbound_quota 的 TIMEOUT=120 判失败——确定性失败，不引入后台
+// 线程或新的控制协议。
+
+// 在对端 fd 上以有界超时排空并观测 FIN（read 返回 0 / reset）——
+// 证明 client 侧 fd 真正关闭（物理资源释放），不是只置逻辑标志。
+bool PeerObservedFin(int fd, int budget_ms) {
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(budget_ms);
+    for (;;) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+        timeval tv{0, 20000};
+        if (::select(fd + 1, &rfds, nullptr, nullptr, &tv) > 0) {
+            char buf[8192];
+            const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+            if (n <= 0)
+                return true;          // FIN 或 reset：对端连接已不可用
+        }
+        if (std::chrono::steady_clock::now() > deadline)
+            return false;
+    }
+}
+
+// 裸对端：listener + accept 线程；每个连接交给 on_conn 处置（可为空 =
+// accept 后不读不写，制造写背压）。析构停线程、join、关全部 fd。
+struct RawPeer {
+    int                      lfd{-1};
+    std::uint16_t            port{0};
+    std::atomic_bool         stop{false};
+    std::atomic_int          accepted{0};
+    std::mutex               mtx;
+    std::vector<int>         conn_fds;
+    std::function<void(int)> on_conn;
+    std::thread              th;
+
+    explicit RawPeer(std::function<void(int)> cb, int backlog = 8)
+        : on_conn(std::move(cb)) {
+        auto lp = MakeRawListener(backlog);
+        lfd  = lp.first;
+        port = lp.second;
+        th   = std::thread([this] {
+            while (!stop.load(std::memory_order_acquire)) {
+                fd_set rfds;
+                FD_ZERO(&rfds);
+                FD_SET(lfd, &rfds);
+                timeval tv{0, 100000};
+                if (::select(lfd + 1, &rfds, nullptr, nullptr, &tv) <= 0)
+                    continue;
+                int c = ::accept(lfd, nullptr, nullptr);
+                if (c < 0)
+                    continue;
+                {
+                    std::lock_guard<std::mutex> lk(mtx);
+                    conn_fds.push_back(c);
+                }
+                accepted.fetch_add(1, std::memory_order_release);
+                if (on_conn)
+                    on_conn(c);
+            }
+        });
+    }
+    ~RawPeer() {
+        stop.store(true, std::memory_order_release);
+        if (th.joinable())
+            th.join();
+        std::lock_guard<std::mutex> lk(mtx);
+        for (int c : conn_fds)
+            ::close(c);
+        ::close(lfd);
+    }
+    std::string Url(const std::string& path) const {
+        return "http://127.0.0.1:" + std::to_string(port) + path;
+    }
+    bool FinAll(int budget_ms) {
+        std::lock_guard<std::mutex> lk(mtx);
+        for (int c : conn_fds)
+            if (!PeerObservedFin(c, budget_ms))
+                return false;
+        return true;
+    }
+};
+
+} // namespace
+
+// 回归①：写背压（对端 accept 后不再读）下写侧无法完成时，Close 必须同步
+// 返回并物理收口（卡住 → CTest TIMEOUT 判失败）。send EAGAIN→就绪等待的
+// syscall 级判定由既有 --wrap=sendmsg/poll 探针覆盖，本用例不声称。
+BOOST_AUTO_TEST_CASE(t_b1_write_backpressure_close_bounded) {
+    // 对端：accept 后只读一次请求字节（证明写泵已物理运行），此后不再读；
+    // 8MiB 请求体压满内核发送缓冲 → 写侧无法完成。
+    std::atomic_int got_bytes{0};
+    RawPeer peer([&got_bytes](int c) {
+        char          buf[4096];
+        const ssize_t n = ::recv(c, buf, sizeof(buf), 0);
+        if (n > 0)
+            got_bytes.store(static_cast<int>(n), std::memory_order_release);
+    });
+    auto budget = std::make_shared<FakeBudget>(/*cap=*/1);
+    NetworkLimits limits = MakeLimits(8, 1);
+    limits.max_body_bytes = 16 * 1024 * 1024;   // 8MiB 请求体需过发送校验
+    auto [impl, engine] = NewImplClient(budget, limits);
+    std::shared_ptr<HttpClient> client = impl;
+    // 写完成（serializer 泵完 → ArmRead）才触发的 seam：用它断言「写侧在
+    // 窗口内未完成」，而不是靠固定 sleep 声称已进入 EAGAIN。
+    auto read_armed = std::make_shared<std::atomic_bool>(false);
+    impl->SetReadArmedHookForTest(
+        [read_armed] { read_armed->store(true, std::memory_order_release); });
+
+    // 8MiB 请求体远超 loopback 内核缓冲，保证写侧必然进入 EAGAIN。
+    HttpRequest req{"POST", peer.Url("/x"), {},
+                    std::string(8 * 1024 * 1024, 'x')};
+    auto out = std::make_shared<std::optional<result<HttpResponse>>>();
+    auto rdy = std::make_shared<std::atomic_bool>(false);
+    BOOST_REQUIRE(Spawn([client, req, out, rdy]() mutable {
+        out->emplace(client->Request(req, DefaultOptions(30000)));
+        rdy->store(true, std::memory_order_release);
+    }));
+    BOOST_REQUIRE(WaitUntil([&] { return budget->Held() == 1; }, 5000));
+    BOOST_REQUIRE(WaitUntil([&] { return peer.accepted.load() == 1; }, 5000));
+    // setup：真实握手替代固定 sleep——对端读到请求字节 ⇒ 写泵已物理运行；
+    // 对端此后不再读 ⇒ 写侧在窗口内不可能完成，read_armed 必然不触发。
+    // 这里断言的是「写侧未完成」这一可观察状态；「EAGAIN→就绪等待」的
+    // syscall 级判定由既有 --wrap=sendmsg/poll 探针动态覆盖，本用例不声称。
+    BOOST_REQUIRE_MESSAGE(WaitUntil([&] { return got_bytes.load() > 0; }, 5000),
+        "peer never observed request bytes: write pump did not run");
+    BOOST_REQUIRE_MESSAGE(!WaitUntil([&] { return read_armed->load(); }, 500),
+        "write completed despite a non-reading peer: setup not backpressured");
+
+    // Close 必须同步返回（物理收口）；卡住 → CTest TIMEOUT 判失败。
+    client->Close();
+    BOOST_REQUIRE(client->IsClosed());
+    BOOST_CHECK_EQUAL(budget->Held(), 0u);          // 名额物理归还
+    BOOST_CHECK_EQUAL(budget->releases.load(), 1);
+    BOOST_REQUIRE(WaitUntil(
+        [&] { return rdy->load(std::memory_order_acquire); }, 5000));
+    BOOST_REQUIRE((*out).has_value());
+    BOOST_REQUIRE(!(*out).value());
+    BOOST_CHECK((*out)->error().code == ErrorCode::Closed);
+    BOOST_CHECK(peer.FinAll(3000));                 // fd 真关闭：对端观测 FIN
+}
+
+// 回归②：对端发出不完整响应（头完整、体不足）后 Close 必须同步返回并物理
+// 收口；不完整响应绝不伪造成成功。读 EAGAIN→就绪等待的 syscall 级判定由
+// 既有 --wrap=recvmsg/recv/poll 探针覆盖，本用例不声称。
+BOOST_AUTO_TEST_CASE(t_b1_read_partial_eagain_close_bounded) {
+    std::atomic_bool served{false};
+    RawPeer peer([&served](int c) {
+        char buf[4096];
+        (void)::recv(c, buf, sizeof(buf), 0);      // 读掉请求
+        const char partial[] =
+            "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nabc";  // 体不足
+        (void)::send(c, partial, sizeof(partial) - 1, 0);
+        served.store(true, std::memory_order_release);
+        // 之后保持连接不关也不补数据：读泵必然落到 EAGAIN。
+    });
+    auto budget = std::make_shared<FakeBudget>(/*cap=*/1);
+    auto [impl, engine] = NewImplClient(budget, MakeLimits(8, 1));
+    std::shared_ptr<HttpClient> client = impl;
+    auto read_armed = std::make_shared<std::atomic_bool>(false);
+    impl->SetReadArmedHookForTest(
+        [read_armed] { read_armed->store(true, std::memory_order_release); });
+
+    HttpRequest req{"GET", peer.Url("/p"), {}, {}};
+    auto out = std::make_shared<std::optional<result<HttpResponse>>>();
+    auto rdy = std::make_shared<std::atomic_bool>(false);
+    BOOST_REQUIRE(Spawn([client, req, out, rdy]() mutable {
+        out->emplace(client->Request(req, DefaultOptions(30000)));
+        rdy->store(true, std::memory_order_release);
+    }));
+    BOOST_REQUIRE(WaitUntil(
+        [&] { return served.load(std::memory_order_acquire); }, 5000));
+    // setup：真实握手替代固定 sleep——read_armed 只在写完成、读就绪等待真实
+    // 武装后触发，等到它即证明请求已写出且读侧已在途（不靠 sleep 假设时序）。
+    // 本用例不声称读泵已进入 EAGAIN（测试侧无可观察量）；「读 EAGAIN→就绪
+    // 等待」的 syscall 级判定由既有 --wrap=recvmsg/recv/poll 探针覆盖。
+    BOOST_REQUIRE_MESSAGE(
+        WaitUntil([&] { return read_armed->load(); }, 5000),
+        "read never armed: write/read handshake not reached");
+
+    // Close 必须同步返回（物理收口）；卡住 → CTest TIMEOUT 判失败。
+    client->Close();
+    BOOST_REQUIRE(client->IsClosed());
+    BOOST_CHECK_EQUAL(budget->Held(), 0u);
+    BOOST_CHECK_EQUAL(budget->releases.load(), 1);
+    BOOST_REQUIRE(WaitUntil(
+        [&] { return rdy->load(std::memory_order_acquire); }, 5000));
+    BOOST_REQUIRE((*out).has_value());
+    BOOST_REQUIRE(!(*out).value());          // 不完整响应不得成功
+    BOOST_CHECK((*out)->error().code == ErrorCode::Closed);
+    BOOST_CHECK(peer.FinAll(3000));
+}
+
+// ---------------------------------------------------------------------------
+// B1-r2 直接回归：连接 op 的失败收口必须先物理释放再注销。
+// 父验收实证（--wrap=ioctl 注入真实连接后的 FIONBIO 失败）：修复前 OnConnect
+// 失败分支直接 Finish，op 先离开 m_ops，owner Close 快照为空，socket 与 8MiB
+// body 无人物理释放，只能等 op 析构——违反「不能依赖析构」。本用例在既有
+// 出站配额套件内直接驱动 ClientOp，走可直接触发的同一失败收口分支（真实
+// Begin→resolve→connect 到已关闭端口 ⇒ connect 失败），断言修复后的物理
+// 后置条件。
+//
+// 注入边界（诚实声明，不冒充完整覆盖）：本机实测一切「有效」fd 的 FIONBIO
+// 都成功（/dev/null、普通文件、目录、pipe、eventfd、epoll、ptmx、socket 均
+// rc=0），测试侧无法在不改 CMake/链接包装（--wrap 需改 tests/CMakeLists.txt）
+// 的前提下让已连接 socket 的 FIONBIO 失败；OnConnect 又是 private，不能直接
+// 调用。故设置用户非阻塞态失败分支由 scratch 探针
+// （http-b1-r2/nonblocking-failure-probe.cc，--wrap=ioctl）动态覆盖 fd
+// EBADF/无发送，本用例覆盖同一收口不变量的可直接触发分支。
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(t_b1_connect_failure_physical_release) {
+    // 先占一个端口再立刻关闭：loopback 上该端口无监听者 ⇒ connect 必然
+    // ECONNREFUSED（不依赖外部网络或时序）。
+    std::uint16_t dead_port = 0;
+    {
+        int lfd = ::socket(AF_INET, SOCK_STREAM, 0);
+        BOOST_REQUIRE(lfd >= 0);
+        sockaddr_in addr{};
+        addr.sin_family      = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port        = htons(0);
+        BOOST_REQUIRE(::bind(lfd, reinterpret_cast<sockaddr*>(&addr),
+                             sizeof(addr)) == 0);
+        socklen_t len = sizeof(addr);
+        BOOST_REQUIRE(::getsockname(lfd, reinterpret_cast<sockaddr*>(&addr),
+                                    &len) == 0);
+        dead_port = ntohs(addr.sin_port);
+        ::close(lfd);
+    }
+
+    auto budget = std::make_shared<FakeBudget>(/*cap=*/1);
+    auto [impl, engine] = NewImplClient(budget, MakeLimits(8, 1));
+    std::shared_ptr<HttpClient> client = impl;
+
+    // 与 Request 相同的接线：先 admit 预留名额，再把 release 挂到 op 的物理
+    // 收口钩子（op 离开 m_ops 时归还一次）。
+    BOOST_REQUIRE(budget->Admit());
+    BOOST_REQUIRE_EQUAL(budget->Held(), 1u);
+    auto op = std::make_shared<http_detail::ClientOp>(impl, engine);
+    op->waiter = bbt::coroutine::sync::CoWaiter::Create();
+    op->request.version(11);
+    op->request.method_string("POST");
+    op->request.target("/");
+    op->request.set(boost::beast::http::field::host, "127.0.0.1");
+    op->request.body() = std::string(8 * 1024 * 1024, 'x');  // 与父夹具同规模
+    op->request.prepare_payload();
+    int unregistered = 0;
+    op->on_unregister = [&] {
+        ++unregistered;
+        budget->Release();
+    };
+    BOOST_REQUIRE(impl->RegisterOp(op));
+    BOOST_REQUIRE(engine->TryPost([op, dead_port] {
+        op->Begin("127.0.0.1", dead_port);
+    }));
+    BOOST_REQUIRE(WaitUntil([&] { return op->finished.load(); }, 10000));
+
+    // 发布序同步（F1）：ClientOp::Finish 先 finished.exchange(true)，随后才写
+    // outcome、经 MaybeUnregister→UnregisterOp→on_unregister 归还配额
+    // （++unregistered、budget->Release()）。finished 的 exchange 只对「其之前」
+    // 的写入建立 happens-before——恰好覆盖 Abort 写下的 body/buffer/socket/
+    // inflight（故下方物理释放断言本就不 flaky），但 outcome/unregistered/quota
+    // 都写在 finished 发布之后，与测试线程之间没有同步边（未参与者实测完整测试
+    // 70 次有 4 次在本断言前假红）。故读这三类字段前，先等待反登记之后的真实
+    // 同步点：on_unregister 内 budget->Release() 的 releases.fetch_add（seq_cst）
+    // 与 held 递减（同一 mtx）。releases==1 与 outcome/unregistered 的写入建立
+    // happens-before；held 递减发生在 fetch_add 之后且受 mtx 保护，故一并要求
+    // Held()==0，取得该写入的可见性。逻辑终态仍由上面的 finished 等待保证。
+    BOOST_REQUIRE(WaitUntil(
+        [&] { return budget->releases.load() == 1 && budget->Held() == 0; },
+        10000));
+
+    // 失败语义保留：connect 失败不得变成成功或静默重试。
+    BOOST_REQUIRE(op->outcome.has_value());
+    BOOST_REQUIRE(!*op->outcome);
+    BOOST_CHECK(op->outcome->error().message.find("connect failed") !=
+                std::string::npos);
+    // 失败收口在 op 离开 m_ops 前已物理释放（不等 Close、不依赖析构）。
+    BOOST_CHECK_EQUAL(op->request.body().size(), 0u);  // 8MiB 不再占有
+    BOOST_CHECK_EQUAL(op->buffer.size(), 0u);
+    BOOST_CHECK_EQUAL(op->inflight.load(), 0);
+    BOOST_CHECK(!op->serializer.has_value());          // 未进入 PumpWrite
+    BOOST_CHECK(!op->socket.is_open());                // socket 已物理关闭
+    BOOST_CHECK_EQUAL(unregistered, 1);                // 离开 m_ops 恰好一次
+    BOOST_CHECK_EQUAL(budget->Held(), 0u);             // 配额恰好归还一次
+    BOOST_CHECK_EQUAL(budget->releases.load(), 1);
+
+    client->Close();
+    BOOST_CHECK(client->IsClosed());
+}
+
+BOOST_AUTO_TEST_CASE(t_end_runtime_convergence) {
+    // 进程寿命运行时没有 Scheduler::Stop：各用例自有的 runtime 都在用例内
+    // 显式 Close() 并断言 IsClosed；这里确认运行时仍在跑，且新建 runtime
+    // 仍能创建→使用→同步 Close 收敛（收尾没有污染全局状态）。
+    BOOST_CHECK(g_scheduler->IsInitialized());
+
+    auto rt = StartClientRuntime(MakeLimits(1, 1));
+    auto client = NewClient(rt);
+    std::weak_ptr<NetworkRuntime> weak = rt;
+    BOOST_CHECK(Close(client));
+    BOOST_CHECK(Close(rt));
+    BOOST_CHECK(rt->IsClosed());
+    // 关闭后工厂拒绝新子对象（收口即封口，不重开）。
+    auto late = rt->CreateHttpClient();
+    BOOST_REQUIRE(!late);
+    BOOST_CHECK(late.error().code == ErrorCode::Closed);
+    // 物理收口 + 外部引用释放：不再有存活的强持有者（无泄漏托管）。
+    rt.reset();
+    client.reset();
+    BOOST_REQUIRE(WaitUntil([&] { return weak.expired(); }));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

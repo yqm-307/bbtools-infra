@@ -19,6 +19,25 @@
 
 现有通信层总契约 `docs/decisions/0002-co-network-contract-v1.md` 继续拥有网络 Runtime、公共错误和关闭语义；本文补充其中缺失的 transport/adapter 执行契约。两者冲突时，以本文对 I/O 执行边界的较新明确规定为准，并在实施 Issue 中记录迁移。
 
+### 1.1 修订记录（2026-10-01：进程寿命运行时 + owner 同步 Close）
+
+上游 coroutine 已按**进程寿命运行时**收敛（候选 HEAD `03430a5`：删除 `Scheduler::Stop()`/restart
+与运行时代际）；infra 关闭契约随之改为**资源 owner 主动调用的同步 `Close()`**。本记录为准，
+**取代**本文原 §4.0.1、§5.2、§6.3、§6.4、§7.3、§8.1、§10.1、§13、§14 中把 `RequestClose`/
+`WaitClosed`/`CloseStatus`/运行时代际/`Scheduler::Stop` 当作关闭与资源收口前提的表述：
+
+- `ICoCloseable` 只有 `void Close() noexcept`（幂等、`owner` 域内调用、**返回即物理资源已释放、
+  后端不会再访问**、未发送数据丢弃不 flush、不重开）与 `bool IsClosed() const noexcept`。
+  `RequestClose`/`WaitClosed`/`ReleaseClosed`/`CloseStatus` 已删除、不保留兼容壳。
+- coroutine 运行时**不参与**业务资源收口，运行时不设业务取消令牌、也没有代际语义。
+- 请求完成在 infra 内部以 `CoWaiter::WaitWithCallback`（登记等待 → 一次投递回调 → 挂起）+
+  adapter 路径 `Notify`（可带载荷）实现；结果放各模块 operation state，`CoWaiter` 只等/唤醒。
+- §14 的 `ForceCloseAfterQuiescence`「调度器已静默（`Scheduler::Stop()` 已返回）」前置条件
+  随 `Stop` 删除而失效；该入口的现状与去向**待按新契约重验**，本节其余文本保留为历史记录。
+
+superseded by：本文修订记录 + [0002 修订记录](0002-co-network-contract-v1.md)。
+本仓当前处于**候选、未提交**状态，本记录不宣称任何实现已交付或已通过验收。
+
 ## 2. 设计结论
 
 ### 2.1 统一的是 I/O 能力，不是中间件客户端
@@ -100,7 +119,7 @@ transport 只依赖 bbtco 提供的稳定等待/唤醒能力，不向 coroutine 
 
 ## 4. CoTCP 公共能力
 
-以下为目标声明，不是现有可编译 API。复用现有 `CallOptions`、`result<T>`、`Error`、`ICoNetwork` 与 `ICoCloseable`，不另建一套 deadline/cancel/error，也不新增 `IoOptions`——等待条件统一走 `CallOptions`（deadline/cancel）与内部 `IoWait`（§5.2），`IoProgress` 只携带 `Ok`/`WouldBlock`/`Eof`，其余结果一律走 `Error` 分支。新增缓冲和地址值类型在下方定义；公共头不暴露 Asio 或第三方类型。`CoTCP`、`CoUDP`、`CoTCPListener` 均不可复制，由 Runtime 工厂返回受托管引用。raw FD 接管（§6.1）保留为内部能力且遵循单一所有权，不作为公共 FD API 导出。
+以下为目标声明，不是现有可编译 API。复用现有 `CallOptions`、`result<T>`、`Error`、`ICoNetwork` 与 `ICoCloseable`，不另建一套 deadline/error，也不新增 `IoOptions`——等待条件统一走 `CallOptions`（只含 deadline，无取消令牌）与内部 `IoWait`（§5.2），`IoProgress` 只携带 `Ok`/`WouldBlock`/`Eof`，其余结果一律走 `Error` 分支。新增缓冲和地址值类型在下方定义；公共头不暴露 Asio 或第三方类型。`CoTCP`、`CoUDP`、`CoTCPListener` 均不可复制，由 Runtime 工厂返回受托管引用。raw FD 接管（§6.1）保留为内部能力且遵循单一所有权，不作为公共 FD API 导出。
 
 ```cpp
 namespace bbt::infra {
@@ -127,15 +146,15 @@ using IoResult = result<IoProgress>;
 | 条件 | 结果 |
 |---|---|
 | 参数非法（`data=nullptr && size>0`）/ 非受管协程执行数据操作 | 分别返回 `InvalidArgument` / `InvalidContext`，立即返回，不挂起 |
-| Runtime 未 `Start`、运行时代际不匹配、executor 获取失败 | `RuntimeUnavailable`，立即返回，不挂起 |
+| Runtime 未初始化（`Scheduler::IsInitialized()` 为假）、executor 获取失败 | `RuntimeUnavailable`，立即返回，不挂起 |
 | 非阻塞 syscall 立即失败（`EAGAIN`/`EWOULDBLOCK`/`EINTR` 之外） | 对应 `Error`（如 `TransportError`），不挂起 |
 | DNS 解析失败 | `TransportError`，`backend_category="dns"`；解析等待使用本次调用的同一绝对 deadline |
 | 对端有序关闭（TCP read 返回 0） | `IoState::Eof` |
 | deadline 到期 | `TimedOut`（Error 分支） |
 | cancel 触发 | `Cancelled`（Error 分支） |
-| owner 已 `RequestClose` 后的新调用 / 等待中关闭 | `Closed`（Error 分支） |
+| owner 已 `Close()` 后的新调用 / 等待中被 owner 关闭 | `Closed`（Error 分支） |
 
-调用入口先检查参数、受管协程上下文和 Runtime 代际；然后按 Closed → Cancelled → TimedOut 检查已经成立的终止条件，再尝试 I/O。`Try*` 没有调用选项，只检查参数、上下文、代际和关闭状态。调用开始后的竞争沿用 `0002`：首次成功发布的逻辑终态不可覆盖；就绪本身不是终态。`Try*` 不挂起，因此不存在被透明 Hook 再挂起的路径：任何 `Try*` 实现内不得调用可能挂起当前 coroutine 的 Hook 或等待原语（见 §3.2）。
+调用入口先检查参数、受管协程上下文与运行时初始化状态（`Scheduler::IsInitialized()`，不再有代际）；然后按 Closed → Cancelled → TimedOut 检查已经成立的终止条件，再尝试 I/O。`Try*` 没有调用选项，只检查参数、上下文、运行时初始化与关闭状态。调用开始后的竞争沿用 `0002`：首次成功发布的逻辑终态不可覆盖；就绪本身不是终态。`Try*` 不挂起，因此不存在被透明 Hook 再挂起的路径：任何 `Try*` 实现内不得调用可能挂起当前 coroutine 的 Hook 或等待原语（见 §3.2）。
 
 EOF 与部分传输：
 
@@ -157,14 +176,14 @@ public:
     IoResult ReadSome(MutableBytes dst, const CallOptions& options);
     IoResult WriteSome(ConstBytes src, const CallOptions& options);
     IoResult WriteAll(ConstBytes src, const CallOptions& options);
-    // RequestClose / IsClosed / WaitClosed 按 ICoCloseable 实现。
+    // Close() / IsClosed() 按 ICoCloseable 实现（同步物理收口）。
 };
 
 class CoTCPListener : public ICoNetwork, public ICoCloseable {
 public:
     result<std::shared_ptr<CoTCP>> Accept(const CallOptions& options);
     SocketAddress LocalAddress() const;
-    // RequestClose 停止接纳；不关闭已经交付的 CoTCP。
+    // Close() 停止接纳并同步收口 listener；不关闭已经交付的 CoTCP。
 };
 
 // 以下为 NetworkRuntime 的新增成员：
@@ -186,12 +205,12 @@ result<std::shared_ptr<CoUDP>> BindUDP(SocketAddress local);
 工厂与生命周期规则：
 
 1. **工厂执行位置**：`DialTCP` 只能在受管 coroutine 内调用，内部可因 DNS、非阻塞 connect 等待而挂起；首版不包含 TLS；`ListenTCP`/`BindUDP` 是控制线程配置操作，不挂起、不等网络事件，可在任何线程调用，但要求 Runtime 已 `Start`。
-2. **所有权**：工厂返回的 `shared_ptr` 是受托管对象引用；Runtime 强持有全部交付对象直至其 Closed，调用方持有引用不能阻止 Runtime 清理。对象关闭后引用仍可用于查询 `IsClosed`/`WaitClosed`。
+2. **所有权**：工厂返回的 `shared_ptr` 是受托管对象引用；Runtime 强持有全部交付对象直至其 Closed，调用方持有引用不能阻止 Runtime 清理。对象关闭后引用仍可用于查询 `IsClosed()`。
 3. **DialTCP 内部步骤**：数值地址（`host` 是合法数值 IP）直接进入非阻塞 connect；主机名先经 transport 内 DNS（或显式复用既有 resolver 能力）解析——DNS 属于 transport 接管的阻塞路径，不允许落到未接管的同步 `getaddrinfo`。非阻塞 connect 以 `EINPROGRESS` 等待 writability，用 `SO_ERROR` 取回真实结果；`SO_ERROR` 非零映射为 `TransportError`（原生错误写入 `backend_category`/`backend_code`，不拼出含凭据的消息）。首版不承诺 TLS；`TcpEndpoint` 若需要 TLS 语义由后续切片扩展，不在本文冒充已支持。
-4. **ListenTCP**：`bind` + `listen(backlog)`；绑定只接受 `SocketAddress` 数值地址（`ip` 不得为空，通配必须显式写 `0.0.0.0` 或 `::`；端口 0 表示动态分配）；`LocalAddress()` 返回实际绑定地址。`Accept` 挂起等待可读，Linux 使用 `accept4` 或等价非阻塞设置交付新 `CoTCP`，其他平台不得把此 syscall 名当公共契约；listener `RequestClose` 唤醒等待中的 `Accept` 并返回 `Closed`，不关闭已交付的连接。
+4. **ListenTCP**：`bind` + `listen(backlog)`；绑定只接受 `SocketAddress` 数值地址（`ip` 不得为空，通配必须显式写 `0.0.0.0` 或 `::`；端口 0 表示动态分配）；`LocalAddress()` 返回实际绑定地址。`Accept` 挂起等待可读，Linux 使用 `accept4` 或等价非阻塞设置交付新 `CoTCP`，其他平台不得把此 syscall 名当公共契约；listener 的 `Close()` 唤醒等待中的 `Accept` 并返回 `Closed`，不关闭已交付的连接。
 5. **BindUDP**：`socket` + `bind`，同样只接受数值地址；`LocalAddress()` 返回实际绑定地址；未 bind 显式地址的组合发送路径不在首版公共 API。
 6. **失败即无对象**：工厂失败返回 Error 且不产出半成品对象；`ListenTCP`/`BindUDP` 失败时内部负责 `close` 已创建的 FD。
-7. **资源限额**：首版复用 `NetworkLimits.max_connections` 作为每个 Runtime 同时拥有的 transport socket 容量（含 listener、UDP socket、accepted TCP、连接中的候选 socket；协议 Conn 引用同一 socket 不重复计数）。创建/接纳前原子预留容量，失败回退、物理关闭后释放；超限返回 `Overloaded`，不静默排队。`backlog` 必须为 1..INT_MAX，非法返回 `InvalidArgument`，内核实际队列上限可能更小。`max_inflight` 已实现为 Runtime 级传输在途账本（[#32](https://github.com/yqm-307/bbtools-infra/issues/32)）：覆盖受管 `DialTCP` 的等待段（DNS 解析与非阻塞 connect 等待）、`CoTCPListener::Accept` 的挂起等待、`CoTCP::ReadSome/WriteSome/WriteAll` 与 `CoUDP::Receive/Send` 的可等待数据操作；`Try*`（`TryReadSome`/`TryWriteSome`/`TryReceive`/`TrySend`）与未受 Runtime 托管的直接 transport 入口（`CoTCP::DialTCP`/`CoTCPListener::ListenTCP`/`CoUDP::BindUDP` 静态工厂）不占名额。容量满立即 `Overloaded`、不排队不挂起；名额由对象在 op 结束时归还，`Scheduler::Stop` 不展开挂起协程栈时由对象侧 `RequestClose`/析构的 quota drain 一次性归还剩余（账本经 `shared_ptr` 与 Runtime 共享持有，归还不依赖协程栈 RAII）。`WriteAll` 的在途粒度是它**内部单次写尝试**，不是一个 `WriteAll` 调用一个名额：每轮在进入等待前 admit、该轮返回即归还，轮与轮之间名额可被其他 op 取走，因此多轮 `WriteAll` 可能在已写入部分字节后以 `Overloaded` 中途失败——已写字节数由 `error.transferred_bytes` 回报，本层不排队、不自动重试，调用方不得假设 `WriteAll` 的在途原子性。受管 `DialTCP` 的等待段在 `Scheduler::Stop` 期间由 DNS 侧先落定（唤醒并 join worker 之后才允许销毁协程栈），挂起 dial 以失败终态返回并经正常路径归还名额。仍保留的边界：HTTP 切片内部的 `max_inflight` 预算与传输账本同上限、各自独立计量；TLS/Unix socket 等非首版 transport 不在本账本范围。
+7. **资源限额**：首版复用 `NetworkLimits.max_connections` 作为每个 Runtime 同时拥有的 transport socket 容量（含 listener、UDP socket、accepted TCP、连接中的候选 socket；协议 Conn 引用同一 socket 不重复计数）。创建/接纳前原子预留容量，失败回退、物理关闭后释放；超限返回 `Overloaded`，不静默排队。`backlog` 必须为 1..INT_MAX，非法返回 `InvalidArgument`，内核实际队列上限可能更小。`max_inflight` 已实现为 Runtime 级传输在途账本（[#32](https://github.com/yqm-307/bbtools-infra/issues/32)）：覆盖受管 `DialTCP` 的等待段（DNS 解析与非阻塞 connect 等待）、`CoTCPListener::Accept` 的挂起等待、`CoTCP::ReadSome/WriteSome/WriteAll` 与 `CoUDP::Receive/Send` 的可等待数据操作；`Try*`（`TryReadSome`/`TryWriteSome`/`TryReceive`/`TrySend`）与未受 Runtime 托管的直接 transport 入口（`CoTCP::DialTCP`/`CoTCPListener::ListenTCP`/`CoUDP::BindUDP` 静态工厂）不占名额。容量满立即 `Overloaded`、不排队不挂起；名额由对象在 op 结束时归还，owner 主动 `Close()` 时由对象侧 `DrainQuota` 一次性归还剩余（账本经 `shared_ptr` 与 Runtime 共享持有，归还不依赖协程栈 RAII）。`WriteAll` 的在途粒度是它**内部单次写尝试**，不是一个 `WriteAll` 调用一个名额：每轮在进入等待前 admit、该轮返回即归还，轮与轮之间名额可被其他 op 取走，因此多轮 `WriteAll` 可能在已写入部分字节后以 `Overloaded` 中途失败——已写字节数由 `error.transferred_bytes` 回报，本层不排队、不自动重试，调用方不得假设 `WriteAll` 的在途原子性。受管 `DialTCP` 的等待段在 owner `Close()` 时由 DNS 侧先落定（唤醒并 join worker），挂起 dial 以失败终态返回并经正常路径归还名额。仍保留的边界：HTTP 切片内部的 `max_inflight` 预算与传输账本同上限、各自独立计量；TLS/Unix socket 等非首版 transport 不在本账本范围。
 
 ### 4.1 CoTCP 语义
 
@@ -227,7 +246,7 @@ public:
     IoResult Send(ConstBytes packet, const SocketAddress& peer,
                   const CallOptions& options);
     SocketAddress LocalAddress() const;
-    // RequestClose / IsClosed / WaitClosed 按 ICoCloseable 实现。
+    // Close() / IsClosed() 按 ICoCloseable 实现（同步物理收口）。
 };
 
 } // namespace bbt::infra
@@ -253,7 +272,7 @@ public:
 | FD readable / writable | sche poller | 只表示“可以重试”，不表示操作成功 |
 | timer / deadline | runtime 时钟 | 到期即参与唤醒竞争，不重置 |
 | cancel | 调用方 token | 立即参与唤醒竞争 |
-| close（owner `RequestClose`） | 任意线程 | 只封口并唤醒，见 §6.4 |
+| close（owner `Close()`） | 任意线程 | 只封口并唤醒，见 §6.4 |
 | command / 自定义事件 | Binding / owner | 供 KCP output queue 等内部状态投递唤醒 |
 
 契约要求：
@@ -289,7 +308,7 @@ public:
 2. driver close 是唯一实际 close；
 3. 关闭由 owner 协调：先使等待失效、确认无 syscall/协议调用正在使用资源、解除监视，再由 driver 唯一关闭并释放 context；
 4. FD 数字复用期间旧事件不能触达新资源；
-5. `RequestClose`/`WaitClosed` 等待 driver callback 和 cleanup 完成。
+5. owner 同步 `Close()` 等待 driver callback 和 cleanup 完成，返回即后端不再访问。
 
 不能同时让 `CoTCP` 和 driver 各自认为自己拥有 FD。`dup` 创建不同的描述符数字，但与原 FD 共享 open file description（包括 O_NONBLOCK 等状态），不能被原 FD 的串行契约自动覆盖；adapter 必须禁止或显式纳入所有权模型。
 
@@ -297,23 +316,23 @@ public:
 
 本文所有“单一 owner / 串行使用”约束是**对 infra adapter 与第三方 Binding 的使用契约**：谁持有对象，谁负责保证同一时刻只有一个执行主体使用它。当前 bbtco 上游（Scheduler/Poller）不提供也不承诺“FD 全局互斥”或“sche 自动串行化协议调用”；不得把单 owner 约束描述成 sche 已实现的能力。需要串行化时由 infra 自行提供（如 Binding 内串行队列、per-connection 状态机）。关闭协议不是正常读写的独占锁；首版不提供跨调用的自动锁，协议 owner/池租约负责完整交互独占。
 
-### 6.3 停止与栈外保活
+### 6.3 关闭与栈外保活（修订见 §1.1）
 
-bbtco `Scheduler::Stop()` 对仍挂起协程采用直接销毁、不做栈展开。因而不能依赖协程栈上的 RAII 释放第三方 context、FD、缓冲或 lease。
+coroutine 运行时按进程寿命存在、不再有 `Scheduler::Stop()`；infra **不得**依赖协程栈上的 RAII 释放第三方 context、FD、缓冲或 lease——物理收口必须由资源 owner 主动同步 `Close()` 显式完成。
 
-Runtime 必须在栈外持有 operation、Binding、连接和 transport，直至 `WaitClosed` 确认后端不会再访问它们。逻辑 `Cancelled`/`TimedOut` 不等于物理清理完成。
+Runtime 必须在栈外持有 operation、Binding、连接和 transport，直至 owner `Close()` 返回（后端不会再访问它们）。逻辑 `Cancelled`/`TimedOut` 不等于物理清理完成。
 
 栈外保活的边界：`shared_ptr` 只保活对象本体；硬 Stop 时第三方栈上（库调用帧内）的临时分配无法被任何栈外 `shared_ptr` 自动回收。adapter 不得宣称“对象保活 = 第三方栈安全”；可行的处理是把等待/阻塞深度控制在栈外可枚举的 operation 上（B/C 级），或证明 A 级库调用在任意挂起点栈内无第三方临时分配依赖（见 §10.1）。
 
-### 6.4 关闭协议与 FD 复用防护
+### 6.4 关闭协议与 FD 复用防护（修订见 §1.1）
 
-`RequestClose` 的分层语义：
+`Close()` 的分层语义（同步；返回即物理收口）：
 
-1. **封口与通知（任意线程）**：`RequestClose` 幂等、可在任意线程调用；它置关闭标志、使在途等待失效（唤醒等待者返回 `Closed`）、拒绝新调用，不等待物理完成。
+1. **封口与通知**：`Close()` 幂等、可在任意线程调用；它置关闭标志、使在途等待失效（唤醒挂起等待者返回 `Closed`）、拒绝新调用。
 2. **解除监视**：owner 或关闭协调者把 FD 从 poller 解除注册，晚到就绪事件不再发布给该对象。
 3. **同步退出**：物理 `close` 必须与正在进行的 syscall 和协议库调用同步——确认没有线程/协程正持有该 FD 做 read/write/recvfrom/send 或处于第三方协议调用内部。实现方式由 Binding 决定（等待 in-flight 计数归零、owner 串行化关闭步骤、或 worker bridge 的物理归零），但“封口后立即 close”不满足本契约。
-4. **物理 close 与释放**：唯一 owner 执行 `close` 和 context 释放。`WaitClosed` 返回后保证后端不会再访问资源。
-5. **FD 代际防护**：close 之后 FD 数字可能被其他组件复用。解除监视必须先于物理 close 完成；poller 侧对每个注册事件持有代际/身份标识，旧代际事件（含已入队未派发的就绪通知）不得触达新资源。该防护的具体机制是 transport 实现责任，不得依赖“解除与 close 之间不会有事件”的时序假设。
+4. **物理 close 与释放**：唯一 owner 执行 `close` 和 context 释放。**`Close()` 返回后保证后端不会再访问资源**；infra 侧的有界等在途归零口径为 —— 在自身锁 + `std::condition_variable` 上以 `detail::kCloseDrainTimeout` 为上限等待在途计数归零，超时即放弃等待并继续物理释放（调用方可据此记录告警，不无限阻塞）。
+5. **FD 复用防护**：close 之后 FD 数字可能被其他组件复用。解除监视必须先于物理 close 完成；poller 侧对每个注册事件持有代际/身份标识，旧身份事件（含已入队未派发的就绪通知）不得触达新资源。该防护的具体机制是 transport 实现责任，不得依赖“解除与 close 之间不会有事件”的时序假设。
 
 反例（明确禁止）：Binding 在收到 close 通知后，一边让第三方协议调用（如 `redisCommandArgv`）仍悬停在库栈内部，一边立刻 `close(fd)`——协议库内部可能正持有该 fd 的缓冲、TLS 状态或重试逻辑，且晚到事件可能触达复用后的 FD。
 
@@ -380,7 +399,7 @@ sche 只报告就绪，不调用推进函数。
 - 协程只等待 operation state；
 - 队列和 worker 数有界；
 - deadline/cancel 可以先发布逻辑结果，但不能谎称已强杀 driver 调用；
-- `WaitClosed` 等待 driver 和队列物理归零。
+- owner 同步 `Close()` 返回即 driver 和队列物理归零。
 
 当前 Mongo adapter 使用此路径；这是保守兼容例外，不是已经证明 mongocxx 永远不能协程化。是否迁移由单独兼容调查裁决，不因存在 socket Hook 而移除 worker bridge。
 
@@ -417,7 +436,7 @@ Binding 对 hiredis `redisContextFuncs` 各回调的目标行为（均为设计�
 |---|---|
 | `read` | A 路径调用 `CoTCP::ReadSome` 并在 transport 内消化 `WouldBlock`，不返回 0 令同步 hiredis 忙循环。B 路径仅在库以非阻塞方式受控推进时调用 `TryReadSome`，此时 0 表示可恢复无进展；EOF 或终止态返回 `< 0` 并置 context error（`err`/`errstr`），让 hiredis 进入错误路径。不伪造“读到 0 字节等于 EOF”。 |
 | `write` | 从 `c->obuf` 取数据，A 路径经 `CoTCP::WriteSome` 发出；单次 `WriteSome` 保持 hiredis 按回调返回值消费 `c->obuf` 的推进语义，不由 Binding 代替 hiredis 删除或重排缓冲。只报告本次实际写入的字节数；B 路径使用 `TryWriteSome`，`WouldBlock` 返回 0；A 路径在 transport 内等待，终止返回 `< 0` 并设 context error。累计已发送数量另存栈外 operation，错误时使连接不可复用，不自动重发。 |
-| `close` | 由 Binding 唯一拥有：转发为 transport `RequestClose`，保证物理 close 走 §6.4 协议；hiredis 不再自己 `close(fd)`。 |
+| `close` | 由 Binding 唯一拥有：转发为 transport `Close()`，保证物理 close 走 §6.4 协议；hiredis 不再自己 `close(fd)`。 |
 | `free_privctx` | 只释放该 hiredis context 独占的私有包装；仍被等待/关闭访问的状态由 Runtime 独立保活，不能在此提前释放。先让非清理协议调用退出再执行 redisFree，cleanup 完整退出后才发布 Closed。 |
 | connect / TLS | connect 经 `DialTCP`（§4.0.1）；TLS 函数表项不可盲覆盖——未实现 TLS 接管时在连接前明确拒绝 TLS 请求，不降级为明文，也不盲目保留会绕过 CoTCP 的 TLS 收发。 |
 
@@ -510,19 +529,19 @@ output callback 不应直接调用可能挂起的 `CoUDP::Send`。KCP owner coro
 - `WouldBlock`、部分读写、EOF、错误和关闭；
 - deadline、cancel、owner close、晚到 completion 的竞争；
 - FD close 与数字复用保护；
-- Stop 不展开栈时的栈外资源清理；
+- owner 主动 `Close()` 的栈外物理收口（不依赖协程栈）；
 - DNS/TLS/第三方线程/内部定时器等未接管路径；
 - 真实后端端到端交互。
 
 通过依赖库自带测试、编译成功、单个 loopback 或观察到 read/write callback，均不足以单独提高兼容级别。
 
-### 10.1 A 级强制 Stop 资源安全门禁
+### 10.1 A 级关闭/物理收口资源安全门禁（修订见 §1.1）
 
-A 级（直接 coroutine binding）意味着第三方协议调用会在库栈内部挂起。由于 `Scheduler::Stop()` 直接销毁挂起协程、不展开栈，任何 A 级 Binding 必须证明：**在任意挂起点被硬 Stop 时，第三方库栈内的资源不会泄漏或悬空**。库栈内的临时分配（缓冲、锁、内部 lease）没有栈外 `shared_ptr` 能替它释放（§6.3）。
+A 级（直接 coroutine binding）意味着第三方协议调用会在库栈内部挂起。由于 coroutine 运行时按进程寿命存在、不再有 `Scheduler::Stop()`，infra **不得**依赖协程栈展开回收第三方库栈内资源；任何 A 级 Binding 必须证明：**在 owner 主动 `Close()` 时（含关闭与库调用竞争），第三方库栈内的资源不会泄漏或悬空**。库栈内的临时分配（缓冲、锁、内部 lease）没有栈外 `shared_ptr` 能替它释放（§6.3）。
 
-- 优先路径是 graceful drain：Stop 前由宿主/owner 排空在途调用、不再发起新调用，让库栈自然退出后再关闭。A 级文档必须给出 drain 顺序与超时行为。
-- 若无法证明 forced stop 下资源安全，该 Binding 降级为 B（非阻塞步进：库调用退出后才等待/关闭）或 C（worker bridge），不得以“有 Hook”维持 A 级。
-- 硬 Stop 后，Runtime 与相关对象仍由宿主持有；若资源未能安全回收，不得宣称该连接/对象已达 `Closed` 语义（物理清理完成）。遗留缺口转为对上游 runtime/库的验证任务，不虚构“Stop 回调”或“资源回收回调”等当前上游不存在的能力。
+- 优先路径是 graceful drain：`Close()` 由宿主/owner 排空在途调用、不再发起新调用，让库栈自然退出后再执行物理 close。A 级文档必须给出 drain 顺序与超时行为（infra 侧有界等待上限见 §6.4 的 `detail::kCloseDrainTimeout`）。
+- 若无法证明关闭竞争下资源安全，该 Binding 降级为 B（非阻塞步进：库调用退出后才等待/关闭）或 C（worker bridge），不得以“有 Hook”维持 A 级。
+- `Close()` 有界等待超时后，Runtime 与相关对象仍由宿主持有；若资源未能安全回收，不得宣称该连接/对象已达 `Closed` 语义（物理清理完成）。遗留缺口转为对上游 runtime/库的验证任务，不虚构“Stop 回调”或“资源回收回调”等当前上游不存在的能力。
 
 ### 10.2 HTTP 目标形态
 
@@ -600,7 +619,7 @@ Mongo 维持 `0004` 的 C 级 worker bridge 例外：这是当前实现的兼容
   经内部装配面装配。
 - **未新增（本节仅限 P4-C 公共面）**：无 readiness-only 就绪原语（§3.2 语义不变）、无万能协议抽象、无新 transport
   层；`NetworkRuntime` 的 `DialTCP/ListenTCP/BindUDP` 转发面保留不变；`max_connections`/
-  `max_inflight`/**运行期**关闭门控未改动（`RequestClose`/`_EndIo` 的 `m_inflight` 物理关闭门控保留）；
+  `max_inflight`/**运行期**关闭门控未改动（`Close()`/`_EndIo` 的 `m_inflight` 物理关闭门控保留）；
   同批集成新增的硬停入口见 §14——本节不覆盖硬停，也不得被读成「硬停未新增」。
 - **兼容影响**：这是公共头与 ABI 的破坏性收敛（删除公共重载与 owner 侧两个虚方法槽位）。
   本仓消费者（`src/http/NetworkRuntimeImpl`、`tests/`）已全部迁移并通过验证；本仓**无法**
@@ -615,6 +634,12 @@ Mongo 维持 `0004` 的 C 级 worker bridge 例外：这是当前实现的兼容
 **当前协调状态**。§4/§5 的冻结签名（含 §4.0.1.7 容量/在途账本语义、`RequestClose`
 的关闭门控）一字未改；本节记录的是「调度器静默后协议 owner 如何把托管链收口」这一
 实现面事实，以及它对公共面的真实影响。
+
+> **修订（见 §1.1，2026-10-01）**：上游 coroutine 已删除 `Scheduler::Stop()` 与运行时代际，
+> 本节原前置条件「调度器已静默（`Scheduler::Stop()` 已返回）」**不再成立**，且本节正文
+> 引用的 `RequestClose`/`WaitClosed`/`CloseStatus`/代际均为**已删除的旧面**。本节的
+> `ForceCloseAfterQuiescence` 入口现状与去向**待按新契约（owner 主动同步 `Close()`）重验**；
+> 下方文本保留为历史记录，不作为当前关闭路径的真源。
 
 ### 14.1 入口清单与可见性
 
@@ -633,13 +658,13 @@ Mongo 维持 `0004` 的 C 级 worker bridge 例外：这是当前实现的兼容
 
 ### 14.2 前置条件与误用危险
 
-- 前置条件（调用方保证）：执行这些对象/owner op 的调度器已静默——`Scheduler::Stop()`
+- 前置条件（**旧 Stop/generation 设计，待按新契约重验**；调用方保证）：执行这些对象/owner op 的调度器已静默——`Scheduler::Stop()`
   已返回，此后不存在任何线程/回调会执行其 op 或等待回调。
 - 危险：非静默状态下调用不安全——在途 op 持有裸 fd 且已注册给 poller，立即关闭会让同一
   fd 号被新 socket 复用（跨连接串写/UAF）。
 - 运行期关闭路径未变：`RequestClose` / `_EndIo` 的 `m_inflight` 门控保留；「立即关闭」只在
   其前置条件成立时可用。
-- 落定口径（实测，不伪造）：硬停后 `WaitClosed` 返回 `CloseStatus::InvalidContext`——本线程
+- 落定口径（**旧 `WaitClosed`/代际设计，待按新契约重验**）：硬停后 `WaitClosed` 返回 `CloseStatus::InvalidContext`——本线程
   无协程上下文，且 `Stop()` 后代际消失的检查早于 `IsClosed()`；落定只能以 `IsClosed()` /
   `ClosedHook` 计数 / owner 名额归零观测，该路径不得写成「`WaitClosed` 返回 Closed」。
 

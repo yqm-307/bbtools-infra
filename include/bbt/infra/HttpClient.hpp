@@ -18,9 +18,13 @@ namespace bbt::infra {
 // max_inflight 预算，不是每个 client 独立计量。Request 在发起任何
 // 底层 I/O 之前原子预留名额；名额不足立即返回 Error(Overloaded)，
 // 此时不创建 socket/resolver、不投递到 io 域、不排队。名额在请求
-// 物理收口后准确归还一次（覆盖正常完成、发起失败、deadline、cancel、
-// RequestClose 与强制 Stop），不依赖挂起协程的栈析构。本配额只覆盖
+// 物理收口后准确归还一次（覆盖正常完成、发起失败、deadline、协程级
+// 取消与 Close()），不依赖挂起协程的栈析构。本配额只覆盖
 // HTTP 出站路径，与 transport #32 的 CoTCP/CoUDP 在途门禁是不同入口。
+//
+// 关闭：Close() 由 owner 主动同步调用（幂等、任意线程），返回即物理
+// 释放；无 RequestClose/WaitClosed。已发送请求在 Close 后立即以终态
+// 返回，迟到响应只消费不交付。
 class HttpClient : public ICoNetwork, public ICoCloseable {
 public:
     // 语义边界（契约 §N1）：

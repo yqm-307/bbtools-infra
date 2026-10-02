@@ -6,7 +6,11 @@
 
 ### 后续目标规格
 
-[0005：CoTCP/CoUDP 与第三方 Binding](0005-co-io-adapter-contract-v1.md) 提出 hiredis transport 函数表直接协程绑定的候选路径。本文 async + strand 仍描述当前实现；下文“同步 API + Hook 被明确禁止”限定于旧 async context 不得混用同步调用，不是禁止独立构建并验证新的 transport Binding。目标路径需验证锁、线程局部状态、Stop 不展开栈与关闭时序，未验收前不得写成已迁移。
+[0005：CoTCP/CoUDP 与第三方 Binding](0005-co-io-adapter-contract-v1.md) 提出 hiredis transport 函数表直接协程绑定的候选路径。本文 async + strand 仍描述当前实现；下文“同步 API + Hook 被明确禁止”限定于旧 async context 不得混用同步调用，不是禁止独立构建并验证新的 transport Binding。目标路径需验证锁、线程局部状态、关闭时序与物理收口，未验收前不得写成已迁移。
+
+### 修订记录（2026-10-01：进程寿命运行时 + owner 同步 Close）
+
+本文原结论中依赖 `CompletionSignal`/`CancellationToken`/运行时代际/`Scheduler::Stop()` 的表述（§选型理由、§执行域与生命周期不变量、§测试架构、§未覆盖与已知差异）已被上游 coroutine 的**进程寿命运行时**（候选 HEAD `03430a5`）与 infra 的**同步 `Close()`** 契约取代。**保留的当前实现事实**仍是 hiredis async + strand、单执行域/单连接生命周期、cleanup 时序；**被取代**的是“请求等待靠 `CompletionSignal`、关闭靠 `RequestClose`/`WaitClosed`、运行时靠代际/Stop”的旧依赖。请求完成改按 operation state + `CoWaiter::WaitWithCallback`/`Notify` 口径描述，superseded by [0002 修订记录](0002-co-network-contract-v1.md) 与本文下方改写。本决策**当前实现**（hiredis async + strand）不变；本仓处于**候选、未提交**状态，不宣称已迁移或已通过新契约验收。
 
 ## 固定依赖
 
@@ -47,7 +51,7 @@
 
 - 单测不依赖 Docker：内置 FakeRedis（真实 RESP multibulk 应答/吞包）+ 静默服务端覆盖 PING/GET/SET/EXISTS/DEL、RemoteError、确定性 Overloaded、deadline/cancel/close、连接拒绝、线程数不变。
 - 真实验收 `tests/redis-live/`：`redis:7-alpine` 容器 `cpus<=0.50`、`mem_limit<=256m`、动态项目名、固定宿主机端口（实测 `compose stop`+`start` 会重分随机映射端口，固定端口才能保证重连语义可验收）、`trap down -v` 清理容器/网络/数据。
-- coroutine Hook 全进程拦截 `nanosleep/usleep/...` 并对非协程线程断言：测试线程的定长睡眠一律 `SYS_nanosleep` 直达 syscall；`Scheduler::Stop()` 路径含同类睡眠，套件收尾以 `Scheduler::GetInstance().release()` 走漏单例所有权，绕过该基线竞态（上游缺陷，测试侧不可修复，已注释在案）。
+- coroutine Hook 全进程拦截 `nanosleep/usleep/...` 并对非协程线程断言：测试线程的定长睡眠一律 `SYS_nanosleep` 直达 syscall；套件收尾不再经 `Scheduler::Stop()` 停机路径（进程寿命运行时下无 Stop；旧版为绕过 `Stop` 路径同类睡眠断言而以 `Scheduler::GetInstance().release()` 漏单例所有权，该基线与修订一并作废，测试侧按新契约重验）。
 
 ## 升级路径
 
@@ -63,6 +67,6 @@
 
 ## 未覆盖与已知差异
 
-- hiredis `scheduleTimer` 未接：本切片不设 connect/command 级 hiredis timeout，deadline 由调用侧 `CompletionSignal` 承担。
+- hiredis `scheduleTimer` 未接：本切片不设 connect/command 级 hiredis timeout；请求 deadline 由调用侧的 operation state + `CoWaiter` 等待承担（登记等待 → adapter 路径 `Notify` 唤醒，超时映射 `WaitStatus::TimedOut`→`ErrorCode::TimedOut`；不再有 `CompletionSignal`）。
 - 主机名解析在 io 域内同步进行（数值 IP 为即时路径）；DNS 协程化留待后续切片。
-- 基线差异：`Scheduler::m_is_running`/`m_run_generation` 默认即真，「Scheduler 未 Start」不可经 `IsRunning()` 区分；RuntimeUnavailable 的可达路径是 client 未 `Start`。
+- 基线差异（进程寿命运行时修订）：不再有 `Scheduler::m_is_running`/`m_run_generation` 与代际语义；「运行时是否就绪」统一用 `Scheduler::IsInitialized()`。`RuntimeUnavailable` 的可达路径是 client 未 `Start` / executor 不可得。

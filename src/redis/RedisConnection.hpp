@@ -11,7 +11,7 @@
 //   - cleanup 在断开/释放路径上必然调用且可重复，fd 所有权归还
 //     hiredis（desc.release()，绝不 close——redisFree 负责关）；
 //   - scheduleTimer 仅在设置 connect/command timeout 时被调，本切片
-//     不设 hiredis 超时（deadline 由调用侧 CompletionSignal 承担），
+//     不设 hiredis 超时（deadline 由调用侧 CoWaiter 等待承担），
 //     thunk 为空转。
 // 关键时序：
 //   - redisAsyncSetConnectCallback 内部立即 _EL_ADD_WRITE，因此 ev
@@ -23,6 +23,7 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include <boost/asio/posix/stream_descriptor.hpp>
@@ -43,11 +44,17 @@ class CoRedisCliImpl;
 // ev.data 承载的桥：hiredis 同步调用钩子（均在 strand 上），异步等待
 // handler 持 shared_ptr 保活；cleanup 后置 ac=null，迟到 handler 安全返回。
 struct RedisEvBridge : std::enable_shared_from_this<RedisEvBridge> {
-    explicit RedisEvBridge(const detail::IoStrand& io) : desc(io) {}
+    RedisEvBridge(const detail::IoStrand& io,
+                  std::shared_ptr<std::recursive_mutex> gate_)
+        : desc(io), gate(std::move(gate_)) {}
 
     redisAsyncContext*                       ac{nullptr};
     std::weak_ptr<RedisConnection>           owner;
     boost::asio::posix::stream_descriptor    desc;
+    // owner 域门（与 CoRedisCliImpl/引擎同一把，shared_ptr 持有避免晚到
+    // handler 触碰已析构对象的引用）：fd 等待完成 handler 持门运行，才能与
+    // owner 线程在调用线程内同步执行的 teardown 配对。
+    std::shared_ptr<std::recursive_mutex>    gate;
     bool want_read{false};
     bool want_write{false};
     bool read_armed{false};
@@ -59,9 +66,10 @@ public:
     enum class State { kIdle, kConnecting, kConnected, kClosed };
 
     RedisConnection(const detail::IoStrand& io, std::string host,
-                    std::uint16_t port, std::weak_ptr<CoRedisCliImpl> owner)
+                    std::uint16_t port, std::weak_ptr<CoRedisCliImpl> owner,
+                    std::shared_ptr<std::recursive_mutex> gate)
         : m_io(io), m_host(std::move(host)), m_port(port),
-          m_owner(std::move(owner)) {}
+          m_owner(std::move(owner)), m_gate(std::move(gate)) {}
 
     // 以下全部只在 io 域（strand）调用。
     // kIdle 时发起非阻塞连接；其余状态幂等返回。teardown 后拒绝重开。
@@ -110,6 +118,7 @@ private:
     std::string                       m_host;
     std::uint16_t                     m_port;
     std::weak_ptr<CoRedisCliImpl>     m_owner;
+    std::shared_ptr<std::recursive_mutex> m_gate;   // owner 域门（共享）
 
     State                             m_state{State::kIdle};
     bool                              m_dead{false};
