@@ -2,10 +2,12 @@
 
 #include <sys/socket.h>
 
+#include <cstddef>
+#include <iterator>
 #include <vector>
 
 #include <boost/asio/buffer.hpp>
-#include <boost/asio/connect.hpp>
+#include <boost/asio/error.hpp>
 
 #include <bbt/coroutine/detail/Define.hpp>
 #include <bbt/coroutine/detail/LocalThread.hpp>
@@ -36,19 +38,22 @@ ClientOp::ClientOp(const std::shared_ptr<HttpClientImpl>& owner_,
 void ClientOp::Begin(std::string host, std::uint16_t port) {
     std::lock_guard<std::recursive_mutex> io_gate(engine->IoGate());
     if (finished || !owner->IsOpenForIo()) {
-        Finish(result<HttpResponse>::err(
+        // #55 F2：已封口/已落定的早退也是失败出口，先物理释放再注销。
+        FailFinish(result<HttpResponse>::err(
             MakeError(ErrorCode::Closed, "http client is closing")));
         return;
     }
     // 用户非阻塞态不在此建立：socket 尚未 open 时 non_blocking() 返回
-    // bad_descriptor 且不置位（B1）；真正 connect 成功后 socket 会被
-    // range async_connect close/reopen，位也必须在那之后重建，见 OnConnect。
+    // bad_descriptor 且不置位（B1）；每个 endpoint 的 async_connect 会
+    // close/open socket，位也必须在那之后重建，见 OnConnect。
 
     auto self = shared_from_this();
     // 先记账再发起：completion 可能同步回调。发起抛异常则立刻冲销。
     try {
         op_armed = true;
         IoAsyncStart();
+        if (io_fault)
+            io_fault("resolve");
         resolver.async_resolve(
             std::move(host), std::to_string(port),
             [self](boost::system::error_code ec,
@@ -58,7 +63,7 @@ void ClientOp::Begin(std::string host, std::uint16_t port) {
     } catch (...) {
         op_armed = false;
         IoAsyncDone();
-        Finish(result<HttpResponse>::err(
+        FailFinish(result<HttpResponse>::err(
             MakeError(ErrorCode::InternalError,
                       "http request: resolve initiate failed")));
         return;
@@ -67,6 +72,10 @@ void ClientOp::Begin(std::string host, std::uint16_t port) {
 
 void ClientOp::OnResolve(boost::system::error_code ec,
                          tcp::resolver::results_type  results) {
+    // #56 H1 测试 seam：在取 IoGate 之前门控「解析完成项进入处理」，使用例
+    // 能在 backend 查询已完成、回调尚未推进的时刻与 Close 竞争。生产恒空。
+    if (on_resolve)
+        on_resolve();
     std::lock_guard<std::recursive_mutex> io_gate(engine->IoGate());
     if (!op_armed) {
         // Abort/Close 已在返回当刻记账：晚到空壳，不触碰 socket/资源。
@@ -78,25 +87,58 @@ void ClientOp::OnResolve(boost::system::error_code ec,
     if (finished)
         return;
     if (ec) {
-        Finish(result<HttpResponse>::err(
+        FailFinish(result<HttpResponse>::err(
             ClassifyBackendError(ec, "http request: resolve failed")));
         return;
     }
+    // #57 H2：接管 endpoint 迭代，逐条在本门内连接，避免 range composed
+    // operation 的内部 close/open 与跨线程 Abort/Close 并发触碰 socket。
+    endpoints     = std::move(results);
+    next_endpoint = 0;
+    TryStartConnect();
+}
+
+void ClientOp::TryStartConnect() {
+    std::lock_guard<std::recursive_mutex> io_gate(engine->IoGate());
+    if (finished)
+        return;
+    // #57 H2 测试 seam：门控「连接内部步骤」（同一 IoGate 内）。生产恒空。
+    if (on_connect_attempt)
+        on_connect_attempt();
+    // 门控期间 Close/Abort 可能已落定：必须复查，绝不在封口后重开 socket。
+    if (finished)
+        return;
+    // 空解析结果：与 range async_connect 的 not_found 收口语义一致。
+    if (next_endpoint >= endpoints.size()) {
+        FailFinish(result<HttpResponse>::err(
+            ClassifyBackendError(asio::error::not_found,
+                                 "http request: connect failed")));
+        return;
+    }
+    // 换 endpoint 可能换协议族：与 range 组合操作相同，先 close 再发起，
+    // 使「关旧 socket → 按新 endpoint 打开（async_connect 内自动 open）→
+    // 发起」全部落在本门内，与跨线程 Abort/Close 串行。这一步 close 也让
+    // 「上一次失败尝试残留的中间 socket」在推进前被物理收口。
+    boost::system::error_code cec;
+    socket.close(cec);
+    auto it = endpoints.begin();
+    std::advance(it, static_cast<std::ptrdiff_t>(next_endpoint));
     auto self = shared_from_this();
     try {
         op_armed = true;
         IoAsyncStart();
-        asio::async_connect(socket, results,
-            [self](boost::system::error_code ec, const tcp::endpoint&) {
-                self->OnConnect(ec);
-            });
+        ++connect_attempts;
+        if (io_fault)
+            io_fault("connect");
+        socket.async_connect(*it, [self](boost::system::error_code ec) {
+            self->OnConnect(ec);
+        });
     } catch (...) {
         op_armed = false;
         IoAsyncDone();
-        Finish(result<HttpResponse>::err(
+        FailFinish(result<HttpResponse>::err(
             MakeError(ErrorCode::InternalError,
                       "http request: connect initiate failed")));
-        return;
     }
 }
 
@@ -111,35 +153,49 @@ void ClientOp::OnConnect(boost::system::error_code ec) {
     if (finished)
         return;
     if (ec) {
-        // B1-r2 共同根因：失败收口必须先物理释放再注销。range async_connect
-        // 在最后一个 endpoint 失败后 socket 仍处于 open 状态，request body 也
-        // 仍被本 op 持有；若直接 Finish，MaybeUnregister 会先把 op 移出
-        // owner m_ops，owner Close 的快照随即为空，socket/body 只能等 op 析构
-        // 才释放——违反「不能依赖析构」。故先同步 Abort（IoGate 递归可重入：
-        // 关 socket/resolver + ReleaseBuffers），再 Finish 落定逻辑终态。
-        Abort();
-        Finish(result<HttpResponse>::err(
-            ClassifyBackendError(ec, "http request: connect failed")));
+        // 与 Boost.Asio range async_connect 的既有语义保持一致：其内部在
+        // 每次完成后检查 socket；若 endpoint 的 socket 打开失败而仍未 open，
+        // 将错误归一为 operation_aborted，并停止继续尝试。单 endpoint
+        // async_connect 不执行这层 composed 检查，因此在这里显式保留它。
+        // Close/Abort 的竞争不会误入此分支：Abort 先在同一 IoGate 将
+        // op_armed 清零，晚到完成项在函数开头直接返回。
+        boost::system::error_code connect_ec = ec;
+        if (!socket.is_open())
+            connect_ec = asio::error::operation_aborted;
+
+        // #57 H2：本 endpoint 失败。若还有下一个 endpoint（且非本地中止），
+        // 在同一门内推进重试；否则先物理释放再落定失败。
+        if (connect_ec != asio::error::operation_aborted &&
+            next_endpoint + 1 < endpoints.size()) {
+            ++next_endpoint;
+            TryStartConnect();
+            return;
+        }
+        // #55 F2 共同根因：失败收口必须先物理释放再注销，否则 MaybeUnregister
+        // 先把 op 移出 owner m_ops，owner Close 的快照随即为空，socket/body
+        // 只能等 op 析构才释放——违反「不能依赖析构」。FailFinish 在同一
+        // IoGate 内先 Abort（关 socket/resolver + ReleaseBuffers）再 Finish。
+        FailFinish(result<HttpResponse>::err(
+            ClassifyBackendError(connect_ec, "http request: connect failed")));
         return;
     }
-    // B1 根因修复：range async_connect 会对每个 endpoint close/reopen
-    // socket，令 socket_ops 的 user_set_non_blocking 位丢失；Begin 里在
-    // 未 open 时设的位同样无效。真正连接成功后在此重建用户非阻塞态，
-    // 并检查失败——否则 send/receive(MSG_DONTWAIT) 拿到的 EAGAIN 会被
-    // Asio 在应用可见前吸收为阻塞 poll(-1) 并持 IoGate，ArmWait 不可达、
-    // Close 被阻塞。设置失败即安全收口，不进入写/读泵。
+    // B1 根因修复：每个 endpoint 的 async_connect 会对 socket close/open，
+    // 令 socket_ops 的 user_set_non_blocking 位丢失；Begin 里在未 open 时设
+    // 的位同样无效。真正连接成功后在此重建用户非阻塞态，并检查失败——否则
+    // send/receive(MSG_DONTWAIT) 拿到的 EAGAIN 会被 Asio 在应用可见前吸收为
+    // 阻塞 poll(-1) 并持 IoGate，ArmWait 不可达、Close 被阻塞。设置失败即
+    // 安全收口，不进入写/读泵。
     boost::system::error_code nb;
     socket.non_blocking(true, nb);
     if (nb) {
         // B1-r2 父验收实证路径：此处 connect completion 已把 op_armed 清零、
         // inflight 归零；若直接 Finish，MaybeUnregister 会先把 op 移出
         // owner m_ops，owner Close 快照为空，fd 与 8MiB body 无人物理释放
-        // （实测 fd_result=0、body_bytes=8388608）。先在同一失败分支内同步
-        // Abort（关 socket/resolver + ReleaseBuffers），再 Finish：保证 op
-        // 离开 m_ops 前资源已物理释放。不进入 PumpWrite/PumpRead，错误码与
-        // 消息语义不变。
-        Abort();
-        Finish(result<HttpResponse>::err(
+        // （实测 fd_result=0、body_bytes=8388608）。FailFinish 在同一失败
+        // 分支内先 Abort（关 socket/resolver + ReleaseBuffers）再 Finish：
+        // 保证 op 离开 m_ops 前资源已物理释放。不进入 PumpWrite/PumpRead，
+        // 错误码与消息语义不变。
+        FailFinish(result<HttpResponse>::err(
             ClassifyBackendError(nb, "http request: set non-blocking failed")));
         return;
     }
@@ -147,9 +203,11 @@ void ClientOp::OnConnect(boost::system::error_code ec) {
         // 序列化器引用本 op 的 request：只在本门内、本次写生命周期内有效，
         // 绝不借给任何 async_* 操作（Abort 可同步 reset）。
         serializer.emplace(request);
+        if (io_fault)
+            io_fault("write");
         PumpWrite();
     } catch (...) {
-        Finish(result<HttpResponse>::err(
+        FailFinish(result<HttpResponse>::err(
             MakeError(ErrorCode::InternalError,
                       "http request: write initiate failed")));
         return;
@@ -176,7 +234,7 @@ void ClientOp::PumpWrite() {
             return;
         }
         if (ec) {
-            Finish(result<HttpResponse>::err(
+            FailFinish(result<HttpResponse>::err(
                 ClassifyBackendError(ec, "http request: send failed")));
             return;
         }
@@ -215,13 +273,15 @@ void ClientOp::ArmWait(tcp::socket::wait_type type) {
     op_armed = true;
     IoAsyncStart();
     try {
+        if (io_fault)
+            io_fault("armwait");
         socket.async_wait(type, [self, type](boost::system::error_code ec) {
             self->OnIoReady(ec, type);
         });
     } catch (...) {
         op_armed = false;
         IoAsyncDone();
-        Finish(result<HttpResponse>::err(MakeError(ErrorCode::InternalError,
+        FailFinish(result<HttpResponse>::err(MakeError(ErrorCode::InternalError,
             type == tcp::socket::wait_read ? "http request: read initiate failed"
                                            : "http request: write initiate failed")));
     }
@@ -239,19 +299,21 @@ void ClientOp::OnIoReady(boost::system::error_code ec,
     if (finished)
         return;
     if (ec) {
-        Finish(result<HttpResponse>::err(ClassifyBackendError(ec,
+        FailFinish(result<HttpResponse>::err(ClassifyBackendError(ec,
             type == tcp::socket::wait_read
                 ? "http request: incomplete or bad response"
                 : "http request: send failed")));
         return;
     }
     try {
+        if (io_fault)
+            io_fault("io_pump");
         if (type == tcp::socket::wait_read)
             PumpRead();
         else
             PumpWrite();
     } catch (...) {
-        Finish(result<HttpResponse>::err(
+        FailFinish(result<HttpResponse>::err(
             MakeError(ErrorCode::InternalError,
                       "http request: io pump failed")));
     }
@@ -271,7 +333,7 @@ void ClientOp::PumpRead() {
             if (ec) {
                 // 不足一条完整消息：eof/reset/partial 一律为 Error，
                 // 不伪造成成功。
-                Finish(result<HttpResponse>::err(ClassifyBackendError(
+                FailFinish(result<HttpResponse>::err(ClassifyBackendError(
                     ec, "http request: incomplete or bad response")));
                 return;
             }
@@ -292,7 +354,7 @@ void ClientOp::PumpRead() {
         boost::system::error_code ec;
         const auto space = buffer.prepare(kReadChunk);
         if (asio::buffer_size(space) == 0) {
-            Finish(result<HttpResponse>::err(
+            FailFinish(result<HttpResponse>::err(
                 MakeError(ErrorCode::InternalError,
                           "http request: read buffer limit")));
             return;
@@ -306,13 +368,13 @@ void ClientOp::PumpRead() {
         if (ec == asio::error::interrupted)
             continue;
         if (ec) {
-            Finish(result<HttpResponse>::err(ClassifyBackendError(
+            FailFinish(result<HttpResponse>::err(ClassifyBackendError(
                 ec, "http request: incomplete or bad response")));
             return;
         }
         if (received == 0) {
             // 对端 FIN 且无完整消息：按不完整响应收口（不伪造成成功）。
-            Finish(result<HttpResponse>::err(ClassifyBackendError(
+            FailFinish(result<HttpResponse>::err(ClassifyBackendError(
                 asio::error::eof,
                 "http request: incomplete or bad response")));
             return;
@@ -356,6 +418,10 @@ void ClientOp::ReleaseBuffers() noexcept {
     parser.reset();
     buffer.clear();
     buffer.shrink_to_fit();
+    // endpoint 解析结果是本 op 的载荷快照（H2 逐条连接用）：一并释放，避免
+    // 离开 m_ops 后仍占住解析结果内存。resolver 对象本身不属于本方法——
+    // 其寿命见 .hpp 中的 H1 说明，绝不在此销毁。
+    endpoints = {};
 }
 
 void ClientOp::Abort() noexcept {
@@ -369,12 +435,27 @@ void ClientOp::Abort() noexcept {
     boost::system::error_code ec;
     // resolver::cancel 无 error_code 重载且未标 noexcept：
     // noexcept 边界内必须兜底，避免异常逃逸成 terminate。
+    // 注意（#56 H1）：cancel 只催出完成项，不 join Asio 解析服务线程；
+    // 本 op 由完成 handler 捕获的 shared_from_this() 保活，故晚到完成项
+    // 必然落在仍存活的对象上，只走 !op_armed 早退。
     try {
         resolver.cancel();
     } catch (...) {
     }
     socket.close(ec);
     ReleaseBuffers();
+}
+
+void ClientOp::FailFinish(result<HttpResponse> r) noexcept {
+    // #55 F2 共同根因的唯一收口机制：所有失败路径都先物理释放再注销。
+    // 顺序不可交换——Finish 经 MaybeUnregister 在 finished && inflight==0
+    // 时把 op 移出 owner m_ops；若先 Finish，op 离开 m_ops 时 socket 仍
+    // open、body/parser/flat_buffer 仍被持有，owner Close 的快照随即为空，
+    // 这些资源只能等 op 析构才释放（违反「不能依赖析构」）。Abort 在同一
+    // IoGate 内关 socket/resolver + ReleaseBuffers，使 op 离开 m_ops 前
+    // 资源已物理释放。
+    Abort();
+    Finish(std::move(r));
 }
 
 // ------------------------------------------------------------------ Client
@@ -504,8 +585,9 @@ void HttpClientImpl::Close() noexcept {
         std::lock_guard<std::mutex> lk(m_ops_mtx);
         m_io_dead = true;
     }
-    // 物理 teardown 必须在返回前真实发生（契约：返回即 op 的 socket/
-    // resolver 已释放、后端不再访问）。不再「投递到 strand 并信任调度」：
+    // 物理 teardown 必须在返回前真实发生（契约：返回即 op 的 socket 与载荷已
+    // 释放；resolver 对象可能由完成项保活，后台查询是否停止不由本层断言，
+    // 后端不再访问已释放资源）。不再「投递到 strand 并信任调度」：
     // 手动 Tick 模式下 strand 无独立驱动线程，投递的 teardown 不会被执行。
     // 本调用经 Engine()->IoGate() 与 io 域 handler 串行，故可安全地在调用
     // 线程内同步执行；同线程嵌套由可递归门承接，不等待自身推进。

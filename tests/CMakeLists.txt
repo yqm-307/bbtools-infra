@@ -131,6 +131,18 @@ target_compile_options(Test_http_child_unregister PRIVATE -Wall -Wextra)
 add_test(NAME http.child_unregister COMMAND Test_http_child_unregister)
 set_tests_properties(http.child_unregister PROPERTIES TIMEOUT 120)
 
+# Issue #55/#56/#57：失败路径物理收口、resolver 寿命边界、composed connect
+# 串行化。直接驱动 impl 层 ClientOp（注入配额钩子、io_fault/on_resolve/
+# on_connect_attempt seam、endpoint 注入与物理状态探针），需要 src/ 内部头。
+add_executable(Test_http_failure_close Test_http_failure_close.cc)
+target_include_directories(Test_http_failure_close PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(Test_http_failure_close
+    PRIVATE bbt::infra_http Boost::boost Threads::Threads)
+target_compile_options(Test_http_failure_close PRIVATE -Wall -Wextra)
+add_test(NAME http.failure_close COMMAND Test_http_failure_close)
+set_tests_properties(http.failure_close PROPERTIES TIMEOUT 120)
+
 # --- Redis 模块测试（Issue #6）：仅在构建 bbt_infra_redis 时注册。
 # 单元套件不依赖外部 Redis（内置 FakeRedis/静默对端）；live 套件按
 # BBT_TEST_REDIS_ADDR 环境变量驱动真实容器验收，未提供时整件跳过。

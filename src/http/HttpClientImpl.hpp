@@ -10,16 +10,19 @@
 // 状态机，不依赖 Linux Hook。
 //
 // 关闭语义（进程寿命运行时修订）：Close() 幂等、任意线程可调用，
-// 返回即本 client 拥有的物理资源（在途 op 的 socket/resolver）已释放、
-// 后端不会再访问；无 RequestClose/WaitClosed、无取消令牌、无 CompletionSignal。
+// 返回即本 client 拥有的可控物理资源（在途 op 的 socket 与载荷）已释放；
+// 解析完成项可能继续保活 resolver 对象，后台查询是否停止不由本层断言，
+// 且后端不会再访问已释放资源；无 RequestClose/WaitClosed、无取消令牌、无
+// CompletionSignal。
 //
 // 资源模型（与 server 同源，冻结契约 resource-close-boundary §6：Close 直接
 // 丢弃未发送数据并同步释放 buffer，不 flush）：
 //   - request/parser/flat_buffer 是 op 自身的 owner 资源，只在 io 域门内被
 //     访问；写/读走「非阻塞 send/receive + 序列化器/解析器泵」；
-//   - 一切等待都是不借 payload 的就绪等待（socket.async_wait），只有
-//     resolve/connect 这两步由 Asio 组合操作推进（它们不借本 op 的
-//     payload，只持 socket/resolver 自身）；
+//   - 一切等待都是不借 payload 的就绪等待（socket.async_wait），resolve 与
+//     单 endpoint async_connect 由 Asio 异步操作推进；多 endpoint 迭代已改为
+//     本模块门内的串行步进（它们不借本 op 的 payload，只持 socket/resolver
+//     自身）；
 //   - Abort（owner Close 的收口入口）在返回当刻记账被中止的等待项、关闭
 //     socket、释放 request body/parser/flat_buffer，故 Close 返回即
 //     「后端不再访问本 op 资源」；晚到的完成项只消费空壳。
@@ -60,6 +63,14 @@ struct ClientOp : std::enable_shared_from_this<ClientOp> {
     // Finish 的 Notify 跨线程安全；早到（协程 park 前）唤醒走
     // CoPollEvent 的 PENDING 路径，不丢唤醒。
     bbt::coroutine::sync::CoWaiter::SPtr  waiter;
+    // resolver 是第三方 Asio 对象的 owner 载荷（#56 H1）。它的后台
+    // getaddrinfo 由 Asio 解析服务线程执行，cancel() 返回不等于该线程已
+    // 停止，也无法同步 join——本适配器不新增阻塞 join 层。寿命保护靠
+    // 「解析 handler 捕获 shared_from_this()」：只要完成项尚未投递，本 op
+    // （含其 resolver 成员）就不会析构；Abort() 只 cancel/关 socket，绝不
+    // 销毁 resolver。晚到完成项经 OnResolve 的 !op_armed 早退，只消费空壳，
+    // 不触碰已释放的 socket/buffer/owner。故「后台仍运行」与「本 op 可控
+    // 物理资源已释放」是两笔独立事实，不混为一谈。
     boost::asio::ip::tcp::resolver        resolver;
     boost::asio::ip::tcp::socket          socket;
     boost::beast::flat_buffer             buffer;
@@ -86,6 +97,38 @@ struct ClientOp : std::enable_shared_from_this<ClientOp> {
     // 取值者负责递减 inflight：完成项或 Abort（返回当刻记账）置零并 -1，
     // 另一侧看到已置零即认定自己是晚到空壳，不再触碰 socket/资源。
     bool                                  op_armed{false};
+
+    // #57 H2：多 endpoint 串行连接状态。不用 asio::async_connect 的 range
+    // 组合操作——其内部对每个 endpoint 的 close/open 在 socket executor 上
+    // 异步恢复，不经过任何本模块入口（不持 IoGate），会与跨线程 Abort/Close
+    // 的 socket 触碰并发。改为在本门内逐条 close/open/发起单次
+    // async_connect（见 .cc TryStartConnect），使「换 endpoint 的 socket
+    // 状态变化」与 owner Abort/Close 共享同一把 IoGate 串行域。多 endpoint
+    // 语义与错误分类不变（见 OnConnect：非 operation_aborted 才回退下一条）。
+    boost::asio::ip::tcp::resolver::results_type endpoints;
+    std::size_t                           next_endpoint{0};
+    // #57 H2 证据计数：本 op 已发起的单次 connect 尝试数（仅 io 域写；测试
+    // 在 op->finished 置位后再读，happens-before 由 finished 的 exchange 建立）。
+    int                                   connect_attempts{0};
+
+    // 测试 seam（#55 F2）：在「发起某个 async_* 之前、同一 try 块内」被调用，
+    // 供用例注入同步异常，确定性走到对应发起失败分支。实参为站点标识
+    // （resolve/connect/write/armwait/io_pump）。生产路径恒为空。
+    std::function<void(const char*)>      io_fault;
+    // 测试 seam（#56 H1）：解析完成项进入处理前（尚未取 IoGate）调用一次，
+    // 供用例门控「查询完成处理」并与 Close 竞争。生产路径恒为空。
+    std::function<void()>                 on_resolve;
+    // 测试 seam（#57 H2）：TryStartConnect 入口（同一 IoGate 内）调用一次，
+    // 供用例门控「连接内部步骤」并观察与 Close 的串行。生产路径恒为空。
+    std::function<void()>                 on_connect_attempt;
+
+    // 测试 seam（#57 H2）：注入解析结果并驱动首个 endpoint 尝试。生产路径
+    // 不经此——生产由 OnResolve 的真实解析结果驱动。
+    void SetEndpointsForTest(boost::asio::ip::tcp::resolver::results_type eps) {
+        endpoints = std::move(eps);
+        next_endpoint = 0;
+    }
+    void StartConnectForTest() { TryStartConnect(); }
 
     ClientOp(const std::shared_ptr<HttpClientImpl>& owner_,
              const std::shared_ptr<HttpIoEngine>&   engine_);
@@ -126,6 +169,13 @@ private:
     void OnResolve(boost::system::error_code ec,
                    boost::asio::ip::tcp::resolver::results_type results);
     void OnConnect(boost::system::error_code ec);
+    // #57 H2：门内推进到下一个 endpoint，关旧 socket、按新 endpoint 协议族
+    // 打开并发起单次 async_connect；全部 socket 触碰在本门内与本门外的
+    // Abort/Close 串行。
+    void TryStartConnect();
+    // #55 F2 共同根因：失败路径在同一 IoGate 内先 Abort()（关 socket/resolver +
+    // 释放 op 载荷）再 Finish()，保证 op 离开 owner m_ops 前资源已物理释放。
+    void FailFinish(result<HttpResponse> r) noexcept;
 };
 
 class HttpClientImpl : public HttpClient,
