@@ -23,6 +23,8 @@
 //                                   Closed；物理收口（driver 返回 + worker
 //                                   退出）才 IsClosed。
 //   t_worker_threads_bound        — 4 个并发 op 峰值 driver 调用 ≤ 2。
+//   t_owner_thread_identity       — 单 worker 跨两个集合的 acquire/use/release
+//                                   线程 identity 均相同（内部观测证据）。
 //
 // 关闭语义（进程寿命修订）：RequestClose/WaitClosed/CloseStatus/取消令牌
 // 全部删除——Close() 幂等、任意线程可调用，封口 + 唤醒等待者 + 有界等待在途
@@ -720,6 +722,42 @@ BOOST_AUTO_TEST_CASE(t_owner_multi_handles_share_workers) {
         [&] { return submitted.load() == 3; }, 30000));
     BOOST_REQUIRE(db->IsClosed());
     BOOST_CHECK_EQUAL(rt->RunningDriverCallsForTest(), 0);
+}
+
+BOOST_AUTO_TEST_CASE(t_owner_thread_identity) {
+    // 单 worker 依次服务两个不同集合；不可达地址让调用进入同步 driver
+    // 路径，但不依赖真实 Mongo。每次调用收口后读取最后一项内部线程证据，
+    // 直接断言目标集合及 worker、acquire、use、release 线程均正确。
+    auto db = NewOwner(MakeRtCfg(1, 4, 1000));
+    auto rt = RuntimeOf(db);
+    auto h1 = db->Collection({"bbt_ut", "identity_a"});
+    auto h2 = db->Collection({"bbt_ut", "identity_b"});
+    BOOST_REQUIRE(h1 && h2);
+    BOOST_REQUIRE(WaitUntil(
+        [&] { return rt->LiveWorkersForTest() == 1; }, 10000));
+
+    auto check_call = [&](const std::shared_ptr<mongo::CoMongoColl>& handle,
+                          const char* collection) {
+        std::optional<result<std::optional<MongoDocument>>> out;
+        BOOST_REQUIRE(RunInCoroutine(
+            [&] { out.emplace(handle->FindOne(EmptyDoc(), Opt(5000))); }));
+        BOOST_REQUIRE(out);
+        BOOST_REQUIRE(!*out);
+        BOOST_CHECK(out->error().code == ErrorCode::Unavailable);
+
+        const auto evidence = rt->LastDriverThreadEvidenceForTest();
+        BOOST_REQUIRE(evidence);
+        BOOST_CHECK(evidence->worker_thread != std::thread::id{});
+        BOOST_CHECK(evidence->worker_thread == evidence->acquire_thread);
+        BOOST_CHECK(evidence->worker_thread == evidence->use_thread);
+        BOOST_CHECK(evidence->worker_thread == evidence->release_thread);
+        BOOST_CHECK_EQUAL(evidence->database, "bbt_ut");
+        BOOST_CHECK_EQUAL(evidence->collection, collection);
+    };
+
+    check_call(h1.value(), "identity_a");
+    check_call(h2.value(), "identity_b");
+    CloseOwnerAndDrain(db, rt);
 }
 
 BOOST_AUTO_TEST_CASE(t_owner_isolation) {

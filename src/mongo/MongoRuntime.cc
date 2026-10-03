@@ -22,6 +22,9 @@ namespace bbt::infra::mongo_detail {
 
 namespace {
 
+thread_local MongoRuntime* g_worker_runtime = nullptr;
+thread_local std::thread::id g_worker_thread;
+
 Error InvalidArg(std::string msg) {
     return MakeError(ErrorCode::InvalidArgument, std::move(msg));
 }
@@ -234,6 +237,8 @@ result<MongoOpOutcome> MongoRuntime::Submit(
 // ---------------- worker 线程域 ----------------
 
 void MongoRuntime::WorkerLoop() noexcept {
+    g_worker_runtime = this;
+    g_worker_thread = std::this_thread::get_id();
     // 起跑登记：在触碰任何 owner 状态之前完成，使 Start 的起跑闩可确定性
     // 判定「全部线程已起跑」。仅此一处取 m_workers_mtx，之后不再需要。
     {
@@ -273,11 +278,16 @@ void MongoRuntime::WorkerLoop() noexcept {
     }
     m_live_workers.fetch_sub(1);
     DrainNotify();
+    g_worker_runtime = nullptr;
+    g_worker_thread = std::thread::id{};
 }
 
 result<MongoOpOutcome> MongoRuntime::RunDriverCall(
     const MongoOp& op) noexcept {
     MongoOpOutcome out;
+    MongoThreadEvidenceForTest evidence;
+    evidence.worker_thread =
+        g_worker_runtime == this ? g_worker_thread : std::thread::id{};
     // 运行中 driver 调用记账（验收「峰值 ≤ worker_threads」）。
     struct RunningGuard {
         MongoRuntime* self;
@@ -309,9 +319,26 @@ result<MongoOpOutcome> MongoRuntime::RunDriverCall(
         // acquire 由 waitQueueTimeoutMS 保底，不会无限等待。目标集合
         // 由发起句柄携带——同 worker 可为不同集合服务，不新建线程。
         const auto& target = op.handle->Target();
+        bool acquired = false;
+        struct EvidenceGuard {
+            MongoRuntime* runtime;
+            MongoThreadEvidenceForTest& evidence;
+            bool& acquired;
+            ~EvidenceGuard() {
+                if (!acquired)
+                    return;
+                evidence.release_thread = std::this_thread::get_id();
+                runtime->RecordThreadEvidenceForTest(std::move(evidence));
+            }
+        } evidence_guard{this, evidence, acquired};
         auto entry = m_pool->pool.acquire();
+        acquired = true;
+        evidence.acquire_thread = std::this_thread::get_id();
+        evidence.database = target.database;
+        evidence.collection = target.collection;
         auto coll  = (*entry)[target.database]
                         .collection(target.collection);
+        evidence.use_thread = std::this_thread::get_id();
         switch (op.kind) {
         case MongoOp::Kind::InsertOne: {
             const auto r = coll.insert_one(doc_v.value());

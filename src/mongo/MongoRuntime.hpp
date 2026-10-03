@@ -35,6 +35,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <thread>
 #include <unordered_set>
 #include <vector>
@@ -50,6 +51,17 @@ namespace bbt::infra::mongo_detail {
 
 class MongoRuntime;
 class MongoCollImpl;
+
+// 仅供 Mongo unit 通过内部头读取的执行域证据；不进入公共 API。
+// 一次 driver 调用的 pool acquire/use/release 必须都发生在同一 worker。
+struct MongoThreadEvidenceForTest {
+    std::thread::id worker_thread;
+    std::thread::id acquire_thread;
+    std::thread::id use_thread;
+    std::thread::id release_thread;
+    std::string      database;
+    std::string      collection;
+};
 
 // 一次命令的堆上 operation state：晚到收口只访问它，不借用调用者栈。
 // runtime 保活 owner 资源（worker/队列/pool）；handle 保活发起句柄，
@@ -175,6 +187,11 @@ public:
         std::lock_guard<std::mutex> lk(m_queue_mtx);
         return m_queue.size();
     }
+    std::optional<MongoThreadEvidenceForTest>
+    LastDriverThreadEvidenceForTest() const {
+        std::lock_guard<std::mutex> lk(m_thread_evidence_mtx);
+        return m_last_thread_evidence;
+    }
 
 private:
     // 非协程上下文/已关闭/未启动的公共前置校验。
@@ -243,6 +260,14 @@ private:
     std::once_flag             m_finalize_once;
     std::atomic<std::size_t>   m_running_calls{0};
     std::atomic<std::size_t>   m_peak_calls{0};
+    mutable std::mutex         m_thread_evidence_mtx;
+    std::optional<MongoThreadEvidenceForTest> m_last_thread_evidence;
+
+    void RecordThreadEvidenceForTest(
+        MongoThreadEvidenceForTest evidence) {
+        std::lock_guard<std::mutex> lk(m_thread_evidence_mtx);
+        m_last_thread_evidence = std::move(evidence);
+    }
 
     enum State : int { kCreated = 0, kRunning = 1, kClosingOrClosed = 2 };
 };

@@ -60,7 +60,17 @@ mongocxx 同步 driver + 有界 worker bridge 形态。
 - `tests/Test_mongo_live.cc` `t_owner_multi_collection_live`：真实
   容器上同一 owner 两个集合句柄并行 CRUD。
 - 观测钩子：`MongoRuntime::LiveWorkersForTest /
-  RunningDriverCallsForTest / PeakDriverCallsForTest`。
+  RunningDriverCallsForTest / PeakDriverCallsForTest`；unit 还通过
+  `LastDriverThreadEvidenceForTest` 核对同一 owner 两个集合的
+  `worker/acquire/use/release` 线程与目标集合。
+
+### Sanitizer 边界（2026-10-03）
+
+ASan/UBSan 的 `mongo.unit` 已通过。TSan 在当前固定的
+mongo-c-driver `2.5.4`（上游 commit `ad87ab88907a0105823469fb5d393ed717bed9ba`）
+上稳定报告 `libmongoc2.so.2.5.4:mongoc_set_destroy` 与其 server-monitor 线程的竞争；
+调用栈位于第三方驱动内部，不能作为本 owner identity 钩子已通过 TSan 的证据。
+该项保留为上游/依赖构建边界，不能以跳过或 suppression 包装成通过。
 
 ## 与已有决策的关系
 

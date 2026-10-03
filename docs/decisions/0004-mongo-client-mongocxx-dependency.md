@@ -29,6 +29,16 @@ superseded by [0002 修订记录](0002-co-network-contract-v1.md)。本仓处于
 | 许可证 | Apache-2.0 |
 | 消费方式 | 私有前缀安装 + CMake package config |
 
+### 复验固定来源（2026-10-03）
+
+| 项 | 解析后的上游 commit | 本地 release archive SHA256 |
+|---|---|---|
+| mongo-c-driver `2.5.4` | `ad87ab88907a0105823469fb5d393ed717bed9ba` | `9ddca33cfad97af34f264895f0e9c687d851f5e12f951ecb5794f95e9f5c5fb3` |
+| mongo-cxx-driver `r4.6.0` | `5cfce9d754a91d47e996394e2cdc9f2e60403542` | `eac122db0789fc82b0ba93f92a1503d74c502bfe4728345eaa8650e50a79da11` |
+
+解析命令为 `git ls-remote` 对应上游 tag 的 peeled commit；构建使用上述版本的隔离前缀，
+不是系统默认库。该记录固定版本与来源，不代表未提交源码树已进入默认 CI。
+
 ## 链接来源与接入
 
 - 构建经 `BBT_MONGOCXX_PREFIX`/`BBT_MONGOC_PREFIX`（cache PATH，默认空）
