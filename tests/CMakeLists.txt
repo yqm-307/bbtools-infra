@@ -104,6 +104,18 @@ target_compile_options(Test_http_lifecycle PRIVATE -Wall -Wextra)
 add_test(NAME http.lifecycle COMMAND Test_http_lifecycle)
 set_tests_properties(http.lifecycle PROPERTIES TIMEOUT 120)
 
+# Issue #62 回归探针：keep-alive deadline timer cancel/re-arm 记账 + 并发
+# Close/peer-FIN。直接读 impl 层只读探针 DebugSessionCount()，需要 src/ 内部
+# 头 include 路径——仅本目标可见。ASan/UBSan 构建下运行并扫描日志。
+add_executable(Test_http_timer_rearm_probe Test_http_timer_rearm_probe.cc)
+target_include_directories(Test_http_timer_rearm_probe PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(Test_http_timer_rearm_probe
+    PRIVATE bbt::infra_http Boost::boost Threads::Threads)
+target_compile_options(Test_http_timer_rearm_probe PRIVATE -Wall -Wextra)
+add_test(NAME http.timer_rearm COMMAND Test_http_timer_rearm_probe)
+set_tests_properties(http.timer_rearm PROPERTIES TIMEOUT 120)
+
 # Issue #37：HTTP 出站连接/在途配额的原子接纳与物理归还。
 # 与 transport #32 不同入口：覆盖 HttpClientImpl::Request 的 owner
 # 预算门禁（max_connections/max_inflight）、Overloaded 确定性、

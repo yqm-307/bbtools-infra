@@ -37,6 +37,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -106,7 +107,10 @@ public:
     void ArmIoWait(boost::asio::ip::tcp::socket::wait_type type);
     void OnIoWait(boost::system::error_code ec,
                   boost::asio::ip::tcp::socket::wait_type type);
-    void OnDeadline(boost::system::error_code ec);
+    void OnDeadline(boost::system::error_code ec, std::uint64_t token);
+    // 取消当前活跃的 deadline 看守并在返回当刻履行其记账义务（token 置空 +
+    // IoAsyncDone）；晚到的完成项 token 不匹配，只消费空壳。仅 io 域、门内。
+    void CancelDeadlineWatch() noexcept;
     void OnPeerWatch(boost::system::error_code ec);
     void Dispatch(bool keep_alive);
     void DeliverResult(std::shared_ptr<QueuedReply> reply);
@@ -158,7 +162,13 @@ public:
     // 发起方置位 +1；完成项或 Close（返回当刻记账）置零并 -1，另一侧看到
     // 置零即认定自己是晚到空壳、不再触碰 fd 与 buffer。
     bool                                     io_wait_armed{false};
-    bool                                     timer_armed{false};
+    // deadline 看守的世代记号（仅 io 域）：每次 arm 分配新 token 并置为当前
+    // 活跃值；完成项只在自身 token 仍等于活跃值时递减（记账 -1）并驱动收口，
+    // 被 cancel/Close 抢先记账的旧看守完成项 token 已不匹配，只消费空壳。这样
+    // keep-alive 重挂不会让旧的 aborted completion 消费新看守的记账：每个
+    // outstanding timer completion 恰好递减一次。
+    std::uint64_t                            timer_gen{0};
+    std::uint64_t                            timer_live{0};
     // 本条回复是否 keep-alive（io 域；PumpWrite 收尾据此决定继续读下一条）。
     bool                                     reply_keep_alive{false};
 };
@@ -230,6 +240,12 @@ public:
     bool OpenForIo() const { return m_close.IsOpen(); }
 
     std::atomic_size_t m_connections{0};
+
+    // 回归/诊断探针：当前仍登记的会话数（已 Start 未反登记）。只读、不参与
+    // 任何生产逻辑，供 issue #62 的 deadline timer 记账回归断言使用。
+    std::size_t DebugSessionCount() const noexcept {
+        return static_cast<std::size_t>(m_session_count.load());
+    }
 
 private:
     // drain 判定：封口（m_draining）后已派发 handler 全部退出、会话与
