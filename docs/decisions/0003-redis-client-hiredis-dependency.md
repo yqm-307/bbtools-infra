@@ -12,6 +12,41 @@
 
 本文原结论中依赖 `CompletionSignal`/`CancellationToken`/运行时代际/`Scheduler::Stop()` 的表述（§选型理由、§执行域与生命周期不变量、§测试架构、§未覆盖与已知差异）已被上游 coroutine 的**进程寿命运行时**（候选 HEAD `03430a5`）与 infra 的**同步 `Close()`** 契约取代。**保留的当前实现事实**仍是 hiredis async + strand、单执行域/单连接生命周期、cleanup 时序；**被取代**的是“请求等待靠 `CompletionSignal`、关闭靠 `RequestClose`/`WaitClosed`、运行时靠代际/Stop”的旧依赖。请求完成改按 operation state + `CoWaiter::WaitWithCallback`/`Notify` 口径描述，superseded by [0002 修订记录](0002-co-network-contract-v1.md) 与本文下方改写。本决策**当前实现**（hiredis async + strand）不变；本仓处于**候选、未提交**状态，不宣称已迁移或已通过新契约验收。
 
+### 候选迁移记录（CoTCP owner binding；候选、未切换）
+
+一个隔离 worktree 候选把 Redis 客户端收敛为「唯一 `CoRedisCliImpl` + 内部窄 `RedisCotcpConn`（CoTCP 承担 Dial/读写/等待/关闭，hiredis 只做 RESP2 编解码）」，删除平行候选 `CoRedisCotcpCliImpl` 与旧 `RedisConnection`。**这是候选实现，未 commit/未合入/未切换 main；生产 Redis 仍是 hiredis async + strand**。公共 `CoRedisCli` 类型与方法签名不变，`CoRedisCli::Create` 只装配唯一实现。
+
+候选相对旧契约的行为调整（签名不变不等于行为不变，须下游知悉）：
+
+- **显式连接生命周期（不做 Lazy）**：公共面删除 `Start()`，改为 `Connect(options)` /
+  `ConnectStatus()` / `Disconnect()`。`Connect` 必须在协程上下文调用并**真实等待 TCP
+  建连完成**（成功返回即连接已建立，不是仅投递）；已连接时重复 `Connect` 幂等，连接
+  中重复 `Connect` 返回 `Overloaded`，`Close` 后返回 `Closed`。`ConnectStatus()` 只读
+  本地状态（Disconnected/Connecting/Connected/Disconnecting/Failed/Closed）、不发网络
+  探测。`Disconnect()` 同步释放当前连接 fd/reader/已登记请求但**不是 Close 别名**：
+  保留配置、可再次 `Connect`。命令不再隐式建连——未 Connect、主动 Disconnect 之后、
+  Connecting 期间、以及默认 `Failed`（`reconnect_on_new_command=false`）下返回错误。
+- **重连默认关闭**：新增 `RedisClientConfig::reconnect_on_new_command`（默认 `false`）。
+  连接进入 `Failed`（显式 Connect 建连失败，或已建立连接被判不可复用）后，同实例后续
+  命令返回 `TransportError`（sticky），不隐式重建连接；`true` 时故障之后的**新命令**
+  至多各尝试一次新连接（若该次重建再次失败，同一批次内其后已入队命令可统一以
+  `TransportError` 落定），已失败命令绝不重发/迁移、无后台重连循环、不隐藏已发生的
+  失败或不确定结果。该选项不绕过显式生命周期（首次未 Connect / 主动 Disconnect /
+  Close 均不隐式建连）。`RedisCotcpConn` 自身永不自动重连，重建只发生在 owner 决定
+  路径（与
+  [0005 §8.1](0005-co-io-adapter-contract-v1.md)「禁止 binding 绕过 binding 自动
+  reconnect」一致）。
+- **单 owner 严格串行**：任一时刻至多一条命令在途；`max_inflight` 当前只做装配期容量
+  校验，不构成 pipeline 流控；`max_queue` 仍是排队容量上限（耗尽返回 `Overloaded`）。
+- **同步 Close**：`Close()` 幂等、任意线程，返回当刻 fd/reader 已物理回收（含在途
+  `DialTCP` 的候选 fd——由 owner 关闭原语在封口后同步收口）、已登记 operation 已落定、
+  `IsClosed()` 为真；`Close` 是终态，之后不得再 `Connect`。`Close`/`Disconnect` 对在途
+  Dial 的封口收口是**无超时的同步等待**（等待段本身不含挂起点，但被唤醒的 dial 协程需
+  能被其它 Scheduler 线程推进才会退出）：单线程 Scheduler 下不得从 dial 所在线程调用
+  `Disconnect`/`Close`。此为候选形态，未 commit/未切换 main。
+
+未验收：live Redis、TLS/RESP3/Cluster/Sentinel、多连接并发、sanitizer、跨平台仍属未覆盖；候选开发所用相邻 hiredis 前缀不是锁定依赖，实际链接前缀须在独立构建中另行固定核对。
+
 ## 固定依赖
 
 | 项 | 值 |
@@ -61,7 +96,7 @@
 
 ## 退出/替换路径
 
-- 公共头 `CoRedisCli.hpp` 不暴露 hiredis 类型；替换后端只需重写 `src/redis/` 内部（RedisDetail 解码、RedisConnection adapter、CoRedisCliImpl 编排），API 与语义不变。
+- 公共头 `CoRedisCli.hpp` 不暴露 hiredis 类型；替换后端只需重写 `src/redis/` 内部（RedisDetail 解码、RedisCotcpConn owner binding、CoRedisCliImpl 编排），API 与语义不变。
 - `RedisDetail` 的 reply 解码与错误分类已隔离为独立翻译层，换后端时错误映射（`RemoteError/TransportError/ProtocolError` + `backend_category="hiredis"`）需要在新后端的等价错误域上重新实现并复核。
 - 若未来需要万能命令接口，在 `CoRedisCli` 之外新增通用 Command API，不回改固定命令集语义。
 
@@ -69,4 +104,4 @@
 
 - hiredis `scheduleTimer` 未接：本切片不设 connect/command 级 hiredis timeout；请求 deadline 由调用侧的 operation state + `CoWaiter` 等待承担（登记等待 → adapter 路径 `Notify` 唤醒，超时映射 `WaitStatus::TimedOut`→`ErrorCode::TimedOut`；不再有 `CompletionSignal`）。
 - 主机名解析在 io 域内同步进行（数值 IP 为即时路径）；DNS 协程化留待后续切片。
-- 基线差异（进程寿命运行时修订）：不再有 `Scheduler::m_is_running`/`m_run_generation` 与代际语义；「运行时是否就绪」统一用 `Scheduler::IsInitialized()`。`RuntimeUnavailable` 的可达路径是 client 未 `Start` / executor 不可得。
+- 基线差异（进程寿命运行时修订）：不再有 `Scheduler::m_is_running`/`m_run_generation` 与代际语义；「运行时是否就绪」统一用 `Scheduler::IsInitialized()`。`RuntimeUnavailable` 的可达路径是 client 未 `Connect`（Disconnected/Connecting/Disconnecting 期间命令） / executor 不可得。

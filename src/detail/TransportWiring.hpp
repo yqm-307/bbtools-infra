@@ -46,13 +46,70 @@ namespace bbt::infra::detail {
 // 约定：回调 noexcept、不得取锁/阻塞——其在 scheduler 恢复路径上执行，由调用
 // 方保证只用于测试同步或登记簿落账。
 //
+// 候选 fd 移交令牌（受管 dial 的同步收口接缝）：仅当调用方（Redis 组装）
+// 需要「Close 返回当刻候选 fd 已物理释放」时才装配。dial 在 connect 成功后经
+// Arm 原子取得候选 fd 并登记「移交在途」；候选 fd 所有权落位连接对象（m_tcp
+// 发布）后由本令牌析构 EndHandoff。owner Close 的封口（CloseWaiters::
+// SealWakeAndDrainRegistrations）会等待移交在途归零后再返回，故该段不含挂起点
+// 且不会自等待。未装配令牌的受管 dial（TCP 传输 owner）保持原语义：候选 fd 由
+// dial 协程恢复时自行释放。
+class DialHandoffToken {
+public:
+    explicit DialHandoffToken(detail::CloseWaiters* waiters) noexcept
+        : m_waiters(waiters) {}
+    ~DialHandoffToken() { Disarm(); }
+    DialHandoffToken(const DialHandoffToken&)            = delete;
+    DialHandoffToken& operator=(const DialHandoffToken&) = delete;
+
+    // 成功取得候选 fd 并登记移交在途。返回 true 时 *out_fd 为 fd 且令牌已 armed
+    // （析构时释放）；返回 false 表示 owner 已接管，调用方不得触碰候选 fd。
+    bool Arm(int* out_fd) noexcept {
+        if (m_waiters == nullptr || m_armed)
+            return false;
+        if (!m_waiters->BeginHandoff(out_fd))
+            return false;
+        m_armed = true;
+        return true;
+    }
+    // 提前释放移交在途（取得 fd 后连接失败需重试下一地址时）。
+    void Disarm() noexcept {
+        if (m_armed) {
+            m_waiters->EndHandoff();
+            m_armed = false;
+        }
+    }
+    // 失败/清理路径（成功 connect 后 SO_ERROR 失败、重试下一地址前）：在关闭门内
+    // 先 close 已移交的候选 fd，再归还移交在途——保证 owner 封口的排空谓词只在 fd
+    // 已 close 后归零（见 CloseWaiters::CloseHandoffFdAndEndHandoff）。仅 armed 时
+    // 经关闭门收口；未 armed（本令牌从未取得 fd，不应到达）兜底自行 close 以免泄漏，
+    // 该状态不可能是 owner 已接管（接管时 Arm 返回 false，调用方不会走到本方法）。
+    void CloseAndDisarm(int fd) noexcept {
+        if (m_waiters != nullptr && m_armed) {
+            m_waiters->CloseHandoffFdAndEndHandoff(fd);
+            m_armed = false;
+        } else if (fd >= 0) {
+            ::close(fd);
+        }
+    }
+
+private:
+    detail::CloseWaiters* m_waiters{nullptr};
+    bool                  m_armed{false};
+};
+
+// 约定：回调 noexcept、不得取锁/阻塞——其在 scheduler 恢复路径上执行，由调用
+// 方保证只用于测试同步或登记簿落账。
+//
 // 已知边界（新语义下的残余）：上游 AwaitBounded 内部自建 waiter，外部无法
 // Notify，因此 DNS 等待段不挂 close_waiters——该段的封口响应只由调用方
-// CallOptions::deadline 界定。owner 的在途账本/连接名额在该 dial 返回时归还。
+// CallOptions::deadline 界定；但封口后 dial 不得再发起 socket/connect（见
+// CloseWaiters::CreateCandidate），故不会在 Close 返回后残留新 fd。
 struct DialWaitOptions {
     std::shared_ptr<detail::CloseWaiters> close_waiters{};
     std::function<void()>                 dns_on_registered{};
     std::function<void()>                 connect_on_registered{};
+    // 非空时启用候选 fd 同步收口（受管 Redis dial）：见 DialHandoffToken。
+    std::shared_ptr<DialHandoffToken>     handoff{};
 };
 
 // 内部装配面：owner↔对象的装配接缝与测试探针。

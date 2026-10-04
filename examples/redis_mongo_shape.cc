@@ -1,9 +1,9 @@
 // Issue #27：Redis/Mongo 调用形态示例（静态形态演示）。
 //
 // 本文件演示 CoRedisCli / CoMongoCli 的真实公开 API 调用形态：装配校验 →
-// Scheduler 内 Create/Start → 协程内命令（deadline）→ 关闭边界。
-// 它只做参数校验与错误路径（不连接真实服务），因此无外部 Redis/Mongo
-// 依赖即可编译运行；真实服务调用形态与语义见 README「示例与兼容说明」。
+// Scheduler 内 Create（Redis 另需协程内显式 Connect）→ 协程内命令（deadline）
+// → 关闭边界。它只做参数校验与错误路径（不连接真实服务），因此无外部
+// Redis/Mongo 依赖即可编译运行；真实服务调用形态与语义见 README「示例与兼容说明」。
 //
 // 注意：这两个客户端的链接依赖 hiredis / mongocxx（经显式前缀接入）。
 // 本示例 target 仅在对应模块 target 存在时注册（见 examples/CMakeLists.txt）。
@@ -53,8 +53,9 @@ CallOptions Budget(int ms) {
     return options;
 }
 
-// Redis 形态：PING → SET → GET → DEL → 关闭。未连接真实 Redis 时，
-// 首个命令在连接建立前等待并按 deadline 返回 Error（本示例打印错误码）。
+// Redis 形态：Connect → PING → SET → GET → DEL → 关闭。未连接真实 Redis 时，
+// 显式 Connect 按 deadline 返回 Error（本示例打印错误码），随后命令按失败状态
+// 直接返回错误（不隐式建连）。
 void RedisShape() {
     RedisClientConfig cfg;
     cfg.host         = "127.0.0.1";
@@ -73,10 +74,14 @@ void RedisShape() {
         return;
     }
     auto redis = std::move(created).value();
-    if (!redis->Start()) {
-        std::cerr << "CoRedisCli::Start failed\n";
-        return;
-    }
+    // 显式生命周期：Connect 必须在协程上下文调用并真实等待 TCP 建连完成
+    // （本函数已运行在 RunInCoroutine 内）。重复 Connect 且已连接为幂等 ok。
+    auto conn = redis->Connect(Budget(500));
+    if (!conn)
+        std::cerr << "redis Connect error (expected without live redis): code="
+                  << static_cast<int>(conn.error().code)
+                  << " status="
+                  << ConnectStateName(redis->ConnectStatus()) << "\n";
 
     auto ping = redis->Ping(Budget(200));
     if (!ping)

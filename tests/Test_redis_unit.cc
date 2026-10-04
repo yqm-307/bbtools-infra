@@ -5,11 +5,16 @@
 //                                   初始化的运行时）。
 //   t_setup_scheduler             — 启动 Scheduler（共享 executor 来源）。
 //                                  进程寿命运行时：整个可执行文件只 Start
-//                                  一次，无 Stop/重启。
+//                                   一次，无 Stop/重启。
 //   t_config_validation           — 非法装配逐项 InvalidArgument。
-//   t_command_prechecks           — 非协程 InvalidContext；未 Start
+//   t_command_prechecks           — 非协程 InvalidContext；未 Connect
 //                                   RuntimeUnavailable；空键/空表
-//                                   InvalidArgument。
+//                                   InvalidArgument；Close 后 Closed。
+//   t_no_lazy_connect_without_connect — 未 Connect 的命令返回错误且服务端无连接
+//                                   （命令不得隐式建连）；显式 Connect 后才可用。
+//   t_connect_disconnect_lifecycle — 显式生命周期状态机：Connect（幂等）/
+//                                   ConnectStatus（只读）/Disconnect（同步收口、
+//                                   可再次 Connect）/Close（终态、拒绝 Connect）。
 //   t_fake_redis_commands         — FakeRedis 预置 RESP 应答：PING/GET
 //                                   （bulk+nil）/SET/EXISTS/DEL 全链路
 //                                   解码与服务端错误映射（RemoteError）。
@@ -17,8 +22,9 @@
 //                                   确定性 Overloaded。
 //   t_deadline_only               — 静默服务端下超时 TimedOut；Close 不覆盖
 //                                   首个逻辑终态。
-//   t_refused_connect             — 连接拒绝 → TransportError，连接失败
-//                                   后队列命令统一失败。
+//   t_refused_connect             — 连接拒绝 → Connect 报 TransportError 且状态
+//                                   Failed；后续命令 sticky TransportError；
+//                                   再次显式 Connect 仍可尝试（不进入终态）。
 //   t_close_during_inflight       — 在途命令随 owner Close() 落定 Closed；
 //                                   Close() 返回即封口且在途 operation/
 //                                   connection 归零（IsClosed）。
@@ -26,9 +32,11 @@
 //                                   executor，无 io_thread）。
 //   t_invalid_context_plain       — 普通线程直接调命令 → InvalidContext。
 //
-// 关闭语义（进程寿命修订）：RequestClose/WaitClosed/CloseStatus/取消令牌
-// 全部删除——Close() 幂等、任意线程可调用，返回即在途归零、连接物理回收；
-// IsClosed() 只读查询。每个用例结束显式 Close() 并断言 IsClosed()。
+// 显式生命周期（不做 Lazy）：连接只在协程内显式 Connect 时建立；Disconnect 不是
+// Close 别名（同步收口连接但保留配置、可再次 Connect）；Close 是 ICoCloseable 终态。
+// 关闭语义（进程寿命修订）：RequestClose/WaitClosed/CloseStatus/取消令牌全部删除——
+// Close() 幂等、任意线程可调用，返回即在途归零、连接物理回收；IsClosed() 只读查询。
+// 每个用例结束显式 Close() 并断言 IsClosed()。
 //
 // 同步纪律与 http 套件一致：CountDownLatch + WaitUntil 有界等待，
 // 不 sleep 假设时序；FakeRedis/静默服务端在协程内经 Hook 驱动，
@@ -53,6 +61,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -124,7 +133,7 @@ bool WaitUntil(const std::function<bool()>& pred, int budget_ms = kBudgetMs) {
 class FakeRedis {
 public:
     explicit FakeRedis(std::deque<std::string> replies,
-                       bool silent = false) {
+                       bool silent = false, int max_conns = 1) {
         int lfd = ::socket(AF_INET, SOCK_STREAM, 0);
         BOOST_REQUIRE(lfd >= 0);
         int one = 1;
@@ -143,18 +152,36 @@ public:
                                     &len) == 0);
         port = ntohs(addr.sin_port);
 
-        auto rs = std::make_shared<std::deque<std::string>>(std::move(replies));
-        auto dn = done;
-        auto sd = saw_data;
+        // 多连接支持（显式生命周期会 Disconnect/重连同一实例）：accept 循环用有限
+        // poll 检查 stop 标志，析构无需等待完整 accept 超时。
+        auto rs  = std::make_shared<std::deque<std::string>>(std::move(replies));
+        auto dn  = done;
+        auto sd  = saw_data;
+        auto stp = stop;
+        auto lh  = std::make_shared<int>(lfd);
         bool succ = false;
         g_scheduler->RegistCoroutineTask(
-            [lfd, rs, dn, sd, silent] {
-                int c = ::accept(lfd, nullptr, nullptr);
-                ::close(lfd);
-                if (c >= 0 && !silent)
-                    Serve(c, rs, sd);
-                else if (c >= 0)
-                    HoldSilent(c, sd);
+            [lh, rs, dn, sd, stp, silent, max_conns] {
+                for (int i = 0; i < max_conns; ++i) {
+                    pollfd p{*lh, POLLIN, 0};
+                    const int pr = ::poll(&p, 1, 100);
+                    if (pr < 0)
+                        break;
+                    if (pr == 0) {
+                        if (stp->load())
+                            break;
+                        --i; // 尚未有连接：保持待 accept 数不变
+                        continue;
+                    }
+                    const int c = ::accept(*lh, nullptr, nullptr);
+                    if (c < 0)
+                        break;
+                    if (!silent)
+                        Serve(c, rs, sd);
+                    else
+                        HoldSilent(c, sd);
+                }
+                ::close(*lh);
                 dn->store(true);
             },
             succ);
@@ -164,10 +191,15 @@ public:
         }
         BOOST_REQUIRE(succ);
     }
-    ~FakeRedis() { WaitUntil([dn = done] { return dn->load(); }, 10000); }
+    ~FakeRedis() {
+        stop->store(true);
+        WaitUntil([dn = done] { return dn->load(); }, 10000);
+    }
 
     std::uint16_t port = 0;
     std::shared_ptr<std::atomic_bool> done{
+        std::make_shared<std::atomic_bool>(false)};
+    std::shared_ptr<std::atomic_bool> stop{
         std::make_shared<std::atomic_bool>(false)};
     // 服务端已收到任意字节 ⇒ 客户端连接建立且首个命令已真正发出（在途）。
     std::shared_ptr<std::atomic_bool> saw_data{
@@ -256,19 +288,26 @@ std::size_t ThreadCount() {
     return 0;
 }
 
-// client 工厂：成功则返回托管对象。
+// client 工厂：Create；connect=true 时在协程内显式 Connect（显式生命周期——
+// 命令不再隐式建连，故需要连接的场景必须显式建连并成功）。
 result<std::shared_ptr<CoRedisCli>> NewClient(const RedisClientConfig& cfg,
-                                            bool start = true) {
+                                            bool connect = true) {
     auto c = CoRedisCli::Create(cfg);
     if (!c)
         return result<std::shared_ptr<CoRedisCli>>::err(
             std::move(c).error());
     auto cli = std::move(c).value();
-    if (start) {
-        auto st = cli->Start();
+    if (connect) {
+        std::optional<result<void>> st;
+        if (!RunInCoroutine([&] { st.emplace(cli->Connect(Opt())); }))
+            return result<std::shared_ptr<CoRedisCli>>::err(MakeError(
+                ErrorCode::InternalError, "redis: connect coroutine not run"));
         if (!st)
+            return result<std::shared_ptr<CoRedisCli>>::err(MakeError(
+                ErrorCode::InternalError, "redis: connect produced no result"));
+        if (!*st)
             return result<std::shared_ptr<CoRedisCli>>::err(
-                std::move(st).error());
+                std::move(*st).error());
     }
     return result<std::shared_ptr<CoRedisCli>>::ok(std::move(cli));
 }
@@ -328,19 +367,18 @@ BOOST_AUTO_TEST_CASE(t_config_validation) {
 }
 
 BOOST_AUTO_TEST_CASE(t_command_prechecks) {
-    auto c = NewClient(MakeConfig("127.0.0.1", 1), /*start=*/false);
+    auto c = NewClient(MakeConfig("127.0.0.1", 1), /*connect=*/false);
     BOOST_REQUIRE(c);
     auto cli = std::move(c).value();
 
-    // 未 Start：协程内调用 → RuntimeUnavailable。
+    // 未 Connect：协程内调用 → RuntimeUnavailable（且不得隐式建连）。
     std::optional<result<void>> ping_out;
     BOOST_REQUIRE(RunInCoroutine(
         [&] { ping_out.emplace(cli->Ping(Opt())); }));
     BOOST_REQUIRE(!*ping_out);
     BOOST_CHECK(ping_out->error().code == ErrorCode::RuntimeUnavailable);
 
-    // 启动后再校验参数形态：空键/空表 InvalidArgument。
-    BOOST_REQUIRE(cli->Start());
+    // 参数形态校验先于连接检查：空键/空表 InvalidArgument。
     std::optional<result<std::optional<std::string>>> get_out;
     BOOST_REQUIRE(RunInCoroutine(
         [&] { get_out.emplace(cli->Get("", Opt())); }));
@@ -361,14 +399,104 @@ BOOST_AUTO_TEST_CASE(t_command_prechecks) {
     BOOST_CHECK(ping_out->error().code == ErrorCode::Closed);
 }
 
+// S1（不做 Lazy）：未 Connect 的命令返回错误且不得隐式建连——服务端从未建立连接（无字节）。
+BOOST_AUTO_TEST_CASE(t_no_lazy_connect_without_connect) {
+    BOOST_REQUIRE(g_prepared.load());
+    FakeRedis fake({"+PONG\r\n"});
+    auto c = NewClient(MakeConfig("127.0.0.1", fake.port), /*connect=*/false);
+    BOOST_REQUIRE(c);
+    auto cli = std::move(c).value();
+    BOOST_CHECK(cli->ConnectStatus() == ConnectState::Disconnected);
+
+    std::optional<result<void>> out;
+    BOOST_REQUIRE(RunInCoroutine([&] { out.emplace(cli->Ping(Opt(1000))); }));
+    BOOST_REQUIRE(!*out);
+    BOOST_CHECK(out->error().code == ErrorCode::RuntimeUnavailable);
+    // 命令不得隐式建连：服务端未收到任何字节。
+    BOOST_CHECK(!fake.saw_data->load());
+
+    // 显式 Connect 后才可用（真实 PING）。
+    BOOST_REQUIRE(RunInCoroutine([&] { out.emplace(cli->Connect(Opt())); }));
+    BOOST_REQUIRE(*out);
+    BOOST_CHECK(cli->ConnectStatus() == ConnectState::Connected);
+    BOOST_REQUIRE(RunInCoroutine([&] { out.emplace(cli->Ping(Opt())); }));
+    BOOST_REQUIRE(*out);
+    BOOST_CHECK(fake.saw_data->load());
+
+    CloseClient(cli);
+}
+
+// S2/S3/S4/S5：显式生命周期状态机（Connect 幂等、ConnectStatus 只读、
+// Disconnect 同步收口且可再次 Connect、Close 终态拒绝 Connect）。
+BOOST_AUTO_TEST_CASE(t_connect_disconnect_lifecycle) {
+    BOOST_REQUIRE(g_prepared.load());
+    // 多连接：Disconnect 后再次 Connect 会建立第二条连接。
+    FakeRedis fake({"+PONG\r\n", "+PONG\r\n"}, /*silent=*/false,
+                   /*max_conns=*/2);
+    auto c = NewClient(MakeConfig("127.0.0.1", fake.port), /*connect=*/false);
+    BOOST_REQUIRE(c);
+    auto cli = std::move(c).value();
+
+    // ConnectStatus 只读、不发网络请求：重复读取不改变状态。
+    for (int i = 0; i < 5; ++i)
+        BOOST_CHECK(cli->ConnectStatus() == ConnectState::Disconnected);
+
+    std::optional<result<void>> out;
+    BOOST_REQUIRE(RunInCoroutine([&] { out.emplace(cli->Connect(Opt())); }));
+    BOOST_REQUIRE(*out);
+    BOOST_CHECK(cli->ConnectStatus() == ConnectState::Connected);
+
+    // 重复 Connect：幂等 ok（不重新拨号）。
+    BOOST_REQUIRE(RunInCoroutine([&] { out.emplace(cli->Connect(Opt())); }));
+    BOOST_REQUIRE(*out);
+    BOOST_CHECK(cli->ConnectStatus() == ConnectState::Connected);
+
+    BOOST_REQUIRE(RunInCoroutine([&] { out.emplace(cli->Ping(Opt())); }));
+    BOOST_REQUIRE(*out);
+
+    // Disconnect：同步收口、非终态、保留配置。
+    cli->Disconnect();
+    BOOST_CHECK(!cli->IsClosed());
+    BOOST_CHECK(cli->ConnectStatus() == ConnectState::Disconnected);
+    // 主动 Disconnect 之后命令被拒，且不得隐式建连。
+    BOOST_REQUIRE(RunInCoroutine([&] { out.emplace(cli->Ping(Opt(1000))); }));
+    BOOST_REQUIRE(!*out);
+    BOOST_CHECK(out->error().code == ErrorCode::RuntimeUnavailable);
+    // 重复 Disconnect：幂等空操作。
+    cli->Disconnect();
+    BOOST_CHECK(cli->ConnectStatus() == ConnectState::Disconnected);
+
+    // 同实例再次显式 Connect。
+    BOOST_REQUIRE(RunInCoroutine([&] { out.emplace(cli->Connect(Opt())); }));
+    BOOST_REQUIRE(*out);
+    BOOST_CHECK(cli->ConnectStatus() == ConnectState::Connected);
+    BOOST_REQUIRE(RunInCoroutine([&] { out.emplace(cli->Ping(Opt())); }));
+    BOOST_REQUIRE(*out);
+
+    // Close 终态：拒绝 Connect，命令 Closed。
+    CloseClient(cli);
+    BOOST_CHECK(cli->ConnectStatus() == ConnectState::Closed);
+    BOOST_REQUIRE(RunInCoroutine([&] { out.emplace(cli->Connect(Opt())); }));
+    BOOST_REQUIRE(!*out);
+    BOOST_CHECK(out->error().code == ErrorCode::Closed);
+    BOOST_REQUIRE(RunInCoroutine([&] { out.emplace(cli->Ping(Opt())); }));
+    BOOST_REQUIRE(!*out);
+    BOOST_CHECK(out->error().code == ErrorCode::Closed);
+}
+
 BOOST_AUTO_TEST_CASE(t_invalid_context_plain) {
     // 普通线程（非协程）调命令：不启动协程直接调用。
-    auto c = NewClient(MakeConfig("127.0.0.1", 6379));
+    auto c = NewClient(MakeConfig("127.0.0.1", 6379), /*connect=*/false);
     BOOST_REQUIRE(c);
     auto cli = std::move(c).value();
     auto res = cli->Ping(Opt());
     BOOST_REQUIRE(!res);
     BOOST_CHECK(res.error().code == ErrorCode::InvalidContext);
+    // Connect 同样要求协程上下文：普通线程直接调用 → InvalidContext。
+    auto conn = cli->Connect(Opt());
+    BOOST_REQUIRE(!conn);
+    BOOST_CHECK(conn.error().code == ErrorCode::InvalidContext);
+    BOOST_CHECK(cli->ConnectStatus() == ConnectState::Disconnected);
     // Close 可在任意线程调用（含非协程线程）。
     CloseClient(cli);
 }
@@ -441,7 +569,9 @@ BOOST_AUTO_TEST_CASE(t_capacity_overloaded) {
     auto submit = [&](int budget_ms) {
         bool succ = false;
         g_scheduler->RegistCoroutineTask(
-            [&] {
+            // budget_ms 按值捕获：协程在 submit 返回之后才执行，引用捕获会
+            // stack-use-after-return。
+            [&, budget_ms] {
                 auto r = cli->Ping(Opt(budget_ms));
                 if (!r) {
                     if (r.error().code == ErrorCode::Overloaded)
@@ -493,24 +623,33 @@ BOOST_AUTO_TEST_CASE(t_deadline_only) {
 }
 
 BOOST_AUTO_TEST_CASE(t_refused_connect) {
-    // 127.0.0.1:1 惯例无监听：connect 拒绝 → 命令 TransportError，
-    // 且失败统一落定（不悬挂）。
-    auto c = NewClient(MakeConfig("127.0.0.1", 1));
+    // 127.0.0.1:1 惯例无监听：connect 拒绝 → Connect 报 TransportError 且状态
+    // Failed；默认不重连（后续命令 sticky TransportError）；再次显式 Connect
+    // 仍可尝试（Failed 不是终态）。
+    auto c = NewClient(MakeConfig("127.0.0.1", 1), /*connect=*/false);
     BOOST_REQUIRE(c);
     auto cli = std::move(c).value();
-    std::optional<result<void>> out;
-    BOOST_REQUIRE(RunInCoroutine(
-        [&] { out.emplace(cli->Ping(Opt(8000))); }));
-    BOOST_REQUIRE(!*out);
-    BOOST_CHECK(out->error().code == ErrorCode::TransportError);
 
-    // 再次提交：重新尝试连接并再次失败（断开后可重试语义）。
-    BOOST_REQUIRE(RunInCoroutine(
-        [&] { out.emplace(cli->Ping(Opt(8000))); }));
+    std::optional<result<void>> out;
+    BOOST_REQUIRE(RunInCoroutine([&] { out.emplace(cli->Connect(Opt(8000))); }));
     BOOST_REQUIRE(!*out);
     BOOST_CHECK(out->error().code == ErrorCode::TransportError);
+    BOOST_CHECK(cli->ConnectStatus() == ConnectState::Failed);
+
+    // 默认 reconnect_on_new_command=false：后续命令直接 TransportError，状态保持 Failed。
+    BOOST_REQUIRE(RunInCoroutine([&] { out.emplace(cli->Ping(Opt(8000))); }));
+    BOOST_REQUIRE(!*out);
+    BOOST_CHECK(out->error().code == ErrorCode::TransportError);
+    BOOST_CHECK(cli->ConnectStatus() == ConnectState::Failed);
+
+    // 显式重建：再次 Connect 仍失败（目标不可达）但可再次尝试，不进入终态。
+    BOOST_REQUIRE(RunInCoroutine([&] { out.emplace(cli->Connect(Opt(8000))); }));
+    BOOST_REQUIRE(!*out);
+    BOOST_CHECK(out->error().code == ErrorCode::TransportError);
+    BOOST_CHECK(cli->ConnectStatus() == ConnectState::Failed);
 
     CloseClient(cli);
+    BOOST_CHECK(cli->ConnectStatus() == ConnectState::Closed);
 }
 
 BOOST_AUTO_TEST_CASE(t_close_during_inflight) {
@@ -548,7 +687,7 @@ BOOST_AUTO_TEST_CASE(t_thread_count_stable) {
     BOOST_REQUIRE(before > 0);
     std::vector<std::shared_ptr<CoRedisCli>> clients;
     for (int i = 0; i < 4; ++i) {
-        auto c = NewClient(MakeConfig("127.0.0.1", 1));
+        auto c = NewClient(MakeConfig("127.0.0.1", 1), /*connect=*/false);
         BOOST_REQUIRE(c);
         clients.push_back(std::move(c).value());
     }
