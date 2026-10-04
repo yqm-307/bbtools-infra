@@ -1357,14 +1357,17 @@ BOOST_AUTO_TEST_CASE(t_owner_close_physical_collect) {
         << " conns_destroyed=" << totals_now.conns_destroyed);
     BOOST_CHECK_EQUAL(totals_now.readers_created, totals_now.readers_freed);
 
-    // 完整静默：已登记 op 归零、owner 批次退出后 IsClosed 落定。
+    // 物理收口不依赖 owner 批次退出；登记归零和 IsClosed 不保证晚到计数已发布。
     BOOST_REQUIRE(WaitUntil([&] {
         const auto s = cli->ProbeSnapshot();
         return s.registered == 0 && s.dial_inflight == 0;
     }));
     BOOST_REQUIRE(WaitUntil([&] { return cli->IsClosed(); }));
+    // owner 恢复后才记录晚到终态被拒；独立有界等待，不推迟上面的物理收口检查。
+    BOOST_REQUIRE(WaitUntil([&] { return cli->ProbeSnapshot().finish_conflicts >= 1; }));
     const auto after = cli->ProbeSnapshot();
     BOOST_CHECK(after.finish_conflicts >= 1); // 晚到终态被拒
+    BOOST_CHECK(out->error().code == ErrorCode::Closed); // 首发终态不被晚到者覆盖
 
     // 收口配对：释放测试侧最后引用后 conn 创建/释放恰好配对。
     tcp.reset();
