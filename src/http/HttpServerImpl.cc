@@ -92,12 +92,18 @@ void HttpSession::BeginRead() {
     }
     if (armed_ok) {
         try {
-            timer_armed = true;
+            // 每次 arm 分配新 token 并记账 +1：完成项带自己的 token，只有它
+            // 仍是当前活跃看守时才递减；被 cancel/Close 抢先记账的旧看守的
+            // aborted completion 不会消费新看守的记账（keep-alive 重挂关键）。
+            const std::uint64_t token = ++timer_gen;
+            timer_live                = token;
             IoAsyncStart();
             deadline_timer.async_wait(
-                [self](boost::system::error_code ec) { self->OnDeadline(ec); });
+                [self, token](boost::system::error_code ec) {
+                    self->OnDeadline(ec, token);
+                });
         } catch (...) {
-            timer_armed = false;
+            timer_live = 0;
             IoAsyncDone();
         }
     }
@@ -217,13 +223,15 @@ void HttpSession::PumpRead() {
     }
 }
 
-void HttpSession::OnDeadline(boost::system::error_code ec) {
+void HttpSession::OnDeadline(boost::system::error_code ec,
+                             std::uint64_t             token) {
     std::lock_guard<std::recursive_mutex> io_gate(server->Engine()->IoGate());
-    if (!timer_armed) {
-        // Close（或回复收口侧的 cancel）已记账：晚到空壳，不再触碰任何资源。
+    if (token != timer_live) {
+        // 已被 cancel/Close 抢先记账的旧看守（keep-alive 重挂后常见）：记账
+        // 义务已由取消侧履行，这里只消费空壳——既不递减，也不冒充本看守。
         return;
     }
-    timer_armed = false;
+    timer_live = 0;
     IoAsyncDone();
     if (ec || closed)
         return;
@@ -231,6 +239,20 @@ void HttpSession::OnDeadline(boost::system::error_code ec) {
     // StopAccepting/Close 都不抢占 handler），其持有的 InFlightRequest
     // 仍然有效，回复在写路径上按「只交付一次终态」收口。
     Close();
+}
+
+void HttpSession::CancelDeadlineWatch() noexcept {
+    // 与 Close 的保留位记账同构：取消当前活跃看守并在返回当刻履行其 -1
+    // 义务。取消侧抢先记账后，该看守完成项的 token 已不等于活跃值，晚到时
+    // 只消费空壳——不会二次递减，也不会消费此后重挂的新看守。
+    if (timer_live == 0)
+        return;
+    try {
+        deadline_timer.cancel();
+    } catch (...) {
+    }
+    timer_live = 0;
+    IoAsyncDone();
 }
 
 void HttpSession::OnPeerWatch(boost::system::error_code ec) {
@@ -377,11 +399,9 @@ void HttpSession::DeliverResult(std::shared_ptr<QueuedReply> reply) {
         boost::system::error_code ignored;
         socket.cancel(ignored);
     }
-    // 期限看守同理：cancel 后其完成项仍会到达一次，但不再触碰资源。
-    try {
-        deadline_timer.cancel();
-    } catch (...) {
-    }
+    // 期限看守同理：取消并在此记账（token 置空）；其完成项仍会到达一次，
+    // 但 token 不匹配，只消费空壳，不会消费 keep-alive 重挂后的新看守。
+    CancelDeadlineWatch();
 
     if (!reply || !reply->r)
         return;   // 壳已在 Close 侧被清空：不再写任何字节
@@ -469,10 +489,7 @@ void HttpSession::ReplyStatusAndClose(unsigned status) {
         boost::system::error_code ignored;
         socket.cancel(ignored);
     }
-    try {
-        deadline_timer.cancel();
-    } catch (...) {
-    }
+    CancelDeadlineWatch();
     // 一次性回复后收口：无论字节是否全部交给内核，本会话都不再读下一条请求。
     close_after_write = true;
     reply_keep_alive  = false;
@@ -548,22 +565,15 @@ void HttpSession::Close() noexcept {
         return;
     }
     closed = true;
-    try {
-        deadline_timer.cancel();
-    } catch (...) {
-        // cancel 失败不可恢复也不致命：socket 关闭后 wait 不再有意义
-    }
+    // 取消并记账 deadline 看守（token 置空，晚到完成项 token 不匹配 → 空壳）。
+    CancelDeadlineWatch();
     boost::system::error_code ignored;
     socket.close(ignored);   // 同时中止 pending 的 async_wait
     // 返回当刻记账被中止的等待项：它们的完成项仍会到达一次，但只消费空壳
-    // （OnIoWait/OnDeadline/OnPeerWatch 的 !armed 分支），不再触碰 fd 与
+    // （OnIoWait/OnDeadline/OnPeerWatch 的守护分支），不再触碰 fd 与
     // buffer。因此此刻 inflight 归零是「后端不再访问本对象资源」的真实判据。
     if (io_wait_armed) {
         io_wait_armed = false;
-        IoAsyncDone();
-    }
-    if (timer_armed) {
-        timer_armed = false;
         IoAsyncDone();
     }
     if (peer_watch_armed) {
