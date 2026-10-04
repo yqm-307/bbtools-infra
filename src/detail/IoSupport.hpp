@@ -28,6 +28,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 #include <boost/asio/any_io_executor.hpp>
@@ -192,11 +193,23 @@ inline constexpr std::chrono::milliseconds kCloseDrainTimeout{5000};
 class CloseWaiters {
 public:
     bool Add(const bbt::coroutine::sync::CoWaiter::SPtr& waiter) {
+        // 测试接缝：装配了 gate 时在「唤醒登记入口」（读 m_closed 之前）回调一次，
+        // 供受控交错回归把对象级封口与该窗口确定性重叠。生产路径 gate 为空，
+        // 只多一次函数对象判空；gate 只在测试装配、运行期不写，故无锁读取。
+        if (m_wake_register_gate_for_test)
+            m_wake_register_gate_for_test();
         std::lock_guard<std::mutex> lk(m_mtx);
         if (m_closed)
             return false;
         m_waiters.push_back(waiter);
         return true;
+    }
+
+    // 测试接缝安装点：约定回调可在测试内有界阻塞（由测试自身放行），生产路径
+    // 不得安装。见 Add 内调用点。
+    void SetWakeRegisterGateForTest(std::function<void()> gate) {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        m_wake_register_gate_for_test = std::move(gate);
     }
 
     void Remove(const bbt::coroutine::sync::CoWaiter* waiter) noexcept {
@@ -220,20 +233,36 @@ public:
             waiter->Notify();
     }
 
-    // 对象级 Close 的收口原语：封口 + 唤醒在册等待者 + 等待在途 fd 兴趣登记
-    // 排空（见类头「等待兴趣登记屏障」）。幂等；已封口后新 BeginRegister 一律
-    // false，故等待必然收敛。
+    // 对象级 Close 的收口原语：封口 + 唤醒在册等待者 + 等待在途 fd 兴趣登记与
+    // 「候选 fd 移交」排空 + 恰好 close 一次在册候选 fd（见下方候选 fd 语义）。
+    // 幂等；已封口后新 BeginRegister / CreateCandidate 一律失败，故等待必然收敛。
     void SealWakeAndDrainRegistrations() noexcept {
+        int  candidate     = -1;
+        bool has_candidate = false;
         std::vector<bbt::coroutine::sync::CoWaiter::SPtr> wake;
         {
             std::lock_guard<std::mutex> lk(m_mtx);
             m_closed = true;
             wake.swap(m_waiters);
+            // 原子接管在册候选 fd：此后 dial 侧 CreateCandidate/Commit 见 m_closed
+            // 一律失败，不会与本次 close 竞争同一 fd。
+            has_candidate   = m_has_candidate;
+            candidate       = m_candidate_fd;
+            m_has_candidate = false;
+            m_candidate_fd  = -1;
         }
         for (auto& waiter : wake)
             waiter->Notify();
-        std::unique_lock<std::mutex> lk(m_mtx);
-        m_reg_drained.wait(lk, [this] { return m_registrations == 0; });
+        {
+            std::unique_lock<std::mutex> lk(m_mtx);
+            m_reg_drained.wait(lk, [this] {
+                return m_registrations == 0 && m_handoffs == 0;
+            });
+        }
+        // 登记与移交均排空后恰好 close 一次：dial 侧已见我接管（返回 false），
+        // 不会重复 close，也不会触碰可能被复用的 fd 号。
+        if (has_candidate && candidate >= 0)
+            ::close(candidate);
     }
 
     // 见类头：未封口则登记一个「进行中的 fd 兴趣登记」，返回 true；已封口返回
@@ -255,6 +284,104 @@ public:
             m_reg_drained.notify_all();
     }
 
+    // ---- 在途「候选 fd」的同步收口（仅受管 dial 装配移交令牌时启用）----
+    // 背景：非阻塞 connect 期间 socket fd 尚未落入连接对象；若只由 dial 协程
+    // 在恢复时释放，Close 返回当刻 fd 可能仍活，违背 ICoCloseable「返回即物理
+    // 释放」。以下原语把候选 fd 的所有权在 connect 等待期交入本关闭登记，owner
+    // 封口即同步收口它，dial 恢复后不得双关或触碰可能复用的 fd 号。
+    //
+    // CreateCandidate：在封口门内建立候选 fd（factory 只做非阻塞 socket/
+    //   SetNonBlocking/connect，锁内执行，与物理 close 同门）。已封口返回 false
+    //   （调用方不得创建 socket/connect）；未封口则执行 factory，成功（fd>=0）
+    //   即记名，owner 封口会在登记与移交排空后恰好 close 它一次。
+    bool CreateCandidate(const std::function<int()>& factory) noexcept {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        if (m_closed)
+            return false;
+        const int fd = factory();
+        if (fd >= 0) {
+            m_candidate_fd  = fd;
+            m_has_candidate = true;
+        }
+        return true;
+    }
+
+    // TakeCandidate：失败/清理路径取回候选 fd 所有权。返回 true 时 *out_fd 为
+    // fd（调用方负责 close/重试）；返回 false 表示 owner 已接管（fd 已/将
+    // close），调用方不得再触碰该 fd。
+    bool TakeCandidate(int* out_fd) noexcept {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        if (m_closed || !m_has_candidate)
+            return false;
+        *out_fd         = m_candidate_fd;
+        m_has_candidate = false;
+        m_candidate_fd  = -1;
+        return true;
+    }
+
+    // BeginHandoff：成功路径原子「登记移交在途 + 取回候选 fd」。返回 true 时
+    // 调用方取得 *out_fd，且必须在 fd 所有权落位（连接对象发布）后调用
+    // EndHandoff；封口等待（SealWakeAndDrainRegistrations）会等到该移交归零，
+    // 使 Close 返回当刻 fd 必然已收口或已由连接对象拥有。返回 false 表示 owner
+    // 已接管，调用方不得触碰。
+    bool BeginHandoff(int* out_fd) noexcept {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        if (m_closed || !m_has_candidate)
+            return false;
+        *out_fd         = m_candidate_fd;
+        m_has_candidate = false;
+        m_candidate_fd  = -1;
+        ++m_handoffs;
+        return true;
+    }
+
+    // 与 BeginHandoff 配对，幂等安全。
+    void EndHandoff() noexcept {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        if (m_handoffs > 0)
+            --m_handoffs;
+        if (m_handoffs == 0)
+            m_reg_drained.notify_all();
+    }
+
+    // ---- 失败/清理路径的关闭门内收口（F-1a）----
+    // 立即 connect 失败、等待失败、SO_ERROR 失败三类路径若「先取出候选 fd / 释放
+    // 移交在途，再下一语句 close」，会让封口排空谓词（registrations==0 &&
+    // handoffs==0）先于物理 close 归零，使并发 Close/Disconnect 返回当刻 fd 可能
+    // 仍活。以下两原语在关闭门（本 m_mtx）内先 close 再归零计数，保证
+    // SealWakeAndDrainRegistrations 的等待条件只在 fd 已 close 后成立。
+
+    // 关闭门内收口「仍在候选槽登记」的 fd（立即 connect 失败 / 等待失败路径）。
+    // 与 owner 封口在同一把 m_mtx 下互斥：owner 观测到候选已不在冊时该 fd 必已
+    // close。返回 true 表示本次由调用方关闭并清除登记（可继续重试下一地址）；
+    // 返回 false 表示 owner 已封口并接管候选 fd（fd 已/将由 owner close），调用方
+    // 不得再触碰，按 Closed 收口。
+    bool CloseCandidateInGate() noexcept {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        if (m_closed)
+            return false;
+        if (m_has_candidate && m_candidate_fd >= 0)
+            ::close(m_candidate_fd);
+        m_has_candidate = false;
+        m_candidate_fd  = -1;
+        return true;
+    }
+
+    // 关闭门内收口「已移交在途」的候选 fd（成功 connect 后 SO_ERROR 失败、重试
+    // 下一地址前的路径）：该 fd 已由 BeginHandoff 移出候选槽并登记为一次在途移交。
+    // close 先于归还移交计数与 notify，保证排空谓词（handoffs==0）只在 fd 已 close
+    // 后成立。owner 不会在此刻接管（fd 已出候选槽），故调用方总是持有该 fd 并负责
+    // 本次 close，不双关。
+    void CloseHandoffFdAndEndHandoff(int fd) noexcept {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        if (fd >= 0)
+            ::close(fd);
+        if (m_handoffs > 0)
+            --m_handoffs;
+        if (m_handoffs == 0)
+            m_reg_drained.notify_all();
+    }
+
     bool Closed() const noexcept {
         std::lock_guard<std::mutex> lk(m_mtx);
         return m_closed;
@@ -265,7 +392,12 @@ private:
     std::condition_variable                           m_reg_drained;
     bool                                              m_closed{false};
     std::size_t                                       m_registrations{0};  // m_mtx 保护
+    std::size_t                                       m_handoffs{0};       // m_mtx 保护（候选 fd 移交在途）
+    int                                               m_candidate_fd{-1};  // m_mtx 保护
+    bool                                              m_has_candidate{false}; // m_mtx 保护
     std::vector<bbt::coroutine::sync::CoWaiter::SPtr> m_waiters;
+    // 仅测试装配；Add 入口回调（见 Add）。生产路径为空。
+    std::function<void()>                             m_wake_register_gate_for_test;
 };
 
 // BeginRegister/EndRegister 的 RAII 配对（异常安全）：析构时若仍持有登记则释放，
@@ -295,7 +427,9 @@ private:
 
 // 每个受管对象一份的关闭态机：Open→Closing→Closed，不重开。
 // 关闭由 owner 主动同步发起（Close）；物理清理落定（in-flight 归零）后
-// MarkClosed 跑一次 closed hook。没有「等待关闭完成」的公共入口。
+// MarkClosed 跑一次 closed hook。并发/重复 Close 的非首次调用者经 WaitClosed
+// 等待首个调用者完成物理收口，使每个合法调用者返回当刻都观察到 Closed 终态
+// （ICoCloseable：返回即物理资源已释放）。
 class ManagedCloseState {
 public:
     enum Phase : int { kOpen = 0, kClosing = 1, kClosed = 2 };
@@ -307,13 +441,21 @@ public:
         int expected = kOpen;
         return m_phase.compare_exchange_strong(expected, kClosing);
     }
-    // 物理清理落定：幂等（仅首次落实者跑回调）。
+    // 物理清理落定：幂等（仅首次落实者跑回调并唤醒等待者）。
     // 「Closed = 后端不会再访问本组件拥有的操作资源」，而非仅收到关闭意图。
     void MarkClosed() noexcept {
         if (m_phase.exchange(kClosed) == kClosed)
             return;
         if (m_hook)
             m_hook();
+        std::lock_guard<std::mutex> lk(m_mtx);
+        m_cv.notify_all();
+    }
+    // 非首次 Close 调用者：等待首个调用者把物理收口落定为 Closed。
+    // 首个调用者同步完成收口，故该等待有界；对已闭合对象调用立即返回。
+    void WaitClosed() const noexcept {
+        std::unique_lock<std::mutex> lk(m_mtx);
+        m_cv.wait(lk, [this] { return m_phase.load() == kClosed; });
     }
     // 发布前一次性注册：对象逃逸到其他线程之前由工厂设置。
     void SetClosedHook(std::function<void()> hook) noexcept {
@@ -325,6 +467,8 @@ public:
 private:
     std::atomic<int> m_phase{kOpen};
     std::function<void()> m_hook;   // 仅发布前写一次，此后只读
+    mutable std::mutex              m_mtx;
+    mutable std::condition_variable m_cv;
 };
 
 // CreateObjectInfo 的前置条件是「运行时已初始化」（不再有运行时代际）；

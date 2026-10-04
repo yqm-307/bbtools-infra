@@ -15,6 +15,10 @@
 // 在途 operation/connection 归零；IsClosed() 只读查询。无 RequestClose/
 // WaitClosed/CloseStatus。
 //
+// 显式生命周期：连接只在协程内显式 Connect 时建立（命令不隐式建连）；断连恢复
+// 由调用方显式 Connect 触发（默认 reconnect_on_new_command=false）；Disconnect
+// 同步收口连接但保留配置、可再次 Connect；Close 是终态。
+//
 // 并发上限 32、单命令 deadline <=2s、套件总预算有界。
 
 #define BOOST_TEST_DYN_LINK
@@ -135,11 +139,16 @@ int Sys(const std::string& prefix, const char* args) {
     return std::system((prefix + " " + args).c_str());
 }
 
-std::shared_ptr<CoRedisCli> NewLiveClient() {
+std::shared_ptr<CoRedisCli> NewLiveClient(bool connect = true) {
     auto c = CoRedisCli::Create(LiveConfig());
     BOOST_REQUIRE(c);
     auto cli = std::move(c).value();
-    BOOST_REQUIRE(cli->Start());
+    if (connect) {
+        // 显式生命周期：真实 Redis 下必须显式 Connect 成功（命令不再隐式建连）。
+        std::optional<result<void>> st;
+        BOOST_REQUIRE(RunInCoroutine([&] { st.emplace(cli->Connect(Opt())); }));
+        BOOST_REQUIRE(st && *st);
+    }
     return cli;
 }
 
@@ -346,15 +355,14 @@ BOOST_AUTO_TEST_CASE(t_reconnect) {
     BOOST_CHECK(down->error().code == ErrorCode::TransportError ||
                 down->error().code == ErrorCode::Unavailable);
 
-    // 起容器：同一 client 重连后恢复（新命令触发重连，不迁移旧命令）。
+    // 起容器：同一 client 显式 Connect 重建连接后恢复（默认不做隐式重连，不迁移旧命令）。
     BOOST_REQUIRE_EQUAL(Sys(ctl, "start redis"), 0);
     std::atomic_bool recovered{false};
     BOOST_REQUIRE(RunInCoroutine([&] {
         const auto dl = std::chrono::steady_clock::now() +
                         std::chrono::seconds(15);
         while (std::chrono::steady_clock::now() < dl) {
-            auto r = cli->Ping(Opt(1500));
-            if (r) {
+            if (cli->Connect(Opt(1500))) {
                 recovered.store(true);
                 return;
             }
@@ -387,13 +395,22 @@ BOOST_AUTO_TEST_CASE(t_server_down_fails) {
         BOOST_TEST_MESSAGE("skip: 需要 PHASE=B（容器停止态）");
         return;
     }
-    auto cli = NewLiveClient();
+    auto cli = NewLiveClient(/*connect=*/false);
+    // 容器停止态：显式 Connect 必须失败而非悬挂/假成功。
+    std::optional<result<void>> conn;
+    BOOST_REQUIRE(RunInCoroutine(
+        [&] { conn.emplace(cli->Connect(Opt())); }));
+    BOOST_REQUIRE(!*conn);
+    BOOST_CHECK(conn->error().code == ErrorCode::TransportError ||
+                conn->error().code == ErrorCode::Unavailable ||
+                conn->error().code == ErrorCode::TimedOut);
+    BOOST_CHECK(cli->ConnectStatus() == ConnectState::Failed);
+    // 未连接的命令立即失败（不隐式建连、不悬挂）。
     std::optional<result<void>> out;
     BOOST_REQUIRE(RunInCoroutine(
         [&] { out.emplace(cli->Ping(Opt())); }));
     BOOST_REQUIRE(!*out);
-    BOOST_CHECK(out->error().code == ErrorCode::TransportError ||
-                out->error().code == ErrorCode::Unavailable);
+    BOOST_CHECK(out->error().code == ErrorCode::TransportError);
     CloseAndCheck(cli);
 }
 

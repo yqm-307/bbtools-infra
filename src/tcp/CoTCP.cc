@@ -198,15 +198,22 @@ result<void> _WaitFd(int fd, bool readable, const CallOptions& options,
     const auto status = waiter->Wait(wait,
         [&waiter, &registered, &claim, close_waiters,
          on_registered = std::move(on_registered)]() -> bool {
-            // on_registered 在事件已建立（InitFdEvent）、等待者已纳管
-            // （_RegistAwaitEvent）之后运行：此刻释放登记屏障是安全的——旧 fd
-            // 的登记已完成，后续唤醒经 close_waiters 的 Notify 抵达。
-            claim.release();
+            // 唤醒登记（Add / 已封口时的自行 Notify）必须压在登记屏障内，先于
+            // claim.release()。若先释放屏障再 Add，对象级封口
+            // （SealWakeAndDrainRegistrations）可在「屏障已放行、唤醒登记未落」
+            // 的窗口里封口空的 m_waiters、排空登记并物理 close fd：上游
+            // Hook_Close 以 POLL_EVENT_CLOSED 首胜，本组合等待被兜底成
+            // Cancelled，而非关闭语义应有的 Closed。把 Add 计入屏障后，封口的
+            // 排空谓词（registrations==0）只在唤醒登记落定之后成立，物理 close
+            // 不再早于登记，自行 Notify 的 POLL_EVENT_CUSTOM 必先胜。
+            // 屏障内仍只含非阻塞操作（Add 为取锁 + push_back；Notify 为投递
+            // custom 事件），不引入等待点。
             if (close_waiters != nullptr) {
                 registered = close_waiters->Add(waiter);
                 if (!registered)
                     waiter->Notify();   // 已封口：不挂起，自行唤醒
             }
+            claim.release();
             if (on_registered) on_registered();
             return true;
         });
@@ -355,43 +362,133 @@ result<CoTCP::SPtr> CoTCP::_DialTcp(
     // output 已携带确定错误（等待段失败 / 对象身份申请失败）时不改写为
     // connect 错误。
     bool decisive_error = false;
+    // 候选 fd 同步收口：仅当调用方装配移交令牌（DialWaitOptions::handoff，
+    // 受管 Redis dial）时启用。未装配时（未托管入口 / TCP 传输 owner）保持原
+    // 语义，由本协程在恢复时自行 close 候选 fd。
+    bbt::infra::detail::CloseWaiters* const cw = dial_wait.close_waiters.get();
+    bbt::infra::detail::DialHandoffToken* const handoff = dial_wait.handoff.get();
+    const bool managed_candidate = handoff != nullptr && cw != nullptr;
     addrinfo* item = results;
     bool numeric_attempt = results == nullptr && numeric_len != 0;
     while (item != nullptr || numeric_attempt) {
         const sockaddr* address = item ? item->ai_addr
                                        : reinterpret_cast<const sockaddr*>(&numeric);
         const socklen_t address_len = item ? item->ai_addrlen : numeric_len;
-        const int fd = ::socket(item ? item->ai_family : numeric.ss_family,
-                                SOCK_STREAM, 0);
-        if (fd < 0 || _SetNonBlocking(fd) != 0) {
-            last_connect_error = errno;
-            if (fd >= 0) ::close(fd);
+
+        int  fd            = -1;
+        int  connect_rc    = -1;
+        int  connect_errno = 0;
+        bool sealed        = false;
+        // 建立候选 fd：受管路径在 owner 关闭门内建立（封口后不得再发起
+        // socket/connect），成功即在关闭登记中记名，owner 封口会同步收口它；
+        // 非受管路径沿用原语义直连。
+        auto establish = [&]() -> int {
+            fd = ::socket(item ? item->ai_family : numeric.ss_family,
+                          SOCK_STREAM, 0);
+            if (fd < 0) {
+                connect_errno = errno;
+                return -1;
+            }
+            if (_SetNonBlocking(fd) != 0) {
+                connect_errno = errno;
+                ::close(fd);
+                fd = -1;
+                return -1;
+            }
+            // The coroutine Hook waits without our CallOptions deadline. This
+            // transport owns the nonblocking syscall and CoWaiter retry loop.
+            connect_rc = static_cast<int>(
+                ::syscall(SYS_connect, fd, address, address_len));
+            connect_errno = connect_rc == 0 ? 0 : errno;
+            return fd;
+        };
+        if (managed_candidate) {
+            if (!cw->CreateCandidate(establish))
+                sealed = true;
+        } else {
+            establish();
+        }
+        auto next_attempt = [&]() {
             if (item != nullptr)
                 item = item->ai_next;
             else
                 numeric_attempt = false;
+        };
+        if (sealed) {
+            output = result<SPtr>::err(
+                MakeError(ErrorCode::Closed, "TCP socket closed"));
+            decisive_error = true;
+            break;
+        }
+        if (fd < 0) {
+            last_connect_error = connect_errno;
+            next_attempt();
             continue;
         }
-        // The coroutine Hook waits without our CallOptions deadline. This
-        // transport owns the nonblocking syscall and CoWaiter retry loop.
-        const int rc = ::syscall(SYS_connect, fd, address, address_len);
-        if (rc == 0) {
+        if (connect_rc == 0) {
+            if (managed_candidate) {
+                int owned = -1;
+                if (!handoff->Arm(&owned)) {
+                    // owner 已封口并接管候选 fd：不建立连接对象（其 fd 已收口）。
+                    output = result<SPtr>::err(
+                        MakeError(ErrorCode::Closed, "TCP socket closed"));
+                    decisive_error = true;
+                    break;
+                }
+                fd = owned;
+            }
             output = make_connection(fd);
             decisive_error = !output;
             break;
         }
-        if (errno != EINPROGRESS) {
-            last_connect_error = errno;
-            ::close(fd);
-            if (item != nullptr)
-                item = item->ai_next;
-            else
-                numeric_attempt = false;
+        if (connect_errno != EINPROGRESS) {
+            last_connect_error = connect_errno;
+            if (managed_candidate) {
+                // F-1a：关闭门内收口候选 fd（先 close 再清除登记），使并发
+                // Close/Disconnect 的封口排空谓词只在 fd 已 close 后归零。owner 已
+                // 接管（返回 false）则不得再触碰该 fd，按 Closed 收口。
+                if (!cw->CloseCandidateInGate()) {
+                    output = result<SPtr>::err(
+                        MakeError(ErrorCode::Closed, "TCP socket closed"));
+                    decisive_error = true;
+                    break;
+                }
+            } else {
+                ::close(fd);
+            }
+            next_attempt();
             continue;
         }
-        auto wait = _WaitFd(fd, false, options, dial_wait.close_waiters.get(),
+        auto wait = _WaitFd(fd, false, options, cw,
                             dial_wait.connect_on_registered);
-        if (!wait) {
+        const bool wait_ok = static_cast<bool>(wait);
+        if (managed_candidate) {
+            // 等待段结束：成功路径经移交取得所有权并登记移交在途（fd 之后由连接
+            // 对象/移交令牌收口）；失败路径在关闭门内收口候选 fd。两者都与 owner
+            // 封口原子互斥——owner 已接管（返回 false）则不得再触碰该 fd（可能已被
+            // 复用），按 Closed 收口。
+            if (wait_ok) {
+                int owned = -1;
+                if (!handoff->Arm(&owned)) {
+                    output = result<SPtr>::err(
+                        MakeError(ErrorCode::Closed, "TCP socket closed"));
+                    decisive_error = true;
+                    break;
+                }
+                fd = owned;
+            } else {
+                // F-1a：关闭门内收口候选 fd；owner 已接管则返回 false，不再触碰。
+                if (!cw->CloseCandidateInGate()) {
+                    output = result<SPtr>::err(
+                        MakeError(ErrorCode::Closed, "TCP socket closed"));
+                    decisive_error = true;
+                    break;
+                }
+                output = result<SPtr>::err(std::move(wait).error());
+                decisive_error = true;
+                break;
+            }
+        } else if (!wait_ok) {
             ::close(fd);
             output = result<SPtr>::err(std::move(wait).error());
             decisive_error = true;
@@ -402,11 +499,15 @@ result<CoTCP::SPtr> CoTCP::_DialTcp(
         if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &length) != 0 ||
             socket_error != 0) {
             last_connect_error = socket_error != 0 ? socket_error : errno;
-            ::close(fd);
-            if (item != nullptr)
-                item = item->ai_next;
-            else
-                numeric_attempt = false;
+            if (managed_candidate) {
+                // F-1a：fd 已由 Arm 移交在途——关闭门内先 close 再归还移交计数，
+                // 保证并发封口的排空谓词只在 fd 已 close 后归零；本地址失败后重试
+                // 下一地址。
+                handoff->CloseAndDisarm(fd);
+            } else {
+                ::close(fd);
+            }
+            next_attempt();
             continue;
         }
         output = make_connection(fd);

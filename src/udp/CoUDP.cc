@@ -296,10 +296,15 @@ CoUDP::WaitOutcome CoUDP::_Wait(bool readable, const CallOptions& options) {
     bool registered = false;
     const auto status = waiter->Wait(wait,
         [&waiter, &registered, &claim, this]() -> bool {
-            claim.release();
+            // 唤醒登记必须压在登记屏障内、先于 claim.release()（见 CoTCP.cc
+            // _WaitFd 同序说明）：先放行屏障会让对象级封口在「屏障已放行、唤醒
+            // 登记未落」窗口里封口空 waiters 并物理 close fd，上游 Hook_Close 以
+            // POLL_EVENT_CLOSED 首胜，等待被兜底成 Cancelled 而非 Closed。Add
+            // 计入屏障后，封口只在唤醒登记落定后物理 close，自行 Notify 先胜。
             registered = m_close_waiters->Add(waiter);
             if (!registered)
                 waiter->Notify();
+            claim.release();
             return true;
         });
     if (registered)

@@ -79,11 +79,14 @@ bbtools-infra 不引入新协程语法；等待/恢复完全复用 bbtools-corou
 
 ## Redis/Mongo 调用形态要点（以当前源码为准）
 
-- **Redis（hiredis async + strand）**：`CoRedisCli` 单连接语义；fd 事件接入
-  coroutine 共享 executor 派生的 strand，不新建线程/io_context。`Get` 未命中
-  返回 `ok(nullopt)`（与错误区分）；服务端错误回复（如 WRONGTYPE）映射为
-  `Error(RemoteError)`；连接断开期间在途命令返回 `Error(TransportError)`，
-  新命令触发重连并在队列内等待（受 `max_queue` 与各自 deadline 约束）。
+- **Redis（CoTCP 字节 I/O + hiredis RESP2 编解码）**：`CoRedisCli` 单连接语义；
+  CoTCP 承担 socket/等待/关闭，hiredis 只做同步编解码，不新建线程/io_context。
+  显式生命周期：协程内 `Connect(options)` 真实等待 TCP 建连完成（命令不隐式建连）；
+  `ConnectStatus()` 只读本地状态、不发网络探测；`Disconnect()` 同步收口连接但保留
+  配置、可再次 `Connect`；`Close()` 是终态。`Get` 未命中返回 `ok(nullopt)`（与错误
+  区分）；服务端错误回复（如 WRONGTYPE）映射为 `Error(RemoteError)`；连接故障后
+  默认（`reconnect_on_new_command=false`）新命令返回 `Error(TransportError)`，显式
+  打开时仅故障后的新命令至多各尝试一次新连接；若同一批次重建再次失败，后续已入队命令可统一以 `TransportError` 落定；已失败命令不重发/不迁移。
 - **Mongo（同步 driver + 有界 worker bridge）**：阻塞 driver 调用在有界
   worker 线程（`worker_threads <= 8`）执行，协程在 worker bridge 上等待；
   driver 失败映射 `Error(Unavailable)`，服务端错误映射 `Error(RemoteError)`

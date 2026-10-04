@@ -89,13 +89,19 @@ result<void> RedisCotcpConn::Dial(
             MakeError(ErrorCode::Closed, "redis: connection close requested"));
     // 经 owner 装配面建立受管 dial：connect 等待段登记到本连接所属 owner 的关闭
     // 唤醒登记上，owner Close 封口即打断在途 connect（无取消令牌）。数值地址不
-    // 走 DNS 等待段；DNS 等待段不可外部 Notify，只能由调用方 deadline 划定。
+    // 走 DNS 等待段；DNS 等待段不可外部 Notify，只能由调用方 deadline 划定，但
+    // 封口后不再发起 socket/connect。移交令牌使候选 fd 在 connect 等待期由 owner
+    // 关闭原语持有：Close 返回当刻候选 fd 已物理收口，dial 恢复后不会双关。
     detail::DialWaitOptions dial_wait;
     dial_wait.close_waiters = dial_waiters;
+    if (dial_waiters)
+        dial_wait.handoff = std::make_shared<detail::DialHandoffToken>(
+            dial_waiters.get());
     auto tcp = detail::TransportWiring::DialTCP(m_host, m_port, options,
                                                 dial_wait);
     if (!tcp) {
-        // 失败路径由 CoTCP 自行 close 候选 fd：本连接不保留任何 socket。
+        // 失败路径的候选 fd 已由承接方收口（owner 封口 close 或 dial 取回
+        // close）：本连接不保留任何 socket。
         return result<void>::err(std::move(tcp).error());
     }
     {

@@ -452,7 +452,8 @@ Binding 对 hiredis `redisContextFuncs` 各回调的目标行为（均为设计�
 
 附加约束：
 
-- **禁止自动 reconnect 绕过 binding**：Binding 不得启用或伪造会自行重建 socket 的路径；断线必须映射为明确错误交回 `RedisConn`，由它决定新建连接（走 `DialTCP`）。
+- **禁止自动 reconnect 绕过 binding**：Binding 不得启用或伪造会自行重建 socket 的路径；断线必须映射为明确错误交回 `RedisConn`，由它决定新建连接（走 `DialTCP`）。收敛为唯一 `CoRedisCliImpl` 后，该「由它决定」落在 owner：默认不重建（错误显式交回调用方），仅在显式 `RedisClientConfig::reconnect_on_new_command` 时，为故障之后的**新命令**至多各重建一次；若该次重建再次失败，同一批次内其后已入队命令可统一以 `TransportError` 落定，不重发已失败命令、不做后台重连循环。
+- **显式生命周期，不做 Lazy**：公共面提供 `Connect(options)`（协程内真实等待 TCP 建连完成）、`Disconnect()`（同步收口连接、保留配置、可再次 Connect，不是 Close 别名）、`ConnectStatus()`（只读本地状态、不发网络探测）与终态 `Close()`。命令不得隐式建连：未 Connect、主动 Disconnect 之后、Connecting/Disconnecting 期间以及默认 `Failed` 状态一律返回错误；`Connect` 可显式重建失败/断开的连接。每次可重建连接使用新的 dial 关闭登记与代际令牌，Disconnect/Close 与在途 dial、迟到 owner 清理不得污染后续新连接。`Disconnect`/`Close` 对在途 Dial 的封口收口是**无超时的同步等待**（等待段本身不含挂起点，但被唤醒的 dial 协程需能被其它 Scheduler 线程推进才会退出）；单线程 Scheduler 下不得从 dial 所在线程调用 `Disconnect`/`Close`。该目标形态仍是 A 级**候选**，未切换生产实现。
 - **0 与负值的精确语义**：`read`/`write` 的每个返回值含义以上表为准，并在最小实验中用 hiredis 实际调用点（`redisBufferRead`、`redisBufferWrite`、`redisGetReply`）核对，不得凭直觉映射。
 - 该目标形态是 A 级**候选**，未经 §10 验收前不得据此把 `0003` 的 async + strand 决策改写为“已迁移”或“已淘汰”；也不能反向把本目标描述回 sche async 形态。
 
