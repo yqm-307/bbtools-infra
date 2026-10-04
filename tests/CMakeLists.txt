@@ -116,6 +116,20 @@ target_compile_options(Test_http_timer_rearm_probe PRIVATE -Wall -Wextra)
 add_test(NAME http.timer_rearm COMMAND Test_http_timer_rearm_probe)
 set_tests_properties(http.timer_rearm PROPERTIES TIMEOUT 120)
 
+# Issue #62 补充探针：在途 handler 与 peer-FIN / owner Close/Teardown 并发。
+# Case A（peer-FIN in-flight）断言 OnPeerWatch→Close 完成、会话 drain、晚到回投
+# 不触碰已关资源；Case B（Close vs in-flight）断言同步 Close 契约与 drain 归零返回；
+# Case B2 直接并发 Teardown()。直接读 impl 层只读探针 DebugSessionCount()/OpenForIo()，
+# 需要 src/ 内部头 include 路径——仅本目标可见。ASan/UBSan 构建下运行并扫描日志。
+add_executable(Test_http_inflight_close_probe Test_http_inflight_close_probe.cc)
+target_include_directories(Test_http_inflight_close_probe PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(Test_http_inflight_close_probe
+    PRIVATE bbt::infra_http Boost::boost Threads::Threads)
+target_compile_options(Test_http_inflight_close_probe PRIVATE -Wall -Wextra)
+add_test(NAME http.inflight_close COMMAND Test_http_inflight_close_probe)
+set_tests_properties(http.inflight_close PROPERTIES TIMEOUT 120)
+
 # Issue #37：HTTP 出站连接/在途配额的原子接纳与物理归还。
 # 与 transport #32 不同入口：覆盖 HttpClientImpl::Request 的 owner
 # 预算门禁（max_connections/max_inflight）、Overloaded 确定性、
