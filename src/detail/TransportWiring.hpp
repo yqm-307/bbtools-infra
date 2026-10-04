@@ -221,6 +221,39 @@ struct TransportWiring {
         owner.m_wait_entry_gate_for_test = std::move(gate);
     }
 
+    // —— 唤醒登记入口 gate（关闭登记竞态回归）——
+    // 可等待 op 在「向 close_waiters 登记唤醒」的入口（Add，读封口态之前）回调
+    // 一次，供受控交错回归确定性重叠对象级封口与登记窗口：断言封口在登记落定前
+    // 无法物理 close fd、op 仍以 Closed（非 Cancelled）落定。约定：仅测试安装，
+    // 回调可在测试内有界阻塞（由测试自身放行）；生产路径为空钩子。
+    static void SetCloseWakeRegisterGateForTest(tcp::CoTCP& owner,
+                                                std::function<void()> gate) noexcept {
+        if (owner.m_close_waiters)
+            owner.m_close_waiters->SetWakeRegisterGateForTest(std::move(gate));
+    }
+    static void SetCloseWakeRegisterGateForTest(tcp::CoTCPListener& owner,
+                                                std::function<void()> gate) noexcept {
+        if (owner.m_close_waiters)
+            owner.m_close_waiters->SetWakeRegisterGateForTest(std::move(gate));
+    }
+    static void SetCloseWakeRegisterGateForTest(udp::CoUDP& owner,
+                                                std::function<void()> gate) noexcept {
+        if (owner.m_close_waiters)
+            owner.m_close_waiters->SetWakeRegisterGateForTest(std::move(gate));
+    }
+
+    // —— 唤醒登记封口探针（关闭登记竞态回归）——
+    // 返回对象级关闭登记是否已封口（CloseWaiters::Closed 置位，即
+    // SealWakeAndDrainRegistrations 已越过封口、正等在册登记排空）。受控交错
+    // 回归据此取得「Close 确已进入封口」的正向证据，排除忙 runner 上 closer
+    // 尚未被调度所造成的假通过；生产路径不使用。
+    static bool CloseWaitersSealedForTest(const tcp::CoTCPListener& owner) noexcept {
+        return owner.m_close_waiters && owner.m_close_waiters->Closed();
+    }
+    static bool CloseWaitersSealedForTest(const udp::CoUDP& owner) noexcept {
+        return owner.m_close_waiters && owner.m_close_waiters->Closed();
+    }
+
     // —— TransportRuntime（owner）：协议 owner 的落定接线 ——
     // 本 owner 的受管 transport 全部物理关闭落定（IsClosed 观察点）后回调
     // 一次：协议 owner 用它把 transport 落定并入自身 finalize 门控；发布前

@@ -198,15 +198,22 @@ result<void> _WaitFd(int fd, bool readable, const CallOptions& options,
     const auto status = waiter->Wait(wait,
         [&waiter, &registered, &claim, close_waiters,
          on_registered = std::move(on_registered)]() -> bool {
-            // on_registered 在事件已建立（InitFdEvent）、等待者已纳管
-            // （_RegistAwaitEvent）之后运行：此刻释放登记屏障是安全的——旧 fd
-            // 的登记已完成，后续唤醒经 close_waiters 的 Notify 抵达。
-            claim.release();
+            // 唤醒登记（Add / 已封口时的自行 Notify）必须压在登记屏障内，先于
+            // claim.release()。若先释放屏障再 Add，对象级封口
+            // （SealWakeAndDrainRegistrations）可在「屏障已放行、唤醒登记未落」
+            // 的窗口里封口空的 m_waiters、排空登记并物理 close fd：上游
+            // Hook_Close 以 POLL_EVENT_CLOSED 首胜，本组合等待被兜底成
+            // Cancelled，而非关闭语义应有的 Closed。把 Add 计入屏障后，封口的
+            // 排空谓词（registrations==0）只在唤醒登记落定之后成立，物理 close
+            // 不再早于登记，自行 Notify 的 POLL_EVENT_CUSTOM 必先胜。
+            // 屏障内仍只含非阻塞操作（Add 为取锁 + push_back；Notify 为投递
+            // custom 事件），不引入等待点。
             if (close_waiters != nullptr) {
                 registered = close_waiters->Add(waiter);
                 if (!registered)
                     waiter->Notify();   // 已封口：不挂起，自行唤醒
             }
+            claim.release();
             if (on_registered) on_registered();
             return true;
         });

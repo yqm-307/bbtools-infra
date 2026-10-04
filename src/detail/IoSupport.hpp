@@ -193,11 +193,23 @@ inline constexpr std::chrono::milliseconds kCloseDrainTimeout{5000};
 class CloseWaiters {
 public:
     bool Add(const bbt::coroutine::sync::CoWaiter::SPtr& waiter) {
+        // 测试接缝：装配了 gate 时在「唤醒登记入口」（读 m_closed 之前）回调一次，
+        // 供受控交错回归把对象级封口与该窗口确定性重叠。生产路径 gate 为空，
+        // 只多一次函数对象判空；gate 只在测试装配、运行期不写，故无锁读取。
+        if (m_wake_register_gate_for_test)
+            m_wake_register_gate_for_test();
         std::lock_guard<std::mutex> lk(m_mtx);
         if (m_closed)
             return false;
         m_waiters.push_back(waiter);
         return true;
+    }
+
+    // 测试接缝安装点：约定回调可在测试内有界阻塞（由测试自身放行），生产路径
+    // 不得安装。见 Add 内调用点。
+    void SetWakeRegisterGateForTest(std::function<void()> gate) {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        m_wake_register_gate_for_test = std::move(gate);
     }
 
     void Remove(const bbt::coroutine::sync::CoWaiter* waiter) noexcept {
@@ -384,6 +396,8 @@ private:
     int                                               m_candidate_fd{-1};  // m_mtx 保护
     bool                                              m_has_candidate{false}; // m_mtx 保护
     std::vector<bbt::coroutine::sync::CoWaiter::SPtr> m_waiters;
+    // 仅测试装配；Add 入口回调（见 Add）。生产路径为空。
+    std::function<void()>                             m_wake_register_gate_for_test;
 };
 
 // BeginRegister/EndRegister 的 RAII 配对（异常安全）：析构时若仍持有登记则释放，

@@ -26,8 +26,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -92,6 +95,10 @@ CallOptions Options(int timeout_ms = 5000) {
 
 // gate 与用例等待的兜底预算，不代表生产 Close 的超时上限。
 constexpr int kSeamBudgetMs = 5000;
+
+// 关闭登记竞态回归：登记落定前观察「Close 是否已返回」的有界预算。修复后
+// 封口被在册登记屏障挡住，该窗口内 Close 必然不返回；仅用于区分旧/新顺序。
+constexpr int kCloseRaceBudgetMs = 400;
 
 // 用例级观测点：整体堆分配，协程与 gate 回调按 shared_ptr 持有。断言失败
 // 展开用例栈后，挂起协程的写入仍落在存活对象上（不引用已析构栈对象）。
@@ -158,6 +165,18 @@ void InstallWaitEntryGate(const std::shared_ptr<Listener>& listener,
 
 // 可等待 op 的结果码语义：-2 = 正常返回（未预期）。
 constexpr int kOpSucceeded = -2;
+
+// 关闭登记竞态回归的确定性握手：op 到达「唤醒登记入口」（CloseWaiters::Add）
+// 时置 at_registration 并等待控制线程放行；控制线程在放行前发起对象级 Close，
+// 以「封口已置位（CloseWaiters::Closed）后 Close 是否仍未返回」区分封口是否被
+// 在册登记屏障挡住。gate 自身有界等待：放行超预算即退出，绝不无界阻塞。
+struct WakeRegisterHandshake {
+    std::mutex              mtx;
+    std::condition_variable cv;
+    bool                    at_registration = false; // op 已到达 Add 入口
+    bool                    proceed         = false; // 测试放行登记
+    bool                    gate_timed_out  = false; // gate 自身有界等待超时
+};
 
 } // namespace
 
@@ -738,6 +757,240 @@ BOOST_AUTO_TEST_CASE(t_accept_adopt_rejected_after_owner_close) {
     BOOST_CHECK_EQUAL(TransportWiring::InflightQuotaHeldForTest(*owner), 0u);
     BOOST_CHECK_EQUAL(TransportWiring::TransportsHeldForTest(*owner), 0u);
     TransportWiring::SetAcceptAdoptGateForTest(*listener.value(), {});
+    guard.Unwind();
+}
+
+// ---------------------------------------------------------------------------
+// 9. 关闭登记竞态（TCP Accept）：可等待 op 已建立 fd 事件、正要向 close_waiters
+//    登记唤醒之际，另一线程发起对象级 Close。修复前的顺序是「先放行登记屏障
+//    （claim.release）再 Add」，封口 SealWakeAndDrainRegistrations 可在此窗口
+//    封口空 m_waiters、排空登记并物理 close fd——上游 Hook_Close 以
+//    POLL_EVENT_CLOSED 首胜，本组合等待被兜底成 Cancelled(4)。修复把 Add 压进
+//    屏障后：封口的排空谓词（registrations==0）只在唤醒登记落定后成立，物理
+//    close 不早于登记，自行 Notify 的 POLL_EVENT_CUSTOM 必先胜。
+//    gate 落在 Add 入口，故本用例确定性重叠两条路径（非概率重试）：
+//      - 登记落定前 Close 无法返回（封口被在册登记屏障挡住）；
+//      - op 以关闭语义 Closed 落定，而非 Cancelled。
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(t_close_during_wake_registration_stays_closed_tcp) {
+    EnsureRuntime();
+    CaseGuard guard;
+
+    auto created = TransportRuntime::Create(Limits(4, 1));
+    BOOST_REQUIRE(created);
+    auto owner = std::move(created).value();
+    guard.OnUnwind([owner] { owner->Close(); });
+    BOOST_REQUIRE(owner->Start());
+
+    auto listen = owner->ListenTCP(SocketAddress{"127.0.0.1", 0}, 16);
+    BOOST_REQUIRE(listen);
+    auto listener = listen.value();
+    guard.OnUnwind([listener] { listener->Close(); });
+
+    auto hs = std::make_shared<WakeRegisterHandshake>();
+    // 收口顺序：gate 放行回调最后登记（OnUnwind 逆序执行），故异常/超时展开时
+    // 先放行 gate、再 Close 对象——清理路径不因 gate 未放行而无界等待。
+    guard.OnUnwind([hs] {
+        std::lock_guard<std::mutex> lk(hs->mtx);
+        hs->proceed = true;
+        hs->cv.notify_all();
+    });
+    TransportWiring::SetCloseWakeRegisterGateForTest(*listener, [hs] {
+        std::unique_lock<std::mutex> lk(hs->mtx);
+        hs->at_registration = true;
+        hs->cv.notify_all();
+        if (!hs->cv.wait_for(lk, std::chrono::milliseconds(kSeamBudgetMs),
+                             [hs] { return hs->proceed; }))
+            hs->gate_timed_out = true;   // 有界：超时即自行退出，绝不无界阻塞
+        hs->cv.notify_all();
+    });
+
+    auto waiter = std::make_shared<Waiter>();
+    bbtco [listener, waiter]() {
+        auto r = listener->Accept(Options(30000));
+        waiter->code.store(r ? kOpSucceeded : static_cast<int>(r.error().code));
+        waiter->settled.Down();
+    };
+
+    {
+        std::unique_lock<std::mutex> lk(hs->mtx);
+        BOOST_REQUIRE_MESSAGE(
+            hs->cv.wait_for(lk, std::chrono::milliseconds(kSeamBudgetMs),
+                            [hs] { return hs->at_registration; }),
+            "Accept 未在预算内到达唤醒登记入口（gate 未落定，未真实挂起）");
+    }
+
+    auto close_done = std::make_shared<bbt::core::thread::CountDownLatch>(1);
+    std::thread closer([listener, close_done] {
+        listener->Close();
+        close_done->Down();
+    });
+
+    // 正向证据：closer 必须实际越过封口（CloseWaiters::Closed 置位），而非只观察
+    // 「Close 未返回」——排除忙 runner 上 closer 尚未被调度造成的假通过。
+    {
+        const auto seal_deadline = std::chrono::steady_clock::now() +
+                                   std::chrono::milliseconds(kSeamBudgetMs);
+        while (!TransportWiring::CloseWaitersSealedForTest(*listener) &&
+               std::chrono::steady_clock::now() < seal_deadline)
+            std::this_thread::yield();
+    }
+    if (!TransportWiring::CloseWaitersSealedForTest(*listener)) {
+        { std::lock_guard<std::mutex> lk(hs->mtx); hs->proceed = true; hs->cv.notify_all(); }
+        if (close_done->WaitTimeout(kSeamBudgetMs) == 0)
+            closer.join();
+        else
+            closer.detach();
+        BOOST_FAIL("closer 未在预算内进入封口（CloseWaiters::Closed 未置位）");
+        return;
+    }
+
+    // 负向观察（有界预算）：封口已置位而 Close 仍不得在放行登记屏障前返回。
+    const bool closed_before_release =
+        (close_done->WaitTimeout(kCloseRaceBudgetMs) == 0);
+    BOOST_CHECK_MESSAGE(!closed_before_release,
+        "登记落定前 Close 已返回：封口未被在册唤醒登记屏障挡住（旧错序）");
+
+    {
+        std::lock_guard<std::mutex> lk(hs->mtx);
+        hs->proceed = true;
+        hs->cv.notify_all();
+    }
+    if (close_done->WaitTimeout(kSeamBudgetMs) != 0) {
+        closer.detach();   // 避免 joinable 析构 terminate 与无界 join
+        BOOST_FAIL("放行登记屏障后 Close 未在预算内返回");
+        return;
+    }
+    closer.join();
+    bool gate_timed_out = false;
+    {
+        std::lock_guard<std::mutex> lk(hs->mtx);
+        gate_timed_out = hs->gate_timed_out;
+    }
+    BOOST_CHECK_MESSAGE(!gate_timed_out,
+        "gate 自身有界等待超时：登记放行超出预算（握手未按序推进）");
+
+    BOOST_CHECK(listener->IsClosed());
+    BOOST_REQUIRE_MESSAGE(waiter->settled.WaitTimeout(kSeamBudgetMs) == 0,
+                          "Close 后挂起 Accept 未在预算内落定");
+    BOOST_CHECK_EQUAL(waiter->code.load(), static_cast<int>(ErrorCode::Closed));
+    BOOST_CHECK_EQUAL(TransportWiring::InflightQuotaHeldForTest(*owner), 0u);
+
+    TransportWiring::SetCloseWakeRegisterGateForTest(*listener, {});
+    guard.Unwind();
+}
+
+// ---------------------------------------------------------------------------
+// 10. 关闭登记竞态（UDP Receive）：与 case 9 同一根因/同一 gate 位置，覆盖
+//     CoUDP::_Wait 的「先放行登记屏障再 Add」错序。断言同：登记落定前 Close
+//     不返回；Close 后挂起 Receive 以 Closed 落定。
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(t_close_during_wake_registration_stays_closed_udp) {
+    EnsureRuntime();
+    CaseGuard guard;
+
+    auto created = TransportRuntime::Create(Limits(4, 1));
+    BOOST_REQUIRE(created);
+    auto owner = std::move(created).value();
+    guard.OnUnwind([owner] { owner->Close(); });
+    BOOST_REQUIRE(owner->Start());
+
+    auto bound = owner->BindUDP(SocketAddress{"127.0.0.1", 0});
+    BOOST_REQUIRE(bound);
+    auto udp = bound.value();
+    guard.OnUnwind([udp] { udp->Close(); });
+
+    auto hs = std::make_shared<WakeRegisterHandshake>();
+    // 收口顺序：gate 放行回调最后登记（OnUnwind 逆序执行），故异常/超时展开时
+    // 先放行 gate、再 Close 对象——清理路径不因 gate 未放行而无界等待。
+    guard.OnUnwind([hs] {
+        std::lock_guard<std::mutex> lk(hs->mtx);
+        hs->proceed = true;
+        hs->cv.notify_all();
+    });
+    TransportWiring::SetCloseWakeRegisterGateForTest(*udp, [hs] {
+        std::unique_lock<std::mutex> lk(hs->mtx);
+        hs->at_registration = true;
+        hs->cv.notify_all();
+        if (!hs->cv.wait_for(lk, std::chrono::milliseconds(kSeamBudgetMs),
+                             [hs] { return hs->proceed; }))
+            hs->gate_timed_out = true;   // 有界：超时即自行退出，绝不无界阻塞
+        hs->cv.notify_all();
+    });
+
+    auto waiter = std::make_shared<Waiter>();
+    bbtco [udp, waiter]() {
+        std::uint8_t buffer[64];
+        auto r = udp->Receive(MutableBytes{buffer, sizeof(buffer)}, Options(30000));
+        waiter->code.store(r ? kOpSucceeded : static_cast<int>(r.error().code));
+        waiter->settled.Down();
+    };
+
+    {
+        std::unique_lock<std::mutex> lk(hs->mtx);
+        BOOST_REQUIRE_MESSAGE(
+            hs->cv.wait_for(lk, std::chrono::milliseconds(kSeamBudgetMs),
+                            [hs] { return hs->at_registration; }),
+            "Receive 未在预算内到达唤醒登记入口（gate 未落定，未真实挂起）");
+    }
+
+    auto close_done = std::make_shared<bbt::core::thread::CountDownLatch>(1);
+    std::thread closer([udp, close_done] {
+        udp->Close();
+        close_done->Down();
+    });
+
+    // 正向证据：closer 必须实际越过封口（CloseWaiters::Closed 置位），而非只观察
+    // 「Close 未返回」——排除忙 runner 上 closer 尚未被调度造成的假通过。
+    {
+        const auto seal_deadline = std::chrono::steady_clock::now() +
+                                   std::chrono::milliseconds(kSeamBudgetMs);
+        while (!TransportWiring::CloseWaitersSealedForTest(*udp) &&
+               std::chrono::steady_clock::now() < seal_deadline)
+            std::this_thread::yield();
+    }
+    if (!TransportWiring::CloseWaitersSealedForTest(*udp)) {
+        { std::lock_guard<std::mutex> lk(hs->mtx); hs->proceed = true; hs->cv.notify_all(); }
+        if (close_done->WaitTimeout(kSeamBudgetMs) == 0)
+            closer.join();
+        else
+            closer.detach();
+        BOOST_FAIL("closer 未在预算内进入封口（CloseWaiters::Closed 未置位）");
+        return;
+    }
+
+    // 负向观察（有界预算）：封口已置位而 Close 仍不得在放行登记屏障前返回。
+    const bool closed_before_release =
+        (close_done->WaitTimeout(kCloseRaceBudgetMs) == 0);
+    BOOST_CHECK_MESSAGE(!closed_before_release,
+        "登记落定前 Close 已返回：封口未被在册唤醒登记屏障挡住（旧错序）");
+
+    {
+        std::lock_guard<std::mutex> lk(hs->mtx);
+        hs->proceed = true;
+        hs->cv.notify_all();
+    }
+    if (close_done->WaitTimeout(kSeamBudgetMs) != 0) {
+        closer.detach();   // 避免 joinable 析构 terminate 与无界 join
+        BOOST_FAIL("放行登记屏障后 Close 未在预算内返回");
+        return;
+    }
+    closer.join();
+    bool gate_timed_out = false;
+    {
+        std::lock_guard<std::mutex> lk(hs->mtx);
+        gate_timed_out = hs->gate_timed_out;
+    }
+    BOOST_CHECK_MESSAGE(!gate_timed_out,
+        "gate 自身有界等待超时：登记放行超出预算（握手未按序推进）");
+
+    BOOST_CHECK(udp->IsClosed());
+    BOOST_REQUIRE_MESSAGE(waiter->settled.WaitTimeout(kSeamBudgetMs) == 0,
+                          "Close 后挂起 Receive 未在预算内落定");
+    BOOST_CHECK_EQUAL(waiter->code.load(), static_cast<int>(ErrorCode::Closed));
+    BOOST_CHECK_EQUAL(TransportWiring::InflightQuotaHeldForTest(*owner), 0u);
+
+    TransportWiring::SetCloseWakeRegisterGateForTest(*udp, {});
     guard.Unwind();
 }
 
