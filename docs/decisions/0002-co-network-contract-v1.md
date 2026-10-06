@@ -77,6 +77,7 @@ struct Error {
     int backend_code;
     std::uint64_t transferred_bytes;
     std::vector<std::pair<std::string, std::string>> details;
+    std::optional<RequestPhase> request_phase;  // #64 追加（见 decisions/0008）
 };
 
 class ICoNetwork : public bbt::coroutine::ICoObject {

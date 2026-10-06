@@ -25,6 +25,13 @@ namespace bbt::infra {
 // 关闭：Close() 由 owner 主动同步调用（幂等、任意线程），返回即物理
 // 释放；无 RequestClose/WaitClosed。已发送请求在 Close 后立即以终态
 // 返回，迟到响应只消费不交付。
+//
+// Issue #64：错误结果携带请求阶段事实（Error::request_phase + RequestPhase），
+// 消费者据此机械区分「请求尚未完整写出」的确定失败与「已完整写出但回复丢失」
+// 的 OutcomeUnknown，不需要解析 message / errno / 日志顺序或用固定等待猜测。
+// 判定入口是公开的 IsRequestCommitted()；request_phase 为空表示该错误不来自
+// 出站 operation（上下文/参数/装配/已关闭拒绝）。分界与终态映射见
+// docs/decisions/0008-http-request-phase-outcome-unknown.md。
 class HttpClient : public ICoNetwork, public ICoCloseable {
 public:
     // 语义边界（契约 §N1）：

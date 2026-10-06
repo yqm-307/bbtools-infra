@@ -244,11 +244,14 @@ result<HttpResponse> TestHandler(IncomingCallContext ctx, HttpRequest req) {
     return result<HttpResponse>::ok(HttpResponse{404, {}, "not found"});
 }
 
-// 对端侧观察到的连接关闭是否属于「连接被中止」的合法分类。
+// 对端侧/owner 侧切断连接导致的本端终态分类。
+// #64：请求已完整写出（对端已读到请求、或本端写侧已完成）后失去可信回复
+// 终态时是 OutcomeUnknown；未写出时的中止仍是确定失败。
 bool IsShutdownError(const Error& e) {
     return e.code == ErrorCode::TransportError ||
            e.code == ErrorCode::ProtocolError ||
-           e.code == ErrorCode::Cancelled;
+           e.code == ErrorCode::Cancelled ||
+           e.code == ErrorCode::OutcomeUnknown;
 }
 
 // POSIX 裸连接助手：充当对端发任意字节/主动断开，与实现解耦。
@@ -506,7 +509,10 @@ BOOST_AUTO_TEST_CASE(t_close_returns_terminal_for_sent_request) {
         WaitUntil([&] { return out_ready.load(std::memory_order_acquire); }));
     BOOST_REQUIRE(out.has_value());
     BOOST_REQUIRE(!out.value());
-    BOOST_CHECK(out->error().code == ErrorCode::Closed);
+    // #64：对端已读到请求（peer.bytes > 0）⇒ 请求已完整写出 ⇒ 回复丢失即未知。
+    BOOST_CHECK(out->error().code == ErrorCode::OutcomeUnknown);
+    BOOST_REQUIRE(out->error().request_phase.has_value());
+    BOOST_CHECK(*out->error().request_phase == RequestPhase::RequestCommitted);
     BOOST_CHECK_EQUAL(deliveries.load(), 1);   // 每请求只交付一次终态
 
     // 关闭后新请求一律 Closed（未发送直接丢弃，不上网）。
@@ -514,13 +520,16 @@ BOOST_AUTO_TEST_CASE(t_close_returns_terminal_for_sent_request) {
                           DefaultOptions(500));
     BOOST_REQUIRE(!res2);
     BOOST_CHECK(res2.error().code == ErrorCode::Closed);
+    // 未发起任何写出：不属于出站 operation，不带阶段事实（nullopt），
+    // 与「已提交后未知」明确分界。
+    BOOST_CHECK(!res2.error().request_phase.has_value());
 
     // 对端此刻才写的响应不产生第二次交付：终态不被覆盖、交付次数不变。
     peer_release.store(true);
     BOOST_REQUIRE(WaitUntil([&] { return peer_wrote.load(); }, 8000));
     BOOST_CHECK_EQUAL(deliveries.load(), 1);
     BOOST_REQUIRE(!out.value());
-    BOOST_CHECK(out->error().code == ErrorCode::Closed);
+    BOOST_CHECK(out->error().code == ErrorCode::OutcomeUnknown);
     BOOST_CHECK(client->IsClosed());
 }
 
@@ -559,14 +568,17 @@ BOOST_AUTO_TEST_CASE(t_late_response_consumed_not_delivered) {
         WaitUntil([&] { return out_ready.load(std::memory_order_acquire); }));
     BOOST_REQUIRE(out.has_value());
     BOOST_REQUIRE(!out.value());
-    BOOST_CHECK(out->error().code == ErrorCode::TimedOut);
+    // #64：请求已完整写出、对端迟到响应不构成可信终态 ⇒ 未知（不是超时）。
+    BOOST_CHECK(out->error().code == ErrorCode::OutcomeUnknown);
+    BOOST_REQUIRE(out->error().request_phase.has_value());
+    BOOST_CHECK(*out->error().request_phase == RequestPhase::RequestCommitted);
 
     // 对端迟到的合法响应：只被消费（连接已中止），不再交付给业务。
     peer_release.store(true);
     BOOST_REQUIRE(WaitUntil([&] { return peer_wrote.load(); }, 8000));
     BOOST_CHECK_EQUAL(deliveries.load(), 1);
     BOOST_REQUIRE(!out.value());
-    BOOST_CHECK(out->error().code == ErrorCode::TimedOut);
+    BOOST_CHECK(out->error().code == ErrorCode::OutcomeUnknown);
 
     // 超时请求不损害后续正常请求（runtime 与 client 仍可用）。
     auto res_ok = CallApi(HttpRequest{"GET", Url("/ok"), {}, ""},
@@ -744,7 +756,11 @@ BOOST_AUTO_TEST_CASE(t_client_close_drains_inflight_read) {
         WaitUntil([&] { return out_ready.load(std::memory_order_acquire); }));
     BOOST_REQUIRE(out.has_value());
     BOOST_REQUIRE(!out.value());
-    BOOST_CHECK(out->error().code == ErrorCode::Closed);
+    // #64：对端已读到请求 ⇒ 已完整写出；owner Close 不改变「请求可能已生效」
+    // 这一事实，故终态是未知而非 Closed。
+    BOOST_CHECK(out->error().code == ErrorCode::OutcomeUnknown);
+    BOOST_REQUIRE(out->error().request_phase.has_value());
+    BOOST_CHECK(*out->error().request_phase == RequestPhase::RequestCommitted);
     // 物理收口：对端见到连接被中止（EOF）。
     BOOST_REQUIRE(WaitUntil([&] { return peer_eof.load(); }, 8000));
 
@@ -839,7 +855,11 @@ BOOST_AUTO_TEST_CASE(t_timeout_caller_returns_cleanup_continues) {
     auto res = CallApi(std::move(req), opt);
     // 调用方按期限及时返回，不等待物理清理。
     BOOST_REQUIRE(!res);
-    BOOST_CHECK(res.error().code == ErrorCode::TimedOut);
+    // #64：对端已读到请求 ⇒ 请求已完整写出 ⇒ 期限先到也解释为未知
+    // （期限只证明本端放弃等待，不证明请求未生效）。
+    BOOST_CHECK(res.error().code == ErrorCode::OutcomeUnknown);
+    BOOST_REQUIRE(res.error().request_phase.has_value());
+    BOOST_CHECK(*res.error().request_phase == RequestPhase::RequestCommitted);
     // 底层清理继续：对端随后观测到连接被中止。
     BOOST_REQUIRE(WaitUntil([&] { return peer_eof.load(); }));
     // 超时请求不损害后续正常请求（runtime 仍可用）。

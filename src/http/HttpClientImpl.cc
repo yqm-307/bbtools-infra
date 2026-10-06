@@ -46,6 +46,9 @@ void ClientOp::Begin(std::string host, std::uint16_t port) {
     // 用户非阻塞态不在此建立：socket 尚未 open 时 non_blocking() 返回
     // bad_descriptor 且不置位（B1）；每个 endpoint 的 async_connect 会
     // close/open socket，位也必须在那之后重建，见 OnConnect。
+    // Issue #64：本次 operation 从此踏入 Connecting；此前（含参数/配额/封口
+    // 拒绝与投递失败）阶段保持 NotStarted——这些路径上的失败都是确定失败。
+    phase.store(RequestPhase::Connecting);
 
     auto self = shared_from_this();
     // 先记账再发起：completion 可能同步回调。发起抛异常则立刻冲销。
@@ -200,6 +203,16 @@ void ClientOp::OnConnect(boost::system::error_code ec) {
         return;
     }
     try {
+        // Issue #64：进入写出阶段。此后直到 PumpWrite 判定 serializer
+        // is_done() 为止，任何失败（写中断/被中止）都仍在「未完整写出」侧，
+        // 保持确定失败。
+        phase.store(RequestPhase::Writing);
+        // 测试 seam（#64 F-1/F-3）：写出阶段已进入、尚未写出任何字节，同一
+        // IoGate 内通知一次。用例据此得到「客户端已进入写出」的因果事件（不靠
+        // accept 计数猜 Connecting/Writing），或在同一门内停放 io 域以确定性
+        // 构造与放弃/Close 的先后。生产恒空。
+        if (on_write_started)
+            on_write_started();
         // 序列化器引用本 op 的 request：只在本门内、本次写生命周期内有效，
         // 绝不借给任何 async_* 操作（Abort 可同步 reset）。
         serializer.emplace(request);
@@ -244,6 +257,11 @@ void ClientOp::PumpWrite() {
             return;
         }
     }
+    // Issue #64：完整写出的唯一线性化点。serializer->is_done() 为真表示请求
+    // 消息（头 + body）的全部字节已由 socket.send 交给内核；此后再失去可信
+    // 回复终态即为 OutcomeUnknown。不在 connect 成功、也不在首次 send 之前
+    // 发布——那时请求可能一字节都没发出去。
+    phase.store(RequestPhase::RequestCommitted);
     ArmRead();
 }
 
@@ -338,6 +356,8 @@ void ClientOp::PumpRead() {
                 return;
             }
             if (parser->is_done()) {
+                // Issue #64：可信回复终态已取得（完整响应，含明确 4xx/5xx）。
+                phase.store(RequestPhase::ReplyTerminal);
                 HttpResponse out;
                 const auto&  res = parser->get();
                 out.status = res.result_int();
@@ -389,6 +409,11 @@ void ClientOp::Finish(result<HttpResponse> r) noexcept {
     // owner close 竞争时先到者的逻辑终态不被覆盖（契约 §128）。
     if (finished.exchange(true))
         return;
+    // Issue #64：终态错误绑定本次落定的请求阶段，并在请求已完整写出时把
+    // 「失去可信回复终态」升级为 OutcomeUnknown。调用方提前放弃（期限/协程
+    // 取消）时已自行决定过阶段，SealError 对已带阶段者不再改写。
+    if (!r)
+        SealError(r.error(), phase.load());
     outcome = std::move(r);
     MaybeUnregister();
     waiter->Notify();
@@ -512,6 +537,8 @@ result<HttpResponse> HttpClientImpl::Request(HttpRequest request,
     // 测试 seam：把注入的 read-armed 通知交给本 op；写发生在 TryPost
     // （向 io 域派发 Begin）之前，io 域读到的必然是最新值。
     op->on_read_armed = m_read_armed_hook;
+    // 测试 seam（#64）：同上，写发生在 TryPost（向 io 域派发 Begin）之前。
+    op->on_write_started = m_write_started_hook;
 
     http::request<http::string_body>& breq = op->request;
     breq.version(11);
@@ -561,18 +588,32 @@ result<HttpResponse> HttpClientImpl::Request(HttpRequest request,
         // outcome 已由 Finish 写入；Notify 与 Wait 经等待位建立可见性。
         return std::move(*op->outcome);
     }
-    // 逻辑结果先行返回；物理清理继续：io 域中止后端 op。
+    // Issue #64：调用方放弃时刻的阶段事实即分界——请求尚未完整写出时保持确定
+    // 失败（TimedOut/Cancelled），已完整写出时升级为 OutcomeUnknown。
+    // F-1（独立审查必修）：放弃决定必须与「后端不再推进」是同一线性化点。若只
+    // 读一次阶段快照就返回、把 Abort 异步投递出去，快照与「未来完整写出」之间
+    // 没有同步关系：快照时未提交 ⇒ 返回确定失败，而被投递的 io 域仍可
+    // Begin/OnConnect/PumpWrite 把请求字节完整交给内核（甚至收到完整响应）。
+    // 这里仿照 Close/TeardownOnIoDomain 的既有范式：调用线程取 engine 的
+    // IoGate，在同一门内先 Abort（记账被中止的等待项 + 关 socket/resolver +
+    // 释放载荷），再读阶段并落定逻辑终态。返回值因此只可能取自「后端已不可能
+    // 再写」之后的阶段：
+    //   - 未提交（NotStarted/Connecting/Writing）⇒ io 域此后任何入口都因
+    //     finished / !op_armed 早退（Begin 也拒绝推进），确定失败为真；
+    //   - 已提交（RequestCommitted/ReplyTerminal）⇒ SealError 升级为
+    //     OutcomeUnknown，不谎报确定失败。
     // Abort 在返回当刻记账被中止的等待项并同步释放 op 载荷，故必须同时落定
-    // 逻辑终态，否则 op 会以 finished=false 留在 m_ops（配额与账面无法归还）；
-    // 终态与旧实现经「被中止完成项 → Finish(Cancelled)」得到的语义一致。
-    // TryPost 失败说明引擎已封，op 已由收口路径落定，无需再投递。
-    m_engine->TryPost([op] {
+    // 逻辑终态，否则 op 会以 finished=false 留在 m_ops（配额与账面无法归还）。
+    // Finish 必须在门内：它置位的 finished 正是让排队中的 Begin 拒绝推进的那
+    // 个判据；门内落定后无需再向 io 域投递收口任务。
+    Error decided = WaitStatusToError(status);
+    {
+        std::lock_guard<std::recursive_mutex> io_gate(m_engine->IoGate());
         op->Abort();
-        op->Finish(result<HttpResponse>::err(
-            MakeError(ErrorCode::Cancelled,
-                      "request wait ended before completion")));
-    });
-    return result<HttpResponse>::err(WaitStatusToError(status));
+        op->SealError(decided, op->Phase());
+        op->Finish(result<HttpResponse>::err(decided));
+    }
+    return result<HttpResponse>::err(std::move(decided));
 }
 
 void HttpClientImpl::Close() noexcept {

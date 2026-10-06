@@ -87,6 +87,29 @@ struct ClientOp : std::enable_shared_from_this<ClientOp> {
     // 首次发布即逻辑终态：Finish 经 CAS 保证只落定一次（io 域为主，
     // TryPost 失败/调用方提前返回的收口路径可能在其它线程触发）。
     std::atomic_bool                      finished{false};
+    // Issue #64：请求阶段事实。写侧只有 io 域（Begin/OnConnect/PumpWrite/
+    // PumpRead），严格单调前进；读侧是调用方线程（Wait 返回后决定终态）与
+    // owner Close 线程（Finish 收口），故用 atomic。
+    std::atomic<RequestPhase>             phase{RequestPhase::NotStarted};
+
+    RequestPhase Phase() const noexcept { return phase.load(); }
+
+    // 终态错误合成（#64 的唯一分界点），就地改写传入的错误：
+    //   - 绑定本次落定的请求阶段；
+    //   - 已完整写出（IsRequestCommitted）且失去可信回复终态时升级为
+    //     OutcomeUnknown；
+    //   - 只改 code 与阶段，不做字符串分配（Finish/FailFinish 是 noexcept
+    //     边界）；物理原因保留在 domain_code/backend_category/backend_code/
+    //     message，便于定位但不参与判定；
+    //   - 已带阶段（调用方提前放弃时自己决定过的终态）原样保留——一次逻辑
+    //     终态只由一个决定点产生，晚到的后端清理不覆盖它。
+    void SealError(Error& e, RequestPhase at) const noexcept {
+        if (e.request_phase.has_value())
+            return;
+        e.request_phase = at;
+        if (IsRequestCommitted(at) && IsReplyLossAfterCommit(e.code))
+            e.code = ErrorCode::OutcomeUnknown;
+    }
     // 在途 async_* 计数：每次发起 +1，对应 completion 落定 -1。
     // Abort/close/cancel 只催完成项不直接清零——计数归零且已 Finish
     // 才允许反登记，owner 据此判断后端不再触碰本 op（§Closed 契约）。
@@ -121,6 +144,11 @@ struct ClientOp : std::enable_shared_from_this<ClientOp> {
     // 测试 seam（#57 H2）：TryStartConnect 入口（同一 IoGate 内）调用一次，
     // 供用例门控「连接内部步骤」并观察与 Close 的串行。生产路径恒为空。
     std::function<void()>                 on_connect_attempt;
+    // 测试 seam（#64 F-1/F-3）：OnConnect 内进入写出阶段（phase=Writing）、
+    // 尚未写出任何字节时，在同一 IoGate 内调用一次。用例据此获得「客户端已
+    // 进入写出」的因果事件（不靠 accept 计数猜 Connecting/Writing），也可在
+    // 同一门内停放 io 域以确定性构造放弃/Close 与写侧的先后。生产路径恒空。
+    std::function<void()>                 on_write_started;
 
     // 测试 seam（#57 H2）：注入解析结果并驱动首个 endpoint 尝试。生产路径
     // 不经此——生产由 OnResolve 的真实解析结果驱动。
@@ -227,6 +255,12 @@ public:
         m_read_armed_hook = std::move(hook);
     }
 
+    // 测试 seam（#64）：给后续新建的 op 注入「已进入写出阶段」通知（io 域内、
+    // 同一 IoGate、写出任何字节之前触发一次）。空 = 不通知。
+    void SetWriteStartedHookForTest(std::function<void()> hook) {
+        m_write_started_hook = std::move(hook);
+    }
+
     // m_ops 跨线程（调用线程登记、io 域反登记），一律持锁访问。
     // 集合持 op 强引用：快照后可跨线程安全收口，不会迭代到悬垂指针。
     // 返回 false 表示已封口（Close 已置 m_io_dead），调用方按 Closed
@@ -285,6 +319,9 @@ private:
     // 测试 seam：注入到每个新 op 的 on_read_armed（Request 在 TryPost
     // 前复制给 op）；默认空 = 不通知。仅测试设置，生产路径保持空。
     std::function<void()>         m_read_armed_hook;
+    // 测试 seam：注入到每个新 op 的 on_write_started（Request 在 TryPost
+    // 前复制给 op）；默认空 = 不通知。仅测试设置，生产路径保持空。
+    std::function<void()>         m_write_started_hook;
 };
 
 } // namespace bbt::infra::http_detail

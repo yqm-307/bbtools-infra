@@ -72,6 +72,16 @@ bool IsHttpErrorCode(const boost::system::error_code& ec) noexcept;
 Error ClassifyBackendError(const boost::system::error_code& ec,
                            std::string message);
 
+// Issue #64：该错误码在「请求已完整写出」之后是否表达「回复丢失」，而不是
+// 对端已给出（或本地输入已决定）的确定判决。
+//  - true：TransportError（eof/reset/partial/连接被中止）、TimedOut（调用方
+//    期限先到）、Cancelled（等待被本地中止）、Closed（owner Close 收口）、
+//    InternalError（读泵内部失败，已无法继续收回复）——请求可能已生效。
+//  - false：ProtocolError（对端字节已到达但 framing/超限不可用）与本地校验
+//    类错误（InvalidArgument/Unavailable 等）是确定判决，保持原分类。
+// 判定只依赖 code，不解析 message/errno。
+bool IsReplyLossAfterCommit(ErrorCode code) noexcept;
+
 // handler 返回 err 分支 → HTTP 状态码（服务端边界，err 不暴露内部细节）。
 unsigned ErrorCodeToHttpStatus(ErrorCode code) noexcept;
 
