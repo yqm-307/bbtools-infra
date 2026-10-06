@@ -304,6 +304,21 @@ Error ClassifyBackendError(const boost::system::error_code& ec,
     return e;
 }
 
+bool IsReplyLossAfterCommit(ErrorCode code) noexcept {
+    switch (code) {
+    case ErrorCode::TransportError:   // eof/reset/partial/连接被本地中止
+    case ErrorCode::TimedOut:         // 调用方期限先到，回复未必不存在
+    case ErrorCode::Cancelled:        // 等待被本地中止
+    case ErrorCode::Closed:           // owner Close 收口
+    case ErrorCode::InternalError:    // 读泵内部失败，已无法继续收回复
+        return true;
+    default:
+        // ProtocolError（对端字节已到达但 framing/超限不可用）与本地校验类
+        // 错误是确定判决，不升级为未知。
+        return false;
+    }
+}
+
 unsigned ErrorCodeToHttpStatus(ErrorCode code) noexcept {
     switch (code) {
     case ErrorCode::InvalidArgument:   return 400;

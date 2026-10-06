@@ -145,6 +145,20 @@ target_compile_options(Test_http_outbound_quota PRIVATE -Wall -Wextra)
 add_test(NAME http.outbound_quota COMMAND Test_http_outbound_quota)
 set_tests_properties(http.outbound_quota PROPERTIES TIMEOUT 120)
 
+# Issue #64：出站请求阶段与 OutcomeUnknown 分界的动态验收（S1–S8）。
+# 服务端「完整收到请求」标记 + 客户端 request_phase 交叉断言；未连接/写中断
+# 对照保持确定失败。S2/S5-b 用 impl 测试接缝 SetWriteStartedHookForTest 取得
+# 「客户端已进入写出阶段」的因果事件（不靠 accept 计数猜阶段），故需要 src
+# 内部头 include 路径——仅本目标可见，不扩散到其他测试。
+add_executable(Test_http_request_phase Test_http_request_phase.cc)
+target_include_directories(Test_http_request_phase PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(Test_http_request_phase
+    PRIVATE bbt::infra_http Boost::boost Threads::Threads)
+target_compile_options(Test_http_request_phase PRIVATE -Wall -Wextra)
+add_test(NAME http.request_phase COMMAND Test_http_request_phase)
+set_tests_properties(http.request_phase PROPERTIES TIMEOUT 120)
+
 # Issue #38：子对象物理关闭后从 Runtime 托管集合反登记——弱引用失效、
 # 调用者提前释放仍托管、并发/重复 close 与工厂竞争、handler 捕获资源
 # 析构计数。

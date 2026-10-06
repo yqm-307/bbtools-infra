@@ -37,6 +37,32 @@ using ErrorDetails = std::vector<std::pair<std::string, std::string>>;
 // 硬编码任何上层专属字段语义。
 inline constexpr std::string_view kErrorDomainInfra = "infra";
 
+// 出站请求阶段（Issue #64）：由 operation owner（HTTP/RPC adapter 的 op 状态）
+// 维护并随终态错误对外发布。消费者据此机械判定「请求字节是否已完整写出」，
+// 不需要解析 message、errno、日志顺序或用固定等待猜测。
+//
+// 阶段单调前进，不回退；逻辑终态发布后晚到的后端回调不得改写它。
+// 语义分界：
+//   - NotStarted/Connecting/Writing：请求字节尚未确认完整写出，
+//     此时失去连接/超时/取消/Close 都是**确定失败**（请求可能一次都没发出）；
+//   - RequestCommitted：请求字节已全部交给底层 socket，此后未取得可信回复
+//     终态时为 OutcomeUnknown（请求可能已生效，回复丢失）；
+//   - ReplyTerminal：已获得可信回复终态（完整响应，含明确 4xx/5xx）。
+enum class RequestPhase {
+    NotStarted = 0,       // 尚未发起任何 I/O（未解析、未连接）
+    Connecting,           // 解析/连接中
+    Writing,              // 请求字节写出中（尚未确认完整写出）
+    RequestCommitted,     // 请求字节已完整写出，等待回复
+    ReplyTerminal,        // 已获得可信回复终态
+};
+
+// 「请求是否已完整写出」的稳定判定：消费者用它读 #64 的分界，
+// 不依赖枚举序号，也不接触 Beast/Asio/socket 类型。
+inline constexpr bool IsRequestCommitted(RequestPhase phase) noexcept {
+    return phase == RequestPhase::RequestCommitted ||
+           phase == RequestPhase::ReplyTerminal;
+}
+
 struct Error {
     ErrorCode   code = ErrorCode::InternalError;
     std::string domain = std::string(kErrorDomainInfra);
@@ -46,6 +72,11 @@ struct Error {
     int         backend_code = 0;
     std::uint64_t transferred_bytes = 0;
     ErrorDetails details;
+    // 出站请求落定/放弃时的阶段事实（见 RequestPhase）。
+    // nullopt 表示该错误不来自出站请求 operation（上下文、参数校验、装配、
+    // 已关闭拒绝等），或该路径不携带阶段。OutcomeUnknown 分界的机器可读出口：
+    // 阶段 + code 一起判定，domain_code/backend_*/message 仍保留物理原因。
+    std::optional<RequestPhase> request_phase;
 };
 
 inline Error MakeError(ErrorCode code, std::string message) {

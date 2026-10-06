@@ -398,14 +398,22 @@ BOOST_AUTO_TEST_CASE(t_malformed_response_is_error) {
     BOOST_CHECK(res.error().code == ErrorCode::ProtocolError);
 }
 
-BOOST_AUTO_TEST_CASE(t_disconnect_is_error) {
+BOOST_AUTO_TEST_CASE(t_disconnect_after_full_write_is_outcome_unknown) {
+    // 对端 accept 后直接关闭、一字节不读。#64 分界：TCP 允许在收到 FIN 后继续
+    // 写，RST 也只能由「本端数据到达已关闭的对端 socket」触发，因此本端请求
+    // 字节必然完整写出（写侧无错误），此后没有可信回复终态 —— 结果是
+    // OutcomeUnknown（请求可能已生效），而不是「未发送」的确定失败。
+    // 连接拒绝 / 真写中断的确定失败对照见 http_request_phase 套件。
     RawServer peer([](int) { /* accept 后直接关闭，不发一字节 */ });
     HttpRequest req{"GET", "http://127.0.0.1:" + std::to_string(peer.port) +
                             "/x", {}, ""};
     auto res = CallApi(std::move(req), DefaultOptions());
     // 断连且不足一条消息：Error，不伪造成成功。
     BOOST_REQUIRE(!res);
-    BOOST_CHECK(res.error().code == ErrorCode::TransportError);
+    BOOST_CHECK(res.error().code == ErrorCode::OutcomeUnknown);
+    BOOST_REQUIRE(res.error().request_phase.has_value());
+    BOOST_CHECK(*res.error().request_phase == RequestPhase::RequestCommitted);
+    BOOST_CHECK(IsRequestCommitted(*res.error().request_phase));
 }
 
 BOOST_AUTO_TEST_CASE(t_https_explicitly_rejected) {

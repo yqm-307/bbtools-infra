@@ -279,7 +279,10 @@ BOOST_AUTO_TEST_CASE(t_close_midflight_unregisters_child) {
         WaitUntil([&] { return out_ready.load(std::memory_order_acquire); }));
     BOOST_REQUIRE(out.has_value());
     BOOST_REQUIRE(!out.value());
-    BOOST_CHECK(out->error().code == ErrorCode::Closed);
+    // #64：服务端 handler 已进入 ⇒ 请求已完整写出 ⇒ owner Close 后是未知。
+    BOOST_CHECK(out->error().code == ErrorCode::OutcomeUnknown);
+    BOOST_REQUIRE(out->error().request_phase.has_value());
+    BOOST_CHECK(*out->error().request_phase == RequestPhase::RequestCommitted);
 
     // 放行 handler：它不被抢占，照常退出并产出唯一一次终态；连接已中止，
     // 回复只被消费不再交付。

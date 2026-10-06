@@ -539,7 +539,12 @@ BOOST_AUTO_TEST_CASE(t_released_on_deadline) {
     }));
     BOOST_REQUIRE((*out1).has_value());
     BOOST_REQUIRE(!(*out1).value());   // result 是 error
-    BOOST_CHECK((*out1)->error().code == ErrorCode::TimedOut);
+    // #64：服务端 handler 已进入 ⇒ 请求已完整写出 ⇒ 本端期限先到是未知，
+    // 不再是 TimedOut（期限不证明远端未执行）。
+    BOOST_CHECK((*out1)->error().code == ErrorCode::OutcomeUnknown);
+    BOOST_REQUIRE((*out1)->error().request_phase.has_value());
+    BOOST_CHECK(*(*out1)->error().request_phase ==
+                RequestPhase::RequestCommitted);
 
     // 超时返回不立即复用名额：op 仍在 m_ops（Abort 未落定）。
     // 等 Abort 催完成项落定（服务端连接被断开 → handler 完成 read 失败），
@@ -586,7 +591,12 @@ BOOST_AUTO_TEST_CASE(t_released_on_client_close) {
     }));
     BOOST_REQUIRE((*out1).has_value());
     BOOST_CHECK(!(*out1).value());   // 被中止的请求是 error
-    BOOST_CHECK((*out1)->error().code == ErrorCode::Closed);
+    // #64：服务端 handler 已进入 ⇒ 请求已完整写出；owner Close 中止等待，
+    // 但请求可能已生效，故是未知而不是 Closed。
+    BOOST_CHECK((*out1)->error().code == ErrorCode::OutcomeUnknown);
+    BOOST_REQUIRE((*out1)->error().request_phase.has_value());
+    BOOST_CHECK(*(*out1)->error().request_phase ==
+                RequestPhase::RequestCommitted);
 
     server.gate->auto_release.store(true);
     server.gate->ReleaseAll();
@@ -832,7 +842,12 @@ BOOST_AUTO_TEST_CASE(t_no_reuse_before_physical_close) {
     }));
     BOOST_REQUIRE((*out1).has_value());
     BOOST_REQUIRE(!(*out1).value());
-    BOOST_CHECK((*out1)->error().code == ErrorCode::Closed);
+    // #64：read_armed 已触发 ⇒ 写侧已完成（请求完整写出）⇒ 本端放弃等待
+    // （cancel）得到未知，而不是 Closed。
+    BOOST_CHECK((*out1)->error().code == ErrorCode::OutcomeUnknown);
+    BOOST_REQUIRE((*out1)->error().request_phase.has_value());
+    BOOST_CHECK(*(*out1)->error().request_phase ==
+                RequestPhase::RequestCommitted);
 
     // peer_guard 析构统一收尾：peer_stop + join + close fds/lfd。
 }
@@ -1206,7 +1221,12 @@ BOOST_AUTO_TEST_CASE(t_b1_read_partial_eagain_close_bounded) {
         [&] { return rdy->load(std::memory_order_acquire); }, 5000));
     BOOST_REQUIRE((*out).has_value());
     BOOST_REQUIRE(!(*out).value());          // 不完整响应不得成功
-    BOOST_CHECK((*out)->error().code == ErrorCode::Closed);
+    // #64：read_armed 已触发 ⇒ 请求已完整写出；不完整响应不构成可信终态，
+    // 故 owner Close 收口后是未知而不是 Closed。
+    BOOST_CHECK((*out)->error().code == ErrorCode::OutcomeUnknown);
+    BOOST_REQUIRE((*out)->error().request_phase.has_value());
+    BOOST_CHECK(*(*out)->error().request_phase ==
+                RequestPhase::RequestCommitted);
     BOOST_CHECK(peer.FinAll(3000));
 }
 
