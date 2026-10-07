@@ -6,6 +6,9 @@
 #   - ctest -j1：contract.basics、http/tcp/udp、redis.unit、mongo.unit；
 #     redis.unit/mongo.unit 先经 ctest -N 注册断言（缺前缀/target → 非零），
 #     断言通过后才跑全量 ctest
+#   - 资源前缀 fail-closed 回归 A/B（tests/resource-prefix/run.sh 不带 --prefix）：
+#     已存在目录/悬浮符号链接/锁占用拒绝 + 克隆失败清理；无网络、无 docker、
+#     不依赖已构建前缀。C/D（正向/异版负向）需真实前缀，本 workflow 不运行
 #   - docs-only 变更检测：纯文档 PR/push 直接上报 success，required check 不会因
 #     paths-ignore 整体跳过而悬空（模板：bbtools-coroutine unit_test.yml changes job）
 #   - 干净 runner 验证：无 /usr/local 旧产物兜底；Redis/Mongo 私有依赖前缀
@@ -157,6 +160,18 @@ jobs:
           path: infra
           fetch-depth: 1
           persist-credentials: false
+
+      # 资源前缀 fail-closed 回归最小入口（tests/resource-prefix/run.sh）。
+      # 只跑 A/B：A) 已存在目录 / 悬浮符号链接 / 锁占用必须 exit 2 拒绝且不删他人锁；
+      # B) 克隆失败非零退出、不留半个前缀、锁必须释放。均用本地目录与 git shim，
+      # 不联网、不跑 docker、不依赖已构建前缀；放在三方依赖构建之前，失败即早停。
+      # 不带 --prefix 时 run.sh 会打印「跳过 C/D」，本步骤名与首行显式限定范围，
+      # 绝不用这次 exit 0 冒充「C/D（正向/异版负向）也通过」。
+      - name: "资源前缀拒绝路径回归（A/B，不含 C/D）"
+        if: needs.changes.outputs.code == 'true'
+        run: |
+          echo "范围：A(fail-closed 拒绝) + B(克隆失败清理)；C/D 需真实前缀，本次不运行。"
+          bash infra/tests/resource-prefix/run.sh
 
       - name: "拉取 bbtools-coroutine @ main"
         if: needs.changes.outputs.code == 'true'
