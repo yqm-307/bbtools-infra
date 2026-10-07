@@ -110,6 +110,11 @@ configure FATAL_ERROR。
 最小回归入口：`tests/resource-prefix/run.sh [--prefix <prefix-root>]`（fail-closed 路径 +
 正向 / 异版负向，不重复三方依赖构建）。
 
+CI 接入：`.github/workflows/ci.yml` 的「资源前缀拒绝路径回归（A/B，不含 C/D）」步骤只跑
+不带 `--prefix` 的 A/B（已存在目录/悬浮符号链接/锁占用拒绝 + 克隆失败清理），无网络、
+无 docker、不依赖已构建前缀；C/D 需要真实前缀，本 workflow 不运行，该步骤的 exit 0
+不表示 C/D 通过。
+
 ## 运行时与重定位限制
 
 - 脚本以 `-DCMAKE_INSTALL_RPATH=<prefix-root>/{hiredis,mongoc,mongocxx}/lib` 构建，
