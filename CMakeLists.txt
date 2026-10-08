@@ -178,20 +178,58 @@ if(BBT_MONGOCXX_PREFIX OR BBT_MONGOC_PREFIX)
 endif()
 if(BBT_MONGOCXX_PREFIX)
     if(BBT_MONGOC_PREFIX)
+        # file(GLOB) 返回列表：多命中时 IS_DIRECTORY 对整条列表为假，旧写法
+        # 会把「命中多个版本目录」误报成「未找到」。这里按命中数区分：0 命中
+        # = 前缀无效，多命中 = 版本不确定；均 fail-closed，诊断必须可区分
+        # （Issue #12 M3）。单命中仍须通过原有目录检查，禁止包搜索静默回退。
         file(GLOB mongoc_DIR "${BBT_MONGOC_PREFIX}/lib/cmake/mongoc-*")
         file(GLOB bson_DIR   "${BBT_MONGOC_PREFIX}/lib/cmake/bson-*")
-        if(NOT IS_DIRECTORY "${mongoc_DIR}" OR
-           NOT IS_DIRECTORY "${bson_DIR}")
+        list(LENGTH mongoc_DIR _bbt_mongoc_n)
+        list(LENGTH bson_DIR   _bbt_bson_n)
+        if(_bbt_mongoc_n EQUAL 0)
             message(FATAL_ERROR
                 "BBT_MONGOC_PREFIX='${BBT_MONGOC_PREFIX}' 无效：未找到 "
-                "lib/cmake/mongoc-* 或 lib/cmake/bson-*")
+                "lib/cmake/mongoc-*")
+        elseif(NOT _bbt_mongoc_n EQUAL 1)
+            message(FATAL_ERROR
+                "BBT_MONGOC_PREFIX='${BBT_MONGOC_PREFIX}' 无效：命中多个版本目录。\n"
+                "lib/cmake/mongoc-* 命中 ${_bbt_mongoc_n} 个目录\n"
+                "命中目录：${mongoc_DIR}")
+        elseif(NOT IS_DIRECTORY "${mongoc_DIR}")
+            message(FATAL_ERROR
+                "BBT_MONGOC_PREFIX='${BBT_MONGOC_PREFIX}' 无效："
+                "lib/cmake/mongoc-* 命中路径不是目录")
+        endif()
+        if(_bbt_bson_n EQUAL 0)
+            message(FATAL_ERROR
+                "BBT_MONGOC_PREFIX='${BBT_MONGOC_PREFIX}' 无效：未找到 "
+                "lib/cmake/bson-*")
+        elseif(NOT _bbt_bson_n EQUAL 1)
+            message(FATAL_ERROR
+                "BBT_MONGOC_PREFIX='${BBT_MONGOC_PREFIX}' 无效：命中多个版本目录。\n"
+                "lib/cmake/bson-* 命中 ${_bbt_bson_n} 个目录\n"
+                "命中目录：${bson_DIR}")
+        elseif(NOT IS_DIRECTORY "${bson_DIR}")
+            message(FATAL_ERROR
+                "BBT_MONGOC_PREFIX='${BBT_MONGOC_PREFIX}' 无效："
+                "lib/cmake/bson-* 命中路径不是目录")
         endif()
     endif()
     file(GLOB bsoncxx_DIR "${BBT_MONGOCXX_PREFIX}/lib/cmake/bsoncxx-*")
-    if(NOT IS_DIRECTORY "${bsoncxx_DIR}")
+    list(LENGTH bsoncxx_DIR _bbt_bsoncxx_n)
+    if(_bbt_bsoncxx_n EQUAL 0)
         message(FATAL_ERROR
             "BBT_MONGOCXX_PREFIX='${BBT_MONGOCXX_PREFIX}' 无效：未找到 "
             "lib/cmake/bsoncxx-*")
+    elseif(NOT _bbt_bsoncxx_n EQUAL 1)
+        message(FATAL_ERROR
+            "BBT_MONGOCXX_PREFIX='${BBT_MONGOCXX_PREFIX}' 无效：命中多个版本目录。\n"
+            "lib/cmake/bsoncxx-* 命中 ${_bbt_bsoncxx_n} 个目录\n"
+            "命中目录：${bsoncxx_DIR}")
+    elseif(NOT IS_DIRECTORY "${bsoncxx_DIR}")
+        message(FATAL_ERROR
+            "BBT_MONGOCXX_PREFIX='${BBT_MONGOCXX_PREFIX}' 无效："
+            "lib/cmake/bsoncxx-* 命中路径不是目录")
     endif()
     find_package(mongocxx CONFIG REQUIRED
         PATHS "${BBT_MONGOCXX_PREFIX}" NO_DEFAULT_PATH)

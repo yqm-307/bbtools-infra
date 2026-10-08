@@ -45,7 +45,10 @@ MongoDocument DocOf(bsoncxx::v1::document::view v);
 //   - type_errc::invalid_argument 及 client/database/collection 的
 //     invalid_*_name → InvalidArgument；
 //   - pool::errc::wait_queue_timeout → Overloaded；
-//   - mongoc 域（server selection/socket/stream/pool 等）→ Unavailable；
+//   - mongoc 域的 MONGOC_ERROR_COMMAND_INVALID_ARG（URI/选项解析失败，
+//     如无效 host specifier、端口越界/非数字、选项值非法）→
+//     InvalidArgument；
+//   - 其余 mongoc 域（server selection/socket/stream/pool 等）→ Unavailable；
 //   - 其余 → InternalError。
 // backend_category 固定 "mongocxx"，backend_code 为 e.code().value()。
 Error ClassifyDriverError(const mongocxx::v1::exception& e,
