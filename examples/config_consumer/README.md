@@ -12,7 +12,7 @@
 ## 有界命令（实测见 `docs/config-watch-v1.md`）
 
 ```bash
-# 依赖：固定 SHA ddfa93c8edad9ce1e6c68b3006dce32df9130d1c 的 bbtools-coroutine 源码树
+# 依赖：固定 SHA 7bcda3b078f975ff2978424be7f6ba38e04fb7f6（main HEAD，进程寿命运行时）的 bbtools-coroutine 源码树
 cmake -S examples/config_consumer -B <build>/config-consumer \
   -DBBT_INFRA_SOURCE_DIR="$PWD" \
   -DBBT_COROUTINE_SOURCE_DIR=<bbtools-coroutine 源码树> \

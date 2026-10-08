@@ -1,13 +1,16 @@
 # config watch v1：版本化快照、本地配置源与 watch 公开契约
 
 范围：`bbtools-infra#35` 首切片（`include/bbt/infra/config/`、`src/config/`、`bbt::infra_config`）。
-状态：**本候选已实现**（版本化不可变快照、内存源、真实本地文件源、watch 去重/失败恢复/关闭、
-正常 drain 与 owner 同步 `Close()` 的资源边界、最小消费示例与独立 consumer）。**候选、未提交**。
+状态：**已并入 main**——`029dc2a4fe113499cfa43feab69e25d2d55d7345`（`feat(config): 实现版本化快照与本地配置源 watch (#35)`），
+随后 `02567ed8017fd2afef21ffc32d18d9f85c2d0b93`（`refactor(infra): migrate close stop lifecycle semantics`）
+按进程寿命运行时迁移为同步 `Close()`。**验收基线** `e0478cb541e55350da5259bcc18f0029852add11`。
+已交付：版本化不可变快照、内存源、真实本地文件源、watch 去重/失败恢复/关闭、
+正常 drain 与 owner 同步 `Close()` 的资源边界、最小消费示例与独立 consumer。
 未交付：远程配置中心/provider 与真实重连、业务 schema 校验、客户端资源热切换（framework 归属）。
 
 ### 修订记录（2026-10-01：进程寿命运行时 + 同步 Close）
 
-上游 coroutine 已按**进程寿命运行时**收敛（候选 HEAD `03430a5`：删除 `Scheduler::Stop()`/restart、
+上游 coroutine 已按**进程寿命运行时**收敛（main HEAD `7bcda3b`；契约修订自 `03430a5`：删除 `Scheduler::Stop()`/restart、
 运行时代际、`CompletionSignal`、`CancellationToken`/`CancellationSource`），infra 关闭契约改为**资源
 owner 主动调用的同步 `Close()`**。本文原「§事件、错误与关闭语义」「§所有权与资源边界」中基于
 `RequestClose`/`WaitClosed`/`CloseStatus`/`CompletionSignal`/强制 `Stop` 的结论**已被取代**（原文保留
@@ -20,10 +23,9 @@ owner 主动调用的同步 `Close()`**。本文原「§事件、错误与关闭
 - 请求等待用 `CoWaiter::WaitWithCallback`（登记 → 一次投递回调 → 挂起），adapter/轮询路径 `Notify`
   唤醒；结果（事件、错误）放 operation state。
 
-说明：本仓处于**候选、未提交**状态。`include/bbt/infra/config/Watch.hpp` 与 `src/config/` 的代码迁移
-（`RequestClose`/`WaitClosed` → `Close()`）在同批候选中进行，本记录与下方改写描述的是**冻结后的目标
-契约**，不代表该模块代码已完成迁移或已通过新契约验收。旧语义下的历史实测结果（下文「§有界命令与
-实测结果」）保留原文并已注明「旧 Stop/WaitClosed 设计，待按新契约重验」。
+说明：`include/bbt/infra/config/Watch.hpp` 与 `src/config/` 的迁移（`RequestClose`/`WaitClosed` → `Close()`）
+已随 `02567ed` 并入 main，本记录与下方改写描述的是**当前已实现并复验的契约**（复验命令与结果见
+「§有界命令与实测结果」）。
 
 ## 模块与公共面
 
@@ -31,10 +33,11 @@ owner 主动调用的同步 `Close()`**。本文原「§事件、错误与关闭
   命名空间固定 `bbt::infra::config`（三层）；实现 `src/config/{Value 为 header-only,MemorySource,FileSource,Watch}`。
 - 模块 target `bbt::infra_config`（STATIC），`PUBLIC` 只依赖 `bbt::infra_common`（即 bbtools-coroutine），
   无第三方新依赖、无隐藏 I/O 线程；公共头不出现 framework 类型或第三方类型。
-- 固定依赖 SHA：`bbtools-coroutine` = `ddfa93c8edad9ce1e6c68b3006dce32df9130d1c`
-  （构建前核对 `git -C <coroutine> status --porcelain` 为空）。等待/关闭契约依据 coroutine 候选
-  HEAD `03430a5` 的进程寿命运行时契约与 `sync/CoWaiter.hpp`/`sync/WaitTypes.hpp`；旧版依据的
-  `sync/CompletionSignal.hpp` §C1 已随进程寿命运行时删除。
+- 固定依赖 SHA：`bbtools-coroutine` = `7bcda3b078f975ff2978424be7f6ba38e04fb7f6`（main HEAD，
+  `Merge pull request #376`；构建前核对 `git -C <coroutine> status --porcelain` 为空）。等待/关闭契约依据其
+  进程寿命运行时契约（`03430a5` 起的修订）与 `sync/CoWaiter.hpp`/`sync/WaitTypes.hpp`；旧版依据的
+  `sync/CompletionSignal.hpp` §C1 已随进程寿命运行时删除。（本文早前记录为 `ddfa93c8edad9ce1e6c68b3006dce32df9130d1c`，
+  它是进程寿命运行时合并前的历史 SHA，已过时。）
 
 ## 文件格式（`FileSource`）
 
@@ -87,26 +90,29 @@ coroutine 运行时按进程寿命存在、不再有 `Scheduler::Stop()`；infra
 
 ## 有界命令与实测结果
 
-> **历史证据（2026-10-01 修订）**：以下命令与结果均为**旧 `RequestClose`/`WaitClosed`/强制 `Stop` 语义**
-> 下实测，原文保留为当时版本的事实；按新契约（`Close()` + `CoWaiter`）**待重验**，不得读作新契约已通过。
-
-以下命令在 `bbtools-infra` 工作树 `feat/issue-35-config-pilot`（base `0f468d9b7af409227f53920bdbf2ba5bd9882e8d`）
-上实测；构建并发 2、`ctest -j1`、`ccache` 加速，临时文件走 `TMPDIR`。
+> **本轮复验（2026-10-08，新契约：owner 主动同步 `Close()` + 进程寿命运行时）**：以下命令与结果均在
+> 验收基线 `e0478cb541e55350da5259bcc18f0029852add11`（worktree `test/infra35-acceptance-3cb0847e2024`）
+> 上、对固定依赖 `bbtools-coroutine = 7bcda3b078f975ff2978424be7f6ba38e04fb7f6`（main HEAD；
+> `git -C <coroutine> status --porcelain` 为空）实测；构建并发 `max(2, nproc/4)=3`、`ctest -j1`、
+> `ccache` 加速，临时文件走 `TMPDIR`。旧 `RequestClose`/`WaitClosed`/强制 `Stop` 语义下的历史命令与结果
+> 已随本修订删除（其结论已被上文取代，不再作为现行证据）。
 
 ```bash
-# 1) 配置构建（ccache、并发 2）
+# 1) 配置构建（ccache、并发 max(2, nproc/4)）
+JOBS=$(( $(nproc) / 4 )); [ "$JOBS" -ge 2 ] || JOBS=2
 cmake -S . -B <build> -G Ninja \
   -DBBT_COROUTINE_SOURCE_DIR=<bbtools-coroutine 源码树> \
-  -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+  -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_BUILD_TYPE=Release
 cmake --build <build> --target bbt_infra_config Test_config_unit Test_config_watch \
-  Example_config_consume bbt_infra_header_selfcheck Test_contract_basics \
-  Test_tcp_loopback Test_udp_loopback Test_iowait_probe --parallel 2
-# 结果：0 error，公共头自给检查（6 个 config 头各生成独立 TU）构建通过
+  Example_config_consume bbt_infra_header_selfcheck Test_contract_basics --parallel "$JOBS"
+# 结果：0 error；公共头自给检查（config 6 头各生成独立 TU）链接通过
 
-# 2) 定向测试（功能 + 冒烟 + 直接耦合；不跑全量）
-ctest --test-dir <build> -j1 -R '^(config\.unit|config\.watch|contract\.basics|tcp\.loopback|udp\.loopback|iowait\.probe)$' \
+# 2) 定向测试（config 功能 + 冒烟；不跑全量）
+ctest --test-dir <build> -j1 -R '^(config\.unit|config\.watch|contract\.basics)$' \
   --output-on-failure --no-tests=error
-# 结果：6/6 Passed，0 skipped（config.unit/config.watch 与冒烟一致通过）
+# 结果：3/3 Passed，0 skipped
+# config.unit：7 用例 96 断言全过；config.watch：6 用例 58 断言全过
+# （断言数经 Boost.Test --report_level=detailed 复核）
 
 # 3) 示例
 <build>/examples/Example_config_consume
@@ -116,14 +122,15 @@ ctest --test-dir <build> -j1 -R '^(config\.unit|config\.watch|contract\.basics|t
 cmake -S examples/config_consumer -B <build>/config-consumer -G Ninja \
   -DBBT_INFRA_SOURCE_DIR="$PWD" -DBBT_COROUTINE_SOURCE_DIR=<bbtools-coroutine 源码树> \
   -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-cmake --build <build>/config-consumer --target config_consumer --parallel 2
+cmake --build <build>/config-consumer --target config_consumer --parallel "$JOBS"
 mkdir -p <run-dir>
 TMPDIR=<run-dir> <build>/config-consumer/config_consumer
 # 结果：16 项检查全 ok，输出 consumer: ALL OK，退出码 0
 ```
 
-`config.watch` 的确定性回归（**已按新契约（owner 主动同步 `Close()`、进程寿命 runtime）迁移**；
-握手建立状态，不用 sleep 近似时序；`Test_config_watch.cc` 共 6 用例 56 断言全过）：
+`config.watch` 的回归覆盖（**已按新契约（owner 主动同步 `Close()`、进程寿命 runtime）迁移**；
+部分交错由握手建立状态；既有去重、关闭后静默与资源边界用例仍使用 `SleepRawMs` 观察窗口，
+这些窗口不能单独证明轮询协程已到达挂起点。`Test_config_watch.cc` 共 6 用例 58 断言全过）：
 
 - `watch_create_without_running_scheduler`：运行时未初始化 → 创建被拒为 `RuntimeUnavailable`。
 - `watch_initial_dedup_update_memory`：首拍 `Initial`、同版本去重、更新版本投递，消费者只看到
@@ -134,7 +141,7 @@ TMPDIR=<run-dir> <build>/config-consumer/config_consumer
   （同拍交错）→ 消费者只收到 `Initial`，待投递更新被丢弃。
 - `watch_failure_recovery_file`：源读取失败不发布伪成功；恢复后继续投递新版本。
 - `watch_close_stops_loop_and_releases_source`：`Close()` 唤醒并等待轮询协程退出 → `IsClosed()`
-  → 释放外部句柄后**源随之析构**（`source_destroyed_after_release=1`）。
+  → 释放外部句柄后**源随之析构**（测试侧 `TrackedSource` 析构标志为真）。
 
 已删除的旧语义用例（不保留旧断言伪装兼容）：`watch_waitclosed_single_waiter_and_drain`、
 `watch_waitclosed_cancelled_mapping`（`WaitClosed`/单等待位/`AlreadyWaiting`/取消令牌已随上游删除）、
