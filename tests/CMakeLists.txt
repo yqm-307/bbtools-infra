@@ -130,6 +130,24 @@ target_compile_options(Test_http_inflight_close_probe PRIVATE -Wall -Wextra)
 add_test(NAME http.inflight_close COMMAND Test_http_inflight_close_probe)
 set_tests_properties(http.inflight_close PROPERTIES TIMEOUT 120)
 
+# Issue #62 验收第 5 项回归探针：session lifetime/teardown 的「m_sessions 反登记
+# 先于最后一次 shared_ptr 释放」顺序（受控持有 io 域门 + 空闲/在途 keep-alive
+# 会话 + 另一线程并发 Close/peer-FIN）。读 impl 层生产状态 DebugSessionCount()
+# 与独立 debug 观测组件（后者仅在 BBT_INFRA_STRINGENT_DEBUG=ON 时存在），需要
+# src/ 内部头 include 路径——仅本目标可见。
+# 两种构建都注册（不引入 debug 默认）：Debug 面追加计数断言；Release 面退回可
+# 生产观测的等价断言（Close 返回即反登记归零 / 物理 fd 回收 / 未走 drain 超时），
+# 不会因宏关掉而恒过。ASan/UBSan 构建下运行并扫描日志。
+add_executable(Test_http_session_lifetime_probe
+    Test_http_session_lifetime_probe.cc)
+target_include_directories(Test_http_session_lifetime_probe PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(Test_http_session_lifetime_probe
+    PRIVATE bbt::infra_http Boost::boost Threads::Threads)
+target_compile_options(Test_http_session_lifetime_probe PRIVATE -Wall -Wextra)
+add_test(NAME http.session_lifetime COMMAND Test_http_session_lifetime_probe)
+set_tests_properties(http.session_lifetime PROPERTIES TIMEOUT 180)
+
 # Issue #37：HTTP 出站连接/在途配额的原子接纳与物理归还。
 # 与 transport #32 不同入口：覆盖 HttpClientImpl::Request 的 owner
 # 预算门禁（max_connections/max_inflight）、Overloaded 确定性、

@@ -43,6 +43,7 @@
 #include <bbt/infra/CoMongoCli.hpp>
 #include <bbt/infra/mongo/Client.hpp>
 
+#include "debug/InfraDebug.hpp"
 #include "mongo/MongoDetail.hpp"
 #include "mongo/MongoProcess.hpp"
 #include "mongo/MongoSupport.hpp"
@@ -51,17 +52,6 @@ namespace bbt::infra::mongo_detail {
 
 class MongoRuntime;
 class MongoCollImpl;
-
-// 仅供 Mongo unit 通过内部头读取的执行域证据；不进入公共 API。
-// 一次 driver 调用的 pool acquire/use/release 必须都发生在同一 worker。
-struct MongoThreadEvidenceForTest {
-    std::thread::id worker_thread;
-    std::thread::id acquire_thread;
-    std::thread::id use_thread;
-    std::thread::id release_thread;
-    std::string      database;
-    std::string      collection;
-};
 
 // 一次命令的堆上 operation state：晚到收口只访问它，不借用调用者栈。
 // runtime 保活 owner 资源（worker/队列/pool）；handle 保活发起句柄，
@@ -170,22 +160,47 @@ public:
             m_drain_cv.notify_all();
     }
 
-    // 验收观测钩子：worker 数、运行中 driver 调用计数与峰值
-    // （worker 线程内维护）。同一 owner 多句柄共享同一组计数。
+    // 真实生产状态观测：worker 数（m_live_workers 参与 drain 谓词）。
+    // 保留、不门控——Release 下同样可用。同一 owner 多句柄共享同一组 worker。
     std::size_t LiveWorkersForTest() const noexcept {
         return static_cast<std::size_t>(m_live_workers.load());
     }
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+    // debug 观测（仅观测数据，整体在宏内）：运行中 driver 调用计数与
+    // 峰值由 debug/InfraDebug.hpp 的 MongoRuntimeObservation 维护，
+    // 取证存储/锁也随其移出生产对象。Release 下这些访问器不存在。
     std::size_t RunningDriverCallsForTest() const noexcept {
-        return m_running_calls.load();
+        return m_obs.running_calls.load();
     }
     std::size_t PeakDriverCallsForTest() const noexcept {
-        return m_peak_calls.load();
+        return m_obs.peak_calls.load();
     }
+    std::optional<bbt::infra::debug::MongoThreadEvidence>
+    LastDriverThreadEvidenceForTest() const {
+        return m_obs.LastEvidence();
+    }
+#endif
     // 队列深度观测（m_queue_mtx 保护）：跨集合共享背压用例用它确定
     // 「前一个 op 已占住队列容量」，再提交下一个断言 Overloaded。
+    // 读的是真实生产队列 m_queue，Release 下同样可用。
     std::size_t QueuedOpsForTest() const noexcept {
         std::lock_guard<std::mutex> lk(m_queue_mtx);
         return m_queue.size();
+    }
+    // 真实状态观测（m_ops_mtx 保护）：计数已从接纳队列取出、被 worker 接管、
+    // 正处 RunDriverCall 入口的 op（读既有 m_ops + MongoOp::phase，不新增运行时
+    // 计数或采样）。Release 下同样可用。
+    // 边界诚实说明：phase==kRunning 由 worker 在出队后、RunDriverCall 入口前落位，
+    // 故它证明「op 已离开队列并被 worker 占用执行槽」，不等同于「已进入 native
+    // driver 调用」——native 入口之后的证据仍由既有 debug 观测（RunningGuard）
+    // 提供，本访问器不冒充后者。
+    std::size_t DriverCallsInFlightForTest() const noexcept {
+        std::lock_guard<std::mutex> lk(m_ops_mtx);
+        std::size_t n = 0;
+        for (const auto& op : m_ops)
+            if (op->phase.load() == MongoOp::Phase::kRunning)
+                ++n;
+        return n;
     }
     // 关闭链路观测（m_ops_mtx 保护）：确认启动失败/关闭收口后 io 域已
     // 置死，后续提交一律按 Closed 拒绝（Issue #12 M1）。
@@ -204,11 +219,6 @@ public:
         static_cast<std::size_t>(-2);
     void SetWorkerSpawnFailForTest(std::size_t at) noexcept {
         m_spawn_fail_at.store(at, std::memory_order_relaxed);
-    }
-    std::optional<MongoThreadEvidenceForTest>
-    LastDriverThreadEvidenceForTest() const {
-        std::lock_guard<std::mutex> lk(m_thread_evidence_mtx);
-        return m_last_thread_evidence;
     }
 
 private:
@@ -278,16 +288,11 @@ private:
     std::mutex                 m_join_mtx;
     // 唯一配对 finalizer 的 once 闩：并发/重复 Close 与析构等待同一事实。
     std::once_flag             m_finalize_once;
-    std::atomic<std::size_t>   m_running_calls{0};
-    std::atomic<std::size_t>   m_peak_calls{0};
-    mutable std::mutex         m_thread_evidence_mtx;
-    std::optional<MongoThreadEvidenceForTest> m_last_thread_evidence;
-
-    void RecordThreadEvidenceForTest(
-        MongoThreadEvidenceForTest evidence) {
-        std::lock_guard<std::mutex> lk(m_thread_evidence_mtx);
-        m_last_thread_evidence = std::move(evidence);
-    }
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+    // 仅观测：运行中 driver 调用计数/峰值 + 执行域取证存储与锁，整体收进
+    // debug 层组件（Release 下生产对象无这些原子/锁/存储，也无相关符号）。
+    bbt::infra::debug::MongoRuntimeObservation m_obs;
+#endif
 
     enum State : int { kCreated = 0, kRunning = 1, kClosingOrClosed = 2 };
 };
@@ -385,7 +390,27 @@ public:
         return m_info;
     }
 
-    // 兼容观测钩子（委托 runtime；Start 未成功建立 runtime 时为 0）。
+    // 真实生产状态观测：委托 runtime 的存活 worker 数（Release 下同样可用；
+    // Start 未成功建立 runtime 时为 0）。
+    std::size_t LiveWorkersForTest() const noexcept {
+        const auto rt = RuntimeSnapshot();
+        return rt ? rt->LiveWorkersForTest() : 0;
+    }
+    // 真实生产状态：委托 runtime 的接纳队列深度（读 m_queue，Release 下
+    // 同样可用；Start 未建立 runtime 时为 0）。测试用它做确定性同步。
+    std::size_t QueuedOpsForTest() const noexcept {
+        const auto rt = RuntimeSnapshot();
+        return rt ? rt->QueuedOpsForTest() : 0;
+    }
+    // 真实生产状态：委托 runtime 的执行槽占用数（读 m_ops + phase==kRunning，
+    // Release 下同样可用；Start 未建立 runtime 时为 0）。
+    std::size_t DriverCallsInFlightForTest() const noexcept {
+        const auto rt = RuntimeSnapshot();
+        return rt ? rt->DriverCallsInFlightForTest() : 0;
+    }
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+    // 兼容 debug 观测钩子（委托 runtime；Start 未建立 runtime 时为 0）。
+    // Release 下不存在。
     std::size_t RunningDriverCallsForTest() const noexcept {
         const auto rt = RuntimeSnapshot();
         return rt ? rt->RunningDriverCallsForTest() : 0;
@@ -394,10 +419,7 @@ public:
         const auto rt = RuntimeSnapshot();
         return rt ? rt->PeakDriverCallsForTest() : 0;
     }
-    std::size_t LiveWorkersForTest() const noexcept {
-        const auto rt = RuntimeSnapshot();
-        return rt ? rt->LiveWorkersForTest() : 0;
-    }
+#endif
 
 private:
     // 稳定快照：m_coll/m_runtime 由 Start 在 m_lifecycle_mtx 内发布、由

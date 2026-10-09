@@ -375,6 +375,57 @@ jobs:
           ctest -j1 --output-on-failure --timeout 180
         timeout-minutes: 5
 
+      # #62：保留完整 Release 门禁，复用同一 job 的依赖串行验证 Debug 诊断。
+      # 不新增 runner 或依赖下载；Debug 定向测试缺项/跳过均失败。
+      - name: "Debug 生命周期定向门禁（8 项，零跳过）"
+        if: needs.changes.outputs.code == 'true'
+        run: |
+          set -euo pipefail
+          DEBUG_BUILD_DIR="${BUILD_DIR}-debug"
+          LAUNCHER=""
+          if [ "${{ steps.cache-meta.outputs.enabled }}" = "true" ] && command -v ccache >/dev/null 2>&1; then
+            LAUNCHER="-DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+          fi
+          cmake -S "$GITHUB_WORKSPACE/infra" -B "$DEBUG_BUILD_DIR" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DBBT_INFRA_STRINGENT_DEBUG=ON \
+            $LAUNCHER \
+            -DBBT_COROUTINE_SOURCE_DIR="$COROUTINE_DIR" -DBBT_CORE_SOURCE_DIR="$CORE_DIR" \
+            -DBBT_HIREDIS_PREFIX="$GITHUB_WORKSPACE/deps-prefix/hiredis" \
+            -DBBT_MONGOCXX_PREFIX="$GITHUB_WORKSPACE/deps-prefix/mongocxx" \
+            -DBBT_MONGOC_PREFIX="$GITHUB_WORKSPACE/deps-prefix/mongoc"
+          cmake --build "$DEBUG_BUILD_DIR" --parallel "$JOBS" --target \
+            Test_contract_basics Test_http_session_lifetime_probe \
+            Test_http_timer_rearm_probe Test_http_inflight_close_probe \
+            Test_http_child_unregister Test_redis_unit Test_redis_cotcp_binding Test_mongo_unit
+          # 两种配置的三份归档必须存在；Debug 有观测符号，Release 无观测符号。
+          python3 - "$BUILD_DIR" "$DEBUG_BUILD_DIR" <<'PY'
+          import pathlib, subprocess, sys
+          for build, debug in ((sys.argv[1], False), (sys.argv[2], True)):
+              for module in ('http', 'redis', 'mongo'):
+                  archive = pathlib.Path(build) / 'src' / f'libbbt_infra_{module}.a'
+                  symbols = subprocess.check_output(['nm', '-C', str(archive)], text=True)
+                  present = 'bbt::infra::debug::' in symbols
+                  if present != debug:
+                      raise SystemExit(f'FAIL: {archive} debug symbols={present}, expected={debug}')
+          PY
+          RX='^(contract\.basics|http\.session_lifetime|http\.timer_rearm|http\.inflight_close|http\.child_unregister|redis\.unit|redis\.cotcp_binding|mongo\.unit)$'
+          ctest --test-dir "$DEBUG_BUILD_DIR" -j1 -R "$RX" \
+            --no-tests=error --output-on-failure --timeout 180 \
+            --output-junit "$DEBUG_BUILD_DIR/diagnostics.xml"
+          python3 - "$DEBUG_BUILD_DIR/diagnostics.xml" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          expected = {'contract.basics', 'http.session_lifetime', 'http.timer_rearm',
+                      'http.inflight_close', 'http.child_unregister', 'redis.unit',
+                      'redis.cotcp_binding', 'mongo.unit'}
+          cases = list(ET.parse(sys.argv[1]).getroot().iter('testcase'))
+          if len(cases) != len(expected) or {c.get('name') for c in cases} != expected:
+              raise SystemExit('FAIL: Debug diagnostics test set is incomplete or duplicated')
+          if any(c.find(tag) is not None for c in cases for tag in ('skipped', 'failure', 'error')):
+              raise SystemExit('FAIL: Debug diagnostics contain skipped/failed/error cases')
+          print('Debug diagnostics: 8 passed, 0 failed, 0 skipped')
+          PY
+        timeout-minutes: 5
+
       - name: "缓存观测汇总"
         # 保存本身由 actions/cache@v4 post 步骤自动执行（key 未命中时才写）；
         # 此步骤只输出 hit/miss、模式与缓存大小，供 run 页面审计。

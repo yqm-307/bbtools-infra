@@ -299,14 +299,16 @@ void MongoRuntime::WorkerLoop() noexcept {
 result<MongoOpOutcome> MongoRuntime::RunDriverCall(
     const MongoOp& op) noexcept {
     MongoOpOutcome out;
-    MongoThreadEvidenceForTest evidence;
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+    bbt::infra::debug::MongoThreadEvidence evidence;
     evidence.worker_thread =
         g_worker_runtime == this ? g_worker_thread : std::thread::id{};
     // 运行中 driver 调用记账（验收「峰值 ≤ worker_threads」）。
     struct RunningGuard {
         MongoRuntime* self;
-        ~RunningGuard() { self->m_running_calls.fetch_sub(1); }
+        ~RunningGuard() { self->m_obs.running_calls.fetch_sub(1); }
     };
+#endif
     try {
         auto doc_v = ViewOf(op.doc,
                             op.kind == MongoOp::Kind::InsertOne
@@ -322,37 +324,47 @@ result<MongoOpOutcome> MongoRuntime::RunDriverCall(
             upd_v = uv.value();
         }
 
-        const auto running = m_running_calls.fetch_add(1) + 1;
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+        const auto running = m_obs.running_calls.fetch_add(1) + 1;
         RunningGuard guard{this};
-        std::size_t  peak = m_peak_calls.load();
+        std::size_t  peak = m_obs.peak_calls.load();
         while (running > peak &&
-               !m_peak_calls.compare_exchange_weak(peak, running)) {
+               !m_obs.peak_calls.compare_exchange_weak(peak, running)) {
         }
+#endif
 
         // 同一 worker 上 acquire/use/release：满足 client 单线程亲和；
         // acquire 由 waitQueueTimeoutMS 保底，不会无限等待。目标集合
         // 由发起句柄携带——同 worker 可为不同集合服务，不新建线程。
         const auto& target = op.handle->Target();
+#ifdef BBT_INFRA_STRINGENT_DEBUG
         bool acquired = false;
         struct EvidenceGuard {
             MongoRuntime* runtime;
-            MongoThreadEvidenceForTest& evidence;
+            bbt::infra::debug::MongoThreadEvidence& evidence;
             bool& acquired;
             ~EvidenceGuard() {
                 if (!acquired)
                     return;
                 evidence.release_thread = std::this_thread::get_id();
-                runtime->RecordThreadEvidenceForTest(std::move(evidence));
+                runtime->m_obs.Record(std::move(evidence));
             }
         } evidence_guard{this, evidence, acquired};
+#endif
+        // acquire / use / release 的真实顺序与语义不受观测影响：
+        // 观测包裹仅在宏内，Release 下不存在 evidence/guard 等对象。
         auto entry = m_pool->pool.acquire();
+#ifdef BBT_INFRA_STRINGENT_DEBUG
         acquired = true;
         evidence.acquire_thread = std::this_thread::get_id();
         evidence.database = target.database;
         evidence.collection = target.collection;
+#endif
         auto coll  = (*entry)[target.database]
                         .collection(target.collection);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
         evidence.use_thread = std::this_thread::get_id();
+#endif
         switch (op.kind) {
         case MongoOp::Kind::InsertOne: {
             const auto r = coll.insert_one(doc_v.value());

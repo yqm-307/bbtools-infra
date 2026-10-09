@@ -53,6 +53,7 @@
 
 #include <bbt/infra/HttpServer.hpp>
 
+#include "debug/InfraDebug.hpp"
 #include "http/HttpDetail.hpp"
 #include "http/HttpIoEngine.hpp"
 
@@ -91,6 +92,14 @@ public:
     void Abort() noexcept;     // io 域：关闭会话（丢弃未发送数据）
     void Close() noexcept;     // io 域：关闭 socket + 同步释放 owner 资源
     bool IsClosed() const noexcept { return closed; }
+
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+    // debug 专用析构（issue #62 验收第 5 项）：向独立观测组件
+    // debug/InfraDebug.hpp 汇报会话生命周期计数。仅在 BBT_INFRA_STRINGENT_DEBUG
+    // 下声明；默认/Release 构建里 HttpSession 没有用户声明析构，也无任何计数
+    // 写入与相关符号。
+    ~HttpSession();
+#endif
 
     // 每次成功发起 async_* +1，对应 completion 入口 -1。
     // 就绪/期限等待在 Close/取消侧记账（见各 *_armed 标记）：Close 返回当刻
@@ -241,8 +250,10 @@ public:
 
     std::atomic_size_t m_connections{0};
 
-    // 回归/诊断探针：当前仍登记的会话数（已 Start 未反登记）。只读、不参与
-    // 任何生产逻辑，供 issue #62 的 deadline timer 记账回归断言使用。
+    // 回归/诊断的只读视图：当前仍登记的会话数（已 Start 未反登记）。它读的是
+    // **生产状态** m_session_count（DrainedLocked 用其判定 drain，跨 io/调用线程
+    // 故必须原子），不是 debug 观测数据，因此在 Release/默认构建下同样可用；
+    // 供 issue #62 的探针与 deadline timer 记账回归断言使用，不参与生产逻辑。
     std::size_t DebugSessionCount() const noexcept {
         return static_cast<std::size_t>(m_session_count.load());
     }

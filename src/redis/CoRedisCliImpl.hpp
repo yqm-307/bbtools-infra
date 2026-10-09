@@ -20,6 +20,7 @@
 #include <bbt/infra/CoRedisCli.hpp>
 #include <bbt/infra/CoTCP.hpp>
 
+#include "debug/InfraDebug.hpp"   // 纯观测数据集中层（仅 Debug 展开）
 #include "detail/IoSupport.hpp"
 #include "redis/RedisDetail.hpp"   // RawReply / DecodeReply
 
@@ -27,25 +28,25 @@ namespace bbt::infra::redis_detail {
 
 class RedisCotcpConn;
 
-// owner coroutine 与落定竞争的可观测计数（隔离验证探针；不参与语义）。
-struct RedisProbe {
-    std::atomic<std::uint64_t> owner_runs{0};            // owner coroutine 批次数
-    std::atomic<std::uint64_t> finish_conflicts{0};      // 晚到终态被拒次数
-    std::atomic<std::uint64_t> skipped_after_finish{0};  // 出队时已落定（未接触后端）
-    std::atomic<std::uint64_t> dial_attempts{0};
-    std::atomic<std::uint64_t> dial_inflight{0};         // 正在 DialTCP 内（挂起/未返回）的批次数
-    std::atomic<std::uint64_t> conns_broken{0};          // 出错后被废弃的连接数
-};
+// owner coroutine 与落定竞争的纯观测计数已集中到 src/debug/InfraDebug.hpp
+// （debug::RedisProbe / debug::RedisProbeSnapshot）；仅内部 debug 层开启时存在，
+// 不参与语义，Release 无该成员、无相关原子写。
 
 struct RedisOp : std::enable_shared_from_this<RedisOp> {
     enum class Kind { Ping, Get, Set, Exists, Delete };
     // kQueued 在队列中；kWorking owner coroutine 正在处理；kDone 后端不再访问。
     enum class Phase : int { kQueued = 0, kWorking = 1, kDone = 2 };
 
-    RedisOp(std::shared_ptr<RedisProbe> probe, Kind kind_,
-                 std::vector<std::string> args, CallOptions opt)
-        : probe(std::move(probe)), kind(kind_), options(std::move(opt)),
-          argv_store(std::move(args)) {
+    RedisOp(
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+        std::shared_ptr<debug::RedisProbe> probe_,
+#endif
+        Kind kind_, std::vector<std::string> args, CallOptions opt)
+        :
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+          probe(std::move(probe_)),
+#endif
+          kind(kind_), options(std::move(opt)), argv_store(std::move(args)) {
         argv.reserve(argv_store.size());
         argvlen.reserve(argv_store.size());
         for (const auto& a : argv_store) {
@@ -68,7 +69,9 @@ struct RedisOp : std::enable_shared_from_this<RedisOp> {
         }
         finished.store(true, std::memory_order_release);
         if (!first) {
+#ifdef BBT_INFRA_STRINGENT_DEBUG
             probe->finish_conflicts.fetch_add(1);
+#endif
             return;
         }
         if (waiter)
@@ -83,7 +86,9 @@ struct RedisOp : std::enable_shared_from_this<RedisOp> {
         return std::optional<result<RawReply>>(std::move(*outcome));
     }
 
-    std::shared_ptr<RedisProbe>                       probe;
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+    std::shared_ptr<debug::RedisProbe>                probe;
+#endif
     Kind                                              kind;
     CallOptions                                       options;
     std::vector<std::string>                          argv_store;
@@ -100,14 +105,10 @@ private:
     std::optional<result<RawReply>>   outcome;
 };
 
-// 隔离验证探针快照（纯整数，无 hiredis/第三方类型）。
+// 真实运行状态快照（纯整数，无 hiredis/第三方类型）：始终存在，不受 debug 开关
+// 影响——只含由生产逻辑消费/可生产观测的真实状态（队列长度、已登记请求数、
+// 当前槽是否有连接、连接是否物理收口）。纯观测计数见 debug::RedisProbeSnapshot。
 struct RedisBindingSnapshot {
-    std::uint64_t owner_runs = 0;
-    std::uint64_t finish_conflicts = 0;
-    std::uint64_t skipped_after_finish = 0;
-    std::uint64_t dial_attempts = 0;
-    std::uint64_t dial_inflight = 0;  // >0：owner 批次正挂在 DialTCP 内
-    std::uint64_t conns_broken = 0;
     std::uint64_t queued = 0;
     std::uint64_t registered = 0;
     bool          has_conn = false;
@@ -115,30 +116,23 @@ struct RedisBindingSnapshot {
     bool          conn_closed = false;
 };
 
-// 进程级 hiredis 调用/收口计数（定义在 .cc，跨连接累计）。
-struct RedisBindingTotals {
-    std::uint64_t readers_created = 0;
-    std::uint64_t readers_freed = 0;
-    std::uint64_t conns_created = 0;
-    std::uint64_t conns_destroyed = 0;
-    std::uint64_t hiredis_calls = 0;
-    std::uint64_t hiredis_max_call_ns = 0;
-    std::uint64_t commands_encoded = 0;
-    std::uint64_t write_rounds = 0;
-    std::uint64_t read_rounds = 0;
-    std::uint64_t partial_write_ops = 0;
-    std::uint64_t partial_read_ops = 0;
-};
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+// 进程级 hiredis 调用/收口计数快照（定义在 .cc，跨连接累计；仅 Debug 面存在）。
+using debug::RedisBindingTotals;
 RedisBindingTotals RedisBindingTotalsForTest() noexcept;
 void ResetRedisBindingTotalsForTest() noexcept;
+#endif
 
 class CoRedisCliImpl final : public CoRedisCli,
                                   public std::enable_shared_from_this<CoRedisCliImpl> {
 public:
     CoRedisCliImpl(RedisClientConfig config,
                         bbt::coroutine::CoObjectInfo info)
-        : m_config(std::move(config)), m_info(std::move(info)),
-          m_probe(std::make_shared<RedisProbe>()) {}
+        : m_config(std::move(config)), m_info(std::move(info))
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+        , m_probe(std::make_shared<debug::RedisProbe>())
+#endif
+    {}
     ~CoRedisCliImpl() override;
 
     result<void> Connect(const CallOptions& options) override;
@@ -165,11 +159,20 @@ public:
     void SetPreAdmitGateForTest(std::function<void()> gate);
 
     // ---- 隔离验证探针（src 内部头；不安装、不进公开面）----
-    RedisBindingSnapshot ProbeSnapshot() const;
+    // 真实状态快照（始终可用，Release 面同样有真实断言依据）。
+    RedisBindingSnapshot BindingStateSnapshot() const;
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+    // 纯观测快照（仅内部 debug 层开启时存在）。
+    debug::RedisProbeSnapshot ProbeSnapshot() const;
+#endif
     // 当前物理连接的 CoTCP 句柄（未建连时为 nullptr）。
     std::shared_ptr<tcp::CoTCP> TransportForTest() const;
     // 测试接缝：DialTCP 成功返回、进入编码/发送之前的落点（默认为空 ⇒ 零开销）。
     void SetPostDialGateForTest(std::function<void()> gate);
+    // 测试接缝：受管 dial 的 connect 等待段在协程真正挂起（已登记 fd 可写等待）
+    // 后回调一次。这是「dial 已进入 native 等待」的真实落点证据（DialWaitOptions::
+    // connect_on_registered），Debug/Release 一致，不用观测计数冒充、不用 sleep。
+    void SetDialWaitEntryGateForTest(std::function<void()> gate);
 
 private:
     result<RawReply> Submit(RedisOp::Kind kind, std::vector<std::string> args,
@@ -229,7 +232,9 @@ private:
     RedisClientConfig             m_config;
     bbt::coroutine::CoObjectInfo  m_info;
     detail::ManagedCloseState     m_close;
-    std::shared_ptr<RedisProbe>   m_probe;
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+    std::shared_ptr<debug::RedisProbe> m_probe;
+#endif
     std::atomic<int>              m_state{
         static_cast<int>(ConnectState::Disconnected)};
 
@@ -260,6 +265,7 @@ private:
     // 测试接缝（仅测试安装；不参与运行期语义）。
     std::function<void()> m_pre_admit_gate_for_test;
     std::function<void()> m_post_dial_gate_for_test;
+    std::function<void()> m_dial_wait_gate_for_test;
 };
 
 
