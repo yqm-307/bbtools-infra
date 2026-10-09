@@ -91,6 +91,17 @@ public:
     void Abort() noexcept;     // io 域：关闭会话（丢弃未发送数据）
     void Close() noexcept;     // io 域：关闭 socket + 同步释放 owner 资源
     bool IsClosed() const noexcept { return closed; }
+    ~HttpSession();
+
+    // issue #62 验收第 5 项探针：会话对象生命周期计数（只读，不参与任何生产
+    // 逻辑）。m_sessions 只保存裸指针，因此「析构时仍未反登记」会把悬垂指针
+    // 留在集合里（Teardown 的裸指针快照遍历即 UAF）；而 Close→MaybeRelease 的
+    // 次序要求反登记严格先于最后一次 shared_ptr 释放。两个计数把该不变式变成
+    // 每次运行可机器判定的回归项：
+    //   DebugSessionDestroyed()          — 已析构的会话数；
+    //   DebugDestroyedWhileRegistered()  — 其中析构时仍未反登记的（必须恒为 0）。
+    static int DebugSessionDestroyed() noexcept;
+    static int DebugDestroyedWhileRegistered() noexcept;
 
     // 每次成功发起 async_* +1，对应 completion 入口 -1。
     // 就绪/期限等待在 Close/取消侧记账（见各 *_armed 标记）：Close 返回当刻

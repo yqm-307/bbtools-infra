@@ -26,6 +26,11 @@ constexpr std::size_t kReadChunk = 4096;
 // 在 io 域内无界空转。
 constexpr int kAcceptBatch = 16;
 
+// issue #62 验收第 5 项探针计数（语义见 HttpServerImpl.hpp 的声明处）。
+// 仅在 ~HttpSession（冷路径）与探针只读访问器中触碰，生产路径不读。
+std::atomic_int g_debug_session_destroyed{0};
+std::atomic_int g_debug_destroyed_while_registered{0};
+
 // 把 beast 解析出的请求转为契约 HttpRequest：头按序保留重复值。
 HttpRequest ToInfraRequest(http::request<http::string_body>& msg) {
     HttpRequest out;
@@ -47,6 +52,25 @@ HttpSession::HttpSession(std::shared_ptr<HttpServerImpl> srv,
     : server(std::move(srv)),
       socket(std::move(sock)),
       deadline_timer(server->Engine()->Io()) {}
+
+HttpSession::~HttpSession() {
+    // issue #62 验收第 5 项：m_sessions 只保存裸指针，任何「析构时仍未反登记」
+    // 都会把悬垂指针留在集合里；正常路径下 MaybeRelease 已在 Close（io 域门内、
+    // inflight 归零时）把节点抹除，所以这里 registered 必为 false。计数把该
+    // 不变式变成可观测回归项，不改变任何生产行为。
+    g_debug_session_destroyed.fetch_add(1, std::memory_order_relaxed);
+    if (registered)
+        g_debug_destroyed_while_registered.fetch_add(1,
+                                                     std::memory_order_relaxed);
+}
+
+int HttpSession::DebugSessionDestroyed() noexcept {
+    return g_debug_session_destroyed.load(std::memory_order_relaxed);
+}
+
+int HttpSession::DebugDestroyedWhileRegistered() noexcept {
+    return g_debug_destroyed_while_registered.load(std::memory_order_relaxed);
+}
 
 void HttpSession::Start() {
     std::lock_guard<std::recursive_mutex> io_gate(server->Engine()->IoGate());
