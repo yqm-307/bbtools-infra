@@ -187,6 +187,24 @@ public:
         std::lock_guard<std::mutex> lk(m_queue_mtx);
         return m_queue.size();
     }
+    // 关闭链路观测（m_ops_mtx 保护）：确认启动失败/关闭收口后 io 域已
+    // 置死，后续提交一律按 Closed 拒绝（Issue #12 M1）。
+    bool IoDeadForTest() const noexcept {
+        std::lock_guard<std::mutex> lk(m_ops_mtx);
+        return m_io_dead;
+    }
+
+    // Issue #12 M1 回归接缝（生产路径不安装；默认 kSpawnFailNone 不改变
+    // 行为）：让下一次 Start 的 worker 组在指定点失败——kSpawnFailReserve
+    // 在 reserve 前失败（等价 bad_alloc），其余值在第 N 个 worker 创建前
+    // 失败（等价 std::thread 构造抛 system_error，此时已起 N 个 worker）。
+    static constexpr std::size_t kSpawnFailNone =
+        static_cast<std::size_t>(-1);
+    static constexpr std::size_t kSpawnFailReserve =
+        static_cast<std::size_t>(-2);
+    void SetWorkerSpawnFailForTest(std::size_t at) noexcept {
+        m_spawn_fail_at.store(at, std::memory_order_relaxed);
+    }
     std::optional<MongoThreadEvidenceForTest>
     LastDriverThreadEvidenceForTest() const {
         std::lock_guard<std::mutex> lk(m_thread_evidence_mtx);
@@ -230,9 +248,11 @@ private:
     std::mutex                   m_lifecycle_mtx;
     std::shared_ptr<MongoPoolLease> m_pool;  // Start 建立
 
-    std::mutex                                   m_ops_mtx;
+    mutable std::mutex                           m_ops_mtx;
     std::unordered_set<std::shared_ptr<MongoOp>> m_ops;
     bool m_io_dead{false};   // m_ops_mtx 保护：teardown 后置位
+    // Issue #12 M1 回归接缝状态；生产默认 kSpawnFailNone。
+    std::atomic<std::size_t> m_spawn_fail_at{kSpawnFailNone};
     // Close 有界排空等待（m_ops_mtx + 谓词「op 清空且 worker 全退」）。
     std::condition_variable                      m_drain_cv;
 
