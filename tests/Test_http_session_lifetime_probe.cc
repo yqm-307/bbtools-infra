@@ -7,10 +7,13 @@
 //   Case 1（受控交错 / 顺序本身）：
 //     K 条会话每条完成 1 次 keep-alive 请求后进入空闲（下一次 BeginRead 的
 //     deadline 看守与读就绪等待都已 armed，各自持有一份 self 强引用）。随后
-//     【测试线程先持有 io 域门】再调用 owner Close()：持门期间 io 完成线程无法
-//     执行任何完成 handler，也无法释放任何 self 强引用。Close() 返回当刻断言：
+//     【测试线程先持有 io 域门】再调用 owner Close()：持门期间 io 域无法执行任何
+//     完成 handler，故三条 armed completion 路径（deadline / 读写就绪 / peer 观测）
+//     持有的 self 都不会被释放。前提：本用例每条连接都读到响应，handler 已退出，
+//     断言窗口内不存在可释放的协程侧 self。Close() 返回当刻断言：
 //       a) 登记会话数已为 0       —— 反登记在 Close 返回前完成；
-//       b) 会话析构数增量为 0     —— 最后一次 shared_ptr 尚未释放；
+//       b) 会话析构数增量为 0     —— 最后一次 shared_ptr 尚未释放（防「Close 内
+//          提前释放最后一次强引用」这类回归；本用例的负向对照未触发该断言）；
 //       即「反登记严格先于最后一次强引用释放」，且 Close 不是被 5s drain 超时
 //       放行；listener 与全部会话 fd 已物理释放（新连接被拒 + socket fd 计数回落）。
 //     释放门后 io 域跑完中止的完成项：断言 K 条会话全部析构、
