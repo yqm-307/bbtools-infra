@@ -79,6 +79,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -86,7 +87,9 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <time.h>
@@ -207,38 +210,115 @@ std::size_t CountSocketFds() {
 // 让对端 connect 在内核里保持挂起：把监听 socket 的 accept 队列填满（backlog=1 +
 // 若干已建立但从未被 accept 的连接）。Linux 在 accept 队列满时丢弃新 SYN 而不回 RST，
 // 因此后续 connect 停留在 SYN_SENT —— 把 DialTCP 确定性地挂在 connect 等待上。
+//
+// 前提必须自证：非阻塞 connect 的握手完成在内核异步进行，批量 connect 之后、队列
+// 真正填满之前，紧邻的 connect 可能先占位而成功（疑似对应
+// t_disconnect_interrupts_inflight_dial 的 TransportForTest/!ready/!*out 三项连锁失败；
+// 该因果未在 CI 复核，仅为与现象一致的推断）。因此填充后必须用一次探测 connect 确认
+// 「新 connect 不会完成」；未确认则继续补充填充，有界重试后仍不成立即显式失败，不做
+// 静默继续。
+//
+// 探测结论只采信真实内核信息：判「完成」必须 POLLOUT 且 SO_ERROR==0（真实
+// ESTABLISHED）；判「悬停」须以内核 TCP 态仍为 SYN_SENT 佐证，不以遍历时长为判据；
+// poll 出错 / POLLERR / POLLHUP / SO_ERROR!=0 / 非阻塞设置失败一律判「不可用」，绝不
+// 当成前提成立。
+//
+// 构造失败（含新增的前提不成立）抛 BlackholeDialError；由成员 FdCleanup 在栈回卷中
+// 真实回收全部 fd，避免 ctor 未完成时 ~BlackholeDial 不执行导致泄漏。
+
+struct BlackholeDialError : std::runtime_error {
+    explicit BlackholeDialError(const std::string& m) : std::runtime_error(m) {}
+};
+
+// 探测结论：
+//   Hangs      悬停（前提成立）——须内核态佐证 SYN_SENT
+//   Completed  真实完成（占住 accept 队列位）
+//   Unusable   不可用（错误/读不到状态，不得据此确认前提）
+//   InProgress 本 slice 无事件，继续有界等待
+enum class ProbeResult { Hangs, Completed, Unusable, InProgress };
+
+// 一次 poll 结果 + SO_ERROR → 结论（纯判据，便于正反例直接验证）。poll 失败不得判
+// 悬停；POLLERR/POLLHUP/SO_ERROR!=0 不得判完成。
+ProbeResult ClassifyProbePoll(int poll_rc, short revents, int so_error) {
+    if (poll_rc < 0)
+        return ProbeResult::Unusable;
+    if (poll_rc == 0)
+        return ProbeResult::InProgress;
+    const short bad = static_cast<short>(POLLERR | POLLHUP | POLLNVAL);
+    if ((revents & POLLOUT) != 0 && (revents & bad) == 0 && so_error == 0)
+        return ProbeResult::Completed;
+    return ProbeResult::Unusable;
+}
+
+// 置非阻塞；失败返回 false（调用方不得据此认为该 fd 可用）。
+bool SetNonBlocking(int fd) {
+    const int fl = ::fcntl(fd, F_GETFL, 0);
+    return fl >= 0 && ::fcntl(fd, F_SETFL, fl | O_NONBLOCK) == 0;
+}
+
+// 内核 TCP 连接态（TCP_INFO.tcpi_state）；读不到返回 -1。
+int TcpInfoState(int fd) {
+    tcp_info info{};
+    socklen_t len = sizeof(info);
+    if (::getsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, &len) != 0 ||
+        len < sizeof(info))
+        return -1;
+    return static_cast<int>(info.tcpi_state);
+}
+
 class BlackholeDial {
+    // 构造期即已构建的回收器：任意一步失败（含抛异常）都会运行其析构，真实关闭
+    // listener 与全部 filler/probe fd。声明在成员末尾 → 最先析构，届时容器仍存活。
+    struct FdCleanup {
+        int*              lfd;
+        std::vector<int>* fillers;
+        std::vector<int>* probes;
+        ~FdCleanup() {
+            for (int s : *fillers)
+                ::close(s);
+            for (int s : *probes)
+                ::close(s);
+            if (*lfd >= 0)
+                ::close(*lfd);
+        }
+    };
+
 public:
-    explicit BlackholeDial(std::size_t fillers = 32) {
+    explicit BlackholeDial(std::size_t fillers = 32)
+        : m_cleanup{&m_lfd, &m_fillers, &m_probes} {
         m_lfd = ::socket(AF_INET, SOCK_STREAM, 0);
-        BOOST_REQUIRE(m_lfd >= 0);
+        if (m_lfd < 0)
+            Fail("BlackholeDial: socket() 失败");
         int one = 1;
         ::setsockopt(m_lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
         sockaddr_in addr{};
         addr.sin_family      = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         addr.sin_port        = 0;
-        BOOST_REQUIRE(::bind(m_lfd, reinterpret_cast<sockaddr*>(&addr),
-                             sizeof(addr)) == 0);
-        BOOST_REQUIRE(::listen(m_lfd, 1) == 0);
+        if (::bind(m_lfd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0)
+            Fail("BlackholeDial: bind() 失败");
+        if (::listen(m_lfd, 1) != 0)
+            Fail("BlackholeDial: listen() 失败");
         socklen_t len = sizeof(addr);
-        BOOST_REQUIRE(::getsockname(m_lfd, reinterpret_cast<sockaddr*>(&addr),
-                                    &len) == 0);
-        port = ntohs(addr.sin_port);
-        for (std::size_t i = 0; i < fillers; ++i) {
-            const int s = ::socket(AF_INET, SOCK_STREAM, 0);
-            if (s < 0)
-                break;
-            ::fcntl(s, F_SETFL, ::fcntl(s, F_GETFL, 0) | O_NONBLOCK);
-            (void)::connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-            m_fillers.push_back(s);
+        if (::getsockname(m_lfd, reinterpret_cast<sockaddr*>(&addr), &len) != 0)
+            Fail("BlackholeDial: getsockname() 失败");
+        port   = ntohs(addr.sin_port);
+        m_addr = addr;
+
+        FillBatch(fillers);
+        // 探测 socket 不计入 FillerCount 契约（== fillers）。判为已完成的探测必然已
+        // POLLOUT 且 SO_ERROR==0（真实 ESTABLISHED），它占住一个 accept 队列位，故保留
+        // 在 m_probes 里不关闭；队列趋满后下一轮探测才会悬停。
+        bool holds = false;
+        for (std::size_t i = 0; i < kMaxProbes && !holds; ++i) {
+            const ProbeResult r = ProbePremise();
+            if (r == ProbeResult::Hangs)
+                holds = true;
+            else if (r == ProbeResult::Unusable)
+                break;  // 立即建立/立即失败：前提不可能成立，不必再试
         }
-    }
-    ~BlackholeDial() {
-        for (int s : m_fillers)
-            ::close(s);
-        if (m_lfd >= 0)
-            ::close(m_lfd);
+        if (!holds)
+            Fail("blackhole dial 前提不成立：accept 队列未填满，connect 不会悬停");
     }
     BlackholeDial(const BlackholeDial&)            = delete;
     BlackholeDial& operator=(const BlackholeDial&) = delete;
@@ -247,8 +327,96 @@ public:
     std::size_t   FillerCount() const { return m_fillers.size(); }
 
 private:
+    // 构造失败统一出口：消息带上已分配计数，便于测试区分「一开头就失败」与「已分配若干
+    // filler 后才失败」（后者才是 fd 泄漏风险路径）。
+    [[noreturn]] void Fail(const char* what) const {
+        throw BlackholeDialError(std::string(what) + "（fillers=" +
+                                 std::to_string(m_fillers.size()) + " probes=" +
+                                 std::to_string(m_probes.size()) + "）");
+    }
+
+    // 一批非阻塞 connect（握手完成前占 SYN 队列；已建立的会占 accept 队列）。
+    void FillBatch(std::size_t n) {
+        for (std::size_t i = 0; i < n; ++i) {
+            const int s = ::socket(AF_INET, SOCK_STREAM, 0);
+            if (s < 0)
+                return;
+            if (!SetNonBlocking(s)) {  // 阻塞 connect 会挂死：失败即弃用该 fd
+                ::close(s);
+                return;
+            }
+            (void)::syscall(SYS_connect, s, reinterpret_cast<sockaddr*>(&m_addr),
+                            static_cast<socklen_t>(sizeof(m_addr)));
+            m_fillers.push_back(s);
+        }
+    }
+    // 一次新 connect 的判定：悬停（前提成立）/ 完成（占位后重试）/ 不可用（前提不
+    // 可能成立）。完成须真实 POLLOUT 且 SO_ERROR==0；悬停以内核态 SYN_SENT 佐证，
+    // 不以遍历时长为判据（有界 poll 只用于区分「在途」与「已完成」）。
+    ProbeResult ProbePremise() {
+        const int s = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (s < 0)
+            return ProbeResult::Unusable;
+        if (!SetNonBlocking(s)) {  // 非阻塞设置失败：不得假确认
+            ::close(s);
+            return ProbeResult::Unusable;
+        }
+        const int rc = static_cast<int>(::syscall(
+            SYS_connect, s, reinterpret_cast<sockaddr*>(&m_addr),
+            static_cast<socklen_t>(sizeof(m_addr))));
+        if (rc == 0) {  // 立即建立：确已完成，保留占位
+            m_probes.push_back(s);
+            return ProbeResult::Completed;
+        }
+        if (errno != EINPROGRESS) {  // 立即失败（如 RST/拒绝）：前提不可用
+            ::close(s);
+            return ProbeResult::Unusable;
+        }
+        for (int i = 0; i < kProbeSlices; ++i) {
+            pollfd    p{s, POLLOUT, 0};
+            const int pr =
+                static_cast<int>(::syscall(SYS_poll, &p, 1, kProbeSliceMs));
+            if (pr < 0 && errno == EINTR)
+                continue;  // 被信号打断：重试本 slice
+            int so_error = 0;
+            if (pr > 0) {
+                socklen_t el = sizeof(so_error);
+                if (::getsockopt(s, SOL_SOCKET, SO_ERROR, &so_error, &el) != 0)
+                    so_error = -1;  // 读不到错误码：不当作 0
+            }
+            const ProbeResult v = ClassifyProbePoll(pr, p.revents, so_error);
+            if (v == ProbeResult::Completed) {
+                m_probes.push_back(s);
+                return ProbeResult::Completed;
+            }
+            if (v == ProbeResult::Unusable) {  // poll 失败/POLLERR/SO_ERROR!=0
+                ::close(s);
+                return ProbeResult::Unusable;
+            }
+            // InProgress：继续有界条件等待
+        }
+        // 等待内无 POLLOUT：以内核连接态确认是否确为悬停，而非以时长为判据。
+        const int st = TcpInfoState(s);
+        if (st == TCP_SYN_SENT) {  // 内核仍在 SYN_SENT：确为悬停
+            m_probes.push_back(s);
+            return ProbeResult::Hangs;
+        }
+        if (st == TCP_ESTABLISHED) {  // 已建立但事件未到：按已完成占位
+            m_probes.push_back(s);
+            return ProbeResult::Completed;
+        }
+        ::close(s);
+        return ProbeResult::Unusable;  // 状态不可读/已关闭：不假确认
+    }
+    static constexpr std::size_t kMaxProbes   = 8;
+    static constexpr int         kProbeSlices = 5;
+    static constexpr int         kProbeSliceMs = 10;
+
     int              m_lfd{-1};
     std::vector<int> m_fillers;
+    std::vector<int> m_probes;
+    sockaddr_in      m_addr{};
+    FdCleanup        m_cleanup;
 };
 
 // RESP2 应答构造（服务端侧字节）。
@@ -721,6 +889,113 @@ BOOST_AUTO_TEST_CASE(t_explicit_connect_lifecycle) {
     }));
     const auto totals = redis_detail::RedisBindingTotalsForTest();
     BOOST_CHECK_EQUAL(totals.readers_created, totals.readers_freed);
+}
+
+// A1：探测判据正反例（含真实内核 RST）。任何错误事件都不得被当成「前提成立」。
+BOOST_AUTO_TEST_CASE(t_blackhole_probe_classification) {
+    // 纯判据
+    BOOST_CHECK(ClassifyProbePoll(1, POLLOUT, 0) == ProbeResult::Completed);
+    BOOST_CHECK(ClassifyProbePoll(-1, 0, 0) == ProbeResult::Unusable);  // poll 失败
+    BOOST_CHECK(ClassifyProbePoll(1, POLLERR, ECONNRESET) == ProbeResult::Unusable);
+    BOOST_CHECK(ClassifyProbePoll(1, POLLOUT, ECONNREFUSED) == ProbeResult::Unusable);
+    BOOST_CHECK(ClassifyProbePoll(1, static_cast<short>(POLLOUT | POLLHUP), 0) ==
+                ProbeResult::Unusable);
+    BOOST_CHECK(ClassifyProbePoll(0, 0, 0) == ProbeResult::InProgress);
+    // fcntl 失败不得被当作可用：无效 fd 置非阻塞失败。
+    BOOST_CHECK(!SetNonBlocking(-1));
+
+    // 真实内核：可建立连接 → Completed；对端 RST → Unusable(SO_ERROR!=0)。
+    const int lfd = ::socket(AF_INET, SOCK_STREAM, 0);
+    BOOST_REQUIRE(lfd >= 0);
+    int one = 1;
+    ::setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port        = 0;
+    BOOST_REQUIRE(::bind(lfd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+    BOOST_REQUIRE(::listen(lfd, 8) == 0);
+    socklen_t alen = sizeof(addr);
+    BOOST_REQUIRE(::getsockname(lfd, reinterpret_cast<sockaddr*>(&addr), &alen) == 0);
+
+    const int c = ::socket(AF_INET, SOCK_STREAM, 0);
+    BOOST_REQUIRE(c >= 0);
+    BOOST_REQUIRE(SetNonBlocking(c));
+    const int crc = static_cast<int>(::syscall(
+        SYS_connect, c, reinterpret_cast<sockaddr*>(&addr),
+        static_cast<socklen_t>(sizeof(addr))));
+    BOOST_REQUIRE(crc == 0 || errno == EINPROGRESS);
+    pollfd cp{c, POLLOUT, 0};
+    BOOST_REQUIRE(::syscall(SYS_poll, &cp, 1, 1000) > 0);
+    int       serr = 0;
+    socklen_t sl   = sizeof(serr);
+    BOOST_REQUIRE(::getsockopt(c, SOL_SOCKET, SO_ERROR, &serr, &sl) == 0);
+    BOOST_CHECK(ClassifyProbePoll(1, cp.revents, serr) == ProbeResult::Completed);
+
+    const int a = ::accept(lfd, nullptr, nullptr);
+    BOOST_REQUIRE(a >= 0);
+    linger lg{1, 0};  // SO_LINGER{on,0} → close 发 RST
+    ::setsockopt(a, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+    ::close(a);
+
+    int   rres     = 0;
+    short rrevents = 0;
+    for (int i = 0; i < 200 && rres == 0; ++i) {  // 有界等待错误事件
+        pollfd    ep{c, POLLOUT, 0};
+        const int pr = static_cast<int>(::syscall(SYS_poll, &ep, 1, 10));
+        if (pr > 0 && (ep.revents & (POLLERR | POLLHUP)) != 0) {
+            rres     = pr;
+            rrevents = ep.revents;
+        }
+    }
+    BOOST_REQUIRE(rres > 0);  // loopback 上 RST 应立即到达
+    int       e2  = 0;
+    socklen_t e2l = sizeof(e2);
+    BOOST_REQUIRE(::getsockopt(c, SOL_SOCKET, SO_ERROR, &e2, &e2l) == 0);
+    BOOST_CHECK(ClassifyProbePoll(rres, rrevents, e2) == ProbeResult::Unusable);
+
+    ::close(c);
+    ::close(lfd);
+}
+
+// A2：构造失败路径（含新增的前提不成立）必须真实回收 fd 回基线，不得泄漏。
+// 用有界 fd 软限额强制 BlackholeDial 内部 socket() 中途 EMFILE：FillBatch 已分配若干
+// filler 后，probe 也拿不到 fd ⇒ 前提无法确认 ⇒ 构造抛 BlackholeDialError。若 ctor 不
+// 回收，这些 fd 会残留在进程里。只降软限（硬限不变）并在构造后立即恢复。
+BOOST_AUTO_TEST_CASE(t_blackhole_dial_ctor_fail_releases_fds) {
+    const std::size_t before = CountSocketFds();
+
+    rlimit old{};
+    BOOST_REQUIRE(::getrlimit(RLIMIT_NOFILE, &old) == 0);
+    std::size_t open_fds = 0;
+    if (DIR* d = ::opendir("/proc/self/fd")) {
+        while (dirent* e = ::readdir(d))
+            if (std::strcmp(e->d_name, ".") != 0 &&
+                std::strcmp(e->d_name, "..") != 0)
+                ++open_fds;
+        ::closedir(d);
+    }
+    rlimit lim   = old;
+    lim.rlim_cur = open_fds + 8;  // 只降软限，硬限不变，可恢复
+    BOOST_REQUIRE(::setrlimit(RLIMIT_NOFILE, &lim) == 0);
+
+    bool        threw = false;
+    std::string msg;
+    try {
+        BlackholeDial hole(64);
+    } catch (const BlackholeDialError& e) {
+        threw = true;
+        msg   = e.what();
+    } catch (...) {
+    }
+    BOOST_REQUIRE(::setrlimit(RLIMIT_NOFILE, &old) == 0);
+
+    BOOST_CHECK_MESSAGE(threw, "构造失败未抛 BlackholeDialError（fd 限额未生效？）");
+    // 失败须发生在 FillBatch 已分配若干 filler 之后（fillers>0），否则本用例未覆盖
+    // 「已分配 fd 后失败」这一泄漏风险路径。
+    BOOST_TEST_MESSAGE("构造失败信息: " << msg);
+    BOOST_CHECK(msg.find("fillers=0 probes=0") == std::string::npos);
+    BOOST_CHECK_EQUAL(CountSocketFds(), before);
 }
 
 // S2：Connect 超时/失败 → Failed 状态；默认 sticky（命令 TransportError 且不再拨号），
