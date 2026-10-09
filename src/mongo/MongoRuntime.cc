@@ -1,5 +1,8 @@
 #include "mongo/MongoRuntime.hpp"
 
+#include <new>
+#include <system_error>
+
 #include <bbt/coroutine/detail/LocalThread.hpp>
 #include <bbt/coroutine/detail/Processer.hpp>
 #include <bbt/coroutine/detail/Scheduler.hpp>
@@ -82,9 +85,20 @@ result<void> MongoRuntime::Start() {
             closed_during_start = true;
         } else {
             try {
+                // Issue #12 M1 回归接缝：reserve 前失败等价 reserve 抛
+                // bad_alloc；第 N 个 worker 创建前失败等价 emplace_back
+                // 抛 system_error（此时已起 N 个 worker）。生产路径默认
+                // kSpawnFailNone，不进入任一分支。
+                if (m_spawn_fail_at.load(std::memory_order_relaxed) ==
+                    kSpawnFailReserve)
+                    throw std::bad_alloc();
                 m_workers.reserve(m_config.worker_threads);
-                for (std::size_t i = 0; i < m_config.worker_threads; ++i)
+                for (std::size_t i = 0; i < m_config.worker_threads; ++i) {
+                    if (m_spawn_fail_at.load(std::memory_order_relaxed) == i)
+                        throw std::system_error(std::make_error_code(
+                            std::errc::resource_unavailable_try_again));
                     m_workers.emplace_back([this] { WorkerLoop(); });
+                }
             } catch (...) {
                 spawn_failed = true;
             }
