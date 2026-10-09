@@ -47,6 +47,8 @@
 #include <thread>
 #include <vector>
 
+#include <dirent.h>
+
 
 #include <bbt/core/thread/Lock.hpp>
 #include <bbt/coroutine/detail/Define.hpp>
@@ -147,6 +149,24 @@ bool WaitUntil(const std::function<bool()>& pred, int budget_ms = kBudgetMs) {
         std::this_thread::yield();
     }
     return true;
+}
+
+// 物理线程数（/proc/self/task）：Issue #12 M1 用它确定性观察 worker 组
+// 收口，替代「猜时序」的 sleep 断言。
+std::size_t ThreadCount() {
+    std::size_t n = 0;
+    DIR*        d = ::opendir("/proc/self/task");
+    if (d == nullptr)
+        return 0;
+    while (const auto* e = ::readdir(d)) {
+        const char* name = e->d_name;
+        if (name[0] == '.' &&
+            (name[1] == '\0' || (name[1] == '.' && name[2] == '\0')))
+            continue;
+        ++n;
+    }
+    ::closedir(d);
+    return n;
 }
 
 
@@ -658,6 +678,64 @@ BOOST_AUTO_TEST_CASE(t_client_start_close_publish_pairing) {
         BOOST_CHECK(cli->IsClosed());
         BOOST_CHECK_EQUAL(impl->LiveWorkersForTest(), 0);
     }
+}
+
+BOOST_AUTO_TEST_CASE(t_worker_spawn_failure_finalizes) {
+    // Issue #12 M1 回归：worker 组启动失败（reserve 抛 bad_alloc 或第 N 个
+    // worker 创建抛 system_error）必须与 Close/析构共用同一 finalizer 完整
+    // 收口——已起 worker 全部退出并 join、m_io_dead 置位、本 owner 的 pool
+    // lease 归还、终态 Closed 发布；不得留下「线程已起但未收口」或半关闭态。
+    // 经接缝确定性注入，失败发生在任何 driver 调用之前，不需要真实 MongoDB。
+    BOOST_REQUIRE(g_prepared.load());
+
+    // 预热并保活一个同 URI 的 pool lease：进程级 pool 与驱动后台线程就位
+    // 后，后续线程计数变化只反映本用例的 worker 组，不把 pool 后台线程
+    // 误计为 worker 泄漏。
+    auto warm_info = mongo_detail::NewObjectInfo("test.rt.warm");
+    BOOST_REQUIRE(warm_info);
+    auto warm = std::make_shared<mongo_detail::MongoRuntime>(
+        MakeUriCfg("mongodb://127.0.0.1:1/bbt_ut"), warm_info.value());
+    BOOST_REQUIRE(warm->Start());
+    const std::size_t base_threads = ThreadCount();
+    BOOST_REQUIRE(base_threads > 1);
+
+    const std::size_t fail_points[] = {
+        mongo_detail::MongoRuntime::kSpawnFailReserve, 0, 1, 3};
+    for (const auto at : fail_points) {
+        auto info = mongo_detail::NewObjectInfo("test.rt.spawn_fail");
+        BOOST_REQUIRE(info);
+        auto cfg           = MakeUriCfg("mongodb://127.0.0.1:1/bbt_ut");
+        cfg.worker_threads = 4;
+        auto rt = std::make_shared<mongo_detail::MongoRuntime>(cfg,
+                                                               info.value());
+        rt->SetWorkerSpawnFailForTest(at);
+
+        auto st = rt->Start();
+        BOOST_REQUIRE_MESSAGE(!st, "spawn fail point " << at << " must fail");
+        BOOST_CHECK(st.error().code == ErrorCode::InternalError);
+        // 未成功发布资源：不进 Running。
+        BOOST_CHECK(!rt->IsRunning());
+        // 已起 worker 全部退出（物理线程回基线），无 worker 线程泄漏。
+        BOOST_CHECK_EQUAL(rt->LiveWorkersForTest(), 0);
+        BOOST_CHECK(WaitUntil([&] { return ThreadCount() <= base_threads; },
+                              5000));
+        // 同一 finalizer 已收口：io 域置死、终态 Closed。
+        BOOST_CHECK(rt->IoDeadForTest());
+        BOOST_CHECK(rt->IsClosed());
+        // 收口幂等：重复 Close 不重复 join/reset，终态不回退。
+        rt->Close();
+        BOOST_CHECK(rt->IsClosed());
+        BOOST_CHECK_EQUAL(rt->LiveWorkersForTest(), 0);
+        // 失败即终态，不可复活：再次 Start 明确拒绝。
+        auto again = rt->Start();
+        BOOST_REQUIRE(!again);
+        BOOST_CHECK(again.error().code == ErrorCode::Closed);
+    }
+
+    // 释放预热 lease：同一 finalizer 收口，线程回基线。
+    warm->Close();
+    BOOST_CHECK(warm->IsClosed());
+    BOOST_CHECK(WaitUntil([&] { return ThreadCount() <= base_threads; }, 5000));
 }
 
 BOOST_AUTO_TEST_SUITE_END()
