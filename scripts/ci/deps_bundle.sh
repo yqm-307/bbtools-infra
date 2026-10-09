@@ -16,8 +16,10 @@
 #   scripts/ci/deps_bundle.sh unpack --tar <tar> --meta <meta> --dest <ws>
 set -euo pipefail
 
-# 打包进 tar 的相对成员（相对 --root）；解包到同一相对路径即绝对路径一致
-MEMBERS=(coroutine bbtools-core deps-prefix)
+# 打包进 tar 的相对成员（相对 --root）；解包到同一相对路径即绝对路径一致。
+# boost-prefix：hosted runner 无现役 ARC 镜像的 /opt/boost，锁定 Boost 1.90 由
+# prepare_boost.sh 建到工作区私有前缀，随归档复用（否则每个消费 job 都要重编）。
+MEMBERS=(coroutine bbtools-core deps-prefix boost-prefix)
 
 usage() { sed -n '2,20p' "$0"; }
 
@@ -101,6 +103,11 @@ unpack() {
       [ -d "$dest/deps-prefix/$module/$subdir" ] || continue
       loader="${loader:+$loader:}$dest/deps-prefix/$module/$subdir"
     done
+  done
+  # hosted 无 /opt/boost：锁定 Boost runtime（context）随归档同前缀解包，运行时也要可解析。
+  for subdir in lib lib64; do
+    [ -d "$dest/boost-prefix/$subdir" ] || continue
+    loader="${loader:+$loader:}$dest/boost-prefix/$subdir"
   done
   [ -n "$loader" ] || { echo "[deps-bundle] FATAL: 无消费端库目录" >&2; exit 1; }
   loader="$loader${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
