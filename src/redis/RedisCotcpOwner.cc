@@ -2,15 +2,20 @@
 
 #include <hiredis/alloc.h>
 
+#ifdef BBT_INFRA_STRINGENT_DEBUG
 #include <chrono>
+#endif
 
 #include "detail/TransportWiring.hpp"   // owner 装配面：受管 Dial 的关闭唤醒登记
 
 namespace bbt::infra::redis_detail {
 
-namespace {
+// 文件级 g_counters / BindingCounters / ResetBindingCounters / BumpMax 已删除：
+// 观测数据集中到 debug::RedisCotcpBindingCounters / debug::RedisCotcpBumpMax，
+// 且只在 BBT_INFRA_STRINGENT_DEBUG 下编译（Release 无定义、无计时、无原子写）。
 
-CotcpBindingCounters g_counters;
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+namespace {
 
 std::uint64_t NowNs() noexcept {
     return static_cast<std::uint64_t>(
@@ -19,44 +24,26 @@ std::uint64_t NowNs() noexcept {
             .count());
 }
 
-void BumpMax(std::atomic<std::uint64_t>& m, std::uint64_t v) noexcept {
-    std::uint64_t cur = m.load(std::memory_order_relaxed);
-    while (v > cur &&
-           !m.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {
-    }
-}
-
 } // namespace
-
-CotcpBindingCounters& BindingCounters() noexcept { return g_counters; }
-
-void ResetBindingCounters() noexcept {
-    g_counters.readers_created.store(0);
-    g_counters.readers_freed.store(0);
-    g_counters.conns_created.store(0);
-    g_counters.conns_destroyed.store(0);
-    g_counters.hiredis_calls.store(0);
-    g_counters.hiredis_max_call_ns.store(0);
-    g_counters.commands_encoded.store(0);
-    g_counters.write_rounds.store(0);
-    g_counters.read_rounds.store(0);
-    g_counters.partial_write_ops.store(0);
-    g_counters.partial_read_ops.store(0);
-}
+#endif
 
 RedisCotcpConn::RedisCotcpConn(std::string host, std::uint16_t port)
     : m_host(std::move(host)), m_port(port) {
     // hiredis 只提供一个解析器实例；不创建 context、不接触 fd。
     m_reader = redisReaderCreate();
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     if (m_reader != nullptr)
-        g_counters.readers_created.fetch_add(1);
-    g_counters.conns_created.fetch_add(1);
+        debug::RedisCotcpBindingCounters().readers_created.fetch_add(1);
+    debug::RedisCotcpBindingCounters().conns_created.fetch_add(1);
+#endif
 }
 
 RedisCotcpConn::~RedisCotcpConn() {
     // redisReader 唯一收口：恰好释放一次（Close 已释放则为空操作）。
     FreeReader();
-    g_counters.conns_destroyed.fetch_add(1);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+    debug::RedisCotcpBindingCounters().conns_destroyed.fetch_add(1);
+#endif
     // 本类不 close 裸 fd：m_tcp 析构走 CoTCP 的物理关闭（恰好一次）。
 }
 
@@ -69,21 +56,25 @@ void RedisCotcpConn::FreeReader() noexcept {
     }
     if (reader != nullptr) {
         redisReaderFree(reader);
-        g_counters.readers_freed.fetch_add(1);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+        debug::RedisCotcpBindingCounters().readers_freed.fetch_add(1);
+#endif
     }
 }
 
+#ifdef BBT_INFRA_STRINGENT_DEBUG
 void RedisCotcpConn::NoteCall(std::uint64_t ns) noexcept {
-    ++m_stats.calls;
-    if (ns > m_stats.max_call_ns)
-        m_stats.max_call_ns = ns;
-    g_counters.hiredis_calls.fetch_add(1);
-    BumpMax(g_counters.hiredis_max_call_ns, ns);
+    debug::HiredisStatsNoteCall(m_stats, ns);
+    auto& c = debug::RedisCotcpBindingCounters();
+    c.hiredis_calls.fetch_add(1);
+    debug::RedisCotcpBumpMax(c.hiredis_max_call_ns, ns);
 }
+#endif
 
 result<void> RedisCotcpConn::Dial(
     const CallOptions& options,
-    const std::shared_ptr<detail::CloseWaiters>& dial_waiters) {
+    const std::shared_ptr<detail::CloseWaiters>& dial_waiters,
+    std::function<void()> connect_wait_registered) {
     if (m_close_requested.load(std::memory_order_acquire))
         return result<void>::err(
             MakeError(ErrorCode::Closed, "redis: connection close requested"));
@@ -94,6 +85,10 @@ result<void> RedisCotcpConn::Dial(
     // 关闭原语持有：Close 返回当刻候选 fd 已物理收口，dial 恢复后不会双关。
     detail::DialWaitOptions dial_wait;
     dial_wait.close_waiters = dial_waiters;
+    // 真实挂起接缝：connect 等待段（EINPROGRESS 的 fd 可写等待）在协程挂起后
+    // 回调一次。默认空 ⇒ 零开销；127.0.0.1 直连不经 DNS 段，故该回调即
+    // 「dial 已进入 native 等待」的落点（区分于 PublishSlot 早于 Dial 的占位）。
+    dial_wait.connect_on_registered = std::move(connect_wait_registered);
     if (dial_waiters)
         dial_wait.handoff = std::make_shared<detail::DialHandoffToken>(
             dial_waiters.get());
@@ -129,7 +124,9 @@ result<std::string> RedisCotcpConn::EncodeCommand(int argc, const char** argv,
     }
     std::string bytes(target, static_cast<std::size_t>(len));
     hi_free(target); // 使用 hiredis 当前分配器释放编码缓冲
-    g_counters.commands_encoded.fetch_add(1);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+    debug::RedisCotcpBindingCounters().commands_encoded.fetch_add(1);
+#endif
     return result<std::string>::ok(std::move(bytes));
 }
 
@@ -146,8 +143,10 @@ result<void> RedisCotcpConn::WriteAllBytes(const std::string& bytes,
     if (!tcp)
         return result<void>::err(
             MakeError(ErrorCode::Closed, "redis: transport not dialed"));
-    std::size_t sent  = 0;
+    std::size_t sent = 0;
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     std::size_t round = 0;
+#endif
     while (sent < bytes.size()) {
         if (std::chrono::steady_clock::now() >= options.deadline) {
             Error e = MakeError(ErrorCode::TimedOut,
@@ -180,12 +179,16 @@ result<void> RedisCotcpConn::WriteAllBytes(const std::string& bytes,
         if (w.value().bytes == 0)
             continue; // 阻塞版不返回 0 字节；防御性续等
         sent += w.value().bytes;
+#ifdef BBT_INFRA_STRINGENT_DEBUG
         ++round;
         m_stats.write_rounds = round;
-        g_counters.write_rounds.fetch_add(1);
+        debug::RedisCotcpBindingCounters().write_rounds.fetch_add(1);
+#endif
     }
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     if (round > 1)
-        g_counters.partial_write_ops.fetch_add(1);
+        debug::RedisCotcpBindingCounters().partial_write_ops.fetch_add(1);
+#endif
     return result<void>::ok();
 }
 
@@ -202,7 +205,9 @@ result<RawReply> RedisCotcpConn::ReadReply(const CallOptions& options) {
         return result<RawReply>::err(
             MakeError(ErrorCode::Closed, "redis: transport not dialed"));
 
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     std::size_t round = 0;
+#endif
     for (;;) {
         // 解析 hiredis reader：与本类 Close 的 reader 释放同锁配对。持锁区间不含
         // 挂起点（ReadSome 在锁外），故 Close 不会与在途 hiredis 调用并发。
@@ -217,9 +222,13 @@ result<RawReply> RedisCotcpConn::ReadReply(const CallOptions& options) {
                             : "redis: reply reader unavailable"));
             }
             void*      obj = nullptr;
+#ifdef BBT_INFRA_STRINGENT_DEBUG
             const auto t0  = NowNs();
+#endif
             const int  rc  = redisReaderGetReply(m_reader, &obj);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
             NoteCall(NowNs() - t0);
+#endif
             if (rc == REDIS_ERR) {
                 const char* why = m_reader->errstr[0] != '\0' ? m_reader->errstr
                                                               : "reader error";
@@ -231,8 +240,10 @@ result<RawReply> RedisCotcpConn::ReadReply(const CallOptions& options) {
                 auto* reply   = static_cast<redisReply*>(obj);
                 auto  decoded = DecodeReply(reply); // 先取值语义快照
                 freeReplyObject(reply);             // 再释放 hiredis 对象
+#ifdef BBT_INFRA_STRINGENT_DEBUG
                 if (round > 1)
-                    g_counters.partial_read_ops.fetch_add(1);
+                    debug::RedisCotcpBindingCounters().partial_read_ops.fetch_add(1);
+#endif
                 return decoded;
             }
         }
@@ -246,9 +257,11 @@ result<RawReply> RedisCotcpConn::ReadReply(const CallOptions& options) {
                 ErrorCode::TransportError, "redis: peer closed connection (EOF)"));
         if (r.value().bytes == 0)
             continue; // WouldBlock 防御：阻塞版不返回
+#ifdef BBT_INFRA_STRINGENT_DEBUG
         ++round;
         m_stats.read_rounds = round;
-        g_counters.read_rounds.fetch_add(1);
+        debug::RedisCotcpBindingCounters().read_rounds.fetch_add(1);
+#endif
         {
             std::lock_guard<std::mutex> lk(m_reader_mtx);
             if (m_reader == nullptr) {
@@ -259,9 +272,13 @@ result<RawReply> RedisCotcpConn::ReadReply(const CallOptions& options) {
                     closing ? "redis: connection close requested"
                             : "redis: reply reader unavailable"));
             }
+#ifdef BBT_INFRA_STRINGENT_DEBUG
             const auto t1  = NowNs();
+#endif
             const int  frc = redisReaderFeed(m_reader, m_read_buf, r.value().bytes);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
             NoteCall(NowNs() - t1);
+#endif
             if (frc != REDIS_OK) {
                 const bool oom = m_reader->err == REDIS_ERR_OOM;
                 return result<RawReply>::err(MakeError(

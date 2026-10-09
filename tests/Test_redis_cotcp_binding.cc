@@ -112,7 +112,9 @@ using namespace bbt::infra;
 using bbt::coroutine::Deadline;
 using bbt::coroutine::SCHE_START_OPT_SCHE_THREAD;
 using bbt::infra::redis_detail::CoRedisCliImpl;
+#ifdef BBT_INFRA_STRINGENT_DEBUG
 using bbt::infra::redis_detail::RedisBindingTotals;
+#endif
 using W = bbt::infra::detail::TransportWiring;
 
 namespace {
@@ -165,6 +167,33 @@ bool WaitUntil(const std::function<bool()>& pred, int budget_ms = kBudgetMs) {
     }
     return true;
 }
+
+// 受控同步：等待受管 dial 的 connect 等待段真正挂起——「dial 已进入 native
+// 等待」的真实落点证据（不用观测计数冒充、不用 sleep 代替同步点）。
+// 接缝来自 DialWaitOptions::connect_on_registered：connect 等待段（EINPROGRESS
+// 的 fd 可写等待）在协程挂起后回调一次；Debug/Release 走同一条路径，无宏分叉。
+// 注意：has_conn 由 PublishSlot 在 Dial 之前发布，早于 dial 挂起，不作为
+// 「dial 在途」证据。必须在发起 Connect 之前 Install（回调仅在挂起登记时触发一次）。
+class DialWaitProbe {
+public:
+    void Install(const std::shared_ptr<CoRedisCliImpl>& cli) {
+        // 回调按值捕获共享闩：dial 协程可能跨地址重试、在探针栈帧析构后仍被
+        // 唤醒（例如 localhost 多地址），捕获 this 会悬垂；共享所有权避免。
+        auto parked = m_parked;
+        cli->SetDialWaitEntryGateForTest([parked] {
+            parked->store(true, std::memory_order_release);
+        });
+    }
+    bool Wait(int budget_ms = kBudgetMs) const {
+        return WaitUntil(
+            [&] { return m_parked->load(std::memory_order_acquire); },
+            budget_ms);
+    }
+
+private:
+    std::shared_ptr<std::atomic_bool> m_parked =
+        std::make_shared<std::atomic_bool>(false);
+};
 
 // 非协程线程定长睡眠：直达内核 syscall（coroutine Hook 拦 libc nanosleep）。
 void SleepMs(int ms) {
@@ -770,7 +799,9 @@ BOOST_AUTO_TEST_CASE(t_close_race_after_wait_registered) {
 // （零接受、零字节）；ConnectStatus 只读、不产生任何网络请求。
 BOOST_AUTO_TEST_CASE(t_no_connect_command_rejected) {
     BOOST_REQUIRE(g_prepared.load());
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     redis_detail::ResetRedisBindingTotalsForTest();
+#endif
 
     RawPeer peer(ReplyOnce("+PONG\r\n"));
     auto    c = NewCotcpClient("127.0.0.1", peer.port, /*connect=*/false);
@@ -780,7 +811,9 @@ BOOST_AUTO_TEST_CASE(t_no_connect_command_rejected) {
     // ConnectStatus 只读：重复读取不拨号、不建连。
     for (int i = 0; i < 8; ++i)
         BOOST_CHECK(cli->ConnectStatus() == ConnectState::Disconnected);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_CHECK_EQUAL(cli->ProbeSnapshot().dial_attempts, 0u);
+#endif
     BOOST_CHECK_EQUAL(peer.Accepted(), 0u);
 
     std::optional<result<void>> out;
@@ -788,7 +821,9 @@ BOOST_AUTO_TEST_CASE(t_no_connect_command_rejected) {
     BOOST_REQUIRE(!*out);
     BOOST_CHECK(out->error().code == ErrorCode::RuntimeUnavailable);
     // 命令没有隐式建连：无拨号、服务端零接受、零字节。
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_CHECK_EQUAL(cli->ProbeSnapshot().dial_attempts, 0u);
+#endif
     BOOST_CHECK_EQUAL(peer.Accepted(), 0u);
     BOOST_CHECK_EQUAL(peer.BytesRead(), 0u);
     BOOST_CHECK(cli->ConnectStatus() == ConnectState::Disconnected);
@@ -797,7 +832,9 @@ BOOST_AUTO_TEST_CASE(t_no_connect_command_rejected) {
     BOOST_REQUIRE(RunInCoroutine([&] { out.emplace(cli->Connect(Opt())); }));
     BOOST_REQUIRE(*out);
     BOOST_CHECK(cli->ConnectStatus() == ConnectState::Connected);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_CHECK_EQUAL(cli->ProbeSnapshot().dial_attempts, 1u);
+#endif
     BOOST_REQUIRE(WaitAccepted(peer, 1));
     BOOST_CHECK_EQUAL(peer.Accepted(), 1u);
     BOOST_REQUIRE(RunInCoroutine([&] { out.emplace(cli->Ping(Opt())); }));
@@ -811,7 +848,9 @@ BOOST_AUTO_TEST_CASE(t_no_connect_command_rejected) {
 // 只读 / Disconnect 同步收口且可再次 Connect / Close 终态拒绝 Connect）。
 BOOST_AUTO_TEST_CASE(t_explicit_connect_lifecycle) {
     BOOST_REQUIRE(g_prepared.load());
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     redis_detail::ResetRedisBindingTotalsForTest();
+#endif
 
     auto    ping_bytes = std::make_shared<std::string>();
     RawPeer peer(CaptureFirstCommand(ping_bytes, "+PONG\r\n"));
@@ -823,7 +862,9 @@ BOOST_AUTO_TEST_CASE(t_explicit_connect_lifecycle) {
     BOOST_REQUIRE(RunInCoroutine([&] { out.emplace(cli->Connect(Opt())); }));
     BOOST_REQUIRE(*out);
     BOOST_CHECK(cli->ConnectStatus() == ConnectState::Connected);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_CHECK_EQUAL(cli->ProbeSnapshot().dial_attempts, 1u);
+#endif
     BOOST_REQUIRE(WaitAccepted(peer, 1));
     BOOST_CHECK_EQUAL(peer.Accepted(), 1u);
     auto tcp = cli->TransportForTest();
@@ -833,7 +874,9 @@ BOOST_AUTO_TEST_CASE(t_explicit_connect_lifecycle) {
     // 重复 Connect：幂等 ok，不重新拨号、不新建连接。
     BOOST_REQUIRE(RunInCoroutine([&] { out.emplace(cli->Connect(Opt())); }));
     BOOST_REQUIRE(*out);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_CHECK_EQUAL(cli->ProbeSnapshot().dial_attempts, 1u);
+#endif
     BOOST_CHECK_EQUAL(peer.Accepted(), 1u);
 
     // Ping 必须真实发送 RESP2 PING 帧。
@@ -847,8 +890,8 @@ BOOST_AUTO_TEST_CASE(t_explicit_connect_lifecycle) {
     BOOST_CHECK(!cli->IsClosed());
     BOOST_CHECK(cli->ConnectStatus() == ConnectState::Disconnected);
     BOOST_CHECK(tcp->IsClosed()); // 物理 fd 已同步关闭
-    BOOST_CHECK_EQUAL(cli->ProbeSnapshot().registered, 0u);
-    BOOST_CHECK(cli->ProbeSnapshot().conn_closed);
+    BOOST_CHECK_EQUAL(cli->BindingStateSnapshot().registered, 0u);
+    BOOST_CHECK(cli->BindingStateSnapshot().conn_closed);
     BOOST_CHECK(cli->TransportForTest() == nullptr);
 
     // 主动 Disconnect 之后命令被拒且不建连（未再发送任何字节）。
@@ -856,13 +899,17 @@ BOOST_AUTO_TEST_CASE(t_explicit_connect_lifecycle) {
     BOOST_REQUIRE(!*out);
     BOOST_CHECK(out->error().code == ErrorCode::RuntimeUnavailable);
     BOOST_CHECK_EQUAL(*ping_bytes, std::string("*1\r\n$4\r\nPING\r\n"));
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_CHECK_EQUAL(cli->ProbeSnapshot().dial_attempts, 1u);
+#endif
 
     // 同实例再次显式 Connect：新代际、新连接。
     BOOST_REQUIRE(RunInCoroutine([&] { out.emplace(cli->Connect(Opt())); }));
     BOOST_REQUIRE(*out);
     BOOST_CHECK(cli->ConnectStatus() == ConnectState::Connected);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_CHECK_EQUAL(cli->ProbeSnapshot().dial_attempts, 2u);
+#endif
     BOOST_REQUIRE(WaitAccepted(peer, 2));
     BOOST_CHECK_EQUAL(peer.Accepted(), 2u);
     BOOST_REQUIRE(RunInCoroutine([&] { out.emplace(cli->Ping(Opt())); }));
@@ -878,17 +925,21 @@ BOOST_AUTO_TEST_CASE(t_explicit_connect_lifecycle) {
     BOOST_REQUIRE(RunInCoroutine([&] { out.emplace(cli->Connect(Opt())); }));
     BOOST_REQUIRE(!*out);
     BOOST_CHECK(out->error().code == ErrorCode::Closed);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_CHECK_EQUAL(cli->ProbeSnapshot().dial_attempts, 2u);
+#endif
 
     tcp.reset();
     tcp2.reset();
     cli.reset();
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_REQUIRE(WaitUntil([&] {
         const auto t = redis_detail::RedisBindingTotalsForTest();
         return t.conns_created == t.conns_destroyed;
     }));
     const auto totals = redis_detail::RedisBindingTotalsForTest();
     BOOST_CHECK_EQUAL(totals.readers_created, totals.readers_freed);
+#endif
 }
 
 // A1：探测判据正反例（含真实内核 RST）。任何错误事件都不得被当成「前提成立」。
@@ -1003,7 +1054,9 @@ BOOST_AUTO_TEST_CASE(t_blackhole_dial_ctor_fail_releases_fds) {
 BOOST_AUTO_TEST_CASE(t_connect_timeout_failed_state) {
     BOOST_REQUIRE(g_prepared.load());
     BlackholeDial hole;
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     redis_detail::ResetRedisBindingTotalsForTest();
+#endif
 
     auto c = NewCotcpClient("127.0.0.1", hole.port, /*connect=*/false);
     BOOST_REQUIRE(c);
@@ -1021,15 +1074,19 @@ BOOST_AUTO_TEST_CASE(t_connect_timeout_failed_state) {
     BOOST_CHECK(out->error().code == ErrorCode::TimedOut);
     BOOST_CHECK(ms >= 250);
     BOOST_CHECK(cli->ConnectStatus() == ConnectState::Failed);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_CHECK_EQUAL(cli->ProbeSnapshot().dial_attempts, 1u);
+#endif
     BOOST_CHECK(cli->TransportForTest() == nullptr);
-    BOOST_CHECK(cli->ProbeSnapshot().conn_closed);
+    BOOST_CHECK(cli->BindingStateSnapshot().conn_closed);
 
     // 默认 reconnect_on_new_command=false：Failed 下命令 TransportError，不重连。
     BOOST_REQUIRE(RunInCoroutine([&] { out.emplace(cli->Ping(Opt(1000))); }));
     BOOST_REQUIRE(!*out);
     BOOST_CHECK(out->error().code == ErrorCode::TransportError);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_CHECK_EQUAL(cli->ProbeSnapshot().dial_attempts, 1u);
+#endif
     BOOST_CHECK(cli->ConnectStatus() == ConnectState::Failed);
 
     // 显式 Connect 可再试（仍超时）——Failed 不是终态。
@@ -1037,7 +1094,9 @@ BOOST_AUTO_TEST_CASE(t_connect_timeout_failed_state) {
         RunInCoroutine([&] { out.emplace(cli->Connect(Opt(300))); }, 8000));
     BOOST_REQUIRE(!*out);
     BOOST_CHECK(out->error().code == ErrorCode::TimedOut);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_CHECK_EQUAL(cli->ProbeSnapshot().dial_attempts, 2u);
+#endif
     BOOST_CHECK(cli->ConnectStatus() == ConnectState::Failed);
 
     cli->Close();
@@ -1053,6 +1112,8 @@ BOOST_AUTO_TEST_CASE(t_connect_while_connecting) {
     BOOST_REQUIRE(c);
     auto cli = std::move(c).value();
 
+    DialWaitProbe dial;
+    dial.Install(cli);
     std::optional<result<void>> first;
     std::atomic_bool            first_ready{false};
     bool                        succ = false;
@@ -1061,7 +1122,7 @@ BOOST_AUTO_TEST_CASE(t_connect_while_connecting) {
         first_ready.store(true, std::memory_order_release);
     }, succ);
     BOOST_REQUIRE(succ);
-    BOOST_REQUIRE(WaitUntil([&] { return cli->ProbeSnapshot().dial_inflight == 1; }));
+    BOOST_REQUIRE(dial.Wait());
     BOOST_CHECK(cli->ConnectStatus() == ConnectState::Connecting);
 
     // 连接中重复 Connect → Overloaded（不引入排队/等待架构）。
@@ -1090,7 +1151,9 @@ BOOST_AUTO_TEST_CASE(t_disconnect_interrupts_inflight_dial) {
     BOOST_REQUIRE(g_prepared.load());
     BlackholeDial hole;
     const auto    sockets_before = CountSocketFds();
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     redis_detail::ResetRedisBindingTotalsForTest();
+#endif
 
     auto c = NewCotcpClient("127.0.0.1", hole.port, /*connect=*/false);
     BOOST_REQUIRE(c);
@@ -1098,14 +1161,15 @@ BOOST_AUTO_TEST_CASE(t_disconnect_interrupts_inflight_dial) {
 
     std::optional<result<void>> out;
     std::atomic_bool            ready{false};
+    DialWaitProbe dial;
+    dial.Install(cli);
     bool                        succ = false;
     g_scheduler->RegistCoroutineTask([&] {
         out.emplace(cli->Connect(Opt(30000)));
         ready.store(true, std::memory_order_release);
     }, succ);
     BOOST_REQUIRE(succ);
-    BOOST_REQUIRE(WaitUntil([&] { return cli->ProbeSnapshot().dial_inflight == 1; }));
-    SleepMs(50);
+    BOOST_REQUIRE(dial.Wait());
     const auto sockets_during = CountSocketFds();
     BOOST_CHECK(cli->TransportForTest() == nullptr);
     BOOST_CHECK(!ready.load());
@@ -1119,16 +1183,18 @@ BOOST_AUTO_TEST_CASE(t_disconnect_interrupts_inflight_dial) {
     BOOST_CHECK(sockets_during > sockets_after);
     BOOST_CHECK(!cli->IsClosed());
     BOOST_CHECK(cli->ConnectStatus() == ConnectState::Disconnected);
-    BOOST_CHECK_EQUAL(cli->ProbeSnapshot().registered, 0u);
-    BOOST_CHECK(cli->ProbeSnapshot().conn_closed);
+    BOOST_CHECK_EQUAL(cli->BindingStateSnapshot().registered, 0u);
+    BOOST_CHECK(cli->BindingStateSnapshot().conn_closed);
 
     BOOST_REQUIRE(WaitUntil([&] { return ready.load(std::memory_order_acquire); }));
     BOOST_REQUIRE(out);
     BOOST_CHECK(!*out); // 被 Disconnect 打断的 Connect 以错误返回
 
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     const auto totals = redis_detail::RedisBindingTotalsForTest();
     BOOST_CHECK_EQUAL(totals.commands_encoded, 0u);
     BOOST_CHECK_EQUAL(totals.write_rounds, 0u);
+#endif
 
     // 协程恢复后内部 dup 释放，socket 数回基线（运行时伪影，非对象资源）。
     BOOST_REQUIRE(WaitUntil([&] { return CountSocketFds() <= sockets_before; }));
@@ -1159,12 +1225,12 @@ BOOST_AUTO_TEST_CASE(t_disconnect_during_inflight_command) {
     auto tcp = cli->TransportForTest();
     BOOST_REQUIRE(tcp != nullptr);
     BOOST_CHECK(!tcp->IsClosed());
-    BOOST_CHECK(cli->ProbeSnapshot().registered >= 1);
+    BOOST_CHECK(cli->BindingStateSnapshot().registered >= 1);
 
     // Disconnect（非协程线程）：同步落定在途命令并收口连接。
     cli->Disconnect();
     BOOST_CHECK(tcp->IsClosed()); // 物理 fd 已同步关闭
-    BOOST_CHECK_EQUAL(cli->ProbeSnapshot().registered, 0u);
+    BOOST_CHECK_EQUAL(cli->BindingStateSnapshot().registered, 0u);
     BOOST_CHECK(cli->TransportForTest() == nullptr);
     BOOST_CHECK(!cli->IsClosed());
     BOOST_CHECK(cli->ConnectStatus() == ConnectState::Disconnected);
@@ -1178,7 +1244,9 @@ BOOST_AUTO_TEST_CASE(t_disconnect_during_inflight_command) {
     BOOST_REQUIRE(RunInCoroutine([&] { out.emplace(cli->Connect(Opt())); }));
     BOOST_REQUIRE(*out);
     BOOST_CHECK(cli->ConnectStatus() == ConnectState::Connected);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_CHECK_EQUAL(cli->ProbeSnapshot().dial_attempts, 2u);
+#endif
 
     cli->Close();
     BOOST_CHECK(cli->IsClosed());
@@ -1193,7 +1261,9 @@ BOOST_AUTO_TEST_CASE(t_resp2_roundtrip_live) {
     bool          from_env = false;
     BOOST_REQUIRE(LiveRedisAddr(host, port, from_env));
 
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     redis_detail::ResetRedisBindingTotalsForTest();
+#endif
     auto c = NewCotcpClient(host, port, /*connect=*/false);
     BOOST_REQUIRE(c);
     auto cli = std::move(c).value();
@@ -1275,6 +1345,7 @@ BOOST_AUTO_TEST_CASE(t_resp2_roundtrip_live) {
     }));
     BOOST_CHECK(big_ok);
 
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     const auto totals = redis_detail::RedisBindingTotalsForTest();
     BOOST_TEST_MESSAGE("live totals: hiredis_calls=" << totals.hiredis_calls
         << " max_call_ns=" << totals.hiredis_max_call_ns
@@ -1287,6 +1358,7 @@ BOOST_AUTO_TEST_CASE(t_resp2_roundtrip_live) {
     // hiredis 调用全部在协程栈内同步返回：单次最长耗时应在同一量级（无库内等待）。
     BOOST_CHECK(totals.hiredis_max_call_ns < 50ull * 1000 * 1000);
     BOOST_CHECK(totals.commands_encoded >= 8);
+#endif
 
     cli->Close();
     BOOST_CHECK(cli->IsClosed());
@@ -1355,7 +1427,9 @@ BOOST_AUTO_TEST_CASE(t_raw_reply_types_and_errors) {
 // 写侧：对端小接收窗 + 先不读 → 部分写/WouldBlock；恢复读取后写满并收到应答。
 BOOST_AUTO_TEST_CASE(t_partial_write_then_full_delivery) {
     BOOST_REQUIRE(g_prepared.load());
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     redis_detail::ResetRedisBindingTotalsForTest();
+#endif
 
     RawPeer peer2(
         [](const std::shared_ptr<PeerState>& st, int c) {
@@ -1377,20 +1451,24 @@ BOOST_AUTO_TEST_CASE(t_partial_write_then_full_delivery) {
     BOOST_REQUIRE(*out);
     BOOST_CHECK(static_cast<bool>(*out));
 
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     const auto totals = redis_detail::RedisBindingTotalsForTest();
     BOOST_TEST_MESSAGE("write totals: write_rounds=" << totals.write_rounds
         << " partial_write_ops=" << totals.partial_write_ops
         << " hiredis_max_call_ns=" << totals.hiredis_max_call_ns);
     BOOST_CHECK(totals.write_rounds >= 2);
     BOOST_CHECK(totals.partial_write_ops >= 1);
+#endif
 
     auto transport = cli->TransportForTest();
     BOOST_REQUIRE(transport);
     cli->Close();
     // Close() 的同步门禁验证物理资源；owner 批次的 IsClosed() 允许稍后落定。
     BOOST_CHECK(transport->IsClosed());
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     const auto closed_totals = redis_detail::RedisBindingTotalsForTest();
     BOOST_CHECK_EQUAL(closed_totals.readers_created, closed_totals.readers_freed);
+#endif
     BOOST_CHECK(WaitUntil([&] { return cli->IsClosed(); }));
 }
 
@@ -1399,7 +1477,9 @@ BOOST_AUTO_TEST_CASE(t_write_side_deadline) {
     BOOST_REQUIRE(g_prepared.load());
 
     RawPeer peer(NeverRead(1500), /*listen_rcvbuf=*/4096);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     redis_detail::ResetRedisBindingTotalsForTest();
+#endif
     auto c = NewCotcpClient("127.0.0.1", peer.port);
     BOOST_REQUIRE(c);
     auto cli = std::move(c).value();
@@ -1420,15 +1500,21 @@ BOOST_AUTO_TEST_CASE(t_write_side_deadline) {
     // 与写轮数证据验证，调用方错误对象不携带该内部计数。
 
     BOOST_TEST_MESSAGE("write-deadline: waiting owner batch to retire");
+    // 真实状态同步（两种构建都成立）：故障连接已摘除、已登记请求归零。
+    BOOST_REQUIRE(WaitUntil([&] {
+        return cli->BindingStateSnapshot().registered == 0;
+    }));
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_REQUIRE(WaitUntil([&] {
         const auto s = cli->ProbeSnapshot();
-        return s.registered == 0 && s.conns_broken >= 1 && s.dial_inflight == 0;
+        return s.conns_broken >= 1 && s.dial_inflight == 0;
     }));
     const auto totals = redis_detail::RedisBindingTotalsForTest();
     BOOST_TEST_MESSAGE("write-deadline write_rounds=" << totals.write_rounds
         << " partial_write_ops=" << totals.partial_write_ops);
     BOOST_CHECK(totals.write_rounds >= 1);
     BOOST_CHECK(cli->ProbeSnapshot().conns_broken >= 1);
+#endif
 
     cli->Close();
     BOOST_CHECK(WaitUntil([&] { return cli->IsClosed(); }));
@@ -1503,7 +1589,9 @@ BOOST_AUTO_TEST_CASE(t_transport_error_is_sticky_no_reconnect) {
     BOOST_CHECK(third->error().code == ErrorCode::TransportError);
     // 第三次请求跨过潜在的重连边界：坏连接不得重新 Dial。
     BOOST_CHECK_EQUAL(peer.Accepted(), 1);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_CHECK_EQUAL(cli->ProbeSnapshot().dial_attempts, 1);
+#endif
 
     cli->Close();
     BOOST_CHECK(WaitUntil([&] { return cli->IsClosed(); }));
@@ -1570,7 +1658,9 @@ BOOST_AUTO_TEST_CASE(t_queued_deadline_skips_without_breaking_connection) {
     BOOST_REQUIRE(*first_out);
     BOOST_REQUIRE(WaitUntil([&] { return peer.ProbeFinished() == 1; }));
     BOOST_CHECK_EQUAL(peer.CommandsRead(), 1);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_CHECK_EQUAL(cli->ProbeSnapshot().conns_broken, 0);
+#endif
 
     cli->Close();
     BOOST_CHECK(WaitUntil([&] { return cli->IsClosed(); }));
@@ -1580,7 +1670,9 @@ BOOST_AUTO_TEST_CASE(t_queued_deadline_skips_without_breaking_connection) {
 // 恰好释放；晚到终态不覆盖首发终态。
 BOOST_AUTO_TEST_CASE(t_owner_close_physical_collect) {
     BOOST_REQUIRE(g_prepared.load());
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     redis_detail::ResetRedisBindingTotalsForTest();
+#endif
 
     RawPeer peer(ReadThenHold(3000));
     auto    c = NewCotcpClient("127.0.0.1", peer.port);
@@ -1597,7 +1689,8 @@ BOOST_AUTO_TEST_CASE(t_owner_close_physical_collect) {
     }, succ);
     BOOST_REQUIRE(succ);
     BOOST_REQUIRE(WaitUntil([&] { return peer.BytesRead() > 0; }));
-    BOOST_REQUIRE(WaitUntil([&] { return cli->ProbeSnapshot().dial_attempts >= 1; }));
+    // 真实状态同步：当前代际连接槽已发布（dial 已完成，命令在途）。
+    BOOST_REQUIRE(WaitUntil([&] { return cli->BindingStateSnapshot().has_conn; }));
     SleepMs(150);
     BOOST_CHECK(!ready.load());
 
@@ -1607,7 +1700,7 @@ BOOST_AUTO_TEST_CASE(t_owner_close_physical_collect) {
     BOOST_REQUIRE(fd >= 0);
     BOOST_CHECK(FdOpen(fd));
     BOOST_CHECK(!tcp->IsClosed());
-    BOOST_CHECK(cli->ProbeSnapshot().registered >= 1);
+    BOOST_CHECK(cli->BindingStateSnapshot().registered >= 1);
 
     // Close：在途命令以 Closed 落定（首个逻辑终态）。
     cli->Close();
@@ -1625,40 +1718,50 @@ BOOST_AUTO_TEST_CASE(t_owner_close_physical_collect) {
     BOOST_CHECK(FdOpen(victim)); // 未被第二次 close 牵连（无双关）
     ::close(victim);
 
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     const auto totals_now = redis_detail::RedisBindingTotalsForTest();
     BOOST_TEST_MESSAGE("close totals: readers_created=" << totals_now.readers_created
         << " readers_freed=" << totals_now.readers_freed
         << " conns_created=" << totals_now.conns_created
         << " conns_destroyed=" << totals_now.conns_destroyed);
     BOOST_CHECK_EQUAL(totals_now.readers_created, totals_now.readers_freed);
+#endif
 
-    // 物理收口不依赖 owner 批次退出；登记归零和 IsClosed 不保证晚到计数已发布。
+    // 物理收口不依赖 owner 批次退出：真实状态「已登记请求归零」在两种构建都成立。
     BOOST_REQUIRE(WaitUntil([&] {
-        const auto s = cli->ProbeSnapshot();
-        return s.registered == 0 && s.dial_inflight == 0;
+        return cli->BindingStateSnapshot().registered == 0;
     }));
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+    BOOST_REQUIRE(WaitUntil([&] { return cli->ProbeSnapshot().dial_inflight == 0; }));
+#endif
     BOOST_REQUIRE(WaitUntil([&] { return cli->IsClosed(); }));
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     // owner 恢复后才记录晚到终态被拒；独立有界等待，不推迟上面的物理收口检查。
     BOOST_REQUIRE(WaitUntil([&] { return cli->ProbeSnapshot().finish_conflicts >= 1; }));
     const auto after = cli->ProbeSnapshot();
     BOOST_CHECK(after.finish_conflicts >= 1); // 晚到终态被拒
+#endif
     BOOST_CHECK(out->error().code == ErrorCode::Closed); // 首发终态不被晚到者覆盖
 
     // 收口配对：释放测试侧最后引用后 conn 创建/释放恰好配对。
     tcp.reset();
     cli.reset();
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_REQUIRE(WaitUntil([&] {
         const auto t = redis_detail::RedisBindingTotalsForTest();
         return t.conns_created == t.conns_destroyed;
     }));
     const auto totals2 = redis_detail::RedisBindingTotalsForTest();
     BOOST_CHECK_EQUAL(totals2.readers_created, totals2.readers_freed);
+#endif
 }
 
 // 重复/并发 Close：无 UAF、无死锁；物理收口恰好一次（fd 关一次、reader 释放配对）。
 BOOST_AUTO_TEST_CASE(t_repeated_and_concurrent_close) {
     BOOST_REQUIRE(g_prepared.load());
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     redis_detail::ResetRedisBindingTotalsForTest();
+#endif
 
     RawPeer peer(ReadThenHold(3000));
     auto    c = NewCotcpClient("127.0.0.1", peer.port);
@@ -1670,9 +1773,12 @@ BOOST_AUTO_TEST_CASE(t_repeated_and_concurrent_close) {
     auto cli = std::move(c).value();
 
     std::optional<result<void>> out;
+    std::atomic_bool            ready{false};
     bool                        succ = false;
-    g_scheduler->RegistCoroutineTask([&] { out.emplace(cli->Ping(Opt(30000))); },
-                                     succ);
+    g_scheduler->RegistCoroutineTask([&] {
+        out.emplace(cli->Ping(Opt(30000)));
+        ready.store(true, std::memory_order_release);
+    }, succ);
     BOOST_REQUIRE(succ);
     BOOST_REQUIRE(WaitUntil([&] { return peer.BytesRead() > 0; }));
     auto tcp = cli->TransportForTest();
@@ -1693,7 +1799,7 @@ BOOST_AUTO_TEST_CASE(t_repeated_and_concurrent_close) {
                 cli->Close();
             if (cli->IsClosed())
                 callers_closed.fetch_add(1);
-            if (tcp->IsClosed() && cli->ProbeSnapshot().registered == 0)
+            if (tcp->IsClosed() && cli->BindingStateSnapshot().registered == 0)
                 callers_phys_closed.fetch_add(1);
         });
     }
@@ -1714,19 +1820,28 @@ BOOST_AUTO_TEST_CASE(t_repeated_and_concurrent_close) {
     ::close(victim);
 
     BOOST_REQUIRE(WaitUntil([&] { return cli->IsClosed(); }));
+
+    // 完成握手：在途 Ping 协程按引用写本用例栈上的 out/cli；Close 只保证资源收口，
+    // 不承诺调用方所有挂起协程已归来，故必须先等该协程归还，再释放测试侧最后引用。
+    BOOST_REQUIRE(WaitUntil([&] { return ready.load(std::memory_order_acquire); }));
+    BOOST_REQUIRE(out);
+    BOOST_REQUIRE(!*out);
+    BOOST_CHECK(out->error().code == ErrorCode::Closed); // Close 落定在途命令
+
+    tcp.reset();
+    cli.reset();
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     const auto totals = redis_detail::RedisBindingTotalsForTest();
     BOOST_TEST_MESSAGE("repeated-close totals: readers_created=" << totals.readers_created
         << " readers_freed=" << totals.readers_freed
         << " conns_created=" << totals.conns_created
         << " conns_destroyed=" << totals.conns_destroyed);
     BOOST_CHECK_EQUAL(totals.readers_created, totals.readers_freed);
-
-    tcp.reset();
-    cli.reset();
     BOOST_REQUIRE(WaitUntil([&] {
         const auto t = redis_detail::RedisBindingTotalsForTest();
         return t.conns_created == t.conns_destroyed;
     }));
+#endif
 }
 
 // F-1 DNS 段界限：主机名 dial 在途时 Close——封口后不再发起 socket/connect（对象
@@ -1738,7 +1853,9 @@ BOOST_AUTO_TEST_CASE(t_b1_close_during_inflight_dial_hostname) {
 
     BlackholeDial hole;
     const auto    sockets_before = CountSocketFds();
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     redis_detail::ResetRedisBindingTotalsForTest();
+#endif
 
     auto c = NewCotcpClient("localhost", hole.port, /*connect=*/false);
     BOOST_REQUIRE(c);
@@ -1746,14 +1863,15 @@ BOOST_AUTO_TEST_CASE(t_b1_close_during_inflight_dial_hostname) {
 
     std::optional<result<void>> out;
     std::atomic_bool            ready{false};
+    DialWaitProbe dial;
+    dial.Install(cli);
     bool                        succ = false;
     g_scheduler->RegistCoroutineTask([&] {
         out.emplace(cli->Connect(Opt(30000)));
         ready.store(true, std::memory_order_release);
     }, succ);
     BOOST_REQUIRE(succ);
-    BOOST_REQUIRE(WaitUntil([&] { return cli->ProbeSnapshot().dial_inflight == 1; }));
-    SleepMs(50);
+    BOOST_REQUIRE(dial.Wait());
 
     cli->Close();
 
@@ -1770,9 +1888,11 @@ BOOST_AUTO_TEST_CASE(t_b1_close_during_inflight_dial_hostname) {
     // Close 打断在途 dial：Connect 以 Closed 落定（dial 等待段被封口唤醒）。
     BOOST_CHECK(out->error().code == ErrorCode::Closed);
 
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     const auto totals = redis_detail::RedisBindingTotalsForTest();
     BOOST_CHECK_EQUAL(totals.commands_encoded, 0u);
     BOOST_CHECK_EQUAL(totals.write_rounds, 0u);
+#endif
 
     // 协程恢复后内部 dup 释放，进程级 socket 数回基线。
     BOOST_REQUIRE(WaitUntil([&] { return CountSocketFds() <= sockets_before; }));
@@ -1781,7 +1901,8 @@ BOOST_AUTO_TEST_CASE(t_b1_close_during_inflight_dial_hostname) {
 // B1：Close 必须覆盖在途 DialTCP。
 //
 // 确定性复现：对端 accept 队列被填满 ⇒ 新 connect 在内核里挂起 ⇒ owner 协程真实
-// 挂在 DialTCP 的 connect 等待上（dial_inflight==1 是可观察落点，非时序猜测）。
+// 挂在 DialTCP 的 connect 等待上（connect 等待段真实挂起接缝 dial.Wait() 是
+// 可观察落点，非时序猜测、非 has_conn 占位）。
 // 此时 Close：封口 owner 级 dial 等待登记打断 connect ⇒ Dial 以 Closed 返回且不留
 // fd；不编码、不发送任何字节。
 BOOST_AUTO_TEST_CASE(t_b1_close_during_inflight_dial) {
@@ -1789,11 +1910,16 @@ BOOST_AUTO_TEST_CASE(t_b1_close_during_inflight_dial) {
 
     BlackholeDial hole;
     const auto    sockets_before = CountSocketFds();
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     redis_detail::ResetRedisBindingTotalsForTest();
+#endif
 
     auto c = NewCotcpClient("127.0.0.1", hole.port, /*connect=*/false);
     BOOST_REQUIRE(c);
     auto cli = std::move(c).value();
+
+    DialWaitProbe dial;
+    dial.Install(cli);
 
     std::optional<result<void>> out;
     std::atomic_bool            ready{false};
@@ -1804,16 +1930,22 @@ BOOST_AUTO_TEST_CASE(t_b1_close_during_inflight_dial) {
     }, succ);
     BOOST_REQUIRE(succ);
 
-    BOOST_REQUIRE(WaitUntil([&] { return cli->ProbeSnapshot().dial_inflight == 1; }));
-    SleepMs(50);
+    BOOST_REQUIRE(dial.Wait());
     const auto sockets_during = CountSocketFds();
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     const auto during = cli->ProbeSnapshot();
     BOOST_TEST_MESSAGE("b1(dial-inflight) fillers=" << hole.FillerCount()
         << " dial_attempts=" << during.dial_attempts
         << " dial_inflight=" << during.dial_inflight
-        << " has_conn=" << during.has_conn
+        << " has_conn=" << cli->BindingStateSnapshot().has_conn
         << " command_returned=" << ready.load());
     BOOST_REQUIRE_EQUAL(during.dial_inflight, 1u);
+#else
+    // Release 面：dial 在途前提由 dial.Wait()（connect 等待段真实挂起接缝）证明；
+    // has_conn 由 PublishSlot 在 Dial 之前发布，不作为 dial 在途证据。
+    BOOST_TEST_MESSAGE("b1(dial-inflight) fillers=" << hole.FillerCount()
+        << " command_returned=" << ready.load());
+#endif
     // dial 未返回 ⇒ 尚未发布任何 CoTCP；此时候选 fd 已建立并在 connect 等待中。
     BOOST_CHECK(cli->TransportForTest() == nullptr);
     BOOST_CHECK(!ready.load());
@@ -1832,8 +1964,8 @@ BOOST_AUTO_TEST_CASE(t_b1_close_during_inflight_dial) {
     // 至多协程内部 dup 一个残留；相对 dial 挂起中至少收回候选 fd 一个。
     BOOST_CHECK(sockets_after <= sockets_before + 1);
     BOOST_CHECK(sockets_during > sockets_after);
-    BOOST_CHECK(cli->ProbeSnapshot().conn_closed);
-    BOOST_CHECK_EQUAL(cli->ProbeSnapshot().registered, 0u);
+    BOOST_CHECK(cli->BindingStateSnapshot().conn_closed);
+    BOOST_CHECK_EQUAL(cli->BindingStateSnapshot().registered, 0u);
     BOOST_CHECK(cli->IsClosed());
     // 双关哨兵：Close 未把候选 fd 号二次 close 到新 socket 上。
     {
@@ -1849,6 +1981,7 @@ BOOST_AUTO_TEST_CASE(t_b1_close_during_inflight_dial) {
     BOOST_CHECK(out->error().code == ErrorCode::Closed);
     BOOST_CHECK(cli->ConnectStatus() == ConnectState::Closed);
 
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     const auto totals = redis_detail::RedisBindingTotalsForTest();
     BOOST_TEST_MESSAGE("b1(dial-inflight) after: conns_broken="
         << cli->ProbeSnapshot().conns_broken
@@ -1859,6 +1992,7 @@ BOOST_AUTO_TEST_CASE(t_b1_close_during_inflight_dial) {
     BOOST_CHECK_EQUAL(totals.commands_encoded, 0u);
     BOOST_CHECK_EQUAL(totals.write_rounds, 0u);
     BOOST_CHECK_EQUAL(totals.read_rounds, 0u);
+#endif
     BOOST_CHECK_EQUAL(hole.FillerCount(), 32u);
 
     // 协程恢复后内部 dup 释放，进程级 socket 数回基线（运行时伪影，非对象资源）。
@@ -1866,12 +2000,14 @@ BOOST_AUTO_TEST_CASE(t_b1_close_during_inflight_dial) {
 
     // 收口配对：释放测试侧最后一引用后，conn/reader 创建与释放恰好配对。
     cli.reset();
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_REQUIRE(WaitUntil([&] {
         const auto t = redis_detail::RedisBindingTotalsForTest();
         return t.conns_created == t.conns_destroyed;
     }));
     const auto totals2 = redis_detail::RedisBindingTotalsForTest();
     BOOST_CHECK_EQUAL(totals2.readers_created, totals2.readers_freed);
+#endif
 }
 
 // B1 的另一半：DialTCP 已成功、尚未编码的瞬间关闭到达。测试接缝在 Connect 内执行
@@ -1881,7 +2017,9 @@ BOOST_AUTO_TEST_CASE(t_b1_close_after_dial_no_encode_or_send) {
     BOOST_REQUIRE(g_prepared.load());
 
     RawPeer peer(NeverRead(1500));
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     redis_detail::ResetRedisBindingTotalsForTest();
+#endif
 
     auto c = NewCotcpClient("127.0.0.1", peer.port, /*connect=*/false);
     BOOST_REQUIRE(c);
@@ -1914,6 +2052,7 @@ BOOST_AUTO_TEST_CASE(t_b1_close_after_dial_no_encode_or_send) {
     BOOST_REQUIRE(!*out);
     BOOST_CHECK(out->error().code == ErrorCode::Closed);
 
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     const auto totals = redis_detail::RedisBindingTotalsForTest();
     BOOST_TEST_MESSAGE("b1(post-dial) commands_encoded=" << totals.commands_encoded
         << " write_rounds=" << totals.write_rounds
@@ -1921,6 +2060,7 @@ BOOST_AUTO_TEST_CASE(t_b1_close_after_dial_no_encode_or_send) {
         << " peer_bytes_read=" << peer.BytesRead());
     BOOST_CHECK_EQUAL(totals.commands_encoded, 0u);
     BOOST_CHECK_EQUAL(totals.write_rounds, 0u);
+#endif
     BOOST_CHECK_EQUAL(peer.BytesRead(), 0u);
     BOOST_REQUIRE(WaitAccepted(peer, 1));
 
@@ -1937,23 +2077,27 @@ BOOST_AUTO_TEST_CASE(t_b1_close_after_dial_no_encode_or_send) {
     ::close(victim);
 
     BOOST_REQUIRE(WaitUntil([&] { return cli->IsClosed(); }));
-    BOOST_CHECK(cli->ProbeSnapshot().conn_closed);
+    BOOST_CHECK(cli->BindingStateSnapshot().conn_closed);
 
     dialed_tcp.reset();
     cli.reset();
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_REQUIRE(WaitUntil([&] {
         const auto t = redis_detail::RedisBindingTotalsForTest();
         return t.conns_created == t.conns_destroyed;
     }));
     const auto totals2 = redis_detail::RedisBindingTotalsForTest();
     BOOST_CHECK_EQUAL(totals2.readers_created, totals2.readers_freed);
+#endif
 }
 
 // reconnect_on_new_command = true：故障之后的新命令允许一次新连接；已失败命令
 // 不重发，连接确实被重建（Accepted/dial_attempts 证据）。
 BOOST_AUTO_TEST_CASE(t_reconnect_new_command_true) {
     BOOST_REQUIRE(g_prepared.load());
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     redis_detail::ResetRedisBindingTotalsForTest();
+#endif
 
     auto conn_idx = std::make_shared<std::atomic<int>>(0);
     RawPeer peer([conn_idx](const std::shared_ptr<PeerState>& st, int c) {
@@ -1985,7 +2129,9 @@ BOOST_AUTO_TEST_CASE(t_reconnect_new_command_true) {
 
     // 新命令建了新连接；已失败命令未被重发（两条命令各发一次）。
     BOOST_CHECK_EQUAL(peer.Accepted(), 2);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_CHECK_EQUAL(cli->ProbeSnapshot().dial_attempts, 2);
+#endif
     BOOST_CHECK_EQUAL(peer.CommandsRead(), 2);
 
     cli->Close();
@@ -2010,7 +2156,9 @@ BOOST_AUTO_TEST_CASE(t_reconnect_dial_failure_exposed) {
     BOOST_REQUIRE(!*conn_out);
     BOOST_CHECK(conn_out->error().code == ErrorCode::TransportError);
     BOOST_CHECK(cli->ConnectStatus() == ConnectState::Failed);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_CHECK_EQUAL(cli->ProbeSnapshot().dial_attempts, 1u);
+#endif
 
     for (int i = 0; i < 3; ++i) {
         std::optional<result<void>> out;
@@ -2019,7 +2167,9 @@ BOOST_AUTO_TEST_CASE(t_reconnect_dial_failure_exposed) {
         BOOST_CHECK(out->error().code == ErrorCode::TransportError);
     }
     // 三次新命令 = 三次重建尝试（每条恰好一次，无后台循环）+ 首次 Connect = 4 次。
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_CHECK_EQUAL(cli->ProbeSnapshot().dial_attempts, 4u);
+#endif
     // 失败被暴露、不进入终态：仍可用显式 Connect 再试。
     BOOST_CHECK(cli->ConnectStatus() == ConnectState::Failed);
 
@@ -2079,7 +2229,8 @@ BOOST_AUTO_TEST_CASE(t_reconnect_only_for_new_commands_after_failure) {
     std::optional<result<void>>              second;
     bbt::core::thread::CountDownLatch        second_done{1};
     BOOST_REQUIRE(spawn_ping(cli, &second, &second_done, 8000));
-    BOOST_REQUIRE(WaitUntil([&] { return cli->ProbeSnapshot().queued >= 1; }, 8000));
+    // 真实状态同步：故障前提交的命令已入队（Release 面同样成立）。
+    BOOST_REQUIRE(WaitUntil([&] { return cli->BindingStateSnapshot().queued >= 1; }, 8000));
 
     // 触发故障：对端关闭连接 ⇒ 命令 1 读侧 EOF。
     release_close->store(true);
@@ -2103,7 +2254,9 @@ BOOST_AUTO_TEST_CASE(t_reconnect_only_for_new_commands_after_failure) {
 
     // 命令 2 从未发送：服务端只读到命令 1 与命令 3；拨号共 2 次（命令 1、命令 3）。
     BOOST_CHECK_EQUAL(peer.CommandsRead(), 2);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_CHECK_EQUAL(cli->ProbeSnapshot().dial_attempts, 2);
+#endif
     BOOST_CHECK_EQUAL(peer.Accepted(), 2);
 
     cli->Close();
@@ -2138,7 +2291,7 @@ BOOST_AUTO_TEST_CASE(t_close_inflight_isolated_synchronous) {
     // 同步门禁（不 WaitUntil）：Close 返回当刻物理收口与逻辑收口均已成立。
     BOOST_CHECK(cli->IsClosed());
     BOOST_CHECK(tcp->IsClosed());
-    BOOST_CHECK_EQUAL(cli->ProbeSnapshot().registered, 0u);
+    BOOST_CHECK_EQUAL(cli->BindingStateSnapshot().registered, 0u);
 
     // 在途命令以 Closed 落定。
     BOOST_REQUIRE(WaitUntil([&] { return ready.load(std::memory_order_acquire); }));

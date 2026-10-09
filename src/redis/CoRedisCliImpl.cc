@@ -27,8 +27,9 @@ Error ClosedError() {
 
 } // namespace
 
+#ifdef BBT_INFRA_STRINGENT_DEBUG
 RedisBindingTotals RedisBindingTotalsForTest() noexcept {
-    const auto& c = BindingCounters();
+    const auto& c = debug::RedisCotcpBindingCounters();
     RedisBindingTotals t;
     t.readers_created     = c.readers_created.load();
     t.readers_freed       = c.readers_freed.load();
@@ -44,7 +45,10 @@ RedisBindingTotals RedisBindingTotalsForTest() noexcept {
     return t;
 }
 
-void ResetRedisBindingTotalsForTest() noexcept { ResetBindingCounters(); }
+void ResetRedisBindingTotalsForTest() noexcept {
+    debug::ResetRedisCotcpBindingCounters();
+}
+#endif
 
 CoRedisCliImpl::~CoRedisCliImpl() {
     // 析构只做兜底：正常路径的连接已在 owner coroutine / Close 中收口。
@@ -159,10 +163,14 @@ result<void> CoRedisCliImpl::EstablishConn(const CallOptions& options) {
     // 上一代际收口（正常为空：Disconnect/Close 已摘槽）。
     SealAndCloseSlot(std::move(old_conn), std::move(old_waiters));
 
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     m_probe->dial_attempts.fetch_add(1);
     m_probe->dial_inflight.fetch_add(1);
-    auto dial = fresh->Dial(options, waiters);
+#endif
+    auto dial = fresh->Dial(options, waiters, m_dial_wait_gate_for_test);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     m_probe->dial_inflight.fetch_sub(1);
+#endif
 
     if (!dial) {
         auto err = std::move(dial).error();
@@ -299,8 +307,12 @@ result<RawReply> CoRedisCliImpl::Submit(RedisOp::Kind   kind,
     if (!pre)
         return result<RawReply>::err(std::move(pre).error());
 
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     auto op   = std::make_shared<RedisOp>(m_probe, kind, std::move(args),
                                               options);
+#else
+    auto op   = std::make_shared<RedisOp>(kind, std::move(args), options);
+#endif
     op->waiter = bbt::coroutine::sync::CoWaiter::Create();
     if (!op->waiter)
         return result<RawReply>::err(MakeError(ErrorCode::InternalError,
@@ -473,7 +485,9 @@ result<std::uint64_t> CoRedisCliImpl::Delete(
 // ---------------- owner coroutine（独占执行域）----------------
 
 void CoRedisCliImpl::RunOwnerCoroutine() {
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     m_probe->owner_runs.fetch_add(1);
+#endif
     for (;;) {
         auto op = TakeNextQueued();
         if (!op) {
@@ -520,7 +534,9 @@ std::shared_ptr<RedisOp> CoRedisCliImpl::TakeNextQueued() {
         }
         if (op->finished.load()) {
             // 已由 deadline/关闭落定：只做簿记，不接触后端。
+#ifdef BBT_INFRA_STRINGENT_DEBUG
             m_probe->skipped_after_finish.fetch_add(1);
+#endif
             op->phase.store(RedisOp::Phase::kDone);
             RetireOp(op);
             continue;
@@ -540,7 +556,9 @@ void CoRedisCliImpl::RetireOp(const std::shared_ptr<RedisOp>& op) {
 void CoRedisCliImpl::FailConnAndDrainQueue() noexcept {
     // 1) 连接故障线性化：摘除并物理收口当前连接（推进代际，使迟到 Dial 完成不得
     //    改写新状态），标记不可复用。连接对象不再留在槽内。
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     m_probe->conns_broken.fetch_add(1);
+#endif
     std::shared_ptr<RedisCotcpConn>       conn;
     std::shared_ptr<detail::CloseWaiters> waiters;
     TakeSlot(&conn, &waiters);
@@ -764,6 +782,10 @@ void CoRedisCliImpl::SetPreAdmitGateForTest(std::function<void()> gate) {
     m_pre_admit_gate_for_test = std::move(gate);
 }
 
+void CoRedisCliImpl::SetDialWaitEntryGateForTest(std::function<void()> gate) {
+    m_dial_wait_gate_for_test = std::move(gate);
+}
+
 bool CoRedisCliImpl::IsIoDead() const {
     std::lock_guard<std::mutex> lk(m_q_mtx);
     return m_io_dead;
@@ -800,14 +822,8 @@ void CoRedisCliImpl::DrainCheckClosed() noexcept {
 
 // ---------------- 探针 ----------------
 
-RedisBindingSnapshot CoRedisCliImpl::ProbeSnapshot() const {
+RedisBindingSnapshot CoRedisCliImpl::BindingStateSnapshot() const {
     RedisBindingSnapshot s;
-    s.owner_runs           = m_probe->owner_runs.load();
-    s.finish_conflicts     = m_probe->finish_conflicts.load();
-    s.skipped_after_finish = m_probe->skipped_after_finish.load();
-    s.dial_attempts        = m_probe->dial_attempts.load();
-    s.dial_inflight        = m_probe->dial_inflight.load();
-    s.conns_broken         = m_probe->conns_broken.load();
     {
         std::lock_guard<std::mutex> lk(m_q_mtx);
         s.queued = m_queue.size();
@@ -824,6 +840,19 @@ RedisBindingSnapshot CoRedisCliImpl::ProbeSnapshot() const {
     }
     return s;
 }
+
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+debug::RedisProbeSnapshot CoRedisCliImpl::ProbeSnapshot() const {
+    debug::RedisProbeSnapshot s;
+    s.owner_runs           = m_probe->owner_runs.load();
+    s.finish_conflicts     = m_probe->finish_conflicts.load();
+    s.skipped_after_finish = m_probe->skipped_after_finish.load();
+    s.dial_attempts        = m_probe->dial_attempts.load();
+    s.dial_inflight        = m_probe->dial_inflight.load();
+    s.conns_broken         = m_probe->conns_broken.load();
+    return s;
+}
+#endif
 
 void CoRedisCliImpl::SetPostDialGateForTest(std::function<void()> gate) {
     m_post_dial_gate_for_test = std::move(gate);

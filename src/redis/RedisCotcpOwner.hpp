@@ -26,6 +26,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -35,35 +36,15 @@
 #include <bbt/infra/CoTCP.hpp>
 #include <bbt/infra/Result.hpp>
 
+#include "debug/InfraDebug.hpp"   // 纯观测数据集中层（仅 Debug 展开）
 #include "detail/IoSupport.hpp"
 #include "redis/RedisDetail.hpp"
 
 namespace bbt::infra::redis_detail {
 
-// 单连接上的 hiredis 调用观测：同步性（单次最长耗时）与 I/O 轮数。
-struct HiredisSyncStats {
-    std::uint64_t calls{0};        // hiredis 同步调用次数
-    std::uint64_t max_call_ns{0};  // 单次最长耗时（证明库内无等待）
-    std::uint64_t write_rounds{0}; // WriteAllBytes 实际写次数（>1 即部分写/WouldBlock）
-    std::uint64_t read_rounds{0};  // ReadReply 实际读次数
-};
-
-// 进程级计数（跨连接）：测试用于断言 reader 创建/释放恰好配对、无库内等待。
-struct CotcpBindingCounters {
-    std::atomic<std::uint64_t> readers_created{0};
-    std::atomic<std::uint64_t> readers_freed{0};
-    std::atomic<std::uint64_t> conns_created{0};
-    std::atomic<std::uint64_t> conns_destroyed{0};
-    std::atomic<std::uint64_t> hiredis_calls{0};
-    std::atomic<std::uint64_t> hiredis_max_call_ns{0};
-    std::atomic<std::uint64_t> commands_encoded{0};
-    std::atomic<std::uint64_t> write_rounds{0};
-    std::atomic<std::uint64_t> read_rounds{0};
-    std::atomic<std::uint64_t> partial_write_ops{0}; // 出现 >1 轮的写操作数
-    std::atomic<std::uint64_t> partial_read_ops{0};  // 出现 >1 轮的读操作数
-};
-CotcpBindingCounters& BindingCounters() noexcept;
-void ResetBindingCounters() noexcept;
+// 单连接 hiredis 观测（HiredisSyncStats）与进程级 cotcp binding 计数
+// （RedisCotcpCounters）已集中到 src/debug/InfraDebug.hpp；只在
+// BBT_INFRA_STRINGENT_DEBUG 打开时存在，Release 无任何相关符号/原子写。
 
 class RedisCotcpConn : public std::enable_shared_from_this<RedisCotcpConn> {
 public:
@@ -78,8 +59,12 @@ public:
     // 建连：经 owner 装配面 CoTCP::DialTCP（DNS/connect/等待/关闭唤醒由 CoTCP 承担）。
     // dial_waiters 为本连接所属 owner 的关闭唤醒登记：Close() 封口它即可打断在途
     // connect 等待，使 Dial 尽快走错误返回（不再有取消令牌）。
+    // connect_wait_registered：可选测试接缝——受管 dial 的 connect 等待段在
+    // 协程真正挂起后回调一次（转发给 DialWaitOptions::connect_on_registered）。
+    // 生产路径默认空 ⇒ 零开销。不得取锁/阻塞（在 scheduler 恢复路径执行）。
     result<void> Dial(const CallOptions& options,
-                      const std::shared_ptr<detail::CloseWaiters>& dial_waiters);
+                      const std::shared_ptr<detail::CloseWaiters>& dial_waiters,
+                      std::function<void()> connect_wait_registered = {});
     // RESP2 命令编码：hiredis 同步调用，无任何 I/O。
     static result<std::string> EncodeCommand(int argc, const char** argv,
                                              const size_t* argvlen);
@@ -106,12 +91,17 @@ public:
 
     bool                    Dialed() const noexcept;
     tcp::CoTCP::SPtr        Transport() const noexcept;
-    const HiredisSyncStats& SyncStats() const noexcept { return m_stats; }
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+    // 单连接 hiredis 同步调用观测（仅内部 debug 层开启时存在；Release 无此接口）。
+    const debug::HiredisSyncStats& SyncStats() const noexcept { return m_stats; }
+#endif
     bool                    Broken() const noexcept { return m_broken; }
     void                    MarkBroken() noexcept { m_broken = true; }
 
 private:
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     void NoteCall(std::uint64_t ns) noexcept;
+#endif
     void FreeReader() noexcept;
 
     std::string      m_host;
@@ -125,7 +115,9 @@ private:
     mutable std::mutex m_reader_mtx;
     redisReader*       m_reader{nullptr};   // m_reader_mtx
     bool               m_broken{false};
-    HiredisSyncStats   m_stats;
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+    debug::HiredisSyncStats m_stats;
+#endif
     char               m_read_buf[8192];
 };
 

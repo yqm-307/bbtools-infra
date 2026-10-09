@@ -13,7 +13,7 @@ add_library(bbt::infra_http ALIAS bbt_infra_http)
 
 target_include_directories(bbt_infra_http PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(bbt_infra_http
-    PUBLIC  bbt::infra_common
+    PUBLIC  bbt::infra_common bbt::infra_internal_debug
     PRIVATE Boost::boost Threads::Threads)
 target_compile_options(bbt_infra_http PRIVATE -Wall -Wextra)
 
@@ -99,7 +99,7 @@ if(BBT_HIREDIS_PREFIX)
     # tcp 依赖是**实现细节**，不得经 Redis 公共接口/安装接口传播，故为 PRIVATE
     # （静态库消费者仍由 CMake 的 LINK_ONLY 传递完成最终链接）。
     target_link_libraries(bbt_infra_redis
-        PUBLIC  bbt::infra_common
+        PUBLIC  bbt::infra_common bbt::infra_internal_debug
         PRIVATE bbt::infra_tcp Boost::boost Threads::Threads hiredis::hiredis)
     target_compile_options(bbt_infra_redis PRIVATE -Wall -Wextra)
 else()
@@ -125,7 +125,7 @@ if(BBT_MONGOCXX_PREFIX)
 
     target_include_directories(bbt_infra_mongo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(bbt_infra_mongo
-        PUBLIC  bbt::infra_common
+        PUBLIC  bbt::infra_common bbt::infra_internal_debug
         PRIVATE Boost::boost Threads::Threads mongo::mongocxx_shared)
     target_compile_options(bbt_infra_mongo PRIVATE -Wall -Wextra)
 else()

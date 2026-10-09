@@ -11,6 +11,32 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# --- 内部 debug 观测层开关（PR #70 review 整改）--------------------------------
+# 与 bbtools-coroutine 的 STRINGENT_DEBUG（其 add_definitions）对齐，但修正两处
+# review 指出的边界：
+#   1) 配置边界：宏只在 **Debug 配置** 生效。用生成器表达式 $<CONFIG:Debug> 固化，
+#      单/多配置生成器一致；Release（及任何非 Debug 配置）结构上不可能带上该宏
+#      ⇒ 结构上零开销，不依赖使用者记得关 option，也不会「只开 option 就让 Release
+#      带宏还宣称零开销」。option 只作为 Debug 下的显式开关。
+#   2) 传播机制：用目标级 INTERFACE compile definition（经 bbt::infra_internal_debug
+#      这一 INTERFACE 库）随链接接口传播，而不是目录级 add_compile_definitions
+#      （后者是目录属性，不随 target/链接接口传播，无法保证外部 add_subdirectory
+#      父级或链接消费者与库 TU 的宏取值一致 ⇒ 潜在 ODR/ABI 混配）。只有真正链接
+#      该 INTERFACE 的三个模块库及其内部测试消费者拿到宏，不污染无关 target。
+option(BBT_INFRA_STRINGENT_DEBUG
+    "启用 bbtools-infra 内部 debug 观测层（仅 Debug 配置定义宏）" OFF)
+add_library(bbt_infra_internal_debug INTERFACE)
+add_library(bbt::infra_internal_debug ALIAS bbt_infra_internal_debug)
+if(BBT_INFRA_STRINGENT_DEBUG)
+    target_compile_definitions(bbt_infra_internal_debug INTERFACE
+        $<$<CONFIG:Debug>:BBT_INFRA_STRINGENT_DEBUG>)
+    message(STATUS
+        "bbtools-infra: 内部 debug 观测层已启用（仅 Debug 配置定义 "
+        "BBT_INFRA_STRINGENT_DEBUG）")
+else()
+    message(STATUS "bbtools-infra: 内部 debug 观测层已关闭（BBT_INFRA_STRINGENT_DEBUG=OFF）")
+endif()
+
 # 公共契约头库：header-only，向外暴露 include/
 add_library(bbt_infra_common INTERFACE)
 add_library(bbt::infra_common ALIAS bbt_infra_common)

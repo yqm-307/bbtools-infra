@@ -48,6 +48,16 @@ HttpSession::HttpSession(std::shared_ptr<HttpServerImpl> srv,
       socket(std::move(sock)),
       deadline_timer(server->Engine()->Io()) {}
 
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+HttpSession::~HttpSession() {
+    // issue #62 验收第 5 项：析构即向独立观测组件 debug/InfraDebug.hpp 上报。
+    // m_sessions 只保存裸指针，正常路径下 MaybeRelease 已在 Close（io 域门内、
+    // inflight 归零时）反登记，故 registered 必为 false。仅在
+    // BBT_INFRA_STRINGENT_DEBUG 下存在：Release 无此析构、无计数写入、无符号。
+    debug::OnHttpSessionDestroyed(registered);
+}
+#endif
+
 void HttpSession::Start() {
     std::lock_guard<std::recursive_mutex> io_gate(server->Engine()->IoGate());
     server->RegisterSession(this);

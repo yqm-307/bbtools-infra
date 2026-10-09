@@ -31,6 +31,15 @@
 // 归零；driver 同步调用不可强杀，超过 kCloseDrainTimeout 的配置下 Close 提前
 // 返回、IsClosed() 在 driver 返回后才成立。用例统一经 CloseClientDrained()
 // 在有界窗口内确认真实收口。
+//
+// 两个验证面（观测数据已迁入 src/debug/InfraDebug.hpp）：
+//   Debug 面（BBT_INFRA_STRINGENT_DEBUG=ON）— 追加 debug 观测断言：运行中
+//     driver 调用计数/峰值（并发上限）、执行域取证（同一次调用
+//     acquire/use/release 同 worker）、以及「逻辑返回≠物理收口」的在途计数；
+//   Release 面（宏 OFF）— debug 组件与本用例的 debug 访问器根本不存在。用例
+//     退回真实生产状态与结果断言：LiveWorkersForTest() 、QueuedOpsForTest()
+//     （真实队列深度，用作同步）、IsClosed()、错误码、结果计数。故关掉宏不会
+//     让任何用例恒过。同步点一律用真实事件（队列深度/结果闩），不用 sleep。
 
 #define BOOST_TEST_DYN_LINK
 #define BOOST_TEST_MAIN
@@ -60,9 +69,15 @@
 
 #include <bbt/infra/CoMongoCli.hpp>
 
-// impl 观测钩子（LiveWorkersForTest/RunningDriverCallsForTest/
-// PeakDriverCallsForTest）用于 worker 并发上限与「逻辑返回≠物理
-// 收口」的确定性核验；MongoRuntime 是 Issue #40 的资源 owner。
+// impl 观测钩子分两类：
+//   - 真实生产状态（Release 下同样可用）：LiveWorkersForTest /
+//     QueuedOpsForTest（读 m_live_workers / m_queue）；
+//   - debug 观测层（src/debug/InfraDebug.hpp，仅 BBT_INFRA_STRINGENT_DEBUG
+//     下存在）：RunningDriverCallsForTest / PeakDriverCallsForTest /
+//     LastDriverThreadEvidenceForTest。
+// 各用例按「Debug 面（宏 ON，追加观测断言）/ Release 面（宏 OFF，退回真实
+// 状态与结果断言，不得恒过）」两面组织，见用例内 #ifdef。MongoRuntime 是
+// Issue #40 的资源 owner。
 #include "mongo/MongoRuntime.hpp"
 
 // Issue #12 M4：直接经真实 driver 构造非法 URI，核对 ClassifyDriverError
@@ -486,8 +501,10 @@ BOOST_AUTO_TEST_CASE(t_server_unreachable) {
 
 BOOST_AUTO_TEST_CASE(t_capacity_overloaded) {
     // worker_threads=1、max_queue=2：先提交的 op 在不可达地址的 server
-    // selection 中占住唯一 worker（RunningDriverCalls==1 为确定性证据），
-    // 随后 2 个 op 占满队列，第 4 个确定性 Overloaded。
+    // selection 中占住唯一 worker，随后 2 个 op 占满队列，第 4 个确定性
+    // Overloaded。同步点用真实队列状态（不 sleep）：提交前两个 op 后，
+    // 接纳队列深度稳定为 1 ⇔ 恰有 1 个已被 worker 取出进入 driver、1 个
+    // 仍在排队——两构建面均可用。
     auto c = NewClient(MakeDeadCfg(1, 2, 8000));
     BOOST_REQUIRE(c);
     auto cli = std::move(c).value();
@@ -509,17 +526,22 @@ BOOST_AUTO_TEST_CASE(t_capacity_overloaded) {
     };
 
     submit(30000);
-    BOOST_REQUIRE(WaitUntil(
-        [&] { return impl->RunningDriverCallsForTest() == 1; }, 10000));
     submit(30000);
+    // 真实状态同步：1 个被 worker 占用（phase==kRunning）、1 个排队，
+    // 队列深度稳定为 1。
+    BOOST_REQUIRE(WaitUntil(
+        [&] { return impl->DriverCallsInFlightForTest() == 1 &&
+                     impl->QueuedOpsForTest() == 1; }, 10000));
     submit(30000);
     submit(30000);
 
     // 恰好 1 个 Overloaded：1 在 driver 中 + 2 排队 = 容量占满，第 4 被拒。
     BOOST_REQUIRE(WaitUntil([&] { return overloaded.load() == 1; }, 10000));
     BOOST_CHECK_EQUAL(overloaded.load(), 1);
-    // 运行中 driver 调用峰值不超 worker_threads。
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+    // 运行中 driver 调用峰值不超 worker_threads（debug 观测）。
     BOOST_CHECK(impl->PeakDriverCallsForTest() <= 1);
+#endif
 
     cli->Close();
     BOOST_REQUIRE(WaitUntil([&] { return done.load() == 4; }, 30000));
@@ -527,7 +549,11 @@ BOOST_AUTO_TEST_CASE(t_capacity_overloaded) {
 
     BOOST_REQUIRE(cli->IsClosed());
     BOOST_CHECK(cli->IsClosed());
+    // 真实生产状态：worker 全退（Release 面同样成立）。
+    BOOST_CHECK_EQUAL(impl->LiveWorkersForTest(), 0);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_CHECK_EQUAL(impl->RunningDriverCallsForTest(), 0);
+#endif
 }
 
 BOOST_AUTO_TEST_CASE(t_deadline_only) {
@@ -536,9 +562,8 @@ BOOST_AUTO_TEST_CASE(t_deadline_only) {
     auto cli = std::move(c).value();
     auto impl = ImplOf(cli);
 
-    // deadline 500ms：先确认 op 已进入 server selection（running==1，
-    // 确定性观测），再断言逻辑 TimedOut 返回且物理调用仍在进行——
-    // 逻辑返回不冒充物理收口。
+    // deadline 500ms：out_ready 结果闩自同步——FindOne 返回即证明逻辑终态
+    // 已交付（且该逻辑返回发生在其物理 driver 调用仍在进行时）。
     std::optional<result<std::optional<MongoDocument>>> out;
     std::atomic_bool out_ready{false};
     bool succ0 = false;
@@ -549,21 +574,30 @@ BOOST_AUTO_TEST_CASE(t_deadline_only) {
         },
         succ0);
     BOOST_REQUIRE(succ0);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+    // Debug 面：先确认 op 已进入 server selection（running==1 确定性观测）。
     BOOST_REQUIRE(WaitUntil(
         [&] { return impl->RunningDriverCallsForTest() == 1; }, 10000));
+#endif
     BOOST_REQUIRE(WaitUntil(
         [&] { return out_ready.load(std::memory_order_acquire); }));
     BOOST_REQUIRE(!*out);
     BOOST_CHECK(out->error().code == ErrorCode::TimedOut);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+    // 逻辑返回后物理 driver 调用仍在进行——逻辑返回不冒充物理收口。
     BOOST_CHECK_EQUAL(impl->RunningDriverCallsForTest(), 1);
+#endif
 
     // Close：首个逻辑终态（TimedOut）不被晚到的关闭覆盖；物理调用继续到
-    // driver 超时，收口后 IsClosed 成立、运行中调用归零。
+    // driver 超时，收口后 IsClosed 成立、worker 全退。
     cli->Close();
     BOOST_REQUIRE(!*out);
     BOOST_CHECK(out->error().code == ErrorCode::TimedOut);
     BOOST_REQUIRE(cli->IsClosed());
+    BOOST_CHECK_EQUAL(impl->LiveWorkersForTest(), 0);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_CHECK_EQUAL(impl->RunningDriverCallsForTest(), 0);
+#endif
 }
 
 BOOST_AUTO_TEST_CASE(t_close_during_inflight) {
@@ -584,9 +618,16 @@ BOOST_AUTO_TEST_CASE(t_close_during_inflight) {
         },
         succ);
     BOOST_REQUIRE(succ);
-    // 等 op 真正进入 driver 调用（确定性观测，不 sleep 猜时序）。
+    // 前置同步（两构建面一致）：等该 op 已被 worker 从队列取出、进入执行槽
+    // （读既有 m_ops + phase==kRunning 真实状态，非新增观测计数），确保 Close
+    // 确实发生在在途处理期间，而非 op 仍在队列时（不靠 sleep 猜时序）。
+    BOOST_REQUIRE(WaitUntil(
+        [&] { return impl->DriverCallsInFlightForTest() == 1; }, 10000));
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+    // Debug 面追加：native driver 调用已在途（既有 RunningGuard 观测）。
     BOOST_REQUIRE(WaitUntil(
         [&] { return impl->RunningDriverCallsForTest() == 1; }, 10000));
+#endif
 
     cli->Close();
     BOOST_REQUIRE(WaitUntil(
@@ -598,7 +639,10 @@ BOOST_AUTO_TEST_CASE(t_close_during_inflight) {
     // 仍为 false」的旧有界窗口行为。
     BOOST_REQUIRE(cli->IsClosed());
     BOOST_CHECK(cli->IsClosed());
+    BOOST_CHECK_EQUAL(impl->LiveWorkersForTest(), 0);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_CHECK_EQUAL(impl->RunningDriverCallsForTest(), 0);
+#endif
 }
 
 BOOST_AUTO_TEST_CASE(t_worker_threads_bound) {
@@ -622,11 +666,16 @@ BOOST_AUTO_TEST_CASE(t_worker_threads_bound) {
             succ);
         BOOST_REQUIRE(succ);
     }
+    // 真实队列状态同步（Debug/Release 均可用）：2 worker + 4 在途 op ⇒
+    // 2 个已进入 driver、2 个排队，接纳队列深度稳定为 2。
     BOOST_REQUIRE(WaitUntil(
-        [&] { return impl->RunningDriverCallsForTest() == 2; }, 10000));
-    BOOST_CHECK(impl->RunningDriverCallsForTest() <= 2);
+        [&] { return impl->QueuedOpsForTest() == 2; }, 10000));
     BOOST_CHECK(all.WaitTimeout(30000) == 0);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+    // debug 观测：运行中 driver 调用峰值 ≤ worker_threads。
+    BOOST_CHECK(impl->RunningDriverCallsForTest() <= 2);
     BOOST_CHECK(impl->PeakDriverCallsForTest() <= 2);
+#endif
 
     CloseClientDrained(cli);
 }
@@ -790,12 +839,15 @@ std::shared_ptr<mongo_detail::MongoRuntime> RuntimeOf(
     return impl->Runtime();
 }
 
-// owner Close + 有界等待物理收口，并断言 worker/在途看板归零。
+// owner Close + 有界等待物理收口，并断言 worker 全退（真实生产状态，
+// Release 面同样成立）。Debug 面追加在途 driver 调用计数归零。
 void CloseOwnerAndDrain(const std::shared_ptr<mongo::CoMongoDb>& db,
                         const std::shared_ptr<mongo_detail::MongoRuntime>& rt) {
     db->Close();
     BOOST_REQUIRE(db->IsClosed());
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_CHECK_EQUAL(rt->RunningDriverCallsForTest(), 0);
+#endif
     BOOST_CHECK_EQUAL(rt->LiveWorkersForTest(), 0);
 }
 
@@ -852,9 +904,15 @@ BOOST_AUTO_TEST_CASE(t_owner_multi_handles_share_workers) {
             succ);
         BOOST_REQUIRE(succ);
     }
+    // 真实状态同步：3 在途 op、2 worker ⇒ 2 个被 worker 占用（phase==kRunning）、
+    // 1 个排队，队列深度稳定为 1（Debug/Release 均可用，读既有 state）。
     BOOST_REQUIRE(WaitUntil(
-        [&] { return rt->RunningDriverCallsForTest() == 2; }, 10000));
+        [&] { return rt->DriverCallsInFlightForTest() == 2 &&
+                     rt->QueuedOpsForTest() == 1; }, 10000));
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+    // debug 观测：无论集合句柄多少，运行中 driver 调用峰值 ≤ worker_threads。
     BOOST_CHECK(rt->PeakDriverCallsForTest() <= 2);
+#endif
     BOOST_CHECK_EQUAL(rt->LiveWorkersForTest(), 2);
 
     for (auto& h : handles)
@@ -863,7 +921,10 @@ BOOST_AUTO_TEST_CASE(t_owner_multi_handles_share_workers) {
     BOOST_REQUIRE(WaitUntil(
         [&] { return submitted.load() == 3; }, 30000));
     BOOST_REQUIRE(db->IsClosed());
+    BOOST_CHECK_EQUAL(rt->LiveWorkersForTest(), 0);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_CHECK_EQUAL(rt->RunningDriverCallsForTest(), 0);
+#endif
 }
 
 BOOST_AUTO_TEST_CASE(t_owner_thread_identity) {
@@ -885,8 +946,13 @@ BOOST_AUTO_TEST_CASE(t_owner_thread_identity) {
             [&] { out.emplace(handle->FindOne(EmptyDoc(), Opt(5000))); }));
         BOOST_REQUIRE(out);
         BOOST_REQUIRE(!*out);
+        // 真实结果：调用确实经该 owner 的 worker 到达 driver 并以
+        // Unavailable 失败（两构建面均成立）。
         BOOST_CHECK(out->error().code == ErrorCode::Unavailable);
 
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+        // Debug 面：读取内部执行域取证，断言目标集合与 worker/acquire/
+        // use/release 线程 identity 均相同（同一次调用同一 worker）。
         const auto evidence = rt->LastDriverThreadEvidenceForTest();
         BOOST_REQUIRE(evidence);
         BOOST_CHECK(evidence->worker_thread != std::thread::id{});
@@ -895,6 +961,10 @@ BOOST_AUTO_TEST_CASE(t_owner_thread_identity) {
         BOOST_CHECK(evidence->worker_thread == evidence->release_thread);
         BOOST_CHECK_EQUAL(evidence->database, "bbt_ut");
         BOOST_CHECK_EQUAL(evidence->collection, collection);
+#else
+        // Release 面：执行域取证属 debug 观测层，本构建下不存在。
+        (void)collection;
+#endif
     };
 
     check_call(h1.value(), "identity_a");
@@ -926,6 +996,10 @@ BOOST_AUTO_TEST_CASE(t_owner_isolation) {
     CloseOwnerAndDrain(db2, rt2);
 }
 
+// 跨集合共享背压：owner worker=1、max_queue=1 下集合 A 占住唯一 worker、集合 B
+// 占满队列、集合 C 确定性 Overloaded——跨集合共享同一 owner 背压而非句柄各自上限。
+// 前置同步用真实状态 DriverCallsInFlightForTest（A 的 op 已离开队列被 worker 接管），
+// 两构建面一致；Release 面同样运行本用例（不再整体 ifdef 删除行为覆盖）。
 BOOST_AUTO_TEST_CASE(t_shared_backpressure_queue_one) {
     // owner worker=1、max_queue=1：集合 A 占住唯一 worker 后，集合 B
     // 的 op 进队列占满容量，集合 C 的 op 确定性 Overloaded——跨集合
@@ -960,8 +1034,11 @@ BOOST_AUTO_TEST_CASE(t_shared_backpressure_queue_one) {
     };
 
     submit(pa, b_overloaded, b_done, 30000);  // 占住唯一 worker（server selection 8s）
+    // 等 A 的 op 已被 worker 从队列取出、进入执行槽（真实状态 phase==kRunning，
+    // 读既有 m_ops），确保后续 B 进入队列时容量被 A 占住（两构建面一致）。
     BOOST_REQUIRE(WaitUntil(
-        [&] { return rt->RunningDriverCallsForTest() == 1; }, 10000));
+        [&] { return rt->DriverCallsInFlightForTest() == 1 &&
+                     rt->QueuedOpsForTest() == 0; }, 10000));
     submit(pb, b_overloaded, b_done, 30000);  // B：进队列占满容量 1
     // 可观察地确认 B 已在队列（而非仅「某协程跑过」）：QueuedOpsForTest
     // 读 m_queue_mtx 保护的 m_queue.size()，与接纳判定同临界区。
@@ -973,7 +1050,9 @@ BOOST_AUTO_TEST_CASE(t_shared_backpressure_queue_one) {
     BOOST_REQUIRE(WaitUntil([&] { return c_done.load() == 1; }, 10000));
     BOOST_CHECK_EQUAL(c_overloaded.load(), 1);
     BOOST_CHECK_EQUAL(b_overloaded.load(), 0);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_CHECK(rt->PeakDriverCallsForTest() <= 1);
+#endif
 
     ha.value()->Close();
     hb.value()->Close();
@@ -982,7 +1061,10 @@ BOOST_AUTO_TEST_CASE(t_shared_backpressure_queue_one) {
     BOOST_REQUIRE(WaitUntil(
         [&] { return b_done.load() + c_done.load() == 3; }, 30000));
     BOOST_REQUIRE(db->IsClosed());
+    BOOST_CHECK_EQUAL(rt->LiveWorkersForTest(), 0);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_CHECK_EQUAL(rt->RunningDriverCallsForTest(), 0);
+#endif
 }
 
 BOOST_AUTO_TEST_CASE(t_handle_close_scoped) {
@@ -1017,8 +1099,13 @@ BOOST_AUTO_TEST_CASE(t_handle_close_scoped) {
         },
         succ);
     BOOST_REQUIRE(succ);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_REQUIRE(WaitUntil(
         [&] { return rt->RunningDriverCallsForTest() == 1; }, 10000));
+#endif
+    // Release 面：无 running 计数；本用例不断言 h1 的具体结果（仅等其落定），
+    // 句柄关闭不取消在途 op，收口断言与 op 是否已进入 driver 无关（逻辑终态
+    // Closed/TimedOut/Unavailable 均可，用例不作区分），故不设前置同步。
 
     c1->Close();
     BOOST_CHECK(c1->IsClosed());
@@ -1047,7 +1134,10 @@ BOOST_AUTO_TEST_CASE(t_handle_close_scoped) {
         return h1_done.load() && h2_done.load();
     }, 30000));
     BOOST_REQUIRE(db->IsClosed());
+    BOOST_CHECK_EQUAL(rt->LiveWorkersForTest(), 0);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_CHECK_EQUAL(rt->RunningDriverCallsForTest(), 0);
+#endif
 }
 
 BOOST_AUTO_TEST_CASE(t_owner_collection_requires_running) {
@@ -1092,16 +1182,29 @@ BOOST_AUTO_TEST_CASE(t_owner_close_not_premature_during_inflight) {
     BOOST_REQUIRE(h);
     auto* hp = h.value().get();
 
-    bool succ = false;
-    g_scheduler->RegistCoroutineTask(
-        [hp] {
-            auto r = hp->FindOne(EmptyDoc(), Opt(30000));
-            (void)r;
-        },
-        succ);
-    BOOST_REQUIRE(succ);
+    // 提交 2 个在途 op（不可达地址长调用）：第一个为目标在途 driver 调用，
+    // 第二个使 Release 面可用真实队列深度（稳定为 1）做派发同步。
+    for (int i = 0; i < 2; ++i) {
+        bool succ = false;
+        g_scheduler->RegistCoroutineTask(
+            [hp] {
+                auto r = hp->FindOne(EmptyDoc(), Opt(30000));
+                (void)r;
+            },
+            succ);
+        BOOST_REQUIRE(succ);
+    }
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_REQUIRE(WaitUntil(
         [&] { return rt->RunningDriverCallsForTest() == 1; }, 10000));
+#else
+    // Release 面：真实状态同步——op 已被 worker 从队列取出、进入执行槽
+    // （phase==kRunning），且队列深度稳定为 1（1 在 worker、1 排队）。
+    // 读既有 state（m_ops/m_queue），不新增 Release 计数。
+    BOOST_REQUIRE(WaitUntil(
+        [&] { return rt->DriverCallsInFlightForTest() == 1 &&
+                     rt->QueuedOpsForTest() == 1; }, 10000));
+#endif
 
     std::atomic_bool closer_done{false};
     std::atomic_bool closed_at_return{false};
@@ -1113,7 +1216,9 @@ BOOST_AUTO_TEST_CASE(t_owner_close_not_premature_during_inflight) {
     // Close 已取关闭权（IsRunning 转假）但 driver 调用仍在途：此刻
     // IsClosed 必须仍为假——终态只在 join + lease 归还之后发布。
     BOOST_REQUIRE(WaitUntil([&] { return !rt->IsRunning(); }, 10000));
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_CHECK_EQUAL(rt->RunningDriverCallsForTest(), 1);
+#endif
     BOOST_CHECK(!closer_done.load());
     BOOST_CHECK(!db->IsClosed());
     closer.join();
@@ -1121,7 +1226,9 @@ BOOST_AUTO_TEST_CASE(t_owner_close_not_premature_during_inflight) {
     BOOST_CHECK(closed_at_return.load());
     BOOST_REQUIRE(db->IsClosed());
     BOOST_CHECK_EQUAL(rt->LiveWorkersForTest(), 0);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_CHECK_EQUAL(rt->RunningDriverCallsForTest(), 0);
+#endif
 }
 
 BOOST_AUTO_TEST_CASE(t_owner_concurrent_close_two_threads) {
@@ -1131,7 +1238,9 @@ BOOST_AUTO_TEST_CASE(t_owner_concurrent_close_two_threads) {
     BOOST_REQUIRE(h);
     auto* hp = h.value().get();
 
-    for (int i = 0; i < 2; ++i) {   // 占住 2 worker
+    // 占住 worker（不可达地址 server selection 2s）。多投 1 个 op 使
+    // Release 面可用真实队列深度做确定性同步。
+    for (int i = 0; i < 3; ++i) {
         bool succ = false;
         g_scheduler->RegistCoroutineTask(
             [hp] {
@@ -1141,8 +1250,17 @@ BOOST_AUTO_TEST_CASE(t_owner_concurrent_close_two_threads) {
             succ);
         BOOST_REQUIRE(succ);
     }
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_REQUIRE(WaitUntil(
         [&] { return rt->RunningDriverCallsForTest() == 2; }, 10000));
+#else
+    // Release 面：真实状态同步——2 worker 均被占用（2 个 op phase==kRunning）。
+    // 仅队列深度==1 无法区分「已完成 2 次取出」与「仅 1 个被取出」，故以 worker
+    // 占用数为主判据，队列深度==1 为辅（第 3 个排队）。
+    BOOST_REQUIRE(WaitUntil(
+        [&] { return rt->DriverCallsInFlightForTest() == 2 &&
+                     rt->QueuedOpsForTest() == 1; }, 10000));
+#endif
 
     std::atomic_int returns{0};
     std::atomic_int closed_observed{0};
@@ -1161,7 +1279,9 @@ BOOST_AUTO_TEST_CASE(t_owner_concurrent_close_two_threads) {
     BOOST_CHECK_EQUAL(closed_observed.load(), 2);
     BOOST_REQUIRE(db->IsClosed());
     BOOST_CHECK_EQUAL(rt->LiveWorkersForTest(), 0);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_CHECK_EQUAL(rt->RunningDriverCallsForTest(), 0);
+#endif
 }
 
 BOOST_AUTO_TEST_CASE(t_owner_start_then_immediate_close) {
@@ -1173,7 +1293,9 @@ BOOST_AUTO_TEST_CASE(t_owner_start_then_immediate_close) {
     db->Close();               // 无在途 op：直接收口
     BOOST_REQUIRE(db->IsClosed());
     BOOST_CHECK_EQUAL(rt->LiveWorkersForTest(), 0);
+#ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_CHECK_EQUAL(rt->RunningDriverCallsForTest(), 0);
+#endif
     auto after_close = db->Collection({"bbt_ut", "x"});
     BOOST_REQUIRE(!after_close);
     BOOST_CHECK(after_close.error().code == ErrorCode::Closed);
