@@ -16,6 +16,9 @@
 //                                          不依赖 handler 限流。
 //   t_quota_shared_across_clients       — 同一 Runtime 下多个 HttpClient
 //                                          共享同一预算（owner 作用域）。
+//   t_quota_isolated_across_runtimes    — 两个独立 client Runtime 同时在途，
+//                                          各自独立预算；一个满额不影响另一个
+//                                          （多 Runtime 作用域隔离）。
 //   t_released_on_normal_completion     — 正常完成后名额归还，可再接纳。
 //   t_released_on_peer_failure          — 对端断开/畸形响应等发起失败后
 //                                          名额归还。
@@ -195,6 +198,19 @@ struct Gate {
         std::lock_guard<std::mutex> lk(mutex);
         for (auto& s : signals)
             s->Release();
+    }
+    // 选择性放行第 idx 个到达者（到达顺序确定时用于只放行其中一个在途
+    // 请求，做「释放 A 不影响 B」的交叉对照）；越界返回 false，不抛。
+    bool ReleaseAt(std::size_t idx) {
+        std::shared_ptr<GateSignal> sig;
+        {
+            std::lock_guard<std::mutex> lk(mutex);
+            if (idx >= signals.size())
+                return false;
+            sig = signals[idx];
+        }
+        sig->Release();
+        return true;
     }
 };
 
@@ -449,6 +465,97 @@ BOOST_AUTO_TEST_CASE(t_quota_shared_across_clients) {
     server.server->StopAccepting();
     BOOST_REQUIRE(Close(server.rt));
     BOOST_REQUIRE(Close(rt));
+}
+
+// 多 Runtime 配额作用域：两个独立 client Runtime 同时在途，一个满额不影响
+// 另一个（原票第二项「多 client / 多 Runtime 配额作用域」的直接对照，补齐
+// 「同 Runtime 多 client 共享」之外的隔离方向）。
+// 与 t_quota_shared_across_clients 恰好相反的作用域断言：那里同 Runtime 下
+// 两个 client 共享一份预算，这里两个 Runtime 各自独立、互不侵占。真实
+// HttpClientImpl::Request 驱动 owner 预算门禁，不注入假账本。
+//
+// 判别力：若预算被错误地做成进程/全局共享（或两个 runtime 意外共用同一
+// owner），B 的首个请求会被 A 的占用挤成 Overloaded——步骤「B 同时在途、
+// 服务端 active==2」即失败；若归还越界触碰其他 runtime 的账本，末段
+// 「A 释放后 B 仍 Overloaded」即失败。两个方向都靠事件门控（服务端 handler
+// 到达计数 + 结果就绪标志），不靠固定 sleep。
+BOOST_AUTO_TEST_CASE(t_quota_isolated_across_runtimes) {
+    auto server = StartServer([](std::shared_ptr<Gate> g){ return MakeGateHandler(g); });
+    // 两个独立 client Runtime，各自拥有独立预算（max_conn=1, max_inflight=1）。
+    auto rt_a = StartClientRuntime(MakeLimits(/*max_conn=*/1, /*max_inflight=*/1));
+    auto rt_b = StartClientRuntime(MakeLimits(/*max_conn=*/1, /*max_inflight=*/1));
+    auto client_a = NewClient(rt_a);
+    auto client_b = NewClient(rt_b);
+    const std::string url = server.base_url + "/x";
+
+    // A 占满自己的唯一名额：请求被服务端 handler 压住，真实在途。
+    auto out_a = std::make_shared<std::optional<result<HttpResponse>>>();
+    auto rdy_a = std::make_shared<std::atomic_bool>(false);
+    SpawnHeld(client_a, url, out_a, rdy_a);
+    BOOST_REQUIRE(WaitUntil([&] { return server.gate->active.load() == 1; }));
+
+    // 方向①：A 满额时 A 的第二个请求确定性 Overloaded，服务端不接到超额。
+    auto res_a2 = CallApi(client_a, url, DefaultOptions());
+    BOOST_REQUIRE(!res_a2);
+    BOOST_CHECK(res_a2.error().code == ErrorCode::Overloaded);
+    BOOST_CHECK_EQUAL(server.gate->total.load(), 1);
+
+    // 独立 Runtime B 同时在途：A 仍持有其唯一名额，B 的请求却被接纳并压住
+    // ——两个 runtime 的预算互不侵占（共享账本下此处会 Overloaded、active 停在 1）。
+    auto out_b = std::make_shared<std::optional<result<HttpResponse>>>();
+    auto rdy_b = std::make_shared<std::atomic_bool>(false);
+    SpawnHeld(client_b, url, out_b, rdy_b);
+    BOOST_REQUIRE(WaitUntil([&] { return server.gate->active.load() == 2; }));
+    BOOST_CHECK_EQUAL(server.gate->total.load(), 2);
+
+    // 方向②：B 也满额后 B 的第二个请求同样 Overloaded，服务端仍只有 2。
+    auto res_b2 = CallApi(client_b, url, DefaultOptions());
+    BOOST_REQUIRE(!res_b2);
+    BOOST_CHECK(res_b2.error().code == ErrorCode::Overloaded);
+    BOOST_CHECK_EQUAL(server.gate->total.load(), 2);
+
+    // 只放行 A 的在途请求：到达顺序确定（已等 active==1 才发起 B），
+    // signals[0] 即 A。B 继续压住，用于后续交叉对照。
+    BOOST_REQUIRE(server.gate->ReleaseAt(0));
+    BOOST_REQUIRE(WaitUntil([&] { return rdy_a->load(std::memory_order_acquire); }));
+    BOOST_REQUIRE((*out_a).has_value());
+    BOOST_REQUIRE((*out_a).value());
+    BOOST_CHECK_EQUAL((*out_a).value().value().status, 200u);
+    // A 的 handler 已退出，B 仍被压住 ⇒ 服务端并发回到 1。
+    BOOST_REQUIRE(WaitUntil([&] { return server.gate->active.load() == 1; }));
+
+    // 后续被接纳者立即放行（不再压门闩）；B 已持有的等待位不受影响。
+    server.gate->auto_release.store(true);
+
+    // A 自己的名额经物理收口归还后可再接纳（轮询消化「server handler 退出」
+    // 与「client op 完成项落定归还名额」之间的调度竞态，Overloaded 即仍占用）。
+    bool admitted = false;
+    auto res_a3 = CallApiUntilAdmitted(client_a, url, DefaultOptions(), admitted);
+    BOOST_REQUIRE(admitted);
+    BOOST_REQUIRE(res_a3);
+    BOOST_CHECK_EQUAL(res_a3.value().status, 200u);
+
+    // 关键交叉断言：A 已归还并再次完成，B 仍处于自身满额状态（其请求尚未
+    // 收口）——B 的新请求必须仍 Overloaded，证明 A 的接纳与归还没有触碰 B 的
+    // 预算（真作用域隔离，而非共享/全局账本）。服务端累计只多了 A 的第三个。
+    auto res_b3 = CallApi(client_b, url, DefaultOptions());
+    BOOST_REQUIRE(!res_b3);
+    BOOST_CHECK(res_b3.error().code == ErrorCode::Overloaded);
+    BOOST_CHECK_EQUAL(server.gate->total.load(), 3);
+
+    // 收尾：放行 B 的在途请求，各自 runtime 同步 Close() 收口。
+    server.gate->ReleaseAll();
+    BOOST_REQUIRE(WaitUntil([&] { return rdy_b->load(std::memory_order_acquire); }));
+    BOOST_REQUIRE((*out_b).has_value());
+    BOOST_REQUIRE((*out_b).value());
+    BOOST_CHECK_EQUAL((*out_b).value().value().status, 200u);
+
+    BOOST_REQUIRE(Close(client_a));
+    BOOST_REQUIRE(Close(client_b));
+    server.server->StopAccepting();
+    BOOST_REQUIRE(Close(server.rt));
+    BOOST_REQUIRE(Close(rt_a));
+    BOOST_REQUIRE(Close(rt_b));
 }
 
 // 正常完成路径归还：上限=1 时连续多个串行请求全部成功。
