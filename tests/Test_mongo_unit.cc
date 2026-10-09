@@ -63,6 +63,10 @@
 // 收口」的确定性核验；MongoRuntime 是 Issue #40 的资源 owner。
 #include "mongo/MongoRuntime.hpp"
 
+// Issue #12 M4：直接经真实 driver 构造非法 URI，核对 ClassifyDriverError
+// 的输入错误分类（URI 解析离线完成，不需要服务端）。
+#include <mongocxx/v1/uri.hpp>
+
 using namespace bbt::infra;
 using bbt::coroutine::Deadline;
 using bbt::coroutine::SCHE_START_OPT_SCHE_THREAD;
@@ -231,6 +235,66 @@ BOOST_AUTO_TEST_CASE(t_effective_uri_userinfo_decoy) {
         "mongodb://connectTimeoutMS=999:pw999@host/bb?t=connectTimeoutMS"
         "&serverselectiontimeoutms=15000&connecttimeoutms=2000"
         "&sockettimeoutms=2000&waitqueuetimeoutms=2000&maxpoolsize=2");
+}
+
+BOOST_AUTO_TEST_CASE(t_driver_invalid_uri_is_invalid_argument) {
+    // Issue #12 M4：真实 driver 对非法 URI/选项抛 mongocxx::v1::exception
+    // （mongoc 域，码 22 = MONGOC_ERROR_COMMAND_INVALID_ARG；mongoc 的
+    // MONGOC_URI_ERROR 用它汇报无效 host specifier / 选项值非法）。经
+    // ClassifyDriverError 必须稳定映射为调用方输入错误 InvalidArgument，
+    // 而非 mongoc 通用 Unavailable。URI 解析离线完成，不需要服务端。
+    const std::vector<std::string> rejected = {
+        "mongodb://127.0.0.1:99999999/bbt_ut",                  // 端口越界
+        "mongodb://127.0.0.1:abc/bbt_ut",                       // 端口非数字
+        "mongodb://127.0.0.1:27017/bbt_ut?maxPoolSize=notanum", // 选项值非数字
+    };
+    for (const auto& uri : rejected) {
+        bool threw = false;
+        try {
+            mongocxx::v1::uri parsed{bsoncxx::v1::stdx::string_view{uri}};
+            (void)parsed;
+        } catch (const mongocxx::v1::exception& e) {
+            threw = true;
+            const auto err =
+                mongo_detail::ClassifyDriverError(e, "mongo: init driver pool");
+            BOOST_CHECK_MESSAGE(err.code == ErrorCode::InvalidArgument,
+                                "uri=" << uri << " code=" << (int)err.code);
+            BOOST_CHECK_EQUAL(err.backend_category, "mongocxx");
+        }
+        BOOST_CHECK_MESSAGE(threw, "driver 未拒绝: " << uri);
+    }
+
+    // 对照：真实 driver 接受（未知选项仅警告、负值 / 畸形 IPv6 不报错）——
+    // 不得盲目断言这些应被拒绝。
+    const std::vector<std::string> accepted = {
+        "mongodb://127.0.0.1:27017/bbt_ut?connectTimeoutMS=-5",
+        "mongodb://127.0.0.1:27017/bbt_ut?bogusOption=1",
+        "mongodb://[badipv6/bbt_ut",
+    };
+    for (const auto& uri : accepted) {
+        bool threw = false;
+        try {
+            mongocxx::v1::uri parsed{bsoncxx::v1::stdx::string_view{uri}};
+            (void)parsed;
+        } catch (const mongocxx::v1::exception&) {
+            threw = true;
+        }
+        BOOST_CHECK_MESSAGE(!threw, "driver 意外拒绝: " << uri);
+    }
+
+    // 脱敏：非法 URI 的错误文本不得泄露 userinfo 中的口令。
+    try {
+        mongocxx::v1::uri parsed{bsoncxx::v1::stdx::string_view{
+            "mongodb://user:secretpw@127.0.0.1:27017/bbt_ut?maxPoolSize=bad"}};
+        (void)parsed;
+        BOOST_CHECK_MESSAGE(false, "driver 未拒绝口令诱饵 URI");
+    } catch (const mongocxx::v1::exception& e) {
+        const auto err =
+            mongo_detail::ClassifyDriverError(e, "mongo: init driver pool");
+        BOOST_CHECK(err.code == ErrorCode::InvalidArgument);
+        BOOST_CHECK_MESSAGE(err.message.find("secretpw") == std::string::npos,
+                            "错误文本泄露口令: " << err.message);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(t_create_before_scheduler) {

@@ -26,6 +26,16 @@ Error InvalidArg(std::string msg) {
     return MakeError(ErrorCode::InvalidArgument, std::move(msg));
 }
 
+// mongoc/mongoc-error.h（mongoc 2.5.4）mongoc_error_code_t：
+// MONGOC_ERROR_COMMAND_INVALID_ARG = 22。mongoc 的 URI 解析错误
+// （mongoc-uri.c 的 MONGOC_URI_ERROR）与选项值校验均以该码汇报（无效
+// host specifier、端口越界/非数字、选项值非法等）。mongocxx 的
+// v1::exception 只保留该码、丢弃 mongoc domain，故只能在 mongoc 域内
+// 以该码区分「调用方输入错误」与 server selection/socket 等驱动侧失败。
+// 未直接包含 mongoc 头：其 mongoc-prelude.h 禁止经非 mongoc/mongoc.h
+// 直接包含，且该前缀 include 目录不在本 TU 的 include 路径上。
+constexpr int kMongocErrorCommandInvalidArg = 22;
+
 } // namespace
 
 result<bsoncxx::v1::document::view> ViewOf(const MongoDocument& doc,
@@ -132,8 +142,15 @@ Error ClassifyDriverError(const mongocxx::v1::exception& e,
             err.domain_code = "DuplicateKey";
         return err;
     }
-    // mongoc 域（server selection/socket/stream/pool 等）：driver 侧失败，
-    // 对端不可达或传输失败统一 Unavailable。
+    // mongoc 域：URI/选项解析失败以 MONGOC_ERROR_COMMAND_INVALID_ARG 汇报，
+    // 属调用方输入错误；其余 server selection/socket/stream/pool 失败统一
+    // Unavailable。该码只在 mongoc 域内比较（mongocrypt 码空间不同，不参与）。
+    if (ec == mongocxx::v1::source_errc::mongoc &&
+        ec.value() == kMongocErrorCommandInvalidArg) {
+        err.code        = ErrorCode::InvalidArgument;
+        err.domain_code = "invalid_argument";
+        return err;
+    }
     if (ec == mongocxx::v1::source_errc::mongoc ||
         ec == mongocxx::v1::source_errc::mongocrypt) {
         err.code        = ErrorCode::Unavailable;

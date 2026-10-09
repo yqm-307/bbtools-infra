@@ -1387,7 +1387,11 @@ BOOST_AUTO_TEST_CASE(t_repeated_and_concurrent_close) {
 
     RawPeer peer(ReadThenHold(3000));
     auto    c = NewCotcpClient("127.0.0.1", peer.port);
-    BOOST_REQUIRE(c);
+    // 建连前置失败不能被误判成后续 Close 失败；不输出可能带敏感内容的错误文本。
+    BOOST_REQUIRE_MESSAGE(c,
+        "Redis client initialization failed: code="
+        << (c ? 0 : static_cast<int>(c.error().code))
+        << ", backend_code=" << (c ? 0 : c.error().backend_code));
     auto cli = std::move(c).value();
 
     std::optional<result<void>> out;
