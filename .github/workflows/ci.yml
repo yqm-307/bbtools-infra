@@ -1,4 +1,4 @@
-# CI：bbtools-infra 构建门禁（#4）
+# CI：bbtools-infra 构建门禁（#4；15min 预算修复）
 #
 # 范围：
 #   - C++17 Release 构建（cmake + ninja，JOBS=3 + ccache，无裸 nproc 并发）
@@ -14,6 +14,20 @@
 #   - 干净 runner 验证：无 /usr/local 旧产物兜底；Redis/Mongo 私有依赖前缀
 #     在 runner workspace 内从源码钉死版本构建（decisions 0003/0004），不写镜像
 #     也不依赖 /usr/local
+#
+# 15min 单 job 预算（本轮修复）：
+#   依赖准备、Release 全量构建测试与 Debug 定向门禁分别计时，
+#   避免冷构建挤占后续测试预算。
+#   修法：按 stage 拆成独立 job，各 job 预算仍 <= 原 15min，**不改 timeout 数值、
+#   不加 retry、不换 runner/共享基础设施**：
+#     - prepare-deps：克隆 coroutine/core + 构建 hiredis/mongoc/mongocxx 私有前缀，
+#       打成单一 tar（保留 symlink）上传 artifact；
+#     - Release 构建 & ctest：下载同一 prepared deps，跑 Release 全量门禁；
+#     - Debug 生命周期定向门禁：下载同一 prepared deps，跑 Debug 8 项零跳过门禁；
+#     - `编译 & ctest`（旧 required check 名）：always() + fail-closed 聚合，只有
+#       全部 required config success 才 green，**不用 needs 跳过当通过**。
+#   依赖前缀经 tar+artifact 复用（不经 artifact 目录 symlink 语义）；unpack 强制
+#   校验 sha256，不匹配即失败，不做弱 TLS/静默回退。
 #
 # 构建模式（#29 第一阶段，仅 workflow_dispatch 可选）：
 #   - clean（默认）：删 BUILD_DIR 全量重建，等价 PR/push 门禁路径
@@ -77,6 +91,10 @@ env:
   BUILD_DIR: ${{ github.workspace }}/build
   COROUTINE_DIR: ${{ github.workspace }}/coroutine
   CORE_DIR: ${{ github.workspace }}/bbtools-core
+  DEPS_PREFIX: ${{ github.workspace }}/deps-prefix
+  # prepared deps 归档：prepare-deps 产出、Release/Debug 消费
+  DEPS_BUNDLE_TAR: ${{ github.workspace }}/deps-bundle.tar
+  DEPS_BUNDLE_META: ${{ github.workspace }}/deps-bundle.meta
   # 同机 3 槽共享 12c：构建并发固定 3，不按 nproc 抢占
   JOBS: 3
   # ARC Pod 可能是每 job 一生的临时 runner；目录固定在 workspace 内，
@@ -143,38 +161,28 @@ jobs:
             echo "code=false" >> "$GITHUB_OUTPUT"
           fi
 
-  build-and-test:
-    name: "编译 & ctest"
+  # 依赖准备：#34 A3 阶段——克隆 coroutine/core 源码 + 源码构建 Redis/Mongo 私有前缀，
+  # 打成一个 tar（保留 symlink）上传，供 Release/Debug 复用同一份 prepared deps。
+  # 独立 job 后本 stage 预算 <= 15min（实测依赖前缀约 5min + 克隆约 30s）。
+  prepare-deps:
+    name: "依赖准备（固定源前缀归档）"
     needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     runs-on: arc-s4-infra
     timeout-minutes: 15
+    outputs:
+      bundle_sha256: ${{ steps.pack.outputs.bundle_sha256 }}
+      coro_ref: ${{ steps.deps.outputs.coro_ref }}
+      core_ref: ${{ steps.deps.outputs.core_ref }}
     steps:
-      - name: "docs-only 变更直接通过"
-        if: needs.changes.outputs.code == 'false'
-        run: echo "docs-only change, skipping build/test; check reports success."
-
-      - name: "拉取 bbtools-infra"
-        if: needs.changes.outputs.code == 'true'
+      - name: "拉取 bbtools-infra（提供 CI 脚本）"
         uses: actions/checkout@v4
         with:
           path: infra
           fetch-depth: 1
           persist-credentials: false
 
-      # 资源前缀 fail-closed 回归最小入口（tests/resource-prefix/run.sh）。
-      # 只跑 A/B：A) 已存在目录 / 悬浮符号链接 / 锁占用必须 exit 2 拒绝且不删他人锁；
-      # B) 克隆失败非零退出、不留半个前缀、锁必须释放。均用本地目录与 git shim，
-      # 不联网、不跑 docker、不依赖已构建前缀；放在三方依赖构建之前，失败即早停。
-      # 不带 --prefix 时 run.sh 会打印「跳过 C/D」，本步骤名与首行显式限定范围，
-      # 绝不用这次 exit 0 冒充「C/D（正向/异版负向）也通过」。
-      - name: "资源前缀拒绝路径回归（A/B，不含 C/D）"
-        if: needs.changes.outputs.code == 'true'
-        run: |
-          echo "范围：A(fail-closed 拒绝) + B(克隆失败清理)；C/D 需真实前缀，本次不运行。"
-          bash infra/tests/resource-prefix/run.sh
-
       - name: "拉取 bbtools-coroutine @ main"
-        if: needs.changes.outputs.code == 'true'
         uses: actions/checkout@v4
         with:
           repository: yqm-307/bbtools-coroutine
@@ -184,7 +192,6 @@ jobs:
           persist-credentials: false
 
       - name: "拉取 bbtools-core @ master"
-        if: needs.changes.outputs.code == 'true'
         uses: actions/checkout@v4
         with:
           repository: yqm-307/bbtools-core
@@ -195,10 +202,9 @@ jobs:
 
       - name: "记录上游依赖版本"
         id: deps
-        if: needs.changes.outputs.code == 'true'
         run: |
           cd coroutine
-          echo "coroutine_ref=$(git rev-parse HEAD)" | tee "$GITHUB_OUTPUT"
+          echo "coro_ref=$(git rev-parse HEAD)" | tee "$GITHUB_OUTPUT"
           git log -1 --format='coroutine main HEAD: %h %s (%ci)'
           cd "$CORE_DIR"
           echo "core_ref=$(git rev-parse HEAD)" | tee -a "$GITHUB_OUTPUT"
@@ -206,9 +212,8 @@ jobs:
 
       # Issue #34 阶段一：在干净 runner 上以源码构建 Redis/Mongo 私有前缀，
       # 钉死 docs/decisions/0003+0004 固定的版本；不改 runner 镜像、不写
-      # /usr/local。前缀落在 workspace 内，job 结束随 Pod 回收。
+      # /usr/local。前缀落在 workspace 内，经 deps_bundle.sh 打成 tar 复用。
       - name: "构建 hiredis 私有前缀（v1.4.1, commit 616f2286）"
-        if: needs.changes.outputs.code == 'true'
         run: |
           set -euo pipefail
           DEPS="$PWD/deps-src"; PREFIX="$PWD/deps-prefix/hiredis"
@@ -229,7 +234,6 @@ jobs:
           grep -E 'HIREDIS_(MAJOR|MINOR|PATCH|SONAME)' "$PREFIX/include/hiredis/hiredis.h"
 
       - name: "构建 mongo-c-driver 前缀（2.5.4）"
-        if: needs.changes.outputs.code == 'true'
         run: |
           set -euo pipefail
           DEPS="$PWD/deps-src"; PREFIX="$PWD/deps-prefix/mongoc"
@@ -251,7 +255,6 @@ jobs:
           cmake --install build
 
       - name: "构建 mongo-cxx-driver 前缀（r4.6.0）"
-        if: needs.changes.outputs.code == 'true'
         run: |
           set -euo pipefail
           DEPS="$PWD/deps-src"; PREFIX="$PWD/deps-prefix/mongocxx"
@@ -272,12 +275,67 @@ jobs:
           cmake --build build --parallel "$JOBS"
           cmake --install build
 
+      # tar 保留 symlink；artifact 只承载 tar 字节，不经 upload-artifact 的目录 symlink 语义。
+      - name: "打包 prepared deps（tar，保留 symlink）"
+        id: pack
+        run: |
+          bash infra/scripts/ci/deps_bundle.sh pack \
+            --root "$GITHUB_WORKSPACE" \
+            --out "$DEPS_BUNDLE_TAR" \
+            --meta "$DEPS_BUNDLE_META"
+
+      - name: "上传 prepared deps 归档"
+        uses: actions/upload-artifact@v4
+        with:
+          name: deps-bundle
+          path: |
+            ${{ env.DEPS_BUNDLE_TAR }}
+            ${{ env.DEPS_BUNDLE_META }}
+          if-no-files-found: error
+          retention-days: 1
+
+  # Release 全量门禁：下载相同 prepared deps，跑现役等价判据（不含 Debug）。
+  release:
+    name: "Release 构建 & ctest"
+    needs: [changes, prepare-deps]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: arc-s4-infra
+    timeout-minutes: 15
+    steps:
+      - name: "拉取 bbtools-infra"
+        uses: actions/checkout@v4
+        with:
+          path: infra
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: "下载 prepared deps 归档"
+        uses: actions/download-artifact@v4
+        with:
+          name: deps-bundle
+          path: ${{ github.workspace }}
+
+      - name: "校验并解包 prepared deps"
+        run: |
+          bash infra/scripts/ci/deps_bundle.sh unpack \
+            --tar "$DEPS_BUNDLE_TAR" \
+            --meta "$DEPS_BUNDLE_META" \
+            --expect-sha "${{ needs.prepare-deps.outputs.bundle_sha256 }}" \
+            --dest "$GITHUB_WORKSPACE"
+
+      # 资源前缀 fail-closed 回归最小入口（tests/resource-prefix/run.sh）。
+      # 只跑 A/B：A) 已存在目录 / 悬浮符号链接 / 锁占用必须 exit 2 拒绝且不删他人锁；
+      # B) 克隆失败非零退出、不留半个前缀、锁必须释放。均用本地目录与 git shim，
+      # 不联网、不跑 docker、不依赖已构建前缀；放在构建之前，失败即早停。
+      - name: "资源前缀拒绝路径回归（A/B，不含 C/D）"
+        run: |
+          echo "范围：A(fail-closed 拒绝) + B(克隆失败清理)；C/D 需真实前缀，本次不运行。"
+          bash infra/tests/resource-prefix/run.sh
+
       # 缓存 key：repo + runner 平台 + 编译器/ccache 版本摘要 + 构建类型 + 依赖 HEAD。
-      # 依赖 HEAD 变化即换 key，不会命中旧依赖的编译缓存；restore-keys 仅按前缀
-      # 回退到同平台旧缓存（增量复用，结果不依赖缓存内容）。
+      # 依赖 HEAD 来自 prepare-deps 的固定 checkout，与原先同 job 内联取的一致。
       - name: "解析缓存开关与 key"
         id: cache-meta
-        if: needs.changes.outputs.code == 'true'
         run: |
           GXX=$(g++ -dumpversion 2>/dev/null || echo unknown-gxx)
           CCV=$(ccache --version 2>/dev/null | head -1 | awk '{print $NF}' || echo no-ccache)
@@ -296,11 +354,11 @@ jobs:
           fi
           PREFIX="ccache-${{ runner.os }}-${{ runner.arch }}-g++${GXX}-${CCV}-Release"
           echo "prefix=$PREFIX" >> "$GITHUB_OUTPUT"
-          echo "key=${PREFIX}-co-${{ steps.deps.outputs.coroutine_ref }}-core-${{ steps.deps.outputs.core_ref }}" >> "$GITHUB_OUTPUT"
+          echo "key=${PREFIX}-co-${{ needs.prepare-deps.outputs.coro_ref }}-core-${{ needs.prepare-deps.outputs.core_ref }}" >> "$GITHUB_OUTPUT"
 
       - name: "恢复 ccache（GitHub cache）"
         id: ccache-restore
-        if: needs.changes.outputs.code == 'true' && steps.cache-meta.outputs.enabled == 'true'
+        if: steps.cache-meta.outputs.enabled == 'true'
         uses: actions/cache@v4
         with:
           path: ${{ env.CCACHE_DIR }}
@@ -310,7 +368,6 @@ jobs:
           # 恢复失败/miss 由 actions/cache 自身安全跳过，不失败 job；空缓存直编
 
       - name: "干净性预检：无 /usr/local 兜底产物"
-        if: needs.changes.outputs.code == 'true'
         run: |
           echo "=== /usr/local 下的 bbt 痕迹（应为空）==="
           find /usr/local/include/bbt /usr/local/lib -name '*bbt*' 2>/dev/null || true
@@ -320,7 +377,6 @@ jobs:
           ninja --version
 
       - name: "编译（Release，JOBS=3 + ccache）"
-        if: needs.changes.outputs.code == 'true'
         run: |
           rm -rf "$BUILD_DIR" && mkdir -p "$BUILD_DIR"
           # 三级降级：cache-bypass/禁用 → 无 ccache 直编 → 有 ccache 直编（缓存内容
@@ -357,7 +413,6 @@ jobs:
           fi
 
       - name: "ctest -j1"
-        if: needs.changes.outputs.code == 'true'
         run: |
           cd "$BUILD_DIR"
           # Issue #34 A3：先断言两个 unit 已注册——若模块 target 缺失（前缀未
@@ -375,15 +430,93 @@ jobs:
           ctest -j1 --output-on-failure --timeout 180
         timeout-minutes: 5
 
-      # #62：保留完整 Release 门禁，复用同一 job 的依赖串行验证 Debug 诊断。
-      # 不新增 runner 或依赖下载；Debug 定向测试缺项/跳过均失败。
-      - name: "Debug 生命周期定向门禁（8 项，零跳过）"
-        if: needs.changes.outputs.code == 'true'
+      # Release 侧观测符号不变式：三份归档必须存在且**无** bbt::infra::debug:: 符号。
+      # （Debug 侧对应断言在 debug job；两侧合起来等价原同 job 的 nm 交叉检查。）
+      - name: "Release 归档无 Debug 观测符号断言"
+        run: |
+          python3 - "$BUILD_DIR" <<'PY'
+          import pathlib, subprocess, sys
+          build = sys.argv[1]
+          for module in ('http', 'redis', 'mongo'):
+              archive = pathlib.Path(build) / 'src' / f'libbbt_infra_{module}.a'
+              if not archive.exists():
+                  raise SystemExit(f'FAIL: 缺 Release 归档 {archive}')
+              symbols = subprocess.check_output(['nm', '-C', str(archive)], text=True)
+              if 'bbt::infra::debug::' in symbols:
+                  raise SystemExit(f'FAIL: Release {archive} 含 debug 观测符号（Release 必须无符号）')
+          print('Release 归档: 三模块均 0 debug 符号 (ok)')
+          PY
+
+      - name: "缓存观测汇总"
+        # 保存本身由 actions/cache@v4 post 步骤自动执行（key 未命中时才写）；
+        # 此步骤只输出 hit/miss、模式与缓存大小，供 run 页面审计。
+        run: |
+          echo "=== 缓存观测汇总 ==="
+          echo "cache-hit: ${CACHE_HIT_REPORTED:-unknown}"
+          echo "build-mode: ${{ github.event_name == 'workflow_dispatch' && inputs.build-mode || 'default(clean)' }}"
+          echo "cache-enabled: ${{ steps.cache-meta.outputs.enabled }}"
+          if command -v ccache >/dev/null 2>&1 && [ -d "$CCACHE_DIR" ]; then
+            du -sh "$CCACHE_DIR" || true
+            ccache --show-stats || true
+          fi
+
+      - name: "依赖来源核查"
+        run: |
+          cd "$BUILD_DIR"
+          echo "=== bbt 源码依赖产物 ==="
+          find . \( -name 'libbbt_core.so*' -o -name 'libbbt_coroutine.so*' \) -exec ls -la {} \;
+          # P2（core-split）后 coroutine 已自闭环、不再产出 libbbt_core.so（首轮真实 run 实证）：
+          # libbbt_coroutine.so 必检，libbbt_core.so 仅告警，不再卡门禁。
+          test -n "$(find . -name 'libbbt_coroutine.so*' -print -quit)"
+          if [ -z "$(find . -name 'libbbt_core.so*' -print -quit)" ]; then
+            echo "WARN: 未见 libbbt_core.so（P2 后预期内）"
+          fi
+          echo "=== test 二进制 ldd（关键依赖） ==="
+          for bin in tests/Test_contract_basics tests/Test_http_loopback tests/Test_http_lifecycle \
+                     tests/Test_redis_unit tests/Test_mongo_unit; do
+            [ -x "$bin" ] || continue
+            echo "--- $bin ---"
+            ldd "$bin" | grep -E 'bbt|boost|libevent|hiredis|mongo|bson' || echo "(静态/无外部依赖)"
+          done
+
+  # #62：Debug 生命周期定向门禁（8 项，零跳过）。下载同一 prepared deps；
+  # 不改 runner、不新增依赖下载；缺项/跳过/失败均判负。
+  debug:
+    name: "Debug 生命周期定向门禁（8 项，零跳过）"
+    needs: [changes, prepare-deps]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: arc-s4-infra
+    timeout-minutes: 15
+    steps:
+      - name: "拉取 bbtools-infra"
+        uses: actions/checkout@v4
+        with:
+          path: infra
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: "下载 prepared deps 归档"
+        uses: actions/download-artifact@v4
+        with:
+          name: deps-bundle
+          path: ${{ github.workspace }}
+
+      - name: "校验并解包 prepared deps"
+        run: |
+          bash infra/scripts/ci/deps_bundle.sh unpack \
+            --tar "$DEPS_BUNDLE_TAR" \
+            --meta "$DEPS_BUNDLE_META" \
+            --expect-sha "${{ needs.prepare-deps.outputs.bundle_sha256 }}" \
+            --dest "$GITHUB_WORKSPACE"
+
+      - name: "Debug 配置与构建（8 目标）"
         run: |
           set -euo pipefail
           DEBUG_BUILD_DIR="${BUILD_DIR}-debug"
           LAUNCHER=""
-          if [ "${{ steps.cache-meta.outputs.enabled }}" = "true" ] && command -v ccache >/dev/null 2>&1; then
+          if [ "${{ env.CACHE_ENABLED }}" = "true" ] && \
+             [ "${{ github.event_name }}" != "pull_request" -o "${{ github.event.pull_request.head.repo.full_name }}" = "${{ github.repository }}" ] && \
+             command -v ccache >/dev/null 2>&1; then
             LAUNCHER="-DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
           fi
           cmake -S "$GITHUB_WORKSPACE/infra" -B "$DEBUG_BUILD_DIR" -G Ninja \
@@ -397,16 +530,24 @@ jobs:
             Test_contract_basics Test_http_session_lifetime_probe \
             Test_http_timer_rearm_probe Test_http_inflight_close_probe \
             Test_http_child_unregister Test_redis_unit Test_redis_cotcp_binding Test_mongo_unit
-          # 两种配置的三份归档必须存在；Debug 有观测符号，Release 无观测符号。
-          python3 - "$BUILD_DIR" "$DEBUG_BUILD_DIR" <<'PY'
+
+      - name: "Debug 门禁（符号、8 项测试与零跳过）"
+        run: |
+          set -euo pipefail
+          DEBUG_BUILD_DIR="${BUILD_DIR}-debug"
+          # Debug 侧观测符号不变式：三份归档必须存在且**含** bbt::infra::debug:: 符号。
+          # （Release 侧"无符号"断言在 release job；两侧合起来等价原同 job 交叉检查。）
+          python3 - "$DEBUG_BUILD_DIR" <<'PY'
           import pathlib, subprocess, sys
-          for build, debug in ((sys.argv[1], False), (sys.argv[2], True)):
-              for module in ('http', 'redis', 'mongo'):
-                  archive = pathlib.Path(build) / 'src' / f'libbbt_infra_{module}.a'
-                  symbols = subprocess.check_output(['nm', '-C', str(archive)], text=True)
-                  present = 'bbt::infra::debug::' in symbols
-                  if present != debug:
-                      raise SystemExit(f'FAIL: {archive} debug symbols={present}, expected={debug}')
+          build = sys.argv[1]
+          for module in ('http', 'redis', 'mongo'):
+              archive = pathlib.Path(build) / 'src' / f'libbbt_infra_{module}.a'
+              if not archive.exists():
+                  raise SystemExit(f'FAIL: 缺 Debug 归档 {archive}')
+              symbols = subprocess.check_output(['nm', '-C', str(archive)], text=True)
+              if 'bbt::infra::debug::' not in symbols:
+                  raise SystemExit(f'FAIL: Debug {archive} 缺 debug 观测符号（STRINGENT_DEBUG 未生效）')
+          print('Debug 归档: 三模块均含 debug 观测符号 (ok)')
           PY
           RX='^(contract\.basics|http\.session_lifetime|http\.timer_rearm|http\.inflight_close|http\.child_unregister|redis\.unit|redis\.cotcp_binding|mongo\.unit)$'
           ctest --test-dir "$DEBUG_BUILD_DIR" -j1 -R "$RX" \
@@ -426,36 +567,28 @@ jobs:
           PY
         timeout-minutes: 5
 
-      - name: "缓存观测汇总"
-        # 保存本身由 actions/cache@v4 post 步骤自动执行（key 未命中时才写）；
-        # 此步骤只输出 hit/miss、模式与缓存大小，供 run 页面审计。
-        if: needs.changes.outputs.code == 'true'
-        run: |
-          echo "=== 缓存观测汇总 ==="
-          echo "cache-hit: ${CACHE_HIT_REPORTED:-unknown}"
-          echo "build-mode: ${{ github.event_name == 'workflow_dispatch' && inputs.build-mode || 'default(clean)' }}"
-          echo "cache-enabled: ${{ steps.cache-meta.outputs.enabled }}"
-          if command -v ccache >/dev/null 2>&1 && [ -d "$CCACHE_DIR" ]; then
-            du -sh "$CCACHE_DIR" || true
-            ccache --show-stats || true
-          fi
+  # required check 名沿用旧 job 名 "编译 & ctest"（不改 GitHub branch rule）。
+  # always() 运行 + fail-closed 聚合：只有 changes 与全部参与 config 真实 success
+  # 才 green；docs-only 时构建 job 显式 skipped 也判成功；**不用 needs 跳过当通过**。
+  build-and-test:
+    name: "编译 & ctest"
+    needs: [changes, prepare-deps, release, debug]
+    if: ${{ always() }}
+    runs-on: arc-s4-infra
+    timeout-minutes: 5
+    steps:
+      - name: "拉取 bbtools-infra（提供门禁脚本）"
+        uses: actions/checkout@v4
+        with:
+          path: infra
+          fetch-depth: 1
+          persist-credentials: false
 
-      - name: "依赖来源核查"
-        if: needs.changes.outputs.code == 'true'
+      - name: "required 门禁结果汇聚（fail-closed）"
         run: |
-          cd "$BUILD_DIR"
-          echo "=== bbt 源码依赖产物 ==="
-          find . \( -name 'libbbt_core.so*' -o -name 'libbbt_coroutine.so*' \) -exec ls -la {} \;
-          # P2（core-split）后 coroutine 已自闭环、不再产出 libbbt_core.so（首轮真实 run 实证）：
-          # libbbt_coroutine.so 必检，libbbt_core.so 仅告警，不再卡门禁。
-          test -n "$(find . -name 'libbbt_coroutine.so*' -print -quit)"
-          if [ -z "$(find . -name 'libbbt_core.so*' -print -quit)" ]; then
-            echo "WARN: 未见 libbbt_core.so（P2 后预期内）"
-          fi
-          echo "=== test 二进制 ldd（关键依赖） ==="
-          for bin in tests/Test_contract_basics tests/Test_http_loopback tests/Test_http_lifecycle \
-                     tests/Test_redis_unit tests/Test_mongo_unit; do
-            [ -x "$bin" ] || continue
-            echo "--- $bin ---"
-            ldd "$bin" | grep -E 'bbt|boost|libevent|hiredis|mongo|bson' || echo "(静态/无外部依赖)"
-          done
+          bash infra/scripts/ci/required_result_gate.sh \
+            --code "${{ needs.changes.outputs.code }}" \
+            --changes "${{ needs.changes.result }}" \
+            --prepare "${{ needs.prepare-deps.result }}" \
+            --release "${{ needs.release.result }}" \
+            --debug "${{ needs.debug.result }}"
