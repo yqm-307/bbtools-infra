@@ -38,7 +38,7 @@ GATE = os.path.join(CI_DIR, "run_infra_gate.sh")
 CHANGED = os.path.join(CI_DIR, "changed_files.py")
 RES_DEPS = os.path.join(WORKTREE, "scripts", "prepare_resource_deps.sh")
 
-CALLEE_SHA = "5b04115e5c871b75c6bbf357e2a9bcd2d26ef3f8"
+CALLEE_SHA = "1c0b0fb0ebc8e7ca3888aa4f6a74d1baecf08cc7"
 CALLEE = f"yqm-307/bbt-framework/.github/workflows/bbtools-classify-v1.yml@{CALLEE_SHA}"
 SHA_PIN_RE = re.compile(r"^[^@\s]+@[0-9a-f]{40}$")
 

@@ -11,7 +11,7 @@
 #     授予 `contents: read`；无 secret、无 OIDC、不向 callee 透传 secret、无写权限。
 #   - 远程 `uses` 全部完整 40-hex SHA pin（actions/checkout v4 已只读核验）。
 #   - 分类与结果判定**真实复用已发布、fixed-SHA 的 framework reusable callee**
-#     `yqm-307/bbt-framework/.github/workflows/bbtools-classify-v1.yml@5b04115e…`：本仓不复制
+#     `yqm-307/bbt-framework/.github/workflows/bbtools-classify-v1.yml@1c0b0fb0…`：本仓不复制
 #     第二套分类/结果公共契约；changed_files 由本仓真实 diff 计算后作为**受限数据**传入，
 #     source（github.sha）与 callee automation 身份由 callee 自身 `job.workflow_*` 分离解析。
 #   - 触发面有意最小：仅 push 到分支 `ci/issue-50-hosted-shadow`，以及指向 `main` 的 PR。
@@ -78,7 +78,7 @@ jobs:
   plan:
     name: "shadow 分类/计划（framework classify callee）"
     needs: [changes]
-    uses: yqm-307/bbt-framework/.github/workflows/bbtools-classify-v1.yml@5b04115e5c871b75c6bbf357e2a9bcd2d26ef3f8
+    uses: yqm-307/bbt-framework/.github/workflows/bbtools-classify-v1.yml@1c0b0fb0ebc8e7ca3888aa4f6a74d1baecf08cc7
     permissions:
       contents: read
     with:
@@ -152,7 +152,7 @@ jobs:
     name: "shadow 结果汇聚（framework result callee）"
     needs: [changes, plan, build]
     if: ${{ always() }}
-    uses: yqm-307/bbt-framework/.github/workflows/bbtools-classify-v1.yml@5b04115e5c871b75c6bbf357e2a9bcd2d26ef3f8
+    uses: yqm-307/bbt-framework/.github/workflows/bbtools-classify-v1.yml@1c0b0fb0ebc8e7ca3888aa4f6a74d1baecf08cc7
     permissions:
       contents: read
     with:

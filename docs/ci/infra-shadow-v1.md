@@ -57,7 +57,7 @@ classifier/result 模板」这条迁移路径。
 影子**不实现**分类/结果逻辑，只调用已发布、已独立审查的 framework reusable callee：
 
 ```
-yqm-307/bbt-framework/.github/workflows/bbtools-classify-v1.yml@5b04115e5c871b75c6bbf357e2a9bcd2d26ef3f8
+yqm-307/bbt-framework/.github/workflows/bbtools-classify-v1.yml@1c0b0fb0ebc8e7ca3888aa4f6a74d1baecf08cc7
 ```
 
 - **分类（`plan` job，classification-only）**：`changed_files` 由本仓真实 diff 计算
