@@ -357,6 +357,10 @@ BOOST_AUTO_TEST_CASE(t_reconnect) {
 
     // 起容器：同一 client 显式 Connect 重建连接后恢复（默认不做隐式重连，不迁移旧命令）。
     BOOST_REQUIRE_EQUAL(Sys(ctl, "start redis"), 0);
+    // start/TCP 握手成功不等于命令就绪；复用 compose 的 redis-cli PING
+    // 健康检查等待。只等待后端前置条件，不重试被测 SET/GET/DEL。
+    BOOST_REQUIRE_EQUAL(Sys(std::string("timeout --kill-after=2 20 ") + ctl,
+                           "up -d --wait --wait-timeout 15 redis"), 0);
     std::atomic_bool recovered{false};
     BOOST_REQUIRE(RunInCoroutine([&] {
         const auto dl = std::chrono::steady_clock::now() +
