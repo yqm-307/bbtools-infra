@@ -27,10 +27,9 @@ cmake --build <build>/transport-consumer --target transport_consumer --parallel 
 `TransportRuntime::Create/Start`、运行时未初始化时工厂拒绝 `RuntimeUnavailable`、
 数值地址 `ListenTCP`/`BindUDP` 与 `LocalAddress()`、资源 owner 主动同步 `Close()`
 （返回即物理收口）后 `IsClosed()` 为真，以及受管对象随 runtime 关闭而落定。
-**候选、未提交（2026-10-01）**：`main.cc` 的关闭调用点已迁到 `Close()`（旧 `RequestClose`/
-`WaitClosed`/`CloseStatus`/`Scheduler::Stop` 已删除），并在本批候选中真实构建与运行通过
-（`transport_consumer: ALL OK`）；候选未提交、未走独立 review 与 PR CI，不得把本文读作
-已发布契约或最终验收结论。
+**已合入 main（close/stop 迁移 `02567ed`）**：`main.cc` 的关闭调用点已迁到 `Close()`（旧 `RequestClose`/
+`WaitClosed`/`CloseStatus`/`Scheduler::Stop` 已删除），并已真实构建与运行通过
+（`transport_consumer: ALL OK`）；本文不充当已发布契约的最终验收结论。
 
 ## 覆盖边界
 

@@ -4,10 +4,9 @@
 自有模型**：不使用 C++20 `co_await`/`Task<T>`，公共接口不泄漏 hiredis、
 mongocxx、bsoncxx 或底层线程类型。
 
-> **候选、未提交（2026-10-01）**：本文描述的是**冻结后的新关闭/等待契约**口径；本目录
-> `*.cc` 示例源码已在同一批候选中迁到此契约（旧 `RequestClose`/`WaitClosed`/`Scheduler::Stop`
-> 调用链已删除），但候选未提交、未走独立 review 与 PR CI，不得把本文读作已发布契约或
-> 最终验收结论。
+> **已合入 main（close/stop 迁移 `02567ed`）**：本文描述的是**新关闭/等待契约**口径；本目录
+> `*.cc` 示例源码已迁到此契约（旧 `RequestClose`/`WaitClosed`/`Scheduler::Stop` 调用链已删除）。
+> 本文不充当已发布契约的最终验收结论，覆盖边界见下文与各决策文档。
 
 ## 示例一览
 

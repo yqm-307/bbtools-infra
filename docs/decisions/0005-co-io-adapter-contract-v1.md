@@ -42,7 +42,8 @@
   已 `Closed`。
 
 superseded by：本文修订记录 + [0002 修订记录](0002-co-network-contract-v1.md)。
-本仓当前处于**候选、未提交**状态，本记录不宣称任何实现已交付或已通过验收。
+本契约（进程寿命运行时 + owner 同步 `Close()`）已合入 main（close/stop 迁移 `02567ed`）；
+本记录只陈述契约与迁移状态，不代表实现已被完整验收。
 
 ## 2. 设计结论
 
@@ -455,7 +456,7 @@ Binding 对 hiredis `redisContextFuncs` 各回调的目标行为（均为设计�
 - **禁止自动 reconnect 绕过 binding**：Binding 不得启用或伪造会自行重建 socket 的路径；断线必须映射为明确错误交回 `RedisConn`，由它决定新建连接（走 `DialTCP`）。收敛为唯一 `CoRedisCliImpl` 后，该「由它决定」落在 owner：默认不重建（错误显式交回调用方），仅在显式 `RedisClientConfig::reconnect_on_new_command` 时，为故障之后的**新命令**至多各重建一次；若该次重建再次失败，同一批次内其后已入队命令可统一以 `TransportError` 落定，不重发已失败命令、不做后台重连循环。
 - **显式生命周期，不做 Lazy**：公共面提供 `Connect(options)`（协程内真实等待 TCP 建连完成）、`Disconnect()`（同步收口连接、保留配置、可再次 Connect，不是 Close 别名）、`ConnectStatus()`（只读本地状态、不发网络探测）与终态 `Close()`。命令不得隐式建连：未 Connect、主动 Disconnect 之后、Connecting/Disconnecting 期间以及默认 `Failed` 状态一律返回错误；`Connect` 可显式重建失败/断开的连接。每次可重建连接使用新的 dial 关闭登记与代际令牌，Disconnect/Close 与在途 dial、迟到 owner 清理不得污染后续新连接。`Disconnect`/`Close` 对在途 Dial 的封口收口是**无超时的同步等待**（等待段本身不含挂起点，但被唤醒的 dial 协程需能被其它 Scheduler 线程推进才会退出）；单线程 Scheduler 下不得从 dial 所在线程调用 `Disconnect`/`Close`。该目标形态仍是 A 级**候选**，未切换生产实现。
 - **0 与负值的精确语义**：`read`/`write` 的每个返回值含义以上表为准，并在最小实验中用 hiredis 实际调用点（`redisBufferRead`、`redisBufferWrite`、`redisGetReply`）核对，不得凭直觉映射。
-- 该目标形态是 A 级**候选**，未经 §10 验收前不得据此把 `0003` 的 async + strand 决策改写为“已迁移”或“已淘汰”；也不能反向把本目标描述回 sche async 形态。
+- 该目标形态（hiredis 函数表直接绑定）是 A 级**候选**，未经 §10 验收前不得写成已交付；它与已合入的 CoTCP owner binding（`9e68967`，见 `0003`）是两条不同路径，也不能反向把本目标描述回 sche async 形态。
 
 实施时必须另行验证：
 
@@ -465,14 +466,15 @@ Binding 对 hiredis `redisContextFuncs` 各回调的目标行为（均为设计�
 - connect、DNS、TLS、command timeout 是否仍有未接管路径；
 - 直接 binding 与当前 async adapter 的兼容/性能/关闭差异。
 
-在这些证据完成前，`0003` 中的 hiredis async + strand 仍是当前实现决策，不得把本文目标形态写成已交付。
+在这些证据完成前，不得把本文 §8 目标形态写成已交付。当前 Redis 实现是已合入（`9e68967`）的 CoTCP owner binding（CoTCP 承担字节 I/O，hiredis 只做同步 RESP2 编解码），既非本文 §8 目标形态，也不是旧的 hiredis async + strand。
 
 ### 8.2 与 0003 的关系
 
-`0003-redis-client-hiredis-dependency.md` 是**当前实现**的决策（hiredis
-async + strand，v1.4.1 / commit `616f2286ba5503f74ae96e720623fa11dbc690af`），
-本文 §8/§8.1 是**候选目标形态**，二者并存；A 级实验通过并经 §11 排序中的迁移
-决定前，旧实现的单执行域、连接单生命周期与 cleanup 时序仍须遵守；目标设计不再受“只能 async + strand”的选型条款限制。`scheduleTimer` 未接是旧实现缺口，不是新实现要保留的不变量。
+`0003-redis-client-hiredis-dependency.md` 记录 hiredis 依赖选型（v1.4.1 / commit
+`616f2286ba5503f74ae96e720623fa11dbc690af`）；其落笔时的 async + strand 实现已由**已合入的
+CoTCP owner binding**（`9e68967`）取代，本文 §8/§8.1 的「hiredis 函数表直接绑定」则是另一条
+**候选目标形态**、尚未交付；在 §10 验收前不得写成已交付。已合入形态仍须遵守单连接生命周期与
+cleanup 时序；目标设计不再受“只能 async + strand”的选型条款限制。`scheduleTimer` 未接是旧实现缺口，不是新实现要保留的不变量。
 
 ## 9. KCP Binding 目标形态
 
@@ -570,7 +572,7 @@ Mongo 维持 `0004` 的 C 级 worker bridge 例外：这是当前实现的兼容
 
 1. **公共规格与上游探针**：冻结 `CoTCP`/`CoUDP` 的值类型、错误和所有权契约（本文 §3–§7），不实现协议客户端；同时验证 `IoWait` 组合等待（§5.2）、单 owner 关闭协议（§6.4）等依赖的上游 runtime 能力——这些探针是后续 Binding 的前置门禁，不是已验证的既有 API。
 2. **CoTCP 最小切片**：完成 CoTCP 的真实 FD、超时、取消、关闭、`DialTCP`/`ListenTCP` 生命周期和最小 contract test。
-3. **Redis 兼容证明**：hiredis 按固定 commit 做最小函数表实验，验证 §8.1 各回调行为与 A 级 Stop 门禁（§10.1）；实验不直接修改现有 Redis adapter。通过后，比较目标 A 级路径与当前 async + strand 路径的兼容、性能和关闭差异，再决定迁移。
+3. **Redis 兼容证明**：hiredis 按固定 commit 做最小函数表实验，验证 §8.1 各回调行为与 A 级 Stop 门禁（§10.1）；实验不直接修改现有 Redis adapter。通过后，比较目标 A 级路径与当前 CoTCP owner binding 路径（`9e68967`）的兼容、性能和关闭差异，再决定迁移。
 4. **HTTP 迁移与执行位置门禁**：在 CoTCP 就绪后启动 §10.2 的 Beast 执行位置迁移（SyncReadStream 适配或非阻塞步进），迁移 Issue 必须先声明执行位置与关闭门禁，保留 `0002` HTTP 对应的 N-01～N-04、N-06；RPC 的 N-05 不是 HTTP 迁移前置。
 5. **CoUDP/KCP（并行可选）**：独立验证 KCP 的 B 级 owner coroutine 路径（§9.1/§9.2），覆盖 output queue、timer、side-channel 与 UDP 共享 socket；CoUDP/KCP 与 TCP 线并行推进，不阻塞 CoTCP/Redis/HTTP。
 6. **Mongo 调查（并行）**：Mongo 保持 C 级 worker bridge；是否可迁移到 A/B 级由独立兼容调查（§10.3）并行推进，不阻塞其他模块。
@@ -592,7 +594,7 @@ Mongo 维持 `0004` 的 C 级 worker bridge 例外：这是当前实现的兼容
 
 - `bbtools-coroutine/agent-docs/2026-09-07-core-runtime-contract.md`：EventLoop/Poller 负责等待与事件交付，Hook 是适配层，不以 Hook 数量代替兼容验证；Stop 不展开挂起协程栈。
 - `bbtools-infra/docs/decisions/0002-co-network-contract-v1.md`：现有 Runtime、错误、关闭和在途资源契约。
-- `bbtools-infra/docs/decisions/0003-redis-client-hiredis-dependency.md`：当前 hiredis async + strand 决策及连接生命周期约束。
+- `bbtools-infra/docs/decisions/0003-redis-client-hiredis-dependency.md`：hiredis 依赖选型与连接生命周期约束（当前实现为 CoTCP owner binding，`9e68967` 取代原 async + strand）。
 - `bbtools-infra/docs/decisions/0004-mongo-client-mongocxx-dependency.md`：当前 Mongo synchronous driver + worker bridge 决策。
 - hiredis 固定 commit `616f2286ba5503f74ae96e720623fa11dbc690af` 的 `redisContextFuncs`、`redisBufferRead`、`redisBufferWrite`、`redisGetReply` 和 `redisFree` 路径。
 - KCP `ikcp.h` 的 `ikcp_setoutput`、`ikcp_input`、`ikcp_update`、`ikcp_check`、`ikcp_recv` 接口。

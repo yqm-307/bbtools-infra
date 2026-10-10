@@ -2,7 +2,7 @@
 
 ## 状态与范围
 
-状态：已实现候选（待独立审查）
+状态：owner + 集合句柄形态已合入 main（PR #44 `feat(mongo): move client ownership into runtime`，`3bd558a`；Issue #40 已关闭）。本记录不代表完整生命周期/跨平台验收已完成。
 日期：2026-09-25。基线：remote main `562a14bc3e03315d994b4834e0c0a01b53287dc9`。
 
 ### 修订记录（2026-10-01：进程寿命运行时 + 同步 Close）

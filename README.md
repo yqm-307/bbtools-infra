@@ -11,11 +11,12 @@
 | 模块 | CMake target | 状态 | 说明 |
 |------|-------------|------|------|
 | HTTP（client + server + NetworkRuntime） | `bbt::infra_http` | 已实现，单测覆盖中 | Beast/Asio 异步；配额、关闭排空、子对象反登记等可靠性边界仍在 Issue 中推进 |
-| CoTCP / CoUDP transport | `bbt::infra_tcp`、`bbt::infra_udp` | 已实现，行为验收未完成 | 基础收发与受管工厂可用；`max_inflight` 门禁、生命周期完整验收归 Issue #31/#32 |
-| Redis client | `bbt::infra_redis` | 已实现最小切片 | hiredis async + strand；单连接语义；`bbt::infra::redis` 公共 API 目录尚未拆分 |
+| CoTCP / CoUDP transport | `bbt::infra_tcp`、`bbt::infra_udp` | 已实现 | 基础收发与受管工厂可用；Runtime 级 `max_inflight` 在途门禁已实现并合入（Issue #31/#32 已关闭）；跨平台/非 Linux、公网 DNS 与部分 lifecycle 直接证据仍未覆盖 |
+| Redis client | `bbt::infra_redis` | 已实现最小切片 | CoTCP owner binding（`CoRedisCliImpl` + 窄 `RedisCotcpConn`）：CoTCP 承担 Dial/读写/等待/关闭，hiredis 只做同步 RESP2 编解码；单连接语义；`bbt::infra::redis` 公共 API 目录尚未拆分 |
 | Mongo client | `bbt::infra_mongo` | 已实现 owner + 句柄形态 | 同步 driver + worker bridge；`mongo::CoMongoDb` 为资源 owner，`mongo::CoMongoColl` 为集合句柄；`include/bbt/infra/mongo/` 公共目录已建，剩余 API 按决策 0006 逐步迁移 |
 | 基础动态配置 | `bbt::infra_config` | 最小切片已合入主线，独立消费已验证 | `bbt::infra::config`；版本化不可变快照 + 内存源 + 真实本地文件源 + watch（初始/更新/重复去重、失败恢复、关闭与晚到通知、正常 drain 与 owner 同步 `Close()` 的资源边界）。**未交付**：远程 provider 与真实重连、业务 schema 校验、客户端资源热切换。契约/命令/未覆盖矩阵见 [docs/config-watch-v1.md](docs/config-watch-v1.md) |
-| RPC / MCP | — | 未开始 | 归对应 Issue 推进，当前无实现 |
+| RPC | `bbt::infra_rpc` | wire profile 最小切片已实现 | 版本化 Protobuf RpcEnvelope wire profile（`bbt::infra::rpc`，Issue #8）：值类型校验、编解码与 HTTP body 绑定；带网络运行的 RpcClient/Server 完整运行时**未交付**（设 `BBT_PROTOBUF_PREFIX` 时构建） |
+| MCP | — | 未开始 | 归对应 Issue 推进，当前无实现 |
 
 已实现能力的单测与示例均可独立构建运行，见下文「独立消费」与 [examples/README.md](examples/README.md)。
 
@@ -23,9 +24,9 @@
 
 [CoTCP/CoUDP 与第三方 Binding 规格](docs/decisions/0005-co-io-adapter-contract-v1.md) 定义目标执行模型：proc 执行收发与协议，sche 只检测就绪并唤醒。
 
-当前 HTTP 为 Asio/Beast 异步推进，Redis 为 hiredis async + strand，Mongo 为同步 driver + worker bridge。CoTCP/CoUDP 已交付基础实现，但完整生命周期与 `max_inflight` 门禁验收仍在 Issue #31/#32 中推进，尚未完成全部规格目标。
+当前 HTTP 为 Asio/Beast 异步推进，Redis 为 CoTCP owner binding（CoTCP 承担字节 I/O/等待/关闭，hiredis 只做同步 RESP2 编解码），Mongo 为同步 driver + worker bridge。CoTCP/CoUDP 已交付基础实现，Runtime 级 `max_inflight` 在途门禁已实现并合入（Issue #32 已关闭，见 [0005 §4](docs/decisions/0005-co-io-adapter-contract-v1.md)）；跨平台/非 Linux、公网 DNS 与部分 lifecycle 的直接验收证据仍未覆盖。
 
-## 资源关闭与请求完成契约（进程寿命运行时；候选、未提交）
+## 资源关闭与请求完成契约（进程寿命运行时）
 
 coroutine 运行时按**进程寿命**存在、不参与业务资源收口（不再有 `Scheduler::Stop()`/restart 与运行时代际）。infra 关闭契约见 [0002 co-network/v1 修订记录](docs/decisions/0002-co-network-contract-v1.md)，要点：
 
@@ -35,7 +36,7 @@ coroutine 运行时按**进程寿命**存在、不参与业务资源收口（不
 - **分层**：Scheduler 只驱动 FD 就绪与通用唤醒；Connection handler 处理本连接的非阻塞读写、buffer 与关闭；协议（Redis/HTTP/Mongo）各自实现协议与错误映射，不共享万能请求接口。
 - 「运行时是否在跑」用初始化状态 `Scheduler::IsInitialized()`，不再有代际语义。
 
-> 状态：本仓处于**候选、未提交**状态。`ICoCloseable.hpp`、`NetworkTypes.hpp`、`src/detail/IoSupport.hpp` 已按新契约修订；其余模块头/实现、tests 与 examples 中的旧符号迁移仍在同批候选内进行。本 README 描述**冻结后的目标契约**，不宣称实现已交付或已通过验收；跨线程同步 `Close()` 的实现口径见 [0005 §6.4](docs/decisions/0005-co-io-adapter-contract-v1.md)。
+> 状态：新的关闭/进程寿命契约**已合入 main**（close/stop 迁移 `02567ed`）：`ICoCloseable.hpp`、`NetworkTypes.hpp`、`src/detail/IoSupport.hpp` 与模块头/实现、tests、examples 的公开调用链均已迁到该契约（`RequestClose`/`WaitClosed`/`ReleaseClosed`/`CloseStatus` 等旧公开入口已删除）。跨线程同步 `Close()` 的实现口径见 [0005 §6.4](docs/decisions/0005-co-io-adapter-contract-v1.md)；本 README 只陈述契约与迁移状态，不据此宣称同步 `Close()` 实现已被完整验收，未覆盖项以各决策文档与 Issue 为准。
 
 ## 依赖方向与公共边界
 
@@ -89,9 +90,9 @@ ctest --test-dir build --output-on-failure
 
 ## CI 覆盖边界
 
-- PR/push CI（`arc-s4-infra` runner）对本构建中已注册的全部测试执行 `ctest -j1`；当前注册的测试集随 `BBT_HIREDIS_PREFIX`/`BBT_MONGOCXX_PREFIX` 是否提供而变。
-- 未提供 Redis/Mongo 前缀时，`redis.unit`/`redis.live`/`mongo.unit`/`mongo.live` 不注册、不运行；CI 镜像默认不带 hiredis/mongocxx 前缀，故当前 CI 实际覆盖 HTTP/transport/contract 面，不覆盖 Redis/Mongo。
-- Redis/Mongo **live 容器验收**（`redis.live`、`mongo.live`）**未纳入 CI**：按环境变量 `BBT_TEST_REDIS_ADDR` / `BBT_TEST_MONGO_URI` 驱动，未提供时跳过。
+- PR/push CI 中**本仓定义的 job** 跑在 hosted `ubuntu-24.04`（`arc-s4-infra` 仅存历史含义）；跨仓 reusable callee（分类/计划、编译 & ctest 汇聚）按其固定 `ubuntu-latest` 运行。对本构建中已注册的全部测试执行 `ctest -j1`。
+- CI 在 `prepare-deps` 阶段用 `scripts/prepare_resource_deps.sh` 以固定 tag+SHA 源码构建 hiredis/mongoc/mongocxx 私有前缀，并在 `release` job 显式断言 `redis.unit`/`mongo.unit` 已注册后纳入 `ctest -j1`；故 CI 覆盖 HTTP/transport/contract 面**以及 Redis/Mongo unit**。真实 run 证据见 [docs/ci/infra-ci-v1.md](docs/ci/infra-ci-v1.md)。
+- Redis/Mongo **live 容器验收**（`redis.live`、`mongo.live`、`redis.cotcp_binding.live`）**未纳入 CI**：按环境变量 `BBT_TEST_REDIS_ADDR` / `BBT_TEST_MONGO_URI` 驱动，未提供时如实标 Skipped。
 - CI 固定依赖到上游 `main`/`master` HEAD，不代表对任意历史 SHA 的回溯兼容。
 
 ## 构建约束

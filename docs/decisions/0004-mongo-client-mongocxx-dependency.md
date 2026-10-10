@@ -16,8 +16,8 @@
 `max_queue` 背压、URI 超时注入、错误映射与“同步 driver 调用不可强杀”；**取代**：完成回投不再
 用 `CompletionSignal`，改由 adapter 路径 `Notify`（可带载荷）唤醒 `CoWaiter`；关闭不再有
 `WaitClosed`——owner 同步 `Close()` 返回即表示在途 driver 调用与队列归零、worker 全退。
-superseded by [0002 修订记录](0002-co-network-contract-v1.md)。本仓处于**候选、未提交**状态，
-不宣称已迁移或已通过新契约验收。
+superseded by [0002 修订记录](0002-co-network-contract-v1.md)。本契约（进程寿命运行时 + owner 同步
+`Close()`）已合入 main（close/stop 迁移 `02567ed`），本记录只陈述契约与迁移状态，不代表已被完整验收。
 
 ## 固定依赖
 

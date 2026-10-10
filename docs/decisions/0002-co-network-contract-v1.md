@@ -34,9 +34,10 @@ owner/framework manager 主动调用的同步 `Close()`**。本记录为准，**
   operation state（详见下方「请求完成」）。
 
 superseded by：本修订记录 + [0005 §6.3/§6.4](0005-co-io-adapter-contract-v1.md)（跨线程同步
-`Close()` 的实现口径）。本仓当前处于**候选、未提交**状态：`ICoCloseable.hpp`、`NetworkTypes.hpp`、
-`src/detail/IoSupport.hpp` 已按本契约修订，其余模块头/实现的迁移仍在同批候选内进行（见 §附记），
-本记录不宣称任何实现已交付或已通过验收。
+`Close()` 的实现口径）。本契约**已合入 main**（close/stop 迁移 `02567ed`）：`ICoCloseable.hpp`、
+`NetworkTypes.hpp`、`src/detail/IoSupport.hpp` 与模块头/实现、tests、examples 的公开调用链均已迁到
+本契约（旧公开入口 `RequestClose`/`WaitClosed`/`ReleaseClosed`/`CloseStatus` 已删除，见 §附记），
+本记录只陈述契约与迁移状态，不代表同步 `Close()` 实现已被完整验收。
 
 ### 后续目标规格
 
