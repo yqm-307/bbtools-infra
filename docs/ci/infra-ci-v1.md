@@ -1,9 +1,9 @@
 # infra-ci-v1：bbtools-infra 正式 hosted 普通 CI（Issue #50 正式切换）
 
-> 状态：**本地候选，未 commit / 未 push / 未建 PR / 未触发任何 CI**。本文件由影子文档
-> `docs/ci/infra-shadow-v1.md`（随影子入口一并退役）改写而来；现行产品 C++、CMake、
-> 依赖锁、AGENTS、release、mirrors、runner 均未改。所有在线事实（真实 run、hosted
-> 工具链版本、跨仓 callee 调用、job 时长）在本轮**未执行**，标记为 UNVERIFIED。
+> 状态：**已合入 main**（commit `28d929bea87c1e0470a93f2919da2c73a758c451`，PR #73），并已由真实
+> hosted run 验证（run `37948171767`，全 job success，总时长 8m50s）。本文件由影子文档
+> `docs/ci/infra-shadow-v1.md`（随影子入口一并退役）改写而来；产品 C++、CMake、依赖锁、AGENTS、
+> release、mirrors 均未改。在线事实以 run `37948171767` 为准；仅个别项仍标 UNVERIFIED（见 §8）。
 
 ## 1. 定位与范围
 
@@ -83,22 +83,27 @@ ccache launcher 是否启用（runner 镜像自带 ccache 时），不改变任�
 - 本文件替代影子 `ci-shadow-v1.yml`（已删除）与影子配方 `scripts/ci/run_infra_gate.sh`
   （已删除，判据并入本 workflow 的 release/debug job）以及本地结果脚本
   `scripts/ci/required_result_gate.sh`（已删除，结果汇聚改由已发布 callee 承担）。
-- 回滚 = 经 PR revert 本候选提交（恢复 `.github/workflows/ci.yml` 现役内容、恢复
+- 回滚 = 经 PR revert 正式切换提交 `28d929b`（恢复 `.github/workflows/ci.yml` 现役内容、恢复
   `ci-shadow-v1.yml` 与两个脚本、恢复影子文档），不触碰产品代码/依赖锁/release/runner。
 
-## 8. 本地验证与未覆盖
+## 8. 验证与未覆盖
 
-本轮本地只跑 Python/YAML/真实 scripts 门禁测试（`scripts/ci/tests/run_tests.py`）与
-`bash -n` / `git diff --check` / 敏感扫描，**不跑产品 C++ 全量构建**（走父级授权 PR CI）。
+切换前本地只跑 Python/YAML/真实 scripts 门禁测试（`scripts/ci/tests/run_tests.py`）与
+`bash -n` / `git diff --check` / 敏感扫描，**未跑产品 C++ 全量构建**（由 hosted CI 承担）。
+本仓正式 CI 已在 push→main 上运行验证：run `37948171767`（event `push`，`28d929b`，PR #73 合入后）全 job success，总时长 8m50s。
 
-**未覆盖 / UNVERIFIED（在线事实，本地不造值）**：
+**已由真实 run 覆盖（run `37948171767`，event `push`→main，`28d929b`，全 job success，8m50s）**：
 
-- 任何真实 hosted run、跨仓 reusable callee 调用的在线身份/权限、`job.workflow_*` 解析。
-- hosted 实际工具链版本（`cmake`/`g++`/`ninja`/Boost）、Boost 下载校验的真实执行。
-- `result` job（reusable 调用）在平台的 check 名是否等于 job `name`「编译 & ctest」；
-  required(context,app) 的精确切换属 F3，须在线读回。
-- 各 job 在 hosted 的实际时长；本轮按「不擅增 timeout」保持现役 15/15/15/5/5 分钟预算，
-  若真实 run 显示超时需单独评审（不在本候选内调大）。
+- 真实 hosted run（`push`→main）、跨仓 reusable callee 调用的在线身份/权限与 `job.workflow_*` 解析。
+- 各 job 在 hosted 的实际时长：`依赖准备（固定源前缀归档）`≈2m18s、`Release 构建 & ctest`≈5m33s、
+  `Debug 生命周期定向门禁（8 项，零跳过）`≈2m41s，均在现役 15 分钟预算内，未触发超时。
+
+**仍未核实（UNVERIFIED）**：
+
+- hosted 实际工具链版本（`cmake`/`g++`/`ninja`/Boost）与 Boost 下载校验的真实执行：本轮未读 run 日志，绿色 run 不代替版本记录。
+- `result` job（reusable 调用）在平台上的 required check 名与 job `name`「编译 & ctest」的精确
+  对应、required(context,app) 的精确切换属 F3，须在线读回（本轮未读回；run 已产出以该名为前缀的
+  汇聚 check 并 success，但不足以断言 required context 已精确切换）。
 - `coroutine@main` / `core@master` 仍沿用现役可变分支头，实际 SHA 由 run 记录。
 - live 组（`redis.live`/`mongo.live`/`redis.cotcp_binding.live`）无容器后端时如实标
   Skipped，不冒充已通过。

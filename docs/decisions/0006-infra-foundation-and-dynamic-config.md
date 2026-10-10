@@ -135,7 +135,7 @@ Redis/Mongo 客户端只接受已经解析并校验的客户端配置。配置�
 
 - 不使用 C++20 `co_await`、`Task<T>` 作为公共示例或公共契约；
 - 使用项目已有的 `CoWaiter`（`WaitWithCallback`/`Notify`）、executor 与协程等待/恢复语义，以及协程级取消（`RequestCancel`）与带载荷 `Notify`；不再有 `CompletionSignal`/`CancellationToken`/运行时代际；
-- Redis 的 hiredis async 回调只负责推进 adapter 状态并唤醒等待者；
+- Redis 由已合入的 CoTCP owner binding（`9e68967`）推进 adapter 状态并唤醒等待者（当前无 hiredis async 回调）；
 - Mongo 的同步 driver 调用运行在有界 worker bridge，完成后回投共享 coroutine executor；
 - 配置 watch 的第三方回调不得直接切入业务协程。
 

@@ -6,17 +6,17 @@
 
 ### 后续目标规格
 
-[0005：CoTCP/CoUDP 与第三方 Binding](0005-co-io-adapter-contract-v1.md) 提出 hiredis transport 函数表直接协程绑定的候选路径。本文 async + strand 仍描述当前实现；下文“同步 API + Hook 被明确禁止”限定于旧 async context 不得混用同步调用，不是禁止独立构建并验证新的 transport Binding。目标路径需验证锁、线程局部状态、关闭时序与物理收口，未验收前不得写成已迁移。
+[0005：CoTCP/CoUDP 与第三方 Binding](0005-co-io-adapter-contract-v1.md) 提出 hiredis transport 函数表直接协程绑定的候选路径。本文 async + strand 描述的是本决策落笔时的实现（其后已由 CoTCP owner binding 取代，见修订记录）；下文“同步 API + Hook 被明确禁止”限定于旧 async context 不得混用同步调用，不是禁止独立构建并验证新的 transport Binding。0005 §8 目标路径需验证锁、线程局部状态、关闭时序与物理收口，未验收前不得写成已迁移。
 
 ### 修订记录（2026-10-01：进程寿命运行时 + owner 同步 Close）
 
-本文原结论中依赖 `CompletionSignal`/`CancellationToken`/运行时代际/`Scheduler::Stop()` 的表述（§选型理由、§执行域与生命周期不变量、§测试架构、§未覆盖与已知差异）已被上游 coroutine 的**进程寿命运行时**（候选 HEAD `03430a5`）与 infra 的**同步 `Close()`** 契约取代。**保留的当前实现事实**仍是 hiredis async + strand、单执行域/单连接生命周期、cleanup 时序；**被取代**的是“请求等待靠 `CompletionSignal`、关闭靠 `RequestClose`/`WaitClosed`、运行时靠代际/Stop”的旧依赖。请求完成改按 operation state + `CoWaiter::WaitWithCallback`/`Notify` 口径描述，superseded by [0002 修订记录](0002-co-network-contract-v1.md) 与本文下方改写。本决策**当前实现**（hiredis async + strand）不变；本仓处于**候选、未提交**状态，不宣称已迁移或已通过新契约验收。
+本文原结论中依赖 `CompletionSignal`/`CancellationToken`/运行时代际/`Scheduler::Stop()` 的表述（§选型理由、§执行域与生命周期不变量、§测试架构、§未覆盖与已知差异）已被上游 coroutine 的**进程寿命运行时**（候选 HEAD `03430a5`）与 infra 的**同步 `Close()`** 契约取代。**保留**的是单连接生命周期与 cleanup 时序；**被取代**的是“请求等待靠 `CompletionSignal`、关闭靠 `RequestClose`/`WaitClosed`、运行时靠代际/Stop”的旧依赖。请求完成改按 operation state + `CoWaiter::WaitWithCallback`/`Notify` 口径描述，superseded by [0002 修订记录](0002-co-network-contract-v1.md) 与本文下方改写。**当前实现已由 CoTCP owner binding 取代**（`9e68967`「converge CoTCP client lifecycle」已合入 main，见下方「CoTCP owner binding 迁移记录」）：CoTCP 承担 Dial/读写/等待/关闭，hiredis 只做同步 RESP2 编解码；下文的 async + strand 描述自此为历史记录。
 
-### 候选迁移记录（CoTCP owner binding；候选、未切换）
+### CoTCP owner binding 迁移记录（已合入 main）
 
-一个隔离 worktree 候选把 Redis 客户端收敛为「唯一 `CoRedisCliImpl` + 内部窄 `RedisCotcpConn`（CoTCP 承担 Dial/读写/等待/关闭，hiredis 只做 RESP2 编解码）」，删除平行候选 `CoRedisCotcpCliImpl` 与旧 `RedisConnection`。**这是候选实现，未 commit/未合入/未切换 main；生产 Redis 仍是 hiredis async + strand**。公共 `CoRedisCli` 类型与方法签名不变，`CoRedisCli::Create` 只装配唯一实现。
+Redis 客户端已收敛为「唯一 `CoRedisCliImpl` + 内部窄 `RedisCotcpConn`（CoTCP 承担 Dial/读写/等待/关闭，hiredis 只做 RESP2 编解码）」，并删除平行候选 `CoRedisCotcpCliImpl` 与旧 `RedisConnection`。**该收敛已合入 main**（`9e68967`「converge CoTCP client lifecycle」，PR #61）：生产 Redis 即此 CoTCP owner binding，不再是 hiredis async + strand。公共 `CoRedisCli` 类型保留，但其**方法签名已变更**（破坏性公共面变更，commit 为 `feat(redis)!`）：删除 `Start()`，新增 `Connect(options)`/`ConnectStatus()`/`Disconnect()`。`CoRedisCli::Create` 只装配唯一实现。
 
-候选相对旧契约的行为调整（签名不变不等于行为不变，须下游知悉）：
+相对旧契约的行为与签名调整（须下游知悉）：
 
 - **显式连接生命周期（不做 Lazy）**：公共面删除 `Start()`，改为 `Connect(options)` /
   `ConnectStatus()` / `Disconnect()`。`Connect` 必须在协程上下文调用并**真实等待 TCP
@@ -43,9 +43,9 @@
   `IsClosed()` 为真；`Close` 是终态，之后不得再 `Connect`。`Close`/`Disconnect` 对在途
   Dial 的封口收口是**无超时的同步等待**（等待段本身不含挂起点，但被唤醒的 dial 协程需
   能被其它 Scheduler 线程推进才会退出）：单线程 Scheduler 下不得从 dial 所在线程调用
-  `Disconnect`/`Close`。此为候选形态，未 commit/未切换 main。
+  `Disconnect`/`Close`。该形态已随 `9e68967` 合入 main。
 
-未验收：live Redis、TLS/RESP3/Cluster/Sentinel、多连接并发、sanitizer、跨平台仍属未覆盖；候选开发所用相邻 hiredis 前缀不是锁定依赖，实际链接前缀须在独立构建中另行固定核对。
+未验收：live Redis、TLS/RESP3/Cluster/Sentinel、多连接并发、sanitizer、跨平台仍属未覆盖；开发期所用相邻 hiredis 前缀不是锁定依赖，实际链接前缀须在独立构建中另行固定核对。
 
 ## 固定依赖
 
