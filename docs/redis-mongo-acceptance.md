@@ -2,7 +2,7 @@
 
 ## 范围
 
-本次仅补 Mongo pool 资源寿命回归、接入 hosted CI 的真实 Redis/Mongo 流程及对齐 #12/#34 的过时记录。不调整客户端架构、公共 API、上游运行时、依赖版本、runner、缓存或安装/导出机制。
+既有交付补 Mongo pool 资源寿命回归、接入 hosted CI 的真实 Redis/Mongo 流程及对齐 #12/#34 的过时记录。本轮 #34 候选再补真实后端强制超时与 owner Close 中断测试；不调整客户端架构、公共 API、上游运行时、依赖版本、runner、缓存或安装/导出机制。
 
 ## Mongo pool 回归
 
@@ -34,6 +34,28 @@ bash tests/mongo-live/run.sh "$BUILD_DIR/tests/Test_mongo_live"
 - 仓库当前无 branch-protection required contexts；本任务不修改保护配置。合入验收必须人为核对精确 PR head 的 Release/Debug 与汇聚检查通过，不能把名字带 required 的注释当作平台强制保护。
 
 复用 compose 的 redis:7-alpine / mongo:8.0；Redis 0.5 CPU/256 MiB，Mongo 0.75 CPU/512 MiB、WiredTiger cache 0.25 GiB。使用独占 project、临时 loopback 端口、有限健康等待和测试时间。Release job 上限 45 分钟，Redis/Mongo 两个 live step 上限分别为 19/16 分钟（计入 timeout 的 kill-after 宽限）；这些是故障预算，不是正常耗时。只清理自有 project 的容器/卷/网络，不 prune 他人资源；一次性 hosted VM 回收是硬杀后的隔离边界，不推广到常驻 runner。镜像 tag 可变，日志记录实际镜像身份，不宣称 digest pin。
+
+## #34 真实超时与 owner Close 补验（当前本地候选）
+
+现行接口没有独立取消 token；本轮以公开 owner 同步 `Close()` 导致在途调用返回 `Closed` 验收中断，不恢复 `CancellationToken`、`Stop` 或 `WaitClosed`。Mongo 集合句柄的 `Close()` 不等于数据库 owner 的关闭。
+
+| 文件 / 用例 | 验收行为与观测 |
+|---|---|
+| `Test_redis_live.cc` / `t_explicit_disconnect_reconnect_recovers` | `Disconnect()` 后不隐式重连，显式 `Connect()` 后 PING / KV 恢复 |
+| `Test_redis_live.cc` / `t_close_race_during_server_pause_settles_closed` | Redis 原生 `CLIENT PAUSE` 窗口内，单条小 SET 已触发既有 CoTCP fd-wait gate 后再 Close；调用返回 `Closed`，保存的旧 transport 物理 closed、登记归零；重复 Close 幂等，新 client 恢复 |
+| `Test_redis_live.cc` / `t_server_pause_forces_timedout_then_recover` | 单条小 PING 在 pause 窗口内触发 fd-wait gate 后返回 `TimedOut`；旧 transport 物理 closed、连接为 Failed 且不隐式复用；同窗口独立见证 PING 恢复后，显式 Connect / KV 正常 |
+| `Test_mongo_live.cc` / `t_backend_blocked_deadline_timedout` | 健康后端的 insert 被 `failCommand(blockConnection)` 延迟；逻辑 `TimedOut` 交付时 driver 仍占执行槽；后端握手确认进入，随后 driver 落定、执行槽归零、延迟 insert 真实生效，原 owner CRUD 恢复 |
+| `Test_mongo_live.cc` / `t_backend_blocked_owner_close_closed` | 后端握手确认 find 已进入阻塞后，由独立线程发起数据库 owner Close；调用先返回 `Closed`，Close 等 driver 返回，返回当刻 IsClosed、worker / 执行槽归零；新 owner CRUD 恢复 |
+
+Redis fd-wait gate 不自报读写方向；本候选的读等待判断基于已建连、单条极小命令且无其他操作，以及实际 `WriteAllBytes → ReadReply` 调用链，不推广到大写入或 pipeline。只读内部状态和既有测试接缝仅对 live 测试目标可见，没有新增生产接口。已返回结果的再次检查是调用方可见终态的回归，不单独当作内部迟到结果没有重复交付的完整证明。
+
+Mongo 的 `waitForFailPoint.timesEntered` 使用本次 arm 返回的累计 `count + 1`，不写死为 1；每例显式解除并核对计数增量为 1。阻塞 `blockTimeMS=8000`、`times:1`，driver socket timeout 大于阻塞时间；控制命令用 `timeout --kill-after=10 45`，JSON 经既有 bsoncxx 解析。异步在途结果采用堆所有权、按值捕获，closer 析构即 join，异常路径 Close owner 并尝试解除 failpoint。
+
+复现仍使用上面的两条 `run.sh` 命令。Redis 编排注入 `BBT_REDIS_RCLI`；Mongo 编排注入 `BBT_MONGO_CTL_EVAL`，并仅对一次性 mongod 启用 `enableTestCommands=1`。服务环境存在而缺控制通道时，新用例硬失败，不静默 skip；无服务环境时原 CTest Skipped 规则不变。
+
+本地候选以 main `1a99bdcbcbcfbc54a9c6ec3d6ccb9c37ce2d74cc` 为基线，消费 coroutine `7bcda3b078f975ff2978424be7f6ba38e04fb7f6`。整合后使用全新 Release 构建目录，限定构建 live 与直接耦合目标；`contract.basics`、`redis.unit`、`redis.cotcp_binding`、`mongo.unit` 4/4 通过，两套实际编排的 A/B/C 及额外 Redis binding live 通过，自有容器清理成功。分包负例实测缺控制通道返回 201；Mongo 在途 op 与 closer 已启动时人为断言失败，同样返回 201 而非 terminate，探针已从候选回滚。分包证据与整合源码逐字节核对，不把阶段外 skip 用例计作该阶段行为通过。
+
+未覆盖：sanitizer/TSan、Redis 半帧迟到回复与 `reconnect_on_new_command=true`、Mongo deadline 与 Close 同时竞争同一 op、多 worker 的部分收口。异常路径的 Mongo failpoint 解除没有单独后端回读证据；只提供守卫实现及干净失败探针，不称该项独立实测完成。本轮未本地全量、未提交或发布；当前新增候选尚无 exact-head hosted CI，也不据本地结果关闭 #34。最终在线验收按下文的精确 SHA 证据要求执行。
 
 ## #12 旧条款重判
 

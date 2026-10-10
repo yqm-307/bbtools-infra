@@ -1,6 +1,11 @@
 # Issue #7 真实 MongoDB 验收用临时容器：资源受限（cpus<=0.75,
 # mem_limit<=512m, wiredTigerCacheSizeGB<=0.25），动态项目名由编排脚本
 # 经 -p 指定，结束即 down -v 清理容器/网络/匿名卷。
+#
+# Issue #34：追加 --setParameter enableTestCommands=1——仅供本一次性测试容器
+# 使用 mongod 自带的 failCommand failpoint（blockConnection）在服务端制造
+# 可观察的在途命令阻塞；该开关只启用容器内测试命令，不进入被测公共面，
+# 也不改变 CRUD 行为。
 services:
   mongo:
     image: mongo:8.0
@@ -10,6 +15,8 @@ services:
       - "0.25"
       - "--bind_ip"
       - "0.0.0.0"
+      - "--setParameter"
+      - "enableTestCommands=1"
     cpus: 0.75
     mem_limit: 512m
     memswap_limit: 512m
