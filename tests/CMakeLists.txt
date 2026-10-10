@@ -241,8 +241,16 @@ if(TARGET bbt_infra_redis)
         SKIP_RETURN_CODE 77)
 
     add_executable(Test_redis_live Test_redis_live.cc)
+    # Issue #34：真实在途/物理收口断言复用 src/redis 内部只读探针
+    # （BindingStateSnapshot / TransportForTest——均为生产始终存在的真实状态面，
+    # 不受 BBT_INFRA_STRINGENT_DEBUG 影响），故需 src 内部头与 hiredis 类型解析
+    # 路径；仅本目标可见，不改变其他目标。
+    target_include_directories(Test_redis_live PRIVATE
+        ${CMAKE_SOURCE_DIR}/src)
+    find_package(hiredis CONFIG REQUIRED PATHS "${BBT_HIREDIS_PREFIX}" NO_DEFAULT_PATH)
     target_link_libraries(Test_redis_live PRIVATE
-        bbt_infra_redis bbt::infra_common Boost::boost Threads::Threads)
+        bbt_infra_redis bbt::infra_tcp bbt::infra_common hiredis::hiredis
+        Boost::boost Threads::Threads)
     target_compile_options(Test_redis_live PRIVATE -Wall -Wextra)
     add_test(NAME redis.live COMMAND Test_redis_live)
     # 无 BBT_TEST_REDIS_ADDR/PHASE 时测试体以 "skip: ..." 打印后 return，
@@ -274,9 +282,14 @@ if(TARGET bbt_infra_mongo)
     set_tests_properties(mongo.unit PROPERTIES TIMEOUT 300)
 
     add_executable(Test_mongo_live Test_mongo_live.cc)
+    # Issue #34：live 用例需要真实生产状态观测（runtime 的 worker/执行槽计数、
+    # MongoCollImpl::Runtime）——读取 src/mongo/ 内部头；mongo::mongocxx_shared
+    # 只为该内部头的 include 路径与符号，测试不直接调 driver API。仅本目标可见。
+    target_include_directories(Test_mongo_live PRIVATE
+        ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(Test_mongo_live PRIVATE
         bbt_infra_mongo bbt::infra_common Boost::boost Threads::Threads
-        mongo::bsoncxx_shared)
+        mongo::bsoncxx_shared mongo::mongocxx_shared)
     target_compile_options(Test_mongo_live PRIVATE -Wall -Wextra)
     add_test(NAME mongo.live COMMAND Test_mongo_live)
     # 与 redis.live 相同：无 BBT_TEST_MONGO_URI 时测试体打印 "skip:" 后

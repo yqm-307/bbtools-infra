@@ -94,6 +94,10 @@ PORT="${ADDR##*:}"
 
 export BBT_TEST_MONGO_URI="mongodb://${HOST}:${PORT}/"
 export BBT_MONGO_CTL="docker compose -p ${PROJECT} -f ${DIR}/compose.yml"
+# Issue #34：容器内 mongosh 控制通道前缀——用例经它在真实后端注入
+# failCommand(blockConnection) 故障并做 waitForFailPoint 进入握手（后端确证
+# 目标命令在途），与 Redis live 的容器内 redis-cli 控制同源；只覆盖本 project。
+export BBT_MONGO_CTL_EVAL="docker compose -p ${PROJECT} -f ${DIR}/compose.yml exec -T mongo mongosh --quiet --eval"
 
 echo "[mongo-live] project=${PROJECT} uri=${BBT_TEST_MONGO_URI}"
 
