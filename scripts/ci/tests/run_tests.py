@@ -43,6 +43,8 @@ PREPARE_BOOST = os.path.join(CI_DIR, "prepare_boost.sh")
 DEPS_BUNDLE = os.path.join(CI_DIR, "deps_bundle.sh")
 CHANGED = os.path.join(CI_DIR, "changed_files.py")
 RES_DEPS = os.path.join(WORKTREE, "scripts", "prepare_resource_deps.sh")
+REDIS_LIVE = os.path.join(WORKTREE, "tests", "redis-live", "run.sh")
+MONGO_LIVE = os.path.join(WORKTREE, "tests", "mongo-live", "run.sh")
 
 CALLEE_SHA = "1c0b0fb0ebc8e7ca3888aa4f6a74d1baecf08cc7"
 CALLEE = f"yqm-307/bbt-framework/.github/workflows/bbtools-classify-v1.yml@{CALLEE_SHA}"
@@ -112,10 +114,52 @@ def run(cmd, **kwargs):
 # --------------------------------------------------------------------------- #
 class RecipeGuardTests(unittest.TestCase):
     def test_shell_scripts_parse(self):
-        for path in (PREPARE_BOOST, DEPS_BUNDLE, RES_DEPS):
+        for path in (PREPARE_BOOST, DEPS_BUNDLE, RES_DEPS, REDIS_LIVE, MONGO_LIVE):
             with self.subTest(path=os.path.basename(path)):
                 proc = run(["bash", "-n", path], env=ENV)
                 self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_live_runners_fail_closed_and_scoped_cleanup(self):
+        # 真实 live 编排：缺 docker/compose 非零失败（不得整组 skip 变绿）；等待有界；
+        # 只 down -v 本编排独占 project（绝不 prune / 宽前缀清理他任务资源）。
+        # 每 phase 都必须被 timeout 包裹：redis 主 bin 三段（A/B/C）+ cotcp 独立段，mongo 三段。
+        phase_timeout_count = {REDIS_LIVE: 3, MONGO_LIVE: 3}
+        for path in (REDIS_LIVE, MONGO_LIVE):
+            text = raw(path)
+            with self.subTest(path=os.path.basename(path)):
+                self.assertIn("set -euo pipefail", text)
+                self.assertRegex(text, r"command -v docker.*\|\|\s*fail")
+                self.assertRegex(text, r"docker compose version.*\|\|\s*fail")
+                self.assertIn("HEALTH_TIMEOUT", text)
+                # 主二进制 fail-closed：去掉 `[ -x "${BIN}" ] || fail` 不得放行。
+                self.assertRegex(text, r'\[ -x "\$\{BIN\}" \]\s*\|\|\s*fail')
+                # trap 必须在 EXIT 注册（否则失败/中断路径不清理）。
+                self.assertIn("trap cleanup EXIT", text)
+                # 每个 phase 的 timeout 都必须存在（漏包任一段 → 无界）。
+                self.assertGreaterEqual(
+                    len(re.findall(
+                        r'timeout --kill-after="\$\{KILL_AFTER\}" "\$\{PHASE_TIMEOUT\}"', text)),
+                    phase_timeout_count[path],
+                )
+                # stop/start/cleanup/health-exec 也必须有界（timeout --kill-after）。
+                self.assertGreaterEqual(text.count("timeout --kill-after"), 3)
+                # 逐 phase 主 bin 上界 <= CTest redis.live/mongo.live TIMEOUT 120。
+                phase = re.search(r"^PHASE_TIMEOUT=(\d+)\s*$", text, re.M)
+                assert phase is not None, "缺少 PHASE_TIMEOUT=<秒>"
+                self.assertLessEqual(int(phase.group(1)), 120)
+                self.assertIn('"${COMPOSE[@]}" down -v --remove-orphans', text)
+                # 绝不整机/宽范围清理：无 docker * prune，也无按全体 id 的强删。
+                self.assertNotRegex(
+                    text, r"docker\s+(?:system|image|container|volume|network)\s+prune")
+                self.assertNotIn("docker ps -aq", text)
+                self.assertNotIn("docker rm", text)
+        # redis 编排追加 redis.cotcp_binding.live（大值/RemoteError 回归），不与 redis.live 混计。
+        self.assertIn("t_resp2_roundtrip_live", raw(REDIS_LIVE))
+        # cotcp 段独立 timeout，上界 <= CTest cotcp.live TIMEOUT 240。
+        self.assertIn('timeout --kill-after="${KILL_AFTER}" "${COTCP_TIMEOUT}"', raw(REDIS_LIVE))
+        cotcp = re.search(r"^COTCP_TIMEOUT=(\d+)\s*$", raw(REDIS_LIVE), re.M)
+        assert cotcp is not None, "缺少 COTCP_TIMEOUT=<秒>"
+        self.assertLessEqual(int(cotcp.group(1)), 240)
 
     def test_python_recipes_compile(self):
         # 用 compile() 做纯语法检查，不落 .pyc（PYTHONDONTWRITEBYTECODE 对 py_compile 无效）。
@@ -588,6 +632,42 @@ class WorkflowStaticTests(unittest.TestCase):
         ):
             with self.subTest(needle=needle):
                 self.assertIn(needle, text)
+
+    def test_live_backend_gate_in_release_job_fail_closed(self):
+        # 真实 Redis/Mongo live 后段门禁追加在 release job 内（复用 Release 产物，不新增
+        # 构建 job、不重编）；缺 docker/compose/二进制非零失败（不得整组 skip 变绿）。
+        text = body(CI_YML)
+        for needle in (
+            "tests/redis-live/run.sh", "tests/mongo-live/run.sh",
+            "Test_redis_live", "Test_redis_cotcp_binding", "Test_mongo_live",
+            "docker compose version", "不得 skip 变绿",
+        ):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, text)
+        # redis run.sh 必须两参调用（第二参 = cotcp_binding live 二进制）；mongo 单参。
+        self.assertRegex(text, r'tests/redis-live/run\.sh"\s+"\$REDIS_BIN"\s+"\$COTCP_BIN"')
+        self.assertRegex(text, r'tests/mongo-live/run\.sh"\s+"\$MONGO_BIN"')
+        # 两套后端为独立 step，各 step timeout-minutes 大于对应脚本内界之和（redis 19 / mongo 16），
+        # 避免共享外框先于脚本内界硬杀 → EXIT trap 不执行残留；release job 45 含构建。
+        live_steps = {
+            "redis": [s for s in self.jobs["release"]["steps"]
+                      if "tests/redis-live/run.sh" in (s.get("run") or "")],
+            "mongo": [s for s in self.jobs["release"]["steps"]
+                      if "tests/mongo-live/run.sh" in (s.get("run") or "")],
+        }
+        self.assertEqual({k: len(v) for k, v in live_steps.items()}, {"redis": 1, "mongo": 1})
+        self.assertEqual(live_steps["redis"][0]["timeout-minutes"], 19)
+        self.assertEqual(live_steps["mongo"][0]["timeout-minutes"], 16)
+        self.assertEqual(self.jobs["release"]["timeout-minutes"], 45)
+        # 唯一分类门禁不变：live 不新增 job，required/optional 集合与现役一致。
+        self.assertEqual(set(self.jobs),
+                         {"changes", "plan", "prepare-deps", "release", "debug", "result"})
+        self.assertEqual(OPTIONAL, ["prepare-deps", "release", "debug"])
+        # live 承载于 release job，docs-only 由 job 级 if 跳过（code/unknown 必跑）。
+        self.assertIn("docs-only", str(self.jobs["release"]["if"]))
+        # live 编排脚本本身存在（run.sh 非 inline，另行 bash -n 覆盖）。
+        for path in (REDIS_LIVE, MONGO_LIVE):
+            self.assertTrue(os.path.isfile(path), path)
 
     def test_inline_scripts_pass_bash_n(self):
         for name, job in self.jobs.items():

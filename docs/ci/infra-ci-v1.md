@@ -36,7 +36,7 @@ yqm-307/bbt-framework/.github/workflows/bbtools-classify-v1.yml@1c0b0fb0ebc8e7ca
 | `变更类型检测` | 真实 diff（`scripts/ci/changed_files.py`）归一为受限路径列表；未知/超预算保守回退 unknown |
 | `分类/计划（framework classify callee）` | 只调用已发布 callee 分类（classification-only，不传 results） |
 | `依赖准备（固定源前缀归档）` | 复现锁定 Boost 1.90（`scripts/ci/prepare_boost.sh`）+ 唯一 recipe `scripts/prepare_resource_deps.sh` 源码构建 hiredis/mongoc/mongocxx + coroutine/core 源码 → 单一 tar artifact（sha256 digest） |
-| `Release 构建 & ctest` | 下载并校验 sha256 解包 → resource-prefix A/B → Release 全量 `cmake` + `ctest -j1` → Release 归档无 Debug 观测符号 → 依赖来源核查 |
+| `Release 构建 & ctest` | 下载并校验 sha256 解包 → resource-prefix A/B → Release 全量 `cmake` + `ctest -j1` → Release 归档无 Debug 观测符号 → 依赖来源核查 → Redis/Mongo 真实容器 A/B/C 与 CoTCP binding live；job 上限 45 分钟，Redis/Mongo live step 上限分别 19/16 分钟（包含 kill-after 宽限） |
 | `Debug 生命周期定向门禁（8 项，零跳过）` | 下载同一归档 → Debug 8 项定向门禁（符号 + 8 项零跳过） |
 | `编译 & ctest` | 唯一权威结果汇聚（`always()`，调用已发布 callee result 契约） |
 
@@ -105,5 +105,4 @@ ccache launcher 是否启用（runner 镜像自带 ccache 时），不改变任�
   对应、required(context,app) 的精确切换属 F3，须在线读回（本轮未读回；run 已产出以该名为前缀的
   汇聚 check 并 success，但不足以断言 required context 已精确切换）。
 - `coroutine@main` / `core@master` 仍沿用现役可变分支头，实际 SHA 由 run 记录。
-- live 组（`redis.live`/`mongo.live`/`redis.cotcp_binding.live`）无容器后端时如实标
-  Skipped，不冒充已通过。
+- 历史 run `37948171767` 的 live 组（`redis.live`/`mongo.live`/`redis.cotcp_binding.live`）为 Skipped，不能作为新增 live 门禁已执行的证据。新增门禁与逐条遗留核销见 [Redis/Mongo 验收说明](../redis-mongo-acceptance.md)；在线验收以相应 PR 的精确 head 和合入后 main run 日志为准。

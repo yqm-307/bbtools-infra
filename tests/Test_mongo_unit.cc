@@ -1325,4 +1325,174 @@ BOOST_AUTO_TEST_CASE(t_owner_same_uri_sibling_lease_preserved) {
     CloseOwnerAndDrain(db2, rt2);
 }
 
+// ========== pool lease 失败归还 / 共享 owner 隔离 / 获取失败门禁 ==========
+//
+// 现有 t_worker_spawn_failure_finalizes 以 warm owner 保活同 URI pool，故只能
+// 证明「worker 组已收口」，无法证明「失败 owner 自己的 pool lease 已归还」
+// 或「兄弟 owner 的 lease 未被强清」——warm 恰好掩盖了这两条不变式。下列
+// 用例改用真实共享资源观察：测试直接经 AcquireMongoPool 取进程级 lease 的
+// 强引用，以 shared_ptr 引用计数 + weak_ptr 实际寿命判别失败 owner 是否归还
+// 引用、最后持有者销毁后 pool 是否真正析构、兄弟 owner 是否被误清。不新增
+// 任何测试开关（沿用既有可内部触达的获取路径）。
+
+// (1) worker 组启动失败后，失败 owner 必须归还自己的 pool lease；lease 的
+//     最后持有者销毁后，进程级 pool 真正析构。
+BOOST_AUTO_TEST_CASE(t_spawn_failure_returns_pool_lease) {
+    BOOST_REQUIRE(g_prepared.load());
+
+    // 专用 URI：除测试探针外，本用例是该 URI 的唯一持有者，故引用计数
+    // 变化只反映失败 owner 的归还动作。
+    auto cfg             = MakeUriCfg("mongodb://127.0.0.1:1/lease_probe");
+    cfg.worker_threads   = 4;
+    const std::string eff = mongo_detail::EffectiveUri(cfg);
+    auto pr = mongo_detail::AcquireMongoPool(eff);
+    BOOST_REQUIRE(pr);
+    auto probe = std::move(pr).value();
+    BOOST_CHECK_EQUAL(probe.use_count(), 1);   // 仅测试探针持有
+
+    // 逐失败点（reserve / 第 0/1/3 个 worker）：每次启动失败后 lease 引用
+    // 都必须归还到探针独占（use_count 回到 1）。
+    const std::size_t fail_points[] = {
+        mongo_detail::MongoRuntime::kSpawnFailReserve, 0, 1, 3};
+    for (const auto at : fail_points) {
+        auto info = mongo_detail::NewObjectInfo("test.rt.lease_fail");
+        BOOST_REQUIRE(info);
+        auto rt = std::make_shared<mongo_detail::MongoRuntime>(cfg,
+                                                               info.value());
+        rt->SetWorkerSpawnFailForTest(at);
+        auto st = rt->Start();
+        BOOST_REQUIRE_MESSAGE(!st, "spawn fail point " << at << " must fail");
+        BOOST_CHECK(st.error().code == ErrorCode::InternalError);
+        BOOST_CHECK(!rt->IsRunning());
+        BOOST_CHECK(rt->IsClosed());
+        // 关键判别：失败 owner 已归还 lease（若有缺陷则计数 > 1）。
+        BOOST_CHECK_EQUAL(probe.use_count(), 1);
+    }
+
+    // 是「归还」而非「销毁」：进程级 lease 仍是同一对象，未被重建或泄漏。
+    auto again = mongo_detail::AcquireMongoPool(eff);
+    BOOST_REQUIRE(again);
+    BOOST_CHECK_EQUAL(again.value().get(), probe.get());
+    BOOST_CHECK_EQUAL(probe.use_count(), 2);
+
+    // 最后持有者销毁：释放全部强引用后 lease 真正析构（weak 失效）。
+    std::weak_ptr<mongo_detail::MongoPoolLease> w = probe;
+    probe.reset();
+    again.value().reset();
+    BOOST_CHECK(w.expired());
+
+    // 之后仍可重新建立进程级 lease（旧 weak 不复活，新 pool 独立成立）。
+    auto fresh = mongo_detail::AcquireMongoPool(eff);
+    BOOST_REQUIRE(fresh);
+    BOOST_CHECK_EQUAL(fresh.value().use_count(), 1);
+    fresh.value().reset();
+}
+
+// (2) 同 URI 共享进程级 lease：一个 owner 的 worker 组启动失败只归还它自己的
+//     lease 引用，不得强清仍存活的兄弟 owner 的 lease，也不得泄漏自身引用。
+BOOST_AUTO_TEST_CASE(t_spawn_failure_lease_isolated_from_sibling) {
+    BOOST_REQUIRE(g_prepared.load());
+
+    auto cfg              = MakeRtCfg(1, 4, 2000);
+    const std::string eff = mongo_detail::EffectiveUri(cfg);
+
+    // 健康 owner A：Running 且持有该 URI 的 lease。
+    auto db = NewOwner(cfg);
+    auto rt = RuntimeOf(db);
+    BOOST_REQUIRE(rt->IsRunning());
+    BOOST_REQUIRE(WaitUntil(
+        [&] { return rt->LiveWorkersForTest() == 1; }, 10000));
+
+    auto pr = mongo_detail::AcquireMongoPool(eff);
+    BOOST_REQUIRE(pr);
+    auto probe = std::move(pr).value();
+    BOOST_CHECK_EQUAL(probe.use_count(), 2);   // 探针 + owner A
+
+    // 失败 owner B：同 URI，worker 组启动失败。
+    auto info = mongo_detail::NewObjectInfo("test.rt.sibling_fail");
+    BOOST_REQUIRE(info);
+    auto rt_b = std::make_shared<mongo_detail::MongoRuntime>(cfg,
+                                                             info.value());
+    rt_b->SetWorkerSpawnFailForTest(0);
+    auto st = rt_b->Start();
+    BOOST_REQUIRE(!st);
+    BOOST_CHECK(st.error().code == ErrorCode::InternalError);
+    BOOST_CHECK(rt_b->IsClosed());
+
+    // B 只归还自己的引用：A 的引用仍在（计数回到 2，而非被强清为 1）。
+    BOOST_CHECK_EQUAL(probe.use_count(), 2);
+    // A 不受影响：仍 Running、未关闭，可继续建句柄并派发命令。
+    BOOST_CHECK(rt->IsRunning());
+    BOOST_CHECK(!db->IsClosed());
+    auto h = db->Collection({"bbt_ut", "sibling"});
+    BOOST_REQUIRE(h);
+    std::optional<result<std::optional<MongoDocument>>> out;
+    BOOST_REQUIRE(RunInCoroutine(
+        [&] { out.emplace(h.value()->FindOne(BadDoc(), Opt(2000))); }));
+    BOOST_REQUIRE(!*out);
+    BOOST_CHECK(out->error().code == ErrorCode::InvalidArgument);
+
+    // 关闭 A：A 归还自己的引用后，仅探针持有。
+    CloseOwnerAndDrain(db, rt);
+    BOOST_CHECK_EQUAL(probe.use_count(), 1);
+    probe.reset();
+}
+
+// (3) pool 创建/获取失败的可控门禁：失败留在 kCreated（可重试），不泄漏
+//     worker；释放占用后同一 owner 可重试成功。
+BOOST_AUTO_TEST_CASE(t_pool_acquire_failure_gates_start) {
+    BOOST_REQUIRE(g_prepared.load());
+
+    // (A) 驱动侧创建失败：URI 通过装配校验（scheme 合法）但驱动拒绝解析/
+    //     选项 → Start 如实返回 InvalidArgument，owner 留在 kCreated（可
+    //     重试），未起任何 worker。真实驱动抛出点，非注入开关。
+    {
+        auto cfg = MakeUriCfg("mongodb://127.0.0.1:99999999/bbt_ut");
+        auto info = mongo_detail::NewObjectInfo("test.rt.bad_uri");
+        BOOST_REQUIRE(info);
+        auto rt = std::make_shared<mongo_detail::MongoRuntime>(cfg,
+                                                               info.value());
+        auto st = rt->Start();
+        BOOST_REQUIRE(!st);
+        BOOST_CHECK(st.error().code == ErrorCode::InvalidArgument);
+        BOOST_CHECK(!rt->IsRunning());
+        BOOST_CHECK(!rt->IsClosed());   // 仍在 kCreated → 允许条件就绪后重试
+        BOOST_CHECK_EQUAL(rt->LiveWorkersForTest(), 0);
+    }
+
+    // (B) 进程级 pool 上限：占满 kMongoMaxPools 个 distinct 存活 lease 后，
+    //     第 kMongoMaxPools+1 个获取被拒绝（真实计数门禁）；释放一个槽位后
+    //     同一 owner 重试 Start 成功。
+    std::vector<std::shared_ptr<mongo_detail::MongoPoolLease>> fills;
+    for (std::size_t i = 0; i < mongo_detail::kMongoMaxPools; ++i) {
+        auto cfg = MakeUriCfg("mongodb://127.0.0.1:1/fill_" +
+                              std::to_string(i));
+        auto r = mongo_detail::AcquireMongoPool(mongo_detail::EffectiveUri(cfg));
+        BOOST_REQUIRE_MESSAGE(r, "fill slot " << i << " must be available");
+        fills.push_back(std::move(r).value());
+    }
+
+    auto over            = MakeUriCfg("mongodb://127.0.0.1:1/over_limit");
+    over.worker_threads  = 1;
+    auto info = mongo_detail::NewObjectInfo("test.rt.over_limit");
+    BOOST_REQUIRE(info);
+    auto rt = std::make_shared<mongo_detail::MongoRuntime>(over, info.value());
+    auto st = rt->Start();
+    BOOST_REQUIRE(!st);
+    BOOST_CHECK(st.error().code == ErrorCode::InvalidArgument);
+    BOOST_CHECK(!rt->IsRunning());
+    BOOST_CHECK(!rt->IsClosed());   // 仍在 kCreated，可重试
+    BOOST_CHECK_EQUAL(rt->LiveWorkersForTest(), 0);
+
+    // 释放一个占用槽位：同一 owner 重试 Start 即可成功（可重试契约）。
+    fills.pop_back();
+    auto retry = rt->Start();
+    BOOST_REQUIRE(retry);
+    BOOST_CHECK(rt->IsRunning());
+    rt->Close();
+    BOOST_CHECK(rt->IsClosed());
+    BOOST_CHECK_EQUAL(rt->LiveWorkersForTest(), 0);
+    fills.clear();
+}
+
 BOOST_AUTO_TEST_SUITE_END()

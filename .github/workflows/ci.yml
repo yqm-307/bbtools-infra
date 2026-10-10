@@ -34,9 +34,16 @@
 #   单独验收）。手动 build-mode/cache-enabled 输入保留，只决定本次 run 内 ccache launcher
 #   是否启用（runner 镜像自带 ccache 时），不影响任何通过标准。
 #
+# Redis/Mongo 真实后端有界 live 门禁：**后段追加在 Release job 内**（复用本 job 已全量
+#   构建的 Release 产物 Test_redis_live / Test_redis_cotcp_binding / Test_mongo_live），
+#   不新增构建 job、不重编、不引入额外框架。缺 docker/compose/二进制一律非零失败；
+#   compose up/health wait 与各阶段测试均有界；结束/失败/trap 只 down -v 本步独占 project
+#   （不 prune、不按宽前缀清理他任务资源）。docs-only 在 release job 级 if 已跳过；
+#   code/unknown 必跑，任一 live 失败 → release failed → result=failure（fail-closed）。
+#
 # 非目标（与本仓现役一致，不越界）：不改产品 C++/CMake/依赖锁/AGENTS/release/mirrors/
-#   runner；sanitizer、性能门禁、平台矩阵、Redis/Mongo live 真实后端验收不在本 workflow
-#   （live 测试保留注册但无容器时如实标 Skipped，不冒充已通过）。
+#   runner；sanitizer、性能门禁、平台矩阵不在本 workflow。live 测试在 release ctest 中
+#   无容器时仍如实标 Skipped，真实执行由上述后段 live 门禁承担（不用 mock 或 skip 冒充）。
 #
 # 公开仓库 + 常驻 hosted：fork PR 会执行 PR head 里的 workflow（内容可被 fork 方修改）；
 #   本 workflow 仅 hosted、顶层 `permissions: {}`；fork 审批现为 first_time_contributors，非硬闸门，self-hosted 准入不能靠本注释保证。
@@ -233,7 +240,8 @@ jobs:
     needs: [changes, plan, prepare-deps]
     if: ${{ needs.plan.result == 'success' && needs.plan.outputs.classification != 'docs-only' && needs.prepare-deps.result == 'success' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # 构建 + ctest + 两套独立 live step（redis 19 / mongo 16）之和；含构建余量，非正常耗时。
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:
@@ -393,6 +401,60 @@ jobs:
             echo "--- $bin ---"
             ldd "$bin" | grep -E 'bbt|boost|libevent|hiredis|mongo|bson' || echo "(静态/无外部依赖)"
           done
+
+      # 真实 Redis/Mongo 有界 live 门禁：复用本 job 已全量构建的 Release 产物，不重编、
+      # 不新增构建 job。缺 docker/compose/任一 live 二进制一律非零失败；两个 run.sh 各自
+      # 有界（compose up/health/test/stop/start/cleanup timeout）并只 down -v 本步独占
+      # project（不 prune）。两套后端**拆成独立 step**，各自 timeout-minutes 大于对应脚本
+      # 内界之和（计入 kill-after 宽限：redis<19min；mongo<16min），避免共享外框先于脚本内界硬杀导致
+      # trap 不执行残留。code/unknown 在此必跑，任一 live 失败 → 本 job failed →
+      # result=failure（fail-closed）；docs-only 已在 job 级 if 跳过。不产出/上传 artifact。
+      - name: "真实 Redis live 门禁（复用 Release 产物，有界 fail-closed）"
+        timeout-minutes: 19
+        run: |
+          set -euo pipefail
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "FAIL: docker 不可用（live 门禁要求真实容器，不得 skip 变绿）" >&2
+            exit 1
+          fi
+          if ! docker compose version >/dev/null 2>&1; then
+            echo "FAIL: docker compose 不可用（live 门禁要求真实容器，不得 skip 变绿）" >&2
+            exit 1
+          fi
+          REDIS_BIN="$BUILD_DIR/tests/Test_redis_live"
+          COTCP_BIN="$BUILD_DIR/tests/Test_redis_cotcp_binding"
+          for b in "$REDIS_BIN" "$COTCP_BIN"; do
+            if [ ! -x "$b" ]; then
+              echo "FAIL: 缺 Release live 二进制 $b（不得 skip 变绿）" >&2
+              exit 1
+            fi
+          done
+          # redis.run.sh 第二参数：redis.cotcp_binding.live 复用同一容器实跑，
+          # 覆盖 RemoteError 大值 / 2MiB 大回复回归，不与 Test_redis_live 混计。
+          bash "$GITHUB_WORKSPACE/infra/tests/redis-live/run.sh" "$REDIS_BIN" "$COTCP_BIN"
+          echo "=== live 容器镜像身份（复用现 compose redis7-alpine，未引入新镜像治理）==="
+          docker image inspect redis:7-alpine --format 'redis:7-alpine id={{.Id}}' 2>/dev/null || true
+
+      - name: "真实 Mongo live 门禁（复用 Release 产物，有界 fail-closed）"
+        timeout-minutes: 16
+        run: |
+          set -euo pipefail
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "FAIL: docker 不可用（live 门禁要求真实容器，不得 skip 变绿）" >&2
+            exit 1
+          fi
+          if ! docker compose version >/dev/null 2>&1; then
+            echo "FAIL: docker compose 不可用（live 门禁要求真实容器，不得 skip 变绿）" >&2
+            exit 1
+          fi
+          MONGO_BIN="$BUILD_DIR/tests/Test_mongo_live"
+          if [ ! -x "$MONGO_BIN" ]; then
+            echo "FAIL: 缺 Release live 二进制 $MONGO_BIN（不得 skip 变绿）" >&2
+            exit 1
+          fi
+          bash "$GITHUB_WORKSPACE/infra/tests/mongo-live/run.sh" "$MONGO_BIN"
+          echo "=== live 容器镜像身份（复用现 compose mongo8.0，未引入新镜像治理）==="
+          docker image inspect mongo:8.0 --format 'mongo:8.0 id={{.Id}}' 2>/dev/null || true
 
   # #62：Debug 生命周期定向门禁（8 项，零跳过）。下载同一 prepared deps；
   # 不改 runner、不新增依赖下载；缺项/跳过/失败均判负。job 名保持现役 check 名。
