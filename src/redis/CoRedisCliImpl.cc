@@ -728,7 +728,11 @@ void CoRedisCliImpl::ExecuteOne(const std::shared_ptr<RedisOp>& op) {
     auto r = conn->ReadReply(op->options);
     if (!r) {
         auto read_error = std::move(r).error();
-        FailConnAndDrainQueue();
+        // 服务端 ERROR 帧（RemoteError）是唯一「完整帧已消费、RESP 流仍同步」的读失败：
+        // 连接健康可续用，不得拆。其余（TimedOut/Closed/ProtocolError/TransportError/
+        // InternalError）表示半帧/坏帧/OOM/连接已死，必须线性化收口并排空故障前队列。
+        if (read_error.code != ErrorCode::RemoteError)
+            FailConnAndDrainQueue();
         finish(result<RawReply>::err(std::move(read_error)));
         return;
     }

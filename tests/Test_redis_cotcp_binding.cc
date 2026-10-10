@@ -1424,6 +1424,54 @@ BOOST_AUTO_TEST_CASE(t_raw_reply_types_and_errors) {
     }
 }
 
+// 服务端 ERROR 帧（RemoteError）是「完整帧已消费、RESP 流仍同步」的唯一读失败：
+// 连接健康可续用，不得拆。同一连接上「错误帧 → PONG → OK」必须逐条成功，且不再
+// dial（Accepted==1）。修复前错误后即拆连接，紧随的 Ping 落到 "redis: not
+// connected"（TransportError）→ 本用例红。
+BOOST_AUTO_TEST_CASE(t_server_error_preserves_connection) {
+    BOOST_REQUIRE(g_prepared.load());
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+    redis_detail::ResetRedisBindingTotalsForTest();
+#endif
+
+    RawPeer peer(ReplySequence(
+        {RespError("WRONGTYPE bad"), RespStatus("PONG"), RespStatus("OK")}));
+    auto    c = NewCotcpClient("127.0.0.1", peer.port);
+    BOOST_REQUIRE(c);
+    auto cli = std::move(c).value();
+
+    // 1) 服务端错误帧 → RemoteError(WRONGTYPE)：错误分类不得回退。
+    std::optional<result<std::optional<std::string>>> g;
+    BOOST_REQUIRE(RunInCoroutine([&] { g.emplace(cli->Get("k", Opt())); }));
+    BOOST_REQUIRE(!*g);
+    BOOST_CHECK(g->error().code == ErrorCode::RemoteError);
+    BOOST_CHECK(g->error().domain_code == "WRONGTYPE");
+
+    // 2) 同一连接续用：错误帧后 Ping 必须成功。
+    std::optional<result<void>> p;
+    BOOST_REQUIRE(RunInCoroutine([&] { p.emplace(cli->Ping(Opt())); }));
+    BOOST_REQUIRE(*p);
+
+    // 3) 同连接继续 Set 成功。
+    std::optional<result<void>> s;
+    BOOST_REQUIRE(RunInCoroutine([&] { s.emplace(cli->Set("k", "v", Opt())); }));
+    BOOST_REQUIRE(*s);
+
+    // 4) 无再 dial：同一连接服务三条命令。
+    BOOST_CHECK_EQUAL(peer.Accepted(), 1u);
+    BOOST_CHECK_EQUAL(peer.CommandsRead(), 3u);
+
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+    // 5) 故障未拆连接：无 conns_broken、仅一次 dial。
+    const auto snap = cli->ProbeSnapshot();
+    BOOST_CHECK_EQUAL(snap.conns_broken, 0u);
+    BOOST_CHECK_EQUAL(snap.dial_attempts, 1u);
+#endif
+
+    cli->Close();
+    BOOST_CHECK(WaitUntil([&] { return cli->IsClosed(); }));
+}
+
 // 写侧：对端小接收窗 + 先不读 → 部分写/WouldBlock；恢复读取后写满并收到应答。
 BOOST_AUTO_TEST_CASE(t_partial_write_then_full_delivery) {
     BOOST_REQUIRE(g_prepared.load());
