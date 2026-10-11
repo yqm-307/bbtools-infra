@@ -35,9 +35,9 @@ yqm-307/bbt-framework/.github/workflows/bbtools-classify-v1.yml@1c0b0fb0ebc8e7ca
 |---|---|
 | `变更类型检测` | 真实 diff（`scripts/ci/changed_files.py`）归一为受限路径列表；未知/超预算保守回退 unknown |
 | `分类/计划（framework classify callee）` | 只调用已发布 callee 分类（classification-only，不传 results） |
-| `依赖准备（固定源前缀归档）` | 复现锁定 Boost 1.90（`scripts/ci/prepare_boost.sh`）+ 唯一 recipe `scripts/prepare_resource_deps.sh` 源码构建 hiredis/mongoc/mongocxx + coroutine/core 源码 → 单一 tar artifact（sha256 digest） |
-| `Release 构建 & ctest` | 下载并校验 sha256 解包 → resource-prefix A/B → Release 全量 `cmake` + `ctest -j1` → Release 归档无 Debug 观测符号 → 依赖来源核查 → Redis/Mongo 真实容器 A/B/C 与 CoTCP binding live；job 上限 45 分钟，Redis/Mongo live step 上限分别 19/16 分钟（包含 kill-after 宽限） |
-| `Debug 生命周期定向门禁（8 项，零跳过）` | 下载同一归档 → Debug 8 项定向门禁（符号 + 8 项零跳过） |
+| `依赖准备（固定源前缀归档）` | 复现锁定 Boost 1.90（`scripts/ci/prepare_boost.sh`）+ 唯一 recipe `scripts/prepare_resource_deps.sh` 源码构建 hiredis/mongoc/mongocxx + 按 framework 已发布固定 40 位 SHA（`bd9c4905…`）download 并 sha256 fail-closed 校验配方后复现锁定 protobuf 3.21.12 前缀（`scripts/prepare_protobuf.sh`）+ coroutine/core 源码 → 单一 tar artifact（含 boost-prefix/protobuf-prefix，sha256 digest） |
+| `Release 构建 & ctest` | 下载并校验 sha256 解包 → resource-prefix A/B → Release 全量 `cmake`（`-DBBT_PROTOBUF_PREFIX` 真实前缀，不静默回退）+ `ctest -j1`（含 redis.unit/mongo.unit 与 7 个正式 RPC 名注册断言：rpc.payload/rpc.runtime/rpc.runtime_faults/rpc.runtime_lifetime/rpc.runtime_roundtrip/rpc.wire_contract/rpc.wire_roundtrip，且全量实跑）→ 无 wire 独立 configure/build 只跑 `rpc.runtime_no_wire`（HTTP 闭包无 protobuf 符号）→ Release 归档无 Debug 观测符号 → 依赖来源核查 → Redis/Mongo 真实容器 A/B/C 与 CoTCP binding live；job 上限 45 分钟，Redis/Mongo live step 上限分别 19/16 分钟（包含 kill-after 宽限） |
+| `Debug 生命周期定向门禁（8 项，零跳过）` | 下载同一归档 → Debug 8 项既有门禁 + 同 7 项 RPC 定向集合（共 15 项零跳过，JUnit expected 精确更新，peers 加入 build 目标）；job 名保持现役 check 名不变 |
 | `编译 & ctest` | 唯一权威结果汇聚（`always()`，调用已发布 callee result 契约） |
 
 `prepare-deps` / `release` / `debug` 均为重型 job（callee `optional`），仅 `docs-only`
@@ -69,6 +69,16 @@ yqm-307/bbt-framework/.github/workflows/bbtools-classify-v1.yml@1c0b0fb0ebc8e7ca
 
 资源前缀经本仓唯一 recipe `scripts/prepare_resource_deps.sh` 以固定 tag+SHA 源码构建
 （hiredis v1.4.1 / mongo-c-driver 2.5.4 / mongo-cxx-driver r4.6.0）。
+
+RPC wire 模块（Issue #8）所用锁定 protobuf 3.21.12 私有前缀**复用** framework 已发布、
+经独立审查的 `scripts/prepare_protobuf.sh`（完整 40 位 commit SHA
+`bd9c490541ccad10cf32e15b91bb40104aa86118`）：CI 从该 SHA download 后用由 Git 对象实算的
+文件 sha256（`d10f1297…`）fail-closed 校验，再执行把 Ubuntu `.deb` 提取到工作区私有前缀
+（配方内含各 `.deb` 包 sha256 门禁，amd64 only，不装系统包、不写 `/usr/local`）。
+`protobuf-prefix` 同样随 prepared deps 归档复用（`unpack` 把
+`protobuf-prefix/usr/lib/<triplet>` 并入消费端 `LD_LIBRARY_PATH`）；Release/Debug 以
+`-DBBT_PROTOBUF_PREFIX` 传真实前缀（不静默回退），无 wire 独立 configure 则不传。锁定版本与
+来源见 [protobuf 3.21.12 provenance](../dependencies/protobuf-3.21.12.provenance.md)。
 
 ## 6. 缓存边界（明确阻塞）
 

@@ -59,6 +59,9 @@ public:
     result<std::shared_ptr<HttpClient>> CreateHttpClient() override;
     result<std::shared_ptr<HttpServer>> ListenHttp(ListenAddress address,
                                                    HttpHandler handler) override;
+    // RPC 工厂不是虚函数：NetworkRuntime::CreateRpcClient/ListenRpc 是非虚普通
+    // 成员，由 RPC 模块（或 http 内 stub）定义并只组合上面的公开 HTTP 工厂。
+    // 本切片无 RPC vtable 槽，也不定义 RPC 符号。
     result<std::shared_ptr<CoTCP>> DialTCP(
         TcpEndpoint endpoint, const CallOptions& options) override;
     result<std::shared_ptr<CoTCPListener>> ListenTCP(

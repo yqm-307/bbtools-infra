@@ -57,6 +57,16 @@ if(_bbt_tr_links MATCHES "infra_http")
         "（实际: ${_bbt_tr_links}）")
 endif()
 
+# --- waypoint 3-3 前置：infra 通用位置参数 payload codec（纯 header-only）。-----
+# 只链接 bbt::infra_common（不依赖 protobuf / bbt_infra_rpc），有/无 wire 两种
+# 配置下都注册；golden 期望字节来自旧 framework CoRpc.hpp 的 literal，且另有
+# 一次性旧源/新源字节级交叉验证（不进仓）。
+add_executable(Test_rpc_payload Test_rpc_payload.cc)
+target_link_libraries(Test_rpc_payload PRIVATE bbt::infra_common)
+target_compile_options(Test_rpc_payload PRIVATE -Wall -Wextra)
+add_test(NAME rpc.payload COMMAND Test_rpc_payload)
+set_tests_properties(rpc.payload PROPERTIES TIMEOUT 60)
+
 # 实测 detail::CoPollEvent 单事件上 FD readable + custom wakeup + timeout
 # 组合的确定性四场景。使用 detail 非稳定头与非公开组合路径，仅用于能力裁决，
 # 不作为生产 IoWait 实现依据；不涉及关闭/Stop 安全断言（新契约已无 Stop）。
@@ -303,6 +313,52 @@ endif()
 
 # --- RPC wire 模块测试（Issue #8）：仅在构建 bbt_infra_rpc 时注册。----------
 if(TARGET bbt_infra_rpc)
+    add_executable(bbt_rpc_runtime_peer rpc_runtime_peer.cc)
+    target_link_libraries(bbt_rpc_runtime_peer PRIVATE
+        bbt::infra_rpc bbt::infra_common Boost::boost Threads::Threads)
+    target_compile_options(bbt_rpc_runtime_peer PRIVATE -Wall -Wextra)
+
+    add_executable(Test_rpc_runtime_roundtrip Test_rpc_runtime_roundtrip.cc)
+    target_link_libraries(Test_rpc_runtime_roundtrip PRIVATE
+        bbt::infra_rpc bbt::infra_common Boost::boost Threads::Threads)
+    target_compile_options(Test_rpc_runtime_roundtrip PRIVATE -Wall -Wextra)
+    add_test(NAME rpc.runtime_roundtrip COMMAND Test_rpc_runtime_roundtrip)
+    # 双进程矩阵含 StopAccepting 后拒绝与「完整写出后对端失联」，含进程启动与
+    # 有界等待；仍受 TIMEOUT 硬上限约束（不留无期限等待）。
+    set_tests_properties(rpc.runtime_roundtrip PROPERTIES TIMEOUT 180)
+
+    add_executable(Test_rpc_runtime Test_rpc_runtime.cc)
+    target_link_libraries(Test_rpc_runtime PRIVATE
+        bbt::infra_rpc bbt::infra_common Boost::boost Threads::Threads)
+    target_compile_options(Test_rpc_runtime PRIVATE -Wall -Wextra)
+    add_test(NAME rpc.runtime COMMAND Test_rpc_runtime)
+    set_tests_properties(rpc.runtime PROPERTIES TIMEOUT 120)
+
+    # waypoint 2-4/2-5：RPC 公开面的故障、限额与关闭矩阵。只用公开头 + 自有
+    # raw 对端（POSIX socket 脚本化服务端，口径同 Test_http_request_phase 的
+    # HTTP fault fixture），不链接 src/ 内部头、不使用测试 seam。
+    add_executable(Test_rpc_runtime_faults Test_rpc_runtime_faults.cc)
+    target_link_libraries(Test_rpc_runtime_faults PRIVATE
+        bbt::infra_rpc bbt::infra_common Boost::boost Threads::Threads)
+    target_compile_options(Test_rpc_runtime_faults PRIVATE -Wall -Wextra)
+    add_test(NAME rpc.runtime_faults COMMAND Test_rpc_runtime_faults)
+    set_tests_properties(rpc.runtime_faults PROPERTIES TIMEOUT 180)
+
+    # waypoint 2-5 补证：RPC 真路径的 owner 物理收口 + 在途 handler 与
+    # client/server Close 的生命周期定向测试。复用生产始终存在的 runtime 内部
+    # 只读探针 UnclosedChildrenForTest()（src 内部头），仅本目标可见；Debug 面
+    # 追加 src/debug/InfraDebug.hpp 进程级会话计数断言（宏经链路
+    # bbt::infra_rpc→bbt::infra_http→bbt::infra_internal_debug 一致传播）。
+    # 两种构建都注册：Release 面退回生产可观测等价断言。
+    add_executable(Test_rpc_runtime_lifetime Test_rpc_runtime_lifetime.cc)
+    target_include_directories(Test_rpc_runtime_lifetime PRIVATE
+        ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(Test_rpc_runtime_lifetime PRIVATE
+        bbt::infra_rpc bbt::infra_common Boost::boost Threads::Threads)
+    target_compile_options(Test_rpc_runtime_lifetime PRIVATE -Wall -Wextra)
+    add_test(NAME rpc.runtime_lifetime COMMAND Test_rpc_runtime_lifetime)
+    set_tests_properties(rpc.runtime_lifetime PROPERTIES TIMEOUT 180)
+
     add_executable(Test_rpc_wire_contract Test_rpc_wire_contract.cc)
     target_link_libraries(Test_rpc_wire_contract
         PRIVATE bbt::infra_rpc bbt::infra_common Boost::boost Threads::Threads)
@@ -323,6 +379,20 @@ if(TARGET bbt_infra_rpc)
     target_link_libraries(bbt_rpc_wire_peer PRIVATE
         bbt::infra_rpc bbt::infra_http Boost::boost Threads::Threads)
     target_compile_options(bbt_rpc_wire_peer PRIVATE -Wall -Wextra)
+else()
+    # 无 wire 构建（未给锁定 BBT_PROTOBUF_PREFIX）：bbt::infra_rpc 聚合 target
+    # 不应存在，RPC 工厂必须显式返回 RuntimeUnavailable（不产生假成功），而
+    # HTTP target 仍独立可用。本目标只链接 bbt::infra_http。
+    if(TARGET bbt_infra_rpc)
+        message(FATAL_ERROR
+            "无 wire 配置下不应导出 bbt_infra_rpc target")
+    endif()
+    add_executable(Test_rpc_runtime_no_wire Test_rpc_runtime_no_wire.cc)
+    target_link_libraries(Test_rpc_runtime_no_wire PRIVATE
+        bbt::infra_http bbt::infra_common Boost::boost Threads::Threads)
+    target_compile_options(Test_rpc_runtime_no_wire PRIVATE -Wall -Wextra)
+    add_test(NAME rpc.runtime_no_wire COMMAND Test_rpc_runtime_no_wire)
+    set_tests_properties(rpc.runtime_no_wire PROPERTIES TIMEOUT 60)
 endif()
 
 # --- 硬停 quiescence / owner 收口两项旧语义用例（Scheduler::Stop 之后经

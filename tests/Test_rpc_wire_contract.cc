@@ -446,7 +446,7 @@ BOOST_AUTO_TEST_CASE(t_http_response_success_roundtrip) {
     BOOST_CHECK(back.value().success);
 }
 
-BOOST_AUTO_TEST_CASE(t_http_response_error_roundtrip) {
+BOOST_AUTO_TEST_CASE(t_response_error_roundtrip) {
     auto env = MakeRespErrEnv();
     auto resp = MakeRpcWireHttpResponse(env);
     BOOST_REQUIRE(resp);
@@ -454,6 +454,35 @@ BOOST_AUTO_TEST_CASE(t_http_response_error_roundtrip) {
     BOOST_REQUIRE(back);
     BOOST_CHECK(!back.value().success);
     BOOST_CHECK(back.value().error.code == ErrorCode::InvalidArgument);
+}
+
+BOOST_AUTO_TEST_CASE(t_response_explicit_false_success_rejected) {
+    auto env = MakeRespOkEnv();
+    auto bytes = EncodeRpcWireEnvelope(env, /*is_response=*/true);
+    BOOST_REQUIRE(bytes);
+    // success 是 response oneof；显式 false 不是成功，也没有 error 分支。
+    // 直接改写 protobuf field 10 的 bool 值，验证解码端不静默升级为成功。
+    bool patched = false;
+    for (std::size_t i = 0; i + 1 < bytes.value().size(); ++i) {
+        if (bytes.value()[i] == 0x50) {
+            bytes.value()[i + 1] = 0x00;
+            patched = true;
+            break;
+        }
+    }
+    BOOST_REQUIRE(patched);
+    auto decoded = DecodeRpcWireEnvelope(bytes.value(), /*is_response=*/true);
+    BOOST_REQUIRE(!decoded);
+    BOOST_CHECK(decoded.error().code == ErrorCode::ProtocolError);
+}
+
+BOOST_AUTO_TEST_CASE(t_http_content_type_name_is_case_insensitive) {
+    auto env = MakeReqEnv();
+    auto req = MakeRpcWireHttpRequest(env, "http://127.0.0.1:8080");
+    BOOST_REQUIRE(req);
+    req.value().headers[0].first = "content-type";
+    auto parsed = ParseRpcWireHttpRequest(req.value());
+    BOOST_REQUIRE(parsed);
 }
 
 // --- seam 互转 ---------------------------------------------------------------

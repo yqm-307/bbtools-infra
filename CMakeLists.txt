@@ -472,6 +472,8 @@ set(BBT_INFRA_PUBLIC_HEADERS
     HttpClient.hpp
     HttpServer.hpp
     NetworkRuntime.hpp
+    RpcClient.hpp
+    RpcServer.hpp
     TransportRuntime.hpp
     CoRedisCli.hpp
     CoMongoCli.hpp
@@ -483,7 +485,8 @@ set(BBT_INFRA_PUBLIC_HEADERS
     config/Source.hpp
     config/MemorySource.hpp
     config/FileSource.hpp
-    config/Watch.hpp)
+    config/Watch.hpp
+    rpc/RpcPayload.hpp)
 
 if(TARGET bbt_infra_rpc_proto)
     list(APPEND BBT_INFRA_PUBLIC_HEADERS rpc/RpcWire.hpp)

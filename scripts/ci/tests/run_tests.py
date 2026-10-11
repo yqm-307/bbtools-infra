@@ -324,12 +324,13 @@ class ChangedFilesRoutingTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# prepared deps 闭包新行为（含 boost-prefix 成员；负向 fail-closed）
+# prepared deps 闭包新行为（含 boost-prefix / protobuf-prefix 成员；负向 fail-closed）
 # --------------------------------------------------------------------------- #
 class PreparedDepsClosureTests(unittest.TestCase):
     def _fixture(self, root):
-        # 造出 deps_bundle pack 要求的全部成员（含 boost-prefix）。
-        for member in ("coroutine", "bbtools-core", "deps-prefix", "boost-prefix"):
+        # 造出 deps_bundle pack 要求的全部成员（含 boost-prefix / protobuf-prefix）。
+        for member in ("coroutine", "bbtools-core", "deps-prefix", "boost-prefix",
+                       "protobuf-prefix"):
             os.makedirs(os.path.join(root, member), exist_ok=True)
         os.makedirs(os.path.join(root, "coroutine", "src"), exist_ok=True)
         with open(os.path.join(root, "coroutine", "src", "a.cc"), "w", encoding="utf-8") as fh:
@@ -345,6 +346,14 @@ class PreparedDepsClosureTests(unittest.TestCase):
         with open(os.path.join(root, "boost-prefix", "lib", "libboost_context.so"),
                   "w", encoding="utf-8") as fh:
             fh.write("b")
+        # 锁定 protobuf 私有前缀（Issue #8）：.so 符号链接同样必须随 tar 保留，
+        # 且 unpack loader 必须把 usr/lib/<triplet> 并入消费端 LD_LIBRARY_PATH。
+        pb_libdir = os.path.join(root, "protobuf-prefix", "usr", "lib", "x86_64-linux-gnu")
+        os.makedirs(pb_libdir, exist_ok=True)
+        with open(os.path.join(pb_libdir, "libprotobuf.so.32.0.12"),
+                  "w", encoding="utf-8") as fh:
+            fh.write("p")
+        os.symlink("libprotobuf.so.32.0.12", os.path.join(pb_libdir, "libprotobuf.so"))
 
     def test_pack_unpack_roundtrip_includes_boost_prefix(self):
         with tempfile.TemporaryDirectory() as td:
@@ -358,9 +367,10 @@ class PreparedDepsClosureTests(unittest.TestCase):
             self.assertEqual(pack.returncode, 0, pack.stdout + pack.stderr)
             meta_text = raw(meta)
             self.assertIn("boost-prefix", meta_text)
+            self.assertIn("protobuf-prefix", meta_text)
             m = re.search(r"^sha256=([0-9a-f]{64})$", meta_text, re.M)
             self.assertIsNotNone(m, meta_text)
-            self.assertIn("symlinks=1", meta_text)
+            self.assertIn("symlinks=2", meta_text)
 
             # 同绝对路径解包（hosted 行为）：sha 命中，loader 必须含 boost-prefix/lib。
             env_file = os.path.join(td, "gh_env")
@@ -371,6 +381,7 @@ class PreparedDepsClosureTests(unittest.TestCase):
             loader = raw(env_file)
             self.assertIn("boost-prefix/lib", loader)
             self.assertIn("deps-prefix/hiredis/lib", loader)
+            self.assertIn("protobuf-prefix/usr/lib/x86_64-linux-gnu", loader)
 
     def test_unpack_rejects_wrong_expected_sha(self):
         with tempfile.TemporaryDirectory() as td:

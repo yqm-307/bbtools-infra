@@ -243,6 +243,10 @@ result<RpcWireEnvelope> FromProto(const pbv1::RpcEnvelopeMsg& in,
             for (const auto& de : pe.details())
                 env.error.details.emplace_back(de.key(), de.value());
         } else if (in.has_success()) {
+            if (!in.success())
+                return result<RpcWireEnvelope>::err(MakeError(
+                    ErrorCode::ProtocolError,
+                    "response success=false without error"));
             env.success = true;
         } else {
             return result<RpcWireEnvelope>::err(MakeError(
@@ -296,8 +300,24 @@ result<RpcWireEnvelope> FromProto(const pbv1::RpcEnvelopeMsg& in,
 
 bool HasHeader(const std::vector<std::pair<std::string, std::string>>& hs,
                const std::string& name, const std::string& expect) {
+    const auto equal_ascii_ci = [](const std::string& lhs,
+                                   const std::string& rhs) {
+        if (lhs.size() != rhs.size())
+            return false;
+        for (std::size_t i = 0; i < lhs.size(); ++i) {
+            const auto lower = [](unsigned char c) {
+                return static_cast<char>(c >= 'A' && c <= 'Z'
+                                             ? c + ('a' - 'A')
+                                             : c);
+            };
+            if (lower(static_cast<unsigned char>(lhs[i])) !=
+                lower(static_cast<unsigned char>(rhs[i])))
+                return false;
+        }
+        return true;
+    };
     for (const auto& [k, v] : hs)
-        if (k == name && v == expect)
+        if (equal_ascii_ci(k, name) && v == expect)
             return true;
     return false;
 }
