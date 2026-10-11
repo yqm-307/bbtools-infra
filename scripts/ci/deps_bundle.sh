@@ -19,7 +19,10 @@ set -euo pipefail
 # 打包进 tar 的相对成员（相对 --root）；解包到同一相对路径即绝对路径一致。
 # boost-prefix：hosted runner 无现役 ARC 镜像的 /opt/boost，锁定 Boost 1.90 由
 # prepare_boost.sh 建到工作区私有前缀，随归档复用（否则每个消费 job 都要重编）。
-MEMBERS=(coroutine bbtools-core deps-prefix boost-prefix)
+# protobuf-prefix：RPC wire 模块所需的锁定 protobuf 3.21.12 私有前缀（由
+# CI 按固定 SHA 的已发布配方 download+校验后建到工作区），同样随归档复用，
+# 使 release/debug/no-wire 消费同一份 prepared deps。
+MEMBERS=(coroutine bbtools-core deps-prefix boost-prefix protobuf-prefix)
 
 usage() { sed -n '2,20p' "$0"; }
 
@@ -108,6 +111,13 @@ unpack() {
   for subdir in lib lib64; do
     [ -d "$dest/boost-prefix/$subdir" ] || continue
     loader="${loader:+$loader:}$dest/boost-prefix/$subdir"
+  done
+  # 锁定 protobuf 3.21.12 前缀随归档解包：protoc 在 build 期由 CMake 显式
+  # LD_LIBRARY_PATH 执行，测试静态链接 libprotobuf.a；此处仍把它并入消费端
+  # loader（usr/lib/<triplet>），使任何共享库解析与前缀一致，不削弱 bundle 门禁。
+  for subdir in usr/lib/x86_64-linux-gnu usr/lib/aarch64-linux-gnu usr/lib lib lib64; do
+    [ -d "$dest/protobuf-prefix/$subdir" ] || continue
+    loader="${loader:+$loader:}$dest/protobuf-prefix/$subdir"
   done
   [ -n "$loader" ] || { echo "[deps-bundle] FATAL: 无消费端库目录" >&2; exit 1; }
   loader="$loader${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"

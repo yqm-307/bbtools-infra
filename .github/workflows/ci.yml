@@ -19,13 +19,21 @@
 #      docker/toolchain.lock 的版本/sha256 源码复现锁定 Boost 1.90（工作区私有前缀，只编
 #      实际消费组件 context，不改镜像、不装系统包、不写 /usr/local）；复用本仓唯一 recipe
 #      `scripts/prepare_resource_deps.sh` 以固定 tag+SHA 源码构建 hiredis/mongoc/mongocxx
-#      私有前缀；克隆 coroutine@main / core@master 源码；整体打成单一 tar artifact
-#      （保留 symlink，记录 sha256 digest）供 release/debug 复用同一份 prepared deps。
+#      私有前缀；按 framework 已发布、固定完整 40 位 SHA 的 `scripts/prepare_protobuf.sh`
+#      配方（CI 从该 SHA download，再用由 Git 对象实算的 sha256 fail-closed 校验）复现
+#      锁定 protobuf 3.21.12 私有前缀（提取 Ubuntu .deb，amd64 only，不装系统包、不写
+#      /usr/local）；克隆 coroutine@main / core@master 源码；整体打成单一 tar artifact
+#      （保留 symlink，记录 sha256 digest）供 release/debug/no-wire 复用同一份 prepared deps。
 #   2) release：下载同一归档并校验 sha256（artifact provenance 闭包，不匹配即 fail-closed）
 #      → resource-prefix fail-closed 回归 A/B（tests/resource-prefix/run.sh，不含 C/D，与
-#      现役同范围并如实声明）→ Release 全量 cmake + ctest -j1（含 redis.unit/mongo.unit
-#      注册断言、live skipped 如实报告）→ Release 归档无 Debug 观测符号断言 → 依赖来源核查。
-#   3) debug：下载同一归档 → Debug 8 项定向门禁（Debug 观测符号断言 + 8 项零跳过）。
+#      现役同范围并如实声明）→ Release 全量 cmake（含 -DBBT_PROTOBUF_PREFIX 真实前缀，
+#      不静默回退）+ ctest -j1（含 redis.unit/mongo.unit 与 7 个正式 RPC 名注册断言：
+#      rpc.payload/rpc.runtime/rpc.runtime_faults/rpc.runtime_lifetime/rpc.runtime_roundtrip/
+#      rpc.wire_contract/rpc.wire_roundtrip，且全量实跑、live skipped 如实报告）→ 无 wire
+#      独立 configure/build（prefix 为空）只跑 rpc.runtime_no_wire 并断言 HTTP 链接闭包不含
+#      protobuf → Release 归档无 Debug 观测符号断言 → 依赖来源核查。
+#   3) debug：下载同一归档 → Debug 8 项既有门禁 + 同 7 项 RPC 定向集合（共 15 项零跳过，
+#      JUnit expected 精确更新）并把同 peers 加入 build 目标。
 #   4) release/debug 均按 callee 分类门控：docs-only 才允许显式跳过；code/unknown 执行全部。
 #      分类无法确定（真实 diff 失败/超预算）→ unknown → 执行全部，绝不擅自判绿。
 #
@@ -85,6 +93,15 @@ env:
   CORE_DIR: ${{ github.workspace }}/bbtools-core
   DEPS_PREFIX: ${{ github.workspace }}/deps-prefix
   BOOST_PREFIX: ${{ github.workspace }}/boost-prefix
+  # 锁定 protobuf 3.21.12 私有前缀（RPC wire 模块）：prepare-deps 建、prepared deps 归档复用。
+  PROTOBUF_PREFIX: ${{ github.workspace }}/protobuf-prefix
+  # 复用来源：framework 已发布且经独立审查的 scripts/prepare_protobuf.sh @
+  # bd9c490541ccad10cf32e15b91bb40104aa86118（完整 40 位 commit SHA，非浮动 ref）。
+  PROTOBUF_RECIPE_URL: https://raw.githubusercontent.com/yqm-307/bbt-framework/bd9c490541ccad10cf32e15b91bb40104aa86118/scripts/prepare_protobuf.sh
+  # 该配方文件的 sha256，由 framework Git 对象实算：
+  #   git cat-file blob bd9c4905…:scripts/prepare_protobuf.sh | sha256sum
+  # CI 下载后必须命中，否则 fail-closed（拒绝篡改/损坏/弱回退）。
+  PROTOBUF_RECIPE_SHA256: d10f129761576cce19283f05c8bd0ef9001cb79a1a83d57f02f00955fb6666af
   # prepared deps 归档：prepare-deps 产出、Release/Debug 消费
   DEPS_BUNDLE_TAR: ${{ github.workspace }}/deps-bundle.tar
   DEPS_BUNDLE_META: ${{ github.workspace }}/deps-bundle.meta
@@ -214,6 +231,25 @@ jobs:
       - name: "构建 hiredis/mongoc/mongocxx 私有前缀（唯一 recipe）"
         run: bash infra/scripts/prepare_resource_deps.sh "$DEPS_PREFIX" --jobs "$JOBS"
 
+      # Issue #8：RPC wire 模块所需锁定 protobuf 3.21.12 私有前缀。配方复用 framework
+      # 已发布、经独立审查的 `scripts/prepare_protobuf.sh`（固定完整 40 位 commit SHA）；
+      # CI 从该 SHA download 后用由 Git 对象实算的 sha256 fail-closed 校验，再执行，把
+      # Ubuntu .deb 提取到工作区私有前缀（recipe 内含包 sha256 门禁，amd64 only，不装
+      # 系统包、不写 /usr/local）。前缀随同一 prepared deps 归档复用（deps_bundle.sh 的
+      # protobuf-prefix 成员）。
+      - name: "复现锁定 protobuf 3.21.12 前缀（已发布配方 + sha256 fail-closed）"
+        run: |
+          set -euo pipefail
+          recipe="$GITHUB_WORKSPACE/prepare_protobuf.sh"
+          curl --fail --location --silent --show-error \
+               --max-time 60 --retry 2 --retry-all-errors \
+               "$PROTOBUF_RECIPE_URL" -o "$recipe"
+          printf '%s  %s\n' "$PROTOBUF_RECIPE_SHA256" "$recipe" \
+            | sha256sum --check --status \
+            || { echo "FAIL: prepare_protobuf.sh sha256 不匹配（来源被篡改/下载损坏），fail-closed" >&2; exit 1; }
+          echo "复用来源: $PROTOBUF_RECIPE_URL (sha256 ok)"
+          bash "$recipe" "$PROTOBUF_PREFIX"
+
       # tar 保留 symlink；artifact 只承载 tar 字节，不经 upload-artifact 的目录 symlink 语义。
       - name: "打包 prepared deps（tar，保留 symlink）"
         id: pack
@@ -330,7 +366,8 @@ jobs:
             -DBBT_CORE_SOURCE_DIR="$CORE_DIR" \
             -DBBT_HIREDIS_PREFIX="$DEPS_PREFIX/hiredis" \
             -DBBT_MONGOCXX_PREFIX="$DEPS_PREFIX/mongocxx" \
-            -DBBT_MONGOC_PREFIX="$DEPS_PREFIX/mongoc"
+            -DBBT_MONGOC_PREFIX="$DEPS_PREFIX/mongoc" \
+            -DBBT_PROTOBUF_PREFIX="$PROTOBUF_PREFIX"
           cmake --build . --parallel "$JOBS"
           if command -v ccache >/dev/null 2>&1 && [ "${{ steps.cache-meta.outputs.enabled }}" = "true" ]; then
             echo "=== ccache 统计（编译后） ==="
@@ -343,7 +380,12 @@ jobs:
           # Issue #34 A3：先断言两个 unit 已注册——若模块 target 缺失（前缀未
           # 传递或 find_package 失败）导致 redis.unit/mongo.unit 没注册，这里
           # 直接非零失败，不进入 ctest 漏判。
-          for t in redis.unit mongo.unit; do
+          # Issue #8 追加：7 个正式 RPC 名必须已注册（bbt_infra_rpc/生成库缺失即非零
+          # 失败，不靠 ctest 全量「恰好没跑」变绿）。这些测试同样由下方全量 ctest -j1
+          # 实际执行，不做只 ctest -N 的假断言。
+          for t in redis.unit mongo.unit \
+                   rpc.payload rpc.runtime rpc.runtime_faults rpc.runtime_lifetime \
+                   rpc.runtime_roundtrip rpc.wire_contract rpc.wire_roundtrip; do
             if ! ctest -N -R "^${t}$" | grep -q "Test.*: ${t}$"; then
               echo "FAIL: '${t}' 未注册（依赖前缀/模块 target 缺失）"
               exit 1
@@ -352,8 +394,64 @@ jobs:
           # --timeout 只作用于无 TIMEOUT 属性的测试（contract.basics）；
           # http.loopback/http.lifecycle 的 TIMEOUT 60/120 测试属性优先级更高，保持不变。
           # 保持与现役门禁一致的 180：contract.basics 无实测耗时证据就收紧会造成门禁 flake。
+          # Issue #8：全量 ctest 追加 7 个正式 RPC 用例（单项 TIMEOUT 最高 180s），外框由 5
+          # 上调到 8 分钟以留足余量（仍 < release job 45 分钟上限）。
           ctest -j1 --output-on-failure --timeout 180
-        timeout-minutes: 5
+        timeout-minutes: 8
+
+      # Issue #8：无 wire 配置独立门禁——不传 BBT_PROTOBUF_PREFIX（prefix 真为空），RPC
+      # 工厂 stub 编入 HTTP target，bbt_infra_rpc 不导出。单独 build 目录（不改 Release
+      # 主 build 目录），只 build+运行 rpc.runtime_no_wire，并断言 HTTP 归档与 no_wire
+      # 二进制均不含 protobuf 符号（保留「HTTP 不传染 protobuf 检查」）。不新增 job/runner。
+      - name: "无 wire 配置门禁（prefix 为空，独立 build，仅 rpc.runtime_no_wire）"
+        run: |
+          set -euo pipefail
+          NO_WIRE_BUILD_DIR="${BUILD_DIR}-no-wire"
+          rm -rf "$NO_WIRE_BUILD_DIR" && mkdir -p "$NO_WIRE_BUILD_DIR"
+          cmake -S "$GITHUB_WORKSPACE/infra" -B "$NO_WIRE_BUILD_DIR" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
+            -DBOOST_ROOT="$BOOST_PREFIX" -DCMAKE_PREFIX_PATH="$BOOST_PREFIX" \
+            -DBBT_COROUTINE_SOURCE_DIR="$COROUTINE_DIR" \
+            -DBBT_CORE_SOURCE_DIR="$CORE_DIR" \
+            -DBBT_HIREDIS_PREFIX="$DEPS_PREFIX/hiredis" \
+            -DBBT_MONGOCXX_PREFIX="$DEPS_PREFIX/mongocxx" \
+            -DBBT_MONGOC_PREFIX="$DEPS_PREFIX/mongoc" \
+            > "$NO_WIRE_BUILD_DIR/configure.log" 2>&1
+          # prefix 必须真为空：configure 日志须出现 stub 分支说明，否则 wire 被静默带入。
+          if ! grep -q "跳过 bbt_infra_rpc 模块" "$NO_WIRE_BUILD_DIR/configure.log"; then
+            echo "FAIL: 无 wire 配置未走 stub 分支（BBT_PROTOBUF_PREFIX 未真正为空）" >&2
+            sed -n '1,80p' "$NO_WIRE_BUILD_DIR/configure.log" >&2
+            exit 1
+          fi
+          # wire-only RPC 测试不得注册（rpc.payload 与 rpc.runtime_no_wire 是设计内、始终注册）。
+          for t in rpc.runtime rpc.runtime_faults rpc.runtime_lifetime \
+                   rpc.runtime_roundtrip rpc.wire_contract rpc.wire_roundtrip; do
+            if ctest --test-dir "$NO_WIRE_BUILD_DIR" -N -R "^${t}$" | grep -q "Test.*: ${t}$"; then
+              echo "FAIL: 无 wire 配置仍注册了 wire RPC 测试 ${t}" >&2
+              exit 1
+            fi
+          done
+          cmake --build "$NO_WIRE_BUILD_DIR" --parallel "$JOBS" \
+            --target Test_rpc_runtime_no_wire
+          # 「HTTP 不传染 protobuf」：无 wire 下 HTTP 归档与 no_wire 二进制均不得含
+          # protobuf/rpc_envelope 符号（wire 配置的 HTTP 闭包不变式见
+          # docs/decisions/0009-rpc-runtime-v1.md）。
+          python3 - "$NO_WIRE_BUILD_DIR" <<'PY'
+          import pathlib, subprocess, sys
+          build = pathlib.Path(sys.argv[1])
+          for art in (build / 'src' / 'libbbt_infra_http.a',
+                      build / 'tests' / 'Test_rpc_runtime_no_wire'):
+              if not art.exists():
+                  raise SystemExit(f'FAIL: 缺无 wire 产物 {art}')
+              syms = subprocess.check_output(['nm', '-C', str(art)], text=True)
+              for bad in ('protobuf', 'rpc_envelope'):
+                  if bad in syms:
+                      raise SystemExit(f'FAIL: 无 wire {art} 含 {bad}（HTTP 被 protobuf 传染）')
+          print('无 wire: HTTP 归档与 no_wire 二进制均无 protobuf 符号 (ok)')
+          PY
+          ctest --test-dir "$NO_WIRE_BUILD_DIR" -j1 -R '^rpc\.runtime_no_wire$' \
+            --no-tests=error --output-on-failure --timeout 120
+        timeout-minutes: 12
 
       # Release 侧观测符号不变式：三份归档必须存在且**无** bbt::infra::debug:: 符号。
       # （Debug 侧对应断言在 debug job；两侧合起来等价原同 job 的 nm 交叉检查。）
@@ -456,14 +554,15 @@ jobs:
           echo "=== live 容器镜像身份（复用现 compose mongo8.0，未引入新镜像治理）==="
           docker image inspect mongo:8.0 --format 'mongo:8.0 id={{.Id}}' 2>/dev/null || true
 
-  # #62：Debug 生命周期定向门禁（8 项，零跳过）。下载同一 prepared deps；
-  # 不改 runner、不新增依赖下载；缺项/跳过/失败均判负。job 名保持现役 check 名。
+  # #62 + Issue #8：Debug 定向门禁（8 项既有 + 7 项正式 RPC = 15 项，零跳过）。下载同一
+  # prepared deps；不改 runner、不新增依赖下载；缺项/跳过/失败均判负。job 名保持现役
+  # check 名不变（避免破坏 required context）。
   debug:
     name: "Debug 生命周期定向门禁（8 项，零跳过）"
     needs: [changes, plan, prepare-deps]
     if: ${{ needs.plan.result == 'success' && needs.plan.outputs.classification != 'docs-only' && needs.prepare-deps.result == 'success' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -488,7 +587,7 @@ jobs:
             --expect-sha "${{ needs.prepare-deps.outputs.bundle_sha256 }}" \
             --dest "$GITHUB_WORKSPACE"
 
-      - name: "Debug 配置与构建（8 目标）"
+      - name: "Debug 配置与构建（8 项既有 + 7 项 RPC + peers）"
         run: |
           set -euo pipefail
           DEBUG_BUILD_DIR="${BUILD_DIR}-debug"
@@ -505,13 +604,17 @@ jobs:
             -DBBT_COROUTINE_SOURCE_DIR="$COROUTINE_DIR" -DBBT_CORE_SOURCE_DIR="$CORE_DIR" \
             -DBBT_HIREDIS_PREFIX="$DEPS_PREFIX/hiredis" \
             -DBBT_MONGOCXX_PREFIX="$DEPS_PREFIX/mongocxx" \
-            -DBBT_MONGOC_PREFIX="$DEPS_PREFIX/mongoc"
+            -DBBT_MONGOC_PREFIX="$DEPS_PREFIX/mongoc" \
+            -DBBT_PROTOBUF_PREFIX="$PROTOBUF_PREFIX"
           cmake --build "$DEBUG_BUILD_DIR" --parallel "$JOBS" --target \
             Test_contract_basics Test_http_session_lifetime_probe \
             Test_http_timer_rearm_probe Test_http_inflight_close_probe \
-            Test_http_child_unregister Test_redis_unit Test_redis_cotcp_binding Test_mongo_unit
+            Test_http_child_unregister Test_redis_unit Test_redis_cotcp_binding Test_mongo_unit \
+            Test_rpc_payload Test_rpc_runtime Test_rpc_runtime_faults Test_rpc_runtime_lifetime \
+            Test_rpc_runtime_roundtrip Test_rpc_wire_contract Test_rpc_wire_roundtrip \
+            bbt_rpc_runtime_peer bbt_rpc_wire_peer
 
-      - name: "Debug 门禁（符号、8 项测试与零跳过）"
+      - name: "Debug 门禁（符号、15 项测试与零跳过）"
         run: |
           set -euo pipefail
           DEBUG_BUILD_DIR="${BUILD_DIR}-debug"
@@ -529,7 +632,7 @@ jobs:
                   raise SystemExit(f'FAIL: Debug {archive} 缺 debug 观测符号（STRINGENT_DEBUG 未生效）')
           print('Debug 归档: 三模块均含 debug 观测符号 (ok)')
           PY
-          RX='^(contract\.basics|http\.session_lifetime|http\.timer_rearm|http\.inflight_close|http\.child_unregister|redis\.unit|redis\.cotcp_binding|mongo\.unit)$'
+          RX='^(contract\.basics|http\.session_lifetime|http\.timer_rearm|http\.inflight_close|http\.child_unregister|redis\.unit|redis\.cotcp_binding|mongo\.unit|rpc\.payload|rpc\.runtime|rpc\.runtime_faults|rpc\.runtime_lifetime|rpc\.runtime_roundtrip|rpc\.wire_contract|rpc\.wire_roundtrip)$'
           ctest --test-dir "$DEBUG_BUILD_DIR" -j1 -R "$RX" \
             --no-tests=error --output-on-failure --timeout 180 \
             --output-junit "$DEBUG_BUILD_DIR/diagnostics.xml"
@@ -537,15 +640,17 @@ jobs:
           import sys, xml.etree.ElementTree as ET
           expected = {'contract.basics', 'http.session_lifetime', 'http.timer_rearm',
                       'http.inflight_close', 'http.child_unregister', 'redis.unit',
-                      'redis.cotcp_binding', 'mongo.unit'}
+                      'redis.cotcp_binding', 'mongo.unit', 'rpc.payload', 'rpc.runtime',
+                      'rpc.runtime_faults', 'rpc.runtime_lifetime', 'rpc.runtime_roundtrip',
+                      'rpc.wire_contract', 'rpc.wire_roundtrip'}
           cases = list(ET.parse(sys.argv[1]).getroot().iter('testcase'))
           if len(cases) != len(expected) or {c.get('name') for c in cases} != expected:
               raise SystemExit('FAIL: Debug diagnostics test set is incomplete or duplicated')
           if any(c.find(tag) is not None for c in cases for tag in ('skipped', 'failure', 'error')):
               raise SystemExit('FAIL: Debug diagnostics contain skipped/failed/error cases')
-          print('Debug diagnostics: 8 passed, 0 failed, 0 skipped')
+          print('Debug diagnostics: 15 passed, 0 failed, 0 skipped')
           PY
-        timeout-minutes: 5
+        timeout-minutes: 12
 
   # 唯一权威结果汇聚：**always** 运行，把五个真实 job 结果交给已发布 callee 的 result 契约。
   # 必跑（required=changes/plan）与重型 job（optional=prepare-deps/release/debug）任一

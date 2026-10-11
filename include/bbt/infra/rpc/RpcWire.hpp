@@ -54,7 +54,7 @@ inline constexpr std::uint32_t kMaxRemainingBudgetMs =
 // 与 NetworkTypes.hpp 中既有 RpcEnvelope（C++ 结构 seam）的关系：
 //   RpcEnvelope 是 framework 消费的公共数据形态；本结构是 wire profile 的
 //   显式版本化形态，多了 profile_version / remaining_budget_ms / outcome。
-//   两者经 ToLegacyEnvelope / FromLegacyEnvelope 显式互转。
+//   两者经 ToWireEnvelope / FromWireEnvelope 显式互转。
 struct RpcWireEnvelope {
     std::uint32_t profile_version = kRpcWireProfileVersion;
     std::string   request_id;
