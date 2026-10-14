@@ -166,8 +166,10 @@ OFF 模式不注册、不宣告 tools，不能用于替代三原语验收。
   低频退出崩溃根因未明；有限成功退出不排除它。上述硬缺口仍阻止完整交付。
 - **重构基线验证**：MCP 的 json/protocol/server/registry/tools/schema/subscribe/stdio_transport/http_transport
   九项定向测试通过，contract.basics 补建后通过；公开示例 stdio initialize→echo→EOF 实测退出 0。
-  `mcp.teardown` 实跑在 T6 的 busy HTTP 503 与 released 断言失败，并在 T8 阶段超时（120 秒）。
-  失败来源尚未核清；保留原测试，不降低期望。本次仅保存可追溯的重构起点，不是测试全绿、PR 就绪或路径点完成。
+  首轮 `mcp.teardown` 曾在 T6 的 busy HTTP 503/released 断言失败，随后 T8 超时（120 秒）。
+  已确认测试头 `Mcp-Name: req` 与 body URI 不一致；仅修正 fixture 请求并增加 T8 入场失败的有界清理，产品校验与原容量/Close 期望未变。
+  修后 teardown 153 checks / 0 failures、冒烟及直接耦合八项通过；新 HEAD 的远端 CI 仍须验证。
+  本次保存可追溯的重构起点，不能据此宣称完整协议合规或路径点完成。
 
 ## CI 覆盖边界
 

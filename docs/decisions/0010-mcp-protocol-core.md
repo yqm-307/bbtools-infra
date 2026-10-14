@@ -29,9 +29,9 @@
 - 固定 jsoncons v1.10.0 `9e57e421285422d7aeeb5aa7dc839f6a19121ee6`，BSL-1.0，仅私有校验；
   dynamic-scope 三头 overlay 修复跨资源 `$dynamicRef`。ICU 78.2（已测 Ubuntu amd64 `78.2-2ubuntu1`）从显式 `MCP_ICU_ROOT` 查找头/库，无系统安装。
   运行时仍须显式私有库环境保证三库均落隔离根；裸 RUNPATH 曾使传递依赖 libicudata 落宿主，不能将 CMake 查找根视为运行时无回落保证。
-  `MCP_JSONCONS_ROOT` 必须是带经核验 overlay 的根，原版 jsoncons 不是已测候选。CMake 仅检查根/查找私有库，不等于自动核完整 SHA。
-- **可复现交付仍有硬缺口**：隔离重放已成功，但仓内尚无完整 overlay/包锁/重放配方；不能把 scratch 依赖成功构建当作全新公开检出可复现。
-  不以这次文档/示例改动扩展依赖或安装授权。
+  `MCP_JSONCONS_ROOT` 必须是带经核验 overlay 的根，原版 jsoncons 不是已测候选。CMake 通过固定 checker 校验依赖根，再仅从私有根查找库；根校验不等于运行时隔离保证。
+- 固定包锁、三头 overlay 与离线 `prepare/check` 已提供于 [cmake/mcp-schema](../../cmake/mcp-schema/README.md)，要求 Python 3.11.8+，调用者须提供锁定归档。
+  该配方不自动下载或系统安装，也不替代公开平台矩阵、Schema ON 的 CI 与完整交付验收。
 
 ## 3. revision、能力与错误
 
@@ -87,8 +87,9 @@
   文档边界不解除原 R5/S9–S11 与 2-3 的验收责任，不能宣传完整 draft2020-12 合规。
 - 未覆盖所有 raw golden/header/SSE 分支；SDK model_dump 不是 server→client 原始 wire。
   双订阅/取消/关闭局部证据不等于全场景证明；低频退出崩溃根因未明，有限成功退出不排除它。
-  重构基线的 `mcp.teardown` 实跑出现 T6 busy HTTP 503/released 两处失败断言，随后在 T8 超时（120 秒）；
-  失败来源未核清，保留原期望与未完成验收状态，不能凭基线提交宣称生命周期已闭环。
+  首轮重构基线的 `mcp.teardown` 出现 T6 busy HTTP 503/released 两处失败断言及 T8 超时（120 秒）。
+  已确认 fixture 的 `Mcp-Name: req` 与 body URI 不一致，导致 HTTP 400、handler 未入场；修正请求头并为 T8 失败入场路径增加有界失败清理。
+  本地原 teardown 153 checks / 0 failures、直接耦合八项通过，原容量/Close 断言保持不变；这只关闭该 fixture 阻断，不宣称所有生命周期风险已闭环。
 - 无 Windows/iOS、多平台、压力或全量 TSan 承诺。整包独立审查不补齐未覆盖的验收项，PR/exact-head CI 尚未获得执行/通过证据。
   先解决已列硬缺口再谈完整 ready；本文件、局部独审 PASS 和本地绿测试都不能自审放行。
 

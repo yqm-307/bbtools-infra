@@ -362,13 +362,15 @@ private:
 };
 
 std::string PostBody(std::uint16_t port, const std::string& body, const char* accept,
-                     const char* mcp_method) {
+                     const char* mcp_method, const char* mcp_name = nullptr) {
     std::string head = "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(port) +
                        "\r\nContent-Type: application/json\r\nAccept: " + accept +
                        "\r\nMCP-Protocol-Version: " + kModern + "\r\n";
     if (mcp_method) {  // modern 请求注解头（S19：缺失 → -32020）
-        head += std::string("Mcp-Method: ") + mcp_method + "\r\nMcp-Name: req\r\n";
+        head += std::string("Mcp-Method: ") + mcp_method + "\r\n";
     }
+    // S19：具名方法的注解必须与 body 的 name/uri 精确一致。
+    if (mcp_name) head += std::string("Mcp-Name: ") + mcp_name + "\r\n";
     head += "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n";
     return head + body;
 }
@@ -706,7 +708,7 @@ void TestHttpCancelNoopAndDisconnectDrivenEnd() {
         HttpConn probe;
         CHECK(probe.Connect(port));
         CHECK(probe.SendAll(PostBody(port, ModernRead("p1", "mem://a"), "application/json",
-                                      "resources/read")));
+                                      "resources/read", "mem://a")));
         const std::string busy = probe.ReadBounded(2000);
         CHECK(busy.find("HTTP/1.1 503") != std::string::npos);
         probe.Close();
@@ -723,7 +725,7 @@ void TestHttpCancelNoopAndDisconnectDrivenEnd() {
             HttpConn probe;
             if (probe.Connect(port) &&
                 probe.SendAll(PostBody(port, ModernRead("p2", "mem://a"), "application/json",
-                                       "resources/read"))) {
+                                       "resources/read", "mem://a"))) {
                 const std::string body = probe.ReadBounded(2000);
                 if (body.find("HTTP/1.1 200") != std::string::npos) released = true;
             }
@@ -845,8 +847,21 @@ void TestHttpS21NetworkAcceptance() {
     HttpConn client;
     CHECK(client.Connect(port));
     CHECK(client.SendAll(PostBody(port, ModernRead("21", "mem://slow"), "application/json",
-                                  "resources/read")));
-    gate->WaitEntered();  // handler 在途（连接协程被业务栈占住）
+                                  "resources/read", "mem://slow")));
+    bool entered = false;
+    {
+        std::unique_lock<std::mutex> lock(gate->m);
+        entered = gate->cv.wait_for(lock, std::chrono::milliseconds{2000},
+                                    [gate] { return gate->entered; });
+    }
+    CHECK(entered);  // admission 失败必须报错并清理，不能无限等待未入场的 handler。
+    if (!entered) {
+        std::fprintf(stderr, "T8-DIAG admission response=%s\n", client.ReadBounded(200).c_str());
+        gate->Release();
+        transport->Close();
+        client.Close();
+        return;
+    }
     std::fprintf(stderr, "PROGRESS T8.a in-flight established\n");
 
     // 对象面基线（Close 前）：listener + 已接受连接 + 测试自身客户端的 socket fd。
