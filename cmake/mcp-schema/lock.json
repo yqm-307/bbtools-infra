@@ -1,0 +1,76 @@
+{
+  "format": 1,
+  "platform": {
+    "system": "Linux",
+    "architecture": "amd64",
+    "machine": "x86_64",
+    "triplet": "x86_64-linux-gnu"
+  },
+  "jsoncons": {
+    "version": "1.10.0",
+    "commit": "9e57e421285422d7aeeb5aa7dc839f6a19121ee6",
+    "archive": "jsoncons-9e57e421.tar.gz",
+    "archive_sha256": "7984a2a3f9fa630162a6d3a64f79391aee2357a814ebafb5379fbeac0b731aeb",
+    "directory": "jsoncons-9e57e421285422d7aeeb5aa7dc839f6a19121ee6",
+    "upstream": "https://github.com/danielaparker/jsoncons",
+    "include_before_sha256": "987538343277261b1b3ecbe3edc77a0de0f3420e3afcf5d3dcf88b05bef0f49e",
+    "include_after_sha256": "fe5c89453b6e099c9f1b48c0f43096dfb0f50fb90331af50a06046ef5961d3d8",
+    "headers_before": {
+      "include/jsoncons_ext/jsonschema/common/eval_context.hpp": "e3971ee2071702bd87d0331edfd03fa2ee30f0d1d71744aea79a403bdc0ca506",
+      "include/jsoncons_ext/jsonschema/common/keyword_validator.hpp": "bcaae280d2537edb582732ce1512f0019bbbf95c5e165e152d7797d6feb432dc",
+      "include/jsoncons_ext/jsonschema/common/schema_validator_factory_base.hpp": "30fcc7917f83a0c1fb45fcf4d27c92d2c6f99c505ffa5f78c98c88c4dadf9fbf"
+    },
+    "headers_after": {
+      "include/jsoncons_ext/jsonschema/common/eval_context.hpp": "ba3e5f2d3ada4abf29f9b729a2c852d2e45f4f3e0c296176aee9a70b0a8a189a",
+      "include/jsoncons_ext/jsonschema/common/keyword_validator.hpp": "dff66d97a4f24d2ce9d60e425718ecfd479e98cafc0e24cbe8995d1d4da40fb5",
+      "include/jsoncons_ext/jsonschema/common/schema_validator_factory_base.hpp": "848cf12ea131c0018880061a4e1c05f6bafdffefc2da4edd7d20983a424d7e56"
+    }
+  },
+  "overlay": {
+    "file": "dynamic-scope.patch",
+    "sha256": "553b2f65a5cfbb3781c47d39028645f5ee6e8a9587c8e2526e17345b604254a5",
+    "license": "BSL-1.0 (same as patched jsoncons headers)"
+  },
+  "icu": {
+    "upstream_version": "78.2",
+    "package_version": "78.2-2ubuntu1",
+    "homepage": "https://icu.unicode.org/",
+    "packages": [
+      {
+        "file": "libicu-dev_78.2-2ubuntu1_amd64.deb",
+        "sha256": "335d24663b21e07b3850565d70d173399cf8b9bb59ad3be17bd5c98e9fadce0a",
+        "Package": "libicu-dev",
+        "Version": "78.2-2ubuntu1",
+        "Architecture": "amd64"
+      },
+      {
+        "file": "libicu78_78.2-2ubuntu1_amd64.deb",
+        "sha256": "c8b97930f9e365d6d00978144b468ac8397ef07d2fb2c453869f05fc3a98c4ca",
+        "Package": "libicu78",
+        "Version": "78.2-2ubuntu1",
+        "Architecture": "amd64"
+      }
+    ],
+    "controls": {
+      ".mcp-controls/libicu-dev/control": "17fc48cffa9566407db372b7da3a7c7cddf7369c8abc064063db1e81d10009af",
+      ".mcp-controls/libicu78/control": "6f37ea035fc16d2b5ce53fc863ebd460a14a384a6a6c3f3d7ed39ae6dd67fadc"
+    },
+    "resources": {
+      "usr/lib/x86_64-linux-gnu/libicui18n.so.78.2": "14b42ecb935cb21758a24a61052e7b4cd410553e4deae37736cd8c748a1511f4",
+      "usr/lib/x86_64-linux-gnu/libicuuc.so.78.2": "1eb54ce8839e953fbaa755522f3488039d879be3a61b272df3cabd6c00f08d2d",
+      "usr/lib/x86_64-linux-gnu/libicudata.so.78.2": "3a08c11ef1d168a1edc3b0437cecb8b42e621f67706980a0502c97364bf744a7",
+      "usr/include/unicode/uvernum.h": "be53eaf56f3f03870639ec0b40d4c16f9b60fa5d44196b96ed3084717084882f",
+      "usr/lib/x86_64-linux-gnu/pkgconfig/icu-uc.pc": "695675574e7b87488ae0572d90f74c9347244b2ab098efe0517e5d929bc473be",
+      "usr/lib/x86_64-linux-gnu/pkgconfig/icu-i18n.pc": "3ff7e90da4063ae70361555bc891f1275ed9c3399e4d82a1e377920816336a9c",
+      "usr/share/doc/libicu-dev/copyright": "5bbff5f646ce750ac0a347e7f91793279b7422a1119820b5f75d98879c201c68",
+      "usr/share/doc/libicu78/copyright": "5bbff5f646ce750ac0a347e7f91793279b7422a1119820b5f75d98879c201c68"
+    },
+    "unicode_tree_sha256": "c75f67c61ee336201df1d7f221f9358491d1cbacd48a4d90f8182d72a995015d",
+    "libdir": "usr/lib/x86_64-linux-gnu",
+    "libraries": [
+      "icui18n",
+      "icuuc",
+      "icudata"
+    ]
+  }
+}

@@ -486,7 +486,12 @@ set(BBT_INFRA_PUBLIC_HEADERS
     config/MemorySource.hpp
     config/FileSource.hpp
     config/Watch.hpp
-    rpc/RpcPayload.hpp)
+    rpc/RpcPayload.hpp
+    mcp/JsonValue.hpp
+    mcp/McpTypes.hpp
+    mcp/McpServer.hpp
+    mcp/McpHttpTransport.hpp
+    mcp/McpStdioTransport.hpp)
 
 if(TARGET bbt_infra_rpc_proto)
     list(APPEND BBT_INFRA_PUBLIC_HEADERS rpc/RpcWire.hpp)

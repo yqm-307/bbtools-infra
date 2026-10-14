@@ -16,7 +16,7 @@
 | Mongo client | `bbt::infra_mongo` | 已实现 owner + 句柄形态 | 同步 driver + worker bridge；`mongo::CoMongoDb` 为资源 owner，`mongo::CoMongoColl` 为集合句柄；`include/bbt/infra/mongo/` 公共目录已建，剩余 API 按决策 0006 逐步迁移 |
 | 基础动态配置 | `bbt::infra_config` | 最小切片已合入主线，独立消费已验证 | `bbt::infra::config`；版本化不可变快照 + 内存源 + 真实本地文件源 + watch（初始/更新/重复去重、失败恢复、关闭与晚到通知、正常 drain 与 owner 同步 `Close()` 的资源边界）。**未交付**：远程 provider 与真实重连、业务 schema 校验、客户端资源热切换。契约/命令/未覆盖矩阵见 [docs/config-watch-v1.md](docs/config-watch-v1.md) |
 | RPC | `bbt::infra_rpc` | wire profile + runtime 候选已实现 | 版本化 Protobuf RpcEnvelope wire profile 与 HTTP-backed RpcClient/RpcServer runtime（`bbt::infra::rpc`，Issue #8/N2）：值类型校验、编解码、HTTP body 绑定、请求关联、deadline、错误和同步 Close；候选仍待 framework 接线、独立审查与合入 main |
-| MCP | — | 未开始 | 归对应 Issue 推进，当前无实现 |
+| MCP server | `bbt::infra_mcp_core`、`bbt::infra_mcp_http`、可选 `bbt::infra_mcp_schema` | 本地重构基线，未完成交付门禁 | 三原语、stdio/Streamable HTTP、固定依赖离线重放；Schema/正则、teardown 与 exact-head CI 缺口保留，见下文 |
 
 已实现能力的单测与示例均可独立构建运行，见下文「独立消费」与 [examples/README.md](examples/README.md)。
 
@@ -87,6 +87,87 @@ ctest --test-dir build --output-on-failure
 
 另有独立消费工程 `examples/config_consumer`（只链接 `bbt::infra_config`，不被本仓构建引用），
 用于从仓外视角复核模块 target 可独立消费；命令见该目录 README 与 [docs/config-watch-v1.md](docs/config-watch-v1.md)。
+
+## MCP server：本地候选使用
+
+C++17 业务通过 `include/bbt/infra/mcp/` 的自有类型注册三原语，不手写 JSON-RPC 信封。
+完整装配见 [examples/mcp_server.cc](examples/mcp_server.cc)，决策与未覆盖项见
+[0010：MCP 协议与实现边界](docs/decisions/0010-mcp-protocol-core.md)。当前是本地候选，**不是 PR 就绪或完整协议合规声明**。
+
+- `bbt::infra_mcp_core`：协议、业务注册与 stdio；不链接 RPC/protobuf、HTTP 模块或 Schema/ICU。
+- `bbt::infra_mcp_http`：组合公开 TransportRuntime/CoTCP 的 Streamable HTTP，不链接 `bbt::infra_http`。
+- `bbt::infra_mcp_schema`：显式选件；私有 jsoncons/ICU 校验器。先调用
+  `EnableToolsSchemaValidation(*server)`，再 `AddTool`；未启用时工具注册拒绝，不用空桩。
+- `Create` → 注册 `AddTool` / `AddResource` / `AddPrompt` → `Start` 冻结 → transport 启动。
+  退出时显式 `transport->Close()`，再 `server->Close()`；幂等、不重开，不调用 Scheduler Stop。
+  已进入的业务 handler 协作式退出，捕获对象必须活到回调实际结束。
+
+### 构建与启动
+
+依赖：已有 Boost 1.90 与固定 bbtools-coroutine 源码。三原语示例另需经核验的
+jsoncons v1.10.0 `9e57e421285422d7aeeb5aa7dc839f6a19121ee6` **加三头 dynamic-scope overlay**，
+以及隔离的 ICU 78.2（已测 Ubuntu amd64 包 `78.2-2ubuntu1`）。这里不自动下载、安装或回退宿主 ICU。
+固定包锁、三头 overlay 和离线 `prepare/check` 已提供于 [cmake/mcp-schema](cmake/mcp-schema/README.md)，
+要求 Python 3.11.8+ 与调用者提供的固定归档；仅凭原版 jsoncons 不能复现已测结果。
+以下 ON 命令使用按该配方准备并核验的依赖根，不自动下载或系统安装。
+
+```bash
+# CO / JSONCONS / ICU 分别指固定 coroutine 源码、带 overlay 的 jsoncons 根和 ICU 解压根。
+JOBS=$(( $(nproc) / 4 )); [ "$JOBS" -ge 2 ] || JOBS=2
+cmake -S . -B build-mcp-on -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+  -DBBT_COROUTINE_SOURCE_DIR="$CO" -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+  -DBBT_MCP_SCHEMA_ADAPTER=ON -DMCP_JSONCONS_ROOT="$JSONCONS" -DMCP_ICU_ROOT="$ICU"
+cmake --build build-mcp-on --target Example_mcp_server --parallel "$JOBS"
+# ICU 的 RUNPATH 不保证传递解析 libicudata；运行时显式钉住整个隔离库根。
+export LD_LIBRARY_PATH="$ICU/usr/lib/x86_64-linux-gnu"
+build-mcp-on/examples/Example_mcp_server --http 0
+# 默认 127.0.0.1，POST /mcp；实际动态端口只写 stderr。SIGINT/SIGTERM 收口。
+# stdio 用 MCP 客户端启动，stdin/stdout 必须是独占管道，不可直接连终端：
+# 客户端配置：command=<Example_mcp_server 的绝对路径>，args=["--stdio"]
+# env={"LD_LIBRARY_PATH":"<ICU解压根>/usr/lib/x86_64-linux-gnu"}（SDK 可能过滤宿主环境）
+```
+
+ON 示例注册 `echo` 工具（必需 string `message`，禁止额外字段；输出 `echo` 和有效调用计数 `count`）、
+`memo://echo` 资源（文本 `echo:memo://echo`）与 `echo` prompt（可选 string `text`，缺省「你好」）。
+示例没有测试专用发布工具；订阅事件发布属于应用调用 `PublishResourceChanged(uri)`，不能凭示例 listen ack 宣称事件发布实测。
+
+仅核心/resource/prompt 模式无需 jsoncons/ICU，仍可构建同一示例：
+
+```bash
+cmake -S . -B build-mcp-off -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+  -DBBT_COROUTINE_SOURCE_DIR="$CO" -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+  -DBBT_MCP_SCHEMA_ADAPTER=OFF
+cmake --build build-mcp-off --target Example_mcp_server --parallel "$JOBS"
+```
+
+OFF 模式不注册、不宣告 tools，不能用于替代三原语验收。
+独立 source-build 消费者见 [examples/mcp_consumer/README.md](examples/mcp_consumer/README.md)。
+
+### 协议、安全与验收边界
+
+- 仅服务 `2026-07-28`、`2025-11-25`、`2025-06-18`；modern 每请求带规范 `_meta`，无需 initialize。
+  legacy stdio 要 initialize/initialized；legacy HTTP 是无 session profile，首次 initialize 可不带版本头，
+  后续业务请求仍需匹配版本头。不 mint/echo session，不支持旧式 2024 SSE transport。
+- modern HTTP 要唯一 `MCP-Protocol-Version` 与 `Mcp-Method`；`Mcp-Name` 只对
+  `tools/call`、`resources/read`、`prompts/get` 必需，解码后精确对应 name/uri。
+  非法/重复 Origin 拒绝；缺 Origin 不代表客户端已认证。
+- 输入校验失败 `-32602` 且不进 handler；业务 `is_error` 与协议错误分层；异常/非法输出固定 `-32603`，不回显异常。
+  modern 订阅支持真 SSE ack/通知；legacy 不虚宣 `resources.subscribe`。模板列表为空，尚不注册动态 URI 模板。
+- 仅本机 loopback，无 auth/TLS/OAuth、公网部署、Windows/iOS、压力或全量 TSan 承诺。
+  HTTP 一连接一请求，无 keep-alive 或 Last-Event-ID 重放。取消不代表业务未执行，也不自动重试。
+- Schema 默认 2020-12，注册期全文 metaschema 校验，默认禁外部 `$ref`/网络，无强转、填默认或删字段。
+  `format` 为 annotation，不强制 format assertion。ICU 的正则语义不等于完整 ECMA-262：可选 ECMAScript
+  74 例仅 64 通过、non-BMP 12 例仅 9 通过；同步 regex 无已验证时间预算，运行故障注入尚缺。
+- 本地 Boost 产品核心 Schema suite：固定版本 46 文件、384 组、1301 例全通过，无 skip/error/mismatch；
+  native std::regex 对照仅 1296 通过、5 例编译阻断，不是 native+ICU 双模式通过。
+  Python oracle 1295 一致、5 例 Unicode regex 不支持、1 例 vocabulary 行为差异，不称两者 1301 全绿。
+- 固定官方 Python SDK `4b5fe5afeb5a6391a167d124d8ee0c21a5f2abec` 对本示例 stdio/HTTP × 三 revision
+  三原语互通已本地实测 6/6；这不替代未覆盖的 raw golden 分支、关闭竞争根因排查、完整最终独审或 exact-head CI。
+  低频退出崩溃根因未明；有限成功退出不排除它。上述硬缺口仍阻止完整交付。
+- **重构基线验证**：MCP 的 json/protocol/server/registry/tools/schema/subscribe/stdio_transport/http_transport
+  九项定向测试通过，contract.basics 补建后通过；公开示例 stdio initialize→echo→EOF 实测退出 0。
+  `mcp.teardown` 实跑在 T6 的 busy HTTP 503 与 released 断言失败，并在 T8 阶段超时（120 秒）。
+  失败来源尚未核清；保留原测试，不降低期望。本次仅保存可追溯的重构起点，不是测试全绿、PR 就绪或路径点完成。
 
 ## CI 覆盖边界
 

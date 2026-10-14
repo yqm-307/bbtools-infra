@@ -1,0 +1,2 @@
+# Preserve upstream whitespace in the pinned unified patch.
+dynamic-scope.patch -whitespace

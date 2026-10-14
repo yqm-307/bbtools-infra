@@ -426,3 +426,131 @@ target_link_libraries(Test_transport_runtime_no_loop
 target_compile_options(Test_transport_runtime_no_loop PRIVATE -Wall -Wextra)
 add_test(NAME transport.runtime_no_loop COMMAND Test_transport_runtime_no_loop)
 set_tests_properties(transport.runtime_no_loop PROPERTIES TIMEOUT 60)
+
+# --- MCP 协议核（Boost.JSON 主体）---------------------------------------------
+# unit：JsonValue 值语义/精确整数/拒绝面/边界；只链接 bbt::infra_mcp_core。
+add_executable(Test_mcp_json Test_mcp_json.cc)
+target_link_libraries(Test_mcp_json PRIVATE bbt::infra_mcp_core Boost::boost)
+target_compile_options(Test_mcp_json PRIVATE -Wall -Wextra)
+add_test(NAME mcp.json COMMAND Test_mcp_json)
+set_tests_properties(mcp.json PROPERTIES TIMEOUT 60)
+
+# protocol：JSON-RPC 输入完整性/owned id/modern _meta 与版本校验/discover·error·
+# result 构造。经 src/ 内部头消费实现面（与仓内其他 impl 层测试同口径，仅本目标
+# 可见）；不依赖 Schema adapter 与任何 transport。
+add_executable(Test_mcp_protocol Test_mcp_protocol.cc)
+target_include_directories(Test_mcp_protocol PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(Test_mcp_protocol PRIVATE bbt::infra_mcp_core Boost::boost)
+target_compile_options(Test_mcp_protocol PRIVATE -Wall -Wextra)
+add_test(NAME mcp.protocol COMMAND Test_mcp_protocol)
+set_tests_properties(mcp.protocol PROPERTIES TIMEOUT 60)
+
+# server：transport-independent 核心（生命周期/有界准入/内建方法分派：modern
+# discover、legacy initialize→initialized/ping、两 era 方法表隔离、错误 id/通知）。
+# 经 src/ 内部头消费实现面（与 mcp.protocol 同口径，仅本目标可见）；不依赖
+# Schema adapter 与任何 transport。
+add_executable(Test_mcp_server Test_mcp_server.cc)
+target_include_directories(Test_mcp_server PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(Test_mcp_server PRIVATE bbt::infra_mcp_core Boost::boost Threads::Threads)
+target_compile_options(Test_mcp_server PRIVATE -Wall -Wextra)
+add_test(NAME mcp.server COMMAND Test_mcp_server)
+set_tests_properties(mcp.server PROPERTIES TIMEOUT 60)
+
+# subscribe：2-5 subscriptions/listen（ack/filters/subscriptionId、长请求在途占用）
+# 与 MRTR 基础 message patterns（S14/S15）：ack 先行与空支持子集、accepted 过滤、
+# 订阅 id 隔离与事件顺序、cancel 结束流、资源发布、MRTR wire 构造/能力门禁
+# （-32021 + data.requiredCapabilities）/重试输入（id-keyed inputResponses、opaque
+# requestState）、legacy 不混 modern 结构。经 src/ 内部头消费实现面（与 mcp.server
+# 同口径，仅本目标可见）；sink 为内部 transport seam，真实 stdio/HTTP 属 3-x。
+add_executable(Test_mcp_subscribe Test_mcp_subscribe.cc)
+target_include_directories(Test_mcp_subscribe PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(Test_mcp_subscribe PRIVATE bbt::infra_mcp_core Boost::boost)
+target_compile_options(Test_mcp_subscribe PRIVATE -Wall -Wextra)
+add_test(NAME mcp.subscribe COMMAND Test_mcp_subscribe)
+set_tests_properties(mcp.subscribe PROPERTIES TIMEOUT 60)
+
+# tools 注册/分派 + 私有 Schema 接缝 + MRTR 接线（R1/R5/R7 增量）。
+# 2-6 起 mcp.tools 经 EnableToolsSchemaValidation 显式接通真实 Schema 校验，
+# 因此链接私有 adapter 目标 bbt_infra_mcp_schema（仅本测试可见，不进公共面；
+# core 本体仍无 ICU/jsoncons 链接，见 src/CMakeLists.txt 闭包门禁）。
+# adapter-OFF 主树（BBT_MCP_SCHEMA_ADAPTER 默认 OFF）不产生该目标，本测试随之
+# 跳过：OFF 面由 core 冒烟 + Test_mcp_server 覆盖（与下方 mcp.schema 门控同口径）；
+# adapter-ON 时本测试必须构建并运行真实引擎，不得弱化。
+if(TARGET bbt_infra_mcp_schema)
+    add_executable(Test_mcp_tools Test_mcp_tools.cc)
+    target_include_directories(Test_mcp_tools PRIVATE
+        ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(Test_mcp_tools PRIVATE
+        bbt::infra_mcp_core bbt_infra_mcp_schema Boost::boost Threads::Threads)
+    target_compile_options(Test_mcp_tools PRIVATE -Wall -Wextra)
+    add_test(NAME mcp.tools COMMAND Test_mcp_tools)
+    set_tests_properties(mcp.tools PROPERTIES TIMEOUT 60)
+endif()
+
+# stdio transport（3-1 S16/S17）：真实非 socket pipe 读写/有界输出/受管协程 dispatch/
+# 订阅 sink 接线/cancel/EOF/诊断 stderr 分离；Close 返回当刻资源快照证据。子进程
+# 模式复用本二进制（--mcp-stdio-child）做真实 fork/exec 全栈交互（官方 SDK 互通
+# 属 4-2/S23，不在此冒充）。
+add_executable(Test_mcp_stdio_transport Test_mcp_stdio_transport.cc)
+target_include_directories(Test_mcp_stdio_transport PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(Test_mcp_stdio_transport PRIVATE
+    bbt::infra_mcp_core Boost::boost Threads::Threads)
+target_compile_options(Test_mcp_stdio_transport PRIVATE -Wall -Wextra)
+add_test(NAME mcp.stdio_transport COMMAND Test_mcp_stdio_transport)
+set_tests_properties(mcp.stdio_transport PROPERTIES TIMEOUT 120)
+
+# HTTP transport（3-2 S18-S20）：真实动态 loopback 上的原始 socket 客户端矩阵——
+# POST JSON/通知 202/GET·DELETE 405/parse·envelope·_meta·header·version 400、
+# 注解头三头（缺失/重复/不符/sentinel Base64/CTL）、Origin 403、完整 POST 后
+# SHUT_WR 仍响应、截断 body EOF 明确失败、SSE 真流（ack/心跳/事件/流结束）、
+# 断连→订阅取消（名额归还）、连接配额与并发 Close。只链接公共面（不消费 src/
+# 内部头）；不链接 bbt_infra_http（S24 头部独立）。
+add_executable(Test_mcp_http_transport Test_mcp_http_transport.cc)
+target_link_libraries(Test_mcp_http_transport PRIVATE
+    bbt::infra_mcp_http Boost::boost Threads::Threads)
+target_compile_options(Test_mcp_http_transport PRIVATE -Wall -Wextra)
+add_test(NAME mcp.http_transport COMMAND Test_mcp_http_transport)
+set_tests_properties(mcp.http_transport PROPERTIES TIMEOUT 180)
+
+# --- MCP 私有 JSON Schema adapter 测试（2-3 切片）：仅当 adapter 目标存在时注册。
+if(TARGET bbt_infra_mcp_schema)
+    add_executable(Test_mcp_schema Test_mcp_schema.cc)
+    # 私有实现头（src/adapters/mcp/）仅本测试目标可见，不进入公共 include 面。
+    target_include_directories(Test_mcp_schema PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/adapters/mcp)
+    target_link_libraries(Test_mcp_schema PRIVATE
+        bbt::infra_mcp_schema Boost::boost Threads::Threads)
+    target_compile_options(Test_mcp_schema PRIVATE -Wall -Wextra)
+    add_test(NAME mcp.schema COMMAND Test_mcp_schema)
+    set_tests_properties(mcp.schema PROPERTIES TIMEOUT 120)
+endif()
+
+# teardown（3-3 S21-S22）：request 栈外 owner 唯一终态/deadline/Cancel/Close、
+# 跨连接 cancel 路由（core 面 + HTTP SSE 真流）、stdio close_drain 降级专测、
+# HTTP 网络级 S21 确定性验收（对象面证据：fd 表/LISTEN 内核表/证据快照）、
+# S22 边界（容量/隔离/不重试/注册上限）。经 src/ 内部面消费 RequestOwner 计数。
+add_executable(Test_mcp_teardown Test_mcp_teardown.cc)
+target_include_directories(Test_mcp_teardown PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(Test_mcp_teardown PRIVATE
+    bbt::infra_mcp_core bbt::infra_mcp_http Boost::boost Threads::Threads)
+target_compile_options(Test_mcp_teardown PRIVATE -Wall -Wextra)
+add_test(NAME mcp.teardown COMMAND Test_mcp_teardown)
+set_tests_properties(mcp.teardown PROPERTIES TIMEOUT 120)
+
+# registry：公共注册面（AddResource/AddPrompt/Start/Close）+ 业务分派（resources/prompts
+# 的 list/read/templates/list/get）：注册校验与原子性、Start 冻结快照、稳定分页与 cursor
+# 校验、未知 uri/name、prompt required/string 参数、结果由库构造（modern 字段/legacy 隔离）、
+# 能力只反映真实注册、异常与空结果脱敏、legacy 生命周期门禁、回调不在锁内。
+# 经 src/ 内部头消费实现面（与 mcp.server 同口径，仅本目标可见）。
+add_executable(Test_mcp_registry Test_mcp_registry.cc)
+target_include_directories(Test_mcp_registry PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(Test_mcp_registry PRIVATE bbt::infra_mcp_core Boost::boost Threads::Threads)
+target_compile_options(Test_mcp_registry PRIVATE -Wall -Wextra)
+add_test(NAME mcp.registry COMMAND Test_mcp_registry)
+set_tests_properties(mcp.registry PROPERTIES TIMEOUT 60)
