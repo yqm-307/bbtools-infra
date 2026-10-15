@@ -341,6 +341,7 @@ jobs:
               "$BOOST_PREFIX/include/boost/version.hpp"
 
       - name: "编译（Release，JOBS=3 + ccache）"
+        id: release-build
         run: |
           rm -rf "$BUILD_DIR" && mkdir -p "$BUILD_DIR"
           # 三级降级：cache-bypass/禁用 → 无 ccache 直编 → 有 ccache 直编（in-run 缓存
@@ -358,6 +359,8 @@ jobs:
           cd "$BUILD_DIR"
           cmake ../infra -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS="-g" -DCMAKE_C_FLAGS="-g" \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
             -DBUILD_TESTING=ON \
             -DBOOST_ROOT="$BOOST_PREFIX" \
             -DCMAKE_PREFIX_PATH="$BOOST_PREFIX" \
@@ -375,6 +378,7 @@ jobs:
           fi
 
       - name: "ctest -j1"
+        id: release-ctest
         run: |
           cd "$BUILD_DIR"
           # Issue #34 A3：先断言两个 unit 已注册——若模块 target 缺失（前缀未
@@ -398,6 +402,34 @@ jobs:
           # 上调到 8 分钟以留足余量（仍 < release job 45 分钟上限）。
           ctest -j1 --output-on-failure --timeout 180
         timeout-minutes: 8
+
+      # 临时诊断：原 ctest 失败仍取证，绝不覆盖失败；首 fault 即停，非重试判绿。
+      - name: "MCP teardown 有界 gdb 诊断（最多 30 次 / 270 秒）"
+        id: mcp-diagnostic
+        if: ${{ !cancelled() && steps.release-build.outcome == 'success' }}
+        timeout-minutes: 5
+        run: |
+          python3 infra/scripts/ci/mcp_teardown_diagnostics.py \
+            --build "$BUILD_DIR" --output "$RUNNER_TEMP/mcp-diagnostic" \
+            --original-outcome "${{ steps.release-ctest.outcome }}" \
+            --source-sha "${{ github.sha }}" \
+            --coroutine-sha "${{ needs.prepare-deps.outputs.coro_ref }}" \
+            --core-sha "${{ needs.prepare-deps.outputs.core_ref }}" \
+            --bundle-sha "${{ needs.prepare-deps.outputs.bundle_sha256 }}"
+
+      - name: "上传最小 MCP 诊断文本（无 core/环境/locals）"
+        if: ${{ !cancelled() && steps.mcp-diagnostic.outcome != 'skipped' && steps.release-build.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mcp-teardown-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/mcp-diagnostic/result.json
+            ${{ runner.temp }}/mcp-diagnostic/original-ctest.txt
+            ${{ runner.temp }}/mcp-diagnostic/gdb-version.txt
+            ${{ runner.temp }}/mcp-diagnostic/provenance.json
+            ${{ runner.temp }}/mcp-diagnostic/debugger.txt
+          if-no-files-found: error
+          retention-days: 1
 
       # Issue #8：无 wire 配置独立门禁——不传 BBT_PROTOBUF_PREFIX（prefix 真为空），RPC
       # 工厂 stub 编入 HTTP target，bbt_infra_rpc 不导出。单独 build 目录（不改 Release

@@ -62,6 +62,106 @@ endif()
 # 本 target 实现（CoTCP/CoUDP 符号经 transport owner 传递）。
 target_link_libraries(bbt_infra_http PUBLIC bbt::infra_transport)
 
+# --- MCP 传递依赖闭包门禁（4-1）------------------------------------------------
+# 从目标出发递归遍历 LINK_LIBRARIES + INTERFACE_LINK_LIBRARIES 构成传递闭包，
+# 取代此前只查一层直接 LINK_LIBRARIES 的检查（捕不到传递依赖）：
+#   - visited 去重（防环）；非目标条目（含 $<...> 生成表达式，按原文）直接以
+#     禁集 regex 匹配；目标条目名字命中禁集同样 FATAL_ERROR，否则继续展开其
+#     两个链接属性；命中即报「MCP 依赖方向破坏」（沿用既有消息风格）。
+#   - 通过时把闭包清单写入 PARENT_SCOPE 的 BBT_MCP_CLOSURE_<target>，并输出
+#     STATUS 行供 configure 日志留正路径证据。
+function(bbt_mcp_assert_link_closure _root_target _banned_regex)
+    set(_queue "${_root_target}")
+    set(_visited "")
+    set(_closure "")
+    while(_queue)
+        list(GET _queue 0 _cur)
+        list(REMOVE_AT _queue 0)
+        if(_cur IN_LIST _visited)
+            continue()
+        endif()
+        list(APPEND _visited "${_cur}")
+        if(_cur MATCHES "${_banned_regex}")
+            message(FATAL_ERROR
+                "MCP 依赖方向破坏：${_root_target} 的传递闭包含禁项"
+                "（条目: ${_cur}，禁集: ${_banned_regex}）")
+        endif()
+        list(APPEND _closure "${_cur}")
+        if(NOT TARGET "${_cur}")
+            continue()
+        endif()
+        foreach(_prop LINK_LIBRARIES INTERFACE_LINK_LIBRARIES)
+            get_target_property(_links "${_cur}" "${_prop}")
+            if(_links)
+                foreach(_l IN LISTS _links)
+                    list(APPEND _queue "${_l}")
+                endforeach()
+            endif()
+        endforeach()
+    endwhile()
+    set(BBT_MCP_CLOSURE_${_root_target} "${_closure}" PARENT_SCOPE)
+    string(REPLACE ";" " " _closure_disp "${_closure}")
+    message(STATUS "MCP 闭包证据: ${_root_target} => [${_closure_disp}]")
+endfunction()
+
+# --- MCP 协议核（Boost.JSON 主体）--------------------------------------------
+# 只依赖 bbt::infra_common（即 coroutine）与 Boost 头：Boost.JSON 以源码方式接入
+# （src/mcp/JsonValue.cc 是唯一包含 boost/json/src.hpp 的 TU），不链接
+# libboost_json、不依赖 HTTP/RPC/protobuf/资源 adapter，也不需要新增系统安装。
+# 本 target 不导出 src 内部头：公共消费者只需要 include/bbt/infra/mcp/。
+add_library(bbt_infra_mcp_core STATIC
+    mcp/JsonValue.cc
+    mcp/McpTypes.cc
+    mcp/Protocol.cc
+    mcp/Registry.cc
+    mcp/StdioTransport.cc)
+add_library(bbt::infra_mcp_core ALIAS bbt_infra_mcp_core)
+
+target_include_directories(bbt_infra_mcp_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(bbt_infra_mcp_core
+    PUBLIC  bbt::infra_common bbt::infra_internal_debug
+    PRIVATE Boost::boost Threads::Threads)
+target_compile_options(bbt_infra_mcp_core PRIVATE -Wall -Wextra)
+
+# 依赖门禁（4-1 升级为传递闭包）：MCP 核不得经 LINK_LIBRARIES /
+# INTERFACE_LINK_LIBRARIES 传递到达 HTTP/RPC/protobuf/资源 adapter 目标
+# （契约要求可核验，而非注释）。
+bbt_mcp_assert_link_closure(bbt_infra_mcp_core
+    "infra_http|infra_rpc|rpc_proto|infra_mongo|infra_redis")
+
+# --- MCP Streamable HTTP transport（3-2 切片）---------------------------------
+# 独立 target：mcp_core 保持「只依赖 common + Boost.JSON 源码 TU」的设计声明
+# （design「执行域」），HTTP transport 组合公开 TransportRuntime/CoTCP（fd/配额/
+# Close owner）与 Boost.Beast 头（framing），不链接/不引用 bbt_infra_http、RPC、
+# protobuf。依赖方向门禁同上：配置期可核验。
+add_library(bbt_infra_mcp_http STATIC
+    mcp/HttpTransport.cc)
+add_library(bbt::infra_mcp_http ALIAS bbt_infra_mcp_http)
+
+target_include_directories(bbt_infra_mcp_http PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(bbt_infra_mcp_http
+    PUBLIC  bbt::infra_mcp_core bbt::infra_transport
+    PRIVATE Boost::boost Threads::Threads)
+target_compile_options(bbt_infra_mcp_http PRIVATE -Wall -Wextra)
+
+# 依赖门禁同 core（4-1 升级为传递闭包）：配置期可核验。
+bbt_mcp_assert_link_closure(bbt_infra_mcp_http
+    "infra_http|infra_rpc|rpc_proto|infra_mongo|infra_redis")
+
+# --- MCP 私有 JSON Schema adapter（2-3 切片，可选）---------------------------
+# 仅在显式给出固定依赖根时构建（BBT_MCP_SCHEMA_ADAPTER=ON + MCP_JSONCONS_ROOT
+# + MCP_ICU_ROOT）：jsoncons/ICU 是开发隔离依赖，core 与公共消费者不链接它。
+# 依赖方向门禁：core 反向链接 schema 即 configure 失败。
+if(BBT_MCP_SCHEMA_ADAPTER)
+    add_subdirectory(adapters/mcp)
+    # 同一闭包门禁复用：core 的传递闭包也不得到达 schema（4-1 并入函数调用）。
+    bbt_mcp_assert_link_closure(bbt_infra_mcp_core "infra_mcp_schema")
+else()
+    message(STATUS
+        "BBT_MCP_SCHEMA_ADAPTER 未开启：跳过私有 JSON Schema adapter"
+        "（开发隔离依赖，需 -DMCP_JSONCONS_ROOT/-DMCP_ICU_ROOT）")
+endif()
+
 # --- Config 基础配置模块（Issue #35）------------------------------------------
 # 只依赖 bbt::infra_common（即 coroutine）；无第三方新依赖。公开面在
 # include/bbt/infra/config/，命名空间 bbt::infra::config。内存源、本地文件源、
