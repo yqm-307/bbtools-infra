@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.16)
+project(net_foundation_consumer LANGUAGES CXX)
+set(BBT_INFRA_SOURCE_DIR "" CACHE PATH "bbtools-infra 源码树")
+set(BBT_INFRA_NETWORK_ONLY ON CACHE BOOL "new net only" FORCE)
+set(BUILD_TESTING OFF CACHE BOOL "consumer only" FORCE)
+add_subdirectory("${BBT_INFRA_SOURCE_DIR}" infra)
+add_executable(consume_net main.cc)
+target_link_libraries(consume_net PRIVATE bbt::infra_net)

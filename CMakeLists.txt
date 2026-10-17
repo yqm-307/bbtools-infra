@@ -11,6 +11,13 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# 在任何旧目标/可选包发现之前分流；残留 prefix 不得重新启用上层模块。
+option(BBT_INFRA_NETWORK_ONLY "只构建新 gnet 网络基础及其实际依赖闭包" OFF)
+if(BBT_INFRA_NETWORK_ONLY)
+    include(cmake/NetworkOnly.cmake)
+    return()
+endif()
+
 # --- 内部 debug 观测层开关（PR #70 review 整改）--------------------------------
 # 与 bbtools-coroutine 的 STRINGENT_DEBUG（其 add_definitions）对齐，但修正两处
 # review 指出的边界：

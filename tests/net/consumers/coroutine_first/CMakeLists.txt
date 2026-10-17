@@ -1,0 +1,28 @@
+cmake_minimum_required(VERSION 3.16)
+project(net_coroutine_first_consumer LANGUAGES CXX)
+# L2 回归：coroutine-first 真实 parent——父级先 add_subdirectory 固定上游，
+# 再接 infra（命中 NetworkOnly 已有 target 复用分支），只 link bbt::infra_net。
+set(NET_CONSUMER_COROUTINE_DIR "" CACHE PATH "bbtools-coroutine 固定源码树")
+set(NET_CONSUMER_INFRA_DIR "" CACHE PATH "bbtools-infra 候选源码树")
+if(NOT EXISTS "${NET_CONSUMER_COROUTINE_DIR}/bbt/coroutine/coroutine.hpp"
+    OR NOT EXISTS "${NET_CONSUMER_INFRA_DIR}/bbt/infra/net/NativeSocket.hpp")
+    message(FATAL_ERROR "consumer 需要显式 NET_CONSUMER_COROUTINE_DIR / NET_CONSUMER_INFRA_DIR")
+endif()
+if(POLICY CMP0167)
+    cmake_policy(SET CMP0167 NEW)
+endif()
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+# 与 NetworkOnly 相同策略：不把上游额外 test/example/benchmark 目标带进本 consumer。
+set(NEED_TEST OFF CACHE BOOL "" FORCE)
+set(NEED_EXAMPLE OFF CACHE BOOL "" FORCE)
+set(NEED_BENCHMARK OFF CACHE BOOL "" FORCE)
+set(NEED_DEBUG OFF CACHE BOOL "" FORCE)
+set(BBT_COROUTINE_SOURCE_DIR "${NET_CONSUMER_COROUTINE_DIR}" CACHE PATH "固定上游" FORCE)
+add_subdirectory("${NET_CONSUMER_COROUTINE_DIR}" "${CMAKE_BINARY_DIR}/_co" EXCLUDE_FROM_ALL)
+set(BBT_INFRA_NETWORK_ONLY ON CACHE BOOL "new net only" FORCE)
+set(BUILD_TESTING OFF CACHE BOOL "consumer only" FORCE)
+add_subdirectory("${NET_CONSUMER_INFRA_DIR}" "${CMAKE_BINARY_DIR}/_infra")
+add_executable(consume_net_coroutine_first main.cc)
+target_link_libraries(consume_net_coroutine_first PRIVATE bbt::infra_net)
