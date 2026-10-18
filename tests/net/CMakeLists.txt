@@ -402,3 +402,16 @@ add_test(NAME net.udp_high_level_compile_reject COMMAND ${CMAKE_COMMAND}
     "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/udp_reject_probe"
     -P "${_net_consumers}/expect_udp_compile.cmake")
 set_tests_properties(net.udp_high_level_compile_reject PROPERTIES TIMEOUT 120)
+
+# P2 回退契约回归（真实 TCP / 动态端口；四场景各 45s）。产品预交付已撤销：
+# 保留历史用例标识用于证据关联；fast_path_echo 现在验证原路径三命令，不代表提速。
+# Wake/封门验证尚未借出快照；busy_fallback 另覆盖 Open 在途时的空 EOF Traffic。
+add_executable(Test_net_co_bridge_buffer_event co_bridge_buffer_event.cc)
+target_link_libraries(Test_net_co_bridge_buffer_event PRIVATE bbt::infra_net Boost::headers)
+target_compile_options(Test_net_co_bridge_buffer_event PRIVATE -Wall -Wextra -Wpedantic)
+foreach(_case fast_path_echo busy_fallback wake_merge_discard seal_discard)
+    add_test(NAME net.co_bridge_buffer_event_${_case}
+        COMMAND Test_net_co_bridge_buffer_event ${_case})
+    set_tests_properties(net.co_bridge_buffer_event_${_case} PROPERTIES TIMEOUT 45
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/runtime")
+endforeach()
