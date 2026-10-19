@@ -12,15 +12,19 @@
 #      必须是该头自身的拒绝标记，不能是「头不存在/缺依赖」。
 # 1) 或 2) 任一失败 ⇒ 环境或回归坏，本 case 直接不通过；不允许用 3) 的失败掩盖它。
 #
-# 入参：CXX、INFRA_DIR、COROUTINE_DIR、WORK_DIR（由 tests/net/CMakeLists.txt 传入）。
-if(NOT CXX OR NOT INFRA_DIR OR NOT COROUTINE_DIR OR NOT WORK_DIR)
-    message(FATAL_ERROR "expect_udp_compile 缺少参数（CXX/INFRA_DIR/COROUTINE_DIR/WORK_DIR）")
+# 入参：CXX、INFRA_DIR、COROUTINE_DIR、BOOST_INCLUDE_DIRS、WORK_DIR（由 tests/net/CMakeLists.txt 传入）。
+if(NOT CXX OR NOT INFRA_DIR OR NOT COROUTINE_DIR OR NOT BOOST_INCLUDE_DIRS OR NOT WORK_DIR)
+    message(FATAL_ERROR "expect_udp_compile 缺少参数（CXX/INFRA_DIR/COROUTINE_DIR/BOOST_INCLUDE_DIRS/WORK_DIR）")
 endif()
 file(MAKE_DIRECTORY "${WORK_DIR}")
 
 # 与 bbt_infra_net_header_selfcheck 相同的编译口径（见 B/compile_commands.json）。
 set(_flags -DBOOST_CONTEXT_DYN_LINK -DBOOST_CONTEXT_NO_LIB
     "-I${INFRA_DIR}" -isystem "${COROUTINE_DIR}" -std=c++17 -Wall -Wextra -Wpedantic)
+foreach(_boost_include IN LISTS BOOST_INCLUDE_DIRS)
+    # -I 保留编译器对默认系统目录的去重，避免 -isystem /usr/include 改坏 include_next。
+    list(APPEND _flags "-I${_boost_include}")
+endforeach()
 
 set(_primitive_tu "${WORK_DIR}/udp_primitive_positive.cc")
 file(WRITE "${_primitive_tu}"

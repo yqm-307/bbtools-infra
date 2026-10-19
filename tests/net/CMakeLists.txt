@@ -143,6 +143,7 @@ add_test(NAME net.udp_high_level_compile_reject COMMAND ${CMAKE_COMMAND}
     "-DCXX=${CMAKE_CXX_COMPILER}"
     "-DINFRA_DIR=${PROJECT_SOURCE_DIR}"
     "-DCOROUTINE_DIR=${BBT_COROUTINE_SOURCE_DIR}"
+    "-DBOOST_INCLUDE_DIRS=${Boost_INCLUDE_DIRS}"
     "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/udp_reject_probe"
     -P "${_net_consumers}/expect_udp_compile.cmake")
 set_tests_properties(net.udp_high_level_compile_reject PROPERTIES TIMEOUT 120)
