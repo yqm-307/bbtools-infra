@@ -1,6 +1,27 @@
-# gnet 网络迁移计划：执行域分离修订
+# TCP 网络实施接续：R2 契约对齐
 
-**状态：2026-10-16 P3 修订候选，整体 F4 仍未验收。** coroutine 文档的旧停机文案另作定向修复，不阻塞 infra 实现。延续已审查的 P0–P7 与 C1–C14，不重启项目、不重做已验证基础包；修订 main/sub 与 Scheduler/Processer 的线程关系。此仓内计划是本轮及后续网络实现的接续入口；早期会话计划只作历史依据，不能覆盖这里的最新方向。本文件不是 build/test/CI/合并证据。
+**状态：核心契约已由用户审阅确认；本轮仅获授权对齐两仓文档，尚未启动 R2 产品实现、构建或集成验证。** 当前目标以 [执行域设计](../architecture/gnet-network-execution.md) 与 [0010](../decisions/0010-gnet-network-foundation.md) 为准。下面的旧 P0–P7/C1–C14 计划保留为历史，不是当前任务状态，也不自动授权任何实现、提交或发布。
+
+## 当前输入与边界
+
+- infra 源码依据 `2cb3ebf60a101bb9cbf93f065db4d41e2130d3cd`；coroutine driver 已合并于 `1e9f0e8c25de85dde003def65bb58b90bdac0e0b`（PR #396；原分析 head `8d7b4383c8631f4dccad74df088abe54ca000b87`）。文档修订不升级构建 pin，不伪称两仓已联调。
+- 不再延续旧独立网络线程、事件快照为接收真源、FIN 自动关闭、gnet 全签名对照或旧 Close(opt) 作为 R2 必做条件。旧能力不删除、不改消费者。
+- R2 范围为 TCP 底座；raw 回调 + 既有同步原语薄封装，同一接收 ring 与网络内核，稳定可靠机制与事实报告归 net，上层保留业务策略。
+- 原有有效基础实现/测试可复用，但不能将旧候选测试和压测自动记为 R2 已通过；高层 UDP、HTTP/RPC 接入与消费者迁移不在本次范围。
+
+## 后续出口（非已授权施工清单）
+
+1. 两仓文档按 R2 一致修订并独立审查；在需要发布/合入时另取授权。coroutine §11.5 对齐 owner 原始回调与受保护共享 ring，§11.3–§11.4 的回调租约/锁外调用/同代解绑不变。发布前只交本地候选，不把旧“文档不阻塞 P3”当作跳过当前契约协调的许可。
+2. 取得实现授权后，固定实际消费源码/契约版本和链接来源，先核验最小真实 Asio driver（Tick/Wait/Wake/预算/解绑）再落地 Engine/Conn；共享公共契约由一个负责人协调，不重复建设已有 foundation。
+3. 连贯完成 raw TCP server/client、并发 ring、发送操作/背压/终态、Run 收口与 Co 薄封装；开发中只做聚焦检查，收敛后合并跑本地冒烟、本功能与直接耦合测试。性能先建实测基线，不预设硬门槛。
+4. 固定最终候选→独立审查及必要修复复审→按授权提交/PR→当前 head 必需 CI/可合并状态验收；不自行合并。消费者迁移另议，不借此改 HTTP/Redis/Mongo/config 或 framework。
+
+---
+
+<details>
+<summary>旧阶段计划与局部验收历史（不作为当前施工指令）</summary>
+
+原计划中的负责人、授权、阶段勾选、线程/快照/Close 规则和“下一步”均仅属于当时版本，不覆盖上文；其中真实证据按原版本保留，不能用于宣称 R2 已实现。
 
 ## 2026-10-16 Engine 生命周期修订（待实施）
 
@@ -267,3 +288,6 @@ TCP Engine Stop 验证首错 `not_enough_memory`、对端关闭、线程/FD 回�
 持续资源耗尽不在支持域：不保证强停/析构完成，不保证等待者被唤醒，也不承诺持续故障下的安全析构能力。这不是允许新增 UAF 或泄漏策略；不新增泄漏兜底、强杀、无限重试或 reaper，也不扩建 runtime 停机模型。`Stop`/`Join` 没有整体 deadline；控制命令的 15s 等待超时不取消已 `Accepted` 的命令，不能据此推定物理关闭或线程回收已经完成。强停仍不等 Handler/`OnClose`，不是业务优雅 drain。
 
 原 C1“异常导致 physical waiter 记录残留进而悬空”的具体推测撤销，并非实测漏洞：实际 `CoIoOperation::Complete` → `CoWaiter::Notify` → `CoPollEvent::Trigger` 路径中，timer 撤销的 `DeferDestroyEvent` 在同锁内对首次 `bad_alloc` 有界重做一次；再次失败沿 `_CannelAllFdEvent` → `_Complete` 上抛，被 `Trigger` 的 catch-all 吞掉并返回 0。因而 `Complete` 不会沿这条链向 `OnClosedOwner` 抛出异常，原先据此推断的 swap-back 记录残留前提不成立；这项判断来自实际调用链与异常处理，不是由 `noexcept` 标签推导。持续 OOM 仍可能使带有限 deadline/timer 的等待丢失唤醒，即记录已清空但 wake 未送达；该真实限制保留，不能以撤销原推测冒充持续故障安全。
+
+
+</details>

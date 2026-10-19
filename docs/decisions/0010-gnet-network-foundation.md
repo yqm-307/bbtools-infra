@@ -1,6 +1,57 @@
-# 0010：gnet 网络迁移契约与首包边界
+# 0010：gnet 网络基础与 R2 TCP 契约
 
-状态：P0 契约候选；P1/P2 与纯逻辑基础包已局部验证及独立审查，尚未提交为完整产品。2026-10-15 用户确认执行域分离，最新线程/驱动权与所有权见 [网络执行域设计](../architecture/gnet-network-execution.md)，阶段与 C1–C14 见 [迁移计划](../plans/gnet-network-migration.md)。infra 文档独立审查无必须修项，coroutine 旧停机文案定向修复另行收口，不阻塞 P3；本文不是完整 Engine 交付，不替代后续 P3–P7。
+**状态：R2 核心契约已获用户确认；产品实现与两仓集成尚未验收。** 当前执行模型及生命周期真源见 [网络执行域设计](../architecture/gnet-network-execution.md)，后续接续见 [迁移计划](../plans/gnet-network-migration.md)。旧逐符号表保留在历史区，不再以 gnet 签名强制约束新 API。
+
+## 当前范围与版本
+
+- 本次固定源码依据：infra `2cb3ebf60a101bb9cbf93f065db4d41e2130d3cd`；coroutine driver PR #396 的 merge commit `1e9f0e8c25de85dde003def65bb58b90bdac0e0b`。设计最初读取的 PR head `8d7b4383c8631f4dccad74df088abe54ca000b87` 与合并提交分开记录。
+- 该版本具备通用 Processer driver 支撑，不等于 infra 已消费或已验证。现有构建 pin 不在本次文档修改中升级；后续须核实际源码、契约和链接 SHA。
+- 目标是完整 TCP 底座：Reactor adapter、Engine、连接、接纳/建连、收发、背压及协程薄封装。上层 HTTP/RPC 接入、消费者切换、UDP/TLS、自愈/动态迁移不在本次范围；旧能力保留，不按文档更新删除。
+- 继续使用 C++17、`bbt::infra::net`、既有 `bbt::infra_net` 与 network-only 构建，不新增依赖、兼容别名壳或第二 runtime。公共网络接口允许重设计，不承诺旧 API/ABI 兼容；迁移消费者须另行授权。
+- 新 net 的 R2 目标替代本决策旧的独立网络线程、受管事件快照、FIN 自动关闭和旧 Close(opt) 要求；0002/0005 的既有模块契约不因此被整体改写。
+
+## 当前核心契约
+
+| 主题 | R2 决定 |
+|---|---|
+| 边界 | net 负责可靠、并发安全的 TCP 字节收发与准确状态；分帧、请求/响应匹配、业务回包、重试/重连/关闭策略归上层 |
+| driver / owner | 自有 Asio context，各 Reactor 自动绑定一个空闲已登记 P 槽；槽不足回滚，不抢占、扩 worker、缩数量或回退网络线程 |
+| 布局 | 普通 server 一个 main + N 个 sub，N 是 sub 数，启动报告全部槽需求；client-only 无 accept main；P 仍可执行业务协程，连接 owner 固定 |
+| 原始回调 | OnAccept/OnConnect/OnRead/OnWrite/OnClose 在 owner 的非业务协程边界短、非阻塞、不可挂起地运行；同连接不重入，不锁内/递归调用用户代码 |
+| 同步接口 | CoRead/CoWrite/Accept/Dial 复用同一异步能力和既有 CoWaiter/Chan；不自动为每条连接建业务协程，不建第二收包内核 |
+| 接收真源 | 并发安全接收 ring 保持 TCP 顺序及未消费数据；OnRead 只是可合并通知，EOF/错误持久可查询，不作为业务包边界 |
+| 读取与 view | TryRead 原子复制/消费；竞争 Busy、空且无终态 WouldBlock，均零消费；组合 Peek/Consume 在短保护内，不跨挂起/外借 view；保护释放持久通知、登记后复查，不阻塞 P |
+| 缓冲寿命 | 显式连接关闭/Engine 收口后已收数据仍可读；Conn/ring/操作结果独立于 socket/context 存活，无强环、UAF 或虚假 drain |
+| AsyncWrite 接纳 | 所有权转移后全量接纳或零接纳；操作身份、容量与通知责任一起预留，有界字节/操作数/命令；同次写字节连续，多次写不自动组成一帧 |
+| 发送完成 | 提交成功、本地交内核完成、对端收到/执行严格分开；OnWrite 报可确认的已发前缀、实际错误和唯一终态，不宣称不可观测的业务成功 |
+| 写错误后继续 | 先冻结/结算本轮已接纳操作，期间新写明确零接纳；结算后未关闭则允许上层新 AsyncWrite 作为新尝试，不自动续发旧操作，保留最近错误；关闭状态不可重开 |
+| 协程超时/取消 | 容量等待超时=未提交；已接纳后只结束等待，操作仍在途，返回身份/采样进度并可查最终结果；不自动关连接、撤字节或重发，不用采样进度推导安全重发 |
+| EOF / fd 错误 | EOF 仅结束读方向，保留尾部与错误，不自动关闭发送侧；普通 errno 不升级为 driver Failed；上层决定连接策略 |
+| 有界背压 | ring 满暂停读取、消费后主动恢复；发送满立即拒绝或由 Co 有界登记等待；accept 先预留 handoff 容量，满则暂停，不丢 fd/完成 |
+| Engine 生命周期 | Run 占合法宿主控制线程；宿主声明 runtime loop 独立持续推进，非法前提在绑定/socket 副作用前拒绝；RequestClose 仅封口，Run 返回才确认网络资源/回调/解绑收口 |
+| 关闭约束 | owner 正常收口→控制域同代同步解绑→必要时独占清理→context 存活时拆 backend→销毁 context；不等上层业务任务/外部句柄归零，不承诺硬 deadline、不建 reaper/Stop |
+| driver Failed | 控制域有限间隔查询所持 token，封口并同代解绑后清理；不在控制域伪调 owner 回调，以 Engine 错误与冻结状态/内部完成订阅为替代出口；不做自动迁移/重绑 |
+
+上表的接口名和状态名表达目标职责，不是已编译的公共头文件声明；精确签名由实现阶段按既定契约落地，不用 stub 冒充交付。
+
+## 复用、兼容与验证
+
+复用现有 EventRingBuffer 存储/游标并补最小同步访问面；其当前类本身仍是非线程安全的。复用 OutboundQueue 的 FIFO/部分发送并补逐操作边界记账，不能把字节合并后失去操作归属。Address/NativeSocket/LB/StreamConnection 的有效能力优先保留，不借机重写基础算法。
+
+现有 EventLoop 自建线程、ConnectionBridge 事件快照、受管 OnOpen/OnTraffic、Engine::Stop/旧 CloseMode 等是旧实现事实，不再是新目标，也没有因本文自动改成 R2。旧局部测试次数和旧依赖消费证明只绑定当时版本。新 driver/原始回调/共享 ring/发送完成/Run 必须补真实验证后才能升格为已交付；精确验证形状见执行域文档第 7 节。
+
+两仓配套对齐 coroutine 核心契约 §11.5 的消费者责任，不改 §11.3–§11.4 的锁外 callback、全租约、Failed 与同代同步解绑。当前本地文档一致性不代表已发布，未来消费记录真实发布契约和链接 SHA。本轮不改代码/构建 pin/测试/CI，不授权提交、推送、消费者迁移或发布。
+
+## 参考与许可
+
+固定参考 gnet v2.10.0 `58b59a11350707153f8c48369693ab9beba7b2fa`；仅作机制/行为比较，不承诺逐方法迁移、性能等价或所有平台可用。现有出处及许可约束继续见 [gnet 移植出处](../dependencies/gnet-2.10.0.provenance.md)，不因重设计删除版权义务。本次不移植新第三方代码。
+
+---
+
+<details>
+<summary>旧迁移候选与验证记录（历史，不作为 R2 约束）</summary>
+
+下文原样保留此前逐符号/Options/Close(opt)/FIN 收口方案与局部验证。旧“冻结”“必须实现”“本轮”“未合并”仅属于当时版本；与上文冲突时不再适用于 R2。高层 UDP 暂缓、现存原语能力与历史消费证据仍须分别理解，不从旧清单自动扩大本轮范围。
 
 ## 范围与版本
 
@@ -178,3 +229,6 @@ P6 进入前采用候选首轮上界：2 loop、2 Processer，最多 32 连接�
 - [gnet.go](https://github.com/panjf2000/gnet/blob/58b59a11350707153f8c48369693ab9beba7b2fa/gnet.go)、[options.go](https://github.com/panjf2000/gnet/blob/58b59a11350707153f8c48369693ab9beba7b2fa/options.go)、[client_unix.go](https://github.com/panjf2000/gnet/blob/58b59a11350707153f8c48369693ab9beba7b2fa/client_unix.go)。
 - 同 SHA 的 `connection_unix.go`、`eventloop_unix.go`、`acceptor_unix.go`、`load_balancer.go`、`pkg/socket/`、`pkg/buffer/` 为实现语义依据；不是 Go 二进制兼容承诺。
 - Apache-2.0 主体与 ring 文件 MIT 适用声明、版权和后续逐文件移植规则见 [gnet 移植出处](../dependencies/gnet-2.10.0.provenance.md)。本包不移植 ring 算法。
+
+
+</details>

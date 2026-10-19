@@ -1,116 +1,114 @@
 #pragma once
 
+// 公共 Engine（R2）：Engine::Run 占调用它的宿主 native 控制线程，自动绑定
+// 已登记 Processer 槽，每个 Reactor 由对应 P 的 driver 推进自有 Asio context；
+// 不新建库内控制线程或网络 I/O 线程。
+//
+// 生命周期（详见 docs/architecture/gnet-network-execution.md §6）：
+//   - Run 先校验 runtime 已初始化（RuntimeNotInitialized）与宿主「runtime 内部
+//     EventLoop 由独立执行流持续推进」的必填声明（RuntimeProgressRequired），
+//     在任何绑定/建 socket 副作用之前拒绝。
+//   - 成功后自动绑槽（server 1 main + N sub；client-only 无 main），安装 listener，
+//     发布 Running，进入控制循环。
+//   - RequestClose 并发安全、幂等，只封口并唤醒控制域；Run 返回才表示本 Engine
+//     网络资源/回调/driver 已收口。
+//   - 控制域按持有 token 有限复查 QueryProcesserDriver；Failed 时封口、同代解绑、
+//     以冻结状态与内部完成订阅为替代出口，不伪调 owner 用户回调。
+//
+// 原始回调在 owner 非业务协程边界短、非阻塞、不可挂起执行。
+
 #include <cstddef>
+#include <exception>
+#include <cstdint>
 #include <memory>
-#include <mutex>
+#include <string>
 #include <system_error>
 #include <vector>
 
+#include <bbt/coroutine/sync/CoWaiter.hpp>
+
 #include <bbt/infra/net/Address.hpp>
-#include <bbt/infra/net/EventHandler.hpp>
+#include <bbt/infra/net/Connection.hpp>
 #include <bbt/infra/net/Options.hpp>
+#include <bbt/infra/net/RawHandler.hpp>
 
 namespace bbt::infra::net {
 
-class ServerEngine;
+enum class EnginePhase { Idle, Starting, Running, Closing, Stopped };
 
-// 公共 Engine（首包局部交付）：真实 TCP 单 main listener + num_event_loop 个 sub owner。
-// 详细执行域/强停顺序/测试判据见 docs/architecture/gnet-network-execution.md 的
-// 「首包公共 Engine」小节与 docs/plans/gnet-network-migration.md 对应小节。
-//
-// 已交付的真实行为：
-// - Run：native 控制线程生命周期入口（不是 CoObject 业务方法）。起 main owner 与
-//   N 个 sub owner（各自 EventLoop 线程 + 私有 bridge），绑定 address（port 0 由内核
-//   分配），发布实际绑定快照并进入 Starting，然后在受管协程内跑 EventHandler::OnBoot
-//   并等待完成（等待在锁外进行，不持任何 mutex 跨 OnBoot），完成后挂上 accept 就绪等待
-//   并进入 Running；不占调用方进程主循环。
-// - accept：LoadBalancer 选 sub owner（三算法复用既有实现；LeastConnections 用每
-//   sub 真实 session 计数）→ 唯一 fd 移交该 sub owner → 既有 bridge 接纳 →
-//   受管 OnOpen/OnTraffic(含 Wake)/OnClose。
-// - ticker（Options::ticker）：Run 进入 Running 且 accept 就绪等待挂好后立即在受管协程
-//   投递第一次 OnTick；返回 delay 决定下一次投递，<= 0 停止 ticker（Engine 继续服务，端口
-//   仍接纳/回显）；Stop/回落取消 timer 并拒绝重挂，在途 tick 自然完成（不等 handler）。
-//   单 ticker 串行不重入；具体语义见 EventHandler::OnTick 注释。
-// - Stop：native 强停，顺序为 撤 listener/封接纳 → 清在途 handoff → 每 sub 物理全闭
-//   → RequestStop/Join → owner context 仍活时 DetachOwner → owner/context 销毁。
-//   不等 handler/OnClose/drain；不 terminate、不 detach 线程、不重开 runtime 停机。
-//   挂起中的 handler 之后继续收尾：晚写/晚 Wake 明确拒绝，Close 为幂等观察。
-//
-// 域门禁（每次现查，不缓存 TLS）：Run/Stop 只能在非受管协程、且非本 Engine 的
-// owner 线程上调用；受管协程内或本 Engine owner 线程内一律在**任何副作用之前**
-// 返回 operation_not_permitted。Stop 以 error_code 返回结果，不做 void noexcept 吞错。
-// 业务连接操作（ICoConnection 的 Wake/Write/Close 与事件内 Reader）仍只允许受管协程；
-// 本接口不构成普通控制线程连接 Block 的新许可。
-//
-// 幂等/终态/并发：运行或启动中重复 Run → device_or_resource_busy（并发 Run 只有一个
-// 可进入）；Stop 之后 Run → operation_canceled（终态），Stop 首胜不会被后续 Run 覆盖回
-// Running；Stop 未启动时也进入同一终态（随后 Run → operation_canceled），已停止时幂等成功。
-// Stop 在 Starting（OnBoot 未完成）也真实收口网络并返回，不等业务回调完成；已经开始的
-// OnBoot 不会被强杀，只按值持 handler 自然完成，10s Boot 等待语义不变。
-//
-// 当前支持的选项（其余显式拒绝，不静默忽略）：
-//   lb、num_event_loop/multicore、reuse_addr、tcp_no_delay、read/write_buffer_cap、
-//   max_inbound/outbound_bytes、max_pending_events、ticker（engine 全局单 ticker，语义见
-//   EventHandler::OnTick）。
-// 未接线请求（reuse_port、keepalive、socket recv/send buffer、edge_triggered_io、
-// multicast_interface_index、bind_to_device、lock_os_thread、log_path/logger）
-// 返回 operation_not_supported。
-class Engine final {
+// 宿主对 runtime 推进方式的必填声明：Independent 表示 runtime 内部 EventLoop
+// 由独立于 Run 的执行流持续推进（THREAD 的 S 线程 / SCHE_LOOP 另一线程 /
+// NO_LOOP 另一执行流持续 LoopOnce）。未声明在绑定前拒绝。
+enum class RuntimeProgress { Unspecified, Independent };
+
+struct EngineConfig {
+    std::vector<Address> listen_addresses;  // 空 = client-only（无 main accept owner）
+    Options options;
+    RuntimeProgress runtime_progress{RuntimeProgress::Unspecified};
+};
+
+struct EngineImpl;  // detail 定义在 Engine.cc
+
+class EngineTestAccess;
+
+class Engine {
 public:
-    // 所有权（2026-10-16 用户授权修订）：构造是唯一入口，按值接收 handler 的
-    // shared_ptr；Engine 与 ServerEngine、适配器以及挂起中的业务回调**共同
-    // 持有**该对象，不留裸借用，也不用 no-op deleter 制造假拥有。不是线程安全声明：
-    // handler 自身仍须按契约实现。
-    // - 允许传空 shared_ptr 构造（延后注入/负例）；Run 在任何线程/socket/受管任务
-    //   副作用之前以 invalid_argument 明确拒绝空拥有关系，不在异步入口留裸引用；
-    //   未 Run 时 Stop/LocalAddresses/CountConnections 按未运行语义返回，不解引用。
-    // - 无库内强环：业务回调只持 handler 与其连接句柄，不反向持 Engine/ServerEngine；
-    //   Engine 也不被挂起中的 OnBoot 延寿（Boot 任务只按值持 handler 与窄结果句柄，
-    //   不保活网络域）。用户自建的反向持有是否成环不在本库保证范围内。
-    // - handler 的析构线程是最后一个拥有者所在线程，可能正是受管协程；不保证在控制
-    //   线程析构，也不要求 handler 析构阻塞 worker。handler 析构不回调 Engine::Stop、
-    //   不引入 reaper。
-    // - handler 必须活过其最后一个回调返回（由共同持有保证），而不是必须活过 Engine
-    //   的整个使用期：Engine 强停/销毁后挂起回调仍安全收尾。
-    explicit Engine(std::shared_ptr<EventHandler> handler);
+    explicit Engine(std::shared_ptr<RawHandler> handler);
     ~Engine();
-
     Engine(const Engine&) = delete;
     Engine& operator=(const Engine&) = delete;
 
-    // 失败回落：nullptr 则失败，错误信息在 error/ok 中返回。
-    // 非阻塞启动（native 控制线程入口）；启动中/运行中重复调用 → busy，终态 → canceled。
-    // 接受集只有 IPv4（当前接纳路径只服务 IPv4 stream）：Unix/IPv6 等**合法**但未支持的
-    // 家族在**任何** owner 线程/listener socket/OnBoot 登记之前返回 operation_not_supported，
-    // 不发布 bound 快照、不进入 Starting，也不进入 Stopped 终态（可换 IPv4 地址重试）；
-    // 空/无效 Address 仍是 invalid_argument，域门禁与 busy/canceled 的优先级不变。
-    std::error_code Run(const Address& address, const Options& options = {});
+    // 阻塞的宿主控制线程入口；成功收口后返回。失败在绑定/socket 副作用前返回。
+    std::error_code Run(const EngineConfig& config);
 
-    // native 强停。未启动/已停止时幂等成功（返回空）；未启动调用同样进入终态。
-    std::error_code Stop();
+    void RequestClose() noexcept;
+    EnginePhase Phase() const noexcept;
+    // 启动失败/Run 收口错误（无错误为空）；可在 Run 返回后查询。
+    std::error_code LastError() const;
+    // driver Failed 时保留的异常（无则空）；不伪调 owner 用户回调。
+    std::exception_ptr LastFailure() const;
 
-    // 实际绑定地址的稳定快照（port 0 请求 → 内核分配的真实端口）。
-    // 已绑定（Starting，含 OnBoot 执行期间）与 Running 可读；未运行/已停止 →
+    // 实际绑定地址快照（port 0 → 内核分配）。未运行/已停止返回
     // operation_not_permitted，且不改写 out。
     std::error_code LocalAddresses(std::vector<Address>& out) const;
 
-    // 当前活跃连接数（接纳成功、尚未 OnClose；跨 sub owner 汇总）。Starting 为 0，
-    // Running 为本代真实计数，强停后为 0。观测只取短锁，不在 owner 线程调用。
     std::size_t CountConnections() const;
+    // 用户原始回调抛出的隔离计数（非 engine 故障；不影响 Run 错误返回）。
+    std::size_t HandlerErrorCount() const;
 
-    // 注意：析构必须在合法控制域（非受管协程、非本 Engine owner 线程）执行；
-    // 若仍在运行/启动中会按 Stop 的同一顺序强停收口。
+    // 观测（非业务）：本代各 owner 绑定的 ProcesserId。server 的 main 是
+    // main_owners 第一项；client-only main_owners 为空。未运行返回空。
+    std::error_code ReactorOwnerIds(std::vector<std::uint64_t>& main_owners,
+                                    std::vector<std::uint64_t>& sub_owners) const;
+
+
+
+    // client 侧非阻塞建连：client-only 与 server 布局都可用（用 sub owner）。
+    // 有 RawHandler 时结果只经 OnConnect 唯一交付，不能用 WaitConnect 二次领取；
+    // 无 RawHandler 时 out_id 可交给 WaitConnect 等待。
+    std::error_code AsyncConnect(const Address& address, std::uint64_t& out_connect_id);
+    // Co 专用：只支持无 RawHandler 的 Engine（否则 operation_not_supported）。
+    // 提交即登记接收责任，完成早于 WaitConnect 也保留结果，消费后释放。
+    std::error_code AsyncConnectAwaitable(const Address& address,
+                                          std::uint64_t& out_connect_id);
+    // 协程内等待建连结果：有 RawHandler 返回 operation_not_supported，且不取消
+    // raw pending。每个 id 只允许一个 receiver，第二个返回 device_or_resource_busy。
+    // 超时/取消终结该 receiver 并由 owner 回收未交付连接，不能再用同 id 重试；
+    // waiter 建立失败返回 not_enough_memory 并回滚 claim，同 id 可重试。
+    std::error_code WaitConnect(std::uint64_t connect_id, Connection& out,
+                                const bbt::coroutine::WaitOptions& options);
+
+    // CoAccept 薄封装：从有界 handoff 队列取已接纳连接（队列满时暂停 native
+    // accept，不丢 fd）。注册后复查，早到通知不丢。
+    std::error_code WaitAccepted(Connection& out,
+                                 const bbt::coroutine::WaitOptions& options);
+
+    // 打开 CoAccept handoff（Run 前调用），容量 > 0 才有界预留给 accept。
+    std::error_code EnableAcceptHandoff(std::size_t capacity);
 
 private:
-    // 发布稳定 server 句柄（锁内只做发布/读取，不在锁内调用 server 的任何方法）。
-    std::error_code EnsureServer(std::shared_ptr<ServerEngine>& out);
-    std::shared_ptr<ServerEngine> Snapshot() const;
-
-    std::shared_ptr<EventHandler> handler_;
-    // facade 短锁：只保护 server_ 句柄的发布与读取，绝不跨 server->Run/Stop
-    //（否则并发的 Stop/观测会被 native Run 的 Boot 等待挡住）。
-    mutable std::mutex mutex_;
-    std::shared_ptr<ServerEngine> server_;
+    friend class EngineTestAccess;
+    std::shared_ptr<EngineImpl> m_impl;
 };
 
 } // namespace bbt::infra::net

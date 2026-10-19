@@ -16,18 +16,18 @@
 | Mongo client | `bbt::infra_mongo` | 已实现 owner + 句柄形态 | 同步 driver + worker bridge；`mongo::CoMongoDb` 为资源 owner，`mongo::CoMongoColl` 为集合句柄；`include/bbt/infra/mongo/` 公共目录已建，剩余 API 按决策 0006 逐步迁移 |
 | 基础动态配置 | `bbt::infra_config` | 最小切片已合入主线，独立消费已验证 | `bbt::infra::config`；版本化不可变快照 + 内存源 + 真实本地文件源 + watch（初始/更新/重复去重、失败恢复、关闭与晚到通知、正常 drain 与 owner 同步 `Close()` 的资源边界）。**未交付**：远程 provider 与真实重连、业务 schema 校验、客户端资源热切换。契约/命令/未覆盖矩阵见 [docs/config-watch-v1.md](docs/config-watch-v1.md) |
 | RPC | `bbt::infra_rpc` | wire profile + runtime 候选已实现 | 版本化 Protobuf RpcEnvelope wire profile 与 HTTP-backed RpcClient/RpcServer runtime（`bbt::infra::rpc`，Issue #8/N2）：值类型校验、编解码、HTTP body 绑定、请求关联、deadline、错误和同步 Close；候选仍待 framework 接线、独立审查与合入 main |
-| gnet 新网络基础（首包候选） | `bbt::infra_net` | network-only、native socket、上下文与纯逻辑包已局部验证 | 固定 coroutine `8ae6a88997c5acaa4fe03430c35e1820ed5b29b0`：Linux TCP/UDP/Unix、IPv4/IPv6 非阻塞 fd 基础、`ICoObject` 环境限制与有界缓冲/Options/LB 基础；Debug/Release 各 16/16 新 net 测试通过，无创建门禁已转绿。完整 Engine/Conn、缓冲接线、Close(opt)、压测与 infra CI **未交付**。**本轮（2026-10-17）用户裁定：高层 UDP 暂缓**——不实现 datagram 的 `Engine`/`Client` 面，只保留显式 `#include <bbt/infra/net/Udp.hpp>` 时的编译拒绝（该头全部内容就是 `#error`，不是 API、不进聚合头与头自检）；IPv4 TCP 与 `NativeSocket` datagram 原语不受影响，UDP 不列本轮必过阻塞。**同轮（150，未审查/未合并）**：`Engine::Run` 接受集收窄为 IPv4——Unix/IPv6 等**合法**但未支持的家族在 owner/listener/OnBoot 任何副作用之前返回 `operation_not_supported`（不再像旧实现那样 bind 成功、返回 0 却零业务事件；空/无效地址仍 `invalid_argument`），非 IPv4 地址不再假成功。**本轮（160）已把消费出处从 `6f650eee`+未提交差异重绑定到上面这个固定 commit**，并用其干净重建的新 DSO 重跑固定版本影响面 107/107 通过；本行先前的 16/16 与后续 98/P6 证据绑定旧 dirty DSO，不作固定 commit 证据。见 [决策 0010](docs/decisions/0010-gnet-network-foundation.md) |
-| gnet 公共 Engine 候选（含 ticker 与 `Action::Shutdown` 向上请求上报） | `bbt::infra_net` | network-only 下真实回环/生命周期已局部验证 | 单 main listener + N sub owner、受管 `OnBoot/OnOpen/OnTraffic/OnClose/OnTick`、native 强停 `Run/Stop` 与域门禁；`Action::{None,Close}` 语义不变（Close 仍在事件协程内封口 + 物理关闭）。**本轮（2026-10-17）用户裁定：Shutdown 向上层传递、自由度给使用者**——`Action::Shutdown`（值 2）只表示**向上请求关闭**：发生它的连接不封口、不关闭，Engine 不封门、不停 ticker、不改 `stopping_`/`phase_`、不 Stop、不拒绝后续业务；每次真实返回上报一次 `EventHandler::OnShutdownRequest()`（可重复、无首胜、可完全忽略），由 `EventHandlerAdapter::ApplyAction` 在产生该事件的同一受管协程任务内同步转发；物理强停仍只能由使用者在自己的控制域调用既有 `Engine::Stop()`/析构，`ServerEngine`/`Engine` 零改动。用例 `net.engine_shutdown_request_*` 7 例已通过；**本行是本地候选，未独立审查、未提交，不替代 0010 的后续目标** | 见 [网络执行域设计](docs/architecture/gnet-network-execution.md) 与 [决策 0010](docs/decisions/0010-gnet-network-foundation.md) |
-| gnet 薄 Client 候选（P3-c2） | `bbt::infra_net`（`bbt::infra::net::Client`） | network-only 下真实回环 Dial 已局部验证 | 最小 TCP Client：一个 `EventLoop` owner + 一个 `ConnectionBridge`（即公共 Engine 单 sub owner 构成；无 listener/main accept、不建第二 runtime、不改 ServerEngine/EventLoop）。`Start/Stop` 控制域（Stop 先取消在途 Dial 再 `RequestStop/Join`，避免未决 `async_wait` 拖住 Join）；`Dial` 仅受管协程、可挂起，成功 out 非空并派发 OnOpen、失败 out 不变、deadline 到期 `timed_out` 且有界晚到清理。`tcp_no_delay` 等未接线选项显式拒绝（不静默忽略）；`num_event_loop` 单 owner 只接受默认/1。Start 启动者唯一（并发第二次 `Start` 明确拒绝、Stop 后不可复活），Stop 的收口序列先取消在途 Dial 再 Join，取消未取得 owner 域收据时不做无界 Join；Dial 取消投递被拒时登记保留，取消责任仍归 owner 域与 Stop 的取消清单。真实回环成功、`ECONNREFUSED`、deadline 晚到清理（含内层执行耗时收据）、Stop 与未决 Dial 竞争（`/proc/net/tcp` SYN_SENT 收据 + fd 回落）、域门禁拒绝、并发 Start 唯一性、控制域析构与存活 shell/handler、取消投递被拒登记保留 8 例（`net.client_*`）已通过；候选待独立审查与合入 main。`Enroll/EnrollContext/DialContext` **未实现** |
+| R2 TCP 底座（Processer driver，当前未提交候选） | `bbt::infra_net` | network-only 下聚焦回归本地通过；未独立审查/未过 CI/未发布 | 自有 main/sub Asio context 由已登记 Processer driver 的 `OnTick/Wait` 推进，不建网络 I/O 线程；`Engine::Run` 占宿主 native 线程、自动绑定空闲槽并在失败时回滚、`RequestClose` 封口、同代同步解绑后收口；原始短回调 `OnAccept/OnConnect/OnRead/OnWrite/OnClose`（owner 非业务协程边界，不可挂起）；并发接收 ring 为单一真源（`TryRead`、RAII `Peek+Consume`、Busy/WouldBlock、持久 EOF/错误、关闭后尾部可读）；`AsyncWrite` 全量/零接纳、有界字节与操作数、逐操作真实前缀与唯一终态、`WriteOperation` 句柄终态可查；`CoRead/CoWrite/CoAccept/CoDial` 仅复用同一 raw 能力。固定消费 coroutine `ae2cc1a0ad02de0027c3cab5d36402139f7aabd3`。旧 `Client/EventHandler/CoTcpConnection/ICoConnection/Action` 已删除，不保留兼容壳。 |
 | MCP | — | 未开始 | 归对应 Issue 推进，当前无实现 |
 
-> 状态口径：表中「gnet …候选」三行指本轮**未合入「原已合并基线」**的**本地候选**——已在 `BBT_INFRA_NETWORK_ONLY=ON` 下局部验证，但**未独立审查、未过 CI、未跑完整 P6（仅有界短负载）**，不得据此升格为已交付。本 README 中「原已合并基线」特指本地固定提交 `3136d1de5031a2eec55475e770d5ebbadc3c32da`（本机 `main`，2026-10-15 fast-forward 合入），**不代表远端实时 `main`**；其余模块各行维持原有说明，本轮未改动，不为其背书或新增含义。
+> 状态口径：表中 R2 TCP 行指**未合入「原已合并基线」**的**本地未提交候选**——已在 `BBT_INFRA_NETWORK_ONLY=ON` 下局部验证，但**未独立审查、未过 CI、未跑完整 P6（仅有界短负载）**，不得据此升格为已交付。本 README 中「原已合并基线」特指本地固定提交 `3136d1de5031a2eec55475e770d5ebbadc3c32da`（本机 `main`，2026-10-15 fast-forward 合入），**不代表远端实时 `main`**；其余模块各行维持原有说明，本轮未改动，不为其背书或新增含义。
 
 已实现能力的单测与示例均可独立构建运行，见下文「独立消费」与 [examples/README.md](examples/README.md)。
 
 ## I/O 执行边界
 
-新 `bbt::infra_net` 采用 **coroutine runtime 与网络 I/O 域分离** 的目标架构：`Scheduler + Processers` 及其内部等待/Timer/Hook/CoPoller 归 coroutine；infra Engine 的 main/sub reactor 各用自有线程和自有 Asio context，业务 Handler 在 Processer 的受管协程运行。两域通过有界命令、事件快照与既有等待/Notify 连接，不重复驱动 `io::GetExecutor()` 的共享 context，不每个 readiness 无限建协程。默认 stream 主从布局、ReusePort/UDP/client 变体、线程图/完成时序及当前实现差异见 [网络执行域设计](docs/architecture/gnet-network-execution.md)；P0–P7 与 C1–C14 见 [迁移计划](docs/plans/gnet-network-migration.md)。**这些仍是文档候选：就「原已合并基线」而言，独立网络 Engine/Conn/Bridge/Close(opt) 尚未接线**（上表 gnet 候选行是本轮未合入该基线的本地候选，不代表该基线已接线）。
+新 `bbt::infra_net` 的 **R2 TCP 核心契约已获用户确认；当前未提交候选已实现本地聚焦验证，尚未独立审查/CI/发布**：infra 拥有自有 main/sub Asio context 与网络资源，每个 Reactor 自动绑定一个空闲已登记 Processer driver 槽；不新增网络 I/O 线程。原始 `OnAccept/OnConnect/OnRead/OnWrite/OnClose` 回调在 owner 非业务协程边界短、非阻塞、不可挂起地运行；协程同步 API 只用既有 CoWaiter/Chan 做薄封装。接收 ring 是并发安全的数据真源，OnRead 仅通知；提交接纳、本地发送完成和业务回包严格分开，普通 EOF/错误/等待超时不自动关连接或重发，协议和业务策略归上层。固定依据是 coroutine PR #396 合并提交 `1e9f0e8c25de85dde003def65bb58b90bdac0e0b`，不表示构建 pin 已升级或两仓已联调。
+
+当前目标见 [网络执行域设计](docs/architecture/gnet-network-execution.md) 与 [0010](docs/decisions/0010-gnet-network-foundation.md)，后续接续见 [迁移计划](docs/plans/gnet-network-migration.md)。上表 R2 行及下方新增的 R2 使用入口描述当前未提交候选；更下方的旧消费命令/旧测试名保留为历史记录，不再代表当前公共 API（旧自建线程/事件快照/受管 OnTraffic 已删除）。不重复驱动 `io::GetExecutor()` 的共享 context，不改变 runtime Timer/Hook/CoPoller，也不迁移其它模块。
 
 [CoTCP/CoUDP 与第三方 Binding 规格](docs/decisions/0005-co-io-adapter-contract-v1.md) 的“proc 执行收发与协议，sche 只检测就绪并唤醒”继续说明旧路径，不覆盖上述新 net 目标。此次不改造或声称已迁移以下历史模块。
 
@@ -35,7 +35,7 @@
 
 ## 资源关闭与请求完成契约（进程寿命运行时）
 
-coroutine 运行时按**进程寿命**存在、不参与业务资源收口（不再有 `Scheduler::Stop()`/restart 与运行时代际）。新 net 的目标关闭模式是 [0010 的 Close(opt)](docs/decisions/0010-gnet-network-foundation.md#closeopt-冻结)：Block/Unblock 共享一次关闭推进，Block 在受管协程等待物理完成而非等待 OnClose；仍待实现与竞争验证，不能当作旧模块的现存接口。以下为**旧模块**的 [0002 co-network/v1 修订记录](docs/decisions/0002-co-network-contract-v1.md) 契约及当前状态，要点：
+coroutine 运行时按**进程寿命**存在、不参与业务资源收口（不再有 `Scheduler::Stop()`/restart 与运行时代际）。新 net 的 R2 目标见 [关闭契约](docs/architecture/gnet-network-execution.md#6-网络关闭不是-runtime-停机)：`RequestClose` 仅封口并请求控制域收口，`Run` 返回才确认网络资源、callback 与同代解绑完成；不等待业务协程或外部句柄归零，关闭后已有接收数据仍可读，不承诺硬 deadline。上述接口是目标、未实测，取代旧 Close(opt) 作为新 net 约束，不改下面的**旧模块** [0002 co-network/v1](docs/decisions/0002-co-network-contract-v1.md) 契约及状态：
 
 - `ICoCloseable` 只有 `void Close() noexcept` + `bool IsClosed() const noexcept`。`Close()` 由资源 owner/framework manager 主动调用、同步完成物理释放并返回：**返回即该对象拥有的物理资源已释放、后端不会再访问它们**；未发送数据直接丢弃、不做 flush、不重开；**没有「等待关闭完成」的入口**。
 - 已删除且不保留兼容壳：`RequestClose`、`WaitClosed`、`ReleaseClosed`、`CloseStatus` 等待结果枚举、`CompletionSignal`、`CancellationToken`/`CancellationSource`（含 `CallOptions.cancel` 字段）、`RuntimeGeneration`/`CurrentRuntimeGeneration`、`Scheduler::Stop()`/restart。
@@ -53,6 +53,61 @@ coroutine 运行时按**进程寿命**存在、不参与业务资源收口（不
 - Redis/Mongo 旧公共头 `CoRedisCli.hpp`/`CoMongoCli.hpp` 仍保留兼容入口；新公共 API 目录（`include/bbt/infra/redis/`、`include/bbt/infra/mongo/`）按决策 0006 拆分后逐步迁移。
 
 ## 独立消费
+
+### R2 TCP 使用入口（当前未提交候选）
+
+公共头：`<bbt/infra/net/Engine.hpp>`、`RawHandler.hpp`、`Connection.hpp`、`CoConnection.hpp`、`Error.hpp`；只链接 `bbt::infra_net`。
+
+前提与关闭：
+- `Engine::Run(EngineConfig, ...)` 阻塞占用**调用它的宿主 native 控制线程**（不能是受管业务协程或本 Engine 的 owner 线程）。
+- `EngineConfig.runtime_progress` 必填 `RuntimeProgress::Independent`，声明 runtime 内部 EventLoop 由独立执行流持续推进；未声明在绑定/建 socket 前以 `operation_not_permitted` 拒绝，runtime 未初始化以 `operation_not_supported` 拒绝。
+- `Connection::RequestClose()` 只是请求封口：立即拒绝新写并唤 owner；已 recv 但尚未
+  进入 ring 的尾部由 owner 先转入 state 真源，之后才发布读侧最终 EOF。请求后、owner
+  完成前读取可得到 `WouldBlock`，不得提前 EOF。首次请求的 reason（包括默认 `{}`）
+  固定，之后写失败/重复请求不会重开接纳或覆盖该原因。`Run` 返回才表示 Engine 收口完成。不要在 `Run` 未返回时并发析构 Engine。
+  - 正常收口由原 owner 完成已有连接的唯一 `OnClose`、待结算写的 `OnWrite` 与 pending connect 的 `OnConnect`，随后同代解绑；**不设隐藏关闭 deadline**，单次可恢复的命令提交失败会补交而非提前以 `Closing` 返回。只有 driver 真实 Failed 才走错误出口冻结并解绑。
+  - 普通用户回调（`OnRead`/`OnAccept`/`OnConnect`）的开始授权点，是**最后一次紧邻 `SafeHandler` 派发前**的 `shared service_sealed` 原子检查（`NotifyReadOwner`、`AdoptFdOnOwner` 的交付前）：检查通过即为已授权在途，短回调必须完成；封口先于该检查则不启动成功回调（`OnAccept` 不调用，`OnConnect` 交付 canceled）。构造/登记阶段的入口早查只是提前短路，不构成授权。授权点与封口共同线性化，检查之后不再有可撤销的无限推迟。
+- 原始回调必须短、非阻塞、不可挂起；接收 ring 是唯一真源，`OnRead` 只是可合并通知。
+- `CoDial`/`WaitConnect` 只用于未配置 `RawHandler` 的 Engine；配置了 raw handler 时
+  `AsyncConnectAwaitable`/`WaitConnect` 明确返回 `operation_not_supported`，raw 的
+  pending/完成由 `OnConnect` 唯一交付，Co 等待不得取消或二次领取。每个 connect op
+  只允许一个 `WaitConnect` 接收者，第二个返回 `device_or_resource_busy`。
+  等待超时/取消终结该接收者并由 owner 回收未交付连接，不能用同 id 再次等待；
+  waiter 建立失败返回 `not_enough_memory`、回滚 claim，同 id 可重试。
+- `CoDial` 的 client-only Engine 若无 raw 接收者，请用空 `shared_ptr<RawHandler>` 构造：
+  等待超时/取消后 owner 才可回收未交付 socket；有 raw handler 时视为已交付，不会因另一个
+  Co 等待取消而误关。
+- `AsyncWrite` 成功只表示库已接纳；`WriteOperation::Query()` 区分仍在途/完成与真实前缀。协程等待超时/取消只结束等待，已接纳操作仍由 owner 推进，可用同一 `WriteOperation` 查最终结果；不自动关闭或重发。
+- `RawHandler::OnClose` 在 owner 上按连接最多一次；peer EOF 只结束读方向，不自动关闭写侧。
+
+最小 raw 入口（伪代码，实际见 `examples/co_net_service` 与 `tests/net/r2_tcp.cc`）：
+
+```cpp
+net::Engine engine(handler);                       // handler : RawHandler
+net::EngineConfig config;
+config.listen_addresses = {address};              // port 0 由内核分配
+config.runtime_progress = net::RuntimeProgress::Independent;
+std::thread runner([&] { error = engine.Run(config); });
+// handler->OnAccept / OnRead / OnWrite / OnClose 在 sub owner 线程执行
+engine.RequestClose();
+runner.join();
+```
+
+Co 薄封装（同一 raw 内核）：
+
+```cpp
+net::Connection conn = /* from CoAccept/CoDial */;
+std::string data;
+if (net::CoRead(conn, data, options) == net::NetErrc::Eof) { /* 尾部已读完 */ }
+net::WriteOutcome outcome;
+net::WriteOperation operation;
+if (net::CoWrite(conn, data, options, outcome, operation)) {
+    // timed_out: outcome.phase==InFlight 时已接纳仍在途，可 operation.Query()
+    //            outcome.phase==Rejected 时未提交
+}
+```
+
+已验证范围（本地、未提交）：真实 port0 raw/Co 回环、sub owner 身份、多 listener、关闭后尾部/残留 Conn、有界发送/部分写/错误结算、容量超时未提交、完成超时仍在途、no-deadline 等待关闭结算、handoff 容量恢复、公平性、运行前提与 driver Failed 收口。未覆盖：长时/多连接性能、部分 Options 组合接线、connect 超时回收的确定性动态用例等，详见实现报告。
 
 ### 新 net 首包候选（与下述旧模块消费分开）
 

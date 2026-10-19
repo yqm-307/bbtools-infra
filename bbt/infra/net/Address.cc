@@ -1,5 +1,7 @@
 #include <bbt/infra/net/Address.hpp>
 
+#include <cstring>
+
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/un.h>
@@ -140,4 +142,14 @@ std::string Address::ToString() const {
     return {};
 }
 
+
+Address Address::FromNative(const sockaddr* addr, socklen_t length) {
+    Address out;
+    if (addr == nullptr || length == 0 || static_cast<std::size_t>(length) > sizeof(sockaddr_storage)) {
+        return out;
+    }
+    std::memcpy(&out.m_storage, addr, static_cast<std::size_t>(length));
+    out.m_size = length;
+    return out;
+}
 } // namespace bbt::infra::net

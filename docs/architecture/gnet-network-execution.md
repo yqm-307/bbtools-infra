@@ -1,154 +1,145 @@
 # gnet 风格网络：执行域、物理线程与所有权
 
-**状态：2026-10-16 P3 修订候选，整体 F4 仍未验收。** 当前首包实现及局部验证见 [0010](../decisions/0010-gnet-network-foundation.md)，剩余工作与验收见 [迁移计划](../plans/gnet-network-migration.md)。本文是新 `bbt::infra::net` 执行模型的权威说明；0010 继续保存逐符号、Options、视图与 Close 契约，不在这里复制接口清单。
+**状态：R2 TCP 核心契约已获用户确认；本文对齐目标设计，不代表新接口已实现或两仓联调已通过。** 机制与公开边界见 [0010](../decisions/0010-gnet-network-foundation.md)，实施接续见 [迁移计划](../plans/gnet-network-migration.md)。旧线程、事件快照及局部验证记录在文末历史区保留，不作为 R2 的实施约束或新版本验收证据。
 
 ## 1. 决定与适用范围
 
-采用 **coroutine 执行域与 infra 网络 I/O 域分离**：
+infra net 提供稳定可靠、并发安全、有界的 TCP 字节收发，尽可能报告可确认的接纳、进度、本地完成、EOF 和错误。这里的可靠不等于网络永不失败、数据必达或对端业务必执行。
 
-- coroutine 的执行主体是 `Scheduler + Processers + Coroutine`；通用等待、唤醒、定时、取消仲裁、Hook 及内部 EventLoop/CoPoller 仍是 runtime 支撑能力，不因这次分层删除或迁出。
-- infra Engine 拥有网络 main/sub reactor、自有线程、自有 Asio `io_context`、listener、连接、缓冲与物理收口。不是把 runtime 的共享 context 换一个名字。
-- 业务事件在 Processer 上的受管协程运行，I/O owner 只推进短的非阻塞网络操作。二者通过有界命令、数据所有权交接与既有公共等待/通知能力相接，不建设第二套协程 runtime。
-- `bbt-framework → bbtools-infra → bbtools-coroutine` 方向不变，coroutine 不引用 infra 的 Engine/Conn/Action。
-
-只适用于本次新 net 路径：0005 的“proc 直接收发、sche 只检测”及 0002 的旧同步 Close 不再约束新 net。现有 HTTP/Redis/Mongo/RPC/config/MCP/旧 transport **没有因此迁移或重新验收**；保留源码并由 network-only 构建隔离，不写 framework，也不重写跨仓服务架构基线。
+- coroutine 继续负责 Scheduler、Processer、有栈协程，以及内部等待、Timer、Hook、CoPoller 和对象安全；进程寿命、单次初始化、无 Stop/restart 不变。
+- infra 自有 main/sub Asio context、listener、socket、连接、缓冲与物理收口；每个 Reactor 绑定一个已登记 Processer driver 槽，不另建网络 I/O 线程。
+- 原始入口为异步操作与短回调；协程同步接口是复用 CoWaiter/Chan 等原语的可选薄封装，不另建网络内核。
+- 上层负责分帧、请求匹配、等待业务回包、重试、避让、重连及业务关闭策略。net 不因普通等待超时、读 EOF 或写错误自动关闭连接或重发。
+- 本次设计覆盖完整 TCP server/client；不包含 HTTP/RPC 接入、消费者迁移、UDP/TLS、动态 owner 迁移或自愈平台。旧模块与原语保留，不因设计确认变成已迁移。
+- 依赖保持 `bbt-framework → bbtools-infra → bbtools-coroutine`；不向 coroutine 下沉网络类型、缓冲或业务策略。
 
 ## 2. 目标线程拓扑
 
-下图为默认后台 Scheduler、非 ReusePort 的 stream 接纳布局；方框中的线程均为实际 OS 线程，未承诺 CPU 绑核。`N` 个网络 owner 与 `M` 个 Processer 分别配置，不要求相等。多 listener 可由同一 main 管理，不是每连接开线程。
+默认 THREAD 模式仍由 S 线程推进 runtime 内部 EventLoop。P 线程交替执行业务协程与非业务协程边界的 driver；业务协程可迁移 P，连接 I/O owner 固定。
 
 ```mermaid
 flowchart TB
-    Peer["TCP / Unix stream 对端"]
-    subgraph IO["infra Engine 自有网络 I/O 域（目标）"]
-        Main["R-main 线程 / MainReactor<br/>自有 io_context<br/>listener · accept · LB"]
-        R0["R-sub-0 线程 / SubReactor 0<br/>自有 io_context<br/>连接组 0 · I/O · buffer · fd close"]
-        RN["R-sub-N 线程 / SubReactor N<br/>自有 io_context<br/>连接组 N · I/O · buffer · fd close"]
-        Main -->|"唯一 fd 所有权交接"| R0
-        Main -->|"唯一 fd 所有权交接"| RN
-    end
-    subgraph Bridge["跨域接缝（目标，不是第二 runtime）"]
-        Cmd["有界 owner 命令<br/>Register / Write / Wake / Close"]
-        Evt["事件快照 / operation state<br/>业务事件任务 · CoWaiter Notify"]
-    end
-    subgraph RT["bbtools-coroutine 进程寿命 runtime"]
-        S["S 线程 / Scheduler driver<br/>内部 CoPoller / io_context<br/>Timer · Hook FD · 通用等待维护"]
-        Queue["既有任务投递 / runnable 队列"]
-        P0["P-0 线程 / Processer 0<br/>Resume 受管业务协程"]
-        PM["P-M 线程 / Processer M<br/>Resume 受管业务协程"]
-        S -->|"内部事件就绪"| Queue
-        Queue --> P0
-        Queue --> PM
-    end
-    Peer --> Main
-    P0 -->|"交命令；必要时挂起协程"| Cmd
-    PM --> Cmd
-    Cmd --> R0
-    Cmd --> RN
-    R0 -->|"数据 / 完成结果"| Evt
-    RN --> Evt
-    Evt -->|"既有通知 / 注册任务路径；不直接 Resume"| Queue
+    Host["宿主 native 控制线程<br/>Engine::Run / 封口 / 同代解绑 / 收口"]
+    S["Scheduler S 线程<br/>runtime 内部 CoPoller · Timer · Hook"]
+    P0["已登记 P：main driver 槽<br/>main 自有 context · accept · LB<br/>也可执行业务协程"]
+    P1["已登记 P：sub driver 槽<br/>sub 自有 context · connect/read/write/close<br/>也可执行业务协程"]
+    State["稳定 Conn / operation 状态<br/>并发安全接收 ring · 有界发送序列"]
+    Co["业务协程可迁移 P<br/>可选 CoRead / CoWrite / Accept / Dial 薄封装"]
+    Host -->|"自动绑定；不新增 I/O 线程"| P0
+    Host --> P1
+    P0 -->|"唯一 fd 交接"| P1
+    P1 -->|"提交数据/状态后短回调"| State
+    Co -->|"有界命令 / try 消费"| State
+    State -->|"既有 Notify；不直接 Resume"| Co
+    S -->|"runtime 等待/定时维护"| Co
 ```
 
-主图隐藏了配置/观测及错误回滚边，不表示绕过它们。Notify 的当前实现可以在通知线程触发 runtime 仲裁并把协程置为 runnable；**不要求每个网络完成先排回 S 线程**，也不表示在 I/O 线程直接 Resume。
-
-| 角色 | 谁驱动、在哪运行 | 拥有什么 | 不负责什么 |
-|---|---|---|---|
-| MainReactor | 自有线程 `R-main` 驱动自有 context | listener、accept、接纳模式、LB 与 fd 交接中的唯一所有权 | 业务 Handler、连接持续 read/write、协程调度 |
-| SubReactor / 网络 EventLoop | 各自唯一线程 `R-sub-i` 驱动各自 context | 归属连接、注册/撤销、非阻塞读写泵、可变缓冲、关闭终态 | 执行业务协程、跨 owner 裸访问、任意阻塞任务 |
-| Scheduler | 后台 S、调用者 loop 或手动 tick，见下表 | runnable 分发策略、runtime 内部 CoPoller/Timer/维护 | accept/协议/连接缓冲、网络 owner 线程、业务优雅退出 |
-| Processer | worker 线程 `P-i` 取任务并 Resume | 当前协程的执行；运行段内同一协程只有一个执行者 | 网络 fd 所有权；等待 socket 时阻塞物理线程 |
-| Bridge | 由两端分别调用既有公开入口 | 一次 operation state 与移交数据的明确寿命 | 新调度器、第二套等待状态机、强制指定恢复线程 |
-
-### 布局变体与驱动权
-
-- **ReusePort**：每个 sub owner 持有自己的 listener 并接纳；无独立 main。必须分别验证监听失败回滚、流量分配和收口，不能由普通接纳场景推定通过。Linux IP 的选项基础不等于 Engine ReusePort 已交付；Unix 明确拒绝该选项。
-- **UDP**：按 listener/数据报 socket 的 owner 推进读写，保留报文边界；不虚构 TCP 式 accept/每 peer 独立 fd，也不强套 stream 的 ET 读泵。
-- **Client**：无 main accept，复用 sub owner 做非阻塞 connect/登记/关闭，不新增第二套 runtime。
-- **线程隔离**：网络 context 只由自己的 driver 推进；单连接状态按 owner 串行化。不承诺 CPU affinity、内存或故障隔离、业务实时性，也不强迫业务协程返回原 Processer。
-
-runtime 已有启动模式不改变：
-
-| `SchedulerStartOpt` | 内部 CoPoller 的 driver | Processers |
+| 角色 | 驱动与责任 | 边界 |
 |---|---|---|
-| `SCHE_START_OPT_SCHE_THREAD` | 新建 Scheduler 线程；Start 初始化后返回 | runtime 创建 worker 线程 |
-| `SCHE_START_OPT_SCHE_LOOP` | 调用 Start 的线程进入 `_Run()`，不返回 | runtime 创建 worker 线程 |
-| `SCHE_START_OPT_SCHE_NO_LOOP` | 宿主唯一驱动线程持续调用 `LoopOnce()` | runtime 创建 worker 线程 |
+| main Reactor | server 普通布局的 listener、accept、LB、fd 唯一交接 | 一个已登记 P 的 driver 槽；不执行业务等待 |
+| sub Reactor | 归属连接的 native I/O、注册/撤销、物理 close、自有 context | 各占一个 P 槽；同连接 owner 固定；非阻塞推进有预算 |
+| Processer | 在 worker 线程调度业务协程并推进绑定 driver | 不给业务协程提供永久 P/CPU 亲和或实时性保证 |
+| Engine::Run | 调用它的非受管、非 owner native 线程上的启动、控制与收口 | 不暗中创建控制线程或第二 I/O driver |
+| Conn/operation | 共享数据与持久状态、数据所有权、有界接纳和完成责任 | 不暴露 Asio 对象，不将 shared_ptr 当作对象同步 |
 
-手动 tick 停止推进不是 runtime Stop；Timer/延迟清理等依赖 tick 的进展可能停止。网络线程继续活跃也不能代替 runtime 的 driver。不得同时后台驱动和手动 tick。
+server 普通布局保留一个 main 加 N 个 sub，配置 N 表示 sub 数，启动必须报告包含 main 的实际槽需求。client-only 不创建 accept owner，不通过 ServerEngine 模拟 client。ReusePort、UDP 等旧目标不自动加入本次 TCP 实施范围。
+
+Engine 自动枚举并绑定空闲已登记 P；查询空槽不是预留，以注册成功的同代 token 为准。槽不足或竞争失败回滚本次绑定，不抢占、不扩 worker、不静默缩数量、不退回独立网络线程。
+
+### runtime 推进前提
+
+宿主必须在启动配置中明确声明：runtime 内部 EventLoop 由独立于 Run 的执行流持续推进。THREAD 使用已有 S 线程；SCHE_LOOP 的 Start 在另一 native 线程运行；NO_LOOP 由另一执行流持续 LoopOnce。未初始化或未声明/声明不独立，Run 在绑定或建 socket 前明确拒绝；目标错误口径分别为 RuntimeNotInitialized / RuntimeProgressRequired，不表示这些 net 错误名已存在于头文件。
+
+现有 Scheduler 提供 IsInitialized 和 driver 查询，但没有公开的启动模式/驱动线程存活探测。声明是宿主须履行的前提，不伪称库能证明另一线程持续进展；宿主停止推进后不能承诺协程 deadline 正常兑现。不得后台驱动与手动 tick 同时推进同一 runtime context。
 
 ## 3. Asio 与 gnet 的复用边界
 
-### 两个 context 域，不是重复驱动一个 context
+`io::GetExecutor()` 仍属于 runtime 内部共享 context，不额外 run/poll/stop/restart，不注册到 infra driver。net 只由绑定 owner 推进自己的 context；解绑后的清理接管另见第 6 节。现有 HTTP/Redis/Mongo/config 等路径不因此迁移。
 
-`bbt::coroutine::io::GetExecutor()` 返回 **runtime 内部共享 context** 的投递句柄。消费者不得给它新开 run/poll 线程，不调用其 stop/restart，也不把它注册到网络 owner 的 driver。它仍由 Scheduler 的唯一驱动路径推进。
+gnet v2.10.0 是接纳交接、owner、读写泵、缓冲及公平性的参考，不是必须逐方法兼容的模板。其 OnTraffic 在 eventloop 栈直接执行；本方案区分 owner 短原始回调与上层可挂起业务协程，不将 goroutine 当固定 OS 线程。
 
-新 net 则创建并管理自己的 context；这是对旧“所有上层适配器不得创建独立 context/线程”适用范围的显式修订，而不是放宽共享 executor 的驱动权。现有 `IoExecutor.hpp` 关于 generation/调度停止的旧注释不是恢复已删除 Stop/restart 的依据。本轮 coroutine 只更正文档，不改该头文件。
+复用已有 Address、NativeSocket、LoadBalancer、EventRingBuffer、OutboundQueue 和部分读写机制，只补实际缺口。EventRingBuffer 当前是单 owner、非线程安全；需要最小同步访问面，不能直接宣称已有类可跨线程使用。OutboundQueue 合并字节不保留公共操作身份，须补有界记账，不能因此重造通用 Future 平台。
 
-首个网络后端使用已有 Boost.Asio 事件能力，**不强制套用 coroutine 的 `bbt::pollevent::Event` 接口来表达全部 gnet 语义**。此前局部探针观察到的撤销栈重入，只是该公共包装的当前行为，不等于 Asio 不能承载多 reactor，也不是已复现 UAF。网络 adapter 必须自己定义撤销完成、在途 callback 与对象释放的关系并通过测试；不以先扩张 coroutine poller 为 P3 前置。
-
-### 参考结构，不照搬 Go 执行栈
-
-固定 gnet v2.10.0 的普通 Unix 布局为每 main/sub 各一个 goroutine 与 poller。`OnTraffic` 从 sub eventloop 的读取栈直接调用，不是每个 readiness 新建 goroutine。只有配置 `LockOSThread` 才将 reactor goroutine 固定在 OS 线程；ReusePort 使用各 loop 自接纳布局。
-
-本方案保留其接纳交接、单连接 owner、按需写就绪、读写泵、缓冲、事件顺序及 Action 思路；**额外 native I/O 线程 + 可挂起业务协程分离是刻意差异**。不能因为同为 Asio、executor 或 strand 就宣称已获得 Processer 亲和：strand 只串行 handler，不固定 OS 线程，也不能替代有栈协程的恢复约束。
-
-### LT / ET 的位置
-
-应用通过读取策略选择 LT 风格的有预算反复读取，或 ET 风格的 drain-to-EAGAIN；预算耗尽向同 owner 续投，高水位暂停读取并在消费后恢复。部分写、按需写就绪、续投公平性与背压属于 Conn/网络 adapter。
-
-这不是把底层 native LT/ET flags 当作 Asio 已公开的能力：Asio `async_wait` 没有逐 fd 切换 `EPOLLET` 的公开开关；其后端内部使用 EPOLLET 也不自动兑现应用的 gnet ET 语义。必须记录实际提供的读泵策略、事件合并及恢复行为，不承诺 native LT/ET 通知次数等价。UDP 另测数据报策略。
+LT/ET 是读泵策略：有预算读取、EAGAIN、续投和高水位恢复由 adapter 兑现。Asio async_wait 不等价 native per-fd EPOLLET；外层 poll_one 数量不约束单 callback 耗时。Wake 必须 noexcept、线程安全、有界、持久记忆早到通知，不能单靠可能分配的 post 假定满足。
 
 ## 4. 跨域调用与完成时序
 
-下图是一次**需要等待的操作**，不是所有 Reader/Writer 方法都必须等待内核发送。缓冲消费、写接纳、真正发送、回调完成与对端处理结果，仍按 0010 分开。
+原始 API 名称表达目标职责，不是已交付头文件签名：
 
-```mermaid
-sequenceDiagram
-    participant Co as 业务协程 / Processer
-    participant Wait as 既有 CoWaiter / runtime
-    participant R as 连接所属 SubReactor
-    participant FD as 非阻塞 socket
-    Co->>Wait: WaitWithCallback(options, on_registered)
-    Note over Co,Wait: 先登记；只在登记成功后投递；让出 Processer
-    Wait->>R: on_registered 投递带状态的有界命令
-    Note over Wait,R: 完成早于完全 park 走既有 PENDING 路径
-    R->>FD: read/write/connect 等非阻塞推进
-    FD-->>R: partial / EAGAIN / 完成 / 错误
-    Note over R: 按需重新等待或续投；每轮有预算
-    R->>Wait: 发布一次结果，Notify（可带载荷）
-    Note over Wait: 与超时/取消竞争；首胜后进入 runnable
-    Wait-->>Co: 某个 Processer 恢复协程并取结果
-```
+| 入口/出口 | 目标语义 |
+|---|---|
+| OnAccept / OnConnect | 交付稳定连接句柄或明确建连失败；net 不自动创建每连接业务协程 |
+| AsyncWrite | 取得不可变数据所有权，全量接纳或零接纳；成功只表示承担发送责任，返回可查询的操作身份 |
+| OnWrite | 报真实交内核进度和唯一终态；非终态进度须可区分，不承诺对端收到/执行 |
+| OnRead | 只是通知，提示复查同一接收 ring 与持久读状态；可合并，不是包数或数据快照 |
+| ReadStatus / WriteStatus / Status | EOF、错误、关闭与操作身份持久可查，通知合并或已发生后仍可观察 |
+| RequestClose / OnClose | 显式封该连接并提交物理收口；关闭后通知，不把普通 fd 错误自动解释成该策略 |
 
-必须满足：
+同连接接纳次序定义发送次序，一次 AsyncWrite 的字节连续；部分写不插入别的操作字节，多次调用不自动组成业务帧。字节、操作数、命令、在途数据和通知责任统一有界计账，接纳后不能因第二层排队满而丢失完成。
 
-1. **登记先于投递**：登记失败不能留下孤儿命令；命令队列满/关闭拒绝必须完成失败路径，不能让等待者无限挂起。发布数据与 Notify 的同步关系要由 operation state/队列契约保证，不能靠“shared_ptr 所以线程安全”。
-2. **首胜与迟到**：完成、超时、协程取消、Close 只交付一次业务终态。超时/取消返回不等于底层 I/O 已结束；操作状态、缓冲与 fd owner 保活到最后内核访问及 callback 结束。`CoWaiter::Cancel()` 不是业务取消唤醒入口。
-3. **不直接恢复业务**：owner 使用已有 Notify/任务注册路径，不调用 detail Resume，不指定“恢复到这个 Processer”，不复制 runtime 仲裁状态机。不存在新的 `Task<T>`、CompletionSignal 或 CancellationToken 依赖。
-4. **投递有界**：同连接至多一个活跃业务事件，readiness/Wake 可以合并；不能每次就绪无限创建协程或任务。各连接仍需公平预算。数据、命令、待发/待收量及事件数都有边界，满时显式背压/拒绝，不静默丢业务数据。
+容量满立即明确拒绝且零接纳；CoWrite 可无限或带绝对 deadline 等容量/本地完成，等待名额同样有界。容量等待超时=未提交；已接纳后的等待超时/取消仅结束等待，返回操作身份、采样进度及仍在途标记，owner 继续持有和推进，最终状态可查。采样不是冻结前缀，不可据此自动重发后缀。等待业务回包始终归上层。
+
+真实写错误结算当前操作已发前缀与本轮后续未发操作；结算期间明确拒绝新写，不能跳过失败前缀继续旧队列。结算完且未关闭时允许新的 AsyncWrite，该调用本身表示上层新尝试；不续发旧操作，最近错误持久保留。关闭与结算同序仲裁，错误结算不能重开关闭状态。
+
+CoWaiter 使用现有登记、复查、投递与 Notify 仲裁，登记失败不留下孤儿责任；完成/超时/取消竞争只产生一次等待结果，不等于底层操作已取消。Notify 在所有外层锁之外执行，不直接 Resume、不缓存协程创建线程/TLS。
 
 ## 5. Handler、数据与执行上下文
 
-- I/O 线程处理非阻塞 native I/O、注册/撤销、物理 close、短的非挂起完成项。业务 `OnOpen/OnTraffic/OnClose`、engine 生命周期与 Tick 事件进入受管协程；同连接事件不重入，engine 生命周期/ticker 各有自己的串行事件位。
-- handler 可以挂起；挂起期间网络 owner 可继续运行，但不可修改当前事件的 backing storage。Reader 只借独立事件快照，cursor 由当前业务事件持有；view 的有效期与使其失效的操作继续遵守 0010。
-- Writer 将不可变数据所有权转给 owner，或显式复制；不跨域裸借 reactor 的 mutable ring，也不持有 OS mutex 跨挂起。零拷贝优化必须先有可验证的寿命契约，不能先假定安全。
-- handler 返回 Action 后回投 owner；Closing/Closed 首胜后晚 Action 不能重新开放连接。同连接业务顺序不得因跨多个 Processer 调度而改变。异常/拒绝的具体映射在 P3 接口冻结与测试中明确，不在此伪称已接线。
-- `ICoObject` 每次操作现查受管协程环境，不能缓存创建线程/TLS；I/O owner 身份是另一判断。非挂起标签不代表协程外合法或线程安全；`NativeSocket` 是 owner 的低层 primitive，不冒充 Co 业务对象。
+### 原始回调与业务协程
+
+原始 OnAccept/OnConnect/OnRead/OnWrite/OnClose 在 Reactor owner P 的非业务协程边界执行，短、非阻塞、不可挂起。同连接不重入，不递归触发用户回调；不同 owner 可并发调用共享 handler。回调和 Notify 前释放内部保护；上层自行将业务转发到协程，业务协程可迁移，不自动为每次 readiness 建任务。
+
+### 接收 ring 是唯一真源
+
+- 复用已有 ring 的存储与游标，补最小并发访问；Co 不另建权威收包队列。
+- 普通 TryRead 原子地复制并消费；多读者只保证各取线性化前缀，不匹配业务请求。竞争返回 Busy、零消费；空且无终态返回 WouldBlock。所有公开 ring 访问入口 try 获取保护，不让回调/owner 等 OS mutex。
+- Peek 与 Consume 必须处在同一次短保护内；不能持保护挂起、调用未知代码或将裸 view 带出。长期持有数据用自有拷贝。
+- owner 竞争失败延后；保护释放使用持久重试谓词、先登记再复查，覆盖先释放后登记交错。raw OnRead 遇 Busy 后合并补通知，不在当前栈递归、不依赖未来新字节。CoRead 可挂起等释放，不 spin。
+- 先预留容量再非阻塞读取，临时未提交字节也算入上限；复制失败不前移消费游标。满则暂停读取，不覆盖未消费数据；消费后持久唤醒并主动复查，不依赖下一次边沿。
+- 先发布数据/持久读状态，再 OnRead；仅有旧未消费数据不空转通知。EOF/错误即使无新增字节也须可观察。
+
+EOF 只终结读取方向，不自动关闭发送侧。尾部仍可消费，耗尽后读返回 EOF；读错误同时保留已收数据与错误观察面。显式连接关闭或 Engine 收口后，已收数据仍可读，剩余 Conn/ring 的寿命不依赖 socket/context；不把缓冲内字节当成已分帧业务包。
+
+CoAccept 只是 OnAccept 的有界交接封装：先预留容量再 native accept，满则暂停接纳，不无限生成协程或漏 fd；单个等待超时不误关供其它等待者取得的连接。CoDial 等待结束且无接收者的未交付 socket 由 owner 回收，这是资源回滚，不是对已交付连接的自动关闭策略。
 
 ## 6. 网络关闭，不是 runtime 停机
 
-runtime 保持进程寿命、初始化一次、无 `Scheduler::Stop()`/restart，不终止或 join runtime worker。
+Engine::Run 占合法宿主 native 线程：校验前提→自动绑定→安装网络资源→发布 Running→控制循环。RequestClose 并发安全、幂等地封 Listen/Connect/Write 等新业务入口并唤醒控制域；返回只表示登记请求，不同步解绑或等待自己。停止新普通业务回调，已有短回调完成，操作结算/关闭通知仍须兑现。
 
-**2026-10-16 用户修订的 Engine 目标契约（待实现）**：按通常全局、贯穿进程的使用方式设计；实例关闭采用强制停止服务，不建设业务优雅排空协议。关闭线性化后拒绝新的 Listen/Connect/连接业务操作，撤销或结算在途网络工作，不再启动新的业务处理；已经运行的用户协程不能被 C++ 强杀，恢复后也不得重新开放服务。已有等待必须得到关闭结果或按既有 deadline/取消契约退出，不能因停止 I/O 驱动而遗留无期限等待。
+正常收口顺序：原 owner 撤 listener、取消 connect、结算 handoff、关闭连接并完成既有责任→原 owner 推进取消完成项→控制线程同代同步解绑、等待全部 Tick/Wait/Wake lease→必要时控制域独占清理剩余 context 项→context 存活时拆 socket/backend→销毁 context→发布 Stopped、Run 返回。
 
-Engine 关闭不等待用户 Handler/OnClose 返回，不承诺待发数据送达，也不把全桥 `WaitDrained`、所有句柄归零、全部 FD/线程/内存已释放作为返回条件。关联对象和资源按明确的所有权、RAII 与最后一个合法使用者自然销毁；允许用户保留已经关闭的连接句柄。句柄后续业务操作必须安全拒绝，身份快照仍可读；不得访问已经销毁的 owner/bridge。自然销毁不等于裸引用悬空、引用环常驻泄漏、遗失等待者或分离线程。具体 owner 撤销及销毁同步仍须实现和验证，不能将服务已关闭写成资源已全部回收。
+RequestClose 是服务封口，Run 返回才确认该 Engine 的网络资源、callback 与 driver 已收口；不等待上层业务协程返回、外部 Conn/数据引用归零或业务回包。外部句柄继续查冻结状态、读已有缓冲，后续新网络操作明确拒绝，不访问已销毁 context。
 
-此前候选的“必须先成功 drain 才可析构，否则 terminate”不采纳；析构不负责业务优雅退出，不以未调用显式 Close 为理由终止进程。I/O 线程本身的安全退出/回收是资源拥有者的责任，不扩成等待业务回调的析构流程。本修订针对 Engine，不删除下述连接 `CloseMode` 的物理完成约定；内部 drain 可作为观测/测试工具，不再是 Engine 关闭成功的业务门槛。
+不提供 Engine Close(deadline) 硬返回时限：同步解绑无 deadline，不捏造可取消解绑。调用者先 RequestClose、等 Run 返回再销毁 Engine，不并发销毁仍被 Run 使用的对象。不建后台 reaper、不 terminate，不以 context.stop 丢 callback 或 runtime 停机伪造资源完成。
 
-连接继续采用 0010 的 `CloseMode::{Block, Unblock}`、无默认值、同一个 `Open → Closing → Closed` 推进。Unblock 成功仅表示封口并可靠投递；Block 仅在受管协程挂起等待**物理完成**，不阻塞 Processer，不等待自身 `OnClose`。普通控制线程 Block 未开放；owner/main 驱动线程不得等待自身。
+### 既有 driver 异常边界
 
-物理完成必须发生在事件撤销、最后内核访问和唯一 fd 关闭之后；OnClose 在当前业务事件归还后串行执行。晚到 callback 只能清理其拥有的状态，不能访问已释放连接或复用后的 fd。Engine 回收还需兑现自有 driver 退出/join 与最后 callback 的寿命，不能以 `io_context::stop()`、成功 cancel 或某次函数返回替代完整释放证据；不能让 reactor 自 join，也不能依赖 runtime 静态析构清理业务资源。
+不假设正常 Reactor 必然失败，不新增自愈/迁移或容错平台。普通 fd errno、EOF、协程超时不升级为 driver Failed。
+
+Run 用有限间隔谓词等待，控制唤醒或到期后通过 QueryProcesserDriver 检查持有 token 的各槽，不无限只等 RequestClose，也不依赖不存在的失败 callback。匹配 Failed 时每代记录一次来源/异常并封入口，再同代同步解绑；全部 callback lease 退出后才独占接管旧 context。代次不符或查询失败明确报控制错误，不能改用新 token 解绑他人。
+
+正常 OnWrite/OnClose 由 owner 发出；driver 已失败时控制域不伪调用 owner 回调。替代出口为 Engine 控制域错误报告与可查询 Conn/operation 冻结结果；内部完成订阅在发布状态后锁外唤醒。物理与 callback 未收口不发布 Stopped、不释放 context，保持责任可达；持续 OOM、永久阻塞回调、线程不获调度不承诺有界完成。这里维持既有故障底线，不把假设扩为新需求。
+
+## 7. 当前实现与验证边界
+
+固定依据为 infra `2cb3ebf60a101bb9cbf93f065db4d41e2130d3cd`、coroutine PR #396 合并提交 `1e9f0e8c25de85dde003def65bb58b90bdac0e0b`；R2 原分析使用的 PR head 为 `8d7b4383c8631f4dccad74df088abe54ca000b87`，不冒充 merge SHA。
+
+coroutine 已有通用 driver 枚举、注册、查询、同代同步解绑、Tick/Wait/Wake 与定向首投；不是 infra 的真实 Asio/TCP 集成证明。infra 已有 foundation、EventLoop/StreamConnection/ConnectionBridge/Engine/Client 及旧事件快照路径；**R2 的 Processer driver adapter、原始回调、共享并发 ring、逐写操作完成与 Run 收口尚未实现/验收**。文末旧用例与次数不能转记为 R2 通过。
+
+后续实施复用已有能力，验证自动绑定/回滚、早到 Wake/预算公平、ring Busy 与释放复查、通知合并/尾部 EOF、部分写/真实错误/仍在途超时、raw/Co server-client 真实回环、关闭/迟到完成/残留句柄、Failed 同代解绑接管。先 Linux 小型真实适配核验；本地只冒烟、本功能与直接耦合测试，全量走 PR CI。性能先建立 raw/Co 吞吐、尾延迟、内存和队列峰值基线，不设未经确认的硬门槛。
+
+## 8. 两仓分工与后续接续
+
+coroutine 契约真源为其 [核心运行时契约 §11](https://github.com/yqm-307/bbtools-coroutine/blob/1e9f0e8c25de85dde003def65bb58b90bdac0e0b/agent-docs/2026-09-07-core-runtime-contract.md)，该链接固定的是文档修订前基线；本次配套修改 §11.5 的 owner 原始回调与受保护共享 ring 边界，§11.3–§11.4 锁外调用、callback lease、Failed、同步解绑保持不变。本地候选一致不等于两仓文档已发布；发布后消费仍须记录实际契约及源码/链接 SHA。
+
+本轮只对齐文档，不改代码、依赖 pin、CI、消费者或框架语义，不含 commit/push/合并。两仓规范发布与实现授权仍需后续落实；已确认核心方向不再作为开放需求重问。C++17、`bbt::infra::net`、Boost 优先及现有构建目标保持，不新增依赖或通用异步平台。
+
+---
+
+<details>
+<summary>旧实现与局部验证历史（不约束 R2，不作为 R2 验收依据）</summary>
+
+以下保留旧线程/bridge/事件快照方案的原始记录和链接。带日期的“本轮”“待实现”“未合并”等只描述当时快照；当前目标与实现边界以本文第 1–8 节为准。
 
 ### owner 安全脱离的调用顺序（私有 bridge 切片，已局部验证）
 
@@ -172,26 +163,6 @@ owner 域 StopServiceOwner（封服务 + 物理关闭全部连接，不等待 ha
 
 本节只是私有 bridge 切片的局部验证结论，**不是 Engine 关闭契约的实现**：公共 Engine/accept/connect/UDP/示例、Engine 级 drain 门槛与业务优雅排空仍未实现。
 
-## 7. 当前实现与后续门禁
-
-当前仅有 `bbt::infra_net` foundation/上下文/native socket 与纯逻辑缓冲/Options/LB 候选。独立网络 driver、Engine/Conn、上述 Bridge、Handler 接线和 Close(opt) **尚未实现**；Debug/Release 首包各 16/16 不能充当这些能力的验收。coroutine 查询修复所消费的精确 SHA 与 main 是否合入分开记录。
-
-P3/P4 的最小真实证据应覆盖：
-
-- 记录 main/sub/Scheduler/Processer 的线程 ID 与 context 身份，证明各 driver 不混用；同连接 owner 固定、业务恢复线程可变。
-- 一个业务 handler 挂起时，其他连接和网络 owner 继续进展；同连接 handler/Action 不重入或乱序，有限 readiness 不产生无界协程。
-- 跨线程早完成、队列满、登记失败、超时/取消/关闭竞争及迟到 completion；首胜一次、操作状态不提前释放。
-- 两种读策略的 partial/EAGAIN/预算续投、高水位恢复、慢消费者；stream 与 UDP 分别验证。
-- 单次 fd 移交及失败回滚、部分启动失败、混合 Block/Unblock、撤销/在途 callback、fd 复用与最终 FD/线程/缓冲回落。
-
-文档审查和 docs-only CI 只能证明文档阶段，不证明本节门禁通过。
-
-## 8. 固定来源与两仓分工
-
-- infra 基线 `3136d1de5031a2eec55475e770d5ebbadc3c32da`；新代码候选范围与固定 coroutine 消费版本见 [0010](../decisions/0010-gnet-network-foundation.md)。
-- coroutine 当前 main 基线 `39fdfff71a8a66d98a874b2e71408f9936b1166b`：[`Scheduler::Start/LoopOnce/_CreateProcessers`](https://github.com/yqm-307/bbtools-coroutine/blob/39fdfff71a8a66d98a874b2e71408f9936b1166b/bbt/coroutine/detail/Scheduler.cc)、[`CoPoller::PollOnce/NotifyCustomEvent`](https://github.com/yqm-307/bbtools-coroutine/blob/39fdfff71a8a66d98a874b2e71408f9936b1166b/bbt/coroutine/detail/CoPoller.cc)、[`CoWaiter`](https://github.com/yqm-307/bbtools-coroutine/blob/39fdfff71a8a66d98a874b2e71408f9936b1166b/bbt/coroutine/sync/CoWaiter.hpp)、[`IoExecutor`](https://github.com/yqm-307/bbtools-coroutine/blob/39fdfff71a8a66d98a874b2e71408f9936b1166b/bbt/coroutine/io/IoExecutor.hpp)。引用解释当前代码，不把本次目标冒充这些 SHA 已实现的能力。
-- coroutine 的 runtime 稳定边界由其 `agent-docs/2026-09-07-core-runtime-contract.md`、`api-reference.md`、`user-guide.md` 维护；本次文档 PR 独立于查询修复 [#388](https://github.com/yqm-307/bbtools-coroutine/pull/388)，由用户合并。infra 本文维护网络线程/owner/bridge；双方不复制对方完整接口或 framework 服务语义。
-- 固定 gnet `58b59a11350707153f8c48369693ab9beba7b2fa`：[`engine.activateReactors/start`](https://github.com/panjf2000/gnet/blob/58b59a11350707153f8c48369693ab9beba7b2fa/engine_unix.go)、[`rotate/orbit/run`](https://github.com/panjf2000/gnet/blob/58b59a11350707153f8c48369693ab9beba7b2fa/reactor_default.go)、[`accept0`](https://github.com/panjf2000/gnet/blob/58b59a11350707153f8c48369693ab9beba7b2fa/acceptor_unix.go)、[`eventloop.read`](https://github.com/panjf2000/gnet/blob/58b59a11350707153f8c48369693ab9beba7b2fa/eventloop_unix.go)。未运行 gnet 压测，不声称性能等价或优于它。
 
 ## 9. 测试进程退出约定与已知限制
 
@@ -449,3 +420,6 @@ TCP Engine Stop 验证首错 `not_enough_memory`、对端关闭、线程/FD 回�
 持续资源耗尽不在支持域：不保证强停/析构完成，不保证等待者被唤醒，也不承诺持续故障下的安全析构能力。这不是允许新增 UAF 或泄漏策略；不新增泄漏兜底、强杀、无限重试或 reaper，也不扩建 runtime 停机模型。`Stop`/`Join` 没有整体 deadline；控制命令的 15s 等待超时不取消已 `Accepted` 的命令，不能据此推定物理关闭或线程回收已经完成。强停仍不等 Handler/`OnClose`，不是业务优雅 drain。
 
 原 C1“异常导致 physical waiter 记录残留进而悬空”的具体推测撤销，并非实测漏洞：实际 `CoIoOperation::Complete` → `CoWaiter::Notify` → `CoPollEvent::Trigger` 路径中，timer 撤销的 `DeferDestroyEvent` 在同锁内对首次 `bad_alloc` 有界重做一次；再次失败沿 `_CannelAllFdEvent` → `_Complete` 上抛，被 `Trigger` 的 catch-all 吞掉并返回 0。因而 `Complete` 不会沿这条链向 `OnClosedOwner` 抛出异常，原先据此推断的 swap-back 记录残留前提不成立；这项判断来自实际调用链与异常处理，不是由 `noexcept` 标签推导。持续 OOM 仍可能使带有限 deadline/timer 的等待丢失唤醒，即记录已清空但 wake 未送达；该真实限制保留，不能以撤销原推测冒充持续故障安全。
+
+
+</details>
