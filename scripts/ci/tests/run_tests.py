@@ -52,8 +52,8 @@ CHECKOUT_SHA = "11d5960a326750d5838078e36cf38b85af677262"
 SHA_PIN_RE = re.compile(r"^[^@\s]+@[0-9a-f]{40}$")
 
 REQUIRED = ["changes", "plan"]
-OPTIONAL = ["prepare-deps", "release", "debug"]
-HEAVY = ("prepare-deps", "release", "debug")
+OPTIONAL = ["prepare-deps", "release", "debug", "network"]
+HEAVY = tuple(OPTIONAL)
 
 ENV = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
 
@@ -417,6 +417,50 @@ class PreparedDepsClosureTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# network-only 报告门禁：测试夹具不是构建/运行证据。
+# --------------------------------------------------------------------------- #
+class NetworkReportTests(unittest.TestCase):
+    def setUp(self):
+        import runpy
+        import xml.etree.ElementTree as ET
+        module = runpy.run_path(os.path.join(CI_DIR, 'check_network_tests.py'))
+        self.check = module['check']
+        names = sorted(module['REQUIRED'])
+        names += [f'net.fixture_{i}' for i in range(111 - len(names))]
+        self.registration = {'tests': [{'name': name} for name in names]}
+        self.report = ET.Element('testsuite')
+        for name in names:
+            ET.SubElement(self.report, 'testcase', name=name)
+
+    def test_complete_report(self):
+        self.check(self.registration, self.report)
+
+    def test_empty_or_incomplete_registration_rejected(self):
+        for registration in ({'tests': []}, {'tests': self.registration['tests'][:-1]}):
+            with self.assertRaises(ValueError):
+                self.check(registration, self.report)
+
+    def test_missing_or_duplicate_result_rejected(self):
+        import copy
+        for replacement in (None, self.report[0]):
+            report = copy.deepcopy(self.report)
+            report.remove(report[-1])
+            if replacement is not None:
+                report.append(copy.deepcopy(replacement))
+            with self.assertRaises(ValueError):
+                self.check(self.registration, report)
+
+    def test_failed_error_or_skipped_rejected(self):
+        import copy
+        import xml.etree.ElementTree as ET
+        for tag in ('failure', 'error', 'skipped'):
+            report = copy.deepcopy(self.report)
+            ET.SubElement(report[0], tag)
+            with self.assertRaises(ValueError):
+                self.check(self.registration, report)
+
+
+# --------------------------------------------------------------------------- #
 # 正式 workflow 静态契约（需 PyYAML）
 # --------------------------------------------------------------------------- #
 try:
@@ -573,14 +617,15 @@ class WorkflowStaticTests(unittest.TestCase):
         # 不得再有第二份跨 job 结果脚本（避免不匹配脚本导致空绿）。
         self.assertNotIn("required_result_gate.sh", self.text)
 
-    def test_result_job_aggregates_all_five_jobs(self):
+    def test_result_job_aggregates_all_jobs(self):
         result = self.jobs["result"]
         self.assertEqual(set(result["needs"]), {"changes", "plan", *HEAVY})
         results_expr = result["with"]["results_json"]
         for key in ("changes", "plan", *HEAVY):
             self.assertIn(f'"{key}"', results_expr)
         for ref in ("needs.changes.result", "needs.plan.result",
-                    "needs.prepare-deps.result", "needs.release.result", "needs.debug.result"):
+                    "needs.prepare-deps.result", "needs.release.result", "needs.debug.result",
+                    "needs.network.result"):
             self.assertIn(ref, results_expr)
 
     def test_result_format_templates_render_to_strict_json(self):
@@ -672,13 +717,32 @@ class WorkflowStaticTests(unittest.TestCase):
         self.assertEqual(self.jobs["release"]["timeout-minutes"], 45)
         # 唯一分类门禁不变：live 不新增 job，required/optional 集合与现役一致。
         self.assertEqual(set(self.jobs),
-                         {"changes", "plan", "prepare-deps", "release", "debug", "result"})
-        self.assertEqual(OPTIONAL, ["prepare-deps", "release", "debug"])
+                         {"changes", "plan", "prepare-deps", "release", "debug", "network", "result"})
+        self.assertEqual(OPTIONAL, ["prepare-deps", "release", "debug", "network"])
         # live 承载于 release job，docs-only 由 job 级 if 跳过（code/unknown 必跑）。
         self.assertIn("docs-only", str(self.jobs["release"]["if"]))
         # live 编排脚本本身存在（run.sh 非 inline，另行 bash -n 覆盖）。
         for path in (REDIS_LIVE, MONGO_LIVE):
             self.assertTrue(os.path.isfile(path), path)
+
+    def test_network_job_runs_real_targets_and_checks_reports(self):
+        job = self.jobs['network']
+        self.assertEqual(job['needs'], ['changes', 'plan', 'prepare-deps'])
+        self.assertEqual(job['timeout-minutes'], 20)
+        scripts = '\n'.join(step.get('run', '') for step in job['steps'])
+        for needle in ('-DBBT_INFRA_NETWORK_ONLY=ON', '-DBUILD_TESTING=ON',
+                       '-DCMAKE_BUILD_TYPE=Debug', 'bbt_infra_net_header_selfcheck',
+                       'Test_net_allocation', 'Test_net_b4_contract', 'Example_co_net_service',
+                       '--expect-sha', 'EXPECTED_COROUTINE_SHA', '--show-only=json-v1',
+                       '--output-junit', '--no-tests=error', 'check_network_tests.py',
+                       '--repeat until-fail:5', 'CMAKE_PREFIX_PATH='):
+            self.assertIn(needle, scripts)
+        self.assertNotIn('-DBBT_CORE_SOURCE_DIR=', scripts)
+        self.assertNotIn('continue-on-error', job)
+        uploads = [step for step in job['steps'] if 'upload-artifact@' in step.get('uses', '')]
+        self.assertEqual(len(uploads), 1)
+        self.assertEqual(uploads[0]['if'], '${{ always() }}')
+        self.assertEqual(uploads[0]['with']['if-no-files-found'], 'error')
 
     def test_inline_scripts_pass_bash_n(self):
         for name, job in self.jobs.items():
@@ -768,7 +832,7 @@ class ClassificationRoutingTests(unittest.TestCase):
         plan = self._plan_for('["docs/ci/x.md"]')
         proc = self._evaluate(plan, {
             "changes": "success", "plan": "success",
-            "prepare-deps": "skipped", "release": "skipped", "debug": "skipped",
+            "prepare-deps": "skipped", "release": "skipped", "debug": "skipped", "network": "skipped",
         })
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(json.loads(proc.stdout)["verdict"], "success")
@@ -777,16 +841,25 @@ class ClassificationRoutingTests(unittest.TestCase):
         plan = self._plan_for('["src/x.cc"]')
         proc = self._evaluate(plan, {
             "changes": "success", "plan": "success",
-            "prepare-deps": "success", "release": "failure", "debug": "success",
+            "prepare-deps": "success", "release": "failure", "debug": "success", "network": "success",
         })
         self.assertEqual(proc.returncode, 1)
         self.assertEqual(json.loads(proc.stdout)["verdict"], "failure")
+
+    def test_code_network_failure_or_skip_blocks_result(self):
+        for changed in ('["bbt/infra/net/Engine.cc"]', '[]'):
+            plan = self._plan_for(changed)
+            for status in ('failure', 'cancelled', 'skipped', ''):
+                results = {name: 'success' for name in ('changes', 'plan', *HEAVY)}
+                results['network'] = status
+                proc = self._evaluate(plan, results)
+                self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
     def test_required_cancelled_is_failure(self):
         plan = self._plan_for('["src/x.cc"]')
         proc = self._evaluate(plan, {
             "changes": "cancelled", "plan": "success",
-            "prepare-deps": "success", "release": "success", "debug": "success",
+            "prepare-deps": "success", "release": "success", "debug": "success", "network": "success",
         })
         self.assertEqual(proc.returncode, 1)
 
@@ -794,7 +867,7 @@ class ClassificationRoutingTests(unittest.TestCase):
         plan = self._plan_for("[]", status="failed")
         proc = self._evaluate(plan, {
             "changes": "success", "plan": "success",
-            "prepare-deps": "skipped", "release": "skipped", "debug": "skipped",
+            "prepare-deps": "skipped", "release": "skipped", "debug": "skipped", "network": "skipped",
         })
         self.assertEqual(proc.returncode, 1)
         self.assertEqual(json.loads(proc.stdout)["verdict"], "failure")
@@ -803,7 +876,7 @@ class ClassificationRoutingTests(unittest.TestCase):
         plan = self._plan_for('["src/x.cc"]')
         proc = self._evaluate(plan, {
             "changes": "success", "plan": "success",
-            "prepare-deps": "success", "release": "success", "debug": "success",
+            "prepare-deps": "success", "release": "success", "debug": "success", "network": "success",
         })
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
@@ -812,7 +885,7 @@ class ClassificationRoutingTests(unittest.TestCase):
         plan = self._plan_for('["src/x.cc"]')
         proc = self._evaluate(plan, {
             "changes": "success", "plan": "success",
-            "prepare-deps": "success", "release": "success", "debug": "success",
+            "prepare-deps": "success", "release": "success", "debug": "success", "network": "success",
             "build-and-test": "success",
         })
         self.assertNotEqual(proc.returncode, 0)
