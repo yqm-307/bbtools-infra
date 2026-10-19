@@ -27,7 +27,9 @@
 
 ## I/O 执行边界
 
-新 `bbt::infra_net` 采用 **coroutine runtime 与网络 I/O 域分离** 的目标架构：`Scheduler + Processers` 及其内部等待/Timer/Hook/CoPoller 归 coroutine；infra Engine 的 main/sub reactor 各用自有线程和自有 Asio context，业务 Handler 在 Processer 的受管协程运行。两域通过有界命令、事件快照与既有等待/Notify 连接，不重复驱动 `io::GetExecutor()` 的共享 context，不每个 readiness 无限建协程。默认 stream 主从布局、ReusePort/UDP/client 变体、线程图/完成时序及当前实现差异见 [网络执行域设计](docs/architecture/gnet-network-execution.md)；P0–P7 与 C1–C14 见 [迁移计划](docs/plans/gnet-network-migration.md)。**这些仍是文档候选：就「原已合并基线」而言，独立网络 Engine/Conn/Bridge/Close(opt) 尚未接线**（上表 gnet 候选行是本轮未合入该基线的本地候选，不代表该基线已接线）。
+新 `bbt::infra_net` 的 **R2 TCP 核心契约已获用户确认，尚未实现/验收**：infra 拥有自有 main/sub Asio context 与网络资源，每个 Reactor 自动绑定一个空闲已登记 Processer driver 槽；不新增网络 I/O 线程。原始 `OnAccept/OnRead/OnWrite` 等回调在 owner 非业务协程边界短、非阻塞、不可挂起地运行；协程同步 API 只用既有 CoWaiter/Chan 做薄封装。接收 ring 是并发安全的数据真源，OnRead 仅通知；提交接纳、本地发送完成和业务回包严格分开，普通 EOF/错误/等待超时不自动关连接或重发，协议和业务策略归上层。固定依据是 coroutine PR #396 合并提交 `1e9f0e8c25de85dde003def65bb58b90bdac0e0b`，不表示构建 pin 已升级或两仓已联调。
+
+当前目标见 [网络执行域设计](docs/architecture/gnet-network-execution.md) 与 [0010](docs/decisions/0010-gnet-network-foundation.md)，后续接续见 [迁移计划](docs/plans/gnet-network-migration.md)。上表 gnet 候选行及下方旧消费命令保留为此前实现/局部验证记录，不是 R2 driver、原始回调、共享 ring 或新 Run 生命周期的交付证明；旧自建线程/事件快照/受管 OnTraffic 仍是待改造的实现事实，不再是新目标。不重复驱动 `io::GetExecutor()` 的共享 context，不改变 runtime Timer/Hook/CoPoller，也不迁移其它模块。
 
 [CoTCP/CoUDP 与第三方 Binding 规格](docs/decisions/0005-co-io-adapter-contract-v1.md) 的“proc 执行收发与协议，sche 只检测就绪并唤醒”继续说明旧路径，不覆盖上述新 net 目标。此次不改造或声称已迁移以下历史模块。
 
@@ -35,7 +37,7 @@
 
 ## 资源关闭与请求完成契约（进程寿命运行时）
 
-coroutine 运行时按**进程寿命**存在、不参与业务资源收口（不再有 `Scheduler::Stop()`/restart 与运行时代际）。新 net 的目标关闭模式是 [0010 的 Close(opt)](docs/decisions/0010-gnet-network-foundation.md#closeopt-冻结)：Block/Unblock 共享一次关闭推进，Block 在受管协程等待物理完成而非等待 OnClose；仍待实现与竞争验证，不能当作旧模块的现存接口。以下为**旧模块**的 [0002 co-network/v1 修订记录](docs/decisions/0002-co-network-contract-v1.md) 契约及当前状态，要点：
+coroutine 运行时按**进程寿命**存在、不参与业务资源收口（不再有 `Scheduler::Stop()`/restart 与运行时代际）。新 net 的 R2 目标见 [关闭契约](docs/architecture/gnet-network-execution.md#6-网络关闭不是-runtime-停机)：`RequestClose` 仅封口并请求控制域收口，`Run` 返回才确认网络资源、callback 与同代解绑完成；不等待业务协程或外部句柄归零，关闭后已有接收数据仍可读，不承诺硬 deadline。上述接口是目标、未实测，取代旧 Close(opt) 作为新 net 约束，不改下面的**旧模块** [0002 co-network/v1](docs/decisions/0002-co-network-contract-v1.md) 契约及状态：
 
 - `ICoCloseable` 只有 `void Close() noexcept` + `bool IsClosed() const noexcept`。`Close()` 由资源 owner/framework manager 主动调用、同步完成物理释放并返回：**返回即该对象拥有的物理资源已释放、后端不会再访问它们**；未发送数据直接丢弃、不做 flush、不重开；**没有「等待关闭完成」的入口**。
 - 已删除且不保留兼容壳：`RequestClose`、`WaitClosed`、`ReleaseClosed`、`CloseStatus` 等待结果枚举、`CompletionSignal`、`CancellationToken`/`CancellationSource`（含 `CallOptions.cancel` 字段）、`RuntimeGeneration`/`CurrentRuntimeGeneration`、`Scheduler::Stop()`/restart。
