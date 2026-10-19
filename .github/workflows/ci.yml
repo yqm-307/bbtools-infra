@@ -695,11 +695,18 @@ jobs:
       - name: "network-only Debug 构建（独立目录，JOBS=3）"
         run: |
           set -euo pipefail
-          # coroutine-first consumer 的既有配方显式使用 ccache，缺失即失败，不静默跳过。
-          command -v ccache
+          LAUNCHER=""
+          if [ "${{ env.CACHE_ENABLED }}" = "true" ] && \
+             [ "${{ github.event_name }}" != "pull_request" -o "${{ github.event.pull_request.head.repo.full_name }}" = "${{ github.repository }}" ] && \
+             command -v ccache >/dev/null 2>&1; then
+            LAUNCHER="-DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+            echo "network-only: ccache enabled (in-run only)"
+          else
+            echo "network-only: ccache unavailable/disabled; direct compile"
+          fi
           cmake -S "$GITHUB_WORKSPACE/infra" -B "$NETWORK_BUILD_DIR" -G Ninja \
             -DBBT_INFRA_NETWORK_ONLY=ON -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Debug \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            $LAUNCHER \
             -DBOOST_ROOT="$BOOST_PREFIX" -DCMAKE_PREFIX_PATH="$BOOST_PREFIX" \
             -DBBT_COROUTINE_SOURCE_DIR="$COROUTINE_DIR"
           # 子 consumer 由 CTest configure，不继承父 cache；显式传递同一锁定 Boost 前缀。

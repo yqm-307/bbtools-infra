@@ -737,12 +737,48 @@ class WorkflowStaticTests(unittest.TestCase):
                        '--output-junit', '--no-tests=error', 'check_network_tests.py',
                        '--repeat until-fail:5', 'CMAKE_PREFIX_PATH='):
             self.assertIn(needle, scripts)
+        self.assertIn('command -v ccache', scripts)
+        self.assertIn('github.event_name', scripts)
+        self.assertIn('CMAKE_CXX_COMPILER_LAUNCHER', scripts)
+        self.assertIn('ccache unavailable/disabled; direct compile', scripts)
+        self.assertIn('$LAUNCHER', scripts)
         self.assertNotIn('-DBBT_CORE_SOURCE_DIR=', scripts)
         self.assertNotIn('continue-on-error', job)
         uploads = [step for step in job['steps'] if 'upload-artifact@' in step.get('uses', '')]
         self.assertEqual(len(uploads), 1)
         self.assertEqual(uploads[0]['if'], '${{ always() }}')
         self.assertEqual(uploads[0]['with']['if-no-files-found'], 'error')
+
+    def test_network_launcher_fallback_and_policy(self):
+        step = next(step for step in self.jobs['network']['steps']
+                    if 'LAUNCHER=' in step.get('run', ''))
+        selection = step['run'].split('cmake -S ', 1)[0]
+        with tempfile.TemporaryDirectory() as td:
+            fake = os.path.join(td, 'ccache')
+            with open(fake, 'w', encoding='utf-8') as handle:
+                handle.write('#!/bin/sh\nexit 0\n')
+            os.chmod(fake, 0o700)
+            # 执行真实 workflow 条件（不运行 cmake），覆盖缺工具/禁用/fork/可用。
+            for available, enabled, fork, expected in (
+                (False, True, False, ''), (True, False, False, ''),
+                (True, True, True, ''),
+                (True, True, False, '-DCMAKE_CXX_COMPILER_LAUNCHER=ccache'),
+            ):
+                script = selection
+                replacements = {
+                    '${{ env.CACHE_ENABLED }}': str(enabled).lower(),
+                    '${{ github.event_name }}': 'pull_request',
+                    '${{ github.event.pull_request.head.repo.full_name }}':
+                        'external/fork' if fork else 'owner/repo',
+                    '${{ github.repository }}': 'owner/repo',
+                }
+                for key, value in replacements.items():
+                    script = script.replace(key, value)
+                script += '\nprintf "SELECTED=%s\\n" "$LAUNCHER"\n'
+                env = dict(ENV, PATH=td if available else os.path.join(td, 'absent'))
+                proc = run(['/bin/bash', '-c', script], env=env)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn(f'SELECTED={expected}\n', proc.stdout)
 
     def test_inline_scripts_pass_bash_n(self):
         for name, job in self.jobs.items():
