@@ -18,6 +18,9 @@ public:
     // （无 if_nametoindex/atoi 回退）。scope 0 合法且 ToString 不输出。
     static Address  Ip(const std::string& host, int port, std::error_code& error);
     static Address  Unix(const std::string& path, std::error_code& error, bool abstract = false);
+    // 内部/适配使用：从已 accept 的 native sockaddr 构造值快照（不保留指针）。
+    // 失败时返回无效 Address（长度超 storage 或空）。
+    static Address  FromNative(const sockaddr* addr, socklen_t length);
     AddressFamily   Family() const noexcept;
     std::uint16_t   Port() const noexcept;
     std::string     ToString() const;
