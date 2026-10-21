@@ -1,8 +1,9 @@
-# bbtools-coroutine 候选绑定出处（本轮新 net 候选 · 固定 commit 重绑定）
+# bbtools-coroutine 消费出处（新 net 候选期固定 commit）
 
-本说明记录本仓新 net 候选（`bbt::infra_net`）本轮集中验证所绑定的上游来源。
-**本轮已把消费出处从「未提交 dirty 差异」重绑定到已合并固定 commit**：不再依赖未发布补丁或未跟踪文件即可重建源码。
-本说明仍**不是已发布版本声明**——本仓该候选自身尚未合入 main。
+本说明记录 `bbt::infra_net` 候选期集中验证所绑定的上游来源，以及旧 dirty 候选与该固定 commit 的关系。
+**候选已随 PR #84 合入 main**（补丁见 `bbt/infra/net/`），本文因此是**历史出处记录**，不是当前构建 pin：
+CI 从 `coroutine@main` 拉取 coroutine 并在 run 中记录实际 SHA（`prepare-deps` 的 `coro_ref`）。
+下文的 `8ae6a889…` 是该候选期用来证明「可脱离未提交差异重建」的固定落点，仍可据此复现当时结论。
 
 ## 固定上游 commit
 
@@ -40,28 +41,27 @@
   并由 `unit_test/CMakeLists.txt` 引用；不再存在「diff 未覆盖的未跟踪文件」这一不可重建缺口。
 - **不得据此推断二进制相同**：文件内容相同 ≠ DSO 相同，一切以实测 DSO、`readelf`、`ldd` 为准。
 
-## 本轮实际链接运行库（从固定 commit 干净重建）
+## 候选期实际链接运行库（从固定 commit 干净重建）
 
 - `libbbt_coroutine.so` sha256 `0f8e03796304319ab110f3d1d07403c71fe8901490639b7c09fc28ff2cdee5b0`
   （SONAME `libbbt_coroutine.so`；GNU build-id `f28d22a77311202fe7d796844c612c90fe1ebcdc`）。
 - 产出位置：`infra-refresh-160/build/_deps/bbtools-coroutine/lib/`；源码输入是只读检出
   `infra-refresh-160/co-fixed`（detached @ `8ae6a889…`，`git status --porcelain --untracked-files=all` 为空），
   且不含指向旧候选树的 git alternates。
-- 被测二进制与该 DSO 的 `ldd`/`RUNPATH` 实解析一致：`net_foundation_consumer`、公开示例
-  `Example_co_net_service`、`Test_net_engine_server`、`Test_net_foundation`、`Test_net_client_connect` 等。
+- 候选期被测二进制与该 DSO 的 `ldd`/`RUNPATH` 实解析一致（含 `net_foundation_consumer`、公开示例
+  `Example_co_net_service`、`Test_net_foundation` 等；当时列出的 `Test_net_engine_server`/`Test_net_client_connect`
+  目标已在 PR #84 重建中删除，不再是当前目标名）。
 - 旧 DSO `2a3b084b4ba42f528968458e367247979b7761a2e574faab06c27e5915e63ebe` 属于旧 dirty 候选，
   **不得**与固定 commit 的证据混用或互相替代。
 
-## 本轮验证边界（固定 commit）
+## 候选期验证边界（固定 commit）
 
-- **已完成**：从该固定 commit 干净重建（Debug / ccache / `BBT_INFRA_NETWORK_ONLY=ON`），
-  固定版本影响面 **107/107 通过、0 失败、0 skip**（= 152 的 98 项影响面 + 9 项 socket primitives / `net.context_no_create` 门禁），
-  含 `net.engine_shutdown_request_*`、`net.engine_tick_*`、`net.client_*`、150 家族守卫、
-  151 多 loop/LB/预算、负编译 `net.udp_high_level_compile_reject`，以及公开示例 4 模式真实重链运行。
-- **未完成（不得据本轮升级为已交付）**：Release 构建、ASAN、完整 P6 压测、infra CI。
-  本仓该候选自身仍未独立审查、未提交、未合入 main。
-- **旧证据边界**：旧候选的 98 项与有界 P6 结果绑定旧 dirty DSO，**不能**作为固定 commit 的 PASS 依据；
-  本轮不引用其绿灯。
+- **候选期已完成**：从该固定 commit 干净重建（Debug / ccache / `BBT_INFRA_NETWORK_ONLY=ON`），
+  当时固定版本影响面 107/107 通过、0 失败、0 skip。该计数与其中的用例名只属于候选期实现，
+  随 PR #84 重建后测试面已变化（现为 `tests/net/` 注册集，由 `scripts/ci/check_network_tests.py` 核对），
+  不能作为当前通过证据；当前证据见合入后 CI run。
+- **候选期未完成**：Release 构建、ASAN、完整压测。这些限制在合入后仍成立，见 0010 与执行域文档的未覆盖清单。
+- **旧证据边界**：旧候选的 98 项与有界压测结果绑定旧 dirty DSO，**不能**作为固定 commit 的 PASS 依据。
 
 ## 限制
 
