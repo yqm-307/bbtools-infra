@@ -22,6 +22,6 @@
 //   家族门）新增真实入口。
 //
 // 相关记录：README「模块交付状态」、docs/decisions/0010-gnet-network-foundation.md、
-// docs/plans/gnet-network-migration.md、docs/architecture/gnet-network-execution.md
+// docs/architecture/gnet-network-execution.md
 // 的 UDP 暂缓注记。
 #error "UDP is not supported yet / UDP 暂不支持: bbt::infra::net has no high-level UDP entry (see bbt/infra/net/Udp.hpp)"

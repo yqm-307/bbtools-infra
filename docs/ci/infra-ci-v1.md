@@ -1,9 +1,10 @@
 # infra-ci-v1：bbtools-infra 正式 hosted 普通 CI（Issue #50 正式切换）
 
-> 状态：**已合入 main**（commit `28d929bea87c1e0470a93f2919da2c73a758c451`，PR #73），并已由真实
-> hosted run 验证（run `37948171767`，全 job success，总时长 8m50s）。本文件由影子文档
+> 状态：**已合入 main**（切换提交 `28d929bea87c1e0470a93f2919da2c73a758c451`，PR #73）。切换后的
+> 首个全 job 验证 run 为 `37948171767`；TCP network-only job 由 PR #84 加入后，由主线 run
+> `39305113509`（head = `99d0821a`，event `push`）验证为 success。本文件由影子文档
 > `docs/ci/infra-shadow-v1.md`（随影子入口一并退役）改写而来；产品 C++、CMake、依赖锁、AGENTS、
-> release、mirrors 均未改。在线事实以 run `37948171767` 为准；仅个别项仍标 UNVERIFIED（见 §8）。
+> release、mirrors 均未改。在线事实以最近一次相关 run 的元数据与产物为准；仅个别项仍标 UNVERIFIED（见 §8）。
 
 ## 1. 定位与范围
 
@@ -38,17 +39,20 @@ yqm-307/bbt-framework/.github/workflows/bbtools-classify-v1.yml@1c0b0fb0ebc8e7ca
 | `依赖准备（固定源前缀归档）` | 复现锁定 Boost 1.90（`scripts/ci/prepare_boost.sh`）+ 唯一 recipe `scripts/prepare_resource_deps.sh` 源码构建 hiredis/mongoc/mongocxx + 按 framework 已发布固定 40 位 SHA（`bd9c4905…`）download 并 sha256 fail-closed 校验配方后复现锁定 protobuf 3.21.12 前缀（`scripts/prepare_protobuf.sh`）+ coroutine/core 源码 → 单一 tar artifact（含 boost-prefix/protobuf-prefix，sha256 digest） |
 | `Release 构建 & ctest` | 下载并校验 sha256 解包 → resource-prefix A/B → Release 全量 `cmake`（`-DBBT_PROTOBUF_PREFIX` 真实前缀，不静默回退）+ `ctest -j1`（含 redis.unit/mongo.unit 与 7 个正式 RPC 名注册断言：rpc.payload/rpc.runtime/rpc.runtime_faults/rpc.runtime_lifetime/rpc.runtime_roundtrip/rpc.wire_contract/rpc.wire_roundtrip，且全量实跑）→ 无 wire 独立 configure/build 只跑 `rpc.runtime_no_wire`（HTTP 闭包无 protobuf 符号）→ Release 归档无 Debug 观测符号 → 依赖来源核查 → Redis/Mongo 真实容器 A/B/C 与 CoTCP binding live；job 上限 45 分钟，Redis/Mongo live step 上限分别 19/16 分钟（包含 kill-after 宽限） |
 | `Debug 生命周期定向门禁（8 项，零跳过）` | 下载同一归档 → Debug 8 项既有门禁 + 同 7 项 RPC 定向集合（共 15 项零跳过，JUnit expected 精确更新，peers 加入 build 目标）；job 名保持现役 check 名不变 |
+| `TCP network-only 构建与契约测试` | 下载同一归档并核实际 coroutine SHA → 独立目录 `-DBBT_INFRA_NETWORK_ONLY=ON` Debug 构建（显式 9 个目标）→ `ctest -j1 --no-tests=error` 跑全注册集并由 `scripts/ci/check_network_tests.py` 拒绝缺项/重复/失败/跳过 → `net.b4_co_pingpong_strict` 复跑 5 次 → 上传 `network-test-results` 产物；job 上限 20 分钟 |
 | `编译 & ctest` | 唯一权威结果汇聚（`always()`，调用已发布 callee result 契约） |
 
-`prepare-deps` / `release` / `debug` 均为重型 job（callee `optional`），仅 `docs-only`
-允许显式跳过；`code` / `unknown` 执行全部。`changes` / `plan` 为必跑（callee `required`）。
+`prepare-deps` / `release` / `debug` / `network` 均为重型 job（callee `optional`，见
+`optional_checks_json`），仅 `docs-only` 允许显式跳过；`code` / `unknown` 执行全部。
+`changes` / `plan` 为必跑（callee `required`）。`network` 是独立入口：旧模块 Release/Debug
+全绿不构成新 net 的覆盖证据，反之亦然。
 
 ## 4. 分类与结果：真实复用已发布 callee
 
 - **分类**：`changed_files` 由本仓真实 diff 计算后作为**受限数据**传入；`source`（`github.sha`）
   与 callee automation 身份由 callee 自身 `job.workflow_*` 分离解析，不解析 caller 变量。
 - **结果**：`result` job（check 名保持旧 required 名「编译 & ctest」）恒 `always()`，
-  把 5 个真实 `needs.*.result`（`changes`/`plan`/`prepare-deps`/`release`/`debug`，含
+  把 6 个真实 `needs.*.result`（`changes`/`plan`/`prepare-deps`/`release`/`debug`/`network`，含
   `skipped`）交给 callee result 契约。任一必跑 job `failure`/`cancelled`/空/意外 `skipped`
   → `verdict=failure` → 调用非零失败。同名 check「编译 & ctest」只有这一个 producer。
 - **保守回退**：`changes` 失败致其 outputs 为空时，`result` 显式回退为保守值
@@ -108,11 +112,24 @@ ccache launcher 是否启用（runner 镜像自带 ccache 时），不改变任�
 - 各 job 在 hosted 的实际时长：`依赖准备（固定源前缀归档）`≈2m18s、`Release 构建 & ctest`≈5m33s、
   `Debug 生命周期定向门禁（8 项，零跳过）`≈2m41s，均在现役 15 分钟预算内，未触发超时。
 
+**TCP network-only 门禁（PR #84 加入）**：
+
+- 合入前：PR #84 的交接记录记载 head `9f8e6019` 的 run `39290786827` 中 network job success，
+  并核对 same-run `network-test-results` 的 `registered.json` 与 `network.xml` 一致（111 项注册、
+  111 项实跑、0 失败、0 跳过）；`net.b4_co_pingpong_strict` 在其中通过并额外复跑 5 次。
+- 合入后：主线 run [39305113509](https://github.com/yqm-307/bbtools-infra/actions/runs/39305113509)
+  （head `99d0821a`，event `push`）全部 job success，含 `依赖准备`、`Release 构建 & ctest`、
+  `Debug 生命周期定向门禁`、`TCP network-only 构建与契约测试` 与 `编译 & ctest` 汇聚。
+- 边界：本次整理读取了 PR 交接记录与 run 元数据，没有重新下载产物逐例复核，也没有本地重跑；
+  不扩张为新 net 的 Release/sanitizer/长时压力或旧模块覆盖证据。
+  切换前 `37948171767` 的 network 结论不存在（job 尚未加入）。
+
 **仍未核实（UNVERIFIED）**：
 
-- hosted 实际工具链版本（`cmake`/`g++`/`ninja`/Boost）与 Boost 下载校验的真实执行：本轮未读 run 日志，绿色 run 不代替版本记录。
+- hosted 实际工具链版本（`cmake`/`g++`/`ninja`/Boost）与 Boost 下载校验的真实执行：未读 run 原始日志，绿色 run 不代替版本记录。
 - `result` job（reusable 调用）在平台上的 required check 名与 job `name`「编译 & ctest」的精确
   对应、required(context,app) 的精确切换属 F3，须在线读回（本轮未读回；run 已产出以该名为前缀的
   汇聚 check 并 success，但不足以断言 required context 已精确切换）。
-- `coroutine@main` / `core@master` 仍沿用现役可变分支头，实际 SHA 由 run 记录。
+- `coroutine@main` / `core@master` 仍沿用现役可变分支头，实际 SHA 由 run 记录；network job 只核
+  同一 run 内 coroutine SHA 与 `prepare-deps` 输出一致，不构成跨 run 的可复现 pin。
 - 历史 run `37948171767` 的 live 组（`redis.live`/`mongo.live`/`redis.cotcp_binding.live`）为 Skipped，不能作为新增 live 门禁已执行的证据。新增门禁与逐条遗留核销见 [Redis/Mongo 验收说明](../redis-mongo-acceptance.md)；在线验收以相应 PR 的精确 head 和合入后 main run 日志为准。

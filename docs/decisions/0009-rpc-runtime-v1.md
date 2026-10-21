@@ -1,6 +1,6 @@
 # RPC Runtime v1：infra 通用能力与 framework 消费边界
 
-状态：候选实现随 waypoint `rpc-infra-foundation` 推进；未合并前不作为两仓 main 已交付事实。
+状态：**已合入 main**（PR #79，合入提交 `3136d1de5031a2eec55475e770d5ebbadc3c32da`）。framework 侧接线与预算验收已在 Issue #2 的交接评论公开（framework `deps.lock` 固定本仓该 SHA）。本文描述当前交付的契约与边界；第 6 节的本地证据是候选期实测记录，不能替代合入后 PR CI 与 framework 集成的结论。
 
 ## 1. 目的与边界
 
@@ -57,32 +57,32 @@ result<std::shared_ptr<RpcServer>> ListenRpc(
 | `bbt-framework/framework/include/bbt/framework/CoRpc.hpp` 的业务包装 | 保留薄包装，映射 infra 唯一 wire/codec | 兼容 Parse/From/ProtoCodec 消费者，禁止第二套字节规则 |
 | `CoApp` 路由、方法表、RequestScope、Actor/有序票据、framework.actor 错误域 | 保留 framework | 属于服务语义与治理，不下沉 infra |
 
-## 4.1 codec 兼容映射（waypoint 3-3 前置候选）
+## 4.1 codec 兼容映射
 
-新增 `include/bbt/infra/rpc/RpcPayload.hpp`：infra 唯一的位置参数 payload codec 下层算法，供 3-3 消费侧迁移前置。它是 framework `CoRpc.hpp`（基线 `bd9c4905` 的 `rpc_detail` 通用区间 23-251 行）的逐位等价收敛，**不**改 framework、不新增第二套字节规则：
+`include/bbt/infra/rpc/RpcPayload.hpp` 是 infra 唯一的**位置参数 payload codec** 下层算法，供 framework 消费侧迁移使用。它是 framework `CoRpc.hpp`（基线 `bd9c4905` 的 `rpc_detail` 通用区间 23-251 行）的逐位等价收敛，**不**改 framework、不新增第二套字节规则：
 
 - **字节规则**：与旧源完全一致——`count(u32 LE)` + 逐字段 `[tag(u8)][len(u32 LE)][payload LE]`；tag 数值 `Bool=1/Int=2/Uint=3/Float=4/String=5/Bytes=6` 不重排；字符串按原始 UTF-8 字节直写，整数/浮点小端。**不是** protobuf wire，也不伪装成 protobuf。
 - **导出面**（复用旧名，便于机械迁移，未新增 registry/codecbase/polymorphism）：`WireType`、`wire_type_v`/`scalar_supported_v`/`is_bytes_v`/`Decay`、`PutU32`/`TakeU32`、`EncodeOne`/`DecodeOne`/`DecodeAt`/`DecodeTuple`/`EncodeTuple`，以及 schema 常量 `kRpcPositionalSchema = "bbt.rpc.positional/v1"`（值等于旧 `kCoRpcPositionalSchema`）。
 - **错误码保持**：结构/字节违规 `ProtocolError`（前缀 `rpc payload: `）、类型不匹配 `TypeMismatch`、序号越界与 count 不匹配 `InvalidArgument`。
-- **ProtoCodec seam**：infra 只给无 protobuf include 的默认 trait `ProtoCodec<T>{ kDefined=false }` 与 `is_proto_codec_v`。`CoRpcReq/CoRpcResp` 业务包装与业务 ProtoCodec 特化仍留 framework；3-3 可令 framework `rpc_detail::ProtoCodec` 继承本默认 trait 或薄兼容，从而保留既有用户特化、不因换 namespace 失效。infra 不 include 任何业务 proto，也不承载业务包装。
+- **ProtoCodec seam**：infra 只给无 protobuf include 的默认 trait `ProtoCodec<T>{ kDefined=false }` 与 `is_proto_codec_v`。`CoRpcReq/CoRpcResp` 业务包装与业务 ProtoCodec 特化仍留 framework；framework 侧可令 `rpc_detail::ProtoCodec` 继承本默认 trait 或薄兼容，从而保留既有用户特化、不因换 namespace 失效。infra 不 include 任何业务 proto，也不承载业务包装。
 - **收敛的潜在 UB**：迁移时对旧实现隐含 UB 面加编译期约束——整数仅 ≤8 字节（旧代码按 `sizeof(D)` 写字节并在 `len<8` 时符号扩展，>8 字节会左移越界）、浮点仅 4/8 字节（旧代码按 4/8 字节 memcpy，`long double` 等会错宽）；超出即编译期拒绝，不扩张类型支持。
 - **32 位长度显式检查**：写字段长度前经 `FitsU32` 判定，超 32 位上界返回 `InvalidArgument`，不静默截断。
 - **命名/依赖**：`namespace bbt::infra::rpc`（不超三层），`Error`/`result` 取 infra，无 framework 依赖。
 
-本小节只是下层前置：framework 接线、`CoRpcReq/CoRpcResp` 薄包装改造与 3-3 勾选均未完成。验证目标 `rpc.payload`（`tests/Test_rpc_payload.cc`，只链接 `bbt::infra_common`）：golden 期望字节取自旧源规则的 literal，decode 侧用同一 literal 独立解回；旧源/新源字节级等价由一次性交叉验证程序（不进仓）另行比对。旧源 pin：rev `bd9c4905…`、blob oid `08d1c954…`、sha256 `ae37d61f…`。
+本小节只定义下层契约：framework 的 `CoRpcReq/CoRpcResp` 薄包装改造、接线与上层策略随 framework 侧任务推进。验证目标 `rpc.payload`（`tests/Test_rpc_payload.cc`，只链接 `bbt::infra_common`）：golden 期望字节取自旧源规则的 literal，decode 侧用同一 literal 独立解回；旧源/新源字节级等价由一次性交叉验证程序（不进仓）另行比对。旧源 pin：rev `bd9c4905…`、blob oid `08d1c954…`、sha256 `ae37d61f…`。
 
 ## 5. 依赖与构建
 
-- infra 候选基线：`bda31481807ca2be67e8b141f96bb375e861f382`。
-- coroutine 验证输入：`5c10c68603260e3204c337638b1e3bf10658661a`，包含 `WaitTypes.hpp` 与进程寿命运行时公共头。
-- Protobuf 前缀：Issue #8 已锁定的 3.21.12 provenance；本轮实际命中 `libprotobuf.a` SHA256 `3e3e4ae1f24b2dd52e8104e7af229918a2d504274a08f7d660aaff59bae7a2de`。
-- framework 调查/接续基线 `bd9c490541ccad10cf32e15b91bb40104aa86118` 的 `deps.lock` 固定 infra `162bb5fd1340e8b3c043086e8ed753aa5ec533cb`。本机旧 framework HEAD `e35894c9846a14043ce10c3bce4ba885c17bf3b3` 固定 `0a40b702935bd6a640c836d4aadefc9b87d974df`，不是本包接线基线；保留其未提交改动，不用它覆盖较新证据。framework 接线前必须固定实际 infra 候选完整 SHA，不以本地安装或两个 main 名称相同代替。
+- 合入基线：`3136d1de5031a2eec55475e770d5ebbadc3c32da`（PR #79）。framework 侧 `deps.lock` 固定该 SHA。
+- coroutine 验证输入：`5c10c68603260e3204c337638b1e3bf10658661a`，包含 `WaitTypes.hpp` 与进程寿命运行时公共头。该 SHA 是候选期验证输入，不等于 CI 现取值；CI 从 `coroutine@main` 拉取并在 run 中记录实际 SHA。
+- Protobuf 前缀：Issue #8 已锁定的 3.21.12 provenance；候选期实测命中 `libprotobuf.a` SHA256 `3e3e4ae1f24b2dd52e8104e7af229918a2d504274a08f7d660aaff59bae7a2de`，CI 侧由 `scripts/prepare_protobuf.sh` 与 `BBT_PROTOBUF_PREFIX` 强制校验，不静默回退。
+- framework 消费：framework PR #55 接线、PR #56 补预算验收，最终 `aeafaae7a146a9ec1bcb6f5d3e2e5b6a06993975`；其 `deps.lock` 固定本仓 `3136d1de…` 与 coroutine `7bcda3b078f975ff2978424be7f6ba38e04fb7f6`。更早的调查基线 `bd9c4905…` 及其固定的 `162bb5fd…` 只作历史参考，不再是当前接线依据。
 - 有 wire 构建：`BBT_PROTOBUF_PREFIX` 必须通过版本、runtime、库 SHA 和 pkg-config provenance 检查，并实际定义 `BBT_INFRA_HAS_RPC_WIRE`、生成/链接 `bbt_infra_rpc_proto`；framework 接线还必须启用 `BBT_FRAMEWORK_HAS_RPC_WIRE` 正式分支。
 - 无 wire 构建：`bbt_infra_http` 仍应独立编译；RPC 工厂 stub 编入 HTTP target，调用返回 `RuntimeUnavailable`；不存在 `bbt_infra_rpc` target，也不留下未解析符号。
 
-## 6. 已验证证据
+## 6. 候选期验证记录
 
-在全新 scratch build 目录、C++17、Boost 1.90 下：
+以下为合入前候选 worktree 的实测记录（全新 scratch build 目录、C++17、Boost 1.90），保留作实现细节证据：
 
 - `cmake` 配置成功，Protobuf 3.21.12 同源与库 SHA 命中。
 - `cmake --build ... --target Test_rpc_runtime bbt_rpc_runtime_peer Test_rpc_runtime_roundtrip bbt_rpc_wire_peer Test_rpc_wire_contract Test_rpc_wire_roundtrip -j2` 成功。
@@ -90,7 +90,7 @@ result<std::shared_ptr<RpcServer>> ListenRpc(
 - `rpc.runtime` 实测 local-min 期限不放大、handler 结构化错误、关联字段不匹配、调用方已过期的确定 `TimedOut`；`rpc.runtime_roundtrip` 不经 framework 实测公开 RpcClient/RpcServer 双进程 success 与 `NotFound`。
 - 不带 `BBT_PROTOBUF_PREFIX` 的独立配置，`cmake --build ... --target bbt_infra_http -j2` 成功；RPC 工厂不导出聚合 target，HTTP target 仍可链接。
 
-模块边界复核（本候选轮，隔离 build，`-DBBT_INFRA_STRINGENT_DEBUG=OFF`、ccache、`-j2`）：
+模块边界复核（候选期，隔离 build，`-DBBT_INFRA_STRINGENT_DEBUG=OFF`、ccache、`-j2`）：
 
 - 有 wire：`bbt_infra_rpc` 为 STATIC，`nm` 显示 `NetworkRuntime::CreateRpcClient/ListenRpc` 只在该库定义；`libbbt_infra_http.a` 无这两个符号（无第二份定义，无 ODR 冲突）。
 - HTTP-only 消费者链接闭包不含 protobuf：`Test_http_loopback` 与 `Test_tcp_runtime_factory`（配置了 `BBT_PROTOBUF_PREFIX` 的构建）的 `link.txt` 只含 `libbbt_infra_http/http/tcp/transport/udp`，`grep -i protobuf|rpc_envelope|bbt_infra_rpc` 无命中；`http.loopback` 正常运行。
@@ -98,4 +98,4 @@ result<std::shared_ptr<RpcServer>> ListenRpc(
 - 无 wire：`cmake` 配置不导出 `bbt_infra_rpc`（tests/CMakeLists 的 FATAL_ERROR 门禁未触发）；`nm libbbt_infra_http.a` 显示 stub 版 `NetworkRuntime::CreateRpcClient/ListenRpc` 在其中；`rpc.runtime_no_wire` Passed，工厂返回 `RuntimeUnavailable`。
 - endpoint 边界改动未改协议/默认行为：RPC 调用签名、错误码、owner 收口、local-min 预算不变；仅把 `RpcBaseUrl` 从复用 `http_detail::ParseHttpUrl` 改为本地 authority 边界检查，host/port 完整性仍由公开 `HttpClient` 校验。
 
-以上是候选 worktree 的证据，不等于已合入 infra main，也不等于 framework 集成完成。尚未覆盖 framework Service/Actor、跨语言 GetValue、真实 Service→Service、预算跨 hop 与 20ms reserve 的组合验收。
+以上是候选期 worktree 的证据，合入后由 PR CI 与 framework 集成验收接续。尚未覆盖：framework Service/Actor、跨语言 GetValue、真实 Service→Service 跨机器链路、预算跨 hop 与 20ms reserve 的组合验收、可选 `dual_service` 示例、全套 sanitizer 门禁。
