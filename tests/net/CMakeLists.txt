@@ -147,3 +147,73 @@ add_test(NAME net.udp_high_level_compile_reject COMMAND ${CMAKE_COMMAND}
     "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/udp_reject_probe"
     -P "${_net_consumers}/expect_udp_compile.cmake")
 set_tests_properties(net.udp_high_level_compile_reject PROPERTIES TIMEOUT 120)
+
+# --- T1 coroutine pin 负向/正向 ctest（cmake -P 级，轻量不编译）--------------
+# pin 唯一真源 cmake/coroutine.sha → CoroutinePin.cmake 读取；本组覆盖：
+#   命中（positive）、错误 SHA（wrong_sha）、tracked 脏（dirty）、消费面内
+#   untracked 源码输入（untracked_src）、非 git 树（no_git）、伪造 manifest
+#   （manifest_rejected——自我声明不是来源证据）、普通路径复用 target 来源
+#   不一致（reuse_mismatch）与同源放行（reuse_ok）。
+# 所有 stub 树在 build 临时目录构造，不触碰真实 coroutine 检出。
+set(_pin_module "${PROJECT_SOURCE_DIR}/cmake/CoroutinePin.cmake")
+set(_pin_probe_root "${CMAKE_CURRENT_BINARY_DIR}/pin-probes")
+foreach(_case positive wrong_sha dirty no_git untracked_src manifest_rejected)
+    add_test(NAME net.pin_${_case} COMMAND ${CMAKE_COMMAND}
+        "-DPIN_CASE=${_case}"
+        "-DPIN_MODULE=${_pin_module}"
+        "-DWORK_DIR=${_pin_probe_root}/${_case}"
+        "-DREAL_COROUTINE_DIR=${BBT_COROUTINE_SOURCE_DIR}"
+        -P "${_net_consumers}/pin_expect.cmake")
+    set_tests_properties(net.pin_${_case} PROPERTIES TIMEOUT 120)
+endforeach()
+# 普通路径「已有 bbt_coroutine target 来源复核」的正负两侧（configure 级）。
+foreach(_kind mismatch ok)
+    add_test(NAME net.pin_reuse_${_kind} COMMAND ${CMAKE_COMMAND}
+        "-DBUILD_ROOT=${CMAKE_CURRENT_BINARY_DIR}"
+        "-DGENERATOR=${CMAKE_GENERATOR}"
+        "-DPIN_MODULE=${_pin_module}"
+        "-DREAL_COROUTINE_DIR=${BBT_COROUTINE_SOURCE_DIR}"
+        "-DSTUB_DIR=${_net_consumers}/source_dir_mismatch/stub"
+        "-DPIN_KIND=${_kind}"
+        -P "${_net_consumers}/expect_pin_reuse.cmake")
+    set_tests_properties(net.pin_reuse_${_kind} PROPERTIES TIMEOUT 300)
+endforeach()
+
+# --- infra-perf 闭环（可选，默认 OFF）：纯 TCP echo 基准 harness。---------------
+# server(raw/co 双模式) 与 loadgen(独立进程参照实现，不链接被测库)；由
+# scripts/bench/driver.py 跨进程编排。不进 ctest 默认负载、不进全量构建目标；
+# 仅 -DBBT_INFRA_PERF_BENCH=ON 时注册目标与 net.perf_* 冒烟。正式计时由
+# 验证者经 driver.py 驱动；这里只保证目标可编译+短冒烟成立。
+option(BBT_INFRA_PERF_BENCH "注册 infra-perf 纯 TCP 基准 harness（默认 OFF）" OFF)
+if(BBT_INFRA_PERF_BENCH)
+    add_executable(bbt_net_tcp_echo_server perf/tcp_echo_server.cc)
+    target_include_directories(bbt_net_tcp_echo_server PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/perf)
+    target_link_libraries(bbt_net_tcp_echo_server PRIVATE
+        bbt::infra_net Boost::headers)
+    target_compile_features(bbt_net_tcp_echo_server PRIVATE cxx_std_17)
+    target_compile_options(bbt_net_tcp_echo_server PRIVATE -Wall -Wextra -Wpedantic)
+
+    add_executable(bbt_net_tcp_loadgen perf/tcp_loadgen.cc)
+    target_include_directories(bbt_net_tcp_loadgen PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/perf)
+    target_compile_features(bbt_net_tcp_loadgen PRIVATE cxx_std_17)
+    target_compile_options(bbt_net_tcp_loadgen PRIVATE -Wall -Wextra -Wpedantic)
+    find_package(Threads REQUIRED)
+    target_link_libraries(bbt_net_tcp_loadgen PRIVATE Threads::Threads)
+
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    # 冒烟只证明进程能起/收/出 JSON：driver.py 编排 + 每进程硬超时 + 协议校验，
+    # 不做正式计时结论。raw 与 co 各一条；driver.py 内部另有 watchdog。
+    foreach(_mode raw co)
+        add_test(NAME net.perf_smoke_${_mode}
+            COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/bench/driver.py"
+                --mode ${_mode} --workload pingpong
+                --server-bin "$<TARGET_FILE:bbt_net_tcp_echo_server>"
+                --loadgen-bin "$<TARGET_FILE:bbt_net_tcp_loadgen>"
+                --clients 2 --payload-bytes 64
+                --duration-ms 800 --warmup-ms 100 --timeout-ms 15000)
+        set_tests_properties(net.perf_smoke_${_mode} PROPERTIES TIMEOUT 60)
+    endforeach()
+endif()

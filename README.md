@@ -25,7 +25,7 @@
 
 新 `bbt::infra_net` 的 **R2 TCP 契约已合入主线**（PR #84，合入提交 `99d0821a`）：infra 拥有自有 main/sub Asio context 与网络资源，每个 Reactor 自动绑定一个空闲已登记 Processer driver 槽；不新增网络 I/O 线程。原始 `OnAccept/OnConnect/OnRead/OnWrite/OnClose` 回调在 owner 非业务协程边界短、非阻塞、不可挂起地运行；协程同步 API 只用既有 CoWaiter/Chan 做薄封装。接收 ring 是并发安全的数据真源，OnRead 仅通知；提交接纳、本地发送完成和业务回包严格分开，普通 EOF/错误/等待超时不自动关连接或重发，协议和业务策略归上层。
 
-设计与契约真源见 [网络执行域设计](docs/architecture/gnet-network-execution.md) 与 [0010](docs/decisions/0010-gnet-network-foundation.md)。执行模型的设计依据是 coroutine PR #396 合并提交 `1e9f0e8c25de85dde003def65bb58b90bdac0e0b`；实际构建使用的 coroutine 版本由 CI 拉取 `coroutine@main` 并在 run 中记录 SHA（`prepare-deps` 的 `coro_ref`），两者不是同一个 pin 概念。旧自建线程/事件快照/受管 OnTraffic 路径已随接口收敛删除。不重复驱动 `io::GetExecutor()` 的共享 context，不改变 runtime Timer/Hook/CoPoller，也不迁移其它模块。
+设计与契约真源见 [网络执行域设计](docs/architecture/gnet-network-execution.md) 与 [0010](docs/decisions/0010-gnet-network-foundation.md)。执行模型的设计依据是 coroutine PR #396 合并提交 `1e9f0e8c25de85dde003def65bb58b90bdac0e0b`；实际构建消费的 coroutine 固定 commit 由 `cmake/coroutine.sha` 唯一提供（CI checkout 与本地 `bbt_coroutine_pin_verify()` 都读它，见 docs/dependencies/bbtools-coroutine-pin.provenance.md），设计依据 SHA 与消费 pin 不是同一个概念。旧自建线程/事件快照/受管 OnTraffic 路径已随接口收敛删除。不重复驱动 `io::GetExecutor()` 的共享 context，不改变 runtime Timer/Hook/CoPoller，也不迁移其它模块。
 
 [CoTCP/CoUDP 与第三方 Binding 规格](docs/decisions/0005-co-io-adapter-contract-v1.md) 的“proc 执行收发与协议，sche 只检测就绪并唤醒”描述旧路径，不覆盖新 net。HTTP/Redis/Mongo/config/RPC 仍走各自既有路径，新 net 仅替换旧 TCP/协程桥接 API，不表示这些消费者已迁移。
 
@@ -109,7 +109,7 @@ if (net::CoWrite(conn, data, options, outcome, operation)) {
 
 ### 新 net 构建与消费
 
-公共头使用 `<bbt/infra/net/...>`，include 根是仓库根；只链接 `bbt::infra_net`。`BBT_COROUTINE_SOURCE_DIR` 指向实际消费的 coroutine 源码树；CMake 的来源路径检查**不代替** SHA 与实际链接核验。CI 的标准形态是从 `coroutine@main` 拉取并在 run 中记录 SHA（`prepare-deps` 的 `coro_ref`），本地复现应显式固定并核对所用 commit 与链接的 DSO。
+公共头使用 `<bbt/infra/net/...>`，include 根是仓库根；只链接 `bbt::infra_net`。`BBT_COROUTINE_SOURCE_DIR` 指向实际消费的 coroutine 源码树；CMake 的来源路径检查**不代替** SHA 与实际链接核验。CI 与本地 configure 都把 coroutine 消费固定到 `cmake/coroutine.sha` 里的不可变 commit（见 docs/dependencies/bbtools-coroutine-pin.provenance.md）：CI checkout 读同一文件，`bbt_coroutine_pin_verify()` 要求该检出 HEAD==pin 且 tracked/staged 干净、消费面无 untracked 源码；非 git 树一律拒绝（来历不明的源码不能证明固定版本）。本地复现只需把 `BBT_COROUTINE_SOURCE_DIR` 指向 pin 的干净 git 检出，configure 自动核验。
 
 ```bash
 set -e
@@ -182,8 +182,8 @@ ctest --test-dir build --output-on-failure
 - PR/push CI 中**本仓定义的 job** 跑在 hosted `ubuntu-24.04`（`arc-s4-infra` 仅存历史含义）；跨仓 reusable callee（分类/计划、编译 & ctest 汇聚）按其固定 `ubuntu-latest` 运行。对本构建中已注册的全部测试执行 `ctest -j1`。
 - CI 在 `prepare-deps` 阶段用 `scripts/prepare_resource_deps.sh` 以固定 tag+SHA 源码构建 hiredis/mongoc/mongocxx 私有前缀，并在 `release` job 显式断言 `redis.unit`/`mongo.unit` 已注册后纳入 `ctest -j1`；故 CI 覆盖 HTTP/transport/contract 面**以及 Redis/Mongo unit**。真实 run 证据见 [docs/ci/infra-ci-v1.md](docs/ci/infra-ci-v1.md)。
 - Redis/Mongo **live 容器验收**纳入 Release job 后段：复用已构建产物，在独占临时容器中运行正常、停止态失败和重启恢复（A/B/C），另执行 `redis.cotcp_binding.live` 大值回归。缺 Docker/Compose/二进制、启动或测试失败均非零退出；不以 Skipped 代替通过。前段无服务的全量 CTest 仍可报告 live Skipped，不能将其当作后段 live 的实跑证据。`docs-only` 变更允许跳过整个 Release job。命令、资源边界和遗留条款对账见 [Redis/Mongo 验收说明](docs/redis-mongo-acceptance.md)。
-- **TCP network-only 独立 job**：`network` job 复用同一 run 的 prepared deps，核实际 coroutine SHA，以 `-DBBT_INFRA_NETWORK_ONLY=ON` 独立 Debug 构建显式目标集，跑全注册集并用 `scripts/ci/check_network_tests.py` 拒绝缺项/重复/失败/跳过，另对 `net.b4_co_pingpong_strict` 复跑 5 次。它不计入 Release/Debug 的旧模块结果，也不代替旧模块回归；`docs-only` 可跳过该 job 但结果汇聚仍判负于意外跳过。契约见 [docs/ci/infra-ci-v1.md](docs/ci/infra-ci-v1.md)。
-- CI 固定依赖到上游 `main`/`master` HEAD，不代表对任意历史 SHA 的回溯兼容。
+- **TCP network-only 独立 job**：`network` job 复用同一 run 的 prepared deps，核实际 coroutine SHA 与 `cmake/coroutine.sha` 的 pin 双命中，以 `-DBBT_INFRA_NETWORK_ONLY=ON` 独立 Debug 构建显式目标集，跑全注册集并用 `scripts/ci/check_network_tests.py` 拒绝缺项/重复/失败/跳过，另对 `net.b4_co_pingpong_strict` 复跑 5 次。它不计入 Release/Debug 的旧模块结果，也不代替旧模块回归；`docs-only` 可跳过该 job 但结果汇聚仍判负于意外跳过。契约见 [docs/ci/infra-ci-v1.md](docs/ci/infra-ci-v1.md)。
+- CI 的 coroutine 消费固定到 `cmake/coroutine.sha` 的不可变 commit；其它上游（core 等）仍按 `master` HEAD 消费，不代表对任意历史 SHA 的回溯兼容。
 
 ## 构建约束
 

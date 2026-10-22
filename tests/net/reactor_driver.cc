@@ -172,6 +172,23 @@ static void WakeCase() {
     CHECK(driver.Wait(200ms) == bbt::coroutine::detail::ProcesserDriverResult::Ok);
     CHECK(std::chrono::steady_clock::now() - begin < 100ms);
 
+    // burst 已被消费（上一步 Wait 已清 latch）后，新的阻塞 Wait 中再来
+    // 一个 Wake：latch 重新置位 + stop 打断当前 run_one_for，不睡满预算。
+    // 这验证"合并重复 stop"不削弱后续独立唤醒的实时性。
+    std::atomic<bool> second_wake_sent{false};
+    std::thread late_waker([&driver, &second_wake_sent] {
+        std::this_thread::sleep_for(30ms);
+        second_wake_sent.store(true);
+        driver.Wake();
+    });
+    begin = std::chrono::steady_clock::now();
+    CHECK(driver.Wait(500ms) == bbt::coroutine::detail::ProcesserDriverResult::Ok);
+    const auto second_elapsed = std::chrono::steady_clock::now() - begin;
+    const bool wake_sent_before_return = second_wake_sent.load();
+    late_waker.join();
+    CHECK(wake_sent_before_return);  // 不能由旧状态提前返回，再靠 join 等到新 Wake。
+    CHECK(second_elapsed < 300ms);
+
     std::cout << "wake wakes=" << driver.WakeCount() << " waits=" << driver.WaitCount()
               << " early/cross-thread/concurrent=ok\n";
 }

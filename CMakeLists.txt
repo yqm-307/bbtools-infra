@@ -116,12 +116,26 @@ function(bbt_add_source_dependency _target _src_dir _bin_subdir)
     endforeach()
 endfunction()
 
+# T1 pin：固定 commit 由 cmake/coroutine.sha 唯一提供（include 时读取并校验
+# 40hex 格式）；git-only 核验对普通/回退两条路径都可见（pin 值在回退分支
+# 只用于「无法核验」的如实警告文案，不静默声明锁版）。
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/CoroutinePin.cmake")
 if(BBT_COROUTINE_SOURCE_DIR)
     if(NOT EXISTS "${BBT_COROUTINE_SOURCE_DIR}/CMakeLists.txt")
         message(FATAL_ERROR
             "BBT_COROUTINE_SOURCE_DIR='${BBT_COROUTINE_SOURCE_DIR}' 无效："
             "未找到顶层 CMakeLists.txt")
     endif()
+    get_filename_component(_bbt_co_expected "${BBT_COROUTINE_SOURCE_DIR}" REALPATH)
+
+    # 复用分支：pin 声明目录之前先核已建 target 的真实 SOURCE_DIR——声明
+    # 目录核验过了不代表实际链接的是同一棵树（与 NetworkOnly.cmake 同函数）。
+    bbt_coroutine_verify_existing_target("${_bbt_co_expected}")
+
+    # 源码消费的声明目录（复用分支已证明 == 实际来源）必须先命中固定 commit
+    # （git HEAD+tracked/staged 干净+消费面无 untracked 源码），再做接入。
+    bbt_coroutine_pin_verify("${_bbt_co_expected}")
+    unset(_bbt_co_expected)
 
     # core 必须在 coroutine 之前接入：coroutine 顶层直接
     # target_link_libraries(bbt_coroutine ... bbt_core)，此刻 bbt_core 若还不是
@@ -145,8 +159,10 @@ if(BBT_COROUTINE_SOURCE_DIR)
             "bbtools-infra: bbtools-core 源码接入 '${BBT_CORE_SOURCE_DIR}'")
     endif()
 
-    bbt_add_source_dependency(bbt_coroutine "${BBT_COROUTINE_SOURCE_DIR}"
-        bbtools-coroutine NEED_TEST)
+    if(NOT TARGET bbt_coroutine)
+        bbt_add_source_dependency(bbt_coroutine "${BBT_COROUTINE_SOURCE_DIR}"
+            bbtools-coroutine NEED_TEST)
+    endif()
     target_link_libraries(bbt_infra_common INTERFACE bbt_coroutine)
 
     # 契约校验：coroutine 仍按核心库名消费 core（拆分前形态）时，本构建必须已有
@@ -165,6 +181,9 @@ if(BBT_COROUTINE_SOURCE_DIR)
     endif()
 else()
     # 回退：查找已安装的 bbt_coroutine 包（导出 bbt_coroutine 目标）。
+    # T1 pin 边界：已安装包不含可核验源码 SHA——本路径无法证明消费的是
+    # 固定 commit，故不冒充「已锁版」；优化闭环的正式证据只认
+    # BBT_COROUTINE_SOURCE_DIR 源码消费（其 pin 核验见上方 include）。
     find_package(bbt_coroutine CONFIG QUIET)
     if(NOT TARGET bbt_coroutine)
         message(FATAL_ERROR
@@ -172,6 +191,10 @@ else()
             "-DBBT_COROUTINE_SOURCE_DIR=<bbtools-coroutine 源码树路径>；"
             "已安装包需提供 bbt_coroutineConfig.cmake 并导出 bbt_coroutine 目标。")
     endif()
+    message(FATAL_ERROR
+        "[bbt-infra-pin] 已安装 bbt_coroutine 包不经源码 SHA 核验："
+        "无法证明消费固定 ${BBT_COROUTINE_PINNED_SHA}。"
+        "锁版证据/正式消费请用 -DBBT_COROUTINE_SOURCE_DIR 源码接入。")
     target_link_libraries(bbt_infra_common INTERFACE bbt_coroutine)
 endif()
 

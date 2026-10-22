@@ -24,12 +24,16 @@ function(bbt_infra_add_net_coroutine)
     endforeach()
 endfunction()
 get_filename_component(_net_co_expected "${BBT_COROUTINE_SOURCE_DIR}" REALPATH)
+include("${CMAKE_CURRENT_LIST_DIR}/CoroutinePin.cmake")
 set(_net_co_real bbt_coroutine)
 if(NOT TARGET bbt_coroutine)
+    # 新建分支：声明目录就是要消费的真实来源，先 pin 再 add_subdirectory。
+    bbt_coroutine_pin_verify("${_net_co_expected}")
     bbt_infra_add_net_coroutine()
 else()
     # L2：复用已有 target 必须核真实 SOURCE_DIR（解 alias、realpath 符号链接），
-    # 拒绝把不明/其他来源的 target 拼上本版本公共头。
+    # 拒绝把不明/其他来源的 target 拼上本版本公共头（标记 [bbt-infra-net] 供
+    # net.consumer_source_dir_mismatch 断言，勿改文案）。
     get_target_property(_net_co_alias bbt_coroutine ALIASED_TARGET)
     if(_net_co_alias)
         set(_net_co_real "${_net_co_alias}")
@@ -42,6 +46,8 @@ else()
     if(NOT _net_co_actual STREQUAL _net_co_expected)
         message(FATAL_ERROR "[bbt-infra-net] 已有 bbt_coroutine 来源(${_net_co_actual})与固定 BBT_COROUTINE_SOURCE_DIR(${_net_co_expected})不一致")
     endif()
+    # 复用分支：核完同源后对真实来源 pin（等价新建分支的声明目录核验）。
+    bbt_coroutine_pin_verify("${_net_co_actual}")
 endif()
 # L2：新建/复用两分支统一补 target 级公共头使用要求（幂等）。上游只有目录级
 # include，覆盖不到 coroutine-first 嵌入父级链接 bbt::infra_net 的消费目标。

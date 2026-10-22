@@ -137,7 +137,15 @@ void ReactorDriver::Wake() noexcept {
     m_wakes.fetch_add(1, std::memory_order_relaxed);
     // 持久 latch 保证早到；stop 保证阻塞中的 run 及时返回。stop 不丢弃
     // 已登记 handler，restart（RunBounded 开头）后继续兑现。
-    m_wake_latch.store(true, std::memory_order_release);
+    // latch 已置位说明此前 Wake 的通知尚未被 RunBounded 消费：对应那次
+    // stop 已发生（或正被并发线程执行），此处跳过重复的幂等 stop，只保留
+    // latch。RunBounded 在每次入睡前都先 exchange(false) 清位检查，因此
+    // "置位未消费" 与 "丢唤醒" 不可能同时成立——latch 才是唤醒载体。
+    const bool already_pending =
+        m_wake_latch.exchange(true, std::memory_order_acq_rel);
+    if (already_pending) {
+        return;
+    }
     try {
         m_context.stop();
     } catch (...) {
