@@ -31,10 +31,14 @@
 #include <bbt/coroutine/coroutine.hpp>
 
 #include <bbt/infra/net/LoadBalancing.hpp>
-#include <bbt/infra/net/EngineTestAccess.hpp>
+#include <bbt/infra/net/detail/EngineTestAccess.hpp>
 #include <bbt/infra/net/NativeSocket.hpp>
+#include <bbt/infra/net/detail/CoInternal.hpp>
+#include <bbt/infra/net/detail/ConnectionState.hpp>
 #include <bbt/infra/net/detail/DriverBinder.hpp>
+#include <bbt/infra/net/detail/OptionsNormalize.hpp>
 #include <bbt/infra/net/detail/ReactorDriver.hpp>
+#include <bbt/infra/net/detail/ReceiveRing.hpp>
 #include <bbt/infra/net/detail/WakeHub.hpp>
 
 namespace bbt::infra::net {
@@ -590,7 +594,7 @@ private:
     bool SubmitReceivedOwner(const char* data, std::size_t size) {
         const std::string_view received(data, size);
         const auto appended = m_state->ring.TryAppend(received);
-        if (appended.status == ReceiveRing::ReadStatus::Busy) {
+        if (appended.status == ReadStatus::Busy) {
             if (!m_state->ring.AppendDeferred(received)) {
                 m_recv_hold.store(size, std::memory_order_release);
                 return false;
@@ -632,7 +636,7 @@ private:
             }
             const std::size_t want = std::min(kReadChunk, available);
             const auto grant = m_state->ring.TryReserveForAppend(want);
-            if (grant.status == ReceiveRing::ReadStatus::Busy) {
+            if (grant.status == ReadStatus::Busy) {
                 break;
             }
             if (grant.granted == 0) {
@@ -799,6 +803,10 @@ struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
     std::atomic<std::int64_t> connect_start_delay_ms{0};
     std::atomic<bool> cancel_retry_needed{false};
     std::atomic<bool> cancel_post_fail_once{false};  // 私有 test 故障注入
+    std::atomic<bool> connect_post_fail_once{false};  // 私有 test：本 Engine 下一次 connect 提交不投递
+    std::atomic<int> connect_wait_status_once{-1};    // 私有 test：下一次领取的等待返回值（-1 未武装）
+    std::mutex connect_submit_barrier_mutex;          // 私有 test 屏障（一次性）
+    std::function<void()> connect_submit_barrier;     // post 成功、写 out_id 之前
     std::atomic<std::int64_t> seal_delay_ms{0};      // 私有 test 延迟
     std::atomic<bool> seal_post_fail_once{false};  // 私有 test 故障注入
     std::atomic<bool> seal_throw_once{false};      // 私有 test：seal handler 抛一次
@@ -2095,23 +2103,21 @@ std::error_code Engine::Run(const EngineConfig& config) {
     }
 
     NormalizedOptions normalized;
-    const int cpu_count = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
-    if (const auto error = NormalizeOptions(config.options, cpu_count, normalized)) {
+    // 归一化只做值验证，不再依赖 CPU 数，也没有历史段容量字段可交叉校验。
+    if (const auto error = NormalizeOptions(config.options, normalized)) {
         return fail(error);
     }
-    if (normalized.edge_triggered_io || !normalized.bind_to_device.empty()
-        || normalized.multicast_interface_index != 0 || normalized.lock_os_thread
-        || normalized.ticker) {
-        // Boost 后端无法等价控制 ET；R2 无 engine ticker/lock-os-thread 语义。
-        // 明确拒绝而非接受后静默忽略。
-        return fail(std::make_error_code(std::errc::operation_not_supported));
+    const bool server = !config.listen_addresses.empty();
+    if (server && impl->handler == nullptr && !impl->handoff_enabled) {
+        // 保持 handler+handoff 共存，但拒绝"两者都无"的无人接收布局：
+        // 仍在 driver 绑定/socket 副作用之前。
+        return fail(std::make_error_code(std::errc::operation_not_permitted));
     }
     impl->max_inbound_bytes = normalized.max_inbound_bytes;
     impl->max_outbound_bytes = normalized.max_outbound_bytes;
     impl->max_ops = normalized.max_pending_events;
     impl->options = normalized;
 
-    const bool server = !config.listen_addresses.empty();
     const std::size_t sub_count = std::max<std::size_t>(1, normalized.num_event_loop);
     const std::size_t slot_count = server ? sub_count + 1 : sub_count;
 
@@ -2493,8 +2499,10 @@ namespace {
 std::error_code StartConnectImpl(const std::shared_ptr<EngineImpl>& impl,
                                  const Address& address, std::uint64_t& out_connect_id,
                                  bool awaitable) {
-    if (awaitable && impl->handler) {
-        // raw-only：不允许提交一个 Co 无法领取的 op。
+    // awaitable=true 是 CoDial 的提交步骤：要求无 raw handler（raw 配置下
+    // OnConnect 是唯一交付，Co 不得提交一个无法领取的 op）。
+    // awaitable=false 是公共 raw 提交：要求有 handler。
+    if (awaitable == (impl->handler != nullptr)) {
         return std::make_error_code(std::errc::operation_not_supported);
     }
     std::uint64_t id = 0;
@@ -2535,9 +2543,14 @@ std::error_code StartConnectImpl(const std::shared_ptr<EngineImpl>& impl,
         op->waiter_attached = awaitable;  // Co 提交即登记接收意图，完成早到不丢
         impl->connects[id] = std::move(op);
     }
-    if (!reactor->TryPost([impl, reactor, address, id] {
-            reactor->BeginConnectOnOwner(address, id);
-        })) {
+    // 私有 test：一次性"零接纳"投递失败注入。与真实失败走同一段回滚（清
+    // receiver 意图、ResolveConnect 取消、清表项、out_id 不变、零回调），
+    // 不构造假网络响应；未武装时行为与产品完全一致。
+    const bool force_post_failure = impl->connect_post_fail_once.exchange(false);
+    if (force_post_failure
+        || !reactor->TryPost([impl, reactor, address, id] {
+               reactor->BeginConnectOnOwner(address, id);
+           })) {
         {
             std::lock_guard<std::mutex> lock(impl->connect_mutex);
             const auto it = impl->connects.find(id);
@@ -2550,6 +2563,19 @@ std::error_code StartConnectImpl(const std::shared_ptr<EngineImpl>& impl,
                              std::make_error_code(std::errc::operation_canceled));
         return std::make_error_code(std::errc::operation_canceled);
     }
+    {
+        // 私有 test 屏障：已成功 TryPost（owner 可能立即完成并回调）、尚未写
+        // out_connect_id。不持任何 impl 锁，owner 线程可自由推进。
+        std::function<void()> barrier;
+        {
+            std::lock_guard<std::mutex> barrier_lock(impl->connect_submit_barrier_mutex);
+            barrier = std::move(impl->connect_submit_barrier);
+            impl->connect_submit_barrier = {};
+        }
+        if (barrier) {
+            barrier();
+        }
+    }
     out_connect_id = id;
     return {};
 }
@@ -2557,17 +2583,13 @@ std::error_code StartConnectImpl(const std::shared_ptr<EngineImpl>& impl,
 } // namespace
 
 std::error_code Engine::AsyncConnect(const Address& address, std::uint64_t& out_connect_id) {
-    // 无 raw handler：提交即保留，可 WaitConnect；有 raw handler：raw-only，
-    // OnConnect 是唯一交付，不登记可等待意图（WaitConnect 会在入口拒绝）。
-    const bool awaitable = (m_impl->handler == nullptr);
-    return StartConnectImpl(m_impl, address, out_connect_id, awaitable);
+    // 只用于 raw 配置：OnConnect 是唯一交付，成功/失败恰一次且 operation 等于
+    // 本次 out_connect_id；任何拒绝路径都不改 out_connect_id、不产生本次回调。
+    return StartConnectImpl(m_impl, address, out_connect_id, /*awaitable=*/false);
 }
 
-std::error_code Engine::AsyncConnectAwaitable(const Address& address,
-                                              std::uint64_t& out_connect_id) {
-    if (m_impl->handler) {
-        return std::make_error_code(std::errc::operation_not_supported);  // raw-only
-    }
+std::error_code Engine::CoSubmitConnect(const Address& address, std::uint64_t& out_connect_id) {
+    // CoDial 的提交步骤：登记接收意图，完成早到也保留结果供领取。
     return StartConnectImpl(m_impl, address, out_connect_id, /*awaitable=*/true);
 }
 
@@ -2650,6 +2672,28 @@ void EngineTestAccess::SetSubmitBarrierOnce(Engine& engine, std::function<void()
     for (auto& reactor : reactors) {
         reactor->SetSubmitBarrier(barrier);
     }
+}
+
+void EngineTestAccess::SetConnectSubmitBarrierOnce(Engine& engine, std::function<void()> barrier) {
+    auto impl = engine.m_impl;
+    std::lock_guard<std::mutex> lock(impl->connect_submit_barrier_mutex);
+    impl->connect_submit_barrier = std::move(barrier);
+}
+
+void EngineTestAccess::SetConnectPostFailureOnce(Engine& engine) {
+    engine.m_impl->connect_post_fail_once.store(true);
+}
+
+void EngineTestAccess::SetConnectWaitStatusOnce(Engine& engine, int status) {
+    engine.m_impl->connect_wait_status_once.store(status < 0 ? -1 : status);
+}
+
+void EngineTestAccess::ClearConnectInjection(Engine& engine) {
+    auto impl = engine.m_impl;
+    impl->connect_post_fail_once.store(false);
+    impl->connect_wait_status_once.store(-1);
+    std::lock_guard<std::mutex> lock(impl->connect_submit_barrier_mutex);
+    impl->connect_submit_barrier = {};
 }
 
 void EngineTestAccess::KickOwner(Engine& engine) {
@@ -2832,8 +2876,10 @@ int EngineTestAccess::FirstConnectionFd(Engine& engine) {
     return -1;
 }
 
-std::error_code Engine::WaitConnect(std::uint64_t connect_id, Connection& out,
-                                    const bbt::coroutine::WaitOptions& options) {
+// CoDial 的领取步骤（内部）：成功才写 out；任何未交付失败都归还 claim 并让
+// owner 回收 fd。有 handler 的 Engine 在写任何等待/取消状态之前拒绝。
+std::error_code Engine::CoWaitConnect(std::uint64_t connect_id, Connection& out,
+                                      const bbt::coroutine::WaitOptions& options) {
     auto impl = m_impl;
     if (impl->handler) {
         // raw-only：不得在任何等待/取消状态写入之前改变 raw 建连责任。
@@ -2850,9 +2896,71 @@ std::error_code Engine::WaitConnect(std::uint64_t connect_id, Connection& out,
         }
         op->receiver_claimed = true;  // 单接收者；超时/取消后不自动释放
     }
+    // 离开 CoDial 且未交付的唯一归还点：清 claim/attach、登记放弃意图；需要
+    // 中断真实连接尝试时同时持久化取消（post 失败由控制循环重试）。owner 在
+    // 真实完成或取消时看到「已放弃且无接收者」即回收未交付 fd，不调 owner 回调。
+    auto abandon = [&](bool cancel_owner) {
+        std::shared_ptr<Reactor> reactor;
+        Connection orphan;
+        {
+            std::lock_guard<std::mutex> lock(op->mutex);
+            op->receiver_claimed = false;
+            op->waiter_attached = false;
+            if (op->done) {
+                // 已完成但本次领取已终结：连接此刻无主，直接回收。
+                if (!op->raw_delivered) {
+                    orphan = op->connection;
+                }
+                op->abandoned = false;
+            } else {
+                // 未完成：放弃接收意图，owner 稍后交付或取消时回收 fd。
+                op->abandoned = true;
+            }
+            reactor = op->reactor;
+            if (cancel_owner) {
+                op->cancel_requested.store(true);
+            }
+        }
+        if (orphan.Valid()) {
+            orphan.RequestClose(std::make_error_code(std::errc::operation_canceled));
+            impl->MaybeEraseConnect(connect_id, op);
+        }
+        if (!cancel_owner) {
+            return;
+        }
+        if (reactor) {
+            if (impl->cancel_post_fail_once.exchange(false)
+                || !reactor->TryPost([reactor, connect_id] {
+                       reactor->CancelConnectOnOwner(connect_id);
+                   })) {
+                impl->cancel_retry_needed.store(true);
+            }
+        } else {
+            impl->cancel_retry_needed.store(true);
+        }
+    };
+
+    // 终态 op 的收尾：只有无错误且确有连接的结果才算本次交付；否则不覆盖 out。
+    auto settle_done = [&](Connection delivered, std::error_code done_error) {
+        impl->MaybeEraseConnect(connect_id, op);
+        if (done_error) {
+            if (!impl->handler && delivered.Valid()) {
+                // 无接收者的已交付连接：owner 交付时已登记，这里回收。
+                delivered.RequestClose(std::make_error_code(std::errc::operation_canceled));
+            }
+            return done_error;
+        }
+        if (!delivered.Valid()) {
+            return std::make_error_code(std::errc::operation_canceled);
+        }
+        out = std::move(delivered);
+        return std::error_code{};
+    };
+
     for (;;) {
         bool already_done = false;
         bool raw_conflict = false;
+        Connection delivered;
         std::error_code done_error;
         {
             std::lock_guard<std::mutex> lock(op->mutex);
@@ -2860,7 +2968,7 @@ std::error_code Engine::WaitConnect(std::uint64_t connect_id, Connection& out,
                 if (op->raw_delivered) {
                     raw_conflict = true;  // 已由 raw handler 唯一交付，不重复领取
                 } else {
-                    out = op->connection;
+                    delivered = op->connection;
                     done_error = op->error;
                 }
                 op->waiter_attached = false;
@@ -2872,114 +2980,142 @@ std::error_code Engine::WaitConnect(std::uint64_t connect_id, Connection& out,
             }
         }
         if (already_done) {
-            impl->MaybeEraseConnect(connect_id, op);
-            return raw_conflict ? std::make_error_code(std::errc::operation_not_supported)
-                                : done_error;
+            if (raw_conflict) {
+                impl->MaybeEraseConnect(connect_id, op);
+                return std::make_error_code(std::errc::operation_not_supported);
+            }
+            return settle_done(std::move(delivered), done_error);
         }
-        // claim → 等待建立/结果领取的异常安全：建立失败回滚 claim（未 done 时
-        // 保留 awaitable 意图），同 id 可重试；不得无接收者却永久 busy。
+        // 登记 → 复查 → 挂起。登记失败与建立失败都在下方向外归还 claim。
         bbt::coroutine::WaitStatus status = bbt::coroutine::WaitStatus::InvalidContext;
         bool add_failed = false;
-        try {
-        auto waiter = op->hub.Create();
-        status = waiter->WaitWithCallback(options, [&] {
-            if (!op->hub.Add(waiter)) {
-                add_failed = true;
-                waiter->Notify();
-                return true;
+        // 私有 test：一次性把"本次等待的返回值"固定成指定 WaitStatus，用于确定性
+        // 覆盖非 Completed 的退出路径（InvalidContext / RuntimeUnavailable /
+        // AlreadyWaiting）。注入点就在等待返回边界：不建立等待者、不等真实事件，
+        // 其余（claim 已取得、op 仍 pending、下方 abandon(true) 的取消投递与 owner
+        // 回收）全部走产品既有代码，不构造假网络响应。未武装时为纯产品路径。
+        // Completed 不可注入：它表示"被通知后复查"，注入会在 op 仍 pending 时
+        // 原地重试；夹带 Completed 的调用退化为真实等待，避免测试写出死循环。
+        const int injected_wait_status = impl->connect_wait_status_once.exchange(-1);
+        const bool inject_wait = injected_wait_status >= 0
+            && injected_wait_status != static_cast<int>(bbt::coroutine::WaitStatus::Completed);
+        if (inject_wait) {
+            status = static_cast<bbt::coroutine::WaitStatus>(injected_wait_status);
+        } else {
+            try {
+                auto waiter = op->hub.Create();
+                status = waiter->WaitWithCallback(options, [&] {
+                    if (!op->hub.Add(waiter)) {
+                        add_failed = true;  // 满额：有界拒绝，不自激重试
+                        waiter->Notify();
+                        return true;
+                    }
+                    bool done = false;
+                    {
+                        std::lock_guard<std::mutex> lock(op->mutex);
+                        done = op->done;
+                    }
+                    if (done) {
+                        waiter->Notify();  // 锁外 Notify
+                    }
+                    return true;
+                });
+            } catch (...) {
+                // 等待对象建立失败：本条领取没有等待者，必须放弃而不是留着 claim。
+                abandon(false);
+                return std::make_error_code(std::errc::not_enough_memory);
             }
-            bool done = false;
-            {
-                std::lock_guard<std::mutex> lock(op->mutex);
-                done = op->done;
-            }
-            if (done) {
-                waiter->Notify();  // 锁外 Notify
-            }
-            return true;
-        });
-        } catch (...) {
-            std::lock_guard<std::mutex> lock(op->mutex);
-            op->receiver_claimed = false;  // 回滚本次未建立的领取
-            op->abandoned = false;
-            if (!op->done) {
-                op->waiter_attached = true;  // 保留提交时接收意图，等 owner
-            }
-            return std::make_error_code(std::errc::not_enough_memory);
         }
         if (add_failed) {
+            // 满额时结果可能已就绪：那就直接交付；否则放弃并让 owner 回收。
             bool done = false;
-            Connection delivered;
+            Connection ready;
+            std::error_code ready_error;
             {
                 std::lock_guard<std::mutex> lock(op->mutex);
-                done = op->done;
-                if (done && !op->raw_delivered) {
-                    delivered = op->connection;  // 同 op 已完成且未由 raw 领取
+                done = op->done && !op->raw_delivered;
+                if (done) {
+                    ready = op->connection;
+                    ready_error = op->error;
                 }
                 op->waiter_attached = false;
             }
             if (done) {
-                if (!impl->handler && delivered.Valid()) {
-                    delivered.RequestClose(std::make_error_code(std::errc::operation_canceled));
-                }
-                impl->MaybeEraseConnect(connect_id, op);
-            } else {
-                // Add 失败且尚未完成：登记放弃意图，让 owner 的稍后交付在无 raw
-                // 接收者时回收，而不是遗留 m_conns/descriptor。
                 std::lock_guard<std::mutex> lock(op->mutex);
-                op->abandoned = true;
+                op->receiver_claimed = false;
+                op->abandoned = false;
             }
+            if (done && !ready_error && ready.Valid()) {
+                impl->MaybeEraseConnect(connect_id, op);
+                out = std::move(ready);
+                return {};
+            }
+            if (done) {
+                impl->MaybeEraseConnect(connect_id, op);
+                return std::make_error_code(std::errc::no_buffer_space);
+            }
+            abandon(false);
             return std::make_error_code(std::errc::no_buffer_space);
         }
-        if (status == bbt::coroutine::WaitStatus::TimedOut
-            || status == bbt::coroutine::WaitStatus::Cancelled) {
-            // 尊重 CoWaiter 该次仲裁：即使之后 op 变 done，也不改写为成功。
-            bool done = false;
-            Connection delivered;
-            std::shared_ptr<Reactor> reactor;
-            {
-                std::lock_guard<std::mutex> lock(op->mutex);
-                op->cancel_requested.store(true);
-                if (op->done) {
-                    delivered = op->connection;
-                    done = true;
-                } else {
-                    op->abandoned = true;
-                    reactor = op->reactor;
-                }
-                op->waiter_attached = false;
-            }
-            if (done) {
-                // 无 raw 实际接收者时回收已交付 fd；raw 已交付不误关。
-                if (!impl->handler && delivered.Valid()) {
-                    delivered.RequestClose(std::make_error_code(std::errc::operation_canceled));
-                }
-                impl->MaybeEraseConnect(connect_id, op);
-            } else if (reactor) {
-                // 持久取消责任：post 失败由控制循环重试，不等网络无限终态。
-                if (impl->cancel_post_fail_once.exchange(false)
-                    || !reactor->TryPost([reactor, connect_id] {
-                        reactor->CancelConnectOnOwner(connect_id);
-                    })) {
-                    impl->cancel_retry_needed.store(true);
-                }
-            } else {
-                impl->cancel_retry_needed.store(true);
-            }
-            return std::make_error_code(
-                status == bbt::coroutine::WaitStatus::TimedOut
-                    ? std::errc::timed_out
-                    : std::errc::operation_canceled);
+        if (status == bbt::coroutine::WaitStatus::Completed) {
+            continue;  // 被通知：回到顶部按真实结果复查
         }
-        if (status != bbt::coroutine::WaitStatus::Completed) {
-            return std::make_error_code(std::errc::io_error);
+        // 其余 WaitStatus 全部终结本次领取，且一律归还责任后再返回。
+        bool done = false;
+        Connection finished;
+        std::error_code finished_error;
+        {
+            std::lock_guard<std::mutex> lock(op->mutex);
+            done = op->done;
+            if (done && !op->raw_delivered) {
+                finished = op->connection;
+                finished_error = op->error;
+            }
+            op->waiter_attached = false;
         }
+        const auto mapped = WaitStatusError(status);
+        if (done) {
+            if (finished.Valid()) {
+                // 等待已按本次仲裁终结：结果无主 → 回收（raw 已交付时不动）。
+                finished.RequestClose(std::make_error_code(std::errc::operation_canceled));
+            }
+            impl->MaybeEraseConnect(connect_id, op);
+            return mapped;
+        }
+        // 尚未完成：交还责任；超时/取消/上下文失效都要求中断真实尝试。
+        abandon(true);
+        return mapped;
     }
 }
 
-std::error_code Engine::WaitAccepted(Connection& out,
-                                     const bbt::coroutine::WaitOptions& options) {
+std::error_code Engine::CoWaitAccepted(Connection& out,
+                                       const bbt::coroutine::WaitOptions& options) {
     auto impl = m_impl;
+    // 配置与生命周期错误立即返回，不等一个永远不会来的 listener。
+    // 判定优先级是契约（见 CoConnection.hpp）：终态先于配置/布局判定。Stopped 时
+    // main accept owner 已解绑，但那是收口带来的结果，不能据此把 Engine 判成
+    // client-only（否则把"已结束"误报成"这类 Engine 不支持 accept"）。
+    {
+        std::lock_guard<std::mutex> lock(impl->mutex);
+        const bool sealed = impl->IsSealed();
+        const auto phase = impl->phase;
+        if (sealed || phase == EnginePhase::Closing || phase == EnginePhase::Stopped) {
+            // 已封口或已开始/完成收口：队列已清空，不会有新连接交付。
+            return std::make_error_code(std::errc::operation_canceled);
+        }
+        if (phase == EnginePhase::Idle || phase == EnginePhase::Starting) {
+            // 尚未发布 Running：还没有 accept 生产者，也不是配置错误。
+            return std::make_error_code(std::errc::operation_not_permitted);
+        }
+        if (!impl->handoff_enabled) {
+            return std::make_error_code(std::errc::operation_not_permitted);
+        }
+        if (!impl->main_reactor) {
+            // Running + handoff 但没有 main accept owner：真正的 client-only 布局，
+            // handoff 永远不会有生产者。
+            return std::make_error_code(std::errc::operation_not_supported);
+        }
+    }
     for (;;) {
         Connection popped;
         bool sealed = false;
@@ -3002,6 +3138,9 @@ std::error_code Engine::WaitAccepted(Connection& out,
             return std::make_error_code(std::errc::operation_canceled);
         }
         auto waiter = impl->accept_hub.Create();
+        if (!waiter) {
+            return std::make_error_code(std::errc::no_buffer_space);
+        }
         bool add_failed = false;
         const auto status = waiter->WaitWithCallback(options, [&] {
             if (!impl->accept_hub.Add(waiter)) {
@@ -3022,14 +3161,8 @@ std::error_code Engine::WaitAccepted(Connection& out,
         if (add_failed) {
             return std::make_error_code(std::errc::no_buffer_space);
         }
-        if (status == bbt::coroutine::WaitStatus::TimedOut) {
-            return std::make_error_code(std::errc::timed_out);
-        }
-        if (status == bbt::coroutine::WaitStatus::Cancelled) {
-            return std::make_error_code(std::errc::operation_canceled);
-        }
         if (status != bbt::coroutine::WaitStatus::Completed) {
-            return std::make_error_code(std::errc::io_error);
+            return WaitStatusError(status);
         }
     }
 }

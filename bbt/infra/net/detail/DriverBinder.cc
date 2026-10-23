@@ -65,6 +65,12 @@ std::error_code DriverBinder::BindSlots(std::size_t count, std::vector<DriverSlo
         return std::make_error_code(std::errc::not_enough_memory);
     }
 
+    // 请求量超过实际可登记的 worker 槽数：这个请求在语义上不可能满足，
+    // 先拒绝，避免为一个不可能成功的绑定做 count 量级的 reserve。
+    if (count > ids.size()) {
+        return std::make_error_code(std::errc::no_buffer_space);
+    }
+
     // 本地构建新绑定：失败时调用者 out 中既存绑定保持原样，不丢责任。
     std::vector<DriverSlot> bound;
     try {

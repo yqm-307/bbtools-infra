@@ -1,7 +1,8 @@
 #pragma once
 
-// 测试/故障注入私有接缝（不列入公共头自检，不承诺产品 API）。
+// 测试/故障注入私有接缝（detail 头，不列入公共头自检，不承诺产品 API）。
 // 通过 Engine 的 friend 访问其 Impl；只在测试可执行文件中使用。
+// 产品代码不使用本头；公共消费者不得依赖这些入口存在或其签名。
 
 #include <chrono>
 #include <cstddef>
@@ -28,9 +29,6 @@ public:
     static std::size_t DirtyCount(Engine& engine);
     static std::size_t RecvHoldBytes(Engine& engine);
     static void SetConnectStartDelay(Engine& engine, std::chrono::milliseconds delay);
-    // 一次性屏障：WaitConnect 初始检查后、Create/Add 前。
-    static void SetConnectOpBarrierOnce(Engine& engine, std::uint64_t id,
-                                        std::function<void()> barrier);
     // 把 op hub 填满到 kMaxWaiters；返回实际加入数（测试持有 keep 保活）。
     static bool ConnectReceiverClaimed(Engine& engine, std::uint64_t id);
     static std::size_t FillConnectHub(
@@ -67,6 +65,19 @@ public:
     static void KickOwner(Engine& engine);
     // 一次性提交屏障：已取得提交资格、尚未 post（仍持 driver 租约）。
     static void SetSubmitBarrierOnce(Engine& engine, std::function<void()> barrier);
+    // 一次性屏障：connect 提交已成功 TryPost、尚未写 out_connect_id。
+    // 用于确定性制造"owner 交付早于提交返回"的交错（屏障内等 owner 回调完成）。
+    static void SetConnectSubmitBarrierOnce(Engine& engine, std::function<void()> barrier);
+    // 一次性注入：本 Engine 下一次 connect 提交不投递（零接纳）。与真实 post 失败
+    // 走同一段回滚；用于验证拒绝路径 out 不变且零回调。
+    static void SetConnectPostFailureOnce(Engine& engine);
+    // 一次性注入：下一次 CoDial 领取在"等待返回"边界直接得到该 WaitStatus。
+    // 枚举取值来自上游 bbt::coroutine::WaitStatus，故以 int 传递（detail 头不拉
+    // 上游等待枚举进公共面）。Completed 不可注入（会退化为真实等待）；未武装
+    // 传负数清除。注入后 claim 归还/取消投递/owner 回收全部走产品既有路径。
+    static void SetConnectWaitStatusOnce(Engine& engine, int status);
+    // 清除上述一次性注入（正常关闭/用例收尾用）。
+    static void ClearConnectInjection(Engine& engine);
 };
 
 } // namespace bbt::infra::net

@@ -60,7 +60,7 @@ gnet v2.10.0 是接纳交接、owner、读写泵、缓冲及公平性的参考�
 
 复用已有 Address、NativeSocket、LoadBalancer、EventRingBuffer、OutboundQueue 和部分读写机制，只补实际缺口。EventRingBuffer 当前是单 owner、非线程安全；需要最小同步访问面，不能直接宣称已有类可跨线程使用。OutboundQueue 合并字节不保留公共操作身份，须补有界记账，不能因此重造通用 Future 平台。
 
-读泵是「有预算的非阻塞读」：单轮最多若干次 `recv(MSG_DONTWAIT)`，遇 EAGAIN 或预算耗尽即返回、由下一次 driver Tick 继续；ring 满则暂停读（`m_read_paused`），消费后由持久通知恢复。Asio 公共 `async_wait` 不等价 native per-fd EPOLLET，因此 `Options::edge_triggered_io` 在 `Run` 中明确拒绝而非接受后静默忽略。Wake 必须 noexcept、线程安全、有界、持久记忆早到通知（`detail/WakeHub`），不能单靠可能分配的 post 假定满足。
+读泵是「有预算的非阻塞读」：单轮最多若干次 `recv(MSG_DONTWAIT)`，遇 EAGAIN 或预算耗尽即返回、由下一次 driver Tick 继续；ring 满则暂停读（`m_read_paused`），消费后由持久通知恢复。Asio 公共 `async_wait` 不等价 native per-fd EPOLLET，因此本实现不提供 edge-triggered 配置项（`Options::edge_triggered_io` 已随「API 冻结候选」删除，见决策 0010）。Wake 必须 noexcept、线程安全、有界、持久记忆早到通知（`detail/WakeHub`），不能单靠可能分配的 post 假定满足。
 
 ## 4. 跨域调用与完成时序
 
@@ -79,9 +79,19 @@ gnet v2.10.0 是接纳交接、owner、读写泵、缓冲及公平性的参考�
 
 容量满立即明确拒绝且零接纳；CoWrite 可无限或带绝对 deadline 等容量/本地完成，等待名额同样有界。容量等待超时=未提交；已接纳后的等待超时/取消仅结束等待，返回操作身份、采样进度及仍在途标记，owner 继续持有和推进，最终状态可查。采样不是冻结前缀，不可据此自动重发后缀。等待业务回包始终归上层。
 
+`WritePhase::Done` 只表示该次发送已到终态，**成功还须 `outcome.error` 为空**（`Done` + 非空 `error` 是失败结算）；`InFlight` 是已接纳未终态，`Rejected` 是未提交，`Unknown` 只来自无效写句柄的 `Query`。`WriteOutcome` 是「回 X 时采样」，不表示调用返回时仍在途。同理，`WaitOptions` 的 deadline 只约束本次等待，不撤销已接纳的 I/O。
+
 真实写错误结算当前操作已发前缀与本轮后续未发操作；结算期间明确拒绝新写，不能跳过失败前缀继续旧队列。结算完且未关闭时允许新的 AsyncWrite，该调用本身表示上层新尝试；不续发旧操作，最近错误持久保留。关闭与结算同序仲裁，错误结算不能重开关闭状态。
 
 CoWaiter 使用现有登记、复查、投递与 Notify 仲裁，登记失败不留下孤儿责任；完成/超时/取消竞争只产生一次等待结果，不等于底层操作已取消。Notify 在所有外层锁之外执行，不直接 Resume、不缓存协程创建线程/TLS。
+
+### Co 入口的执行域 gate 与快速拒绝
+
+四个 Co 入口（`CoRead`/`CoWrite`/`CoAccept`/`CoDial`）在任何消费、接纳、提交或创建等待责任**之前**校验当前执行域，非协程上下文（普通线程、runtime idle、raw owner 回调）统一 `operation_not_permitted`，包括带现成数据、零长度写、已就绪 accept 的快路径。gate 复用上游无创建查询 `GetLocalCoroutineId()`，不构造 `CoObject`、不创建 Processer、不产生网络副作用。
+
+`CoAccept` 的拒绝优先级本身是契约：执行域非法 → `operation_not_permitted`；已封口/`Closing`/`Stopped` → `operation_canceled`；`Idle`/`Starting` → `operation_not_permitted`；`Running` 未开 handoff → `operation_not_permitted`；`Running` + handoff 但无 main accept owner（client-only）→ `operation_not_supported`。终态判定先于布局判定：`Stopped` 时 main owner 已解绑，但那是收口结果，不得据此误报成「这类 Engine 不支持 accept」。完整错误码矩阵与迁移清单见 [决策 0010「API 冻结候选」](../decisions/0010-gnet-network-foundation.md)。
+
+`CoDial` 是唯一 Co 建连交付，支持无 `RawHandler` 的 server 与 client-only Engine；配置了 handler 时在任何提交前拒绝。两段式（提交 → 领取）是内部步骤，不公开中间 ID。凡是**已提交**之后未交付就离开的路径（等待对象建立失败、等待名额满、等待返回 `InvalidContext`/`RuntimeUnavailable`、超时/取消）都由内部归还 claim 并让 owner 回收未交付 fd——这是资源回滚，不是对已交付连接的关闭策略；执行域 gate 失败在提交之前发生，没有 claim 需要归还。
 
 ## 5. Handler、数据与执行上下文
 
@@ -126,7 +136,9 @@ Run 用有限间隔谓词等待，控制唤醒或到期后通过 QueryProcesserD
 
 已落地（PR #84，`bbt/infra/net/`）：`detail/ReactorDriver`（真实 Asio context 的 `OnTick/Wait/Wake`、预算、槽绑定/回滚/同代解绑、driver Failed 出口）、`detail/DriverBinder`、`detail/ReceiveRing`（共享并发 ring + 释放代次通知）、`detail/OutboundQueue`（逐操作记账）、`detail/WakeHub`、`Engine`（`Run`/`RequestClose`/`LocalAddresses`/`CountConnections`/`AsyncConnect`/`AsyncConnectAwaitable`/`WaitConnect`/`WaitAccepted`/`EnableAcceptHandoff`）、`Connection`/`WriteOperation`、`RawHandler`、`CoConnection`（`CoAccept`/`CoRead`/`CoWrite`/`CoDial`）。
 
-验证面：`tests/net/` 的 `net_foundation`、`net_primitives`、`net_allocation`、`net.reactor_driver_*`、`net.r2_*`、`net.b4_*`、`net_foundation_consumer`、`example_co_net_service_roundtrip`，以及 `net.consumer_coroutine_first_{configure,build,run}` 与 `net.consumer_source_dir_mismatch` 负向配置；CI 的 network job 用 `scripts/ci/check_network_tests.py` 强制注册集与 JUnit 实跑集一致、零跳过。合入后主线 run `39305113509` 的该 job 为 success。
+**API 冻结候选（未合入）**：分支 `refactor/net-minimal-api-freeze` 的工作区候选把公共面收口为 `Engine`（`Run`/`RequestClose`/`Phase`/`LastError`/`LastFailure`/`LocalAddresses`/`CountConnections`/`HandlerErrorCount`/`ReactorOwnerIds`/`AsyncConnect`/`EnableAcceptHandoff`）、`Connection`/`WriteOperation`、独立公共 `ReadAccess` 与 `Types.hpp`、`RawHandler`、13 字段 `Options`、`CoRead`/`CoWrite`/`CoAccept`/`CoDial`；`Connection::State()`、两处内部构造、`AsyncConnectAwaitable`、公开 `WaitConnect`/`WaitAccepted`、公共 `NormalizeOptions` 与 12 个历史 Options 字段被删除或收回内部，测试接缝全部落在 `detail/`。该候选**尚未提交、未经 PR CI、未正式冻结**，冻结符号清单、删除迁移表与逐条行为契约见 [决策 0010「API 冻结候选」](../decisions/0010-gnet-network-foundation.md)。
+
+验证面：`tests/net/` 的 `net_foundation`、`net_primitives`、`net_allocation`、`net.reactor_driver_*`、`net.r2_*`、`net.b4_*`、`net.freeze_*`（候选分支新增）、`net_foundation_consumer`、`example_co_net_service_roundtrip`，以及 `net.consumer_coroutine_first_{configure,build,run}` 与 `net.consumer_source_dir_mismatch` 负向配置；CI 的 network job 用 `scripts/ci/check_network_tests.py` 强制注册集与 JUnit 实跑集一致、零跳过。合入后主线 run `39305113509` 的该 job 为 success —— 该 success 属于 PR #84 的形态，**不能用于证明上面那个未合入候选**（候选尚未推送，也就没有它的 CI 记录）。
 
 未覆盖：Long-running/多连接压力与性能门槛、Release/ASAN/TSAN、非 Linux 平台、ReusePort 跨 loop 验收、TLS、高层 UDP（仅编译拒绝入口）、HTTP/RPC/Redis/Mongo/config 消费者迁移、Engine 级 graceful drain。文末旧用例与次数只绑定其当时版本，不能转记为当前通过证据。
 

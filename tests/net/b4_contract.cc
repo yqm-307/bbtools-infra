@@ -10,7 +10,7 @@
 //   wait_accepted_existing_out 既有 out 有效不算本轮成功
 //   run_preconditions         未初始化/未声明独立推进零副作用拒绝
 //   engine_driver_failed      Engine 级 Failed 同步解绑/冻结/不伪回调
-//   unsupported_options       ET/ticker 明确拒绝非静默忽略
+//   invalid_options_rejected  保留字段非法值在绑定前拒绝（历史 ET/ticker 字段已删除）
 //   handoff_full_resume       容量 1 下先 reserve 再 accept、满后恢复
 //   lb_subs                   LB 分配真实落到两个 sub owner
 //   fairness                  热连接 + 第二连接 + 业务协程同时进展
@@ -19,10 +19,12 @@
 #include <bbt/infra/net/Engine.hpp>
 #include <bbt/infra/net/NativeSocket.hpp>
 #include <bbt/infra/net/RawHandler.hpp>
+#include <bbt/infra/net/detail/CoInternal.hpp>
 #include <bbt/infra/net/detail/ConnectionState.hpp>
 #include <bbt/infra/net/detail/ReceiveRing.hpp>
+#include <bbt/infra/net/detail/TestAccess.hpp>
 #include <bbt/infra/net/detail/WakeHub.hpp>
-#include <bbt/infra/net/EngineTestAccess.hpp>
+#include <bbt/infra/net/detail/EngineTestAccess.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -242,7 +244,7 @@ struct EchoHandler : RawHandler {
     }
     void OnRead(Connection connection) override {
         std::string data;
-        if (connection.TryRead(data).status == ReceiveRing::ReadStatus::Ok && !data.empty()) {
+        if (connection.TryRead(data).status == ReadStatus::Ok && !data.empty()) {
             WriteOperation operation;
             connection.AsyncWrite(data, operation);
         }
@@ -276,7 +278,7 @@ static std::error_code TryAccept(ConnectionState& state, std::string data,
     std::shared_ptr<WriteOpRecord> record;
     const auto error = state.AcceptWrite(std::move(data), record);
     if (!error) {
-        out = WriteOperation(std::move(record));
+        out = ConnectionTestAccess::MakeWrite(std::move(record));
     }
     return error;
 }
@@ -293,16 +295,16 @@ static EngineConfig ServerConfig(const Address& listen, std::size_t subs = 1) {
 static void RingAllocNoConsume() {
     ReceiveRing ring(256);
     const std::string payload(64, 'z');
-    CHECK(ring.TryAppend(payload).status == ReceiveRing::ReadStatus::Ok);
+    CHECK(ring.TryAppend(payload).status == ReadStatus::Ok);
     CHECK(ring.Size() == payload.size());
     std::string out;
     g_fail_alloc = true;
     auto result = ring.TryRead(out);
     g_fail_alloc = false;
-    CHECK(result.status == ReceiveRing::ReadStatus::Error);
+    CHECK(result.status == ReadStatus::Error);
     CHECK(ring.Size() == payload.size());  // 未消费、未丢字节
     std::string retry;
-    CHECK(ring.TryRead(retry).status == ReceiveRing::ReadStatus::Ok);
+    CHECK(ring.TryRead(retry).status == ReadStatus::Ok);
     CHECK(retry == payload);
     CHECK(ring.Size() == 0);
     std::cout << "ring_alloc_no_consume fail_status=Error retry=ok\n";
@@ -311,9 +313,9 @@ static void RingAllocNoConsume() {
 static void RingReleaseNotify() {
     StartRuntime(1);
     auto state = std::make_shared<ConnectionState>(1, 4096, 1024, 4, nullptr);
-    Connection connection(state);
-    CHECK(state->ring.TryAppend("release!").status == ReceiveRing::ReadStatus::Ok);
-    auto held = state->ring.TryAccess();
+    Connection connection = ConnectionTestAccess::Make(state);
+    CHECK(state->ring.TryAppend("release!").status == ReadStatus::Ok);
+    auto held = ConnectionTestAccess::HoldForTest(state);
     CHECK(bool(held));
     std::atomic<int> result{-1};
     auto task = Task([&] {
@@ -324,7 +326,7 @@ static void RingReleaseNotify() {
         }
     });
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    held = ReceiveRing::ReadAccess();  // 锁外 NotifyRelease
+    ConnectionTestAccess::Reset(held);  // 锁外 NotifyRelease
     Get(task);
     CHECK(result.load() == 0);
     std::cout << "ring_release_notify busy_wait_woken=ok\n";
@@ -467,7 +469,8 @@ static void WaitAcceptedExistingOut() {
         auto error = CoAccept(engine, out, Until(3000ms));
         if (error || !out.Valid()) { result.store(1); return; }
         // 无更多 handoff：既有 out 有效不能算本轮成功。
-        const auto second = engine.WaitAccepted(out, Until(40ms));
+        // 内部等待步骤（公共面只留 CoAccept）：既有 out 有效不算本轮成功。
+        const auto second = CoAccess::WaitAccepted(engine, out, Until(40ms));
         if (second == std::make_error_code(std::errc::timed_out)) {
             result.store(0);
         } else {
@@ -537,23 +540,36 @@ static void EngineDriverFailed() {
               << " no_pseudo_onclose=ok\n";
 }
 
-static void UnsupportedOptions() {
+// ET/ticker 等历史字段已从 Options 删除，"识别后拒绝"路径不复存在。本条改为：
+// 保留字段的非法值仍在 Run 的归一化阶段、driver 绑定/socket 副作用之前拒绝，
+// 且 Engine 回到 Stopped、LocalAddresses 拒绝（无零副作用泄漏）。
+// 「字段本身不存在」由 Test_net_freeze 的 net.freeze_options_contract 负向编译
+// 对照证明（编译期，不在运行期）。
+static void InvalidOptionsRejected() {
     StartRuntime(2);
-    {
+    struct Case {
+        const char* label;
+        std::int64_t num_event_loop;
+        std::int64_t max_inbound_bytes;
+        std::error_code expected;
+    };
+    const Case cases[] = {
+        {"negative_loop", -1, 1024, std::make_error_code(std::errc::invalid_argument)},
+        {"zero_inbound", 1, 0, std::make_error_code(std::errc::invalid_argument)},
+    };
+    for (const auto& item : cases) {
         Engine engine(std::make_shared<NullHandler>());
         EngineConfig config = ServerConfig(Loopback(0));
-        config.options.edge_triggered_io = true;
-        CHECK(engine.Run(config) == std::make_error_code(std::errc::operation_not_supported));
+        config.options.num_event_loop = item.num_event_loop;
+        config.options.max_inbound_bytes = item.max_inbound_bytes;
+        const auto error = engine.Run(config);
+        CHECK(error == item.expected);
         CHECK(engine.Phase() == EnginePhase::Stopped);
+        std::vector<Address> addresses;
+        CHECK(engine.LocalAddresses(addresses)
+              == std::make_error_code(std::errc::operation_not_permitted));
+        std::cout << "invalid_options " << item.label << " err=" << error.value() << '\n';
     }
-    {
-        Engine engine(std::make_shared<NullHandler>());
-        EngineConfig config = ServerConfig(Loopback(0));
-        config.options.ticker = true;
-        CHECK(engine.Run(config) == std::make_error_code(std::errc::operation_not_supported));
-        CHECK(engine.Phase() == EnginePhase::Stopped);
-    }
-    std::cout << "unsupported_options et/ticker=rejected\n";
 }
 
 static void HandoffFullResume() {
@@ -689,17 +705,17 @@ static std::size_t CountFds() {
 
 static void RingAppendFaultSharedOut() {
     ReceiveRing ring(64);
-    CHECK(ring.TryAppend("abcdef").status == ReceiveRing::ReadStatus::Ok);
+    CHECK(ring.TryAppend("abcdef").status == ReadStatus::Ok);
     const std::string original = "prefix";
     std::string out = original;
     ReceiveRing::SetAppendFaultForTest([] { throw std::bad_alloc(); });
     const auto failed = ring.TryRead(out);
     ReceiveRing::SetAppendFaultForTest({});
-    CHECK(failed.status == ReceiveRing::ReadStatus::Error);
+    CHECK(failed.status == ReadStatus::Error);
     CHECK(ring.Size() == 6);       // 未消费
     CHECK(out == original);        // out 不变（强保证）
     std::string retry;
-    CHECK(ring.TryRead(retry).status == ReceiveRing::ReadStatus::Ok);
+    CHECK(ring.TryRead(retry).status == ReadStatus::Ok);
     CHECK(retry == "abcdef");
     std::cout << "ring_append_fault_shared_out unchanged=ok\n";
 }
@@ -707,8 +723,8 @@ static void RingAppendFaultSharedOut() {
 static void CoReadAppendFaultNonEmptyOut() {
     StartRuntime(1);
     auto state = std::make_shared<ConnectionState>(1, 4096, 1024, 4, nullptr);
-    Connection connection(state);
-    CHECK(state->ring.TryAppend("co-payload").status == ReceiveRing::ReadStatus::Ok);
+    Connection connection = ConnectionTestAccess::Make(state);
+    CHECK(state->ring.TryAppend("co-payload").status == ReadStatus::Ok);
     auto out = std::make_shared<std::string>("existing");
     std::atomic<int> result{-1};
     ReceiveRing::SetAppendFaultForTest([] { throw std::bad_alloc(); });
@@ -723,16 +739,24 @@ static void CoReadAppendFaultNonEmptyOut() {
     CHECK(result.load() == 0);
     CHECK(state->ring.Size() == 10);   // 未消费
     CHECK(*out == "existing");
-    std::string retry;
-    CHECK(CoRead(connection, retry, Until(500ms)) == std::error_code{});
-    CHECK(retry == "co-payload");
+    // 重试必须在协程域内（CoRead 在非法域一律 operation_not_permitted）。
+    auto retry_out = std::make_shared<std::string>();
+    std::atomic<int> retry_result{-1};
+    auto retry_task = Task([&] {
+        if (!CoRead(connection, *retry_out, Until(500ms))) {
+            retry_result.store(0);
+        }
+    });
+    Get(retry_task);
+    CHECK(retry_result.load() == 0);
+    CHECK(*retry_out == "co-payload");
     std::cout << "co_read_append_fault_nonempty_out unchanged=ok\n";
 }
 
 static void CoReadIdleNoSpin() {
     StartRuntime(1);
     auto state = std::make_shared<ConnectionState>(1, 4096, 1024, 4, nullptr);
-    Connection connection(state);
+    Connection connection = ConnectionTestAccess::Make(state);
     std::atomic<int> result{-1};
     std::string out;
     const auto before = state->ring.AccessGeneration();
@@ -745,7 +769,7 @@ static void CoReadIdleNoSpin() {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     const auto during = state->ring.AccessGeneration();
     CHECK(during - before <= 2);  // 空数据等待不自激取保护
-    CHECK(state->ring.TryAppend("x").status == ReceiveRing::ReadStatus::Ok);
+    CHECK(state->ring.TryAppend("x").status == ReadStatus::Ok);
     Get(task);
     CHECK(result.load() == 0);
     CHECK(state->ring.AccessGeneration() - before <= 4);
@@ -775,23 +799,23 @@ static void StagedCloseTail() {
     CHECK(retained && retained->Valid());
     // owner 已取走、追加遇 Busy 的字节走同 ring pending（统一锁由 owner 持，
     // 不在消费者保护内调用）。Busy 竞争路径由 staged_recv_busy_close 覆盖。
-    CHECK(retained->State()->ring.AppendDeferred("second"));
+    CHECK(ConnectionTestAccess::StateOf(*retained)->ring.AppendDeferred("second"));
     retained->RequestClose();          // 请求封口；最终 EOF 由 owner stage 后发布
     std::string tail;
     for (int i = 0; i < 500; ++i) {
         std::string chunk;
         const auto result = retained->TryRead(chunk);
-        if (result.status == ReceiveRing::ReadStatus::Ok) {
+        if (result.status == ReadStatus::Ok) {
             tail += chunk;
             continue;
         }
-        if (result.status == ReceiveRing::ReadStatus::WouldBlock
-            || result.status == ReceiveRing::ReadStatus::Busy) {
+        if (result.status == ReadStatus::WouldBlock
+            || result.status == ReadStatus::Busy) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;  // owner 尚未发布最终 EOF
         }
-        CHECK(result.status == ReceiveRing::ReadStatus::Eof
-              || result.status == ReceiveRing::ReadStatus::Error);
+        CHECK(result.status == ReadStatus::Eof
+              || result.status == ReadStatus::Error);
         break;
     }
     CHECK(tail == "firstsecond");
@@ -829,10 +853,10 @@ static void ConnectCompleteBeforeWait() {
     std::atomic<int> result{-1};
     auto task = Task([&] {
         std::uint64_t id = 0;
-        if (client.AsyncConnectAwaitable(address, id)) { result.store(1); return; }
+        if (CoAccess::SubmitConnect(client, address, id)) { result.store(1); return; }
         std::this_thread::sleep_for(std::chrono::milliseconds(30));  // 完成早于等待
         Connection out;
-        if (!client.WaitConnect(id, out, Until(1000ms)) && out.Valid()) {
+        if (!CoAccess::WaitConnect(client, id, out, Until(1000ms)) && out.Valid()) {
             result.store(0);
         }
     });
@@ -857,11 +881,11 @@ static void ConnectTimeoutRecyclesAdopt() {
         std::atomic<int> wait_error{-1};
         auto task = Task([&] {
             std::uint64_t id = 0;
-            if (client.AsyncConnectAwaitable(address, id)) {
+            if (CoAccess::SubmitConnect(client, address, id)) {
                 return;
             }
             Connection out;
-            wait_error.store(client.WaitConnect(id, out, Until(30ms)).value());
+            wait_error.store(CoAccess::WaitConnect(client, id, out, Until(30ms)).value());
         });
         Get(task);
         CHECK(wait_error.load() == std::make_error_code(std::errc::timed_out).value());
@@ -886,9 +910,9 @@ static void ConnectHardCap() {
     EngineTestAccess::SetConnectLimit(client, 1);
     EngineTestAccess::SetConnectDeliveryDelay(client, std::chrono::milliseconds(300));
     std::uint64_t first = 0;
-    CHECK(!client.AsyncConnectAwaitable(address, first));
+    CHECK(!CoAccess::SubmitConnect(client, address, first));
     std::uint64_t second = 0;
-    CHECK(client.AsyncConnectAwaitable(address, second)
+    CHECK(CoAccess::SubmitConnect(client, address, second)
           == std::make_error_code(std::errc::no_buffer_space));
     runner.CloseAndJoin();
     std::cout << "connect_hard_cap all_pending_zero_accept=ok\n";
@@ -1023,7 +1047,7 @@ static void CoReadRapid() {
     StartRuntime(1);
     constexpr int kCount = 2000;
     auto state = std::make_shared<ConnectionState>(1, 1 << 20, 1024, 4, nullptr);
-    Connection connection(state);
+    Connection connection = ConnectionTestAccess::Make(state);
     std::atomic<int> total{0};
     std::atomic<int> result{-1};
     auto task = Task([&] {
@@ -1045,10 +1069,10 @@ static void CoReadRapid() {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
         for (;;) {
             const auto result = state->ring.TryAppend("x");
-            if (result.status == ReceiveRing::ReadStatus::Ok) {
+            if (result.status == ReadStatus::Ok) {
                 break;
             }
-            if (result.status == ReceiveRing::ReadStatus::Busy) {
+            if (result.status == ReadStatus::Busy) {
                 if (state->ring.AppendDeferred("x")) {
                     break;  // 非阻塞：Busy 时由调用者重试，不锁等
                 }
@@ -1107,7 +1131,7 @@ static void WriteTerminalNoAlloc() {
 static void WriteCapacityAfterDrain() {
     StartRuntime(1);
     auto state = std::make_shared<ConnectionState>(1, 4096, 4096, 1, nullptr);
-    Connection connection(state);
+    Connection connection = ConnectionTestAccess::Make(state);
     auto sink = [](const std::string_view* views, std::size_t, std::size_t budget) -> ssize_t {
         return static_cast<ssize_t>(std::min(views[0].size(), budget));
     };
@@ -1149,7 +1173,7 @@ static void WriteCapacityAfterDrain() {
 static void WriteCapacityAfterPartial() {
     StartRuntime(1);
     auto state = std::make_shared<ConnectionState>(1, 4096, 8, 4, nullptr);
-    Connection connection(state);
+    Connection connection = ConnectionTestAccess::Make(state);
     WriteOperation first;
     CHECK(!TryAccept(*state, std::string(8, 'x'), first));
     std::atomic<int> second_result{-1};
@@ -1333,7 +1357,7 @@ static void StagedRecvBusyClose() {
         if (!conn1) {
             return;
         }
-        auto hold = conn1->State()->ring.TryHoldForTest();
+        auto hold = ConnectionTestAccess::HoldForTest(ConnectionTestAccess::StateOf(*conn1));
         if (!hold) {
             return;
         }
@@ -1341,7 +1365,7 @@ static void StagedRecvBusyClose() {
         while (!release_hold.load() && std::chrono::steady_clock::now() < deadline) {
             std::this_thread::yield();
         }
-        hold = ReceiveRing::ReadAccess();
+        ConnectionTestAccess::Reset(hold);
         holder_done.store(true);
     });
     EngineTestAccess::SetReadAppendHook(engine, [&] {
@@ -1367,11 +1391,11 @@ static void StagedRecvBusyClose() {
     for (int i = 0; i < 200 && tail.size() < 5; ++i) {
         std::string chunk;
         const auto result = conn1->TryRead(chunk);
-        if (result.status == ReceiveRing::ReadStatus::Ok) {
+        if (result.status == ReadStatus::Ok) {
             tail += chunk;
             continue;
         }
-        if (result.status == ReceiveRing::ReadStatus::Busy) {
+        if (result.status == ReadStatus::Busy) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;  // owner 短暂持锁：按 TryRead 契约重试
         }
@@ -1389,12 +1413,14 @@ static void StagedRecvBusyClose() {
 
 
 static void RingDeferredNonblockingTry() {
-    ReceiveRing ring(1024);
+    // 保护由公共守卫经内部 TestAccess 取得：裸 ReceiveRing 不再提供 try-hold。
+    auto state = std::make_shared<ConnectionState>(1, 1024, 1024, 4, nullptr);
+    ReceiveRing& ring = state->ring;
     ring.ReserveDeferred(64);
     std::atomic<bool> held{false};
     std::atomic<bool> release{false};
     std::thread holder([&] {
-        auto hold = ring.TryHoldForTest();
+        auto hold = ConnectionTestAccess::HoldForTest(state);
         if (!hold) {
             return;
         }
@@ -1403,7 +1429,7 @@ static void RingDeferredNonblockingTry() {
         while (!release.load() && std::chrono::steady_clock::now() < deadline) {
             std::this_thread::yield();
         }
-        hold = ReceiveRing::ReadAccess();
+        ConnectionTestAccess::Reset(hold);
     });
     CHECK(WaitUntil([&] { return held.load(); }, 3000ms));
     const auto begin = std::chrono::steady_clock::now();
@@ -1415,7 +1441,7 @@ static void RingDeferredNonblockingTry() {
     holder.join();
     CHECK(ring.AppendDeferred("abc"));   // 释放后同一协议可提交
     std::string out;
-    CHECK(ring.TryRead(out).status == ReceiveRing::ReadStatus::Ok);
+    CHECK(ring.TryRead(out).status == ReadStatus::Ok);
     CHECK(out == "abc");
     std::cout << "ring_deferred_nonblocking_try elapsed_ms=" << elapsed << " ok\n";
 }
@@ -1433,7 +1459,7 @@ static void RingDeferredBackingReuse() {
         CHECK(appended);
         CHECK(ring.PendingSize() == payload.size());
         std::string out;
-        CHECK(ring.TryRead(out).status == ReceiveRing::ReadStatus::Ok);
+        CHECK(ring.TryRead(out).status == ReadStatus::Ok);
         CHECK(out == payload);
         CHECK(ring.PendingSize() == 0);
     }
@@ -1479,25 +1505,32 @@ static void CoBusyReleasePhases() {
     auto make_state = [] {
         auto state = std::make_shared<ConnectionState>(1, 4096, 1024, 4, nullptr);
         CHECK(state->ring.TryAppend(std::string(256, 'x')).status
-              == ReceiveRing::ReadStatus::Ok);
+              == ReadStatus::Ok);
         return state;
     };
     // 1) 尝试前释放：TryAccess 直接可读。
     {
         auto state = make_state();
-        Connection connection(state);
-        auto hold = state->ring.TryHoldForTest();
+        Connection connection = ConnectionTestAccess::Make(state);
+        auto hold = ConnectionTestAccess::HoldForTest(state);
         CHECK(bool(hold));
-        hold = ReceiveRing::ReadAccess();  // 尝试前释放
-        std::string out;
-        CHECK(CoRead(connection, out, Until(1000ms)) == std::error_code{});
-        CHECK(out.size() == 256);
+        ConnectionTestAccess::Reset(hold);  // 尝试前释放
+        auto shared_out = std::make_shared<std::string>();
+        std::atomic<int> read_result{-1};
+        auto read_task = Task([&] {
+            if (!CoRead(connection, *shared_out, Until(1000ms))) {
+                read_result.store(0);
+            }
+        });
+        Get(read_task);
+        CHECK(read_result.load() == 0);
+        CHECK(shared_out->size() == 256);
     }
     // 2) Busy 之后、waiter 创建之前释放：必须靠「TryAccess 之前采的旧代次」
     //    在 on_registered 复查出差异；修复前采到已释放后的 G+1 → 超时。
     {
         auto state = make_state();
-        Connection connection(state);
+        Connection connection = ConnectionTestAccess::Make(state);
         std::atomic<bool> entered{false};
         std::atomic<bool> release_now{false};
         ReceiveRing::SetBusyBeforeWaiterHookForTest([&] {
@@ -1507,7 +1540,7 @@ static void CoBusyReleasePhases() {
                 std::this_thread::yield();
             }
         });
-        auto hold = state->ring.TryHoldForTest();
+        auto hold = ConnectionTestAccess::HoldForTest(state);
         CHECK(bool(hold));
         std::atomic<int> result{-1};
         std::string out;
@@ -1518,7 +1551,7 @@ static void CoBusyReleasePhases() {
             }
         });
         CHECK(WaitUntil([&] { return entered.load(); }, 1000ms));
-        hold = ReceiveRing::ReadAccess();   // Busy 后、waiter 前释放并推进代次
+        ConnectionTestAccess::Reset(hold);   // Busy 后、waiter 前释放并推进代次
         release_now.store(true);
         Get(task);
         ReceiveRing::SetBusyBeforeWaiterHookForTest({});
@@ -1527,10 +1560,10 @@ static void CoBusyReleasePhases() {
     // 3) waiter 加入 hub 之后释放：走 release hub Notify。
     {
         auto state = make_state();
-        Connection connection(state);
+        Connection connection = ConnectionTestAccess::Make(state);
         std::atomic<bool> added{false};
         ReceiveRing::SetAfterAddHookForTest([&] { added.store(true); });
-        auto hold = state->ring.TryHoldForTest();
+        auto hold = ConnectionTestAccess::HoldForTest(state);
         CHECK(bool(hold));
         std::atomic<int> result{-1};
         auto task = Task([&] {
@@ -1540,7 +1573,7 @@ static void CoBusyReleasePhases() {
             }
         });
         CHECK(WaitUntil([&] { return added.load(); }, 1000ms));
-        hold = ReceiveRing::ReadAccess();   // Add 之后释放
+        ConnectionTestAccess::Reset(hold);   // Add 之后释放
         Get(task);
         ReceiveRing::SetAfterAddHookForTest({});
         CHECK(result.load() == 0);
@@ -1551,7 +1584,7 @@ static void CoBusyReleasePhases() {
 static void CoWouldBlockClosedRace() {
     StartRuntime(1);
     auto state = std::make_shared<ConnectionState>(1, 4096, 1024, 4, nullptr);
-    Connection connection(state);
+    Connection connection = ConnectionTestAccess::Make(state);
     std::atomic<bool> entered{false};
     std::atomic<bool> closed{false};
     ReceiveRing::SetWouldBlockBeforeWaiterHookForTest([&] {
@@ -1717,12 +1750,12 @@ static void RawBusyDeferredOnRead() {
             }
             std::string chunk;
             const auto result = connection.TryRead(chunk);
-            if (result.status == ReceiveRing::ReadStatus::Busy) {
+            if (result.status == ReadStatus::Busy) {
                 busy.fetch_add(1);
                 busy_seen.store(true);
                 return;
             }
-            if (result.status == ReceiveRing::ReadStatus::Ok) {
+            if (result.status == ReadStatus::Ok) {
                 std::lock_guard<std::mutex> lock(mutex);
                 data += chunk;
                 got.store(true);
@@ -1746,11 +1779,11 @@ static void RawBusyDeferredOnRead() {
     CHECK(stored && stored->Valid());
     // 短保护跨另一 native 线程：测试线程持锁，OnRead 的 TryRead 得到 Busy；
     // 不持锁挂起。
-    auto hold = stored->State()->ring.TryHoldForTest();
+    auto hold = ConnectionTestAccess::HoldForTest(ConnectionTestAccess::StateOf(*stored));
     CHECK(bool(hold));
     handler->hold_ready.store(true);
     CHECK(WaitUntil([&] { return handler->busy_seen.load(); }, 1000ms));
-    hold = ReceiveRing::ReadAccess();  // 释放
+    ConnectionTestAccess::Reset(hold);  // 释放
     // 无新网络字节：owner 必须补投 OnRead 取回原 ring 字节。
     CHECK(WaitUntil([&] { return handler->got.load(); }, 2000ms));
     {
@@ -1847,7 +1880,7 @@ static void WakeHubCapacityBounded() {
 static void CoReadHubFullBounded() {
     StartRuntime(1);
     auto state = std::make_shared<ConnectionState>(1, 4096, 1024, 4, nullptr);
-    Connection connection(state);
+    Connection connection = ConnectionTestAccess::Make(state);
     std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>> keep;
     for (std::size_t i = 0; i < WakeHub::kMaxWaiters; ++i) {
         auto waiter = state->ring.CreateDataWaiter();
@@ -1863,10 +1896,17 @@ static void CoReadHubFullBounded() {
     Get(task);
     CHECK(result.load() == std::make_error_code(std::errc::no_buffer_space).value());
     keep.clear();  // 清理不污染进程
-    CHECK(state->ring.TryAppend("z").status == ReceiveRing::ReadStatus::Ok);
-    std::string out;
-    CHECK(CoRead(connection, out, Until(500ms)) == std::error_code{});
-    CHECK(out == "z");
+    CHECK(state->ring.TryAppend("z").status == ReadStatus::Ok);
+    auto cleanup_out = std::make_shared<std::string>();
+    std::atomic<int> cleanup_result{-1};
+    auto cleanup_task = Task([&] {
+        if (!CoRead(connection, *cleanup_out, Until(500ms))) {
+            cleanup_result.store(0);
+        }
+    });
+    Get(cleanup_task);
+    CHECK(cleanup_result.load() == 0);
+    CHECK(*cleanup_out == "z");
     std::cout << "co_read_hub_full_bounded rejected=ok cleanup=ok\n";
 }
 
@@ -2010,7 +2050,7 @@ static void CoDialFastComplete() {
     EngineRunner runner(client, ClientConfig());
     CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
     std::atomic<bool> barrier_entered{false};
-    SetCoDialBarrierForTest([&] {
+    CoTestAccess::SetDialBarrier([&] {
         barrier_entered.store(true);
         // 等 owner 完成（awaitable 意图保留），再进入 WaitConnect。
         CHECK(WaitUntil([&] { return EngineTestAccess::PendingConnectCount(client) == 0; },
@@ -2029,7 +2069,7 @@ static void CoDialFastComplete() {
         }
     });
     Get(task);
-    SetCoDialBarrierForTest({});
+    CoTestAccess::SetDialBarrier({});
     CHECK(barrier_entered.load());
     CHECK(result.load() == 0);
     CHECK(EngineTestAccess::ConnectTableSize(client) == 0);
@@ -2189,6 +2229,10 @@ static void CallbackAuthBarriers() {
 
 
 
+// 公共建连单一交付（D5）：无 handler 的 Engine 上 AsyncConnect 零提交拒绝，
+// out_id 保持原值、不产生 OnConnect；同一 Engine 上 CoDial 才是正例交付。
+// 早到完成（owner 先完成、后领取）由 connect_complete_before_wait 经内部
+// 两段式覆盖，Scenario 不再依赖已删除的公开 awaitable 提交。
 static void AsyncConnectPublicFastComplete() {
     StartRuntime(2);
     Address address;
@@ -2196,14 +2240,21 @@ static void AsyncConnectPublicFastComplete() {
     Engine client{std::shared_ptr<RawHandler>()};
     EngineRunner runner(client, ClientConfig());
     CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
-    std::uint64_t id = 0;
-    CHECK(!client.AsyncConnect(address, id));
-    // owner 完成早于 WaitConnect attach（公共 AsyncConnect 提交即保留）。
-    CHECK(WaitUntil([&] { return EngineTestAccess::PendingConnectCount(client) == 0; }, 2000ms));
+    const std::uint64_t sentinel = 0x5A5A;
+    std::uint64_t id = sentinel;
+    CHECK(client.AsyncConnect(address, id)
+          == std::make_error_code(std::errc::operation_not_supported));
+    CHECK(id == sentinel);                               // 拒绝不改 out_id
+    CHECK(EngineTestAccess::ConnectTableSize(client) == 0);  // 零提交
+    CHECK(EngineTestAccess::PendingConnectCount(client) == 0);
+    using namespace std::chrono_literals;
+    std::this_thread::sleep_for(50ms);
+    CHECK(EngineTestAccess::ConnectionCount(client) == 0);   // 无隐式建连/无 fd 遗留
+
     std::atomic<int> result{-2};
     auto task = Task([&] {
         Connection connection;
-        const auto error = client.WaitConnect(id, connection, Until(1000ms));
+        const auto error = CoDial(client, address, connection, Until(2000ms));
         if (!error && connection.Valid()) {
             result.store(0);
             connection.RequestClose();
@@ -2212,12 +2263,15 @@ static void AsyncConnectPublicFastComplete() {
         }
     });
     Get(task);
-    CHECK(result.load() == 0);  // 不再 invalid_argument，也不孤儿
+    CHECK(result.load() == 0);  // CoDial 是唯一 Co 建连交付
     CHECK(WaitUntil([&] { return EngineTestAccess::ConnectionCount(client) == 0; }, 2000ms));
     CHECK(EngineTestAccess::ConnectTableSize(client) == 0);
+    Address peer;
+    std::error_code ignored;
+    (void)listener.Accept(peer, ignored);
     runner.CloseAndJoin();
     CHECK(!runner.error);
-    std::cout << "async_connect_public_fast_complete waitable=ok\n";
+    std::cout << "async_connect_public_fast_complete raw_no_handler=rejected codial=ok\n";
 }
 
 static void AsyncConnectRawNotWaitable() {
@@ -2244,7 +2298,7 @@ static void AsyncConnectRawNotWaitable() {
     std::atomic<int> result{-2};
     auto task = Task([&] {
         Connection connection;
-        result.store(client.WaitConnect(id, connection, Until(2000ms)).value());
+        result.store(CoAccess::WaitConnect(client, id, connection, Until(2000ms)).value());
     });
     Get(task);
     CHECK(result.load() == std::make_error_code(std::errc::operation_not_supported).value());
@@ -2267,13 +2321,13 @@ static void WaitConnectAddFailureRecycles() {
     // 延迟交付：先填满 op hub，再让 Add 失败；owner 稍后交付时无接收者必须回收。
     EngineTestAccess::SetConnectDeliveryDelay(client, std::chrono::milliseconds(2000));
     std::uint64_t id = 0;
-    CHECK(!client.AsyncConnect(address, id));
+    CHECK(!CoAccess::SubmitConnect(client, address, id));
     std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>> keep;
     CHECK(EngineTestAccess::FillConnectHub(client, id, keep) == WakeHub::kMaxWaiters);
     std::atomic<int> result{-2};
     auto task = Task([&] {
         Connection connection;
-        result.store(client.WaitConnect(id, connection, Until(2000ms)).value());
+        result.store(CoAccess::WaitConnect(client, id, connection, Until(2000ms)).value());
         if (connection.Valid()) {
             connection.RequestClose();
         }
@@ -2528,7 +2582,7 @@ static void RawPendingWaitRejected() {
     std::atomic<int> result{-2};
     auto task = Task([&] {
         Connection connection;
-        result.store(client.WaitConnect(id, connection, Until(1ms)).value());
+        result.store(CoAccess::WaitConnect(client, id, connection, Until(1ms)).value());
     });
     Get(task);
     CHECK(result.load() == std::make_error_code(std::errc::operation_not_supported).value());
@@ -2581,11 +2635,11 @@ static void WaitConnectSingleReceiver() {
     CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
     EngineTestAccess::SetConnectDeliveryDelay(client, std::chrono::milliseconds(300));
     std::uint64_t id = 0;
-    CHECK(!client.AsyncConnect(address, id));
+    CHECK(!CoAccess::SubmitConnect(client, address, id));
     std::atomic<int> first_result{-2};
     auto first = Task([&] {
         Connection connection;
-        const auto error = client.WaitConnect(id, connection, Until(2000ms));
+        const auto error = CoAccess::WaitConnect(client, id, connection, Until(2000ms));
         if (!error && connection.Valid()) {
             first_result.store(0);
             connection.RequestClose();
@@ -2595,7 +2649,7 @@ static void WaitConnectSingleReceiver() {
     });
     CHECK(WaitUntil([&] { return EngineTestAccess::ConnectReceiverClaimed(client, id); }, 2000ms));
     Connection second_conn;
-    const auto second = client.WaitConnect(id, second_conn, Until(1000ms));
+    const auto second = CoAccess::WaitConnect(client, id, second_conn, Until(1000ms));
     CHECK(second == std::make_error_code(std::errc::device_or_resource_busy));
     Get(first);
     CHECK(first_result.load() == 0);  // 第一接收者在第二次拒绝后仍成功领取
@@ -2633,7 +2687,7 @@ static void RunStagedCloseBeforeRelease(bool engine_close) {
         if (!conn1) {
             return;
         }
-        auto hold = conn1->State()->ring.TryHoldForTest();
+        auto hold = ConnectionTestAccess::HoldForTest(ConnectionTestAccess::StateOf(*conn1));
         if (!hold) {
             return;
         }
@@ -2641,7 +2695,7 @@ static void RunStagedCloseBeforeRelease(bool engine_close) {
         while (!release_hold.load() && std::chrono::steady_clock::now() < deadline) {
             std::this_thread::yield();
         }
-        hold = ReceiveRing::ReadAccess();
+        ConnectionTestAccess::Reset(hold);
         holder_done.store(true);
     });
     EngineTestAccess::SetReadAppendHook(engine, [&] {
@@ -2674,11 +2728,11 @@ static void RunStagedCloseBeforeRelease(bool engine_close) {
     for (int i = 0; i < 200 && tail.size() < 5; ++i) {
         std::string chunk;
         const auto result = conn1->TryRead(chunk);
-        if (result.status == ReceiveRing::ReadStatus::Ok) {
+        if (result.status == ReadStatus::Ok) {
             tail += chunk;
             continue;
         }
-        if (result.status == ReceiveRing::ReadStatus::Busy) {
+        if (result.status == ReadStatus::Busy) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
         }
@@ -2728,7 +2782,7 @@ static void SealWaitDriverFailedExit() {
     EngineRunner client_runner(client, ClientConfig());
     CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
     std::uint64_t id = 0;
-    CHECK(!client.AsyncConnect(addresses[0], id));
+    CHECK(!CoAccess::SubmitConnect(client, addresses[0], id));
     CHECK(WaitUntil([&] { return server_handler->accepted.load() == 1; }, 3000ms));
     EngineTestAccess::SetSealDelay(client, std::chrono::milliseconds(500));
     EngineTestAccess::SetWaitDriverFailedOnce(client);
@@ -2774,7 +2828,7 @@ static void RequestCloseWriteErrorIntent() {
     requested.MarkClosed({});
     CHECK(requested.CloseReason() == reason);  // 默认/重复 reason 不覆盖首次请求
     CHECK(!requested.TryPopTerminal(terminal));  // owner final 不重复发布已结算写
-    CHECK(WriteOperation(pending).Query().error.value() == EPIPE);
+    CHECK(ConnectionTestAccess::MakeWrite(pending).Query().error.value() == EPIPE);
 
     ConnectionState default_reason(1003, 64, 64, 4, sealed);
     default_reason.owner_dirty = [] {};
@@ -2831,13 +2885,13 @@ static void SealedWriteErrorReadPublication() {
         notified.store(status == bbt::coroutine::WaitStatus::Completed);
     });
     CHECK(ready.wait_for(1000ms) == std::future_status::ready);
-    CHECK(state.ring.TryAppend("tail").status == ReceiveRing::ReadStatus::Ok);
+    CHECK(state.ring.TryAppend("tail").status == ReadStatus::Ok);
     state.MarkClosed({});
     Get(task);
     CHECK(notified.load() && state.ring.ReadClosed());
     std::string tail;
-    CHECK(state.ring.TryRead(tail).status == ReceiveRing::ReadStatus::Ok && tail == "tail");
-    CHECK(state.ring.TryRead(tail).status == ReceiveRing::ReadStatus::Eof);
+    CHECK(state.ring.TryRead(tail).status == ReadStatus::Ok && tail == "tail");
+    CHECK(state.ring.TryRead(tail).status == ReadStatus::Eof);
     state.MarkClosed(std::make_error_code(std::errc::io_error));
     CHECK(!state.CloseReason());
     std::cout << "sealed_write_error_read_publication close_waiter=completed tail_before_eof=1\n";
@@ -2854,9 +2908,11 @@ static void RequestCloseWriteReadiness() {
         void OnAccept(Connection connection) override { accepted.set_value(connection); }
         void OnWrite(Connection connection, WriteResult result) override {
             WriteOperation rejected;
+            // 内部状态断言经 TestAccess：公共句柄不再暴露 State()。
+            const auto state = ConnectionTestAccess::StateOf(connection);
             write_checked.store(result.error.value() == EPIPE && result.sent == 0
-                && connection.State()->CloseRequested()
-                && !connection.State()->CanAcceptWrite(1)
+                && state && state->CloseRequested()
+                && !state->CanAcceptWrite(1)
                 && connection.AsyncWrite("must-reject", rejected) == make_error_code(NetErrc::Closed));
             writes.fetch_add(1);
         }
@@ -2904,8 +2960,8 @@ static void RequestCloseWriteReadiness() {
     const auto outcome = pending.Query();
     CHECK(outcome.phase == WritePhase::Done && outcome.error.value() == EPIPE && outcome.sent == 0);
     std::string tail;
-    CHECK(connection.TryRead(tail).status == ReceiveRing::ReadStatus::Ok && tail == "tail");
-    CHECK(connection.TryRead(tail).status == ReceiveRing::ReadStatus::Eof);
+    CHECK(connection.TryRead(tail).status == ReadStatus::Ok && tail == "tail");
+    CHECK(connection.TryRead(tail).status == ReadStatus::Eof);
     connection.RequestClose(std::make_error_code(std::errc::io_error));
     CHECK(connection.Closed() && !connection.CloseReason());
     CHECK(connection.WriteAcceptance() == AcceptanceState::Closed);
@@ -2942,7 +2998,7 @@ static void RequestCloseReadTerminalOrder() {
         if (!conn1) {
             return;
         }
-        auto hold = conn1->State()->ring.TryHoldForTest();
+        auto hold = ConnectionTestAccess::HoldForTest(ConnectionTestAccess::StateOf(*conn1));
         if (!hold) {
             return;
         }
@@ -2950,7 +3006,7 @@ static void RequestCloseReadTerminalOrder() {
         while (!release_hold.load() && std::chrono::steady_clock::now() < deadline) {
             std::this_thread::yield();
         }
-        hold = ReceiveRing::ReadAccess();
+        ConnectionTestAccess::Reset(hold);
     });
     EngineTestAccess::SetReadAppendHook(engine, [&] {
         hook_entered.store(true);
@@ -2978,19 +3034,19 @@ static void RequestCloseReadTerminalOrder() {
     holder.join();
     std::string early;
     const auto early_result = conn1->TryRead(early);
-    CHECK(early_result.status != ReceiveRing::ReadStatus::Eof);  // 不得 EOF
-    CHECK(early_result.status != ReceiveRing::ReadStatus::Ok || early.empty());
+    CHECK(early_result.status != ReadStatus::Eof);  // 不得 EOF
+    CHECK(early_result.status != ReadStatus::Ok || early.empty());
     release_shutdown.store(true);
     CHECK(WaitUntil([&] { return handler->closed.load() == 1; }, 3000ms));
     std::string tail;
     for (int i = 0; i < 200 && tail.size() < 5; ++i) {
         std::string chunk;
         const auto result = conn1->TryRead(chunk);
-        if (result.status == ReceiveRing::ReadStatus::Ok) {
+        if (result.status == ReadStatus::Ok) {
             tail += chunk;
             continue;
         }
-        if (result.status == ReceiveRing::ReadStatus::Busy) {
+        if (result.status == ReadStatus::Busy) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
         }
@@ -2998,7 +3054,7 @@ static void RequestCloseReadTerminalOrder() {
     }
     CHECK(tail == "first");
     std::string eof;
-    CHECK(conn1->TryRead(eof).status == ReceiveRing::ReadStatus::Eof);
+    CHECK(conn1->TryRead(eof).status == ReadStatus::Eof);
     EngineTestAccess::SetReadAppendHook(engine, {});
     (void)client.Close();
     runner.CloseAndJoin();
@@ -3012,11 +3068,11 @@ static void StageDetachedNotifyFaultNoDuplicate() {
     ReceiveRing::SetNotifyFaultOnceForTest();
     CHECK(ring.StageDetached("abc"));  // 已提交；通知失败不逆转提交
     std::string out;
-    CHECK(ring.TryRead(out).status == ReceiveRing::ReadStatus::Ok);
+    CHECK(ring.TryRead(out).status == ReadStatus::Ok);
     CHECK(out == "abc");
     CHECK(ring.Size() == 0);
     std::string again;
-    CHECK(ring.TryRead(again).status == ReceiveRing::ReadStatus::WouldBlock);
+    CHECK(ring.TryRead(again).status == ReadStatus::WouldBlock);
     std::cout << "stage_detached_notify_fault no_duplicate=ok\n";
 }
 
@@ -3084,19 +3140,19 @@ static void WaitConnectClaimCreateFailureRecovers() {
     CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
     EngineTestAccess::SetConnectDeliveryDelay(client, std::chrono::milliseconds(300));
     std::uint64_t id = 0;
-    CHECK(!client.AsyncConnect(address, id));
+    CHECK(!CoAccess::SubmitConnect(client, address, id));
     EngineTestAccess::FailNextConnectWaiterCreateOnce(client);
     std::atomic<int> first{-2};
     auto task1 = Task([&] {
         Connection connection;
-        first.store(client.WaitConnect(id, connection, Until(1000ms)).value());
+        first.store(CoAccess::WaitConnect(client, id, connection, Until(1000ms)).value());
     });
     Get(task1);
     CHECK(first.load() == std::make_error_code(std::errc::not_enough_memory).value());
     std::atomic<int> second{-2};
     auto task2 = Task([&] {
         Connection connection;
-        const auto error = client.WaitConnect(id, connection, Until(2000ms));
+        const auto error = CoAccess::WaitConnect(client, id, connection, Until(2000ms));
         if (!error && connection.Valid()) {
             second.store(0);
             connection.RequestClose();
@@ -3135,7 +3191,7 @@ static int RunCases(int argc, char** argv) {
         else if (test == "wait_accepted_existing_out") { WaitAcceptedExistingOut(); }
         else if (test == "run_preconditions") { RunPreconditions(); }
         else if (test == "engine_driver_failed") { EngineDriverFailed(); }
-        else if (test == "unsupported_options") { UnsupportedOptions(); }
+        else if (test == "invalid_options_rejected") { InvalidOptionsRejected(); }
         else if (test == "handoff_full_resume") { HandoffFullResume(); }
         else if (test == "lb_subs") { LbSubs(); }
         else if (test == "fairness") { Fairness(); }

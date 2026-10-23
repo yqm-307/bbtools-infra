@@ -58,6 +58,36 @@ foreach(_case raw_roundtrip co_accept_read_write co_dial close_retained
         WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/runtime")
 endforeach()
 
+# API 冻结契约（计划 §7 D1–D6）：公共面守卫寿命、执行域 gate、Options 契约、
+# 输出归属、建连单一交付与未交付回收、accept 配置与共存。
+# 编译期冻结（公共头不含 State/内部构造/测试屏障/旧等待 API）由
+# net.freeze_public_surface 证明；这里只放需要真实资源与时序的用例。
+# 早到交付、等待返回非 Completed 的三个退出路径、raw 投递失败/Idle/真实建连失败
+# 与 CoAccept 阶段矩阵都经 detail/EngineTestAccess 的一次性注入确定性制造，
+# 不靠串行重跑碰运气；每条负例都带正对照。
+add_executable(Test_net_freeze freeze_contract.cc)
+target_link_libraries(Test_net_freeze PRIVATE bbt::infra_net Boost::headers)
+target_compile_options(Test_net_freeze PRIVATE -Wall -Wextra -Wpedantic)
+target_link_options(Test_net_freeze PRIVATE -rdynamic)
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/runtime")
+foreach(_case guard_lifetime co_context_gate options_contract write_output_reuse
+        output_preservation connect_delivery connect_failure_cleanup accept_configuration)
+    add_test(NAME net.freeze_${_case} COMMAND Test_net_freeze ${_case})
+    set_tests_properties(net.freeze_${_case} PROPERTIES TIMEOUT 60
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/runtime")
+endforeach()
+
+# D1 公共面正/负编译门禁：正向 TU 只用公共头；负向 TU 逐项证明被删除/收回的
+# 符号真实编译失败。不用 WILL_FAIL（会把任意失败翻成通过）。
+add_test(NAME net.freeze_public_surface COMMAND ${CMAKE_COMMAND}
+    "-DCXX=${CMAKE_CXX_COMPILER}"
+    "-DINFRA_DIR=${PROJECT_SOURCE_DIR}"
+    "-DCOROUTINE_DIR=${BBT_COROUTINE_SOURCE_DIR}"
+    "-DBOOST_INCLUDE_DIRS=${Boost_INCLUDE_DIRS}"
+    "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/public_surface_probe"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/consumers/expect_public_surface.cmake")
+set_tests_properties(net.freeze_public_surface PROPERTIES TIMEOUT 300)
+
 
 # B4 契约聚焦回归：针对父级处置的真实根因（ring 异常安全/释放通知/write 事务/
 # connect 仲裁/Engine Failed/接线/公平）。
@@ -68,7 +98,7 @@ target_link_options(Test_net_b4_contract PRIVATE -rdynamic -Wl,--wrap=sendmsg)
 foreach(_case ring_alloc_no_consume ring_release_notify hub_early_notify_retained
         write_total_ops_bound write_query_monotonic onwrite_throw_continues
         wait_accepted_existing_out run_preconditions engine_driver_failed
-        unsupported_options handoff_full_resume lb_subs fairness
+        invalid_options_rejected handoff_full_resume lb_subs fairness
         ring_append_fault_shared_out co_read_append_fault_nonempty_out co_read_idle_no_spin
         staged_close_tail connect_complete_before_wait connect_timeout_recycles_adopt
         connect_hard_cap connect_raw_completion_cleanup lb_least_connections
