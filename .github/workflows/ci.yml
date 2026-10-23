@@ -185,19 +185,34 @@ jobs:
       bundle_sha256: ${{ steps.pack.outputs.bundle_sha256 }}
       coro_ref: ${{ steps.deps.outputs.coro_ref }}
       core_ref: ${{ steps.deps.outputs.core_ref }}
+      coroutine_pin_sha: ${{ steps.pin.outputs.coroutine_pin_sha }}
     steps:
-      - name: "拉取 bbtools-infra（提供 CI 脚本）"
+      - name: "拉取 bbtools-infra（提供 CI 脚本与 coroutine pin 真源）"
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           path: infra
           fetch-depth: 1
           persist-credentials: false
 
-      - name: "拉取 bbtools-coroutine @ main"
+      # T1 coroutine pin：唯一真源是仓内 cmake/coroutine.sha（40hex 单行），
+      # CMake/CI 都从这里读，不维护第二份字面量。格式不符（非恰好 40 个
+      # 小写 hex）即 fail-closed——pin 文件本身是门禁的一部分。
+      - name: "读取 coroutine pin 真源（cmake/coroutine.sha）"
+        id: pin
+        run: |
+          set -euo pipefail
+          pin="$(python3 -c 'import pathlib,re,sys; raw=pathlib.Path("infra/cmake/coroutine.sha").read_bytes(); assert re.fullmatch(rb"[0-9a-f]{40}\n?", raw), "invalid coroutine.sha"; sys.stdout.write(raw[:40].decode("ascii"))')"
+          if ! printf '%s' "$pin" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "FAIL: infra/cmake/coroutine.sha 非法（'$pin'），要求恰好 40 个小写 hex" >&2
+            exit 1
+          fi
+          echo "coroutine_pin_sha=${pin}" | tee "$GITHUB_OUTPUT"
+
+      - name: "拉取 bbtools-coroutine @ 固定 pin"
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: yqm-307/bbtools-coroutine
-          ref: main
+          ref: ${{ steps.pin.outputs.coroutine_pin_sha }}
           path: coroutine
           fetch-depth: 1
           persist-credentials: false
@@ -211,12 +226,22 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: "记录上游依赖版本"
+      - name: "记录上游依赖版本（coroutine 必须命中 pin，fail-closed）"
         id: deps
+        env:
+          COROUTINE_PIN_SHA: ${{ steps.pin.outputs.coroutine_pin_sha }}
         run: |
+          set -euo pipefail
           cd coroutine
-          echo "coro_ref=$(git rev-parse HEAD)" | tee "$GITHUB_OUTPUT"
-          git log -1 --format='coroutine main HEAD: %h %s (%ci)'
+          coro_ref="$(git rev-parse HEAD)"
+          echo "coro_ref=${coro_ref}" | tee "$GITHUB_OUTPUT"
+          # T1：checkout 的 ref 必须恰好是固定 commit；漂移/浅克隆错位一律非零，
+          # 不静默接受「main 现在恰好是某 SHA」的浮动消费。
+          test "${coro_ref}" = "${COROUTINE_PIN_SHA}" || {
+            echo "FAIL: coroutine HEAD=${coro_ref} != pin ${COROUTINE_PIN_SHA}" >&2
+            exit 1
+          }
+          git log -1 --format='coroutine pinned HEAD: %h %s (%ci)'
           cd "$CORE_DIR"
           echo "core_ref=$(git rev-parse HEAD)" | tee -a "$GITHUB_OUTPUT"
           git log -1 --format='core master HEAD: %h %s (%ci)'
@@ -679,18 +704,25 @@ jobs:
           name: deps-bundle
           path: ${{ github.workspace }}
 
-      - name: "校验依赖归档与实际 coroutine SHA"
+      - name: "校验依赖归档与实际 coroutine SHA（双钉：bundle + pin）"
         env:
           EXPECTED_BUNDLE_SHA: ${{ needs.prepare-deps.outputs.bundle_sha256 }}
           EXPECTED_COROUTINE_SHA: ${{ needs.prepare-deps.outputs.coro_ref }}
+          COROUTINE_PIN_SHA: ${{ needs.prepare-deps.outputs.coroutine_pin_sha }}
         run: |
           set -euo pipefail
           bash infra/scripts/ci/deps_bundle.sh unpack \
             --tar "$DEPS_BUNDLE_TAR" --meta "$DEPS_BUNDLE_META" \
             --expect-sha "$EXPECTED_BUNDLE_SHA" --dest "$GITHUB_WORKSPACE"
           actual=$(git -C "$COROUTINE_DIR" rev-parse HEAD)
+          # 双钉：同 run artifact 记录的 coroutine SHA 与 workflow 自身 pin 都必须
+          # 精确命中——前者防「同 run 内不一致」，后者防「整套 prepared deps 漂移」。
           test "$actual" = "$EXPECTED_COROUTINE_SHA"
-          echo "network coroutine SHA: $actual"
+          test "$actual" = "$COROUTINE_PIN_SHA" || {
+            echo "FAIL: network coroutine HEAD=${actual} != pin ${COROUTINE_PIN_SHA}" >&2
+            exit 1
+          }
+          echo "network coroutine SHA: $actual (bundle + pin 双命中)"
 
       - name: "network-only Debug 构建（独立目录，JOBS=3）"
         run: |
