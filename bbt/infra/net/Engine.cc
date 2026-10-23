@@ -348,6 +348,16 @@ public:
             m_read_append_hook();
         }
     }
+    // 私有 test 接缝：TryAppend 观测 Busy 之后、AppendDeferred 之前调用（正常为空）。
+    // 用于确定性制造「Busy 已发生 → 读者释放 → deferred 成功」的交错；产品路径为空时无差异。
+    void SetAppendBusyHook(std::function<void()> hook) {
+        m_append_busy_hook = std::move(hook);
+    }
+    void InvokeAppendBusyHook() {
+        if (m_append_busy_hook) {
+            m_append_busy_hook();
+        }
+    }
     // 不构造 std::function（避免回调派发前的分配/抛出）；用户异常仍隔离。
     template <class Callback>
     void SafeHandler(Callback&& callback) {
@@ -403,6 +413,7 @@ private:
     std::function<void()> m_pre_auth_barrier;
     std::function<void()> m_post_auth_barrier;
     std::function<void()> m_read_append_hook;
+    std::function<void()> m_append_busy_hook;  // 私有 test：TryAppend Busy 后/deferred 前（正常为空）
 };
 
 // owner 侧连接核心：唯一 fd、读/写泵与原始回调派发。
@@ -595,6 +606,7 @@ private:
         const std::string_view received(data, size);
         const auto appended = m_state->ring.TryAppend(received);
         if (appended.status == ReadStatus::Busy) {
+            m_owner->InvokeAppendBusyHook();  // 测试：Busy 后/deferred 前（正常为空）
             if (!m_state->ring.AppendDeferred(received)) {
                 m_recv_hold.store(size, std::memory_order_release);
                 return false;
@@ -652,6 +664,18 @@ private:
                     break;  // 字节保留在 m_recv_buf，等保护/容量恢复后再提交
                 }
                 notified = true;
+                // 本轮可能刚把字节放进 pending（append 时 Busy）。pending 是更早
+                // 收到的数据，必须等消费者先合入，否则下一次 recv 的新字节会
+                // 落在它前面，读序被破坏。入口的同类检查只在循环外，够不着这里。
+                //
+                // 置 m_read_paused 而不是只 break：pending 未清时内核通常仍可读，
+                // 单纯 break 会让 owner 立刻被 level-triggered 读事件重新唤醒，
+                // 形成热自旋。暂停后由消费者合入时的 data 通知唤醒 PumpOwner，
+                // 经 ring.Size() < ReadLowWater 解除（见 PumpOwner 的恢复分支）。
+                if (m_state->ring.PendingSize() != 0) {
+                    m_read_paused = true;
+                    break;
+                }
                 continue;
             }
             if (bytes == 0) {
@@ -2857,6 +2881,18 @@ void EngineTestAccess::SetReadAppendHook(Engine& engine, std::function<void()> h
     }
     for (auto& reactor : reactors) {
         reactor->SetReadAppendHook(hook);
+    }
+}
+
+void EngineTestAccess::SetAppendBusyHook(Engine& engine, std::function<void()> hook) {
+    auto impl = engine.m_impl;
+    std::vector<std::shared_ptr<Reactor>> reactors;
+    {
+        std::lock_guard<std::mutex> lock(impl->mutex);
+        reactors = impl->reactors;
+    }
+    for (auto& reactor : reactors) {
+        reactor->SetAppendBusyHook(hook);
     }
 }
 

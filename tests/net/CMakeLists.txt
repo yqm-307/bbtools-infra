@@ -118,6 +118,23 @@ foreach(_case ring_alloc_no_consume ring_release_notify hub_early_notify_retaine
     set_tests_properties(net.b4_${_case} PROPERTIES TIMEOUT 45)
 endforeach()
 
+# 接收路径确定性交错（Boost.Test + 产品内置接缝）：
+# 验证 pending 未合入前的 recv 不得越过它。用 EngineTestAccess::SetAppendBusyHook
+# 在 TryAppend Busy 与 AppendDeferred 之间取得控制权，取代此前仓外复制 Engine.cc
+# 的单对象替换手法。接缝为空 function 时产品行为零差异（既有 103 项回归仍全过）。
+# Boost.Test 用 included（header-only），不引入 libboost_unit_test_framework。
+add_executable(Test_net_append_busy_hook detail/append_busy_hook.cc)
+target_link_libraries(Test_net_append_busy_hook PRIVATE bbt::infra_net Boost::headers)
+target_include_directories(Test_net_append_busy_hook PRIVATE ${PROJECT_SOURCE_DIR})
+target_compile_features(Test_net_append_busy_hook PRIVATE cxx_std_17)
+target_compile_options(Test_net_append_busy_hook PRIVATE -Wall -Wextra -Wpedantic)
+target_link_options(Test_net_append_busy_hook PRIVATE -rdynamic)
+foreach(_case pending_not_flushed_before_next_recv pending_without_next_recv_is_ordered
+              pending_pause_recovers_at_low_water)
+    add_test(NAME net.${_case} COMMAND Test_net_append_busy_hook --run_test=net_append_busy_hook/${_case})
+    set_tests_properties(net.${_case} PROPERTIES TIMEOUT 90)
+endforeach()
+
 # 仓外式最小消费：只依赖新 target，不包含旧 infra 头。
 add_executable(net_foundation_consumer
     ${PROJECT_SOURCE_DIR}/examples/net_foundation_consumer/main.cc)

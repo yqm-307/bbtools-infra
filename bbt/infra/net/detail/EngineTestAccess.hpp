@@ -42,6 +42,9 @@ public:
     static std::size_t ConnectionCount(Engine& engine);
     // 测试屏障：owner recv 后、ring append 前调用（正常为空）。
     static void SetReadAppendHook(Engine& engine, std::function<void()> hook);
+    // 测试接缝：TryAppend 观测 Busy 之后、AppendDeferred 之前调用（正常为空）。
+    // 用于确定性制造「Busy → 读者释放 → deferred 成功」的交错。
+    static void SetAppendBusyHook(Engine& engine, std::function<void()> hook);
     // 单次 seal post 失败注入（验证 Run 保持 Closing、不伪 Stopped）。
     static void SetSealPostFailureOnce(Engine& engine);
     // 私有 test：seal handler 抛一次（验证 Run 走真实错误出口、不永久挂）。
