@@ -278,8 +278,10 @@ inline long PageBytes() {
 // 只读 /proc/self，不引入第三方采样器）。Start() 时 /proc 不可用即记录
 // proc_ok=false：进程必须在最终 JSON 如实上报 proc_ok=false（driver 视该
 // 运行为无效测量），不得静默退化成 0 值冒充成功。
-// cpu_per_op 用窗口 utime+stime 增量 / 完成数；rss_max_bytes 是窗口内 max RSS
-// （显式标注 max，与 end/steady 分开，不混计）。
+// cpu_per_op 用窗口 utime+stime 增量 / 完成数；rss_max_bytes 是观测器寿命内
+// （Start 到 Stop：含预热与收口，Stop 在 Engine join 之后）按固定间隔采样
+// /proc/self 的最大 RSS，显式标注 max 并与 end/瞬时读数分开、不混计。它是
+// 采样峰值，可能漏掉瞬时峰——不是内核 VmHWM，也不是正式测量窗内的峰值。
 class ProcObserver {
 public:
     void Start(std::chrono::milliseconds interval) {

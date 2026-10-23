@@ -54,7 +54,7 @@ coroutine 运行时按**进程寿命**存在、不参与业务资源收口（不
 
 ### R2 TCP 使用入口（已合入主线）
 
-公共头：`<bbt/infra/net/Engine.hpp>`、`RawHandler.hpp`、`Connection.hpp`、`CoConnection.hpp`、`Error.hpp`；只链接 `bbt::infra_net`。
+公共头（冻结面 14 个，清单见 [0010](docs/decisions/0010-gnet-network-foundation.md#冻结公共面d1d5)）：`Annotations.hpp`、`ICoObject.hpp`、`CoObject.hpp`、`Address.hpp`、`NativeSocket.hpp`、`Options.hpp`、`LoadBalancing.hpp`、`Types.hpp`、`ReadAccess.hpp`、`Connection.hpp`、`RawHandler.hpp`、`Engine.hpp`、`CoConnection.hpp`、`Error.hpp`；include 根为仓库根，只链接 `bbt::infra_net`。`detail/**` 不属公共面。
 
 前提与关闭：
 - `Engine::Run(const EngineConfig&)` 阻塞占用**调用它的宿主 native 控制线程**（不能是受管业务协程或本 Engine 的 owner 线程）；在受管协程或该 Engine 的 owner 线程内调用会以 `operation_not_permitted` 拒绝。
@@ -66,12 +66,12 @@ coroutine 运行时按**进程寿命**存在、不参与业务资源收口（不
   - 正常收口由原 owner 完成已有连接的唯一 `OnClose`、待结算写的 `OnWrite` 与 pending connect 的 `OnConnect`，随后同代解绑；**不设隐藏关闭 deadline**，单次可恢复的命令提交失败会补交而非提前以 `Closing` 返回。只有 driver 真实 Failed 才走错误出口冻结并解绑。
   - 普通用户回调（`OnRead`/`OnAccept`/`OnConnect`）的开始授权点，是**最后一次紧邻 `SafeHandler` 派发前**的 `shared service_sealed` 原子检查（`NotifyReadOwner`、`AdoptFdOnOwner` 的交付前）：检查通过即为已授权在途，短回调必须完成；封口先于该检查则不启动成功回调（`OnAccept` 不调用，`OnConnect` 交付 canceled）。构造/登记阶段的入口早查只是提前短路，不构成授权。授权点与封口共同线性化，检查之后不再有可撤销的无限推迟。
 - 原始回调必须短、非阻塞、不可挂起；接收 ring 是唯一真源，`OnRead` 只是可合并通知。
-- `CoDial`/`WaitConnect` 只用于未配置 `RawHandler` 的 Engine；配置了 raw handler 时
-  `AsyncConnectAwaitable`/`WaitConnect` 明确返回 `operation_not_supported`，raw 的
-  pending/完成由 `OnConnect` 唯一交付，Co 等待不得取消或二次领取。每个 connect op
-  只允许一个 `WaitConnect` 接收者，第二个返回 `device_or_resource_busy`。
-  等待超时/取消终结该接收者并由 owner 回收未交付连接，不能用同 id 再次等待；
-  waiter 建立失败返回 `not_enough_memory`、回滚 claim，同 id 可重试。
+- 建连交付唯一（D5）：raw 路径用 `Engine::AsyncConnect` + `RawHandler::OnConnect`；
+  Co 路径用 `CoDial`（协程内建连，失败不覆盖调用者原有 `out`）。`WaitConnect`、
+  `AsyncConnectAwaitable`、`WaitAccepted` 是 `CoDial`/`CoAccept` 的内部步骤，**不再是
+  公共入口**，没有兼容壳。配置了 `RawHandler` 的 Engine 走 raw 交付，不得再对同一
+  connect op 另起 Co 等待；未配置 handler 时请用 `CoDial`。
+  等待超时/取消终结该等待并由 owner 回收未交付连接，不能用同 id 再次等待。
 - `CoDial` 的 client-only Engine 若无 raw 接收者，请用空 `shared_ptr<RawHandler>` 构造：
   等待超时/取消后 owner 才可回收未交付 socket；有 raw handler 时视为已交付，不会因另一个
   Co 等待取消而误关。

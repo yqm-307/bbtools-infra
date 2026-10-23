@@ -6,113 +6,95 @@
 //
 // 线程/域约束：AsyncWrite/TryRead/状态查询/RequestClose 可在任意合法调用域；
 // 物理 I/O 与原始回调只由 owner 推进。net 不做分帧、请求匹配或重发。
+//
+// 身份：Id() 只在创建它的 Engine 内唯一（连接 id 与建连操作 id 各自递增），
+// 不是跨 Engine/跨进程身份，也不是取消、等待或查找句柄。无效句柄 Id() 为 0。
+//
+// 状态不公开：内部状态类型与 ring 表示不属冻结面。实现放在 Connection.cc，
+// 本头只前向声明内部类型，因此消费者无法依赖 state/ring 布局，也不能凭任意
+// 状态构造句柄——构造仅供 Engine owner 与内部 TestAccess 使用。
 
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <string>
-#include <string_view>
 #include <system_error>
 #include <utility>
 
-#include <bbt/infra/net/detail/ConnectionState.hpp>
+#include <bbt/infra/net/ReadAccess.hpp>
+#include <bbt/infra/net/Types.hpp>
 
 namespace bbt::infra::net {
 
+class ConnectionState;
+struct WriteOpRecord;
+
 // 单次已接纳发送的观察句柄：持操作记录，终态在句柄寿命内永久可查；
 // 释放句柄不取消已接纳发送。不是通用 Future/Task 平台。
+// 无效句柄（未接纳或已被复用覆盖）的 Query 为 Unknown/0/空。
 class WriteOperation {
 public:
     WriteOperation() = default;
-    explicit WriteOperation(std::shared_ptr<WriteOpRecord> record)
-        : m_record(std::move(record)) {}
 
-    bool Valid() const noexcept { return m_record != nullptr; }
-    std::uint64_t Id() const noexcept { return m_record ? m_record->id : 0; }
-
-    WriteOutcome Query() const {
-        if (!m_record) {
-            return {};
-        }
-        std::lock_guard<std::mutex> lock(m_record->mutex);
-        if (!m_record->terminal) {
-            return WriteOutcome{WritePhase::InFlight, m_record->sent, {}};
-        }
-        return WriteOutcome{WritePhase::Done, m_record->sent, m_record->error};
-    }
+    bool Valid() const noexcept;
+    std::uint64_t Id() const noexcept;
+    WriteOutcome Query() const;
 
 private:
+    friend class Connection;
+    friend class ConnectionTestAccess;
+    explicit WriteOperation(std::shared_ptr<WriteOpRecord> record);
+
     std::shared_ptr<WriteOpRecord> m_record;
 };
 
 class Connection {
 public:
     Connection() = default;
-    explicit Connection(std::shared_ptr<ConnectionState> state) : m_state(std::move(state)) {}
 
-    bool Valid() const noexcept { return m_state != nullptr; }
-    std::uint64_t Id() const noexcept { return m_state ? m_state->m_id : 0; }
-    const std::shared_ptr<ConnectionState>& State() const noexcept { return m_state; }
+    bool Valid() const noexcept;
+    std::uint64_t Id() const noexcept;
 
     // 全量接纳或零接纳；成功后库取得数据所有权，观察句柄用于终态查询/等待。
-    std::error_code AsyncWrite(std::string data, WriteOperation& out_operation) {
-        if (!m_state) {
-            return make_error_code(NetErrc::Closed);
-        }
-        std::shared_ptr<WriteOpRecord> record;
-        const auto error = m_state->AcceptWrite(std::move(data), record);
-        if (!error) {
-            out_operation = WriteOperation(std::move(record));
-        }
-        return error;
-    }
+    // 每次调用先置 out_operation 无效：拒绝时保持无效且不泄露上次结果，
+    // 成功时写入本次新身份。
+    std::error_code AsyncWrite(std::string data, WriteOperation& out_operation);
 
     // 竞争 Busy（零消费）；空且无终态 WouldBlock；Ok 已复制并消费。
-    ReceiveRing::ReadResult TryRead(std::string& out) {
-        if (!m_state) {
-            return {ReceiveRing::ReadStatus::Error, 0, make_error_code(NetErrc::Closed)};
-        }
-        return m_state->ring.TryRead(out);
-    }
+    ReadResult TryRead(std::string& out);
 
-    // 同一短保护内的 Peek+Consume 组合守卫；不得在守卫内存活期间挂起/回调。
-    ReceiveRing::ReadAccess TryAccess() {
-        if (!m_state) {
-            return {};
-        }
-        return m_state->ring.TryAccess();
-    }
+    // 组合 Peek+Consume 守卫（见 ReadAccess.hpp 的寿命与有效期约束）。
+    // 守卫持本连接状态强引用：即使随后释放本句柄，守卫内访问仍安全。
+    ReadAccess TryAccess();
 
-    std::size_t ReadableBytes() { return m_state ? m_state->ring.Size() : 0; }
+    std::size_t ReadableBytes();
+    std::error_code ReadError() const;
+    bool ReadEof() const;
 
-    std::error_code ReadError() const { return m_state ? m_state->ring.ReadError() : std::error_code{}; }
-    bool ReadEof() const { return m_state ? m_state->ring.ReadEof() : true; }
+    std::error_code LastWriteError(std::uint64_t* operation = nullptr);
+    AcceptanceState WriteAcceptance() const;
 
-    std::error_code LastWriteError(std::uint64_t* operation = nullptr) {
-        return m_state ? m_state->LastWriteError(operation) : make_error_code(NetErrc::Closed);
-    }
-
-    AcceptanceState WriteAcceptance() const {
-        return m_state ? m_state->Acceptance() : AcceptanceState::Closed;
-    }
-
-    bool Closed() const { return m_state ? m_state->Closed() : true; }
-    std::error_code CloseReason() const {
-        return m_state ? m_state->CloseReason() : make_error_code(NetErrc::Closed);
-    }
+    bool Closed() const;
+    std::error_code CloseReason() const;
 
     // 请求封口：立即拒绝新写并唤 owner；物理 fd 关闭、已 recv 尾部入真源、
     // 最终读 EOF 与 OnClose 由 owner 兑现。请求后读侧可能短暂 WouldBlock，
     // 不得在尾部尚未入 ring 前返回 EOF。幂等；首次请求的 reason（包括默认 {}）
     // 固定，后续请求不覆盖，最终关闭状态不回退。
-    void RequestClose(std::error_code reason = {}) {
-        if (m_state) {
-            m_state->RequestClose(reason);
-        }
-    }
+    void RequestClose(std::error_code reason = {});
 
 private:
+    // 内部构造责任：只有 Engine owner（Engine/Reactor/ConnCore）与内部测试接缝
+    // 可以凭状态构造句柄，消费者不能。
+    friend class Engine;
+    friend class Reactor;
+    friend class ConnCore;
+    friend struct CoAccess;
+    friend class EngineTestAccess;
+    friend class ConnectionTestAccess;
+    friend class ReadAccess;
+    explicit Connection(std::shared_ptr<ConnectionState> state);
+
     std::shared_ptr<ConnectionState> m_state;
 };
 

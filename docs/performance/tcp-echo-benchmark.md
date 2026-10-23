@@ -160,5 +160,13 @@ baseline 产品树**不修改、不安装**；只复用其构建产物与公共�
 - 已有 `tests/net/r2_tcp.cc::perf_baseline`（raw-only、n=500、co 未测）是旧
   CTest 内的极小基线，**不动、不删、不替代**；co 路径若 hang 属于真实
   baseline 问题，由本 harness 的 watchdog 如实报告而非掩盖。
-- RSS 口径：`server.rss_max_bytes` 是服务进程寿命内采样峰值，包含预热；`measurement.server_rss_end_bytes` 是 measured loadgen 结束、Engine teardown 之前的 RSS，作为当前矩阵内存护栏。它不等于测量窗峰值或泄漏证明。`proc_ok=false` 时测量整体无效。
+- RSS 口径（内存护栏字段）：`server.rss_max_bytes`（聚合 JSON 内嵌的服务端最终
+  JSON 原样保留）是**周期采样最大 RSS**——`ProcObserver` 在 scheduler 启动后按
+  50ms 间隔读 `/proc/self/stat` 的 `rss`，起点为预热之前的首个采样，`Stop()` 在
+  Engine join 与自有任务收口之后、输出最终 JSON 之前，取值是所有采样与端点读数
+  的最大值，因此覆盖预热至收口，**不是**正式测量窗内的峰值。它是采样值：间隔
+  可能漏掉瞬时峰，所以既不是内核 `VmHWM`，也不能当窗口峰值读。
+  `measurement.server_rss_start_bytes` / `measurement.server_rss_end_bytes` 是
+  测量窗前后两次 `stat` 快照的瞬时 RSS（末端在 Engine teardown 之前），只作诊断，
+  不作内存护栏。任一字段都不构成无泄漏证明；`proc_ok=false` 时测量整体无效。
 - `conns` 每次调用需超过其 500ms 的建连尾部预算；正式矩阵使用预热 5000ms、测量 20000ms。更短运行可能产生零工作，driver 必须拒绝，不能当通过。

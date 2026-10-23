@@ -80,6 +80,7 @@ int main() {
     check(!engine.LocalAddresses(addresses) && addresses.size() == 1, "local addresses");
 
     std::atomic<int> echo_ok{0};
+    std::atomic<int> echo_drained{0};   // 尾部读空后的守卫状态断言
     auto server_task = [&] {
         net::Connection connection;
         if (net::CoAccept(engine, connection, Until(3000ms))) {
@@ -94,8 +95,15 @@ int main() {
         if (net::CoWrite(connection, data, Until(3000ms), outcome, operation)) {
             return;
         }
-        if (outcome.phase == net::WritePhase::Done && data == "hello") {
+        // Done 只表示该次发送已到终态，成功还须 error 为空。
+        if (outcome.phase == net::WritePhase::Done && !outcome.error && data == "hello") {
             echo_ok.store(1);
+        }
+        // 公开读取守卫：读空后立即再取一次保护应得到 WouldBlock（不是 Busy）；
+        // 守卫持连接状态强引用，释放 connection 之后仍可安全 Size/析构。
+        auto drained = connection.TryAccess();
+        if (!drained && drained.WouldBlock()) {
+            echo_drained.store(1);
         }
         connection.RequestClose();
     };
@@ -135,7 +143,9 @@ int main() {
     runner.join();
     check(!run_error, "engine run clean");
 
+    check(echo_drained.load() == 1, "read guard would_block after drain");
     std::cout << "co_net_service echo=" << (echo_ok.load() ? "ok" : "bad")
+              << " guard_wouldblock_after_drain=" << (echo_drained.load() ? "ok" : "bad")
               << " failures=" << failures.load() << '\n';
     const bool clean = failures.load() == 0;
     std::cout.flush();

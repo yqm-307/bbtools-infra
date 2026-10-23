@@ -5,17 +5,22 @@
 // 不新建库内控制线程或网络 I/O 线程。
 //
 // 生命周期（详见 docs/architecture/gnet-network-execution.md §6）：
-//   - Run 先校验 runtime 已初始化（RuntimeNotInitialized）与宿主「runtime 内部
-//     EventLoop 由独立执行流持续推进」的必填声明（RuntimeProgressRequired），
-//     在任何绑定/建 socket 副作用之前拒绝。
+//   - Run 先校验宿主控制域：在协程上下文或已登记 Processer 上调用返回
+//     operation_not_permitted；runtime 未初始化返回 operation_not_supported；
+//     未声明 RuntimeProgress::Independent 返回 operation_not_permitted。
+//     全部发生在 driver 绑定/socket 副作用之前。
+//   - server 布局（listen_addresses 非空）要求 handler 与 handoff 至少一个存在：
+//     两者都无时 Run 返回 operation_not_permitted，同样发生在副作用之前。
 //   - 成功后自动绑槽（server 1 main + N sub；client-only 无 main），安装 listener，
-//     发布 Running，进入控制循环。
+//     发布 Running（此时 LocalAddresses 才可能非空），进入控制循环。
 //   - RequestClose 并发安全、幂等，只封口并唤醒控制域；Run 返回才表示本 Engine
 //     网络资源/回调/driver 已收口。
 //   - 控制域按持有 token 有限复查 QueryProcesserDriver；Failed 时封口、同代解绑、
-//     以冻结状态与内部完成订阅为替代出口，不伪调 owner 用户回调。
+//     以冻结状态、LastError/LastFailure 与内部完成订阅为替代出口，不伪调 owner
+//     用户回调（包括不伪报建连成功/失败）。
 //
 // 原始回调在 owner 非业务协程边界短、非阻塞、不可挂起执行。
+// 运行时对象（Scheduler/driver/Processer）由宿主负责，本类不取消它们的寿命。
 
 #include <cstddef>
 #include <exception>
@@ -47,18 +52,22 @@ struct EngineConfig {
     RuntimeProgress runtime_progress{RuntimeProgress::Unspecified};
 };
 
-struct EngineImpl;  // detail 定义在 Engine.cc
+struct EngineImpl;  // 定义在 Engine.cc
 
 class EngineTestAccess;
+struct CoAccess;
 
 class Engine {
 public:
+    // handler 可为空：client-only 布局允许无 raw 接收者（Co 消费），
+    // 但 server 布局必须另有 handoff 接收者（见 Run）。
     explicit Engine(std::shared_ptr<RawHandler> handler);
     ~Engine();
     Engine(const Engine&) = delete;
     Engine& operator=(const Engine&) = delete;
 
-    // 阻塞的宿主控制线程入口；成功收口后返回。失败在绑定/socket 副作用前返回。
+    // 阻塞的宿主控制线程入口；成功收口后返回。前置校验失败在绑定/socket
+    // 副作用前返回。
     std::error_code Run(const EngineConfig& config);
 
     void RequestClose() noexcept;
@@ -68,8 +77,11 @@ public:
     // driver Failed 时保留的异常（无则空）；不伪调 owner 用户回调。
     std::exception_ptr LastFailure() const;
 
-    // 实际绑定地址快照（port 0 → 内核分配）。未运行/已停止返回
-    // operation_not_permitted，且不改写 out。
+    // 实际绑定地址快照（port 0 → 内核分配）。
+    //   - Running/Closing：返回本代快照。
+    //   - Starting：可返回当前快照，可能尚未安装 listener 因而为空；这不是
+    //     "无监听"结论，只在 Running 之后才有完整语义。
+    //   - Idle/Stopped：返回 operation_not_permitted，且不改写 out。
     std::error_code LocalAddresses(std::vector<Address>& out) const;
 
     std::size_t CountConnections() const;
@@ -81,33 +93,41 @@ public:
     std::error_code ReactorOwnerIds(std::vector<std::uint64_t>& main_owners,
                                     std::vector<std::uint64_t>& sub_owners) const;
 
-
-
-    // client 侧非阻塞建连：client-only 与 server 布局都可用（用 sub owner）。
-    // 有 RawHandler 时结果只经 OnConnect 唯一交付，不能用 WaitConnect 二次领取；
-    // 无 RawHandler 时 out_id 可交给 WaitConnect 等待。
+    // 非阻塞建连，只用于配置了 RawHandler 的 Engine（raw 唯一交付）：
+    //   - 无 handler：提交前返回 operation_not_supported，out_connect_id 不改；
+    //     Co 建连走 CoDial，不公开中间 ID。
+    //   - 返回成功只表示本次提交已接纳：out_connect_id 必为本次非零操作 ID，
+    //     且该 ID 只在本次 Engine 内唯一（不是取消/等待句柄）。
+    //   - 正常 owner 推进下，成功或失败由 OnConnect 恰好交付一次，回调的
+    //     operation 等于返回的 out_connect_id。回调可能先于本函数返回，调用者
+    //     不得假设"先拿到 id 再收到回调"，须用回调自带的 operation 关联。
+    //   - 所有提交拒绝路径（无 handler、非 Running/已封口、容量满、投递失败）
+    //     保持 out_connect_id 原值，且不产生本次 OnConnect。
+    //   - driver Failed 时不伪调 owner 回调：只经 LastError/LastFailure 与
+    //     收口状态报告。
     std::error_code AsyncConnect(const Address& address, std::uint64_t& out_connect_id);
-    // Co 专用：只支持无 RawHandler 的 Engine（否则 operation_not_supported）。
-    // 提交即登记接收责任，完成早于 WaitConnect 也保留结果，消费后释放。
-    std::error_code AsyncConnectAwaitable(const Address& address,
-                                          std::uint64_t& out_connect_id);
-    // 协程内等待建连结果：有 RawHandler 返回 operation_not_supported，且不取消
-    // raw pending。每个 id 只允许一个 receiver，第二个返回 device_or_resource_busy。
-    // 超时/取消终结该 receiver 并由 owner 回收未交付连接，不能再用同 id 重试；
-    // waiter 建立失败返回 not_enough_memory 并回滚 claim，同 id 可重试。
-    std::error_code WaitConnect(std::uint64_t connect_id, Connection& out,
-                                const bbt::coroutine::WaitOptions& options);
-
-    // CoAccept 薄封装：从有界 handoff 队列取已接纳连接（队列满时暂停 native
-    // accept，不丢 fd）。注册后复查，早到通知不丢。
-    std::error_code WaitAccepted(Connection& out,
-                                 const bbt::coroutine::WaitOptions& options);
 
     // 打开 CoAccept handoff（Run 前调用），容量 > 0 才有界预留给 accept。
+    // 保留既有"handler + handoff"共存语义：同一连接可同时通知 OnAccept 并入
+    // handoff 队列；两个读取者并存时只保证线性化的字节前缀，不自动路由。
     std::error_code EnableAcceptHandoff(std::size_t capacity);
 
 private:
     friend class EngineTestAccess;
+    friend struct CoAccess;
+
+    // ---- Co 内部步骤（detail/CoInternal.hpp 是唯一调用方）----
+    // 两段式建连是 CoDial 的内部细节：提交（登记接收意图）与领取（等待结果）。
+    // 不公开，避免冻结一个无法放弃的中间 ID。
+    std::error_code CoSubmitConnect(const Address& address, std::uint64_t& out_connect_id);
+    // 领取：仅成功的本次结果交付 out；失败不改 out，且必须由本函数内部
+    // 归还 claim/登记责任并让 owner 回收未交付 fd。
+    std::error_code CoWaitConnect(std::uint64_t connect_id, Connection& out,
+                                  const bbt::coroutine::WaitOptions& options);
+    // 从有界 handoff 队列取已接纳连接；配置/生命周期错误立即返回，不等。
+    std::error_code CoWaitAccepted(Connection& out,
+                                   const bbt::coroutine::WaitOptions& options);
+
     std::shared_ptr<EngineImpl> m_impl;
 };
 

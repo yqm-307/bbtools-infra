@@ -52,7 +52,7 @@ consumer 侧对齐 coroutine 核心契约 §11.5 的责任，不改 §11.3–§1
 
 ## 值层与并发接缝的现行口径
 
-- `Options.hpp`/Options.cc：gnet `options.go` 全字段映射的类型化 `Options` 与 `NormalizeOptions` 纯值归一化（loop 解析、cap 默认/最小 1024/向上 2 次幂、ET chunk、keepalive 默认取整、socket buffer/枚举/NUL 校验、失败不改输入）；logger 为自有窄回调，仅可存储。有界资源三字段（每连接待收/待发总量默认各 1MiB、待处理命令限额默认 1024）必须正值，且基础 cap 不得超对应总量。归一化成功后由 `Engine::Run` 消费，但 `ticker`/`edge_triggered_io`/`bind_to_device`/`multicast_interface_index`/`lock_os_thread` 在 Run 中被明确拒绝。
+- `Options.hpp`/`detail/OptionsNormalize.{hpp,cc}`：`Options` 只保留已接线字段（lb/reuse_addr/reuse_port/num_event_loop/tcp_keep_*/tcp_no_delay/socket_*_buffer/max_inbound_bytes/max_outbound_bytes/max_pending_events）；归一化（loop 解析、keepalive 默认取整、socket buffer/枚举/NUL 校验、失败不改输入）下沉 `detail/OptionsNormalize.*`，`NormalizeOptions`/`NormalizedOptions` 不再是公共入口。有界资源三字段必须正值（默认各 1MiB、pending 1024），`0` 拒绝。D3 已删除 `multicore`、读写 buffer cap、ET/ticker/锁线程/设备/组播与全部日志相关字段及类型。
 - `LoadBalancing.hpp`：RoundRobin/LeastConnections/SourceAddrHash 纯选择；跨域调用由 Engine 的短锁串行化，算法对象自身非线程安全。
 - `detail/{ReceiveRing,OutboundQueue,EventRingBuffer,SourceAddrHash}.hpp`：`EventRingBuffer` 为仅增长、预检拒绝不覆盖的有界弹性 ring；`ReceiveRing` 在其上补最小并发访问面（单次 `TryRead` 原子复制+消费、`TryAccess` 的 Peek+Consume 组合守卫、释放代次通知）；`OutboundQueue` 为 ring+分段溢出队列，保留逐操作身份与已发前缀。这些是内部部件，不进公共自检、不是公开 API。
 - 执行权与数据接缝的原理约束（详见[执行域设计](../architecture/gnet-network-execution.md)第 2、5 节）：fd 与物理 close 只在 native owner/reactor 线程；原始回调在 owner 的非业务协程边界短、非阻塞、不可挂起；业务协程可迁移 Processer，不持有 fd 所有权；接收 ring 是并发安全的唯一真源，`OnRead` 只是可合并通知；不允许任何 OS mutex 持有跨挂起，也不把 `shared_ptr` 当作对象同步。
@@ -139,7 +139,7 @@ D3/D4 是分析期的阶段标签（P3/P4），阶段编号已随交付取消，
 | Run、Rotate | 现行 `Engine::Run(EngineConfig)`：单/多地址监听、自动绑槽、失败回滚并清理已创建资源；运行中重复 Run → `device_or_resource_busy`，收口后 Run → `operation_canceled`。无 `Rotate` | 已由 R2 实现 |
 | 全局 Stop、Engine.Stop | **未采用**：R2 不提供 `Engine::Stop`，收口只有 `Engine::RequestClose` + `Run` 返回；不等待用户回调、资源随所有权销毁、不停止 runtime、不建全局 registry 的原则保留 | 分析期计划；现行口径见「当前核心契约」Engine 生命周期行 |
 | Engine.Validate、CountConnections | `Engine::LastError()`/`LastFailure()`/`Phase()` 表达启动与收口错误，`CountConnections()` 报当前连接数 | 已由 R2 实现 |
-| Engine.Register、RegisteredResult | 未提供；等价能力为 `EnableAcceptHandoff(capacity)` + `WaitAccepted` 的有界 handoff（满则暂停 accept，不丢 fd），以及 `AsyncConnect`/`WaitConnect` 的 connect 结果交付 | 分析期计划（以 handoff 形态落地） |
+| Engine.Register、RegisteredResult | 未提供；等价能力为 `EnableAcceptHandoff(capacity)` 的有界 handoff（满则暂停 accept，不丢 fd，`CoAccept` 领取）与 `AsyncConnect`（raw `OnConnect`）/`CoDial`（Co）的建连交付；`WaitAccepted`/`WaitConnect` 是内部步骤 | 已实现（D5 收口） |
 | NewNetConnContext、FromNetConnContext、NewNetAddrContext、FromNetAddrContext | 未提供 Go 式 context 注入；不复制 string-key context 协议 | 未采用 |
 | Engine.Dup、DupListener | 未提供；`EngineConfig::listen_addresses` 直接支持多 listener，`NativeSocket::Dup` 仍是原语 | 未采用（多地址已由配置表达） |
 | EventLoop.Register、Enroll | 内部化为 Engine 的 sub owner 选择 + 唯一 fd 移交（`detail/ReactorDriver`）；不公开 Enroll 入口 | 分析期计划（内部形态已实现） |
@@ -152,7 +152,7 @@ D3/D4 是分析期的阶段标签（P3/P4），阶段编号已随交付取消，
 | Wake、CloseWithCallback、Close | 未提供 `CloseWithCallback`/Close(opt)。`Connection::RequestClose(reason)` 只封口并唤 owner；`AsyncWrite` 的终态经 `OnWrite` 与 `WriteOperation::Query()` 观察 | 分析期计划 |
 | SetDeadline、SetReadDeadline、SetWriteDeadline | 不提供连接级 deadline；协程等待用 coroutine 的 `WaitOptions`（`CoRead`/`CoWrite`/`CoAccept`/`CoDial` 均为参数），不改 Reader/Writer 语义 | R（固定参考同不支持） |
 | NewClient、Start、Stop | **未采用**：R2 不提供独立 `Client` 类型，client-only 即 `EngineConfig::listen_addresses` 为空的 Engine，不复制第二套 runtime | 分析期计划 |
-| Client.Dial、DialContext、Enroll、EnrollContext | 现行形态为 `Engine::AsyncConnect`（raw：`OnConnect` 唯一交付）+ `Engine::AsyncConnectAwaitable`/`WaitConnect`（未配置 handler 时）；不移植 Go context | 已由 R2 实现覆盖 |
+| Client.Dial、DialContext、Enroll、EnrollContext | 现行形态为 `Engine::AsyncConnect`（raw：`OnConnect` 唯一交付）+ `CoDial`（协程内建连）；`AsyncConnectAwaitable`/`WaitConnect` 已内部化，不移植 Go context | 已由 R2 实现（D5 收口） |
 | EventHandler、BuiltinEventEngine | **未采用**：R2 只有 `RawHandler`（`OnAccept/OnConnect/OnRead/OnWrite/OnClose` 默认空实现，在 owner 非业务协程边界短、非阻塞、不可挂起），没有 `OnBoot`/`OnTick`/`OnShutdown*`/`Action`。业务事件若要挂起须由使用者自行转发到自己的协程 | 分析期计划（曾是 `EventHandler`） |
 | Action.None/Close/Shutdown | **未采用**：R2 没有 `Action` 枚举与 `OnShutdown`/`OnShutdownRequest`。可复用的原则只有两条：连接收口只执行一次且不可重开；库不替使用者决定「是否关闭整个 Engine」，该决定归宿主控制域（现为 `Engine::RequestClose`） | 分析期计划 |
 | main/sub reactor、连接 owner | main 与各 sub 由已登记 Processer driver 槽推进各自 Asio context（不自建线程）；接纳后按 LB 唯一交接；业务协程可迁移 Processer，不是 fd owner，也不重复驱动 runtime 共享 context | 已由 R2 实现（`detail/ReactorDriver`）；ReusePort/UDP/client 布局见执行域设计 |
@@ -184,29 +184,51 @@ D3/D4 是分析期的阶段标签（P3/P4），阶段编号已随交付取消，
 
 | 字段 / With 方法 | C++ 去向 | 状态 |
 |---|---|---|
-| Options / WithOptions | `net::Options` 类型化一次校验（`NormalizeOptions`），不移植任意 option 回调 | 已由 R2 实现 |
+| Options / WithOptions | `net::Options` 是公共配置类型（只保留已接线字段）；归一化实现下沉 `detail/OptionsNormalize.*`，`NormalizeOptions`/`NormalizedOptions` 不再是公共入口 | 已由 R2 实现（D3 收敛后） |
 | LB / WithLoadBalancing | `Options::lb` 取 `LoadBalancing::{RoundRobin,LeastConnections,SourceAddrHash}` | 已由 R2 实现 |
 | ReuseAddr / WithReuseAddr | `NativeSocket::SetReuseAddr`；Engine 侧经 `Options::reuse_addr` 应用到 listener | 已由 R2 实现 |
 | ReusePort / WithReusePort | `NativeSocket::SetReusePort`（仅 IP）；Engine 接受该字段但未提供跨 loop 接纳验收，非 Linux U | 原语层已实现，Engine 侧未验收 |
-| MulticastInterfaceIndex / WithMulticastInterfaceIndex | 字段存在于 `Options`，非 0 时 `Engine::Run` 明确 `operation_not_supported` 拒绝；需自有 multicast 场景才能实现 | 分析期计划 |
-| BindToDevice / WithBindToDevice | 字段存在于 `Options`，非空时 `Engine::Run` 明确 `operation_not_supported` 拒绝；不引入特权路径 | 分析期计划 |
-| Multicore / WithMulticore | 未提供；sub 数量由 `num_event_loop` 显式给出，不按 CPU 自动扩张 | 分析期计划 |
+| MulticastInterfaceIndex / WithMulticastInterfaceIndex | 字段已随 D3 删除；组播不在冻结面，`Udp.hpp` 是显式编译拒绝入口 | 未提供（字段已删） |
+| BindToDevice / WithBindToDevice | 字段已随 D3 删除；不引入特权路径 | 未提供（字段已删） |
+| Multicore / WithMulticore | 字段已随 D3 删除；sub 数量由 `num_event_loop` 显式给出，不按 CPU 自动扩张 | 未提供（字段已删） |
 | NumEventLoop / WithNumEventLoop | `Options::num_event_loop`：0 表示未指定（默认 1 个 sub），>0 覆盖，<0 归一化时拒绝 | 已由 R2 实现 |
-| ReadBufferCap / WithReadBufferCap | `Options::read_buffer_cap` 归一化为默认 64KiB、最小 1024、向上取 2 次幂并检查溢出；**该值当前未接入 Engine**，接收 ring 容量由 `max_inbound_bytes` 决定 | 值层已实现，Engine 未接线 |
-| WriteBufferCap / WithWriteBufferCap | `Options::write_buffer_cap` 同上；**当前未接入 Engine**，待发队列与总量由 `max_outbound_bytes`（段容量另取 min(outbound,64KiB)）与 `max_pending_events` 约束 | 值层已实现，Engine 未接线 |
-| LockOSThread / WithLockOSThread | 字段存在于 `Options`，为 true 时 `Engine::Run` 明确 `operation_not_supported` 拒绝；R2 不提供 CPU affinity，也不把可迁 Processer 的业务协程锁到创建线程 | 分析期计划（刻意不实现） |
-| Ticker / WithTicker | 字段存在于 `Options`，为 true 时 `Engine::Run` 明确 `operation_not_supported` 拒绝；无 engine ticker | 分析期计划 |
+| ReadBufferCap / WithReadBufferCap | 字段已随 D3 删除；接收容量由 `Options::max_inbound_bytes` 约束，不再有独立 cap | 未提供（字段已删） |
+| WriteBufferCap / WithWriteBufferCap | 字段已随 D3 删除；发送容量由 `max_outbound_bytes` 与 `max_pending_events` 约束 | 未提供（字段已删） |
+| LockOSThread / WithLockOSThread | 字段已随 D3 删除；R2 不提供 CPU affinity，也不把可迁 Processer 的业务协程锁到创建线程 | 未提供（字段已删） |
+| Ticker / WithTicker | 字段已随 D3 删除；无 engine ticker | 未提供（字段已删） |
 | TCPKeepAlive / WithTCPKeepAlive | idle 秒，`> 0` 时 Engine 应用 `SO_KEEPALIVE` + `TCP_KEEPIDLE`；归一化处理默认 interval=idle/5、count=5 | 已由 R2 实现 |
 | TCPKeepInterval / WithTCPKeepInterval | interval 秒，应用 `TCP_KEEPINTVL`（最小 1） | 已由 R2 实现 |
 | TCPKeepCount / WithTCPKeepCount | 正整数 count，应用 `TCP_KEEPCNT` | 已由 R2 实现 |
 | TCPNoDelay / WithTCPNoDelay（TCPNoDelay/TCPDelay） | `bool tcp_no_delay`，默认 true，由 `SetNoDelay` 应用 | 已由 R2 实现 |
 | SocketRecvBuffer / WithSocketRecvBuffer | 正字节数，应用到 `SO_RCVBUF`；内核可能调整实际值 | 已由 R2 实现 |
 | SocketSendBuffer / WithSocketSendBuffer | 正字节数，应用到 `SO_SNDBUF`；内核可能调整实际值 | 已由 R2 实现 |
-| LogPath / WithLogPath | 字段可存储但不启用文件日志；不新增 zap 依赖 | 已归一化，未接线 |
-| LogLevel / WithLogLevel | `net::LogLevel` 四级枚举，归一化时拒绝非法 cast 值 | 已由 R2 实现（值层） |
-| Logger / WithLogger | `LoggerCallback` 窄回调，仅可存储，可不设置；不导出第三方日志对象 | 值层已实现，Engine 未调用 |
-| EdgeTriggeredIO / WithEdgeTriggeredIO | 为 true 时 `Engine::Run` 明确 `operation_not_supported` 拒绝 | 分析期计划 |
-| EdgeTriggeredIOChunk / WithEdgeTriggeredIOChunk | 归一化保留值（向上取整并检查溢出），但因 ET 被拒绝而不生效 | 分析期计划 |
+| LogPath / WithLogPath | 字段已随 D3 删除；不新增 zap 依赖 | 未提供（字段已删） |
+| LogLevel / WithLogLevel | 字段与 `net::LogLevel` 类型已随 D3 删除 | 未提供（字段已删） |
+| Logger / WithLogger | 字段与 `LoggerCallback` 已随 D3 删除；不导出第三方日志对象 | 未提供（字段已删） |
+| EdgeTriggeredIO / WithEdgeTriggeredIO | 字段已随 D3 删除；IO 触发模式不属公共配置 | 未提供（字段已删） |
+| EdgeTriggeredIOChunk / WithEdgeTriggeredIOChunk | 字段已随 D3 删除 | 未提供（字段已删） |
+
+## 冻结公共面（D1–D5）
+
+本决策的公共面以 14 个头为准（include 根为仓库根，消费目标 `bbt::infra_net`）：
+
+`bbt/infra/net/{Annotations,ICoObject,CoObject,Address,NativeSocket,Options,LoadBalancing,Types,ReadAccess,Connection,RawHandler,Engine,CoConnection,Error}.hpp`
+
+`detail/**`、私有成员与实现 `.cc` 不在冻结面内（可优化，但须守住下列行为）；`Udp.hpp` 是显式编译拒绝入口，不属冻结面；测试接缝只存在于 `detail/`。
+
+D1–D5 迁移结论：
+
+- D1 隔离内部表示：读写值类型集中在 `Types.hpp`；`Connection` 等只前置声明内部状态，实现在 `.cc`。`Connection::State()`、内部状态构造、公共头对 detail 枚举/类的依赖已移除，调用者迁移到公开值类型。
+- D2 读取守卫：独立 move-only `ReadAccess`，短保护内 `Peek`/`Consume`，持连接状态强引用；复制被删除（双持保护），移动/释放顺序即寿命顺序。保活不授予跨挂起持锁权限。
+- D3 配置面收敛：只保留已接线配置，归一化下沉 `detail/OptionsNormalize.*`；`multicore`、读写 buffer cap、ET/ticker/锁线程/设备/组播与日志字段及类型删除，`NormalizeOptions`/`NormalizedOptions` 不再是公共入口。这是源码兼容变更，不以「仅内部整理」描述。
+- D4 统一 Co 执行域：`CoRead`/`CoWrite`/`CoAccept`/`CoDial` 在消费、接纳或登记之前校验当前受管协程；含已有数据、零长写、现成 accept 的快路径；非法域零副作用，输出按各入口契约处理（失败不覆盖调用者原有 `out`）。
+- D5 唯一建连交付：保留 raw `AsyncConnect` + `OnConnect`；Co 用 `CoDial`。`AsyncConnectAwaitable`、`WaitConnect`、`WaitAccepted` 内部化，无 raw handler 的建连走 `CoDial`，Co 接纳走 `CoAccept`，不恢复兼容壳。
+
+冻结的六个方面：公开签名/默认参数/`noexcept`/类型与字段；逐入口错误与输出；线程与执行域；关闭及残留句柄寿命；容量与全量/零接纳；C++17 构建消费与固定依赖。
+
+兼容承诺边界：本次只承诺**源码与可观测行为兼容**；不承诺跨编译器或已编译二进制的 ABI 稳定性（不因无安装包而忽略 ABI 影响）。`Options` 的默认值是冻结契约的一部分，新增字段视为契约变更。公共头正文指纹只能作变更报警，不能单独证明语义兼容。
+
+门禁：`net.freeze_public_surface` 用正/负 TU 对照（正对照只 include 上述 14 头且不引用 `detail/`；负对照逐项证明被删除/收回的符号真实编译失败），`net.freeze_options_contract` 断言 `Options{}`/`ReadResult`/`WriteOutcome`/`EngineConfig` 默认值与空句柄输出。
 
 ## Engine 强制关闭修订（分析期记录）
 

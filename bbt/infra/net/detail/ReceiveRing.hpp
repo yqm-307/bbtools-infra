@@ -17,6 +17,10 @@
 // staged 责任：owner 取走内核字节后若追加遇 Busy，调用 AppendDeferred 把字节
 // 放入本 ring 的 pending 区（预分配容量，不丢）；后续任一消费者取得数据锁时
 // 先把 pending 合入 ring。关闭只置终态，pending 尾部仍可被残留 Conn 消费。
+//
+// 公共面只暴露 ReadStatus/ReadResult（Types.hpp）；本头与 AccessAttempt 都是
+// 内部部件，不随公共契约冻结。公共读取守卫 bbt::infra::net::ReadAccess 通过
+// friend 使用本类的锁与游标，并自行持连接状态强引用保活（见 ReadAccess.hpp）。
 
 #include <atomic>
 #include <cstddef>
@@ -33,6 +37,7 @@
 #include <bbt/coroutine/sync/CoWaiter.hpp>
 
 #include <bbt/infra/net/Error.hpp>
+#include <bbt/infra/net/Types.hpp>
 #include <bbt/infra/net/detail/EventRingBuffer.hpp>
 #include <bbt/infra/net/detail/WakeHub.hpp>
 
@@ -40,15 +45,17 @@ namespace bbt::infra::net {
 
 class ReceiveRing {
 public:
-    enum class ReadStatus { Ok, Busy, WouldBlock, Eof, Error };
-    struct ReadResult {
-        ReadStatus status{ReadStatus::WouldBlock};
-        std::size_t bytes{0};
-        std::error_code error;
-    };
     struct AppendGrant {
         ReadStatus status{ReadStatus::WouldBlock};
         std::size_t granted{0};
+        std::error_code error;
+    };
+
+    // 一次保护尝试的结果：lock 有效即取得数据锁（status==Ok）；否则为
+    // Busy/WouldBlock/Eof/Error 且 lock 为空。构造公共 ReadAccess 用。
+    struct AccessAttempt {
+        std::unique_lock<std::mutex> lock;
+        ReadStatus status{ReadStatus::WouldBlock};
         std::error_code error;
     };
 
@@ -235,118 +242,75 @@ public:
         return result;
     }
 
-    // 同一短保护内的组合访问守卫。
-    class ReadAccess {
-    public:
-        ReadAccess() = default;
-        ReadAccess(ReadAccess&& other) noexcept
-            : m_ring(other.m_ring),
-              m_lock(std::move(other.m_lock)),
-              m_status(other.m_status),
-              m_error(other.m_error),
-              m_changed(other.m_changed) {
-            other.m_ring = nullptr;
+    // 同一短保护内的访问尝试（内部部件）：公共 ReadAccess 由 Connection::TryAccess
+    // 以「state 强引用 + 本尝试的锁」构造，从而把保活责任交给守卫而不是 ring。
+    AccessAttempt TryAccessAttempt() {
+        RetryPendingNotification();
+        std::unique_lock<std::mutex> lock(m_mutex, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            return {std::unique_lock<std::mutex>(), ReadStatus::Busy, {}};
         }
-        ReadAccess& operator=(ReadAccess&& other) noexcept {
-            if (this != &other) {
-                Release();
-                m_ring = other.m_ring;
-                m_lock = std::move(other.m_lock);
-                m_status = other.m_status;
-                m_error = other.m_error;
-                m_changed = other.m_changed;
-                other.m_ring = nullptr;
-            }
-            return *this;
+        FlushPendingLocked();
+        if (m_ring.Size() == 0) {
+            const ReadResult terminal = TerminalLocked();
+            lock.unlock();
+            NotifyRelease();
+            WakeOwnerOnly();  // owner 可能在 reserve/append Busy 后退回
+            return {std::unique_lock<std::mutex>(), terminal.status, terminal.error};
         }
-        ReadAccess(const ReadAccess&) = delete;
-        ReadAccess& operator=(const ReadAccess&) = delete;
-        ~ReadAccess() { Release(); }
+        return {std::move(lock), ReadStatus::Ok, {}};
+    }
 
-        explicit operator bool() const { return m_status == ReadStatus::Ok; }
-        bool Busy() const { return m_status == ReadStatus::Busy; }
-        bool WouldBlock() const { return m_status == ReadStatus::WouldBlock; }
-        bool Eof() const { return m_status == ReadStatus::Eof; }
-        bool Error() const { return m_status == ReadStatus::Error; }
-        std::error_code ErrorCode() const { return m_error; }
+    // 测试接缝：仅取保护（不要求有数据），用于确定性制造 append-Busy。
+    AccessAttempt TryHoldAttemptForTest() {
+        std::unique_lock<std::mutex> lock(m_mutex, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            return {std::unique_lock<std::mutex>(), ReadStatus::Busy, {}};
+        }
+        return {std::move(lock), ReadStatus::Ok, {}};
+    }
 
-        std::size_t Size() const {
-            return m_lock.owns_lock() ? m_ring->m_ring.Size() : 0;
+    // ---- 供公共 ReadAccess 在持锁期间使用（friend）----
+    std::size_t LockedSize() const { return m_ring.Size(); }
+    std::string_view LockedPeek() const { return m_ring.Peek(); }
+    std::error_code LockedDiscard(std::size_t count) {
+        const auto error = m_ring.Discard(count);
+        if (!error) {
+            m_size.store(m_ring.Size() + m_pending_size.load(), std::memory_order_release);
         }
-        std::string_view Peek() const {
-            return m_lock.owns_lock() ? m_ring->m_ring.Peek() : std::string_view{};
+        return error;
+    }
+    std::error_code LockedCopyAll(std::string& out) const {
+        EventSnapshot snapshot = m_ring.TakeSnapshot();
+        const auto view = snapshot.Peek();
+        out.append(view.data(), view.size());
+        return {};
+    }
+    std::error_code LockedConsumeInto(std::string& out) {
+        std::size_t consumed = 0;
+        std::error_code error;
+        try {
+            error = CopyConsumeLocked(out, consumed);
+        } catch (...) {
+            error = std::make_error_code(std::errc::not_enough_memory);
         }
-        std::error_code Consume(std::size_t n) {
-            if (!m_lock.owns_lock()) {
-                return std::make_error_code(std::errc::operation_not_permitted);
-            }
-            const auto error = m_ring->m_ring.Discard(n);
-            if (!error) {
-                m_ring->m_size.store(m_ring->m_ring.Size()
-                                     + m_ring->m_pending_size.load(), std::memory_order_release);
-                m_changed = true;
-            }
-            return error;
+        if (!error) {
+            m_size.store(m_ring.Size() + m_pending_size.load(), std::memory_order_release);
         }
-        // 复制全部但不消费（异常安全，不改游标；跨绕环完整）。
-        std::error_code CopyAll(std::string& out) const {
-            if (!m_lock.owns_lock()) {
-                return std::make_error_code(std::errc::operation_not_permitted);
-            }
-            EventSnapshot snapshot = m_ring->m_ring.TakeSnapshot();
-            const auto view = snapshot.Peek();
-            out.append(view.data(), view.size());
-            return {};
+        return error;
+    }
+    // 守卫解锁后调用：数据已变则通知 data hub，否则补唤醒 owner 重试；
+    // 两种路径都推进访问代次（Busy 等待者按代次复查）。
+    void AfterProtectionRelease(bool changed) {
+        if (changed) {
+            NotifyDataChanged();
+        } else {
+            // 消费者持锁期间 owner 可能在 reserve/append 上 Busy 而退回；
+            // 释放必须唤醒 owner 重试（owner 自身释放不走这里）。
+            WakeOwnerOnly();
         }
-        // 强保证复制+消费（与 TryRead 共用同一实现）。
-        std::error_code ConsumeInto(std::string& out) {
-            if (!m_lock.owns_lock()) {
-                return std::make_error_code(std::errc::operation_not_permitted);
-            }
-            std::size_t consumed = 0;
-            std::error_code error;
-            try {
-                error = m_ring->CopyConsumeLocked(out, consumed);
-            } catch (...) {
-                error = std::make_error_code(std::errc::not_enough_memory);
-            }
-            if (!error) {
-                m_ring->m_size.store(m_ring->m_ring.Size()
-                                     + m_ring->m_pending_size.load(), std::memory_order_release);
-                m_changed = true;
-            }
-            return error;
-        }
-
-    private:
-        friend class ReceiveRing;
-        ReadAccess(ReceiveRing* ring, std::unique_lock<std::mutex> lock,
-                   ReadStatus status, std::error_code error)
-            : m_ring(ring), m_lock(std::move(lock)), m_status(status), m_error(error) {}
-
-        void Release() {
-            if (m_lock.owns_lock()) {
-                m_lock.unlock();
-                if (m_ring != nullptr) {
-                    if (m_changed) {
-                        m_ring->NotifyDataChanged();
-                    } else {
-                        // 消费者持锁期间 owner 可能在 reserve/append 上 Busy 而退回；
-                        // 释放必须唤醒 owner 重试（owner 自身释放不走这里）。
-                        m_ring->WakeOwnerOnly();
-                    }
-                    m_ring->NotifyRelease();
-                }
-            }
-            m_ring = nullptr;
-        }
-
-        ReceiveRing* m_ring{nullptr};
-        std::unique_lock<std::mutex> m_lock;
-        ReadStatus m_status{ReadStatus::WouldBlock};
-        std::error_code m_error;
-        bool m_changed{false};
-    };
+        NotifyRelease();
+    }
 
     // 确定性时序测试接缝（正常为空）：分别落在 Busy/WouldBlock 分支创建 waiter
     // 之前、以及 on_registered 加入 hub 之后、复查谓词之前。
@@ -380,32 +344,6 @@ public:
     // recv=EAGAIN 也能取回原 ring 字节。
     void RequestRawRetry() { m_raw_retry.store(true, std::memory_order_release); }
     bool TakeRawRetry() { return m_raw_retry.exchange(false, std::memory_order_acq_rel); }
-
-    // 测试接缝：仅取保护（不要求有数据），用于确定性制造 append-Busy。
-    ReadAccess TryHoldForTest() {
-        std::unique_lock<std::mutex> lock(m_mutex, std::try_to_lock);
-        if (!lock.owns_lock()) {
-            return ReadAccess(this, std::unique_lock<std::mutex>(), ReadStatus::Busy, {});
-        }
-        return ReadAccess(this, std::move(lock), ReadStatus::Ok, {});
-    }
-
-    ReadAccess TryAccess() {
-        RetryPendingNotification();
-        std::unique_lock<std::mutex> lock(m_mutex, std::try_to_lock);
-        if (!lock.owns_lock()) {
-            return ReadAccess(this, std::unique_lock<std::mutex>(), ReadStatus::Busy, {});
-        }
-        FlushPendingLocked();
-        if (m_ring.Size() == 0) {
-            const ReadResult terminal = TerminalLocked();
-            lock.unlock();
-            NotifyRelease();
-            WakeOwnerOnly();  // owner 可能在 reserve/append Busy 后退回
-            return ReadAccess(this, std::unique_lock<std::mutex>(), terminal.status, terminal.error);
-        }
-        return ReadAccess(this, std::move(lock), ReadStatus::Ok, {});
-    }
 
     std::shared_ptr<bbt::coroutine::sync::CoWaiter> CreateDataWaiter() {
         return m_data_hub.Create();

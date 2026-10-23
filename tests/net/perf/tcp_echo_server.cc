@@ -42,7 +42,7 @@
 #include <bbt/infra/net/CoConnection.hpp>
 #include <bbt/infra/net/Engine.hpp>
 #include <bbt/infra/net/RawHandler.hpp>
-#include <bbt/infra/net/detail/ReceiveRing.hpp>
+#include <bbt/infra/net/Types.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -162,7 +162,10 @@ struct RawEchoHandler : RawHandler {
         std::mutex mu;
         FrameParser parser;
         std::deque<std::string> pending;          // 待 echo 的完整帧（含头），FIFO
-        std::shared_ptr<ConnectionState> state;   // 身份：防 Id 复用后误删后继 slot
+        // 身份：公共 Connection::Id()（本 Engine 内单调分配、不退让复用）。
+        // 不持内部状态指针——冻结面不公开 ConnectionState，且 Id 只在本 Engine
+        // 内有意义，因此 Id 表（parsers/eof_pending）不得跨 Engine 共享。
+        std::uint64_t id{0};
         std::uint64_t expected_seq{0};            // 下一帧期望 seq（帧序完整性）
         bool eof{false};                          // 对端 FIN（读终态）已见；
                                                 // pending 排空后须 RequestClose
@@ -181,10 +184,10 @@ struct RawEchoHandler : RawHandler {
             ++g_active_conns;
         }
         auto slot = std::make_shared<Slot>();
-        slot->state = connection.State();
+        slot->id = connection.Id();
         std::lock_guard<std::mutex> lk(mu);
-        // Id 可复用：同 id 旧连接的 slot 可能仍在表（其 OnClose 未到达）——
-        // 直接覆盖是对的，旧连接的数据面已终态；旧 OnClose 到达时按 state 识别。
+        // 同 id 旧连接若仍有残留 slot（其 OnClose 未到达），数据面已终态，
+        // 直接覆盖；迟到 OnClose 按 Id 相等识别，不会误删后继 slot。
         parsers[connection.Id()] = std::move(slot);
     }
 
@@ -275,7 +278,7 @@ struct RawEchoHandler : RawHandler {
         for (;;) {
             std::string data;
             const auto result = connection.TryRead(data);
-            if (result.status == ReceiveRing::ReadStatus::Ok) {
+            if (result.status == ReadStatus::Ok) {
                 if (data.empty()) break;  // Ok 但无数据：本批已尽
                 g_metrics.bytes_in.fetch_add(data.size());
                 if (!DrainToPending(*slot, data.data(), data.size())) {
@@ -285,13 +288,13 @@ struct RawEchoHandler : RawHandler {
                 }
                 continue;
             }
-            if (result.status == ReceiveRing::ReadStatus::Busy ||
-                result.status == ReceiveRing::ReadStatus::WouldBlock) {
+            if (result.status == ReadStatus::Busy ||
+                result.status == ReadStatus::WouldBlock) {
                 // Busy：他线程正在读，留待其释放触发的重投 OnRead；
                 // WouldBlock：本批可读数据已尽且无终态——正常中途，不关。
                 break;
             }
-            if (result.status == ReceiveRing::ReadStatus::Error) {
+            if (result.status == ReadStatus::Error) {
                 g_metrics.errors.fetch_add(1);
             }
             terminal = true;  // Eof / Error 终态
@@ -337,10 +340,10 @@ struct RawEchoHandler : RawHandler {
     void OnClose(Connection connection, std::error_code) override {
         std::lock_guard<std::mutex> lk(mu);
         const auto it = parsers.find(connection.Id());
-        // Id 复用：迟到的 OnClose 只删属于自己 state 的 slot——同 id 已有新连接
-        // 登记时，表中 slot 属于新连接，不得擦除（否则新连接 OnRead 提前返回，
-        // echo 永远不到 → 对端 3s 超时，conns 负载尾部稳定丢 clients 个连接）。
-        if (it != parsers.end() && it->second->state == connection.State()) {
+        // 身份：迟到的 OnClose 只删属于自己 Id 的 slot——同 id 已有新连接登记时，
+        // 表中 slot 属于新连接，不得擦除（否则新连接 OnRead 提前返回，echo 永远
+        // 不到 → 对端超时，conns 负载尾部稳定丢 clients 个连接）。
+        if (it != parsers.end() && it->second->id == connection.Id()) {
             // 丢弃未发出的 echo（对端已走）；如实计数不静默。
             const auto dropped = it->second->pending.size();
             if (dropped > 0) {
@@ -350,7 +353,7 @@ struct RawEchoHandler : RawHandler {
         }
         const auto eit = eof_pending.find(connection.Id());
         if (eit != eof_pending.end() &&
-            eit->second->state == connection.State()) {
+            eit->second->id == connection.Id()) {
             eof_pending.erase(eit);
         }
         {
@@ -561,7 +564,7 @@ int RunServer(int argc, char** argv) {
                 Connection c;
                 bbt::coroutine::WaitOptions opts;
                 opts.deadline = std::chrono::steady_clock::now() + 200ms;
-                const auto err = engine.WaitAccepted(c, opts);
+                const auto err = CoAccept(engine, c, opts);
                 if (err == std::make_error_code(std::errc::timed_out)) continue;
                 if (err) break;
                 g_metrics.accepted.fetch_add(1);
