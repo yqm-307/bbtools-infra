@@ -129,7 +129,8 @@ target_include_directories(Test_net_append_busy_hook PRIVATE ${PROJECT_SOURCE_DI
 target_compile_features(Test_net_append_busy_hook PRIVATE cxx_std_17)
 target_compile_options(Test_net_append_busy_hook PRIVATE -Wall -Wextra -Wpedantic)
 target_link_options(Test_net_append_busy_hook PRIVATE -rdynamic)
-foreach(_case pending_not_flushed_before_next_recv pending_without_next_recv_is_ordered)
+foreach(_case pending_not_flushed_before_next_recv pending_without_next_recv_is_ordered
+              pending_pause_recovers_at_low_water)
     add_test(NAME net.${_case} COMMAND Test_net_append_busy_hook --run_test=net_append_busy_hook/${_case})
     set_tests_properties(net.${_case} PROPERTIES TIMEOUT 90)
 endforeach()
