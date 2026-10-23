@@ -2414,8 +2414,9 @@ BOOST_AUTO_TEST_CASE(t_f1a_candidate_close_in_gate) {
             "F-1a handoff path: handed-off fd leaked, iter=" << iter);
     }
 
-    // 3) 域级：受管 dial 打到不可达数值地址（立即 connect 失败路径）后候选 fd 已收口，
-    //    socket 数回基线（无残留、无双关）。取一个当前无监听者的 loopback 端口。
+    // 3) 域级：受管 dial 打到无监听者的 loopback 端口后失败，socket 数最终回基线。
+    // 非阻塞 connect 可能先返回 EINPROGRESS，不能假定此处只走立即失败路径。
+    // 前两组按具体 fd 验证关闭门原语的同步收口；这里覆盖完整拨号失败后的资源回收。
     {
         int probe = ::socket(AF_INET, SOCK_STREAM, 0);
         BOOST_REQUIRE(probe >= 0);
@@ -2445,9 +2446,10 @@ BOOST_AUTO_TEST_CASE(t_f1a_candidate_close_in_gate) {
         BOOST_REQUIRE(WaitUntil([&] { return ready.load(std::memory_order_acquire); }));
         BOOST_REQUIRE(!*out);
         BOOST_CHECK(out->error().code == ErrorCode::TransportError);
-        // 立即失败路径无 fd 等待、无内部 dup：候选 fd 已由关闭门原语收口，socket 数
-        // 不得高于基线（体现「失败路径 close 先于排空谓词归零」的可见后果）。
-        BOOST_CHECK_MESSAGE(CountSocketFds() <= sockets_before,
+        // fd 等待可能持有运行时内部 dup，协程返回时尚待驱动线程延迟析构。
+        // 复用同类用例的有界等待；仍要求 socket 数回到原基线，超时或残留即失败。
+        // 不以额外 fd 容差或重跑代替资源回收。
+        BOOST_CHECK_MESSAGE(WaitUntil([&] { return CountSocketFds() <= sockets_before; }),
             "F-1a domain: managed dial failure left a residual socket fd (before="
                 << sockets_before << " after=" << CountSocketFds() << ")");
         cli->Close();
