@@ -16,7 +16,7 @@
 | Mongo client | `bbt::infra_mongo` | 已实现 owner + 句柄形态 | 同步 driver + worker bridge；`mongo::CoMongoDb` 为资源 owner，`mongo::CoMongoColl` 为集合句柄；`include/bbt/infra/mongo/` 公共目录已建，剩余 API 按决策 0006 逐步迁移 |
 | 基础动态配置 | `bbt::infra_config` | 最小切片已合入主线，独立消费已验证 | `bbt::infra::config`；版本化不可变快照 + 内存源 + 真实本地文件源 + watch（初始/更新/重复去重、失败恢复、关闭与晚到通知、正常 drain 与 owner 同步 `Close()` 的资源边界）。**未交付**：远程 provider 与真实重连、业务 schema 校验、客户端资源热切换。契约/命令/未覆盖矩阵见 [docs/config-watch-v1.md](docs/config-watch-v1.md) |
 | RPC | `bbt::infra_rpc` | 已合入主线 | 版本化 Protobuf RpcEnvelope wire profile 与 HTTP-backed RpcClient/RpcServer runtime（`bbt::infra::rpc`，Issue #8/N2）：值类型校验、编解码、HTTP body 绑定、请求关联、deadline local-min、错误和同步 Close；payload codec 见 `include/bbt/infra/rpc/RpcPayload.hpp`。随 [PR #79](https://github.com/yqm-307/bbtools-infra/pull/79) 合入（`3136d1de`），framework 侧消费与预算验收已在 Issue #2 的交接评论公开；framework 的 Service/Actor、业务方法表与路由仍归 framework，可选 `dual_service` 示例、跨机器与全平台压力未覆盖 |
-| R2 TCP 网络底座（Processer driver） | `bbt::infra_net` | 已合入主线 | 自有 main/sub Asio context 由已登记 Processer driver 的 `OnTick/Wait` 推进，不建网络 I/O 线程；`Engine::Run` 占宿主 native 线程、自动绑定空闲槽并在失败时回滚、`RequestClose` 封口、同代同步解绑后收口；原始短回调 `OnAccept/OnConnect/OnRead/OnWrite/OnClose`（owner 非业务协程边界，不可挂起）；并发接收 ring 为单一真源（`TryRead`、RAII `Peek+Consume`、Busy/WouldBlock、持久 EOF/错误、关闭后尾部可读）；`AsyncWrite` 全量/零接纳、有界字节与操作数、逐操作真实前缀与唯一终态、`WriteOperation` 句柄终态可查；`CoRead/CoWrite/CoAccept/CoDial` 仅复用同一 raw 能力。旧 `Client/EventHandler/CoTcpConnection/ICoConnection/Action` 已删除，不保留兼容壳；消费者迁移（HTTP/Redis/Mongo/config 仍走旧路径）不在本次 PR 范围。见 [PR #84](https://github.com/yqm-307/bbtools-infra/pull/84)（合入提交 `99d0821a`） |
+| R2 TCP 网络底座（Processer driver） | `bbt::infra_net` | 已合入主线（API 冻结候选待评审） | 自有 main/sub Asio context 由已登记 Processer driver 的 `OnTick/Wait` 推进，不建网络 I/O 线程；`Engine::Run` 占宿主 native 线程、自动绑定空闲槽并在失败时回滚、`RequestClose` 封口、同代同步解绑后收口；原始短回调 `OnAccept/OnConnect/OnRead/OnWrite/OnClose`（owner 非业务协程边界，不可挂起）；并发接收 ring 为单一真源（`TryRead`、RAII `Peek+Consume`、Busy/WouldBlock、持久 EOF/错误、关闭后尾部可读）；`AsyncWrite` 全量/零接纳、有界字节与操作数、逐操作真实前缀与唯一终态、`WriteOperation` 句柄终态可查；`CoRead/CoWrite/CoAccept/CoDial` 仅复用同一 raw 能力。旧 `Client/EventHandler/CoTcpConnection/ICoConnection/Action` 已删除，不保留兼容壳；消费者迁移（HTTP/Redis/Mongo/config 仍走旧路径）不在本次 PR 范围。见 [PR #84](https://github.com/yqm-307/bbtools-infra/pull/84)（合入提交 `99d0821a`）。**公共 API 冻结候选**见 [0010](docs/decisions/0010-gnet-network-foundation.md) 的「API 冻结候选（工作区候选，未提交）」一节：分支 `refactor/net-minimal-api-freeze` 上的收口改动**尚未提交、未推送、未经 PR CI、未正式冻结**，合入前本文不把它当作已交付形态 |
 | MCP server | — | 未交付（草稿候选） | C++17 server-only 的协议核心、tools/resources/prompts 与 stdio/Streamable HTTP 候选保存在 [草稿 PR #80](https://github.com/yqm-307/bbtools-infra/pull/80)，未合入 main，当前主线无可消费 target。目标、阻断与 R1–R11 / S1–S24 验收由 [Issue #85](https://github.com/yqm-307/bbtools-infra/issues/85) 维护；完整 client SDK 与 OAuth 不在首版范围。实时冲突和检查状态以该 PR 为准 |
 
 已实现能力的单测与示例均可独立构建运行，见下文「独立消费」与 [examples/README.md](examples/README.md)。
@@ -52,13 +52,16 @@ coroutine 运行时按**进程寿命**存在、不参与业务资源收口（不
 
 ## 独立消费
 
-### R2 TCP 使用入口（已合入主线）
+### R2 TCP 使用入口（已合入主线；公共 API 冻结候选见 0010）
 
 公共头：`<bbt/infra/net/Engine.hpp>`、`RawHandler.hpp`、`Connection.hpp`、`CoConnection.hpp`、`Error.hpp`；只链接 `bbt::infra_net`。
 
+> 下面是 **main 上已合入的形态**。分支 `refactor/net-minimal-api-freeze` 上有一份尚未提交的公共 API 冻结候选（`Connection::State()`、公共 `Connection(state)`/`WriteOperation(record)` 构造、`Engine::AsyncConnectAwaitable`/`WaitConnect`/`WaitAccepted`、公共 `NormalizeOptions` 与 12 个历史 Options 字段被删除或收回内部；新增公共 `Types.hpp`/`ReadAccess.hpp`）。候选**未提交、未推送、未经 PR CI、未正式冻结**；冻结符号表与删除迁移表见 [0010「API 冻结候选」](docs/decisions/0010-gnet-network-foundation.md)，本节在候选合入前不改口。
+
 前提与关闭：
-- `Engine::Run(const EngineConfig&)` 阻塞占用**调用它的宿主 native 控制线程**（不能是受管业务协程或本 Engine 的 owner 线程）；在受管协程或该 Engine 的 owner 线程内调用会以 `operation_not_permitted` 拒绝。
+- `Engine::Run(const EngineConfig&)` 阻塞占用**调用它的宿主 native 控制线程**：在受管协程上下文或任一已登记 Processer 线程上调用会以 `operation_not_permitted` 拒绝（判定取自 `GetLocalCoroutineId`/`TryGetLocalProcesser`，两版一致）。
 - `EngineConfig.runtime_progress` 必填 `RuntimeProgress::Independent`，声明 runtime 内部 EventLoop 由独立执行流持续推进；未声明在绑定/建 socket 前以 `operation_not_permitted` 拒绝，runtime 未初始化以 `operation_not_supported` 拒绝。
+- server 布局（`listen_addresses` 非空）在 main 上**不强制**"handler 或 handoff 至少一个"：两者都无时 `Run` 仍会成功进入 Running，accept 到的连接无人接收。冻结候选把这一条变成前置拒绝——`Run` 在 driver 绑定/socket 副作用之前以 `operation_not_permitted` 返回。handler 与 handoff 可共存（两版一致）：同一连接既通知 `OnAccept` 也进 handoff，二者 `Id()` 相同，两个读取者只保证线性化字节前缀。
 - `Connection::RequestClose()` 只是请求封口：立即拒绝新写并唤 owner；已 recv 但尚未
   进入 ring 的尾部由 owner 先转入 state 真源，之后才发布读侧最终 EOF。请求后、owner
   完成前读取可得到 `WouldBlock`，不得提前 EOF。首次请求的 reason（包括默认 `{}`）
@@ -72,10 +75,13 @@ coroutine 运行时按**进程寿命**存在、不参与业务资源收口（不
   只允许一个 `WaitConnect` 接收者，第二个返回 `device_or_resource_busy`。
   等待超时/取消终结该接收者并由 owner 回收未交付连接，不能用同 id 再次等待；
   waiter 建立失败返回 `not_enough_memory`、回滚 claim，同 id 可重试。
+  （冻结候选中 `WaitConnect`/`AsyncConnectAwaitable` 已收为内部，Co 建连只用 `CoDial`。）
 - `CoDial` 的 client-only Engine 若无 raw 接收者，请用空 `shared_ptr<RawHandler>` 构造：
   等待超时/取消后 owner 才可回收未交付 socket；有 raw handler 时视为已交付，不会因另一个
   Co 等待取消而误关。
-- `AsyncWrite` 成功只表示库已接纳；`WriteOperation::Query()` 区分仍在途/完成与真实前缀。协程等待超时/取消只结束等待，已接纳操作仍由 owner 推进，可用同一 `WriteOperation` 查最终结果；不自动关闭或重发。
+- `CoAccept`（main 形态）：已封口时从队列/等待中返回 `operation_canceled`；其余情况（含 `Idle`、未启用 handoff、无 listener 的 client-only）**不会立即报配置错误**，而是进入 handoff 等待，直到拿到连接、封口或等待超时（`timed_out`）——所以调用方必须给 deadline，不能靠它自己发现"没配 handoff"。失败不覆盖调用者原 `Connection`。冻结候选把这里改成前置快速拒绝：执行域非法 → `operation_not_permitted`；已封口/`Closing`/`Stopped` → `operation_canceled`；`Idle`/`Starting` → `operation_not_permitted`；`Running` 未开 handoff → `operation_not_permitted`；`Running` + handoff 但无 main accept owner → `operation_not_supported`。
+- 四个 Co 入口都是协程内调用：main 形态下非法域由各等待原语自行拒绝（可能出现 `io_error` 之类的底层映射）；冻结候选统一为在消费/接纳/提交之前校验执行域，非协程上下文一律 `operation_not_permitted`（含带现成数据、零长写、已就绪 accept 的快路径），不构造 `CoObject`、不创建 Processer、不产生网络副作用。
+- `AsyncWrite` 成功只表示库已接纳；`WriteOperation::Query()` 区分仍在途/完成与真实前缀。`WritePhase::Done` 只表示该次发送已到终态，**成功还须 `error` 为空**。协程等待超时/取消只结束等待，已接纳操作仍由 owner 推进，可用同一 `WriteOperation` 查最终结果；不自动关闭或重发。
 - `RawHandler::OnClose` 在 owner 上按连接最多一次；peer EOF 只结束读方向，不自动关闭写侧。
 
 最小 raw 入口（伪代码，实际见 `examples/co_net_service` 与 `tests/net/r2_tcp.cc`）：
@@ -95,6 +101,9 @@ Co 薄封装（同一 raw 内核）：
 
 ```cpp
 net::Connection conn = /* from CoAccept/CoDial */;
+// WaitOptions 只有一个字段 deadline（steady_clock::time_point）；examples 里的
+// Until(3000ms) 就是这个类型。deadline 只约束本次等待，不撤销已接纳的 I/O。
+const bbt::coroutine::WaitOptions options{std::chrono::steady_clock::now() + 3000ms};
 std::string data;
 if (net::CoRead(conn, data, options) == net::NetErrc::Eof) { /* 尾部已读完 */ }
 net::WriteOutcome outcome;
@@ -105,7 +114,7 @@ if (net::CoWrite(conn, data, options, outcome, operation)) {
 }
 ```
 
-覆盖边界：真实 port0 raw/Co 回环、sub owner 身份、多 listener、关闭后尾部/残留 Conn、有界发送/部分写/错误结算、容量超时未提交、完成超时仍在途、no-deadline 等待关闭结算、handoff 容量恢复、公平性、运行前提与 driver Failed 收口均有对应注册用例。未覆盖：长时/多连接性能、部分 Options 组合接线、Release/ASAN、全部 connect 超时回收的确定性动态用例。`ticker`、`edge_triggered_io`、`bind_to_device`、`multicast_interface_index`、`lock_os_thread` 的非默认配置在 `Run` 中以 `operation_not_supported` 明确拒绝；高层 UDP 仅有 `<bbt/infra/net/Udp.hpp>` 编译拒绝入口。
+覆盖边界：真实 port0 raw/Co 回环、sub owner 身份、多 listener、关闭后尾部/残留 Conn、有界发送/部分写/错误结算、容量超时未提交、完成超时仍在途、no-deadline 等待关闭结算、handoff 容量恢复、公平性、运行前提与 driver Failed 收口均有对应注册用例。未覆盖：长时/多连接性能、部分 Options 组合接线、Release/ASAN、全部 connect 超时回收的确定性动态用例。`ticker`、`edge_triggered_io`、`bind_to_device`、`multicast_interface_index`、`lock_os_thread` 在 main 上是以 `operation_not_supported` 在 `Run` 中拒绝的历史字段；**冻结候选中这五个字段已从 `Options` 删除**，改为编译期拒绝（不存在入口）。高层 UDP 仅有 `<bbt/infra/net/Udp.hpp>` 编译拒绝入口。
 
 ### 新 net 构建与消费
 
@@ -128,6 +137,8 @@ ctest --test-dir <独立 build> -j1 --no-tests=error --output-on-failure
 ```
 
 `network-only` 在旧目标、数据库/protobuf 包发现之前分流，残留 prefix 不启用被排除模块；不修改旧功能源码，也不代表旧模块已回归。首包消费工程见 [examples/net_foundation_consumer](examples/net_foundation_consumer/README.md)，协程用法示例见 [examples/co_net_service](examples/co_net_service/README.md)。`net.context_no_create` 是必过门禁（查询路径不再隐式创建 Processer，修复经 coroutine [PR #388](https://github.com/yqm-307/bbtools-coroutine/pull/388) 合入），未改断言或设置 skip。
+
+上面的 target 列表是 main 的形态。冻结候选分支另加目标 `Test_net_freeze` 与 9 个注册用例 `net.freeze_*`（8 个运行期契约用例 + `net.freeze_public_surface` 正/负编译门禁）；该分支尚未提交，因此这些用例还没有任何 PR CI 记录。
 
 已启动 runtime 的测试与示例按 [执行域设计 §9](docs/architecture/gnet-network-execution.md#9-测试进程退出约定与已知限制) 经 `RunTestProcessExit` / `std::_Exit` 收口；该约定只规避测试进程静态析构竞态，不是 runtime 资源回收证据。
 

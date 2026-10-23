@@ -7,6 +7,7 @@
 #include <bbt/infra/net/Options.hpp>
 // detail 内部件仅测试同仓引用，不构成公开 API。
 #include <bbt/infra/net/detail/EventRingBuffer.hpp>
+#include <bbt/infra/net/detail/OptionsNormalize.hpp>
 #include <bbt/infra/net/detail/OutboundQueue.hpp>
 #include <bbt/infra/net/detail/SourceAddrHash.hpp>
 
@@ -725,12 +726,12 @@ static void TestBuffer() {
 }
 
 // ---------------------------------------------------------------------------
-// options：NormalizeOptions
+// options：内部归一化 NormalizeOptions（detail 头；不是公共配置 API）
 // ---------------------------------------------------------------------------
 
-static NormalizedOptions NormalizeOrThrow(const Options& in, int cpu_count) {
+static NormalizedOptions NormalizeOrThrow(const Options& in) {
     NormalizedOptions out;
-    const std::error_code ec = NormalizeOptions(in, cpu_count, out);
+    const std::error_code ec = NormalizeOptions(in, out);
     if (ec) {
         throw std::runtime_error("NormalizeOptions failed: " + ec.message());
     }
@@ -738,149 +739,128 @@ static NormalizedOptions NormalizeOrThrow(const Options& in, int cpu_count) {
 }
 
 static void TestOptionsDefaultsAndLoops() {
-    Options in;
-    int cpu_calls = 0;      // 归一化不读 CPU：CPU 数只能来自显式参数
-    (void)cpu_calls;
-    const NormalizedOptions out = NormalizeOrThrow(in, 4);
+    // 默认：loop=1（无 CPU 数推导）、socket 选项默认值、每连接总量界默认 1MiB。
+    const NormalizedOptions out = NormalizeOrThrow(Options{});
     CHECK(out.lb == LoadBalancing::RoundRobin);
-    CHECK(out.num_event_loop == 1);             // 未指定 + 非 multicore
-    CHECK(out.read_buffer_cap == 64 * 1024);    // 默认 64KiB
-    CHECK(out.write_buffer_cap == 64 * 1024);
-    CHECK(!out.edge_triggered_io);
-    CHECK(out.edge_triggered_io_chunk == 0);
+    CHECK(out.num_event_loop == 1);
+    CHECK(!out.reuse_addr);
+    CHECK(!out.reuse_port);
     CHECK(out.tcp_no_delay);
-    CHECK(out.socket_recv_buffer == 0);         // 不设置
+    CHECK(out.socket_recv_buffer == 0);         // 0 = 不设置
     CHECK(out.socket_send_buffer == 0);
     CHECK(out.max_inbound_bytes == 1024 * 1024);
     CHECK(out.max_outbound_bytes == 1024 * 1024);
     CHECK(out.max_pending_events == 1024);
     CHECK(out.tcp_keep_alive == std::chrono::seconds{0});
 
-    const Options multicore = [] {
-        Options o;
-        o.multicore = true;
-        return o;
-    }();
-    CHECK(NormalizeOrThrow(multicore, 7).num_event_loop == 7);
-
+    // 显式 sub 数原样保留（server 另占 main 槽由 Engine 决定，不在此推导）。
     const Options explicit_loops = [] {
         Options o;
-        o.multicore = true;
         o.num_event_loop = 2;
         return o;
     }();
-    CHECK(NormalizeOrThrow(explicit_loops, 7).num_event_loop == 2);   // 正值覆盖
+    CHECK(NormalizeOrThrow(explicit_loops).num_event_loop == 2);
 
-    const Options too_many = [] {
+    // 负值拒绝，且失败不改 out（先全量验证再一次性提交）。
+    const Options negative = [] {
         Options o;
-        o.num_event_loop = 10001;
-        o.lock_os_thread = true;
+        o.num_event_loop = -1;
         return o;
     }();
     NormalizedOptions sentinel;
     sentinel.num_event_loop = 777;
-    CHECK(IsInvalidArgument(NormalizeOptions(too_many, 4, sentinel)));
-    CHECK(sentinel.num_event_loop == 777);      // 失败不改 out
-    const Options edge_ok = [] {
-        Options o;
-        o.num_event_loop = 10000;
-        o.lock_os_thread = true;
-        return o;
-    }();
-    CHECK(NormalizeOrThrow(edge_ok, 4).num_event_loop == 10000);
+    sentinel.max_pending_events = 4321;
+    CHECK(IsInvalidArgument(NormalizeOptions(negative, sentinel)));
+    CHECK(sentinel.num_event_loop == 777);
+    CHECK(sentinel.max_pending_events == 4321);
 }
 
-static void TestOptionsCapsAndEt() {
-    // 0 默认、负值拒绝、最小 1024、向上 2 次幂。
-    const auto caps = [](std::int64_t v) {
-        Options o;
-        o.read_buffer_cap = v;
-        o.write_buffer_cap = v;
-        o.max_inbound_bytes = 4 * 1024 * 1024 * 1024LL;     // 放开总量以测取整
-        o.max_outbound_bytes = 4 * 1024 * 1024 * 1024LL;
-        return NormalizeOrThrow(o, 2);
-    };
-    CHECK(caps(0).read_buffer_cap == 64 * 1024);
-    CHECK(caps(1).read_buffer_cap == 1024);
-    CHECK(caps(1023).read_buffer_cap == 1024);
-    CHECK(caps(1024).read_buffer_cap == 1024);
-    CHECK(caps(1025).write_buffer_cap == 2048);
-    CHECK(caps(1 << 20).read_buffer_cap == 1 << 20);
-    CHECK(caps((1 << 30) + 1).read_buffer_cap == 1u << 31);
-
-    const auto cap_err = [](std::int64_t v) {
-        Options o;
-        o.read_buffer_cap = v;
-        NormalizedOptions out;
-        return NormalizeOptions(o, 2, out);
-    };
-    CHECK(IsInvalidArgument(cap_err(-1)));
-    CHECK(IsOutOfRange(cap_err(std::numeric_limits<std::int64_t>::max())));
-
-    // 基础 cap 不能超对应总量（总量与 WriteBufferCap 语义不同）。
-    const Options cap_over_total = [] {
-        Options o;
-        o.read_buffer_cap = 2 * 1024 * 1024;    // 归一化 2MiB > 默认总量 1MiB
-        return o;
-    }();
-    NormalizedOptions sentinel;
-    sentinel.num_event_loop = 777;
-    CHECK(IsInvalidArgument(NormalizeOptions(cap_over_total, 2, sentinel)));
-    CHECK(sentinel.num_event_loop == 777);
-    const Options raised_total = [] {
-        Options o;
-        o.read_buffer_cap = 2 * 1024 * 1024;
-        o.max_inbound_bytes = 4 * 1024 * 1024;
-        return o;
-    }();
-    CHECK(NormalizeOrThrow(raised_total, 2).read_buffer_cap == 2u * 1024 * 1024);
-
-    const auto resource_err = [](std::int64_t inbound, std::int64_t outbound, std::int64_t events) {
+static void TestOptionsResourceBounds() {
+    // 每连接总量界必须正值；不再有段容量字段与之交叉校验。
+    const auto bounds = [](std::int64_t inbound, std::int64_t outbound, std::int64_t events) {
         Options o;
         o.max_inbound_bytes = inbound;
         o.max_outbound_bytes = outbound;
         o.max_pending_events = events;
         NormalizedOptions out;
-        return NormalizeOptions(o, 2, out);
+        return NormalizeOptions(o, out);
     };
-    CHECK(IsInvalidArgument(resource_err(0, 1024, 1024)));
-    CHECK(IsInvalidArgument(resource_err(1024, -5, 1024)));
-    CHECK(IsInvalidArgument(resource_err(1024, 1024, 0)));
+    CHECK(IsInvalidArgument(bounds(0, 1024, 1024)));
+    CHECK(IsInvalidArgument(bounds(1024, -5, 1024)));
+    CHECK(IsInvalidArgument(bounds(1024, 1024, 0)));
+    CHECK(IsInvalidArgument(bounds(-1, 1024, 1024)));
 
-    // ET chunk。
-    const auto et = [](std::int64_t chunk, bool enabled) {
+    // 小总量界必须可用（旧版会被默认 64KiB 段容量 cap 交叉校验拒绝）。
+    const auto small = [](std::int64_t value) {
         Options o;
-        o.edge_triggered_io_chunk = chunk;
-        o.edge_triggered_io = enabled;
-        return NormalizeOrThrow(o, 2);
+        o.max_inbound_bytes = value;
+        o.max_outbound_bytes = value;
+        o.max_pending_events = 1;
+        return NormalizeOrThrow(o);
     };
-    const auto et_chunk_on = et(100, false);
-    CHECK(et_chunk_on.edge_triggered_io);
-    CHECK(et_chunk_on.edge_triggered_io_chunk == 128);
-    const auto et_flag_default = et(0, true);
-    CHECK(et_flag_default.edge_triggered_io);
-    CHECK(et_flag_default.edge_triggered_io_chunk == 1024 * 1024);
-    const auto et_off = et(0, false);
-    CHECK(!et_off.edge_triggered_io);
-    CHECK(et_off.edge_triggered_io_chunk == 0);
-    const auto et_err = [](std::int64_t chunk) {
+    CHECK(small(1).max_inbound_bytes == 1);
+    CHECK(small(1).max_outbound_bytes == 1);
+    CHECK(small(1).max_pending_events == 1);
+    CHECK(small(4096).max_inbound_bytes == 4096);
+    CHECK(small(4096).max_outbound_bytes == 4096);
+
+    // 合法枚举原样保留；非法枚举拒绝。
+    const auto lb = [](LoadBalancing mode) {
         Options o;
-        o.edge_triggered_io_chunk = chunk;
+        o.lb = mode;
         NormalizedOptions out;
-        return NormalizeOptions(o, 2, out);
+        return NormalizeOptions(o, out);
     };
-    CHECK(IsInvalidArgument(et_err(-3)));
-    CHECK(IsOutOfRange(et_err(std::numeric_limits<std::int64_t>::max())));
+    CHECK(!lb(LoadBalancing::RoundRobin));
+    CHECK(!lb(LoadBalancing::LeastConnections));
+    CHECK(!lb(LoadBalancing::SourceAddrHash));
+    CHECK(IsInvalidArgument(lb(static_cast<LoadBalancing>(42))));
+    CHECK(IsInvalidArgument(lb(static_cast<LoadBalancing>(-1))));
+
+    // socket 选项直接映射；0 不设置，负值/超原生 int 拒绝。
+    const auto sock = [](std::int64_t recv, std::int64_t send) {
+        Options o;
+        o.socket_recv_buffer = recv;
+        o.socket_send_buffer = send;
+        return NormalizeOrThrow(o);
+    };
+    CHECK(sock(0, 0).socket_recv_buffer == 0);
+    CHECK(sock(65536, 131072).socket_recv_buffer == 65536);
+    CHECK(sock(65536, 131072).socket_send_buffer == 131072);
+    CHECK(sock(std::numeric_limits<std::int32_t>::max(), 0).socket_recv_buffer
+        == std::numeric_limits<std::int32_t>::max());
+    const auto sock_err = [](std::int64_t recv, std::int64_t send) {
+        Options o;
+        o.socket_recv_buffer = recv;
+        o.socket_send_buffer = send;
+        NormalizedOptions out;
+        return NormalizeOptions(o, out);
+    };
+    CHECK(IsOutOfRange(sock_err(-1, 0)));
+    CHECK(IsOutOfRange(sock_err(0, -1)));
+    CHECK(IsOutOfRange(sock_err(std::int64_t{std::numeric_limits<std::int32_t>::max()} + 1, 0)));
+    CHECK(IsOutOfRange(sock_err(0, std::int64_t{std::numeric_limits<std::int32_t>::max()} + 1)));
+
+    // reuse flags 与 nodelay 原样映射（接线点同名字段）。
+    const Options flags = [] {
+        Options o;
+        o.reuse_addr = true;
+        o.reuse_port = true;
+        o.tcp_no_delay = false;
+        return o;
+    }();
+    const auto mapped = NormalizeOrThrow(flags);
+    CHECK(mapped.reuse_addr && mapped.reuse_port && !mapped.tcp_no_delay);
 }
 
-static void TestOptionsKeepaliveAndSocketBuffers() {
+static void TestOptionsKeepalive() {
     // 默认 interval=idle/5、count=5；除得 0 时最小 1 秒（C++ 差异）。
     const auto keep = [](int idle_s, int interval_s, std::int64_t count) {
         Options o;
         o.tcp_keep_alive = std::chrono::seconds{idle_s};
         o.tcp_keep_interval = std::chrono::seconds{interval_s};
         o.tcp_keep_count = count;
-        return NormalizeOrThrow(o, 2);
+        return NormalizeOrThrow(o);
     };
     const auto k11 = keep(11, 0, 0);
     CHECK(k11.tcp_keep_alive == std::chrono::seconds{11});
@@ -909,156 +889,47 @@ static void TestOptionsKeepaliveAndSocketBuffers() {
         o.tcp_keep_interval = std::chrono::seconds{interval_s};
         o.tcp_keep_count = count;
         NormalizedOptions out;
-        return NormalizeOptions(o, 2, out);
+        return NormalizeOptions(o, out);
     };
     CHECK(IsInvalidArgument(keep_err(-1, 0, 0)));
     CHECK(IsInvalidArgument(keep_err(0, -1, 0)));
     CHECK(IsInvalidArgument(keep_err(0, 0, -1)));
-    // 原生 int 上限本身合法（内核 int 秒），超界才拒绝。
+
+    // 原生 int 秒上限本身合法（内核 int 秒），超界才拒绝。
     const auto k_intmax = keep(0x7fffffff, 0, 0);
     CHECK(k_intmax.tcp_keep_alive == std::chrono::seconds{0x7fffffff});
     CHECK(k_intmax.tcp_keep_interval == std::chrono::seconds{0x7fffffff / 5});
-    // 超原生 int 秒范围：用更大构造验证（不依赖 int 参数截断）。
     {
         Options o;
         o.tcp_keep_alive = std::chrono::seconds{std::int64_t{1} << 40};
         NormalizedOptions out;
-        CHECK(IsOutOfRange(NormalizeOptions(o, 2, out)));
+        CHECK(IsOutOfRange(NormalizeOptions(o, out)));
     }
 
-    // fix1 回归：keep count 正值不得超原生 int（TCP_KEEPCNT 截断防护），
-    // 启用与禁用（idle=0）都验证；INT_MAX 本身合法；失败时 out 保持原值。
+    // keep count 正值不得超原生 int（TCP_KEEPCNT 截断防护）；启用与禁用都验证。
     {
         const std::int64_t kIntMax = std::numeric_limits<std::int32_t>::max();
         CHECK(keep(11, 0, kIntMax).tcp_keep_count == static_cast<std::size_t>(kIntMax));
         CHECK(keep(0, 9, kIntMax).tcp_keep_count == static_cast<std::size_t>(kIntMax));
         Options over;
-        over.tcp_keep_count = kIntMax + 1;          // 启用路径
+        over.tcp_keep_count = kIntMax + 1;
         NormalizedOptions out;
-        out.tcp_keep_count = 4321;                  // 哨兵
-        CHECK(IsOutOfRange(NormalizeOptions(over, 2, out)));
+        out.tcp_keep_count = 4321;
+        CHECK(IsOutOfRange(NormalizeOptions(over, out)));
         CHECK(out.tcp_keep_count == 4321);
-        Options over_disabled;                      // 禁用路径同样拒绝
+        Options over_disabled;
         over_disabled.tcp_keep_count = kIntMax + 1;
         NormalizedOptions out2;
-        CHECK(IsOutOfRange(NormalizeOptions(over_disabled, 2, out2)));
-    }
-
-    // socket buffer：0 不设置、负值/超原生 int 拒绝。
-    const auto sock = [](std::int64_t recv, std::int64_t send) {
-        Options o;
-        o.socket_recv_buffer = recv;
-        o.socket_send_buffer = send;
-        return NormalizeOrThrow(o, 2);
-    };
-    CHECK(sock(0, 0).socket_recv_buffer == 0);
-    CHECK(sock(65536, 131072).socket_recv_buffer == 65536);
-    CHECK(sock(65536, 131072).socket_send_buffer == 131072);
-    CHECK(sock(std::numeric_limits<std::int32_t>::max(), 0).socket_recv_buffer
-        == std::numeric_limits<std::int32_t>::max());
-    const auto sock_err = [](std::int64_t recv, std::int64_t send) {
-        Options o;
-        o.socket_recv_buffer = recv;
-        o.socket_send_buffer = send;
-        NormalizedOptions out;
-        return NormalizeOptions(o, 2, out);
-    };
-    CHECK(IsOutOfRange(sock_err(-1, 0)));
-    CHECK(IsOutOfRange(sock_err(0, -1)));
-    CHECK(IsOutOfRange(sock_err(std::int64_t{std::numeric_limits<std::int32_t>::max()} + 1, 0)));
-    CHECK(IsOutOfRange(sock_err(0, std::int64_t{std::numeric_limits<std::int32_t>::max()} + 1)));
-
-    // 接口索引：负值 / 超 u32 拒绝。
-    const auto ifindex_err = [](std::int64_t v) {
-        Options o;
-        o.multicast_interface_index = v;
-        NormalizedOptions out;
-        return NormalizeOptions(o, 2, out);
-    };
-    CHECK(IsOutOfRange(ifindex_err(-1)));
-    CHECK(IsOutOfRange(ifindex_err(std::int64_t{std::numeric_limits<std::uint32_t>::max()} + 1)));
-    CHECK(NormalizeOrThrow(
-        [] { Options o; o.multicast_interface_index = std::numeric_limits<std::uint32_t>::max(); return o; }(), 2)
-        .multicast_interface_index == std::numeric_limits<std::uint32_t>::max());
-}
-
-static void TestOptionsStringsLoggerAndFailure() {
-    // 嵌 NUL 拒绝。
-    const auto path_err = [](const std::string& bind, const std::string& log) {
-        Options o;
-        o.bind_to_device = bind;
-        o.log_path = log;
-        NormalizedOptions out;
-        return NormalizeOptions(o, 2, out);
-    };
-    CHECK(IsInvalidArgument(path_err(std::string("eth\0x", 5), "")));
-    CHECK(IsInvalidArgument(path_err("", std::string("/tmp/l\0og", 9))));
-    const auto path_ok = [](const std::string& bind, const std::string& log) {
-        Options o;
-        o.bind_to_device = bind;
-        o.log_path = log;
-        return NormalizeOrThrow(o, 2);
-    };
-    const auto ok_path = path_ok("eth0", "/tmp/gnet.log");
-    CHECK(ok_path.bind_to_device == "eth0");
-    CHECK(ok_path.log_path == "/tmp/gnet.log");
-
-    // 非法枚举拒绝。
-    const auto lb_err = [](LoadBalancing mode) {
-        Options o;
-        o.lb = mode;
-        NormalizedOptions out;
-        return NormalizeOptions(o, 2, out);
-    };
-    CHECK(IsInvalidArgument(lb_err(static_cast<LoadBalancing>(42))));
-    CHECK(IsInvalidArgument(lb_err(static_cast<LoadBalancing>(-1))));
-    const auto level_err = [](LogLevel level) {
-        Options o;
-        o.log_level = level;
-        NormalizedOptions out;
-        return NormalizeOptions(o, 2, out);
-    };
-    CHECK(IsInvalidArgument(level_err(static_cast<LogLevel>(99))));
-    CHECK(IsInvalidArgument(level_err(static_cast<LogLevel>(-2))));
-
-    // cpu_count 是显式纯逻辑参数。
-    {
-        Options o;
-        NormalizedOptions out;
-        CHECK(IsInvalidArgument(NormalizeOptions(o, 0, out)));
-        CHECK(IsInvalidArgument(NormalizeOptions(o, -3, out)));
-    }
-
-    // logger：归一化不调用；结果可存储、可调用。
-    int logger_calls = 0;
-    {
-        Options o;
-        o.logger = [&logger_calls](LogLevel, std::string_view) { ++logger_calls; };
-        const NormalizedOptions out = NormalizeOrThrow(o, 2);
-        CHECK(logger_calls == 0);           // 归一化期间零调用
-        CHECK(out.logger);
-        out.logger(LogLevel::Warn, "probe");
-        CHECK(logger_calls == 1);
-    }
-    {
-        // 失败路径同样不调用 logger，输入不被半改。
-        logger_calls = 0;                   // 与上一块的 probe 调用隔离
-        Options o;
-        o.logger = [&logger_calls](LogLevel, std::string_view) { ++logger_calls; };
-        o.num_event_loop = -7;
-        NormalizedOptions out;
-        CHECK(IsInvalidArgument(NormalizeOptions(o, 2, out)));
-        CHECK(logger_calls == 0);
-        CHECK(o.num_event_loop == -7);      // 原输入保持
+        CHECK(IsOutOfRange(NormalizeOptions(over_disabled, out2)));
     }
 }
 
 static void TestOptions() {
     TestOptionsDefaultsAndLoops();
-    TestOptionsCapsAndEt();
-    TestOptionsKeepaliveAndSocketBuffers();
-    TestOptionsStringsLoggerAndFailure();
+    TestOptionsResourceBounds();
+    TestOptionsKeepalive();
 }
+
 
 // ---------------------------------------------------------------------------
 // load_balancing：三算法纯选择

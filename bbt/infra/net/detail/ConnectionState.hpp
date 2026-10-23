@@ -37,18 +37,12 @@
 #include <bbt/coroutine/sync/CoWaiter.hpp>
 
 #include <bbt/infra/net/Error.hpp>
+#include <bbt/infra/net/Types.hpp>
 #include <bbt/infra/net/detail/OutboundQueue.hpp>
 #include <bbt/infra/net/detail/ReceiveRing.hpp>
 #include <bbt/infra/net/detail/WakeHub.hpp>
 
 namespace bbt::infra::net {
-
-enum class WritePhase { InFlight, Done, Rejected, Unknown };
-struct WriteOutcome {
-    WritePhase phase{WritePhase::Unknown};
-    std::size_t sent{0};
-    std::error_code error;
-};
 
 struct WriteOpRecord {
     std::uint64_t id{0};
@@ -65,8 +59,6 @@ struct CompletedWrite {
     std::size_t sent{0};
     std::error_code error;
 };
-
-enum class AcceptanceState { Open, Settling, Closed };
 
 class ConnectionState {
 public:

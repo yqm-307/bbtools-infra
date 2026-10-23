@@ -19,6 +19,7 @@
 #include <bbt/infra/net/RawHandler.hpp>
 #include <bbt/infra/net/detail/ConnectionState.hpp>
 #include <bbt/infra/net/detail/ReceiveRing.hpp>
+#include <bbt/infra/net/detail/TestAccess.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -189,7 +190,7 @@ struct EchoHandler : RawHandler {
         }
         std::string data;
         const auto result = connection.TryRead(data);
-        if (result.status == ReceiveRing::ReadStatus::Ok && !data.empty()) {
+        if (result.status == ReadStatus::Ok && !data.empty()) {
             WriteOperation operation;
             connection.AsyncWrite(data, operation);
         }
@@ -298,7 +299,7 @@ static std::error_code TryAccept(ConnectionState& state, std::string data,
     std::shared_ptr<WriteOpRecord> record;
     const auto error = state.AcceptWrite(std::move(data), record);
     if (!error) {
-        out = WriteOperation(std::move(record));
+        out = ConnectionTestAccess::MakeWrite(std::move(record));
     }
     return error;
 }
@@ -455,9 +456,9 @@ static void CloseRetained() {
     }
     CHECK(retained && retained->Valid());
     std::string tail;
-    CHECK(retained->TryRead(tail).status == ReceiveRing::ReadStatus::Ok && tail == "tail");
+    CHECK(retained->TryRead(tail).status == ReadStatus::Ok && tail == "tail");
     std::string more;
-    CHECK(retained->TryRead(more).status == ReceiveRing::ReadStatus::Eof);
+    CHECK(retained->TryRead(more).status == ReadStatus::Eof);
     std::cout << "close_retained tail=" << tail << " eof=ok\n";
 }
 
@@ -501,7 +502,7 @@ static void WriteTimeout() {
     StartRuntime(1);
     {
         auto state = std::make_shared<ConnectionState>(1, 4096, 128, 4, nullptr);
-        Connection connection(state);
+        Connection connection = ConnectionTestAccess::Make(state);
         WriteOperation warm;
         CHECK(!connection.AsyncWrite(std::string(64, 'a'), warm));
         CHECK(!connection.AsyncWrite(std::string(64, 'b'), warm));
@@ -523,7 +524,7 @@ static void WriteTimeout() {
     }
     {
         auto state = std::make_shared<ConnectionState>(2, 4096, 4096, 16, nullptr);
-        Connection connection(state);
+        Connection connection = ConnectionTestAccess::Make(state);
         std::atomic<int> result{-1};
         auto operation_holder = std::make_shared<WriteOperation>();
         auto task = Task([&] {
@@ -586,7 +587,7 @@ static void CloseWaitersSettle() {
     CHECK(accept_result.load() == 0);
 
     auto state = std::make_shared<ConnectionState>(9, 4096, 64, 4, nullptr);
-    Connection connection(state);
+    Connection connection = ConnectionTestAccess::Make(state);
     WriteOperation warm;
     CHECK(!connection.AsyncWrite(std::string(64, 'x'), warm));
     std::atomic<int> write_result{-1};
@@ -607,33 +608,37 @@ static void CloseWaitersSettle() {
 }
 
 static void RingCombined() {
-    ReceiveRing ring(64);
-    CHECK(ring.TryAppend("abcdef").status == ReceiveRing::ReadStatus::Ok);
+    // 公共守卫（bbt::infra::net::ReadAccess）语义：同一保护的 Peek+Consume、
+    // Busy 零消费、释放后另一读者可继续。
+    auto state = std::make_shared<ConnectionState>(1, 64, 64, 4, nullptr);
+    Connection connection = ConnectionTestAccess::Make(state);
+    Connection peer = ConnectionTestAccess::Make(state);  // 同一 ring 的第二句柄
+    CHECK(state->ring.TryAppend("abcdef").status == ReadStatus::Ok);
     {
-        auto access = ring.TryAccess();
+        auto access = connection.TryAccess();
         CHECK(bool(access));
         CHECK(access.Size() == 6);
         CHECK(access.Peek() == "abcdef");
         CHECK(!access.Consume(2));
     }
     std::string out;
-    CHECK(ring.TryRead(out).status == ReceiveRing::ReadStatus::Ok);
+    CHECK(connection.TryRead(out).status == ReadStatus::Ok);
     CHECK(out == "cdef");
 
-    CHECK(ring.TryAppend("xy").status == ReceiveRing::ReadStatus::Ok);
-    auto held = ring.TryAccess();
+    CHECK(state->ring.TryAppend("xy").status == ReadStatus::Ok);
+    auto held = connection.TryAccess();
     CHECK(bool(held));
     std::promise<int> busy;
     auto busy_future = busy.get_future();
     std::thread other([&] {
-        auto probe = ring.TryAccess();
+        auto probe = peer.TryAccess();
         busy.set_value(probe.Busy() ? 1 : 0);
     });
     CHECK(busy_future.wait_for(2s) == std::future_status::ready);
     CHECK(busy_future.get() == 1);
-    held = ReceiveRing::ReadAccess();
+    ConnectionTestAccess::Reset(held);
     other.join();
-    CHECK(!ring.HasReadError());
+    CHECK(!state->ring.HasReadError());
     std::cout << "ring_combined peek_consume=ok busy_zero_consume=ok release=ok\n";
 }
 
@@ -708,7 +713,7 @@ static void WriteFifoPrefix() {
 static void CoReadTimeout() {
     StartRuntime(1);
     auto state = std::make_shared<ConnectionState>(1, 4096, 1024, 4, nullptr);
-    Connection connection(state);
+    Connection connection = ConnectionTestAccess::Make(state);
     std::atomic<int> result{-1};
     auto out = std::make_shared<std::string>();
     auto task = Task([&] {

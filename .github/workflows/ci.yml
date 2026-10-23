@@ -714,7 +714,7 @@ jobs:
           printf 'CMAKE_PREFIX_PATH=%s\nBOOST_ROOT=%s\n' "$BOOST_PREFIX" "$BOOST_PREFIX" >> "$GITHUB_ENV"
           cmake --build "$NETWORK_BUILD_DIR" --parallel "$JOBS" --target \
             bbt_infra_net_header_selfcheck Test_net_primitives Test_net_allocation \
-            Test_net_foundation Test_net_reactor_driver Test_net_r2 Test_net_b4_contract \
+            Test_net_foundation Test_net_reactor_driver Test_net_r2 Test_net_b4_contract Test_net_freeze \
             net_foundation_consumer Example_co_net_service
 
       - name: "network-only 全注册集实跑与零跳过核对"
