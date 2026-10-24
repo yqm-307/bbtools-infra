@@ -64,23 +64,25 @@ public:
     // 有界栈 snapshot + hub 锁下复制、锁外 Notify：不持锁跨 Notify，也不在
     // Notify 路径分配（Add 上限 = 数组容量）。
     void NotifyAll() {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        if (m_waiters.empty()) {
+            return;  // 登记后复查谓词；空 hub 不需要构造 snapshot 或再次加锁。
+        }
         std::array<std::shared_ptr<bbt::coroutine::sync::CoWaiter>, kMaxWaiters> snapshot;
         std::size_t count = 0;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            for (auto& weak : m_waiters) {
-                if (count >= kMaxWaiters) {
-                    break;
-                }
-                if (auto waiter = weak.lock()) {
-                    snapshot[count++] = std::move(waiter);
-                }
+        for (auto& weak : m_waiters) {
+            if (count >= kMaxWaiters) {
+                break;
+            }
+            if (auto waiter = weak.lock()) {
+                snapshot[count++] = std::move(waiter);
             }
         }
+        lock.unlock();
         for (std::size_t i = 0; i < count; ++i) {
             (void)snapshot[i]->Notify();
         }
-        std::lock_guard<std::mutex> lock(m_mutex);
+        std::lock_guard<std::mutex> prune_lock(m_mutex);
         PruneLocked();
     }
 
