@@ -13,7 +13,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 # 在任何旧目标/可选包发现之前分流；残留 prefix 不得重新启用上层模块。
 option(BBT_INFRA_NETWORK_ONLY "只构建新 gnet 网络基础及其实际依赖闭包" OFF)
-if(BBT_INFRA_NETWORK_ONLY)
+option(BBT_INFRA_REDIS_NET "构建基于新 net 的 Redis 窄适配及其依赖闭包" OFF)
+if(BBT_INFRA_NETWORK_ONLY OR BBT_INFRA_REDIS_NET)
     include(cmake/NetworkOnly.cmake)
     return()
 endif()

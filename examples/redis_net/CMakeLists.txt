@@ -1,0 +1,7 @@
+add_executable(redis_net_example main.cc)
+target_link_libraries(redis_net_example PRIVATE bbt::infra_redis_net)
+target_compile_options(redis_net_example PRIVATE -Wall -Wextra -Wpedantic)
+if(BUILD_TESTING)
+    add_test(NAME redis.net.consumer COMMAND redis_net_example)
+    set_tests_properties(redis.net.consumer PROPERTIES TIMEOUT 20 LABELS "redis_net")
+endif()

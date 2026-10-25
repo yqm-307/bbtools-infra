@@ -2955,7 +2955,10 @@ static void RequestCloseWriteReadiness() {
     CHECK(::shutdown(fd, SHUT_WR) == 0);  // 下一次真实 sendmsg 必然 EPIPE
     release_ready.set_value();
     CHECK(WaitUntil([&] { return handler->closes.load() == 1; }, 3000ms));
-    CHECK(barrier_released.load() && handler->write_checked.load() && handler->close_checked.load());
+    // 分别检查屏障、写终态和关闭终态，失败时保留具体归因。
+    CHECK(barrier_released.load());
+    CHECK(handler->write_checked.load());
+    CHECK(handler->close_checked.load());
     CHECK(handler->writes.load() == 1);
     const auto outcome = pending.Query();
     CHECK(outcome.phase == WritePhase::Done && outcome.error.value() == EPIPE && outcome.sent == 0);
