@@ -78,7 +78,7 @@ docs/decisions/   依赖、边界与兼容取舍
 - 文档用中文，标识符/命令/错误原文保留。长期决策和必要摘要入仓；构建产物、原始日志、会话、凭据与私有路径不入仓。
 - 初始化文档运行 `git diff --check`；实现后必须给出真实 build/test/consume 命令。平台与依赖支持逐项验证，不从 Boost/第三方声明直接推定本仓支持。
 - 本地验证边界：必走冒烟 + 本次开发功能的单测 + 直接耦合功能的单测，三者全过；本地不跑全量测试，全量走 PR 的 CI（以 `gh pr checks` 为准）。同机多 agent 并行时：新 configure 加 `-DCMAKE_CXX_COMPILER_LAUNCHER=ccache`；本地并发取 `JOBS=$(( $(nproc) / 4 ))`（最小2，8核→2），增量用 `--target <t> --parallel $JOBS`；确需本地全量时串行（`flock /tmp/bbt-build.lock`，一次一个，`--parallel $(( $(nproc) / 2 ))`，8核→4）；禁止 bare `--parallel` / bare `ninja` / `make -j$(nproc)`。
-- 新依赖、公共接口破坏、CI/发布、系统安装和运行基础设施先确认。经用户授权后 commit/push，代码走 PR，不直推 main、不自行合并/发布。
+- 新依赖、公共接口破坏、CI/发布、系统安装和运行基础设施先确认。独立审查通过后可自主 commit、推送功能分支并创建 PR；不直推 main、不自行合并/发布。
 - 关键契约、依赖和生命周期变更独立审查；远端写入回读。缺环境/授权时 BLOCKED，不用 stub、放宽检查或扩大权限伪装完成。
 - 向 core/coroutine 报支撑缺口，附双方 SHA、最小复现/测试标识、期望契约位置、真实命令和失败/寿命时序证据。运行时拥有者先与既有任务去重；没有实证缺口不要求底层重写，不用改变 Stop 掩盖 adapter 资源错误。发布交接附模块公开目标/契约引用与验证，消费者仍须验证实际链接版本及自身集成。
 
@@ -93,4 +93,4 @@ docs/decisions/   依赖、边界与兼容取舍
 ## 任务入口
 
 - 主 Issue：https://github.com/yqm-307/bbtools-infra/issues/1
-- Issue 创建不等于授权实现、迁移、安装、部署或归档旧仓；逐次进度和验收留在 Issue/PR。
+- 验收标准明确的 Issue 可直接实现并走 PR；Issue 创建不等于授权迁移、安装、部署或归档旧仓。逐次进度和验收留在 Issue/PR。
