@@ -12,7 +12,8 @@
 |------|-------------|------|------|
 | HTTP（client + server + NetworkRuntime） | `bbt::infra_http` | 已实现，单测覆盖中 | Beast/Asio 异步；配额、关闭排空、子对象反登记等可靠性边界仍在 Issue 中推进 |
 | CoTCP / CoUDP transport | `bbt::infra_tcp`、`bbt::infra_udp` | 已实现 | 基础收发与受管工厂可用；Runtime 级 `max_inflight` 在途门禁已实现并合入（Issue #31/#32 已关闭）；跨平台/非 Linux、公网 DNS 与部分 lifecycle 直接证据仍未覆盖 |
-| Redis client | `bbt::infra_redis` | 已实现最小切片 | CoTCP owner binding（`CoRedisCliImpl` + 窄 `RedisCotcpConn`）：CoTCP 承担 Dial/读写/等待/关闭，hiredis 只做同步 RESP2 编解码；单连接语义；`bbt::infra::redis` 公共 API 目录尚未拆分 |
+| Redis client | `bbt::infra_redis` | 已实现最小切片 | 旧入口仍使用 CoTCP owner binding（`CoRedisCliImpl` + 窄 `RedisCotcpConn`）；原同步关闭与排队配置契约保留 |
+| Redis net 窄入口 | `bbt::infra_redis_net` | 隔离候选，待独立审查 | `bbt::infra::redis::CoRedisCli`：共享 Engine、单连接/单活动操作、非阻塞 Close；真实 Redis、分帧与宿主寿命定向验收入口见 [docs/redis-net.md](docs/redis-net.md)。framework 消费者未切换 |
 | Mongo client | `bbt::infra_mongo` | 已实现 owner + 句柄形态 | 同步 driver + worker bridge；`mongo::CoMongoDb` 为资源 owner，`mongo::CoMongoColl` 为集合句柄；`include/bbt/infra/mongo/` 公共目录已建，剩余 API 按决策 0006 逐步迁移 |
 | 基础动态配置 | `bbt::infra_config` | 最小切片已合入主线，独立消费已验证 | `bbt::infra::config`；版本化不可变快照 + 内存源 + 真实本地文件源 + watch（初始/更新/重复去重、失败恢复、关闭与晚到通知、正常 drain 与 owner 同步 `Close()` 的资源边界）。**未交付**：远程 provider 与真实重连、业务 schema 校验、客户端资源热切换。契约/命令/未覆盖矩阵见 [docs/config-watch-v1.md](docs/config-watch-v1.md) |
 | RPC | `bbt::infra_rpc` | 已合入主线 | 版本化 Protobuf RpcEnvelope wire profile 与 HTTP-backed RpcClient/RpcServer runtime（`bbt::infra::rpc`，Issue #8/N2）：值类型校验、编解码、HTTP body 绑定、请求关联、deadline local-min、错误和同步 Close；payload codec 见 `include/bbt/infra/rpc/RpcPayload.hpp`。随 [PR #79](https://github.com/yqm-307/bbtools-infra/pull/79) 合入（`3136d1de`），framework 侧消费与预算验收已在 Issue #2 的交接评论公开；framework 的 Service/Actor、业务方法表与路由仍归 framework，可选 `dual_service` 示例、跨机器与全平台压力未覆盖 |
