@@ -1,6 +1,6 @@
-# Redis 的 net 窄入口（候选，待独立审查）
+# Redis 的 net 窄入口（已合入，默认关闭）
 
-公共头 `<bbt/infra/redis/CoRedisCli.hpp>`，类型 `bbt::infra::redis::CoRedisCli`，CMake 目标 `bbt::infra_redis_net`。这是独立的新入口；旧 `bbt::infra::CoRedisCli` / `bbt::infra_redis` 保留原契约。此候选不表示 framework 消费者已经切换。
+公共头 `<bbt/infra/redis/CoRedisCli.hpp>`，类型 `bbt::infra::redis::CoRedisCli`，CMake 目标 `bbt::infra_redis_net`。该独立入口经审查后由 [PR #95](https://github.com/yqm-307/bbtools-infra/pull/95) 合入，合并提交 `7401099b16741d67f88a64807dd086a3ea0996ae`；旧 `bbt::infra::CoRedisCli` / `bbt::infra_redis` 保留原契约。默认构建不启用新入口，framework 消费者尚未切换。
 
 ## 构建和消费
 
@@ -26,7 +26,7 @@ target_link_libraries(my_app PRIVATE bbt::infra_redis_net)
 
 hiredis 仅用于实现的 RESP2 编码/reader 和共享的 `src/redis/RedisDetail`；公共头不含 hiredis 类型，亦不链接旧 CoTCP。实现放在编译单元中以隔离连接、锁和解析状态。
 
-可运行示例是 [examples/redis_net/main.cc](../examples/redis_net/main.cc)，执行 `<private-build>/examples/redis_net/redis_net_example`。它使用已获授权的 `127.0.0.1:6379`，只写入强唯一 key，删除并用 EXISTS 读回确认。运行时只有一个 worker；Engine 的 Run 在自有 native 控制线程推进。
+可运行示例是 [examples/redis_net/main.cc](../examples/redis_net/main.cc)，执行 `<private-build>/examples/redis_net/redis_net_example`。运行前须提供允许写入测试 key 的 `127.0.0.1:6379` Redis；示例只写入强唯一 key，删除并用 EXISTS 读回确认。运行时只有一个 worker；Engine 的 Run 在自有 native 控制线程推进。
 
 ## 调用语义
 
@@ -78,4 +78,8 @@ Close/析构在短锁内封口，返回前对已发布连接 RequestClose，不�
 
 测试使用真实 CoDial 提交屏障、真实完整请求接收、被扣留的回复、owner 回收屏障、weak 句柄、reader 分配/释放计数、完整任务集、Run/Stopped、总 fd/socket 基线。每例有有限 watchdog，成功失败都清理自有 keys。原始日志、机器结果与本机绝对路径留在私有交接目录，不进入仓库。
 
-本候选仅验证本机 Linux/WSL、IPv4 RESP2。IPv6 端到端、AUTH/TLS、RESP3、Cluster/Sentinel、其他平台及 framework 消费切换尚未验收。旧关闭测试的历史偶发失败仍由独立 close-failure 节点保留归因边界；本地一次通过不宣称它已根治。合并和全量 CI 状态须另行审查。
+PR #95 的本地独立验收限于 Linux/WSL、IPv4 RESP2：新 Redis 测试、公开示例及直接耦合 net 选集合计 25/25，通过且零跳过；仓外只链接公开目标的消费程序完成真实命令、清键读回和宿主排空。验证按进入目标阶段、触发事件、检查结果与资源收口构造，方法见[开发指南](development.md#测试要证明什么)。
+
+[PR CI](https://github.com/yqm-307/bbtools-infra/actions/runs/40206223878) 与[合入后 main CI](https://github.com/yqm-307/bbtools-infra/actions/runs/40208785081) 均通过，但这些 run 的 workflow 没有启用 `BBT_INFRA_REDIS_NET`、构建新 Redis 目标或运行 `redis.net.*`；新路径目前只有上述本地验收，不能把旧模块及 net CI 全绿解释为新 Redis 路径已获 CI 覆盖。现有 Redis live 临时容器机制见[真实后端验收](redis-mongo-acceptance.md#ci-与复现)，新路径接线须单独实现和验证。
+
+IPv6 端到端、AUTH/TLS、RESP3、Cluster/Sentinel、其他平台、sanitizer 及 framework 消费切换尚未验收；readerCreate OOM 与真实同代 Engine driver unbind failure 未动态注入。旧 `net.b4_request_close_write_readiness` 偶发失败根因仍未知，拆分断言只改善归因能力；一次通过不宣称已根治。
