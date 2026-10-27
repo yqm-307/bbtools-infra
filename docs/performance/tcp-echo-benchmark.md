@@ -109,8 +109,7 @@ cmake -S <candidate> -B <build> -G Ninja \
     -DBBT_INFRA_NETWORK_ONLY=ON -DCMAKE_BUILD_TYPE=Release \
     -DBBT_COROUTINE_SOURCE_DIR=<固定 coroutine 树> \
     -DBBT_INFRA_PERF_BENCH=ON -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-JOBS=$(( $(nproc) / 4 )); [ "$JOBS" -lt 2 ] && JOBS=2
-cmake --build <build> --parallel "$JOBS" \
+cmake --build <build> --parallel 2 \
     --target bbt_net_tcp_echo_server bbt_net_tcp_loadgen
 
 # 冒烟（ctest 注册 net.perf_smoke_raw / net.perf_smoke_co）

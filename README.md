@@ -129,8 +129,7 @@ cmake -S . -B <独立 build> -G Ninja \
   -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
   -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DBBT_INFRA_NETWORK_ONLY=ON \
   -DBBT_COROUTINE_SOURCE_DIR=<coroutine 源码树> -DBUILD_TESTING=ON
-JOBS=$(( $(nproc) / 4 )); [ "$JOBS" -ge 2 ] || JOBS=2
-cmake --build <独立 build> --parallel "$JOBS" --target \
+cmake --build <独立 build> --parallel 2 --target \
   bbt_infra_net_header_selfcheck Test_net_primitives Test_net_allocation \
   Test_net_foundation Test_net_reactor_driver Test_net_r2 Test_net_b4_contract \
   net_foundation_consumer Example_co_net_service
@@ -199,4 +198,4 @@ ctest --test-dir build --output-on-failure
 
 ## 构建约束
 
-本地验证边界与并发限制按 AGENTS.md 执行：必走冒烟 + 本次开发功能单测 + 直接耦合功能单测；新 configure 加 `-DCMAKE_CXX_COMPILER_LAUNCHER=ccache`；本地并发取 `JOBS=$(( $(nproc) / 4 ))`；禁止 bare `--parallel` 或 `ninja -j$(nproc)`。
+本地验证边界与并发限制按 AGENTS.md 执行：必走冒烟 + 本次开发功能单测 + 直接耦合功能单测；新 configure 加 `-DCMAKE_CXX_COMPILER_LAUNCHER=ccache`；本地编译固定 `--parallel 2`；禁止 bare `--parallel` 或 `ninja -j$(nproc)`。
