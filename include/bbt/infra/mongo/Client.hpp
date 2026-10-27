@@ -15,15 +15,27 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
-#include <bbt/infra/CoMongoCli.hpp>
+#include <bbt/coroutine/syntax/Async.hpp>
+
 #include <bbt/infra/ICoCloseable.hpp>
 #include <bbt/infra/ICoNetwork.hpp>
+#include <bbt/infra/NetworkTypes.hpp>
 #include <bbt/infra/Result.hpp>
+#include <bbt/infra/mongo/Bson.hpp>
 
 namespace bbt::infra::mongo {
+
+// mongo 装配参数的公共上限（owner 与旧 CoMongoCli 契约共用同一组边界，
+// 逐项大于零且不超上限，违规返回 InvalidArgument）。
+inline constexpr std::size_t kMongoLimitsMaxWorkerThreads = 8;
+inline constexpr std::size_t kMongoLimitsMaxQueue         = 1000000;
+inline constexpr std::chrono::milliseconds kMongoLimitsMaxTimeout{
+    std::chrono::minutes{10}};
 
 // CoMongoDb 装配参数（owner 级资源预算）。本切片一个 owner 绑定一组
 // worker + 一条接纳队列 + 一个生效 URI 的 pool lease；database/
@@ -100,19 +112,27 @@ inline result<void> ValidateMongoTarget(const MongoTarget& t) {
 // CoMongoColl：集合句柄（轻量目标值 + owner 引用）。句柄不拥有
 // worker/队列/pool；Close() 只封该句柄的接纳与新命令前置校验（幂等、
 // 任意线程），不影响同 owner 的兄弟句柄，也不等待 owner 在途归零。
+//
+// 等待入口：4 个 CRUD 用上游 bbt_co_async 标记返回类型，调用方必须经
+// bbt_co_await 消费（`auto r = bbt_co_await coll->FindOne(...)`）。标记只
+// 附加返回类型、不改变实现与语义；只有写了 await 的表达式才会在非协程域先撞
+// AwaitHelper 的 std::logic_error（早于本组件的 InvalidContext 校验）。漏写
+// await 直接持有返回值的调用不被静态拦住、函数体照常执行，故这不是协程外
+// 调用的完整静态强制。
+// Create/Start/Collection/Close 不挂起，保持裸 result<void>/void。
 class CoMongoColl : public ICoNetwork, public ICoCloseable {
 public:
     // 句柄级命令：语义与 CoMongoCli 同名方法一致，差别只在目标集合
     // 由句柄携带而非 owner 绑定。
-    virtual result<void> InsertOne(const MongoDocument& doc,
-                                   const CallOptions&   options) = 0;
-    virtual result<std::optional<MongoDocument>> FindOne(
+    virtual bbt_co_async(result<void>) InsertOne(const MongoDocument& doc,
+                                                 const CallOptions&   options) = 0;
+    virtual bbt_co_async(result<std::optional<MongoDocument>>) FindOne(
         const MongoDocument& filter, const CallOptions& options) = 0;
-    virtual result<MongoUpdateResult> UpdateOne(
+    virtual bbt_co_async(result<MongoUpdateResult>) UpdateOne(
         const MongoDocument& filter, const MongoDocument& update,
         const CallOptions&   options) = 0;
-    virtual result<std::uint64_t> DeleteOne(const MongoDocument& filter,
-                                            const CallOptions&   options) = 0;
+    virtual bbt_co_async(result<std::uint64_t>) DeleteOne(
+        const MongoDocument& filter, const CallOptions& options) = 0;
 };
 
 // CoMongoDb：mongo 资源 owner（连接配置 + pool lease + worker 组 +

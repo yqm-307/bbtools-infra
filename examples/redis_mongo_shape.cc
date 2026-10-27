@@ -156,12 +156,12 @@ void MongoShape() {
                  0x10, 'x',  0x00,        // int32 元素 "x"
                  0x01, 0x00, 0x00, 0x00,  // 值 = 1
                  0x00};                   // 结尾
-    auto ins = items.value()->InsertOne(doc, Budget(1000));
+    auto ins = bbt_co_await items.value()->InsertOne(doc, Budget(1000));
     if (!ins)
         std::cerr << "mongo InsertOne error (expected without live mongo): code="
                   << static_cast<int>(ins.error().code) << "\n";
 
-    auto find = logs.value()->FindOne(doc, Budget(1000));
+    auto find = bbt_co_await logs.value()->FindOne(doc, Budget(1000));
     if (!find)
         std::cerr << "mongo FindOne error: code="
                   << static_cast<int>(find.error().code) << "\n";

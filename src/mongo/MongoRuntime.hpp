@@ -40,6 +40,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include <bbt/coroutine/syntax/Async.hpp>
+
 #include <bbt/infra/CoMongoCli.hpp>
 #include <bbt/infra/mongo/Client.hpp>
 
@@ -312,15 +314,15 @@ public:
     // 不拥有 worker/ops；析构前只做句柄级接纳封口（幂等）。
     ~MongoCollImpl() override { Close(); }
 
-    result<void> InsertOne(const MongoDocument& doc,
-                           const CallOptions&   options) override;
-    result<std::optional<MongoDocument>> FindOne(
+    bbt_co_async(result<void>) InsertOne(const MongoDocument& doc,
+                                         const CallOptions&   options) override;
+    bbt_co_async(result<std::optional<MongoDocument>>) FindOne(
         const MongoDocument& filter, const CallOptions& options) override;
-    result<MongoUpdateResult> UpdateOne(const MongoDocument& filter,
-                                        const MongoDocument& update,
-                                        const CallOptions&   options) override;
-    result<std::uint64_t> DeleteOne(const MongoDocument& filter,
-                                    const CallOptions&   options) override;
+    bbt_co_async(result<MongoUpdateResult>) UpdateOne(
+        const MongoDocument& filter, const MongoDocument& update,
+        const CallOptions&   options) override;
+    bbt_co_async(result<std::uint64_t>) DeleteOne(
+        const MongoDocument& filter, const CallOptions& options) override;
 
     // 句柄关闭只做接纳门禁：封口后新命令前置校验返回 Closed；已提交的
     // 在途 op 由 op->handle 保活，物理收口归 runtime，句柄不等 owner drain。

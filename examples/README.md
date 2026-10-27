@@ -15,6 +15,7 @@ mongocxx、bsoncxx 或底层线程类型。
 | `http_loopback.cc` | `Example_http_loopback` | 无（loopback） | NetworkRuntime 完整生命周期：装配 → HTTP loopback → 关闭边界 |
 | `config_consume.cc` | `Example_config_consume` | 无 | 配置首切片：本地文件/内存源读取 → 上层校验 → 接受/拒绝；格式错误不发布伪成功 |
 | `redis_mongo_shape.cc` | `Example_redis_mongo_shape` | 链接 hiredis + mongocxx（经 `bbt::infra_redis` + `bbt::infra_mongo`） | Redis/Mongo 命令调用形态与错误/缺失分支；不连真实服务 |
+| `mongo_client/main.cc` | `mongo_client_example` | 链接 mongocxx（经 `bbt::infra_mongo`）；真实 MongoDB 由 `BBT_TEST_MONGO_URI` 注入 | 公开 target 消费闭环：`MongoDocument::FromJson` → `bbt_co_await` 的 `InsertOne`/`FindOne` → 类型化 getter + canonical `ToJson` → `DeleteOne` 并读回未命中；只含公开头 |
 
 `examples/config_consumer/` 是一个**独立 CMake 工程**（不被本仓构建引用），只 include
 `bbt/infra/config/` 公共头、只链接 `bbt::infra_config`，用于从仓外视角复核模块 target 可独立
@@ -27,6 +28,20 @@ watch 的关闭/去重/drain 与 owner 同步 `Close()` 资源边界不在示例
 target（`CoRedisCli::Create` 与 `mongo::CoMongoDb::Create` 分属两模块实现；
 公共契约均为 header-only）。Mongo 侧演示 Issue #40 的 owner + 集合句柄形态：
 一个 `mongo::CoMongoDb` 承载 worker/队列/pool，`Collection()` 取轻量句柄。
+
+`examples/mongo_client/` 是 Mongo 公开入口的最小真实消费示例：只 include
+`<bbt/infra/mongo/Bson.hpp>`、`<bbt/infra/mongo/Client.hpp>`、`<bbt/infra/Result.hpp>`，
+只链接 `bbt::infra_mongo`，不引用 `src/mongo/` 内部头，也不出现 mongocxx/bsoncxx 类型。
+它读取 `BBT_TEST_MONGO_URI`（例如 `tests/mongo-live/run.sh` 注入的
+`mongodb://127.0.0.1:<port>/`）：未设置时打印 `skip:` 并返回 77（ctest 记为 Skipped）；
+设置时执行 `FromJson` → `InsertOne` → `FindOne` → `GetInt64/GetDouble/GetBool/GetString`
+→ canonical `ToJson` → `DeleteOne` → 读回未命中，只写自己的唯一 `_id` 并在结束前删除。
+
+```bash
+cmake --build <build> --target mongo_client_example --parallel 2
+BBT_TEST_MONGO_URI=mongodb://127.0.0.1:<port>/ ./<build>/examples/mongo_client/mongo_client_example
+ctest --test-dir <build> -j1 -R '^mongo\.client\.consumer$' --output-on-failure
+```
 
 ## 构建
 
@@ -106,3 +121,7 @@ bbtools-infra 不引入新协程语法；等待/恢复完全复用 bbtools-corou
   未纳入 CI**：按环境变量 `BBT_TEST_REDIS_ADDR` / `BBT_TEST_MONGO_URI` 驱动，
   未提供时整件跳过。`Example_redis_mongo_shape` 同样只演示静态调用形态与
   错误路径，不构成对真实服务的验证。
+- `mongo_client_example`（`mongo.client.consumer`）在 Release CI 的全量构建里
+  只有**编译**覆盖；运行需要 `BBT_TEST_MONGO_URI`，无容器时为 Skipped，不能
+  当作「示例已运行」。真实运行证据需由本地 `tests/mongo-live/run.sh` 同源容器
+  或未来的示例 job 提供。

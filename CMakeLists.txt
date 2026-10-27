@@ -508,6 +508,7 @@ set(BBT_INFRA_PUBLIC_HEADERS
     TransportRuntime.hpp
     CoRedisCli.hpp
     CoMongoCli.hpp
+    mongo/Bson.hpp
     mongo/Client.hpp
     CoTCP.hpp
     CoUDP.hpp
