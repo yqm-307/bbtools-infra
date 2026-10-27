@@ -256,7 +256,7 @@ if(TARGET bbt_infra_redis)
     # 不受 BBT_INFRA_STRINGENT_DEBUG 影响），故需 src 内部头与 hiredis 类型解析
     # 路径；仅本目标可见，不改变其他目标。
     target_include_directories(Test_redis_live PRIVATE
-        ${CMAKE_SOURCE_DIR}/src)
+        ${CMAKE_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR})
     find_package(hiredis CONFIG REQUIRED PATHS "${BBT_HIREDIS_PREFIX}" NO_DEFAULT_PATH)
     target_link_libraries(Test_redis_live PRIVATE
         bbt_infra_redis bbt::infra_tcp bbt::infra_common hiredis::hiredis

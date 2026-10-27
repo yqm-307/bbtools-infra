@@ -823,7 +823,7 @@ jobs:
           set -euo pipefail
           command -v docker >/dev/null 2>&1 || { echo "FAIL: docker 不可用" >&2; exit 1; }
           docker compose version >/dev/null 2>&1 || { echo "FAIL: docker compose 不可用" >&2; exit 1; }
-          test -d "$HIREDIS_PREFIX" || { echo "FAIL: hiredis 私有前缀缺失: $HIREDIS_PREFIX" >&2; exit 1; }
+          test -d "$DEPS_PREFIX/hiredis" || { echo "FAIL: hiredis 私有前缀缺失: $DEPS_PREFIX/hiredis" >&2; exit 1; }
           echo "docker/compose/hiredis 前缀就绪"
 
       - name: "redis-net Debug 构建（独立目录，JOBS=3）"
@@ -840,7 +840,7 @@ jobs:
             $LAUNCHER \
             -DBOOST_ROOT="$BOOST_PREFIX" -DCMAKE_PREFIX_PATH="$BOOST_PREFIX" \
             -DBBT_COROUTINE_SOURCE_DIR="$COROUTINE_DIR" \
-            -DBBT_HIREDIS_PREFIX="$HIREDIS_PREFIX"
+            -DBBT_HIREDIS_PREFIX="$DEPS_PREFIX/hiredis"
           cmake --build "$REDIS_NET_BUILD_DIR" --parallel "$JOBS" --target \
             bbt_infra_redis_net_header_selfcheck Test_redis_net_contract redis_net_example
 
