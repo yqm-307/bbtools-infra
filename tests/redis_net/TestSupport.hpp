@@ -1,9 +1,11 @@
 #pragma once
 
 #include <bbt/infra/redis/CoRedisCli.hpp>
+#include <bbt/infra/redis/CoRedisPool.hpp>
 #include <bbt/infra/net/detail/EngineTestAccess.hpp>
 #include <bbt/infra/net/detail/TestAccess.hpp>
 #include <bbt/coroutine/coroutine.hpp>
+#include <bbt/coroutine/syntax/Async.hpp>
 #include <hiredis/hiredis.h>
 
 #include <arpa/inet.h>
@@ -62,7 +64,12 @@ template<class T> void ExpectCode(const result<T>& value, ErrorCode code) {
     CHECK(!value);
     CHECK(value.error().code == code);
 }
-inline net::Address Loopback(int port = 6379) {
+inline int RedisPort() {
+    const char* port = std::getenv("BBT_REDIS_PORT");
+    return port ? std::atoi(port) : 6379;
+}
+inline net::Address Loopback(int port = 0) {
+    if (port == 0) { port = RedisPort(); }
     std::error_code error;
     auto address = net::Address::Ip("127.0.0.1", port, error);
     CHECK(!error);
@@ -203,7 +210,7 @@ public:
         return client;
     }
     void Connect(const std::shared_ptr<Client>& client) {
-        auto value = Call([client] { return client->Connect(Until()); });
+        auto value = Call([client] { return bbt_co_await client->Connect(Until()); });
         if (!value) { throw std::runtime_error("Connect: " + value.error().message); }
     }
     void Stop() {
@@ -244,7 +251,7 @@ private:
 using Reply = std::unique_ptr<redisReply, decltype(&freeReplyObject)>;
 class RealRedis {
 public:
-    RealRedis() : m_context(redisConnectWithTimeout("127.0.0.1", 6379, timeval{2, 0}), &redisFree) {
+    RealRedis() : m_context(redisConnectWithTimeout("127.0.0.1", RedisPort(), timeval{2, 0}), &redisFree) {
         CHECK(m_context && m_context->err == 0);
         CHECK(redisSetTimeout(m_context.get(), timeval{2, 0}) == REDIS_OK);
         std::random_device random;

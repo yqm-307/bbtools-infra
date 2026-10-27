@@ -227,7 +227,7 @@ if(TARGET bbt_infra_redis)
     # 真实 Redis loopback 由 BBT_TEST_REDIS_ADDR 驱动；原始对端故障用例始终执行。
     add_executable(Test_redis_cotcp_binding Test_redis_cotcp_binding.cc)
     target_include_directories(Test_redis_cotcp_binding PRIVATE
-        ${CMAKE_SOURCE_DIR}/src)
+        ${CMAKE_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR})
     # 候选内部头引用 hiredis 类型（RawReply 解码路径）：src 作用域解析出的
     # IMPORTED target 不跨目录，故此处按同一显式前缀复现接入（仅测试目标可见）。
     find_package(hiredis CONFIG REQUIRED PATHS "${BBT_HIREDIS_PREFIX}" NO_DEFAULT_PATH)

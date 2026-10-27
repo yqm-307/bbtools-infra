@@ -1,4 +1,4 @@
-#include "redis/RedisDetail.hpp"
+#include "RedisDetail.hpp"
 
 namespace bbt::infra::redis_detail {
 
