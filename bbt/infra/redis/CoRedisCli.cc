@@ -5,11 +5,12 @@
 #include <utility>
 
 #include <bbt/coroutine/coroutine.hpp>
+#include <bbt/coroutine/syntax/Async.hpp>
 #include <hiredis/hiredis.h>
 
 #include <bbt/infra/net/CoConnection.hpp>
 #include <bbt/infra/net/Error.hpp>
-#include "redis/RedisDetail.hpp"
+#include "detail/RedisDetail.hpp"
 
 namespace bbt::infra::redis {
 namespace {
@@ -106,7 +107,7 @@ struct CoRedisCli::State {
         return cause;
     }
 
-    result<void> Connect(CallOptions options) {
+    bbt_co_async(result<void>) Connect(CallOptions options) {
         if (bbt::coroutine::GetLocalCoroutineId() == 0) { return result<void>::err(ContextError()); }
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -140,7 +141,7 @@ struct CoRedisCli::State {
         return result<void>::ok();
     }
 
-    result<RawReply> Execute(std::vector<std::string> args, CallOptions options) {
+    bbt_co_async(result<RawReply>) Execute(std::vector<std::string> args, CallOptions options) {
         if (bbt::coroutine::GetLocalCoroutineId() == 0) { return result<RawReply>::err(ContextError()); }
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -256,42 +257,47 @@ void CoRedisCli::Close() noexcept {
     state->connection.RequestClose();
     if (!state->busy) { state->reader.reset(); }
 }
+bool CoRedisCli::StreamHealthy() const noexcept {
+    const auto state = state_;
+    std::lock_guard<std::mutex> lock(state->mutex);
+    return !state->closed && !state->broken && state->connection.Valid() && !state->connection.Closed();
+}
 bool CoRedisCli::IsClosed() const noexcept {
     const auto state = state_;
     std::lock_guard<std::mutex> lock(state->mutex);
     return state->closed;
 }
-result<void> CoRedisCli::Connect(const CallOptions& options) {
+bbt_co_async(result<void>) CoRedisCli::Connect(const CallOptions& options) {
     const auto state = state_; // 此后包括挂起恢复都不再访问公开对象。
-    return state->Connect(options);
+    return bbt_co_await state->Connect(options);
 }
-result<void> CoRedisCli::Ping(const CallOptions& options) {
+bbt_co_async(result<void>) CoRedisCli::Ping(const CallOptions& options) {
     const auto state = state_;
-    auto value = state->Execute({"PING"}, options);
+    auto value = bbt_co_await state->Execute({"PING"}, options);
     return value ? result<void>::ok() : result<void>::err(std::move(value.error()));
 }
-result<std::optional<std::string>> CoRedisCli::Get(std::string_view key, const CallOptions& options) {
+bbt_co_async(result<std::optional<std::string>>) CoRedisCli::Get(std::string_view key, const CallOptions& options) {
     const auto state = state_;
-    auto value = state->Execute({"GET", std::string(key)}, options);
+    auto value = bbt_co_await state->Execute({"GET", std::string(key)}, options);
     if (!value) { return result<std::optional<std::string>>::err(std::move(value.error())); }
     if (value.value().type == RawReply::Type::Nil) { return result<std::optional<std::string>>::ok(std::nullopt); }
     return result<std::optional<std::string>>::ok(std::move(value.value().str));
 }
-result<void> CoRedisCli::Set(std::string_view key, std::string_view value, const CallOptions& options) {
+bbt_co_async(result<void>) CoRedisCli::Set(std::string_view key, std::string_view value, const CallOptions& options) {
     const auto state = state_;
-    auto reply = state->Execute({"SET", std::string(key), std::string(value)}, options);
+    auto reply = bbt_co_await state->Execute({"SET", std::string(key), std::string(value)}, options);
     return reply ? result<void>::ok() : result<void>::err(std::move(reply.error()));
 }
-result<bool> CoRedisCli::Exists(std::string_view key, const CallOptions& options) {
+bbt_co_async(result<bool>) CoRedisCli::Exists(std::string_view key, const CallOptions& options) {
     const auto state = state_;
-    auto value = state->Execute({"EXISTS", std::string(key)}, options);
+    auto value = bbt_co_await state->Execute({"EXISTS", std::string(key)}, options);
     if (!value) { return result<bool>::err(std::move(value.error())); }
     return result<bool>::ok(value.value().integer == 1);
 }
-result<std::uint64_t> CoRedisCli::Delete(std::vector<std::string> keys, const CallOptions& options) {
+bbt_co_async(result<std::uint64_t>) CoRedisCli::Delete(std::vector<std::string> keys, const CallOptions& options) {
     const auto state = state_;
     keys.insert(keys.begin(), "DEL");
-    auto value = state->Execute(std::move(keys), options);
+    auto value = bbt_co_await state->Execute(std::move(keys), options);
     if (!value) { return result<std::uint64_t>::err(std::move(value.error())); }
     return result<std::uint64_t>::ok(static_cast<std::uint64_t>(value.value().integer));
 }

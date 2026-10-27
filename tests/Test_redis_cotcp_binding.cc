@@ -106,7 +106,7 @@
 
 #include "detail/TransportWiring.hpp"
 #include "redis/CoRedisCliImpl.hpp"
-#include "redis/RedisDetail.hpp"
+#include "bbt/infra/redis/detail/RedisDetail.hpp"
 
 using namespace bbt::infra;
 using bbt::coroutine::Deadline;

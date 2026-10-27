@@ -8,7 +8,18 @@ target_link_options(Test_redis_net_contract PRIVATE
 foreach(_case connect_failure_owned close_invalidates_immediately close_idempotent
         close_during_connect close_pending_command_once handle_destroy_late_callback
         shared_engine_isolation host_drain_no_residue set_get_remote_error
-        fragmented_reply unknown_disconnect framing_and_faults)
+        fragmented_reply unknown_disconnect framing_and_faults
+        pool_connect pool_basic_commands pool_concurrent pool_overloaded pool_close
+        pool_stages pool_wait_exits pool_wait_windows pool_repair_waiter pool_connect_rollback)
     add_test(NAME redis.net.${_case} COMMAND Test_redis_net_contract ${_case})
     set_tests_properties(redis.net.${_case} PROPERTIES TIMEOUT 30 LABELS "redis_net")
 endforeach()
+
+file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/async-includes.txt"
+    CONTENT "$<JOIN:$<TARGET_PROPERTY:Test_redis_net_contract,INCLUDE_DIRECTORIES>,\n>\n")
+add_test(NAME redis.net.async_compile COMMAND ${CMAKE_COMMAND}
+    "-DCXX=${CMAKE_CXX_COMPILER}"
+    "-DINCLUDES=${CMAKE_CURRENT_BINARY_DIR}/async-includes.txt"
+    "-DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/AsyncCompile.cc"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/AsyncCompile.cmake")
+set_tests_properties(redis.net.async_compile PROPERTIES TIMEOUT 60 LABELS "redis_net")

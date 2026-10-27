@@ -1,6 +1,6 @@
 # Redis 的 net 窄入口（已合入，默认关闭）
 
-公共头 `<bbt/infra/redis/CoRedisCli.hpp>`，类型 `bbt::infra::redis::CoRedisCli`，CMake 目标 `bbt::infra_redis_net`。该独立入口经审查后由 [PR #95](https://github.com/yqm-307/bbtools-infra/pull/95) 合入，合并提交 `7401099b16741d67f88a64807dd086a3ea0996ae`；旧 `bbt::infra::CoRedisCli` / `bbt::infra_redis` 保留原契约。默认构建不启用新入口，framework 消费者尚未切换。
+公共头 `<bbt/infra/redis/CoRedisCli.hpp>` 与 `<bbt/infra/redis/CoRedisPool.hpp>`，类型 `bbt::infra::redis::CoRedisCli` / `CoRedisPool`，CMake 目标 `bbt::infra_redis_net`。公共头与实现同目录置于 `bbt/infra/redis/`（对齐 `bbt/infra/net` 布局；include 路径与 namespace 不变），hiredis 编解码共享层在 `bbt/infra/redis/detail/`（新旧 Redis 实现共用，不公开）。等待入口用上游 PR #414 的 `bbt_co_async(result<...>)` 标记，调用方经 `bbt_co_await` 消费；await helper 的协程域前置检查先于函数体，非协程直调抛 `std::logic_error`。固定大小连接池 `CoRedisPool` 的语义见[池](#池-coredispool)一节。该独立入口经审查后由 [PR #95](https://github.com/yqm-307/bbtools-infra/pull/95) 合入，合并提交 `7401099b16741d67f88a64807dd086a3ea0996ae`；旧 `bbt::infra::CoRedisCli` / `bbt::infra_redis` 保留原契约。默认构建不启用新入口，framework 消费者尚未切换。
 
 ## 构建和消费
 
@@ -13,7 +13,7 @@ cmake -S . -B <private-build> \
   -DBBT_COROUTINE_SOURCE_DIR=<coroutine-source-at-cmake/coroutine.sha> \
   -DBBT_HIREDIS_PREFIX=<hiredis-private-prefix> -DBUILD_TESTING=ON
 cmake --build <private-build> --target Test_redis_net_contract redis_net_example \
-  bbt_infra_redis_net_header_selfcheck --parallel 2
+  bbt_infra_redis_net_header_selfcheck --parallel 2  # target 定义在 bbt/infra/redis/CMakeLists.txt
 ctest --test-dir <private-build> -j1 -R '^redis\.net\.' --output-on-failure
 ```
 
@@ -23,9 +23,9 @@ ctest --test-dir <private-build> -j1 -R '^redis\.net\.' --output-on-failure
 target_link_libraries(my_app PRIVATE bbt::infra_redis_net)
 ```
 
-hiredis 仅用于实现的 RESP2 编码/reader 和共享的 `src/redis/RedisDetail`；公共头不含 hiredis 类型，亦不链接旧 CoTCP。实现放在编译单元中以隔离连接、锁和解析状态。
+hiredis 仅用于实现的 RESP2 编码/reader 和共享的 `bbt/infra/redis/detail/RedisDetail`；公共头不含 hiredis 类型，亦不链接旧 CoTCP。实现放在编译单元中以隔离连接、锁和解析状态。
 
-可运行示例是 [examples/redis_net/main.cc](../examples/redis_net/main.cc)，执行 `<private-build>/examples/redis_net/redis_net_example`。运行前须提供允许写入测试 key 的 `127.0.0.1:6379` Redis；示例只写入强唯一 key，删除并用 EXISTS 读回确认。运行时只有一个 worker；Engine 的 Run 在自有 native 控制线程推进。
+可运行示例是 [examples/redis_net/main.cc](../examples/redis_net/main.cc)，执行 `ctest --test-dir <private-build> -R '^redis\.net\.consumer$' --output-on-failure`。运行前须提供允许写入测试 key 的自有 loopback Redis，通过 `BBT_REDIS_PORT` 注入端口（未设置默认 6379；设置值须为 1–65535 的十进制整数）；示例只写入强唯一 key，删除并用 EXISTS 读回确认。运行时只有一个 worker；Engine 的 Run 在自有 native 控制线程推进。
 
 ## 调用语义
 
@@ -34,7 +34,7 @@ hiredis 仅用于实现的 RESP2 编码/reader 和共享的 `src/redis/RedisDeta
 `Connect`、`Ping`、`Get`、`Set`、`Exists`、`Delete` 都返回本仓 `result<T>`，要求真实协程域。调用方式：
 
 ```cpp
-auto reply = client->Get(key, options);
+auto reply = bbt_co_await client->Get(key, options);
 if (reply) {
     if (reply.value()) { Consume(*reply.value()); } // 缺失 key 为 nullopt
 } else {
@@ -61,6 +61,14 @@ key/value 二进制安全；拒绝空 key 和空 DEL 列表。PING 只接受 PON
 
 未知结果或后端故障后，命令持续返回 TransportError，只有显式 Connect 才恢复；不会消费迟到回复或重发旧命令。收到完整 ERROR 后同一流仍可 Ping/Get。
 
+## 池（CoRedisPool）
+
+`CoRedisPool::Create(engine, address, {connections, max_waiters})` 只装配不联网；`connections` 固定池大小且大于零，`max_waiters=0` 表示池满立即返回 Overloaded、拒绝排队。`Connect(CallOptions)` 显式把全池建好才 Ready；部分失败回滚本次建连，不发布半就绪状态；已就绪且无坏 slot 时重复 Connect 幂等零动作；并发 Connect 竞争返回 Overloaded。
+
+每个命令（Ping/Get/Set/Exists/Delete，与单连接同签名）内部借一条连接执行后 RAII 归还，业务无需手动 Acquire；借与命令执行共用同一绝对 deadline。池满时有界 FIFO 排队：归还方锁内 handoff 连接并 Notify 队首等待者；超时、协程取消与 Close 分别可区分（TimedOut/Cancelled/Closed），等待者不遗失；离场时已收到的 handoff 连接转交回池。
+
+命令退出后按单连接实际流状态判断：传输/协议等破坏流的失败关闭该连接并退役归属 slot，坏流不回池；完整 RemoteError、参数错误及零接纳且流仍健康的失败正常归还；slot 由显式 `Connect` 重建（只建坏 slot），无自动重发命令或后台重连。`Close` 并发安全幂等不可重开：立即逻辑封口、唤醒全部等待者并关闭持有 client，不关共享 Engine，不假装物理排空；in-flight 命令按单连接语义保留 OutcomeUnknown。
+
 ## 关闭与宿主收尾
 
 Close/析构在短锁内封口，返回前对已发布连接 RequestClose，不等物理 fd、在途 CoDial 或任务结束。合法域中此后新操作返回 Closed；IsClosed 只表示逻辑封口。Close 不关闭共享 Engine，关闭 A 后 B 仍能正常操作。
@@ -79,6 +87,6 @@ Close/析构在短锁内封口，返回前对已发布连接 RequestClose，不�
 
 PR #95 的本地独立验收限于 Linux/WSL、IPv4 RESP2：新 Redis 测试、公开示例及直接耦合 net 选集合计 25/25，通过且零跳过；仓外只链接公开目标的消费程序完成真实命令、清键读回和宿主排空。验证按进入目标阶段、触发事件、检查结果与资源收口构造，方法见[开发指南](development.md#测试要证明什么)。
 
-[PR CI](https://github.com/yqm-307/bbtools-infra/actions/runs/40206223878) 与[合入后 main CI](https://github.com/yqm-307/bbtools-infra/actions/runs/40208785081) 均通过，但这些 run 的 workflow 没有启用 `BBT_INFRA_REDIS_NET`、构建新 Redis 目标或运行 `redis.net.*`；新路径目前只有上述本地验收，不能把旧模块及 net CI 全绿解释为新 Redis 路径已获 CI 覆盖。现有 Redis live 临时容器机制见[真实后端验收](redis-mongo-acceptance.md#ci-与复现)，新路径接线须单独实现和验证。
+PR #95 的 CI run 没有启用 `BBT_INFRA_REDIS_NET`。当前 workflow 已接入独立 `redis-net` job：`BBT_INFRA_REDIS_NET=ON` Debug 构建公开头自检、`Test_redis_net_contract`（含池用例）与 `redis_net_example`，经 `tests/redis-live/compose.yml` 起临时 Redis 容器（动态项目名/端口，`BBT_REDIS_PORT` 注入），`redis.net.*` 注册集与 JUnit 实跑集合必须精确一致且零跳过，示例跑真实命令冒烟，结束 `down -v` 清理本 job 独占容器；该 job 与 release/debug/network 一起进入 result 汇聚。现有 Redis live 临时容器机制见[真实后端验收](redis-mongo-acceptance.md#ci-与复现)。
 
 IPv6 端到端、AUTH/TLS、RESP3、Cluster/Sentinel、其他平台、sanitizer 及 framework 消费切换尚未验收；readerCreate OOM 与真实同代 Engine driver unbind failure 未动态注入。旧 `net.b4_request_close_write_readiness` 偶发失败根因仍未知，拆分断言只改善归因能力；一次通过不宣称已根治。

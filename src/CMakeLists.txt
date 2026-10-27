@@ -87,14 +87,16 @@ if(BBT_HIREDIS_PREFIX)
         PATHS "${BBT_HIREDIS_PREFIX}" NO_DEFAULT_PATH)
 
     add_library(bbt_infra_redis STATIC
-        redis/RedisDetail.cc
+        # RedisDetail 是新旧 Redis 实现共享的 hiredis 编解码内部层，实现已
+        # 随新 net 入口迁至 bbt/infra/redis/detail/；旧实现源仍在 src/redis/。
+        "${PROJECT_SOURCE_DIR}/bbt/infra/redis/detail/RedisDetail.cc"
         redis/CoRedisCliImpl.cc
         # CoTCP owns byte I/O/wait/close; hiredis remains a synchronous RESP2
         # codec inside the sole CoRedisCliImpl implementation.
         redis/RedisCotcpOwner.cc)
     add_library(bbt::infra_redis ALIAS bbt_infra_redis)
 
-    target_include_directories(bbt_infra_redis PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_include_directories(bbt_infra_redis PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR})
     # Redis owner binding uses CoTCP for byte I/O (tcp does not depend on http).
     # tcp 依赖是**实现细节**，不得经 Redis 公共接口/安装接口传播，故为 PRIVATE
     # （静态库消费者仍由 CMake 的 LINK_ONLY 传递完成最终链接）。

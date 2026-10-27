@@ -1,0 +1,16 @@
+file(STRINGS "${INCLUDES}" _includes)
+set(_flags -std=c++17 -fsyntax-only)
+foreach(_include IN LISTS _includes)
+    list(APPEND _flags "-I${_include}")
+endforeach()
+execute_process(COMMAND "${CXX}" ${_flags} "${SOURCE}" RESULT_VARIABLE _positive
+    OUTPUT_VARIABLE _out ERROR_VARIABLE _error)
+if(NOT _positive EQUAL 0)
+    message(FATAL_ERROR "async 正例编译失败: ${_out}${_error}")
+endif()
+execute_process(COMMAND "${CXX}" ${_flags} -DBBT_NEGATIVE_ASYNC "${SOURCE}" RESULT_VARIABLE _negative
+    OUTPUT_VARIABLE _out ERROR_VARIABLE _error)
+if(_negative EQUAL 0 OR NOT _error MATCHES "value")
+    message(FATAL_ERROR "async 负例没有按直接 result 访问被拒绝: ${_out}${_error}")
+endif()
+message(STATUS "async 正例可编译，直接 value() 负例被拒绝")

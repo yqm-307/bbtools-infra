@@ -38,7 +38,7 @@
 
 #include "debug/InfraDebug.hpp"   // 纯观测数据集中层（仅 Debug 展开）
 #include "detail/IoSupport.hpp"
-#include "redis/RedisDetail.hpp"
+#include "bbt/infra/redis/detail/RedisDetail.hpp"
 
 namespace bbt::infra::redis_detail {
 

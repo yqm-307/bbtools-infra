@@ -773,12 +773,149 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # Redis net 窄入口（BBT_INFRA_REDIS_NET=ON）：真实构建新 target 并实跑 redis.net.*，
+  # 真实后端用临时容器（复用 tests/redis-live/compose.yml 的资源约束）。
+  # fail-closed：缺 docker/compose 或容器未就绪一律失败，不 skip 变绿。
+  redis-net:
+    name: "Redis net 构建与契约测试（含池）"
+    needs: [changes, plan, prepare-deps]
+    if: ${{ needs.plan.result == 'success' && needs.plan.outputs.classification != 'docs-only' && needs.prepare-deps.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      REDIS_NET_BUILD_DIR: ${{ github.workspace }}/build-redis-net
+    steps:
+      - name: "拉取 bbtools-infra"
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: infra
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: "下载同 run prepared deps"
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: deps-bundle
+          path: ${{ github.workspace }}
+
+      - name: "校验依赖归档与实际 coroutine SHA（双钉：bundle + pin）"
+        env:
+          EXPECTED_BUNDLE_SHA: ${{ needs.prepare-deps.outputs.bundle_sha256 }}
+          EXPECTED_COROUTINE_SHA: ${{ needs.prepare-deps.outputs.coro_ref }}
+          COROUTINE_PIN_SHA: ${{ needs.prepare-deps.outputs.coroutine_pin_sha }}
+        run: |
+          set -euo pipefail
+          bash infra/scripts/ci/deps_bundle.sh unpack \
+            --tar "$DEPS_BUNDLE_TAR" --meta "$DEPS_BUNDLE_META" \
+            --expect-sha "$EXPECTED_BUNDLE_SHA" --dest "$GITHUB_WORKSPACE"
+          actual=$(git -C "$COROUTINE_DIR" rev-parse HEAD)
+          test "$actual" = "$EXPECTED_COROUTINE_SHA"
+          test "$actual" = "$COROUTINE_PIN_SHA" || {
+            echo "FAIL: redis-net coroutine HEAD=${actual} != pin ${COROUTINE_PIN_SHA}" >&2
+            exit 1
+          }
+          echo "redis-net coroutine SHA: $actual (bundle + pin 双命中)"
+
+      - name: "前置检查 docker/compose 与 hiredis 前缀"
+        run: |
+          set -euo pipefail
+          command -v docker >/dev/null 2>&1 || { echo "FAIL: docker 不可用" >&2; exit 1; }
+          docker compose version >/dev/null 2>&1 || { echo "FAIL: docker compose 不可用" >&2; exit 1; }
+          test -d "$DEPS_PREFIX/hiredis" || { echo "FAIL: hiredis 私有前缀缺失: $DEPS_PREFIX/hiredis" >&2; exit 1; }
+          echo "docker/compose/hiredis 前缀就绪"
+
+      - name: "redis-net Debug 构建（独立目录，JOBS=3）"
+        run: |
+          set -euo pipefail
+          LAUNCHER=""
+          if [ "${{ env.CACHE_ENABLED }}" = "true" ] && \
+             [ "${{ github.event_name }}" != "pull_request" -o "${{ github.event.pull_request.head.repo.full_name }}" = "${{ github.repository }}" ] && \
+             command -v ccache >/dev/null 2>&1; then
+            LAUNCHER="-DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+          fi
+          cmake -S "$GITHUB_WORKSPACE/infra" -B "$REDIS_NET_BUILD_DIR" -G Ninja \
+            -DBBT_INFRA_REDIS_NET=ON -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Debug \
+            $LAUNCHER \
+            -DBOOST_ROOT="$BOOST_PREFIX" -DCMAKE_PREFIX_PATH="$BOOST_PREFIX" \
+            -DBBT_COROUTINE_SOURCE_DIR="$COROUTINE_DIR" \
+            -DBBT_HIREDIS_PREFIX="$DEPS_PREFIX/hiredis"
+          cmake --build "$REDIS_NET_BUILD_DIR" --parallel "$JOBS" --target \
+            bbt_infra_redis_net_header_selfcheck Test_redis_net_contract redis_net_example
+
+      - name: "启动临时 Redis 容器（动态项目名与端口）"
+        run: |
+          set -euo pipefail
+          PROJECT="bbt-redis-net-$$-$(date +%s)"
+          BBT_REDIS_PORT="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
+          echo "BBT_REDIS_PORT=$BBT_REDIS_PORT" >> "$GITHUB_ENV"
+          echo "BBT_REDIS_NET_PROJECT=$PROJECT" >> "$GITHUB_ENV"
+          export BBT_REDIS_PORT
+          timeout 180 docker compose -p "$PROJECT" -f "$GITHUB_WORKSPACE/infra/tests/redis-live/compose.yml" up -d
+          for i in $(seq 1 60); do
+            if timeout 10 docker compose -p "$PROJECT" -f "$GITHUB_WORKSPACE/infra/tests/redis-live/compose.yml" exec -T redis redis-cli ping 2>/dev/null | grep -q PONG; then
+              echo "redis 容器就绪 port=$BBT_REDIS_PORT"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "FAIL: redis 容器健康检查超时" >&2
+          exit 1
+
+      - name: "redis.net.* 全注册集实跑（零跳过核对）"
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          ctest --test-dir "$REDIS_NET_BUILD_DIR" --show-only=json-v1 > "$REDIS_NET_BUILD_DIR/registered.json"
+          ctest --test-dir "$REDIS_NET_BUILD_DIR" -j1 -R '^redis\.net\.' --no-tests=error \
+            --output-on-failure --timeout 120 --output-junit "$REDIS_NET_BUILD_DIR/redis-net.xml"
+          # 注册集与实跑集合必须精确一致：registered 中 redis.net.* 的数量 == JUnit 中实际执行数。
+          python3 - "$REDIS_NET_BUILD_DIR/registered.json" "$REDIS_NET_BUILD_DIR/redis-net.xml" <<'PY'
+          import json, sys, xml.etree.ElementTree as ET
+          registered = json.load(open(sys.argv[1]))
+          names = sorted(t["name"] for t in registered["tests"] if t["name"].startswith("redis.net."))
+          root = ET.parse(sys.argv[2]).getroot()
+          ran = sorted(tc.attrib["name"] for ts in root.iter("testsuite") for tc in ts.iter("testcase"))
+          skipped = [tc.attrib["name"] for ts in root.iter("testsuite") for tc in ts.iter("skipped")]
+          assert names == ran, f"注册集 {len(names)} 与实跑 {len(ran)} 不一致: {set(names)^set(ran)}"
+          assert not skipped, f"意外 skipped: {skipped}"
+          print(f"redis.net 注册集与实跑一致: {len(ran)} 项零跳过")
+          PY
+
+      - name: "redis_net_example 真实命令冒烟"
+        run: |
+          set -euo pipefail
+          ctest --test-dir "$REDIS_NET_BUILD_DIR" -j1 -R '^redis\.net\.consumer$' --no-tests=error --output-on-failure --timeout 60
+
+      - name: "清理本 job 独占的 Redis 容器"
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          if [ -n "${BBT_REDIS_NET_PROJECT:-}" ]; then
+            timeout 60 docker compose -p "$BBT_REDIS_NET_PROJECT" -f "$GITHUB_WORKSPACE/infra/tests/redis-live/compose.yml" down -v
+            remaining="$(docker ps -aq --filter "label=com.docker.compose.project=$BBT_REDIS_NET_PROJECT")"
+            test -z "$remaining"
+          fi
+
+      - name: "保留 redis-net 注册集与实跑报告"
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: redis-net-test-results
+          path: |
+            ${{ env.REDIS_NET_BUILD_DIR }}/registered.json
+            ${{ env.REDIS_NET_BUILD_DIR }}/redis-net.xml
+            ${{ env.REDIS_NET_BUILD_DIR }}/Testing/Temporary/LastTest.log
+          if-no-files-found: error
+          retention-days: 7
+
   # 唯一权威结果汇聚：always 运行；network 与其它重型 job 一起交给已发布 callee。
   # code/unknown 下任一 failure/cancelled/空/意外 skipped 均判负；docs-only 可跳重型 job。
   # job 名保持旧 required check 名「编译 & ctest」，同名 check 只此一个 producer。
   result:
     name: "编译 & ctest"
-    needs: [changes, plan, prepare-deps, release, debug, network]
+    needs: [changes, plan, prepare-deps, release, debug, network, redis-net]
     if: ${{ always() }}
     uses: yqm-307/bbt-framework/.github/workflows/bbtools-classify-v1.yml@1c0b0fb0ebc8e7ca3888aa4f6a74d1baecf08cc7
     permissions:
@@ -795,7 +932,7 @@ jobs:
       event_json: ${{ needs.changes.outputs.event_json || format('{{"name":"{0}"}}', github.event_name) }}
       changed_files_json: ${{ needs.changes.outputs.changed_files_json || '[]' }}
       required_checks_json: '["changes","plan"]'
-      optional_checks_json: '["prepare-deps","release","debug","network"]'
+      optional_checks_json: '["prepare-deps","release","debug","network","redis-net"]'
       classifier_status: ${{ needs.changes.outputs.classifier_status || 'unknown' }}
-      # 汇聚六个真实 job 的 needs.*.result（含 skipped），不构造假状态、不省略键。
-      results_json: ${{ format('{{"changes":"{0}","plan":"{1}","prepare-deps":"{2}","release":"{3}","debug":"{4}","network":"{5}"}}', needs.changes.result, needs.plan.result, needs.prepare-deps.result, needs.release.result, needs.debug.result, needs.network.result) }}
+      # 汇聚七个真实 job 的 needs.*.result（含 skipped），不构造假状态、不省略键。
+      results_json: ${{ format('{{"changes":"{0}","plan":"{1}","prepare-deps":"{2}","release":"{3}","debug":"{4}","network":"{5}","redis-net":"{6}"}}', needs.changes.result, needs.plan.result, needs.prepare-deps.result, needs.release.result, needs.debug.result, needs.network.result, needs.redis-net.result) }}
