@@ -309,6 +309,33 @@ if(TARGET bbt_infra_mongo)
         TIMEOUT 120
         SKIP_REGULAR_EXPRESSION "skip:"
         SKIP_RETURN_CODE 77)
+
+    # 公开 BSON/async 入口的消费示例（examples/mongo_client）：只链接
+    # bbt::infra_mongo、只含公开头。真实 CRUD 由 BBT_TEST_MONGO_URI 注入；
+    # 未注入时示例打印 "skip:" 并返回 77，与 mongo.live 同规约。注册点必须在
+    # include(CTest) 之后（tests/ 由根 CMakeLists 的 BUILD_TESTING 块加入），
+    # examples/ 自身处理时 add_test 尚未 enable_testing。
+    if(TARGET mongo_client_example)
+        add_test(NAME mongo.client.consumer COMMAND mongo_client_example)
+        set_tests_properties(mongo.client.consumer PROPERTIES
+            TIMEOUT 120
+            SKIP_REGULAR_EXPRESSION "skip:"
+            SKIP_RETURN_CODE 77)
+    endif()
+
+    # Mongo 新入口 async/await 正负编译门禁（与 tests/redis_net 同规约）：
+    # 正例（4 个 CRUD 经 bbt_co_await 消费）必须可编译；负例（漏写 await、
+    # 直接按 result 访问）必须被拒绝。只做 -fsyntax-only，不需要后端/链接。
+    # 包含面用显式列表：公开头 + pin 的 coroutine 源码根（源码消费是唯一能通过
+    # pin 核验的路径，故该变量必非空）。
+    file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/mongo-async-includes.txt"
+        CONTENT "${CMAKE_SOURCE_DIR}/include\n${BBT_COROUTINE_SOURCE_DIR}\n")
+    add_test(NAME mongo.async_compile COMMAND ${CMAKE_COMMAND}
+        "-DCXX=${CMAKE_CXX_COMPILER}"
+        "-DINCLUDES=${CMAKE_CURRENT_BINARY_DIR}/mongo-async-includes.txt"
+        "-DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/mongo_async/AsyncCompile.cc"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/mongo_async/AsyncCompile.cmake")
+    set_tests_properties(mongo.async_compile PROPERTIES TIMEOUT 60)
 endif()
 
 # --- RPC wire 模块测试（Issue #8）：仅在构建 bbt_infra_rpc 时注册。----------

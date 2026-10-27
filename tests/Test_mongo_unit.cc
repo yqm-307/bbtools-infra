@@ -897,7 +897,7 @@ BOOST_AUTO_TEST_CASE(t_owner_multi_handles_share_workers) {
         auto* hp = h.get();
         g_scheduler->RegistCoroutineTask(
             [hp, &submitted] {
-                auto r = hp->FindOne(EmptyDoc(), Opt(30000));
+                auto r = bbt_co_await hp->FindOne(EmptyDoc(), Opt(30000));
                 (void)r;
                 submitted.fetch_add(1);
             },
@@ -943,7 +943,7 @@ BOOST_AUTO_TEST_CASE(t_owner_thread_identity) {
                           const char* collection) {
         std::optional<result<std::optional<MongoDocument>>> out;
         BOOST_REQUIRE(RunInCoroutine(
-            [&] { out.emplace(handle->FindOne(EmptyDoc(), Opt(5000))); }));
+            [&] { out.emplace(bbt_co_await handle->FindOne(EmptyDoc(), Opt(5000))); }));
         BOOST_REQUIRE(out);
         BOOST_REQUIRE(!*out);
         // 真实结果：调用确实经该 owner 的 worker 到达 driver 并以
@@ -1024,7 +1024,7 @@ BOOST_AUTO_TEST_CASE(t_shared_backpressure_queue_one) {
         bool succ = false;
         g_scheduler->RegistCoroutineTask(
             [h, budget_ms, &overloaded, &done] {
-                auto r = h->FindOne(EmptyDoc(), Opt(budget_ms));
+                auto r = bbt_co_await h->FindOne(EmptyDoc(), Opt(budget_ms));
                 if (!r && r.error().code == ErrorCode::Overloaded)
                     overloaded.fetch_add(1);
                 done.fetch_add(1);
@@ -1083,7 +1083,7 @@ BOOST_AUTO_TEST_CASE(t_handle_close_scoped) {
     // 证明 owner 在正常工作。
     std::optional<result<std::optional<MongoDocument>>> noop;
     BOOST_REQUIRE(RunInCoroutine(
-        [&] { noop.emplace(c2->FindOne(BadDoc(), Opt(2000))); }));
+        [&] { noop.emplace(bbt_co_await c2->FindOne(BadDoc(), Opt(2000))); }));
     BOOST_REQUIRE(!*noop);
     BOOST_CHECK(noop->error().code == ErrorCode::InvalidArgument);
 
@@ -1093,7 +1093,7 @@ BOOST_AUTO_TEST_CASE(t_handle_close_scoped) {
     bool succ = false;
     g_scheduler->RegistCoroutineTask(
         [&] {
-            auto r = c1->FindOne(EmptyDoc(), Opt(30000));
+            auto r = bbt_co_await c1->FindOne(EmptyDoc(), Opt(30000));
             (void)r;
             h1_done.store(true);
         },
@@ -1112,7 +1112,7 @@ BOOST_AUTO_TEST_CASE(t_handle_close_scoped) {
     // 已关句柄的新命令 → Closed（不接触 owner 队列）。
     std::optional<result<std::optional<MongoDocument>>> out;
     BOOST_REQUIRE(RunInCoroutine(
-        [&] { out.emplace(c1->FindOne(EmptyDoc(), Opt())); }));
+        [&] { out.emplace(bbt_co_await c1->FindOne(EmptyDoc(), Opt())); }));
     BOOST_REQUIRE(!*out);
     BOOST_CHECK(out->error().code == ErrorCode::Closed);
 
@@ -1121,7 +1121,7 @@ BOOST_AUTO_TEST_CASE(t_handle_close_scoped) {
     std::atomic_bool h2_done{false};
     g_scheduler->RegistCoroutineTask(
         [&] {
-            auto r = c2->FindOne(EmptyDoc(), Opt(30000));
+            auto r = bbt_co_await c2->FindOne(EmptyDoc(), Opt(30000));
             (void)r;
             h2_done.store(true);
         },
@@ -1188,7 +1188,7 @@ BOOST_AUTO_TEST_CASE(t_owner_close_not_premature_during_inflight) {
         bool succ = false;
         g_scheduler->RegistCoroutineTask(
             [hp] {
-                auto r = hp->FindOne(EmptyDoc(), Opt(30000));
+                auto r = bbt_co_await hp->FindOne(EmptyDoc(), Opt(30000));
                 (void)r;
             },
             succ);
@@ -1244,7 +1244,7 @@ BOOST_AUTO_TEST_CASE(t_owner_concurrent_close_two_threads) {
         bool succ = false;
         g_scheduler->RegistCoroutineTask(
             [hp] {
-                auto r = hp->FindOne(EmptyDoc(), Opt(30000));
+                auto r = bbt_co_await hp->FindOne(EmptyDoc(), Opt(30000));
                 (void)r;
             },
             succ);
@@ -1319,7 +1319,7 @@ BOOST_AUTO_TEST_CASE(t_owner_same_uri_sibling_lease_preserved) {
     // 之前确定性拒绝不良构 BSON → InvalidArgument（证明未触碰已归还 lease）。
     std::optional<result<std::optional<MongoDocument>>> out;
     BOOST_REQUIRE(RunInCoroutine(
-        [&] { out.emplace(h2.value()->FindOne(BadDoc(), Opt(2000))); }));
+        [&] { out.emplace(bbt_co_await h2.value()->FindOne(BadDoc(), Opt(2000))); }));
     BOOST_REQUIRE(!*out);
     BOOST_CHECK(out->error().code == ErrorCode::InvalidArgument);
     CloseOwnerAndDrain(db2, rt2);
@@ -1428,7 +1428,7 @@ BOOST_AUTO_TEST_CASE(t_spawn_failure_lease_isolated_from_sibling) {
     BOOST_REQUIRE(h);
     std::optional<result<std::optional<MongoDocument>>> out;
     BOOST_REQUIRE(RunInCoroutine(
-        [&] { out.emplace(h.value()->FindOne(BadDoc(), Opt(2000))); }));
+        [&] { out.emplace(bbt_co_await h.value()->FindOne(BadDoc(), Opt(2000))); }));
     BOOST_REQUIRE(!*out);
     BOOST_CHECK(out->error().code == ErrorCode::InvalidArgument);
 
@@ -1493,6 +1493,199 @@ BOOST_AUTO_TEST_CASE(t_pool_acquire_failure_gates_start) {
     BOOST_CHECK(rt->IsClosed());
     BOOST_CHECK_EQUAL(rt->LiveWorkersForTest(), 0);
     fills.clear();
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// ===================== mongo_bson：BSON 公共入口 =====================
+// 只经公开面（include/bbt/infra/mongo/Bson.hpp）验证构造/读取语义，不引入
+// bsoncxx 类型断言；JSON 形态断言用 canonical/relaxed 输出里的 Extended JSON
+// 标记（$numberInt/$numberLong/$numberDouble），不绑定空格排版。
+BOOST_AUTO_TEST_SUITE(mongo_bson)
+
+BOOST_AUTO_TEST_CASE(t_bson_from_json_canonical_roundtrip) {
+    auto doc = mongo::MongoDocument::FromJson(
+        R"({"_id":"demo-1","n":7,"ratio":1.5,"ok":true,"tag":"t"})");
+    BOOST_REQUIRE(doc);
+    const auto& d = doc.value();
+    BOOST_CHECK(d.Has("_id"));
+    BOOST_CHECK(d.Has("n"));
+    BOOST_CHECK(!d.Has("missing"));
+    BOOST_CHECK(d.GetString("_id") && d.GetString("_id").value() == "demo-1");
+    BOOST_CHECK(d.GetString("tag") && d.GetString("tag").value() == "t");
+    BOOST_CHECK(d.GetInt64("n") && d.GetInt64("n").value() == 7);
+    BOOST_CHECK(d.GetDouble("ratio") && d.GetDouble("ratio").value() == 1.5);
+    BOOST_CHECK(d.GetBool("ok") && d.GetBool("ok").value());
+
+    auto json = d.ToJson();   // 默认 canonical
+    BOOST_REQUIRE(json);
+    BOOST_CHECK(json.value().find("$numberInt") != std::string::npos);
+    BOOST_CHECK(json.value().find("$numberDouble") != std::string::npos);
+    BOOST_CHECK(json.value().find("demo-1") != std::string::npos);
+
+    // canonical 输出可作为输入回环：类型与值都保持。
+    auto again = mongo::MongoDocument::FromJson(json.value());
+    BOOST_REQUIRE(again);
+    BOOST_CHECK(again.value().GetInt64("n") &&
+                again.value().GetInt64("n").value() == 7);
+    BOOST_CHECK(again.value().GetDouble("ratio") &&
+                again.value().GetDouble("ratio").value() == 1.5);
+    BOOST_CHECK(again.value().GetString("tag") &&
+                again.value().GetString("tag").value() == "t");
+    // relaxed 也保留值（数值类型见 t_bson_numeric_fidelity）。
+    auto relaxed = d.ToJson(mongo::MongoJsonMode::k_relaxed);
+    BOOST_REQUIRE(relaxed);
+    BOOST_CHECK(relaxed.value().find("$numberInt") == std::string::npos);
+}
+
+// 契约 §4.2 的五行数值保真，逐条用实测断言固化。
+BOOST_AUTO_TEST_CASE(t_bson_numeric_fidelity) {
+    // 1) JSON 写 7 → int32：canonical 出 $numberInt，relaxed 出裸 7。
+    auto i32 = mongo::MongoDocument::FromJson(R"({"v":7})");
+    BOOST_REQUIRE(i32);
+    auto i32_canon = i32.value().ToJson();
+    BOOST_REQUIRE(i32_canon);
+    BOOST_CHECK(i32_canon.value().find("$numberInt") != std::string::npos);
+    auto i32_relaxed = i32.value().ToJson(mongo::MongoJsonMode::k_relaxed);
+    BOOST_REQUIRE(i32_relaxed);
+    BOOST_CHECK(i32_relaxed.value().find("$numberInt") == std::string::npos);
+    BOOST_CHECK(i32.value().GetInt64("v") && i32.value().GetInt64("v").value() == 7);
+    // 只接受 double，不把 int 隐式当 double。
+    BOOST_CHECK(!i32.value().GetDouble("v"));
+    BOOST_CHECK(i32.value().GetDouble("v").error().code == ErrorCode::TypeMismatch);
+
+    // 2) 需要 int64 必须写 $numberLong；canonical 保持 $numberLong。
+    auto i64 = mongo::MongoDocument::FromJson(R"({"v":{"$numberLong":"7"}})");
+    BOOST_REQUIRE(i64);
+    auto i64_canon = i64.value().ToJson();
+    BOOST_REQUIRE(i64_canon);
+    BOOST_CHECK(i64_canon.value().find("$numberLong") != std::string::npos);
+    BOOST_CHECK(i64.value().GetInt64("v") && i64.value().GetInt64("v").value() == 7);
+
+    // 3) $numberLong + relaxed 往返 → 回环后变成 int32（relaxed 输出裸 7）。
+    auto i64_relaxed = i64.value().ToJson(mongo::MongoJsonMode::k_relaxed);
+    BOOST_REQUIRE(i64_relaxed);
+    BOOST_CHECK(i64_relaxed.value().find("$numberLong") == std::string::npos);
+    auto degraded = mongo::MongoDocument::FromJson(i64_relaxed.value());
+    BOOST_REQUIRE(degraded);
+    auto degraded_canon = degraded.value().ToJson();
+    BOOST_REQUIRE(degraded_canon);
+    BOOST_CHECK(degraded_canon.value().find("$numberInt") != std::string::npos);
+    BOOST_CHECK(degraded.value().GetInt64("v") &&
+                degraded.value().GetInt64("v").value() == 7);
+
+    // 4) int64 值域：超出 int32 的值经 canonical 往返仍是同一个 int64。
+    auto wide = mongo::MongoDocument::FromJson(R"({"v":{"$numberLong":"2147483648"}})");
+    BOOST_REQUIRE(wide);
+    BOOST_CHECK(wide.value().GetInt64("v") &&
+                wide.value().GetInt64("v").value() == 2147483648LL);
+    auto wide_json = wide.value().ToJson();
+    BOOST_REQUIRE(wide_json);
+    auto wide_again = mongo::MongoDocument::FromJson(wide_json.value());
+    BOOST_REQUIRE(wide_again);
+    BOOST_CHECK(wide_again.value().GetInt64("v") &&
+                wide_again.value().GetInt64("v").value() == 2147483648LL);
+
+    // 5) double 字面量保留 double：canonical 出 $numberDouble，relaxed 不塌成整数。
+    auto dbl = mongo::MongoDocument::FromJson(R"({"v":7.0})");
+    BOOST_REQUIRE(dbl);
+    BOOST_CHECK(dbl.value().GetDouble("v") && dbl.value().GetDouble("v").value() == 7.0);
+    BOOST_CHECK(!dbl.value().GetInt64("v"));
+    BOOST_CHECK(dbl.value().GetInt64("v").error().code == ErrorCode::TypeMismatch);
+    auto dbl_canon = dbl.value().ToJson();
+    BOOST_REQUIRE(dbl_canon);
+    BOOST_CHECK(dbl_canon.value().find("$numberDouble") != std::string::npos);
+    auto dbl_relaxed = dbl.value().ToJson(mongo::MongoJsonMode::k_relaxed);
+    BOOST_REQUIRE(dbl_relaxed);
+    BOOST_CHECK(dbl_relaxed.value().find("7.0") != std::string::npos);
+
+    // 6) 超出 int64 的整数 → InvalidArgument，不静默变 double。
+    auto overflow = mongo::MongoDocument::FromJson(R"({"v":9223372036854775808})");
+    BOOST_REQUIRE(!overflow);
+    BOOST_CHECK(overflow.error().code == ErrorCode::InvalidArgument);
+    BOOST_CHECK(overflow.error().backend_category == "bsoncxx");
+}
+
+BOOST_AUTO_TEST_CASE(t_bson_invalid_json) {
+    // 空串 / 仅空白 / 畸形 / 顶层非对象 / 多份对象 / 尾部内容：都在构造侧拒绝，
+    // 不接触 driver。libbson 的 JSON 前端只消费第一份文档、不报后续内容，故
+    // 单文档完整性由 FromJson 自己核对（相邻与空白分隔的第二份对象都算畸形）。
+    for (const char* bad : {"", "   ", "not json", R"({"a":)", R"({"a" 1})",
+                            R"({"v":1}{"w":2})", R"({"v":1} {"w":2})",
+                            "{\"v\":1}\n\t {\"w\":2}", R"({"v":1} trailing)",
+                            R"({"v":1}})"}) {
+        auto doc = mongo::MongoDocument::FromJson(bad);
+        BOOST_REQUIRE_MESSAGE(!doc, "应拒绝的 JSON 被接受: " << bad);
+        BOOST_CHECK(doc.error().code == ErrorCode::InvalidArgument);
+    }
+    // 解析期失败携带 bsoncxx 后端原因（空串/空白在前置分支，无后端码）。
+    auto malformed = mongo::MongoDocument::FromJson(R"({"a":)");
+    BOOST_REQUIRE(!malformed);
+    BOOST_CHECK(malformed.error().backend_category == "bsoncxx");
+    // 多文档是本组件的完整性检查，不是库报错：不得冒充 backend 元数据。
+    auto joined = mongo::MongoDocument::FromJson(R"({"v":1}{"w":2})");
+    BOOST_REQUIRE(!joined);
+    BOOST_CHECK(joined.error().code == ErrorCode::InvalidArgument);
+    BOOST_CHECK(joined.error().backend_category.empty());
+    // 顶层数组不是文档：libbson 会把它当数字键文档，这里显式拒绝。
+    auto array = mongo::MongoDocument::FromJson("[1,2]");
+    BOOST_REQUIRE(!array);
+    BOOST_CHECK(array.error().code == ErrorCode::InvalidArgument);
+    // 正向对照：正常前后空白、字符串内的括号与转义不算第二份文档。
+    auto spaced = mongo::MongoDocument::FromJson(
+        " \n\t" R"({"s":"a}b{ c \" }"})" "  \r\n");
+    BOOST_REQUIRE(spaced);
+    BOOST_CHECK(spaced.value().GetString("s").value() == "a}b{ c \" }");
+}
+
+BOOST_AUTO_TEST_CASE(t_bson_missing_field_not_found) {
+    auto doc = mongo::MongoDocument::FromJson(R"({"a":1})");
+    BOOST_REQUIRE(doc);
+    const auto& d = doc.value();
+    BOOST_CHECK(!d.Has("b"));
+    BOOST_CHECK(d.GetString("b").error().code == ErrorCode::NotFound);
+    BOOST_CHECK(d.GetInt64("b").error().code == ErrorCode::NotFound);
+    BOOST_CHECK(d.GetDouble("b").error().code == ErrorCode::NotFound);
+    BOOST_CHECK(d.GetBool("b").error().code == ErrorCode::NotFound);
+}
+
+BOOST_AUTO_TEST_CASE(t_bson_type_mismatch) {
+    auto doc = mongo::MongoDocument::FromJson(
+        R"({"s":"x","i":1,"d":1.5,"b":true})");
+    BOOST_REQUIRE(doc);
+    const auto& d = doc.value();
+    // 每个 getter 只接受自己的类型（GetInt64 另接受 int32/int64）。
+    BOOST_CHECK(d.GetInt64("s").error().code == ErrorCode::TypeMismatch);
+    BOOST_CHECK(d.GetDouble("i").error().code == ErrorCode::TypeMismatch);
+    BOOST_CHECK(d.GetInt64("d").error().code == ErrorCode::TypeMismatch);
+    BOOST_CHECK(d.GetBool("i").error().code == ErrorCode::TypeMismatch);
+    BOOST_CHECK(d.GetString("b").error().code == ErrorCode::TypeMismatch);
+    BOOST_CHECK(d.GetString("i").error().code == ErrorCode::TypeMismatch);
+    // 正向对照：同字段用正确 getter 读取成功。
+    BOOST_CHECK(d.GetString("s") && d.GetString("s").value() == "x");
+    BOOST_CHECK(d.GetInt64("i") && d.GetInt64("i").value() == 1);
+    BOOST_CHECK(d.GetDouble("d") && d.GetDouble("d").value() == 1.5);
+    BOOST_CHECK(d.GetBool("b") && d.GetBool("b").value());
+}
+
+BOOST_AUTO_TEST_CASE(t_bson_empty_document) {
+    // 空字节载体：读取/序列化都按 InvalidArgument 拒绝，Has 为假。
+    const MongoDocument empty{};
+    BOOST_CHECK(!empty.Has("a"));
+    BOOST_CHECK(empty.ToJson().error().code == ErrorCode::InvalidArgument);
+    BOOST_CHECK(empty.GetString("a").error().code == ErrorCode::InvalidArgument);
+    BOOST_CHECK(empty.GetInt64("a").error().code == ErrorCode::InvalidArgument);
+    // 手写最小良构文档 {} 仍可用（bytes 是唯一真源）：无字段但可序列化。
+    const MongoDocument empty_doc{{0x05, 0x00, 0x00, 0x00, 0x00}};
+    auto json = empty_doc.ToJson();
+    BOOST_REQUIRE(json);
+    BOOST_CHECK(!empty_doc.Has("a"));
+    BOOST_CHECK(empty_doc.GetInt64("a").error().code == ErrorCode::NotFound);
+    // 不良构字节（声明长度超出缓冲）→ InvalidArgument，不冒充 NotFound。
+    const MongoDocument bad{{0x10, 0x00, 0x00, 0x00, 0x00}};
+    BOOST_CHECK(bad.ToJson().error().code == ErrorCode::InvalidArgument);
+    BOOST_CHECK(bad.GetInt64("a").error().code == ErrorCode::InvalidArgument);
+    BOOST_CHECK(!bad.Has("a"));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

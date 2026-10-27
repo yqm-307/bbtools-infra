@@ -54,6 +54,7 @@
 #include <bbt/coroutine/syntax/SyntaxMacro.hpp>
 
 #include <bbt/infra/CoMongoCli.hpp>
+#include <bbt/infra/mongo/Bson.hpp>
 #include <bbt/infra/mongo/Client.hpp>
 
 // Issue #34：用例需要真实生产状态观测（runtime 的 worker/执行槽计数、
@@ -718,28 +719,28 @@ BOOST_AUTO_TEST_CASE(t_owner_multi_collection_live) {
     bool s1 = false, s2 = false;
     g_scheduler->RegistCoroutineTask(
         [&] {
-            if (ca->InsertOne(da, Opt(3000))) {
-                auto g = ca->FindOne(fa, Opt(3000));
+            if (bbt_co_await ca->InsertOne(da, Opt(3000))) {
+                auto g = bbt_co_await ca->FindOne(fa, Opt(3000));
                 if (g && g.value().has_value()) {
                     auto fv = FieldString(*g.value(), "v");
                     if (fv && *fv == "a") ok.fetch_add(1);
                     else                errs.fetch_add(1);
                 } else errs.fetch_add(1);
-                auto d = ca->DeleteOne(fa, Opt(3000));
+                auto d = bbt_co_await ca->DeleteOne(fa, Opt(3000));
                 if (!d || d.value() != 1u) errs.fetch_add(1);
             } else errs.fetch_add(1);
         },
         s1);
     g_scheduler->RegistCoroutineTask(
         [&] {
-            if (cb->InsertOne(db_, Opt(3000))) {
-                auto g = cb->FindOne(fb, Opt(3000));
+            if (bbt_co_await cb->InsertOne(db_, Opt(3000))) {
+                auto g = bbt_co_await cb->FindOne(fb, Opt(3000));
                 if (g && g.value().has_value()) {
                     auto fv = FieldString(*g.value(), "v");
                     if (fv && *fv == "b") ok.fetch_add(1);
                     else                errs.fetch_add(1);
                 } else errs.fetch_add(1);
-                auto d = cb->DeleteOne(fb, Opt(3000));
+                auto d = bbt_co_await cb->DeleteOne(fb, Opt(3000));
                 if (!d || d.value() != 1u) errs.fetch_add(1);
             } else errs.fetch_add(1);
         },
@@ -750,6 +751,105 @@ BOOST_AUTO_TEST_CASE(t_owner_multi_collection_live) {
 
     ca->Close();
     cb->Close();
+    db->Close();
+    BOOST_REQUIRE(WaitUntil([&] { return db->IsClosed(); }, 15000));
+    BOOST_CHECK(db->IsClosed());
+}
+
+// 公开 BSON 入口的真实后端闭环：FromJson 构造 → InsertOne → FindOne →
+// 类型化 getter + ToJson（canonical）→ DeleteOne → 读回未命中。只用公开头
+// （<bbt/infra/mongo/Bson.hpp> / <bbt/infra/mongo/Client.hpp>）与公开 target，
+// 不引入 bsoncxx 类型；「只含公开头」的隔离编译证据由 mongo_client_example
+// 提供，本 TU 仍包含 src/mongo 内部头供其它用例使用。
+BOOST_AUTO_TEST_CASE(t_public_bson_api_live) {
+    if (!LiveEnabled() || !PhaseIs('A')) {
+        BOOST_TEST_MESSAGE("skip: 需要 BBT_TEST_MONGO_URI 且 PHASE=A");
+        return;
+    }
+    auto d = mongo::CoMongoDb::Create(LiveRuntimeConfig(2, 16));
+    BOOST_REQUIRE(d);
+    auto db = std::move(d).value();
+    BOOST_REQUIRE(db->Start());
+    auto h = db->Collection({"bbt_live", "bson_api"});
+    BOOST_REQUIRE(h);
+    auto coll = h.value();
+
+    struct BsonApiState {
+        std::optional<result<void>>                              inserted;
+        std::optional<result<std::optional<MongoDocument>>>       found;
+        std::optional<result<std::uint64_t>>                      deleted;
+        std::optional<result<std::optional<MongoDocument>>>       miss;
+        std::string                                               json;
+        std::string                                               tag;
+        std::int64_t                                              n     = 0;
+        double                                                    ratio = 0.0;
+        bool                                                      ok    = false;
+    };
+    auto state = std::make_shared<BsonApiState>();
+    const bool ran = RunInCoroutine([coll, state] {
+        auto doc = mongo::MongoDocument::FromJson(
+            R"({"_id":"bbt:t:bsonapi","tag":"hello","n":7,"ratio":1.5,"ok":true})");
+        if (!doc) {
+            state->inserted.emplace(
+                result<void>::err(std::move(doc).error()));
+            return;
+        }
+        auto filter = mongo::MongoDocument::FromJson(
+            R"({"_id":"bbt:t:bsonapi"})");
+        if (!filter) {
+            state->inserted.emplace(
+                result<void>::err(std::move(filter).error()));
+            return;
+        }
+        state->inserted.emplace(
+            bbt_co_await coll->InsertOne(doc.value(), Opt(5000)));
+        auto found = bbt_co_await coll->FindOne(filter.value(), Opt(5000));
+        state->found.emplace(found);
+        if (found && found.value()) {
+            const auto& got = *found.value();
+            if (auto n = got.GetInt64("n"); n)
+                state->n = n.value();
+            if (auto ratio = got.GetDouble("ratio"); ratio)
+                state->ratio = ratio.value();
+            if (auto ok = got.GetBool("ok"); ok)
+                state->ok = ok.value();
+            if (auto tag = got.GetString("tag"); tag)
+                state->tag = tag.value();
+            if (auto json = got.ToJson(); json)
+                state->json = json.value();
+        }
+        state->deleted.emplace(
+            bbt_co_await coll->DeleteOne(filter.value(), Opt(5000)));
+        // 删除后读回：未命中是 ok(nullopt)，与错误分支区分。
+        state->miss.emplace(
+            bbt_co_await coll->FindOne(filter.value(), Opt(5000)));
+    });
+    BOOST_REQUIRE(ran);
+    // 断言式错误信息只在失败分支取 error()（result 在 ok 分支取 error() 会抛）。
+    BOOST_REQUIRE(state->inserted);
+    if (!static_cast<bool>(*state->inserted))
+        BOOST_FAIL("InsertOne 失败: " << state->inserted->error().message);
+    BOOST_REQUIRE(state->found);
+    if (!static_cast<bool>(*state->found))
+        BOOST_FAIL("FindOne 失败: " << state->found->error().message);
+    BOOST_REQUIRE(state->found->value().has_value());
+    const MongoDocument& got = *state->found->value();
+    BOOST_CHECK(got.Has("tag"));
+    BOOST_CHECK_EQUAL(state->n, 7);
+    BOOST_CHECK(state->ratio == 1.5);
+    BOOST_CHECK(state->ok);
+    BOOST_CHECK_EQUAL(state->tag, "hello");
+    BOOST_CHECK(state->json.find("$numberInt") != std::string::npos);
+    BOOST_REQUIRE(state->deleted);
+    if (!static_cast<bool>(*state->deleted))
+        BOOST_FAIL("DeleteOne 失败: " << state->deleted->error().message);
+    BOOST_CHECK_EQUAL(state->deleted->value(), 1u);
+    BOOST_REQUIRE(state->miss);
+    if (!static_cast<bool>(*state->miss))
+        BOOST_FAIL("删除后 FindOne 失败: " << state->miss->error().message);
+    BOOST_CHECK(!state->miss->value().has_value());
+
+    coll->Close();
     db->Close();
     BOOST_REQUIRE(WaitUntil([&] { return db->IsClosed(); }, 15000));
     BOOST_CHECK(db->IsClosed());
@@ -801,8 +901,8 @@ BOOST_AUTO_TEST_CASE(t_backend_blocked_deadline_timedout) {
         const MongoDocument basef = JsonDoc(R"({"_id":"bbt:t:blkbase"})");
         auto                bst   = std::make_shared<BaseState>();
         BOOST_REQUIRE(RunHeapOp(bst, [h, base, basef](BaseState& s) {
-            s.ins.emplace(h->InsertOne(base, Opt()));
-            s.del.emplace(h->DeleteOne(basef, Opt()));
+            s.ins.emplace(bbt_co_await h->InsertOne(base, Opt()));
+            s.del.emplace(bbt_co_await h->DeleteOne(basef, Opt()));
         }));
         BOOST_REQUIRE(bst->ins && *bst->ins);
         BOOST_REQUIRE(bst->del && *bst->del && bst->del->value() == 1u);
@@ -833,7 +933,7 @@ BOOST_AUTO_TEST_CASE(t_backend_blocked_deadline_timedout) {
     BOOST_REQUIRE(RunHeapOp(
         st,
         [h, rt, blk](TimeoutState& s) {
-            s.out.emplace(h->InsertOne(blk, Opt(1200)));
+            s.out.emplace(bbt_co_await h->InsertOne(blk, Opt(1200)));
             // 逻辑终态交付当刻：该 op 仍在执行槽内（driver 未返回）。
             s.inflight_at_return.store(rt->DriverCallsInFlightForTest() == 1);
         },
@@ -867,8 +967,8 @@ BOOST_AUTO_TEST_CASE(t_backend_blocked_deadline_timedout) {
         };
         auto lst = std::make_shared<LandState>();
         BOOST_REQUIRE(RunHeapOp(lst, [h, blkf](LandState& s) {
-            s.landed.emplace(h->FindOne(blkf, Opt()));
-            s.sweep.emplace(h->DeleteOne(blkf, Opt()));
+            s.landed.emplace(bbt_co_await h->FindOne(blkf, Opt()));
+            s.sweep.emplace(bbt_co_await h->DeleteOne(blkf, Opt()));
         }));
         BOOST_REQUIRE(lst->landed && *lst->landed);
         BOOST_CHECK_MESSAGE(lst->landed->value().has_value(),
@@ -897,9 +997,9 @@ BOOST_AUTO_TEST_CASE(t_backend_blocked_deadline_timedout) {
         const MongoDocument recf = JsonDoc(R"({"_id":"bbt:t:blkrec"})");
         auto                rst  = std::make_shared<RecState>();
         BOOST_REQUIRE(RunHeapOp(rst, [h, rec, recf](RecState& s) {
-            s.ins.emplace(h->InsertOne(rec, Opt()));
-            s.g.emplace(h->FindOne(recf, Opt()));
-            s.del.emplace(h->DeleteOne(recf, Opt()));
+            s.ins.emplace(bbt_co_await h->InsertOne(rec, Opt()));
+            s.g.emplace(bbt_co_await h->FindOne(recf, Opt()));
+            s.del.emplace(bbt_co_await h->DeleteOne(recf, Opt()));
         }));
         BOOST_REQUIRE(rst->ins && *rst->ins);
         BOOST_REQUIRE(rst->g && *rst->g && rst->g->value().has_value());
@@ -957,8 +1057,8 @@ BOOST_AUTO_TEST_CASE(t_backend_blocked_owner_close_closed) {
         const MongoDocument basef = JsonDoc(R"({"_id":"bbt:t:closebase"})");
         auto                bst   = std::make_shared<BaseState>();
         BOOST_REQUIRE(RunHeapOp(bst, [h, base, basef](BaseState& s) {
-            s.ins.emplace(h->InsertOne(base, Opt()));
-            s.del.emplace(h->DeleteOne(basef, Opt()));
+            s.ins.emplace(bbt_co_await h->InsertOne(base, Opt()));
+            s.del.emplace(bbt_co_await h->DeleteOne(basef, Opt()));
         }));
         BOOST_REQUIRE(bst->ins && *bst->ins);
         BOOST_REQUIRE(bst->del && *bst->del && bst->del->value() == 1u);
@@ -990,7 +1090,7 @@ BOOST_AUTO_TEST_CASE(t_backend_blocked_owner_close_closed) {
     bool launched = false;
     g_scheduler->RegistCoroutineTask(
         [op, h, rt, flt] {
-            op->out.emplace(h->FindOne(flt, Opt(30000)));
+            op->out.emplace(bbt_co_await h->FindOne(flt, Opt(30000)));
             // Closed 逻辑终态交付当刻：driver 仍在执行槽内。
             op->inflight_at_return.store(rt->DriverCallsInFlightForTest() == 1);
             op->t_op_done_ns.store(NowNs());
@@ -1089,9 +1189,9 @@ BOOST_AUTO_TEST_CASE(t_backend_blocked_owner_close_closed) {
             JsonDoc(R"({"_id":"bbt:t:closefresh"})");
         auto rst2 = std::make_shared<RecState2>();
         BOOST_REQUIRE(RunHeapOp(rst2, [h2, rec2, rec2f](RecState2& s) {
-            s.ins.emplace(h2->InsertOne(rec2, Opt()));
-            s.g.emplace(h2->FindOne(rec2f, Opt()));
-            s.del.emplace(h2->DeleteOne(rec2f, Opt()));
+            s.ins.emplace(bbt_co_await h2->InsertOne(rec2, Opt()));
+            s.g.emplace(bbt_co_await h2->FindOne(rec2f, Opt()));
+            s.del.emplace(bbt_co_await h2->DeleteOne(rec2f, Opt()));
         }));
         BOOST_REQUIRE(rst2->ins && *rst2->ins);
         BOOST_REQUIRE(rst2->g && *rst2->g && rst2->g->value().has_value());

@@ -9,34 +9,25 @@
 #include <memory>
 #include <optional>
 #include <string>
-#include <vector>
 
 #include <bbt/infra/ICoCloseable.hpp>
 #include <bbt/infra/ICoNetwork.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
 #include <bbt/infra/Result.hpp>
+#include <bbt/infra/mongo/Client.hpp>
 
 namespace bbt::infra {
 
-// MongoClientConfig 各项显式、大于零且不超下列上限；违规返回 InvalidArgument。
-inline constexpr std::size_t kMongoLimitsMaxWorkerThreads = 8;
-inline constexpr std::size_t kMongoLimitsMaxQueue         = 1000000;
-inline constexpr std::chrono::milliseconds kMongoLimitsMaxTimeout{
-    std::chrono::minutes{10}};
-
-// BSON 文档的 owning 字节载体：bytes 为一份完整 BSON 文档（首部 int32
-// 长度 + 元素序列 + 结尾 0x00），二进制安全。合法性（结构良构）在提交
-// 时校验，非法输入返回 InvalidArgument，不会进入 driver。
-struct MongoDocument {
-    std::vector<std::uint8_t> bytes;
-};
-
-// UpdateOne 的写回执（acknowledged write concern 下由驱动给出）。
-struct MongoUpdateResult {
-    std::int64_t matched  = 0;
-    std::int64_t modified = 0;
-    std::int64_t upserted = 0;
-};
+// MongoDocument / MongoUpdateResult 的唯一实现在
+// <bbt/infra/mongo/Bson.hpp>（namespace bbt::infra::mongo）。这里保留旧名
+// 别名：既有调用点与 `MongoDocument{{0x05, ...}}` 聚合直写不变，类型也不再
+// 有两处定义。kMongoLimits* 边界同样由 mongo/Client.hpp 提供（owner 与旧
+// client 共用同一组装配上限），旧名的 using 声明一并保留。
+using mongo::MongoDocument;
+using mongo::MongoUpdateResult;
+using mongo::kMongoLimitsMaxQueue;
+using mongo::kMongoLimitsMaxTimeout;
+using mongo::kMongoLimitsMaxWorkerThreads;
 
 // CoMongoCli 装配参数（Issue #7 旧契约，保留兼容）。本切片一个
 // client 绑定一个 db.collection，内部由独占的 mongo owner

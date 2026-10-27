@@ -23,3 +23,12 @@ if(TARGET bbt::infra_redis AND TARGET bbt::infra_mongo)
         bbt::infra_redis bbt::infra_mongo Threads::Threads)
     target_compile_options(Example_redis_mongo_shape PRIVATE -Wall -Wextra)
 endif()
+
+# Mongo 公开 target 消费示例（Mongo 适配迁移）：只链接 bbt::infra_mongo、
+# 只含公开头；真实 CRUD 由 BBT_TEST_MONGO_URI 注入的真实后端驱动，未注入时
+# 打印 skip: 并返回 77。Release CI 的全量构建给出「公开消费可编译」证据。
+# ctest 注册在 tests/CMakeLists.txt——examples/ 早于 include(CTest) 处理，
+# 此处 add_test 不会被 enable_testing() 生效。
+if(TARGET bbt::infra_mongo)
+    add_subdirectory(mongo_client)
+endif()

@@ -120,6 +120,7 @@ if(BBT_MONGOCXX_PREFIX)
     # mongo::mongocxx_shared 等 IMPORTED target 由顶层 find_package 提供
     # （目录级可见性，见根 CMakeLists.txt 的接入注释）。
     add_library(bbt_infra_mongo STATIC
+        mongo/Bson.cc
         mongo/MongoDetail.cc
         mongo/MongoProcess.cc
         mongo/MongoRuntime.cc)

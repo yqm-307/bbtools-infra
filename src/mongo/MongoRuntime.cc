@@ -591,8 +591,8 @@ result<MongoOpOutcome> CollSubmit(
 
 } // namespace
 
-result<void> MongoCollImpl::InsertOne(const MongoDocument& doc,
-                                      const CallOptions&   options) {
+bbt_co_async(result<void>) MongoCollImpl::InsertOne(
+    const MongoDocument& doc, const CallOptions& options) {
     if (doc.bytes.empty())
         return result<void>::err(InvalidArg("mongo InsertOne: empty document"));
     auto r = CollSubmit(shared_from_this(), MongoOp::Kind::InsertOne,
@@ -602,7 +602,7 @@ result<void> MongoCollImpl::InsertOne(const MongoDocument& doc,
     return result<void>::ok();
 }
 
-result<std::optional<MongoDocument>> MongoCollImpl::FindOne(
+bbt_co_async(result<std::optional<MongoDocument>>) MongoCollImpl::FindOne(
     const MongoDocument& filter, const CallOptions& options) {
     if (filter.bytes.empty())
         return result<std::optional<MongoDocument>>::err(
@@ -616,7 +616,7 @@ result<std::optional<MongoDocument>> MongoCollImpl::FindOne(
         std::move(r).value().doc);
 }
 
-result<MongoUpdateResult> MongoCollImpl::UpdateOne(
+bbt_co_async(result<MongoUpdateResult>) MongoCollImpl::UpdateOne(
     const MongoDocument& filter, const MongoDocument& update,
     const CallOptions& options) {
     if (filter.bytes.empty())
@@ -636,7 +636,7 @@ result<MongoUpdateResult> MongoCollImpl::UpdateOne(
     return result<MongoUpdateResult>::ok(out);
 }
 
-result<std::uint64_t> MongoCollImpl::DeleteOne(
+bbt_co_async(result<std::uint64_t>) MongoCollImpl::DeleteOne(
     const MongoDocument& filter, const CallOptions& options) {
     if (filter.bytes.empty())
         return result<std::uint64_t>::err(
