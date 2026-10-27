@@ -56,17 +56,20 @@
 
 ## 本地验证
 
-本地必走冒烟 + 本次开发功能的单测 + 直接耦合功能的单测；本地不跑全量，全量走 PR CI。新 configure 加 `-DCMAKE_CXX_COMPILER_LAUNCHER=ccache`。本地并发按 `max(2, nproc/4)`，增量限定 `--target`；禁止 bare `--parallel`、bare `ninja` 或 `make -j$(nproc)`。
+本地必走冒烟 + 本次开发功能的单测 + 直接耦合功能的单测；本地不跑全量，全量走 PR CI。新 configure 加 `-DCMAKE_CXX_COMPILER_LAUNCHER=ccache`。增量限定 `--target`；禁止 bare `--parallel`、bare `ninja` 或 `make -j$(nproc)`。
+
+本地编译固定最多 2 个并行任务，增量与全量均适用，显式写 `--parallel 2` 或 `-j2`，不按逻辑核数放大。宿主是 12 核 / 15 GiB 的共享 WSL，编译峰值吃内存而非 CPU：按核数推导的并发会让单次构建耗尽内存，并把同机并行工作的其他 agent 一起卡死。并发是内存预算，不是吞吐调优。
 
 下面是命令模板，必须替换目录和实际目标；模板不是对任意模块的已运行证明。Redis 的具体配置与消费命令见[模块文档](redis-net.md#构建和消费)，其他模块查各自入口。
 
 ```bash
-JOBS=$(( $(nproc) / 4 )); test "$JOBS" -ge 2 || JOBS=2
-cmake --build <private-build> --target <affected-targets> --parallel "$JOBS"
+cmake --build <private-build> --target <affected-targets> --parallel 2
 ctest --test-dir <private-build> -j1 -R '<affected-tests>' --output-on-failure --no-tests=error
 ```
 
-确需本地全量时，沿用互斥锁 `/tmp/bbt-build.lock`，一次一个构建，以 `flock` 持锁并使用 `--parallel $(( $(nproc) / 2 ))`；这是例外，不把每次交付变成本地全量。纯文档修改做 `git diff --check`、链接/事实核对和适用审查，无需为文档重跑产品测试。上述代码块为参数模板，未作为一条完整命令执行。
+同机多个 agent 时，构建、测试、profile 与 perf 复用宿主既有队列 `/tmp/bbt-build.lock`（`flock` 持锁执行），不各建锁或队列；找不到入口先查清，不直接并行启动重任务。确需本地全量同样走该锁，一次一个构建，并仍限 `--parallel 2`；这是例外，不把每次交付变成本地全量。队列只保证互斥，不提供内存硬隔离。
+
+重任务启动前检查可用内存与既有任务；一次只运行一个重任务，内存不足则等待或报告阻塞，不靠反复重试、增加 swap 或清空缓存推进。纯文档修改做 `git diff --check`、链接/事实核对和适用审查，无需为文档重跑产品测试。上述代码块为参数模板，未作为一条完整命令执行。
 
 新增目标或测试须核对 **构建选项 → 实际构建目标 → CTest 注册集合 → 实跑结果 → CI 执行路径**。注册、执行和预期范围须一致，跳过或缺项按验收条件处理并明确列出。没有进入 workflow 的路径，即使已有 CI 全绿也仍是未覆盖；CI 接线变更另行确认，不在文档中宣称已完成。
 

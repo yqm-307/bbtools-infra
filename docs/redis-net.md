@@ -12,9 +12,8 @@ cmake -S . -B <private-build> \
   -DBBT_INFRA_REDIS_NET=ON \
   -DBBT_COROUTINE_SOURCE_DIR=<coroutine-source-at-cmake/coroutine.sha> \
   -DBBT_HIREDIS_PREFIX=<hiredis-private-prefix> -DBUILD_TESTING=ON
-JOBS=$(( $(nproc) / 4 )); test "$JOBS" -ge 2 || JOBS=2
 cmake --build <private-build> --target Test_redis_net_contract redis_net_example \
-  bbt_infra_redis_net_header_selfcheck --parallel "$JOBS"
+  bbt_infra_redis_net_header_selfcheck --parallel 2
 ctest --test-dir <private-build> -j1 -R '^redis\.net\.' --output-on-failure
 ```
 

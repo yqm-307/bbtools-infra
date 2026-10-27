@@ -172,8 +172,7 @@ case 作用域 → 业务资源显式 close/join（socket/listener/owner loop、
 本地命令示例（独占构建目录，新 configure 必加 ccache）：
 
 ```sh
-JOBS=$(( $(nproc) / 4 )); [ "$JOBS" -ge 2 ] || JOBS=2
-cmake --build build-r2 --target Test_net_r2 --parallel "$JOBS"
+cmake --build build-r2 --target Test_net_r2 --parallel 2
 ctest --test-dir build-r2 -R '^net\.r2_raw_roundtrip$' --output-on-failure
 ```
 
