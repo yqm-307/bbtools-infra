@@ -487,6 +487,7 @@ if(BBT_PROTOBUF_PREFIX)
         POSITION_INDEPENDENT_CODE ON)
 endif()
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/AsyncMisuseErrors.cmake")
 add_subdirectory(src)
 
 # Issue #27：最小真实消费示例（examples/）；不影响库目标与测试注册。
