@@ -46,7 +46,7 @@ RES_DEPS = os.path.join(WORKTREE, "scripts", "prepare_resource_deps.sh")
 REDIS_LIVE = os.path.join(WORKTREE, "tests", "redis-live", "run.sh")
 MONGO_LIVE = os.path.join(WORKTREE, "tests", "mongo-live", "run.sh")
 
-CALLEE_SHA = "1c0b0fb0ebc8e7ca3888aa4f6a74d1baecf08cc7"
+CALLEE_SHA = "ce247be9d3473432e0da6c204481ad9403c430bb"
 CALLEE = f"yqm-307/bbt-framework/.github/workflows/bbtools-classify-v1.yml@{CALLEE_SHA}"
 CHECKOUT_SHA = "11d5960a326750d5838078e36cf38b85af677262"
 SHA_PIN_RE = re.compile(r"^[^@\s]+@[0-9a-f]{40}$")
