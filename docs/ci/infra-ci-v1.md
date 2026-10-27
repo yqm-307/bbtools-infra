@@ -12,7 +12,7 @@
 fixed-SHA 的 framework 分类/结果 reusable callee：
 
 ```
-yqm-307/bbt-framework/.github/workflows/bbtools-classify-v1.yml@1c0b0fb0ebc8e7ca3888aa4f6a74d1baecf08cc7
+yqm-307/bbt-framework/.github/workflows/bbtools-classify-v1.yml@ce247be9d3473432e0da6c204481ad9403c430bb
 ```
 
 正式入口保持 `.github/workflows/ci.yml` 路径与触发面（PR→main / push→main /
