@@ -415,8 +415,14 @@ jobs:
         run: |
           set -euo pipefail
           RPC_BUILD_DIR="${BUILD_DIR}-rpc-release"
+          # cache-meta 已归一 fork/bypass；runner 无 ccache 时直接编译（不装工具）。
+          LAUNCHER=""
+          if [ "${{ steps.cache-meta.outputs.enabled }}" = "true" ] && \
+             command -v ccache >/dev/null 2>&1; then
+            LAUNCHER="-DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+          fi
           cmake -S "$GITHUB_WORKSPACE/infra" -B "$RPC_BUILD_DIR" -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_BUILD_TYPE=Release $LAUNCHER \
             -DBUILD_TESTING=ON -DBBT_INFRA_HTTP_NET=ON -DBBT_INFRA_RPC_NET=ON \
             -DBOOST_ROOT="$BOOST_PREFIX" -DCMAKE_PREFIX_PATH="$BOOST_PREFIX" \
             -DBBT_COROUTINE_SOURCE_DIR="$COROUTINE_DIR" -DBBT_PROTOBUF_PREFIX="$PROTOBUF_PREFIX"
@@ -448,8 +454,13 @@ jobs:
         run: |
           set -euo pipefail
           NO_WIRE_BUILD_DIR="${BUILD_DIR}-http-no-wire"
+          LAUNCHER=""
+          if [ "${{ steps.cache-meta.outputs.enabled }}" = "true" ] && \
+             command -v ccache >/dev/null 2>&1; then
+            LAUNCHER="-DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+          fi
           cmake -S "$GITHUB_WORKSPACE/infra" -B "$NO_WIRE_BUILD_DIR" -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_BUILD_TYPE=Release $LAUNCHER \
             -DBUILD_TESTING=ON -DBBT_INFRA_HTTP_NET=ON -DBBT_INFRA_RPC_NET=OFF \
             -DBBT_PROTOBUF_PREFIX= -DBOOST_ROOT="$BOOST_PREFIX" -DCMAKE_PREFIX_PATH="$BOOST_PREFIX" \
             -DBBT_COROUTINE_SOURCE_DIR="$COROUTINE_DIR"
@@ -692,8 +703,16 @@ jobs:
         run: |
           set -euo pipefail
           RPC_BUILD_DIR="${BUILD_DIR}-rpc-debug"
+          # 与本 job 旧模块构建同一判定：cache 开关 + 非 fork + runner 自带 ccache；
+          # 任一不满足直接编译（不装工具、不放宽测试）。
+          LAUNCHER=""
+          if [ "${{ env.CACHE_ENABLED }}" = "true" ] && \
+             [ "${{ github.event_name }}" != "pull_request" -o "${{ github.event.pull_request.head.repo.full_name }}" = "${{ github.repository }}" ] && \
+             command -v ccache >/dev/null 2>&1; then
+            LAUNCHER="-DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+          fi
           cmake -S "$GITHUB_WORKSPACE/infra" -B "$RPC_BUILD_DIR" -G Ninja \
-            -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_BUILD_TYPE=Debug $LAUNCHER \
             -DBUILD_TESTING=ON -DBBT_INFRA_HTTP_NET=ON -DBBT_INFRA_RPC_NET=ON \
             -DBOOST_ROOT="$BOOST_PREFIX" -DCMAKE_PREFIX_PATH="$BOOST_PREFIX" \
             -DBBT_COROUTINE_SOURCE_DIR="$COROUTINE_DIR" -DBBT_PROTOBUF_PREFIX="$PROTOBUF_PREFIX"
