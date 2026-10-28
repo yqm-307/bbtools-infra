@@ -533,7 +533,8 @@ jobs:
       # project（不 prune）。两套后端**拆成独立 step**，各自 timeout-minutes 大于对应脚本
       # 内界之和（计入 kill-after 宽限：redis<19min；mongo<16min），避免共享外框先于脚本内界硬杀导致
       # trap 不执行残留。code/unknown 在此必跑，任一 live 失败 → 本 job failed →
-      # result=failure（fail-closed）；docs-only 已在 job 级 if 跳过。不产出/上传 artifact。
+      # result=failure（fail-closed）；docs-only 已在 job 级 if 跳过。Redis 不产出 artifact；
+      # Mongo 仅失败时由脚本先留诊断、再由后续 upload step 上传（不改变原始失败码）。
       - name: "真实 Redis live 门禁（复用 Release 产物，有界 fail-closed）"
         timeout-minutes: 19
         run: |
@@ -561,6 +562,7 @@ jobs:
           docker image inspect redis:7-alpine --format 'redis:7-alpine id={{.Id}}' 2>/dev/null || true
 
       - name: "真实 Mongo live 门禁（复用 Release 产物，有界 fail-closed）"
+        id: mongo_live_gate
         timeout-minutes: 16
         run: |
           set -euo pipefail
@@ -580,6 +582,17 @@ jobs:
           bash "$GITHUB_WORKSPACE/infra/tests/mongo-live/run.sh" "$MONGO_BIN"
           echo "=== live 容器镜像身份（复用现 compose mongo8.0，未引入新镜像治理）==="
           docker image inspect mongo:8.0 --format 'mongo:8.0 id={{.Id}}' 2>/dev/null || true
+
+      # 仅失败上传脚本在 down -v 前采集的诊断（容器状态/日志/inspect/阶段日志）；
+      # 上传步骤不改变 run.sh 的原始退出码，也不把已失败的 job 判绿。
+      - name: "上传 Mongo live 失败诊断产物（仅失败）"
+        if: ${{ failure() && steps.mongo_live_gate.outcome == 'failure' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mongo-live-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ github.workspace }}/mongo-live-diagnostics
+          if-no-files-found: warn
+          retention-days: 7
 
   # #62 + Issue #8：Debug 定向门禁（8 项既有 + 7 项正式 RPC = 15 项，零跳过）。下载同一
   # prepared deps；不改 runner、不新增依赖下载；缺项/跳过/失败均判负。job 名保持现役

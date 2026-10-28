@@ -74,6 +74,10 @@ public:
     // 一次性屏障：connect 提交已成功 TryPost、尚未写 out_connect_id。
     // 用于确定性制造"owner 交付早于提交返回"的交错（屏障内等 owner 回调完成）。
     static void SetConnectSubmitBarrierOnce(Engine& engine, std::function<void()> barrier);
+    // 一次性屏障：owner 已占用本次 pending connect 回调预算、尚未进入
+    // StartConnectSocketOnOwner 的起点封口检查。用于确定性制造"封口发布"
+    // 与"起点撤销"的交错（验证预算归还，不靠概率复现）。
+    static void SetConnectStartBarrierOnce(Engine& engine, std::function<void()> barrier);
     // 一次性注入：本 Engine 下一次 connect 提交不投递（零接纳）。与真实 post 失败
     // 走同一段回滚；用于验证拒绝路径 out 不变且零回调。
     static void SetConnectPostFailureOnce(Engine& engine);

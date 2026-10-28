@@ -253,6 +253,27 @@ void ConnectFailureOwned() {
     std::cout << "connect_failure refused=TransportError expired=TimedOut controlled_cancel=Cancelled raw_handler=RuntimeUnavailable idle=RuntimeUnavailable\n";
 }
 
+// 封口发布与建连起点撤销的交错（确定性，不靠概率）：owner 已占用本次
+// pending connect 回调预算、尚未做起点封口检查时发布 seal。此时该次拨号
+// 不登记 pending 描述符，取消投递也找不到它；预算必须在撤销路径归还，
+// 否则 SealServiceOnOwner 永久 defer，Engine 收口对 seal 结果无上界等待。
+void SealDuringConnectStart() {
+    Host host;
+    Endpoint listener(true);
+    auto cli = host.Make(listener.address);
+    Access::SetConnectStartBarrierOnce(*host.engine, [&] {
+        // 屏障在 owner 线程内执行：此刻预算已占用、最终封口检查尚未做。
+        host.engine->RequestClose();
+    });
+    auto value = host.Call([&] { return bbt_co_await cli->Connect(Until()); });
+    CHECK(!value);
+    const int code = static_cast<int>(value.error().code);
+    cli.reset();
+    host.Finish();
+    std::cout << "seal_during_connect_start code=" << code
+              << " sealed_at_start=1 budget_returned=1 join_bounded=1\n";
+}
+
 void CloseInvalidates() {
     Host host;
     auto cli = host.Make();
@@ -741,6 +762,7 @@ int Run(int argc, char** argv) {
         else if (name == "fragmented_reply") { FragmentedReply(); }
         else if (name == "unknown_disconnect") { UnknownDisconnect(); }
         else if (name == "connect_failure_owned") { ConnectFailureOwned(); }
+        else if (name == "seal_during_connect_start") { SealDuringConnectStart(); }
         else if (name == "close_invalidates_immediately") { CloseInvalidates(); }
         else if (name == "close_idempotent") { CloseIdempotent(); }
         else if (name == "close_during_connect") { CloseDuringConnect(); }

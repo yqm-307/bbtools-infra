@@ -322,6 +322,22 @@ public:
         std::lock_guard<std::mutex> lock(m_auth_barrier_mutex);
         m_pre_auth_barrier = std::move(barrier);
     }
+    void SetConnectStartBarrier(std::function<void()> barrier) {
+        std::lock_guard<std::mutex> lock(m_connect_start_barrier_mutex);
+        m_connect_start_barrier = std::move(barrier);
+    }
+    // owner 已占用本次 pending connect 回调预算、尚未做起点封口检查时调用。
+    void InvokeConnectStartBarrier() {
+        std::function<void()> barrier;
+        {
+            std::lock_guard<std::mutex> lock(m_connect_start_barrier_mutex);
+            barrier = std::move(m_connect_start_barrier);
+            m_connect_start_barrier = {};
+        }
+        if (barrier) {
+            barrier();
+        }
+    }
     void SetPostAuthBarrier(std::function<void()> barrier) {
         std::lock_guard<std::mutex> lock(m_auth_barrier_mutex);
         m_post_auth_barrier = std::move(barrier);
@@ -434,6 +450,8 @@ private:
     std::function<void()> m_write_ready_barrier;  // 写泵持锁前（一次性）
     std::mutex m_submit_barrier_mutex;
     std::function<void()> m_submit_barrier;  // 私有 test 屏障（一次性）
+    std::mutex m_connect_start_barrier_mutex;
+    std::function<void()> m_connect_start_barrier;  // 建连起点/封口检查前（一次性）
     std::mutex m_auth_barrier_mutex;
     std::function<void()> m_pre_auth_barrier;
     std::function<void()> m_post_auth_barrier;
@@ -1689,6 +1707,7 @@ void Reactor::BeginConnectOnOwner(const Address& address, std::uint64_t connect_
 
 void Reactor::StartConnectSocketOnOwner(const Address& address, std::uint64_t connect_id,
                                         const std::shared_ptr<ReclaimRecord>& reclaim) {
+    InvokeConnectStartBarrier();  // 测试：已在起点、尚未做最终封口检查
     if (m_sealed.load() || m_impl->IsSealed()) {
         // 未创建 fd：责任即时收口。
         MarkReclaimReleased(reclaim);
@@ -1700,6 +1719,11 @@ void Reactor::StartConnectSocketOnOwner(const Address& address, std::uint64_t co
         }
         m_impl->ResolveConnect(connect_id, Connection(),
                                std::make_error_code(std::errc::operation_canceled));
+        // 两个调用方（定时器路径与直通路径）都已先占用一次 pending connect
+        // 回调预算；本路径从未登记 pending 描述符，seal 只能等预算归零，
+        // 因此必须在此归还，否则 SealServiceOnOwner 永久 defer、Run 收口
+        // 无限等待。
+        FinishConnectCallback();
         return;
     }
     std::error_code error;
@@ -2954,6 +2978,19 @@ void EngineTestAccess::SetConnectLimit(Engine& engine, std::size_t limit) {
 std::size_t EngineTestAccess::ConnectTableSize(Engine& engine) {
     std::lock_guard<std::mutex> lock(engine.m_impl->connect_mutex);
     return engine.m_impl->connects.size();
+}
+
+void EngineTestAccess::SetConnectStartBarrierOnce(Engine& engine,
+                                                  std::function<void()> barrier) {
+    auto impl = engine.m_impl;
+    std::vector<std::shared_ptr<Reactor>> reactors;
+    {
+        std::lock_guard<std::mutex> lock(impl->mutex);
+        reactors = impl->reactors;
+    }
+    for (auto& reactor : reactors) {
+        reactor->SetConnectStartBarrier(barrier);
+    }
 }
 
 std::size_t EngineTestAccess::PendingConnectCount(Engine& engine) {

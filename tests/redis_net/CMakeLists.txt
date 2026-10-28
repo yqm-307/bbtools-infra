@@ -5,7 +5,7 @@ target_compile_options(Test_redis_net_contract PRIVATE -Wall -Wextra -Wpedantic)
 target_link_options(Test_redis_net_contract PRIVATE
     -Wl,--wrap=redisReaderCreate -Wl,--wrap=redisReaderFree
     -Wl,--wrap=redisReaderGetReply -Wl,--wrap=redisReaderFeed)
-foreach(_case connect_failure_owned close_invalidates_immediately close_idempotent
+foreach(_case connect_failure_owned seal_during_connect_start close_invalidates_immediately close_idempotent
         close_during_connect close_pending_command_once handle_destroy_late_callback
         shared_engine_isolation host_drain_no_residue set_get_remote_error
         fragmented_reply unknown_disconnect framing_and_faults
