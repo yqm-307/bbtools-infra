@@ -39,6 +39,7 @@
 #include <bbt/infra/net/Error.hpp>
 #include <bbt/infra/net/Types.hpp>
 #include <bbt/infra/net/detail/OutboundQueue.hpp>
+#include <bbt/infra/net/detail/ReclaimRecord.hpp>
 #include <bbt/infra/net/detail/ReceiveRing.hpp>
 #include <bbt/infra/net/detail/WakeHub.hpp>
 
@@ -62,15 +63,31 @@ struct CompletedWrite {
 
 class ConnectionState {
 public:
+    // owner_released：本连接物理收口的共享释放记录。Engine 采用路径传入活跃
+    // 记录（released=false，责任存活到 fd 真实关闭且 owner 清理）；带句柄
+    // CoDial 传入本次预分配的同一记录（与 ReclaimReceipt 同终态）。缺省（如
+    // detail 单测的独立 state）从无 backend fd，视为已无责任。
     ConnectionState(std::uint64_t id, std::size_t inbound_max, std::size_t outbound_max,
-                    std::size_t max_ops, std::shared_ptr<std::atomic<bool>> service_sealed)
+                    std::size_t max_ops, std::shared_ptr<std::atomic<bool>> service_sealed,
+                    std::shared_ptr<ReclaimRecord> owner_released = {})
         : m_id(id),
           ring(inbound_max),
           m_queue(std::min<std::size_t>(outbound_max, 64 * 1024), outbound_max, max_ops),
           m_outbound_max(outbound_max),
           m_max_ops(max_ops),
-          m_service_sealed(std::move(service_sealed)) {
+          m_service_sealed(std::move(service_sealed)),
+          m_owner_released(owner_released ? std::move(owner_released)
+                                          : std::make_shared<ReclaimRecord>(true)) {
         m_pending_terminal.set_capacity(std::max<std::size_t>(1, max_ops));
+    }
+
+    // ---- 物理回收观察 ----
+    bool OwnerReleased() const noexcept {
+        return m_owner_released->released.load(std::memory_order_acquire);
+    }
+    // 仅 owner/控制域在 fd 真实关闭且本连接责任清理后调用；幂等。
+    void MarkOwnerReleased() noexcept {
+        m_owner_released->released.store(true, std::memory_order_release);
     }
 
     const std::uint64_t m_id;
@@ -450,6 +467,7 @@ private:
     std::error_code m_close_reason;
     boost::circular_buffer<CompletedWrite> m_pending_terminal;
     std::shared_ptr<std::atomic<bool>> m_service_sealed;
+    std::shared_ptr<ReclaimRecord> m_owner_released;
     WakeHub m_write_hub;
     WakeHub m_close_hub;
 };

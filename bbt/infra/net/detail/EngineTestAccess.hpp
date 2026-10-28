@@ -46,6 +46,9 @@ public:
     // 用于确定性制造「Busy → 读者释放 → deferred 成功」的交错。
     static void SetAppendBusyHook(Engine& engine, std::function<void()> hook);
     // 单次 seal post 失败注入（验证 Run 保持 Closing、不伪 Stopped）。
+    static void SetAcceptWaiterHook(Engine& engine, std::function<void()> registered);
+    // 下一次 listener stop post 零接纳，hook 在 posted latch 释放之前观察物理状态。
+    static void SetAcceptStopPostFailureOnce(Engine& engine, std::function<void()> after_failure);
     static void SetSealPostFailureOnce(Engine& engine);
     // 私有 test：seal handler 抛一次（验证 Run 走真实错误出口、不永久挂）。
     static void SetSealThrowOnce(Engine& engine);

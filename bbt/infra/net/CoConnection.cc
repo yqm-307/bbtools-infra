@@ -10,6 +10,7 @@
 
 #include <bbt/infra/net/detail/CoInternal.hpp>
 #include <bbt/infra/net/detail/ConnectionState.hpp>
+#include <bbt/infra/net/detail/ReclaimRecord.hpp>
 #include <bbt/infra/net/detail/TestAccess.hpp>
 
 // 实现放 .cc：Co 入口需要连接内部状态、Engine 私有等待步骤与统一 gate，
@@ -93,9 +94,18 @@ std::shared_ptr<ConnectionState> CoAccess::StateOf(const Connection& connection)
 }
 
 std::error_code CoAccess::SubmitConnect(Engine& engine, const Address& address,
-                                       std::uint64_t& out_connect_id)
+                                       std::uint64_t& out_connect_id,
+                                       const std::shared_ptr<ReclaimRecord>& reclaim)
 {
+    if (reclaim) {
+        return engine.CoSubmitConnect(address, out_connect_id, reclaim);
+    }
     return engine.CoSubmitConnect(address, out_connect_id);
+}
+
+ReclaimReceipt CoAccess::MakeReceipt(std::shared_ptr<ReclaimRecord> record)
+{
+    return ReclaimReceipt(std::move(record));
 }
 
 std::error_code CoAccess::WaitConnect(Engine& engine, std::uint64_t connect_id, Connection& out,
@@ -315,12 +325,29 @@ std::error_code CoAccept(Engine& engine, Connection& out,
 std::error_code CoDial(Engine& engine, const Address& address, Connection& out,
                        const bbt::coroutine::WaitOptions& options)
 {
+    // 原重载转发：同一门禁/提交/等待首胜语义；内部责任记录丢弃（无观察者）。
+    ReclaimReceipt ignored;
+    return CoDial(engine, address, out, ignored, options);
+}
+
+std::error_code CoDial(Engine& engine, const Address& address, Connection& out,
+                       ReclaimReceipt& receipt,
+                       const bbt::coroutine::WaitOptions& options)
+{
+    // 每次调用先重置为本次：提交前拒绝（上下文/配置/容量）保持无效句柄，
+    // Released()=true 表示无已提交资源责任。
+    receipt = ReclaimReceipt{};
     if (const auto gate = RequireCoroutineContext()) {
         return gate;
     }
+    // 提交前预分配共享释放记录：一旦接纳，无论超时/取消/未交付/Close 竞态，
+    // 记录都随提交流经 owner 各真实 close 点，描述本次物理 socket 责任。
+    auto record = std::make_shared<ReclaimRecord>(false);
     std::uint64_t id = 0;
-    // 提交即登记接收意图；提交失败零副作用，无需回收。
-    if (const auto error = CoAccess::SubmitConnect(engine, address, id)) {
+    // 提交即登记接收意图；提交失败零副作用（回滚同步完成，无存活 socket）。
+    if (const auto error = CoAccess::SubmitConnect(engine, address, id, record)) {
+        record->released.store(true, std::memory_order_release);
+        receipt = ReclaimReceipt{};
         return error;
     }
     if (auto& barrier = DialBarrierForTest()) {
@@ -330,9 +357,13 @@ std::error_code CoDial(Engine& engine, const Address& address, Connection& out,
     const auto error = CoAccess::WaitConnect(engine, id, result, options);
     if (error) {
         // 领取失败的全部路径（等待建立失败、登记满、非法域/运行时不可用、
-        // 超时/取消）已在 CoWaitConnect 内归还 claim 并让 owner 回收未交付 fd。
+        // 超时/取消）已在 CoWaitConnect 内归还 claim 并让 owner 回收未交付 fd；
+        // 句柄保持有效，Released() 由 owner 回收路径最终置位，可观察收口。
+        receipt = CoAccess::MakeReceipt(std::move(record));
         return error;
     }
+    // 成功交付：记录已随连接转入 owner 责任，句柄与该连接回收同终态。
+    receipt = CoAccess::MakeReceipt(std::move(record));
     out = std::move(result);
     return {};
 }

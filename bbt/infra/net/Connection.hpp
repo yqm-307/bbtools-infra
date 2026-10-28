@@ -28,6 +28,32 @@ namespace bbt::infra::net {
 
 class ConnectionState;
 struct WriteOpRecord;
+struct ReclaimRecord;  // detail：物理回收共享释放记录，布局不出公共面
+struct CoAccess;       // detail：Co 内部步骤门面（唯一内部构造入口）
+
+// 一次带句柄 CoDial 的物理回收观察句柄（值语义，默认无效）：
+//   - 无效句柄 Released()=true：没有已提交资源责任（默认构造，或本次调用在
+//     上下文/提交前被拒绝）。
+//   - 有效句柄 Released()=false：本次建连/物理 socket 责任仍存活——排队、
+//     建连中、已连接未交付或已交付连接尚未物理收口。
+//   - 有效句柄 Released()=true：本次 fd 已真实关闭且 owner 资源责任清理
+//     （未交付失败由 owner 回收收口；成功交付则与该连接 Released 同终态）。
+// 句柄只观察：不等待、不取消、不收回；寿命不延长 socket/Engine，也不与
+// Engine 成环——持句柄不阻碍 Engine 回收物理资源。不是 Future/等待平台。
+class ReclaimReceipt {
+public:
+    ReclaimReceipt() = default;
+
+    bool Valid() const noexcept;
+    bool Released() const noexcept;
+
+private:
+    // 内部构造：只有带句柄 CoDial 凭本次提交的共享记录构造有效句柄。
+    friend struct CoAccess;
+    explicit ReclaimReceipt(std::shared_ptr<ReclaimRecord> record);
+
+    std::shared_ptr<ReclaimRecord> m_record;
+};
 
 // 单次已接纳发送的观察句柄：持操作记录，终态在句柄寿命内永久可查；
 // 释放句柄不取消已接纳发送。不是通用 Future/Task 平台。
@@ -76,6 +102,11 @@ public:
 
     bool Closed() const;
     std::error_code CloseReason() const;
+
+    // 物理回收观察：无效句柄=true；有效句柄仅底层 fd 已物理关闭且 owner 对
+    // 本连接的资源责任清理后为 true。Closed() 是逻辑接纳终态（可能先于物理
+    // 收口，如请求封口后 fd 仍在 owner 手中）；Released() 不取代 Closed()。
+    bool Released() const noexcept;
 
     // 请求封口：立即拒绝新写并唤 owner；物理 fd 关闭、已 recv 尾部入真源、
     // 最终读 EOF 与 OnClose 由 owner 兑现。请求后读侧可能短暂 WouldBlock，

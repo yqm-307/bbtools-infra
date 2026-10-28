@@ -118,6 +118,49 @@ foreach(_case ring_alloc_no_consume ring_release_notify hub_early_notify_retaine
     set_tests_properties(net.b4_${_case} PROPERTIES TIMEOUT 45)
 endforeach()
 
+# 物理回收观察句柄契约：ReclaimReceipt / Connection::Released / 带句柄 CoDial。
+# 未交付窗口由 delivery-delay seam 与服务端真实 accept 证明，不靠固定 sleep。
+add_executable(Test_net_reclaim_receipt reclaim_receipt.cc)
+target_link_libraries(Test_net_reclaim_receipt PRIVATE bbt::infra_net Boost::headers)
+target_compile_options(Test_net_reclaim_receipt PRIVATE -Wall -Wextra -Wpedantic)
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/runtime")
+foreach(_case receipt_invalid_default codial_success_close_released
+        codial_timeout_undelivered dial_refused_released dial_pre_submit_rejections
+        released_not_before_physical_close engine_stop_releases driver_failed_releases driver_failed_live_fd)
+    add_test(NAME net.reclaim_${_case} COMMAND Test_net_reclaim_receipt ${_case})
+    set_tests_properties(net.reclaim_${_case} PROPERTIES TIMEOUT 60
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/runtime")
+endforeach()
+
+# 接纳独立封口（net.stop_*）：真实 listener 物理关闭后才 stopped、已交付连接
+# 双向读写继续、CoAccept 被唤醒并取消、Run 前/Starting 封口不重开、重复并发、
+# client-only 拨号继续、Failed 与最终 RequestClose 收口、未交付 handoff 回收。
+add_executable(Test_net_accept_stop net_accept_stop.cc)
+target_link_libraries(Test_net_accept_stop PRIVATE bbt::infra_net Boost::headers)
+target_compile_options(Test_net_accept_stop PRIVATE -Wall -Wextra -Wpedantic)
+target_link_options(Test_net_accept_stop PRIVATE -rdynamic)
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/runtime")
+foreach(_case stop_running_delivered_conn_rw stop_wakes_coaccept_waiters
+        stop_late_coaccept_rejected stop_before_run_no_listener
+        stop_client_only_dial_continues stop_client_only_before_run stop_post_failure_retry stop_repeat_and_concurrent
+        stop_during_starting_race stop_with_driver_failed
+        stop_undelivered_handoff_reclaimed)
+    add_test(NAME net.stop_${_case} COMMAND Test_net_accept_stop ${_case})
+    set_tests_properties(net.stop_${_case} PROPERTIES TIMEOUT 120
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/runtime")
+endforeach()
+
+# F0 回归：已 accept 但未交付的 fd 在停止竞态下必须被物理关闭（--wrap=syscall）。
+# 独立 target，避免将 wrapped syscall 带入其它 net 测试进程。
+add_executable(net_accept_stop_fd net_accept_stop_fd.cc)
+target_link_libraries(net_accept_stop_fd PRIVATE bbt::infra_net Boost::headers)
+target_compile_options(net_accept_stop_fd PRIVATE -Wall -Wextra -Wpedantic)
+target_link_options(net_accept_stop_fd PRIVATE -rdynamic -Wl,--wrap=syscall)
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/runtime")
+add_test(NAME net.stop_fd_regression COMMAND net_accept_stop_fd)
+set_tests_properties(net.stop_fd_regression PROPERTIES TIMEOUT 120
+    WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/runtime")
+
 # 接收路径确定性交错（Boost.Test + 产品内置接缝）：
 # 验证 pending 未合入前的 recv 不得越过它。用 EngineTestAccess::SetAppendBusyHook
 # 在 TryAppend Busy 与 AppendDeferred 之间取得控制权，取代此前仓外复制 Engine.cc

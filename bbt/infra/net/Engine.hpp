@@ -53,6 +53,7 @@ struct EngineConfig {
 };
 
 struct EngineImpl;  // 定义在 Engine.cc
+struct ReclaimRecord;  // detail：物理回收共享释放记录（带句柄 CoDial 内部传递）
 
 class EngineTestAccess;
 struct CoAccess;
@@ -112,6 +113,21 @@ public:
     // handoff 队列；两个读取者并存时只保证线性化的字节前缀，不自动路由。
     std::error_code EnableAcceptHandoff(std::size_t capacity);
 
+    // 仅封监听/交接授权的停止：任意线程、非阻塞、幂等、不可重新打开。
+    // 只封本代 listener/handoff：不封已交付连接的 CoRead/CoWrite，不封 CoDial，
+    // 不停 driver，不调用 RequestClose/SealService，不改已交付连接；Run 后
+    // 已交付连接双向读写继续可用，最后由宿主另行 RequestClose 与 join。
+    // 请求本身不是物理关闭凭据：AcceptingStopped 为 true 才表示本代全部
+    // listener 已由 owner 真实 close（或 Failed 同代同步解绑后由控制域收口）、
+    // handoff 已封口且等待者已唤醒。Run 前请求不允许随后新开监听；反复/并发
+    // 请求不重开。
+    void RequestStopAccepting() noexcept;
+
+    // 默认 false。本代全部 listener 已物理关闭、handoff 已封口、等待者已唤醒
+    // 时为 true；只证明 listener 停止，不证明全部已交付/未交付 fd 或业务
+    // 任务已释放（后者仍走 Connection::Released 与 Engine 最终收口）。
+    bool AcceptingStopped() const noexcept;
+
 private:
     friend class EngineTestAccess;
     friend struct CoAccess;
@@ -120,6 +136,10 @@ private:
     // 两段式建连是 CoDial 的内部细节：提交（登记接收意图）与领取（等待结果）。
     // 不公开，避免冻结一个无法放弃的中间 ID。
     std::error_code CoSubmitConnect(const Address& address, std::uint64_t& out_connect_id);
+    // 带责任记录的提交（带句柄 CoDial 专用）：记录随提交流经 owner 各真实
+    // close/转交点；未交付失败由 owner 回收路径收口该记录。
+    std::error_code CoSubmitConnect(const Address& address, std::uint64_t& out_connect_id,
+                                    const std::shared_ptr<ReclaimRecord>& reclaim);
     // 领取：仅成功的本次结果交付 out；失败不改 out，且必须由本函数内部
     // 归还 claim/登记责任并让 owner 回收未交付 fd。
     std::error_code CoWaitConnect(std::uint64_t connect_id, Connection& out,
