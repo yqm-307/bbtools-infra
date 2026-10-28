@@ -38,6 +38,7 @@
 #include <bbt/infra/net/detail/DriverBinder.hpp>
 #include <bbt/infra/net/detail/OptionsNormalize.hpp>
 #include <bbt/infra/net/detail/ReactorDriver.hpp>
+#include <bbt/infra/net/detail/ReclaimRecord.hpp>
 #include <bbt/infra/net/detail/ReceiveRing.hpp>
 #include <bbt/infra/net/detail/WakeHub.hpp>
 
@@ -69,6 +70,13 @@ int GetSocketError(int fd) {
         return errno;
     }
     return value;
+}
+
+// 建连责任收口：仅在各真实 close 点（或确认无 fd 创建）之后调用；幂等。
+void MarkReclaimReleased(const std::shared_ptr<ReclaimRecord>& record) {
+    if (record) {
+        record->released.store(true, std::memory_order_release);
+    }
 }
 
 ssize_t SendViewsRaw(int fd, const std::string_view* views, std::size_t count,
@@ -122,6 +130,13 @@ public:
         const int fd = m_fd;
         m_fd = -1;
         return fd;
+    }
+    // 显式物理 close 点：责任转移/失败收口前调用，使「记录释放」晚于真实关闭。
+    void Close() noexcept {
+        if (m_fd >= 0) {
+            ::close(m_fd);
+            m_fd = -1;
+        }
     }
 
 private:
@@ -234,16 +249,23 @@ public:
 
     // owner 封服务 / 控制域冻结 / 解绑后释放 driver。
     void SealServiceOnOwner(std::function<void()> on_done = {});
+    // 接收域独立封口：撤该 owner 的全部 listener 并物理关闭 fd；不触已交付
+    // 连接，也不停 driver。未绑 owner 时直接视为已停止。
+    void StopAcceptingOnOwner();
     void FinishConnectCallback();
     void FinalizeControl();
     void ReleaseDriver();
 
-    // owner：从 native fd 接管（handoff / connect 完成）。
+    // owner：从 native fd 接管（handoff / connect 完成）。reclaim 是带句柄
+    // CoDial 的本次责任记录（accept/raw 路径为空，采用时另建活跃记录）。
     void AdoptFdOnOwner(FdHandle fd, bool is_connect, std::uint64_t connect_id,
                         std::shared_ptr<HandoffReservation> reservation,
-                        bool delayed_delivery = false);
-    void BeginConnectOnOwner(const Address& address, std::uint64_t connect_id);
-    void StartConnectSocketOnOwner(const Address& address, std::uint64_t connect_id);
+                        bool delayed_delivery = false,
+                        const std::shared_ptr<ReclaimRecord>& reclaim = {});
+    void BeginConnectOnOwner(const Address& address, std::uint64_t connect_id,
+                             const std::shared_ptr<ReclaimRecord>& reclaim = {});
+    void StartConnectSocketOnOwner(const Address& address, std::uint64_t connect_id,
+                                   const std::shared_ptr<ReclaimRecord>& reclaim = {});
     void CancelAllRequestedOnOwner();
 
     void MarkDirty(const std::shared_ptr<ConnCore>& core);
@@ -299,6 +321,22 @@ public:
     void SetPreAuthBarrier(std::function<void()> barrier) {
         std::lock_guard<std::mutex> lock(m_auth_barrier_mutex);
         m_pre_auth_barrier = std::move(barrier);
+    }
+    void SetConnectStartBarrier(std::function<void()> barrier) {
+        std::lock_guard<std::mutex> lock(m_connect_start_barrier_mutex);
+        m_connect_start_barrier = std::move(barrier);
+    }
+    // owner 已占用本次 pending connect 回调预算、尚未做起点封口检查时调用。
+    void InvokeConnectStartBarrier() {
+        std::function<void()> barrier;
+        {
+            std::lock_guard<std::mutex> lock(m_connect_start_barrier_mutex);
+            barrier = std::move(m_connect_start_barrier);
+            m_connect_start_barrier = {};
+        }
+        if (barrier) {
+            barrier();
+        }
     }
     void SetPostAuthBarrier(std::function<void()> barrier) {
         std::lock_guard<std::mutex> lock(m_auth_barrier_mutex);
@@ -392,6 +430,9 @@ private:
     std::atomic<bool> m_sealed{false};
     std::vector<std::shared_ptr<Listener>> m_listeners;
     std::vector<std::shared_ptr<ConnectPending>> m_pending_connects;  // owner-only
+    // 已建连、交付定时器仍捕获的 fd；正常由 owner 消费，解绑后由控制域显式关。
+    // 不能靠 driver/context 最后一个强引用析构来证明物理关闭。
+    std::vector<std::shared_ptr<FdHandle>> m_delivery_fds;
     std::mutex m_mutex;
     std::unordered_map<std::uint64_t, std::shared_ptr<ConnCore>> m_conns;
     std::mutex m_dirty_mutex;
@@ -409,6 +450,8 @@ private:
     std::function<void()> m_write_ready_barrier;  // 写泵持锁前（一次性）
     std::mutex m_submit_barrier_mutex;
     std::function<void()> m_submit_barrier;  // 私有 test 屏障（一次性）
+    std::mutex m_connect_start_barrier_mutex;
+    std::function<void()> m_connect_start_barrier;  // 建连起点/封口检查前（一次性）
     std::mutex m_auth_barrier_mutex;
     std::function<void()> m_pre_auth_barrier;
     std::function<void()> m_post_auth_barrier;
@@ -425,6 +468,19 @@ public:
           m_desc(std::move(descriptor)),
           m_owner(owner),
           m_handler(std::move(handler)) {}
+
+    ~ConnCore() {
+        // 兜底收口：正常路径 ShutdownOwner/CancelControl 已关闭 backend 并标记
+        // 释放；若核心仍带未关 fd 被析构（异常/收口竞态），这里显式关闭并标记，
+        // 不把「released」留给 native 对象析构的隐式时序。
+        if (!m_backend_closed) {
+            boost::system::error_code ignored;
+            m_desc.cancel(ignored);
+            m_desc.close(ignored);
+            m_backend_closed = true;
+        }
+        m_state->MarkOwnerReleased();
+    }
 
     const std::shared_ptr<ConnectionState>& State() const { return m_state; }
     std::size_t RecvHold() const { return m_recv_hold.load(std::memory_order_acquire); }
@@ -524,6 +580,9 @@ public:
             m_onclose_done = true;
         }
         m_closed = true;
+        // fd 已在上方 m_desc.close() 物理关闭，终态与 OnClose 责任已兑现：
+        // 此刻起本连接无存活物理资源责任。
+        m_state->MarkOwnerReleased();
     }
 
     // 控制域（解绑后）：关闭 fd、冻结状态、唤醒内部等待者，不调用户回调。
@@ -545,6 +604,8 @@ public:
             m_ring_closed = true;
         }
         m_closed = true;
+        // 控制域不调用户回调：fd 已物理关闭且内部责任收口，标记释放。
+        m_state->MarkOwnerReleased();
     }
 
 private:
@@ -816,6 +877,15 @@ struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
     std::atomic<std::uint64_t> next_connect_id{1};
     std::atomic<std::size_t> conn_count{0};
 
+    // 仅封监听/交接授权的停止：由 RequestStopAccepting 置位的不可逆 latch；
+    // accept_stop_done 仅在 owner 物理关闭全部本代 listener（或控制域同代
+    // 解绑后确认无 listener）后置位，才作为 AcceptingStopped 的凭据。
+    std::atomic<bool> accept_stop_requested{false};
+    std::atomic<bool> accept_stop_posted{false};
+    std::atomic<bool> accept_stop_done{false};
+    std::atomic<bool> accept_stop_post_fail_once{false};
+    std::function<void()> accept_stop_failure_hook; // 仅测试，运行前装配
+
     std::size_t max_inbound_bytes{1024 * 1024};
     std::size_t max_outbound_bytes{1024 * 1024};
     std::size_t max_ops{1024};
@@ -846,6 +916,7 @@ struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
     bool handoff_closed{false};
     std::atomic<bool> resume_pending{false};
     WakeHub accept_hub;
+    std::function<void()> accept_waiter_hook; // 私有测试，消费前装配
 
     struct ConnectOp {
         std::mutex mutex;
@@ -857,6 +928,9 @@ struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
         std::atomic<bool> cancel_requested{false};
         bool owner_delivering{false};  // owner 已进入授权交付段（seal 不得抢先终态）
         std::shared_ptr<Reactor> reactor;
+        // 控制域兜底句柄：主标记沿 owner 捕获链在各真实 close 点置位；此处
+        // 副本仅供 Run 收口/析构兜底在 owner 链路未执行时补标记（幂等）。
+        std::shared_ptr<ReclaimRecord> reclaim;
         Connection connection;
         std::error_code error;
         WakeHub hub;
@@ -1023,7 +1097,10 @@ struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
         bool erase = false;
         {
             std::lock_guard<std::mutex> lock(op->mutex);
-            erase = op->done && !op->waiter_attached;
+            // 未转移且未释放的记录必须留在表内，等控制域收尾兜底补标记；
+            // 否则「lambda 未执行的提交」会随擦表丢失唯一可达的记录句柄。
+            erase = op->done && !op->waiter_attached
+                && (!op->reclaim || op->reclaim->released.load(std::memory_order_acquire));
         }
         if (!erase) {
             return;
@@ -1032,6 +1109,28 @@ struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
         const auto it = connects.find(id);
         if (it != connects.end() && it->second == op) {
             connects.erase(it);  // 完成且无人等待：释放活动登记
+        }
+    }
+
+    // 控制域收尾兜底（幂等）：仅在 unbind/FinalizeControl 之后调用——此刻
+    // owner 链路不再执行；FinalizeControl 已显式关闭 pending descriptor、
+    // delivery holder 和连接 backend，不依赖异步捕获或 context 的最终析构。
+    // 因此未转移的建连记录此刻已无真实 fd，才可补标记为释放；
+    // 已完结且无人等待的表项随后正常擦除，保持活动登记语义不变。
+    void SettleAbandonedConnectReclaim() {
+        std::lock_guard<std::mutex> lock(connect_mutex);
+        for (auto it = connects.begin(); it != connects.end();) {
+            auto& op = it->second;
+            {
+                std::lock_guard<std::mutex> op_lock(op->mutex);
+                MarkReclaimReleased(op->reclaim);
+            }
+            bool removable = false;
+            {
+                std::lock_guard<std::mutex> op_lock(op->mutex);
+                removable = op->done && !op->waiter_attached;
+            }
+            it = removable ? connects.erase(it) : std::next(it);
         }
     }
 
@@ -1093,6 +1192,25 @@ struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
     }
     bool IsSealed() const {
         return service_sealed && service_sealed->load(std::memory_order_acquire);
+    }
+
+    // 仅在 owner 物理关闭全部本代 listener，或控制域同代同步解绑后确认无
+    // listener 时置位；幂等、可重入，并唤醒 AcceptingStopped 观测者。
+    void TryPostAcceptStop(const std::shared_ptr<Reactor>& main) {
+        if (accept_stop_done.load(std::memory_order_acquire) ||
+            accept_stop_posted.exchange(true, std::memory_order_acq_rel)) { return; }
+        const bool inject_failure = accept_stop_post_fail_once.exchange(false);
+        if (inject_failure || !main->TryPostInternal([main] { main->StopAcceptingOnOwner(); })) {
+            if (inject_failure && accept_stop_failure_hook) { accept_stop_failure_hook(); }
+            // post 拒绝不等于 fd 已关闭；保留持久请求，由控制循环再交。
+            accept_stop_posted.store(false, std::memory_order_release);
+        }
+    }
+
+    void MarkAcceptStopDone() {
+        accept_stop_done.store(true, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(mutex);
+        control_cv.notify_all();
     }
 };
 
@@ -1173,6 +1291,9 @@ std::error_code Reactor::InstallOnOwner(const std::vector<Address>& addresses) {
         ts.tv_nsec = (install_delay % 1000) * 1000000L;
         (void)::syscall(SYS_nanosleep, &ts, nullptr);
     }
+    if (!addresses.empty() && m_impl->accept_stop_requested.load(std::memory_order_acquire)) {
+        return std::make_error_code(std::errc::operation_canceled);
+    }
     if (m_installed.load()) {
         return {};
     }
@@ -1224,9 +1345,19 @@ std::error_code Reactor::InstallOnOwner(const std::vector<Address>& addresses) {
         return first;
     }
     m_installed.store(true);
+    if (!addresses.empty() && m_impl->accept_stop_requested.load(std::memory_order_acquire)) {
+        // Run 前/安装中已封口：本次安装不得留存监听，把已打开的 fd 关闭、
+        // 返回错误，由 Run 走安装失败收口、不发布 Running。
+        boost::system::error_code ignored;
+        for (auto& listener : m_listeners) {
+            listener->desc.close(ignored);
+        }
+        m_listeners.clear();
+        return std::make_error_code(std::errc::operation_canceled);
+    }
     ArmAcceptAll();
     return {};
-}
+    }
 
 std::vector<Address> Reactor::LocalAddresses() const {
     std::vector<Address> out;
@@ -1238,8 +1369,9 @@ std::vector<Address> Reactor::LocalAddresses() const {
 }
 
 void Reactor::ArmAcceptAll() {
-    if (!m_installed.load() || m_sealed.load() || m_impl->IsSealed()) {
-        return;
+    if (!m_installed.load() || m_sealed.load() || m_impl->IsSealed()
+        || m_impl->accept_stop_requested.load(std::memory_order_acquire)) {
+        return;  // 接收域已独立封口：不再重挂监听
     }
     for (auto& listener : m_listeners) {
         ArmAccept(listener);
@@ -1247,8 +1379,9 @@ void Reactor::ArmAcceptAll() {
 }
 
 void Reactor::ArmAccept(const std::shared_ptr<Listener>& listener) {
-    if (!m_installed.load() || m_sealed.load() || m_impl->IsSealed()) {
-        return;
+    if (!m_installed.load() || m_sealed.load() || m_impl->IsSealed()
+        || m_impl->accept_stop_requested.load(std::memory_order_acquire)) {
+        return;  // 封口后不再 arm，释放的预留由 Reservation 析构回收
     }
     bool expected = false;
     if (!listener->armed.compare_exchange_strong(expected, true)) {
@@ -1287,7 +1420,7 @@ void Reactor::DoAccept(const std::shared_ptr<Listener>& listener,
                                               SOCK_NONBLOCK | SOCK_CLOEXEC));
     if (fd < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            ArmAccept(listener);  // 虚假就绪：释放预留后重挂
+            ArmAccept(listener);  // 虚假就绪：释放预留后重挂（封口后 ArmAccept 不再重挂）
             return;
         }
         if (errno == EINTR) {
@@ -1298,6 +1431,10 @@ void Reactor::DoAccept(const std::shared_ptr<Listener>& listener,
         return;
     }
     FdHandle handle(fd);
+    if (m_impl->accept_stop_requested.load(std::memory_order_acquire)) {
+        // fd 由 handle 析构物理关闭，预留随 reservation 析构释放，不重挂监听。
+        return;
+    }
     Address peer = Address::FromNative(reinterpret_cast<sockaddr*>(&storage), length);
     std::shared_ptr<Reactor> target = m_impl->PickSub(peer);
     if (!target) {
@@ -1319,10 +1456,15 @@ void Reactor::RecordAcceptError(std::error_code error) {
 
 void Reactor::AdoptFdOnOwner(FdHandle fd, bool is_connect, std::uint64_t connect_id,
                              std::shared_ptr<HandoffReservation> reservation,
-                             bool delayed_delivery) {
+                             bool delayed_delivery,
+                             const std::shared_ptr<ReclaimRecord>& reclaim) {
     if (m_sealed.load() || m_impl->IsSealed() || fd.Get() < 0) {
         if (is_connect) {
             const auto error = std::make_error_code(std::errc::operation_canceled);
+            // 真实 close 点：显式关闭（原路径依赖 FdHandle 析构的隐式关闭），
+            // 之后才允许把本次责任标记为释放。
+            fd.Close();
+            MarkReclaimReleased(reclaim);
             if (m_impl->handler) {
                 SafeHandler([this, connect_id, error] {
                     m_impl->handler->OnConnect(Connection(), error, connect_id);
@@ -1333,34 +1475,45 @@ void Reactor::AdoptFdOnOwner(FdHandle fd, bool is_connect, std::uint64_t connect
         } else {
             ResumeMainAccept();
         }
-        return;  // fd 由 FdHandle 关闭；reservation 析构释放
+        return;  // fd 已显式关闭或从未持有；reservation 析构释放
     }
     if (is_connect && !delayed_delivery) {
         const auto delay_ms = m_impl->connect_delivery_delay_ms.load();
         if (delay_ms > 0) {
             // 私有 test seam：延后「已完成 connect 的交付」，用于确定性
-            // timeout/adopt 竞态；fd 由 holder RAII 覆盖关闭竞争。
+            // timeout/adopt 竞态；fd 由 holder RAII 覆盖关闭竞争，记录随
+            // holder 同行，取消/失败关闭 fd 后仍可标记释放（不依赖 op 查表）。
             auto holder = std::make_shared<FdHandle>(std::move(fd));
+            m_delivery_fds.push_back(holder);
             auto timer = std::make_shared<asio::steady_timer>(
                 Ctx(), std::chrono::milliseconds(delay_ms));
             auto self = shared_from_this();
-            timer->async_wait([self, timer, holder, connect_id](
+            timer->async_wait([self, timer, holder, connect_id, reclaim](
                                   const boost::system::error_code& error) {
+                auto& held = self->m_delivery_fds;
+                held.erase(std::remove(held.begin(), held.end(), holder), held.end());
                 if (error) {
+                    // 交付等待被撤销：真实 close 点（holder 显式关闭）后收口。
+                    holder->Close();
+                    MarkReclaimReleased(reclaim);
                     return;
                 }
                 self->AdoptFdOnOwner(FdHandle(std::move(*holder)), true, connect_id, nullptr,
-                                     /*delayed_delivery=*/true);
+                                     /*delayed_delivery=*/true, reclaim);
             });
             return;
         }
     }
     TcpWait descriptor(Ctx());
     boost::system::error_code boost_error;
-    descriptor.assign(fd.Release(), boost_error);
+    const int adopted_fd = fd.Release();
+    descriptor.assign(adopted_fd, boost_error);
     if (boost_error) {
+        // assign 失败：descriptor 未取得所有权，此处是真实 close 点。
+        ::close(adopted_fd);
         m_impl->RecordError(FromBoost(boost_error));
         if (is_connect) {
+            MarkReclaimReleased(reclaim);
             if (m_impl->handler) {
                 SafeHandler([this, connect_id, boost_error] {
                     m_impl->handler->OnConnect(Connection(), FromBoost(boost_error), connect_id);
@@ -1373,8 +1526,11 @@ void Reactor::AdoptFdOnOwner(FdHandle fd, bool is_connect, std::uint64_t connect
     }
     descriptor.non_blocking(true, boost_error);
     if (boost_error) {
+        boost::system::error_code close_ignored;
+        descriptor.close(close_ignored);  // 真实 close 点；RecordError 仍用原错误
         m_impl->RecordError(FromBoost(boost_error));
         if (is_connect) {
+            MarkReclaimReleased(reclaim);
             if (m_impl->handler) {
                 SafeHandler([this, connect_id, boost_error] {
                     m_impl->handler->OnConnect(Connection(), FromBoost(boost_error), connect_id);
@@ -1389,9 +1545,14 @@ void Reactor::AdoptFdOnOwner(FdHandle fd, bool is_connect, std::uint64_t connect
         m_impl->RecordError(option_error);
     }
     const std::uint64_t id = m_impl->next_conn_id.fetch_add(1, std::memory_order_relaxed);
+    // 责任转交：带句柄 CoDial 的记录原样随连接转入 owner 责任（不提前标释放）；
+    // accept/raw 连接另建活跃记录供 Connection::Released() 观察。
+    auto owner_record = reclaim ? reclaim
+                                : std::make_shared<ReclaimRecord>(false);
     auto state = std::make_shared<ConnectionState>(id, m_impl->max_inbound_bytes,
                                                    m_impl->max_outbound_bytes,
-                                                   m_impl->max_ops, m_impl->service_sealed);
+                                                   m_impl->max_ops, m_impl->service_sealed,
+                                                   std::move(owner_record));
     auto core = std::make_shared<ConnCore>(state, std::move(descriptor), this, m_impl->handler);
     std::weak_ptr<Reactor> weak_self = weak_from_this();
     std::weak_ptr<ConnCore> weak_core = core;
@@ -1415,6 +1576,9 @@ void Reactor::AdoptFdOnOwner(FdHandle fd, bool is_connect, std::uint64_t connect
         if (auto pending_op = m_impl->FindConnect(connect_id)) {
             std::lock_guard<std::mutex> lock(pending_op->mutex);
             pending_op->owner_delivering = true;  // 授权交付段开始，seal 让位
+            // 责任已随连接转入 state（released 由连接收口标记）：清除 op 侧
+            // 兜底副本，让 op 按既有条件正常擦表，不影响连接期观察。
+            pending_op->reclaim = nullptr;
         }
         // 开始授权点：紧邻交付的同一原子检查（构造窗口内封口不启动成功回调）。
         InvokePreAuthBarrier();
@@ -1447,7 +1611,12 @@ void Reactor::AdoptFdOnOwner(FdHandle fd, bool is_connect, std::uint64_t connect
         // OnAccept 的同一开始授权点：入口早查不是授权，最后一次紧邻派发的
         // 原子检查才与封口线性化。
         InvokePreAuthBarrier();
-        if (m_impl->IsSealed()) {
+        bool authorized;
+        {
+            std::lock_guard<std::mutex> lock(m_impl->handoff_mutex);
+            authorized = !m_impl->handoff_closed && !m_impl->IsSealed();
+        }
+        if (!authorized) {
             core->CancelControl();
             RemoveConn(core);
             return;
@@ -1472,8 +1641,11 @@ void Reactor::AdoptFdOnOwner(FdHandle fd, bool is_connect, std::uint64_t connect
     }
 }
 
-void Reactor::BeginConnectOnOwner(const Address& address, std::uint64_t connect_id) {
+void Reactor::BeginConnectOnOwner(const Address& address, std::uint64_t connect_id,
+                                  const std::shared_ptr<ReclaimRecord>& reclaim) {
     if (m_sealed.load() || m_impl->IsSealed()) {
+        // 尚未创建任何 fd：本次责任即时收口。
+        MarkReclaimReleased(reclaim);
         if (m_impl->handler) {
             SafeHandler([this, connect_id] {
                 m_impl->handler->OnConnect(Connection(),
@@ -1495,12 +1667,14 @@ void Reactor::BeginConnectOnOwner(const Address& address, std::uint64_t connect_
         m_pending_connects.push_back(pending);
         auto self = shared_from_this();
         ++m_pending_connect_callbacks;
-        timer->async_wait([self, pending, connect_id, address](
+        timer->async_wait([self, pending, connect_id, address, reclaim](
                               const boost::system::error_code& error) {
             auto& list = self->m_pending_connects;
             list.erase(std::remove(list.begin(), list.end(), pending), list.end());
             if (error && error != asio::error::operation_aborted) {
                 const auto from_boost = FromBoost(error);
+                // 定时器真实失败：未创建 fd，责任即时收口。
+                MarkReclaimReleased(reclaim);
                 if (self->m_impl->handler) {
                     self->SafeHandler([self, connect_id, from_boost] {
                         self->m_impl->handler->OnConnect(Connection(), from_boost, connect_id);
@@ -1512,6 +1686,8 @@ void Reactor::BeginConnectOnOwner(const Address& address, std::uint64_t connect_
             }
             if (self->m_sealed.load() || self->m_impl->IsSealed() || pending->canceled) {
                 const auto canceled = std::make_error_code(std::errc::operation_canceled);
+                // 占位被取消/封口：未创建 fd，责任即时收口。
+                MarkReclaimReleased(reclaim);
                 if (self->m_impl->handler) {
                     self->SafeHandler([self, connect_id, canceled] {
                         self->m_impl->handler->OnConnect(Connection(), canceled, connect_id);
@@ -1521,16 +1697,20 @@ void Reactor::BeginConnectOnOwner(const Address& address, std::uint64_t connect_
                 self->FinishConnectCallback();
                 return;
             }
-            self->StartConnectSocketOnOwner(address, connect_id);
+            self->StartConnectSocketOnOwner(address, connect_id, reclaim);
         });
         return;
     }
     ++m_pending_connect_callbacks;
-    StartConnectSocketOnOwner(address, connect_id);
+    StartConnectSocketOnOwner(address, connect_id, reclaim);
 }
 
-void Reactor::StartConnectSocketOnOwner(const Address& address, std::uint64_t connect_id) {
+void Reactor::StartConnectSocketOnOwner(const Address& address, std::uint64_t connect_id,
+                                        const std::shared_ptr<ReclaimRecord>& reclaim) {
+    InvokeConnectStartBarrier();  // 测试：已在起点、尚未做最终封口检查
     if (m_sealed.load() || m_impl->IsSealed()) {
+        // 未创建 fd：责任即时收口。
+        MarkReclaimReleased(reclaim);
         if (m_impl->handler) {
             SafeHandler([this, connect_id] {
                 m_impl->handler->OnConnect(Connection(),
@@ -1539,6 +1719,11 @@ void Reactor::StartConnectSocketOnOwner(const Address& address, std::uint64_t co
         }
         m_impl->ResolveConnect(connect_id, Connection(),
                                std::make_error_code(std::errc::operation_canceled));
+        // 两个调用方（定时器路径与直通路径）都已先占用一次 pending connect
+        // 回调预算；本路径从未登记 pending 描述符，seal 只能等预算归零，
+        // 因此必须在此归还，否则 SealServiceOnOwner 永久 defer、Run 收口
+        // 无限等待。
+        FinishConnectCallback();
         return;
     }
     std::error_code error;
@@ -1555,6 +1740,10 @@ void Reactor::StartConnectSocketOnOwner(const Address& address, std::uint64_t co
         }
     }
     if (error) {
+        // 真实 close 点：显式关闭已打开的 socket（原路径依赖析构隐式关闭），
+        // 之后才把本次责任标记为释放。
+        (void)socket.Close();
+        MarkReclaimReleased(reclaim);
         if (m_impl->handler) {
             SafeHandler([this, connect_id, error] {
                 m_impl->handler->OnConnect(Connection(), error, connect_id);
@@ -1569,7 +1758,8 @@ void Reactor::StartConnectSocketOnOwner(const Address& address, std::uint64_t co
     boost::system::error_code boost_error;
     descriptor->assign(fd, boost_error);
     if (boost_error) {
-        ::close(fd);
+        ::close(fd);  // assign 失败：descriptor 未取得所有权，此处是真实 close 点
+        MarkReclaimReleased(reclaim);
         if (m_impl->handler) {
             SafeHandler([this, connect_id, boost_error] {
                 m_impl->handler->OnConnect(Connection(), FromBoost(boost_error), connect_id);
@@ -1587,11 +1777,16 @@ void Reactor::StartConnectSocketOnOwner(const Address& address, std::uint64_t co
     auto self = shared_from_this();
     try {
         descriptor->async_wait(TcpWait::wait_write,
-        [self, descriptor, pending, connect_id](const boost::system::error_code& wait_error) {
+        [self, descriptor, pending, connect_id, reclaim](const boost::system::error_code& wait_error) {
             // 从 pending 列表移除。
             auto& list = self->m_pending_connects;
             list.erase(std::remove(list.begin(), list.end(), pending), list.end());
             if (pending->canceled) {
+                // 真实 close 点：取消后不再使用该描述符，显式关闭并收口记录
+                //（不把 released 留给捕获析构的隐式时序）。
+                boost::system::error_code close_ignored;
+                descriptor->close(close_ignored);
+                MarkReclaimReleased(reclaim);
                 if (self->m_impl->handler) {
                     self->SafeHandler([self, connect_id] {
                         self->m_impl->handler->OnConnect(Connection(),
@@ -1605,6 +1800,10 @@ void Reactor::StartConnectSocketOnOwner(const Address& address, std::uint64_t co
             }
             if (wait_error) {
                 const auto error = FromBoost(wait_error);
+                // 真实 close 点：等待失败，显式关闭并收口记录。
+                boost::system::error_code close_ignored;
+                descriptor->close(close_ignored);
+                MarkReclaimReleased(reclaim);
                 if (self->m_impl->handler) {
                     self->SafeHandler([self, connect_id, error] {
                         self->m_impl->handler->OnConnect(Connection(), error, connect_id);
@@ -1617,6 +1816,10 @@ void Reactor::StartConnectSocketOnOwner(const Address& address, std::uint64_t co
             const int socket_error = GetSocketError(descriptor->native_handle());
             if (socket_error != 0) {
                 const auto error = std::error_code(socket_error, std::system_category());
+                // 真实 close 点：SO_ERROR 失败（如拒连），显式关闭并收口记录。
+                boost::system::error_code close_ignored;
+                descriptor->close(close_ignored);
+                MarkReclaimReleased(reclaim);
                 if (self->m_impl->handler) {
                     self->SafeHandler([self, connect_id, error] {
                         self->m_impl->handler->OnConnect(Connection(), error, connect_id);
@@ -1627,9 +1830,15 @@ void Reactor::StartConnectSocketOnOwner(const Address& address, std::uint64_t co
                 return;
             }
             const int connected_fd = descriptor->release();
-            self->AdoptFdOnOwner(FdHandle(connected_fd), /*is_connect=*/true, connect_id, nullptr);
+            // fd 转交成功：记录随 fd 进入 AdoptFdOnOwner，不在此标释放。
+            self->AdoptFdOnOwner(FdHandle(connected_fd), /*is_connect=*/true, connect_id, nullptr,
+                                 /*delayed_delivery=*/false, reclaim);
         });
     } catch (...) {
+        // 真实 close 点：等待未建立，显式关闭并收口记录（原路径由 finalize 兜底）。
+        boost::system::error_code close_ignored;
+        descriptor->close(close_ignored);
+        MarkReclaimReleased(reclaim);
         FinishConnectCallback();
         const auto error = std::make_error_code(std::errc::not_enough_memory);
         if (m_impl->handler) {
@@ -1884,6 +2093,22 @@ void Reactor::SealServiceOnOwner(std::function<void()> on_done) {
     }
 }
 
+void Reactor::StopAcceptingOnOwner() {
+    // 接收域独立封口：撤该 owner 的全部 listener 并物理关闭 fd。cancel 先让
+    // pending async_wait 以 operation_aborted 返回（arm 时已复位 armed，不再
+    // 重挂），close 即物理停用；失败不抛，fd 关闭责任在此兑现。
+    boost::system::error_code ignored;
+    for (auto& listener : m_listeners) {
+        listener->desc.cancel(ignored);
+        listener->desc.close(ignored);
+    }
+    // 保留不可变地址元数据，避免与启动控制线程读取地址快照并发擦除；
+    // 物理 fd 已关闭，最终解绑后由 FinalizeControl 释放对象。
+    // 物理关闭确认后才置位：AcceptingStopped()==true 等价于本代 listener 全部
+    // 真实关闭（并行路径：控制域同代解绑收口亦调用 MarkAcceptStopDone）。
+    m_impl->MarkAcceptStopDone();
+}
+
 void Reactor::FinalizeControl() {
     {
         // 先解除 dirty 链（不分配），再关闭/清空 conns，避免裸链节点悬空。
@@ -1907,7 +2132,16 @@ void Reactor::FinalizeControl() {
         listener->desc.close(ignored);
     }
     m_listeners.clear();
+    // 解绑只保证 owner 不再执行，不保证异步回调捕获已析构。
+    // 先关闭那些仍可能被回调强引用的真实资源，再清容器及发布回执。
+    for (auto& pending : m_pending_connects) {
+        pending->canceled = true;
+        // start_timer 此时尚无 fd；owner 已解绑，不靠其取消或析构证明回收。
+        if (pending->desc) { pending->desc->close(ignored); }
+    }
     m_pending_connects.clear();
+    for (auto& holder : m_delivery_fds) { holder->Close(); }
+    m_delivery_fds.clear();
     std::vector<std::shared_ptr<ConnCore>> snapshot;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -2042,6 +2276,10 @@ Engine::~Engine() {
         reactor->FinalizeControl();
         reactor->ReleaseDriver();
     }
+    impl->SettleAbandonedConnectReclaim();
+    if (impl->accept_stop_requested.load(std::memory_order_acquire)) {
+        impl->MarkAcceptStopDone();
+    }
     {
         std::lock_guard<std::mutex> lock(impl->mutex);
         impl->reactors.clear();
@@ -2065,6 +2303,63 @@ void Engine::RequestClose() noexcept {
         impl->control_cv.notify_all();
     } catch (...) {
     }
+}
+
+void Engine::RequestStopAccepting() noexcept {
+    auto impl = m_impl;
+    if (!impl) {
+        return;
+    }
+    try {
+        // 不可逆 latch：仅第一次真实执行封口，并发/重复请求幂等、不重开。
+        if (impl->accept_stop_requested.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+        // 同一接纳门，封口路径不创建可能分配失败的临时 deque。
+        {
+            std::lock_guard<std::mutex> lock(impl->handoff_mutex);
+            impl->handoff_closed = true;
+            impl->handoff_reserved = 0;
+        }
+        impl->accept_hub.NotifyAll();
+        for (;;) {
+            Connection connection;
+            {
+                std::lock_guard<std::mutex> lock(impl->handoff_mutex);
+                if (impl->handoff.empty()) { break; }
+                connection = std::move(impl->handoff.front());
+                impl->handoff.pop_front();
+            }
+            connection.RequestClose(std::make_error_code(std::errc::operation_canceled));
+        }
+        // 物理关闭 listener 交由主接受者 owner 执行（真实 close 后才 stopped）。
+        // client-only / 尚未 Run / owner 已解绑：本代无 listener，停止即生效。
+        std::shared_ptr<Reactor> main;
+        EnginePhase phase;
+        {
+            std::lock_guard<std::mutex> lock(impl->mutex);
+            main = impl->main_reactor;
+            phase = impl->phase;
+        }
+        if (main) {
+            impl->TryPostAcceptStop(main);
+        } else if (phase == EnginePhase::Idle || phase == EnginePhase::Running ||
+                   phase == EnginePhase::Stopped) {
+            impl->MarkAcceptStopDone();
+        }
+        // Starting/Closing 尚未发布或已移走 owner 时，必须等安装回滚/解绑收口。
+        impl->control_cv.notify_all();
+    } catch (...) {
+    }
+}
+
+bool Engine::AcceptingStopped() const noexcept {
+    auto impl = m_impl;
+    if (!impl) {
+        return false;
+    }
+    return impl->accept_stop_requested.load(std::memory_order_acquire)
+        && impl->accept_stop_done.load(std::memory_order_acquire);
 }
 
 EnginePhase Engine::Phase() const noexcept {
@@ -2117,6 +2412,52 @@ std::error_code Engine::Run(const EngineConfig& config) {
         impl->control_cv.notify_all();
         return error;
     };
+    std::vector<std::shared_ptr<Reactor>> reactors;
+
+    // 安装/绑定失败，或监听停止与安装竞争：解绑已分配槽、控制域独占清理
+    // reactor、不发布 Running、保留不可伪报的 Stopped/Closing 责任态。
+    const bool server = !config.listen_addresses.empty();
+    // Run 前已封监听（且 server 布局）：不创建任何 socket/绑定，本代不再新开监听；
+    // 置于运行时/绑定一切副作用之前，故无运行时时亦报 operation_canceled。
+    if (server && impl->accept_stop_requested.load(std::memory_order_acquire)) {
+        return fail(std::make_error_code(std::errc::operation_canceled));
+    }
+
+    auto abort_install = [&](std::error_code error) -> std::error_code {
+        std::vector<DriverSlot> to_unbind;
+        {
+            std::lock_guard<std::mutex> lock(impl->mutex);
+            to_unbind = std::move(impl->slots);
+            impl->slots.clear();
+            for (auto& slot : impl->residual_slots) {
+                to_unbind.push_back(std::move(slot));
+            }
+            impl->residual_slots.clear();
+        }
+        const auto unbind_error = DriverBinder::UnbindSlots(to_unbind);
+        if (unbind_error || !to_unbind.empty()) {
+            std::lock_guard<std::mutex> lock(impl->mutex);
+            impl->slots = std::move(to_unbind);
+            impl->RecordError(unbind_error ? unbind_error : error);
+            impl->phase = EnginePhase::Closing;
+            return unbind_error ? unbind_error : error;
+        }
+        for (auto& reactor : reactors) {
+            reactor->FinalizeControl();
+            reactor->ReleaseDriver();
+        }
+        impl->SettleAbandonedConnectReclaim();
+        if (impl->accept_stop_requested.load(std::memory_order_acquire)) {
+            impl->MarkAcceptStopDone();
+        }
+        {
+            std::lock_guard<std::mutex> lock(impl->mutex);
+            impl->reactors.clear();
+            impl->main_reactor.reset();
+            impl->subs.clear();
+        }
+        return fail(error);
+    };
 
     auto* scheduler = bbt::coroutine::detail::Scheduler::GetInstance().get();
     if (scheduler == nullptr || !scheduler->IsInitialized()) {
@@ -2131,7 +2472,6 @@ std::error_code Engine::Run(const EngineConfig& config) {
     if (const auto error = NormalizeOptions(config.options, normalized)) {
         return fail(error);
     }
-    const bool server = !config.listen_addresses.empty();
     if (server && impl->handler == nullptr && !impl->handoff_enabled) {
         // 保持 handler+handoff 共存，但拒绝"两者都无"的无人接收布局：
         // 仍在 driver 绑定/socket 副作用之前。
@@ -2167,7 +2507,6 @@ std::error_code Engine::Run(const EngineConfig& config) {
         }
         return fail(error);
     }
-    std::vector<std::shared_ptr<Reactor>> reactors;
     std::shared_ptr<Reactor> main_reactor;
     {
         std::lock_guard<std::mutex> lock(impl->mutex);
@@ -2271,38 +2610,19 @@ std::error_code Engine::Run(const EngineConfig& config) {
             impl->phase = EnginePhase::Closing;
             return install_error;
         }
-        // 同步安装失败：同代解绑；失败/残留则保留责任对象与 Closing，不伪报 Stopped。
-        std::vector<DriverSlot> to_unbind;
-        {
-            std::lock_guard<std::mutex> lock(impl->mutex);
-            to_unbind = std::move(impl->slots);
-            impl->slots.clear();
-            for (auto& slot : impl->residual_slots) {
-                to_unbind.push_back(std::move(slot));
-            }
-            impl->residual_slots.clear();
-        }
-        const auto unbind_error = DriverBinder::UnbindSlots(to_unbind);
-        if (unbind_error || !to_unbind.empty()) {
-            std::lock_guard<std::mutex> lock(impl->mutex);
-            impl->slots = std::move(to_unbind);
-            impl->RecordError(unbind_error ? unbind_error : install_error);
-            impl->phase = EnginePhase::Closing;
-            return unbind_error ? unbind_error : install_error;
-        }
-        for (auto& reactor : reactors) {
-            reactor->FinalizeControl();
-            reactor->ReleaseDriver();
-        }
-        {
-            std::lock_guard<std::mutex> lock(impl->mutex);
-            impl->reactors.clear();
-            impl->main_reactor.reset();
-            impl->subs.clear();
-        }
-        return fail(install_error);
+        // 同步安装失败：走统一安装失败收口，不伪报 Stopped。
+        return abort_install(install_error);
     }
 
+    if (server && impl->accept_stop_requested.load(std::memory_order_acquire)) {
+        // 停止与安装竞争：不得在接受已停止的布局上发布 Running；
+        // listener 已由 owner 关闭或从未创建，走安装失败收口。
+        return abort_install(std::make_error_code(std::errc::operation_canceled));
+    }
+
+    if (!server && impl->accept_stop_requested.load(std::memory_order_acquire)) {
+        impl->MarkAcceptStopDone();
+    }
     {
         std::vector<Address> local;
         if (server && main_reactor) {
@@ -2324,6 +2644,9 @@ std::error_code Engine::Run(const EngineConfig& config) {
         }
         if (close) {
             break;
+        }
+        if (main_reactor && impl->accept_stop_requested.load(std::memory_order_acquire)) {
+            impl->TryPostAcceptStop(main_reactor);
         }
         if (impl->cancel_retry_needed.exchange(false)) {
             // 一次性取消投递失败后的持久重试：控制循环补交，不等网络无限终态。
@@ -2470,6 +2793,10 @@ std::error_code Engine::Run(const EngineConfig& config) {
         reactor->FinalizeControl();
         reactor->ReleaseDriver();
     }
+    impl->SettleAbandonedConnectReclaim();
+    if (impl->accept_stop_requested.load(std::memory_order_acquire)) {
+        impl->MarkAcceptStopDone();
+    }
     {
         std::lock_guard<std::mutex> lock(impl->mutex);
         impl->reactors.clear();
@@ -2522,7 +2849,8 @@ namespace {
 
 std::error_code StartConnectImpl(const std::shared_ptr<EngineImpl>& impl,
                                  const Address& address, std::uint64_t& out_connect_id,
-                                 bool awaitable) {
+                                 bool awaitable,
+                                 const std::shared_ptr<ReclaimRecord>& reclaim = {}) {
     // awaitable=true 是 CoDial 的提交步骤：要求无 raw handler（raw 配置下
     // OnConnect 是唯一交付，Co 不得提交一个无法领取的 op）。
     // awaitable=false 是公共 raw 提交：要求有 handler。
@@ -2551,7 +2879,10 @@ std::error_code StartConnectImpl(const std::shared_ptr<EngineImpl>& impl,
             bool removable = false;
             {
                 std::lock_guard<std::mutex> op_lock(it->second->mutex);
-                removable = it->second->done && !it->second->waiter_attached;
+                // 与 MaybeEraseConnect 同条件：未转移且未释放的记录留在表内兜底。
+                removable = it->second->done && !it->second->waiter_attached
+                    && (!it->second->reclaim
+                        || it->second->reclaim->released.load(std::memory_order_acquire));
             }
             if (removable) {
                 it = impl->connects.erase(it);
@@ -2564,6 +2895,7 @@ std::error_code StartConnectImpl(const std::shared_ptr<EngineImpl>& impl,
         }
         auto op = std::make_shared<EngineImpl::ConnectOp>();
         op->reactor = reactor;
+        op->reclaim = reclaim;
         op->waiter_attached = awaitable;  // Co 提交即登记接收意图，完成早到不丢
         impl->connects[id] = std::move(op);
     }
@@ -2572,9 +2904,11 @@ std::error_code StartConnectImpl(const std::shared_ptr<EngineImpl>& impl,
     // 不构造假网络响应；未武装时行为与产品完全一致。
     const bool force_post_failure = impl->connect_post_fail_once.exchange(false);
     if (force_post_failure
-        || !reactor->TryPost([impl, reactor, address, id] {
-               reactor->BeginConnectOnOwner(address, id);
+        || !reactor->TryPost([impl, reactor, address, id, reclaim] {
+               reactor->BeginConnectOnOwner(address, id, reclaim);
            })) {
+        // 投递失败回滚：owner 从未执行，本次从未创建 fd，责任即时收口。
+        MarkReclaimReleased(reclaim);
         {
             std::lock_guard<std::mutex> lock(impl->connect_mutex);
             const auto it = impl->connects.find(id);
@@ -2617,6 +2951,12 @@ std::error_code Engine::CoSubmitConnect(const Address& address, std::uint64_t& o
     return StartConnectImpl(m_impl, address, out_connect_id, /*awaitable=*/true);
 }
 
+std::error_code Engine::CoSubmitConnect(const Address& address, std::uint64_t& out_connect_id,
+                                        const std::shared_ptr<ReclaimRecord>& reclaim) {
+    // 带责任记录的提交：记录随 post 捕获流经 owner 各真实 close/转交点。
+    return StartConnectImpl(m_impl, address, out_connect_id, /*awaitable=*/true, reclaim);
+}
+
 // ---- EngineTestAccess（私有测试接缝，非产品 API）----
 
 std::error_code EngineTestAccess::InjectDriverFailure(Engine& engine) {
@@ -2638,6 +2978,19 @@ void EngineTestAccess::SetConnectLimit(Engine& engine, std::size_t limit) {
 std::size_t EngineTestAccess::ConnectTableSize(Engine& engine) {
     std::lock_guard<std::mutex> lock(engine.m_impl->connect_mutex);
     return engine.m_impl->connects.size();
+}
+
+void EngineTestAccess::SetConnectStartBarrierOnce(Engine& engine,
+                                                  std::function<void()> barrier) {
+    auto impl = engine.m_impl;
+    std::vector<std::shared_ptr<Reactor>> reactors;
+    {
+        std::lock_guard<std::mutex> lock(impl->mutex);
+        reactors = impl->reactors;
+    }
+    for (auto& reactor : reactors) {
+        reactor->SetConnectStartBarrier(barrier);
+    }
 }
 
 std::size_t EngineTestAccess::PendingConnectCount(Engine& engine) {
@@ -2862,6 +3215,15 @@ void EngineTestAccess::SetWaitDriverFailedOnce(Engine& engine) {
 
 void EngineTestAccess::SetSealThrowOnce(Engine& engine) {
     engine.m_impl->seal_throw_once.store(true);
+}
+
+void EngineTestAccess::SetAcceptWaiterHook(Engine& engine, std::function<void()> registered) {
+    engine.m_impl->accept_waiter_hook = std::move(registered);
+}
+
+void EngineTestAccess::SetAcceptStopPostFailureOnce(Engine& engine, std::function<void()> after_failure) {
+    engine.m_impl->accept_stop_failure_hook = std::move(after_failure);
+    engine.m_impl->accept_stop_post_fail_once.store(true);
 }
 
 void EngineTestAccess::SetInstallDelay(Engine& engine, std::chrono::milliseconds delay) {
@@ -3133,10 +3495,17 @@ std::error_code Engine::CoWaitAccepted(Connection& out,
     // client-only（否则把"已结束"误报成"这类 Engine 不支持 accept"）。
     {
         std::lock_guard<std::mutex> lock(impl->mutex);
-        const bool sealed = impl->IsSealed();
+        const bool service_sealed = impl->IsSealed();
         const auto phase = impl->phase;
-        if (sealed || phase == EnginePhase::Closing || phase == EnginePhase::Stopped) {
+        if (service_sealed || phase == EnginePhase::Closing || phase == EnginePhase::Stopped) {
             // 已封口或已开始/完成收口：队列已清空，不会有新连接交付。
+            return std::make_error_code(std::errc::operation_canceled);
+        }
+        // 接受已停止（RequestStopAccepting 且本代 listener 已物理关）：仅在
+        // Running 时作为接收域终态报 canceled；Idle/Starting 保持
+        // operation_not_permitted（尚未建立 accept 生产者）。
+        if (impl->accept_stop_requested.load(std::memory_order_acquire) &&
+            phase == EnginePhase::Running) {
             return std::make_error_code(std::errc::operation_canceled);
         }
         if (phase == EnginePhase::Idle || phase == EnginePhase::Starting) {
@@ -3157,11 +3526,12 @@ std::error_code Engine::CoWaitAccepted(Connection& out,
         bool sealed = false;
         {
             std::lock_guard<std::mutex> lock(impl->handoff_mutex);
-            if (!impl->handoff.empty()) {
+            if (!impl->handoff_closed && !impl->handoff.empty()) {
                 popped = impl->handoff.front();
                 impl->handoff.pop_front();
             } else {
-                sealed = impl->IsSealed();
+                sealed = impl->IsSealed()
+                    || impl->accept_stop_requested.load(std::memory_order_acquire);
             }
         }
         // 用本轮实际弹出的连接判断成功；调用者原有 out 有效不算。
@@ -3184,10 +3554,12 @@ std::error_code Engine::CoWaitAccepted(Connection& out,
                 waiter->Notify();
                 return true;
             }
+            if (impl->accept_waiter_hook) { impl->accept_waiter_hook(); }
             bool ready = false;
             {
                 std::lock_guard<std::mutex> lock(impl->handoff_mutex);
-                ready = !impl->handoff.empty() || impl->IsSealed();
+                ready = !impl->handoff.empty() || impl->IsSealed()
+                    || impl->accept_stop_requested.load(std::memory_order_acquire);
             }
             if (ready) {
                 waiter->Notify();  // 锁外 Notify

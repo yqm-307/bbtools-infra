@@ -4,12 +4,24 @@
 
 #include <bbt/infra/net/Error.hpp>
 #include <bbt/infra/net/detail/ConnectionState.hpp>
+#include <bbt/infra/net/detail/ReclaimRecord.hpp>
 #include <bbt/infra/net/detail/ReceiveRing.hpp>
 
 // 实现放 .cc：Connection/WriteOperation 的转发需要 ConnectionState/ReceiveRing
 // 完整定义，放在公共头会把 state/ring 布局与内部枚举经公共面传出。
 
 namespace bbt::infra::net {
+
+// ReclaimReceipt：无效句柄没有已提交资源责任（Released=true）；有效句柄的
+// 释放状态在共享记录上，终态在句柄寿命内永久可查，观察不改变回收本身。
+bool ReclaimReceipt::Valid() const noexcept { return m_record != nullptr; }
+
+bool ReclaimReceipt::Released() const noexcept {
+    return !m_record || m_record->released.load(std::memory_order_acquire);
+}
+
+ReclaimReceipt::ReclaimReceipt(std::shared_ptr<ReclaimRecord> record)
+    : m_record(std::move(record)) {}
 
 WriteOperation::WriteOperation(std::shared_ptr<WriteOpRecord> record)
     : m_record(std::move(record)) {}
@@ -82,6 +94,12 @@ AcceptanceState Connection::WriteAcceptance() const {
 }
 
 bool Connection::Closed() const { return m_state ? m_state->Closed() : true; }
+
+bool Connection::Released() const noexcept {
+    // 无效句柄没有资源责任；有效句柄以 owner 物理收口标记为准（conn_state
+    // 记录在 fd 真实关闭且 owner 责任清理后置位）。
+    return !m_state || m_state->OwnerReleased();
+}
 
 std::error_code Connection::CloseReason() const {
     return m_state ? m_state->CloseReason() : make_error_code(NetErrc::Closed);

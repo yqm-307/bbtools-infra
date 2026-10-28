@@ -1,0 +1,7 @@
+add_executable(http_net_example main.cc)
+target_link_libraries(http_net_example PRIVATE bbt::infra_http_net)
+target_compile_options(http_net_example PRIVATE -Wall -Wextra -Wpedantic)
+if(BUILD_TESTING)
+    add_test(NAME http.net.consumer COMMAND http_net_example)
+    set_tests_properties(http.net.consumer PROPERTIES TIMEOUT 30 LABELS "http_net")
+endif()

@@ -52,8 +52,11 @@ std::error_code CoWrite(Connection& connection, const std::string& data,
 // 从有界 handoff 队列取已接纳连接（队列满时暂停 native accept，不丢 fd）。
 // 配置/生命周期错误立即返回，不等待永远不会来的事件。判定优先级是契约：
 //   0. 执行域非法（非协程上下文）：operation_not_permitted，先于任何状态判定。
-//   1. 已封口 / Closing / Stopped：operation_canceled（终态优先；Stopped 时
-//      main accept owner 已解绑，但结论仍是"取消"，不得当作 client-only）。
+//   1. 已封口 / Closing / Stopped / 接受已停止（RequestStopAccepting 且
+//      AcceptingStopped()）：operation_canceled（终态优先；Stopped 时 main
+//      accept owner 已解绑，但结论仍是"取消"，不得当作 client-only）。
+//      接受停止后，handoff 已清空且不会再有新连接交付，晚到的 CoAccept 直接
+//      返回，失败不覆盖调用者原有 out。
 //   2. Idle / Starting：operation_not_permitted（尚未建立 accept 生产者）。
 //   3. Running 但未开启 handoff：operation_not_permitted（配置缺失）。
 //   4. Running + handoff 但无 main accept owner（client-only）：operation_not_supported。
@@ -63,6 +66,17 @@ std::error_code CoAccept(Engine& engine, Connection& out,
 
 // 协程内建连；失败不覆盖调用者原有 out，不遗留待回收责任。
 std::error_code CoDial(Engine& engine, const Address& address, Connection& out,
+                       const bbt::coroutine::WaitOptions& options = {});
+
+// 带物理回收观察句柄的建连（非破坏重载，原重载转发至此）：
+//   - 每次调用先把 receipt 重置为本次；执行域非法/提交未接纳时句柄保持无效
+//    （Released()=true，无已提交资源责任）。
+//   - 提交接纳后（无论后续超时/取消/未交付/Close 竞态）句柄有效，描述本次
+//     真实物理 socket 责任：Released()=false 直至 fd 真实关闭且 owner 责任
+//     清理，或责任随成功交付转入连接（与 Connection::Released() 同终态）。
+//   - 失败不改 out；句柄只观察，不等待/取消，寿命不延长 socket/Engine。
+std::error_code CoDial(Engine& engine, const Address& address, Connection& out,
+                       ReclaimReceipt& receipt,
                        const bbt::coroutine::WaitOptions& options = {});
 
 } // namespace bbt::infra::net

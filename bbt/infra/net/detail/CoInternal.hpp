@@ -21,6 +21,7 @@ namespace bbt::infra::net {
 
 class ConnectionState;
 class Engine;
+struct ReclaimRecord;  // detail：物理回收共享释放记录
 
 // 统一执行域 gate：复用上游无创建查询 GetLocalCoroutineId，
 // 与 ICoObject::RequireCoroutine 判定同源。不为检查构造 CoObject、不缓存 TLS、
@@ -41,8 +42,12 @@ struct CoAccess {
     static std::shared_ptr<ConnectionState> StateOf(const Connection& connection);
 
     // 提交：只用于无 handler 的 Engine（否则 operation_not_supported 且零提交）。
+    // reclaim 非空时为带句柄 CoDial 的本次责任记录；同时是 ReclaimReceipt 的
+    // 唯一内部构造入口。
     static std::error_code SubmitConnect(Engine& engine, const Address& address,
-                                        std::uint64_t& out_connect_id);
+                                        std::uint64_t& out_connect_id,
+                                        const std::shared_ptr<ReclaimRecord>& reclaim = {});
+    static ReclaimReceipt MakeReceipt(std::shared_ptr<ReclaimRecord> record);
     // 领取：成功才写 out；任何未交付失败都由内部归还 claim 并让 owner 回收 fd。
     static std::error_code WaitConnect(Engine& engine, std::uint64_t connect_id, Connection& out,
                                       const bbt::coroutine::WaitOptions& options);
