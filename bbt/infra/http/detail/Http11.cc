@@ -143,6 +143,12 @@ result<Http11Connection::ExchangeResult> Http11Connection::ReadResponse(
             const auto error = net::CoRead(
                 m_connection, bytes, {StageDeadline(deadlines.timeout.read, deadlines.total)});
             if (error == net::make_error_code(net::NetErrc::Eof)) {
+                // Beast put_eof 前置 got_some()：对端一个响应字节都没发就断开
+                // 时不能喂空 parser（会 abort）。请求已完整写出，回复丢失，按
+                // 未知结果交付（请求可能已生效）。
+                if (!parser.got_some()) {
+                    return R::err(CallError(error, "peer closed without response", true));
+                }
                 boost::system::error_code eof;
                 parser.put_eof(eof);
                 if (eof || !parser.is_done()) {

@@ -1,11 +1,10 @@
 #pragma once
 // co-network/v1 N1b-1：网络 Runtime 装配面。
 // Runtime 是资源拥有者；工厂返回的 shared_ptr 是受托管对象引用。
-// RPC 工厂是**非虚普通成员**（不属于 NetworkRuntime vtable）：装配面在这里
-// 固定，实现落在独立的 RPC 模块。启用锁定的 Protobuf wire profile 时由
-// bbt::infra_rpc（STATIC）定义；未启用时由 http 切片内的 stub 定义并返回
-// RuntimeUnavailable，不产生假成功。这样只链接 bbt::infra_http 的消费者既
-// 不需要 RPC 模块/protobuf，也不会因虚函数槽留下未解析符号。
+//
+// RPC 不在本装配面上：RPC core 已迁移到新 bbt::infra::http 栈
+// （BBT_INFRA_RPC_NET 闭包，bbt/infra/rpc/Client.hpp、Server.hpp），
+// 经 NetworkRuntime 的旧 RpcClient/RpcServer 工厂与兼容壳已删除。
 
 #include <memory>
 
@@ -15,8 +14,6 @@
 #include <bbt/infra/ICoNetwork.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
 #include <bbt/infra/Result.hpp>
-#include <bbt/infra/RpcClient.hpp>
-#include <bbt/infra/RpcServer.hpp>
 
 namespace bbt::infra {
 
@@ -58,12 +55,6 @@ public:
     virtual result<std::shared_ptr<HttpClient>> CreateHttpClient() = 0;
     virtual result<std::shared_ptr<HttpServer>> ListenHttp(
         ListenAddress address, HttpHandler handler) = 0;
-    // RPC 工厂：非虚普通成员，不是 NetworkRuntime 的 vtable 槽。实现只组合
-    // 公开的 CreateHttpClient/ListenHttp；启用 wire 时定义位于 bbt::infra_rpc，
-    // 未启用时位于 http 切片内的 stub（返回 RuntimeUnavailable）。
-    result<std::shared_ptr<RpcClient>> CreateRpcClient();
-    result<std::shared_ptr<RpcServer>> ListenRpc(
-        ListenAddress address, RpcHandler handler);
 
     // co-io-adapter/v1 §4.0.1：受管 TCP 工厂。工厂返回的 shared_ptr 是
     // 受托管引用；Runtime 强持有交付对象直至 Closed，超容量返回 Overloaded。

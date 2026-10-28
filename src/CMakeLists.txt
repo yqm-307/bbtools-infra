@@ -137,33 +137,3 @@ else()
         "接入 Mongo 客户端请传 -DBBT_MONGOCXX_PREFIX=<mongo-cxx-driver 安装前缀>"
         " 与 -DBBT_MONGOC_PREFIX=<mongo-c-driver 安装前缀>")
 endif()
-
-# --- RPC wire 模块（Issue #8）------------------------------------------------
-# 仅在 protoc/runtime 同源前缀给出时构建。proto 真源经 add_custom_command
-# 生成到 build/generated/；本模块编译生成物 + 公开面 adapter。
-#
-# 模块边界：RPC 工厂（NetworkRuntime::CreateRpcClient/ListenRpc）是非虚普通
-# 成员，符号只在本 target（或 http 内 stub）定义。本 target 公开依赖
-# bbt::infra_http（共享同一 HTTP owner），但 HTTP target 反向不依赖本模块或
-# protobuf——只链接 bbt::infra_http 的消费者因此不会链接 protobuf/生成库。
-if(TARGET bbt_infra_rpc_proto)
-    add_library(bbt_infra_rpc STATIC
-        rpc/RpcWire.cc
-        rpc/RpcRuntimeImpl.cc)
-    add_library(bbt::infra_rpc ALIAS bbt_infra_rpc)
-
-    target_include_directories(bbt_infra_rpc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_link_libraries(bbt_infra_rpc
-        PUBLIC  bbt::infra_http bbt::infra_common
-        PRIVATE bbt_infra_rpc_proto Boost::boost Threads::Threads)
-    target_compile_options(bbt_infra_rpc PRIVATE -Wall -Wextra)
-    target_compile_definitions(bbt_infra_rpc PRIVATE BBT_INFRA_HAS_RPC_WIRE=1)
-else()
-    # 无 wire：RPC 工厂 stub 与 http 消费者编入同一 target（RpcRuntimeImpl.cc
-    # 的 #else 分支），让只链接 bbt::infra_http 的调用仍能链接并返回
-    # RuntimeUnavailable；不导出会假成功的 bbt_infra_rpc target/符号。
-    target_sources(bbt_infra_http PRIVATE rpc/RpcRuntimeImpl.cc)
-    message(STATUS
-        "BBT_PROTOBUF_PREFIX 未设置：跳过 bbt_infra_rpc 模块。"
-        "接入 RPC wire profile 请传 -DBBT_PROTOBUF_PREFIX=<protobuf 前缀>")
-endif()

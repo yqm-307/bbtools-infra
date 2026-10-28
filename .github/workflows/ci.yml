@@ -24,16 +24,8 @@
 #      锁定 protobuf 3.21.12 私有前缀（提取 Ubuntu .deb，amd64 only，不装系统包、不写
 #      /usr/local）；克隆 coroutine@main / core@master 源码；整体打成单一 tar artifact
 #      （保留 symlink，记录 sha256 digest）供 release/debug/no-wire 复用同一份 prepared deps。
-#   2) release：下载同一归档并校验 sha256（artifact provenance 闭包，不匹配即 fail-closed）
-#      → resource-prefix fail-closed 回归 A/B（tests/resource-prefix/run.sh，不含 C/D，与
-#      现役同范围并如实声明）→ Release 全量 cmake（含 -DBBT_PROTOBUF_PREFIX 真实前缀，
-#      不静默回退）+ ctest -j1（含 redis.unit/mongo.unit 与 7 个正式 RPC 名注册断言：
-#      rpc.payload/rpc.runtime/rpc.runtime_faults/rpc.runtime_lifetime/rpc.runtime_roundtrip/
-#      rpc.wire_contract/rpc.wire_roundtrip，且全量实跑、live skipped 如实报告）→ 无 wire
-#      独立 configure/build（prefix 为空）只跑 rpc.runtime_no_wire 并断言 HTTP 链接闭包不含
-#      protobuf → Release 归档无 Debug 观测符号断言 → 依赖来源核查。
-#   3) debug：下载同一归档 → Debug 8 项既有门禁 + 同 7 项 RPC 定向集合（共 15 项零跳过，
-#      JUnit expected 精确更新）并把同 peers 加入 build 目标。
+#   2) release：旧模块全量 + payload；独立新 RPC/HTTP Release 契约与消费；HTTP-only 无 protobuf、缺前缀拒绝。
+#   3) debug：旧 8 项门禁 + payload；独立新 RPC/HTTP Debug 契约与消费。所有新增用例须注册实跑一致且零跳过。
 #   4) network：下载同一归档 → NetworkOnly 入口只接入 coroutine + Boost，不探测 core/旧模块，
 #      构建新 TCP 目标并运行注册集；注册集与 JUnit 必须精确一致，缺项/重复/跳过均失败。
 #   5) release/debug/network 均按 callee 分类门控：docs-only 才允许显式跳过；code/unknown 执行全部。
@@ -393,8 +385,7 @@ jobs:
             -DBBT_CORE_SOURCE_DIR="$CORE_DIR" \
             -DBBT_HIREDIS_PREFIX="$DEPS_PREFIX/hiredis" \
             -DBBT_MONGOCXX_PREFIX="$DEPS_PREFIX/mongocxx" \
-            -DBBT_MONGOC_PREFIX="$DEPS_PREFIX/mongoc" \
-            -DBBT_PROTOBUF_PREFIX="$PROTOBUF_PREFIX"
+            -DBBT_MONGOC_PREFIX="$DEPS_PREFIX/mongoc"
           cmake --build . --parallel "$JOBS"
           if command -v ccache >/dev/null 2>&1 && [ "${{ steps.cache-meta.outputs.enabled }}" = "true" ]; then
             echo "=== ccache 统计（编译后） ==="
@@ -407,12 +398,8 @@ jobs:
           # Issue #34 A3：先断言两个 unit 已注册——若模块 target 缺失（前缀未
           # 传递或 find_package 失败）导致 redis.unit/mongo.unit 没注册，这里
           # 直接非零失败，不进入 ctest 漏判。
-          # Issue #8 追加：7 个正式 RPC 名必须已注册（bbt_infra_rpc/生成库缺失即非零
-          # 失败，不靠 ctest 全量「恰好没跑」变绿）。这些测试同样由下方全量 ctest -j1
-          # 实际执行，不做只 ctest -N 的假断言。
-          for t in redis.unit mongo.unit \
-                   rpc.payload rpc.runtime rpc.runtime_faults rpc.runtime_lifetime \
-                   rpc.runtime_roundtrip rpc.wire_contract rpc.wire_roundtrip; do
+          # RPC runtime/wire 迁往本 job 后续新 RPC 闭包，payload 仍在此验证。
+          for t in redis.unit mongo.unit rpc.payload; do
             if ! ctest -N -R "^${t}$" | grep -q "Test.*: ${t}$"; then
               echo "FAIL: '${t}' 未注册（依赖前缀/模块 target 缺失）"
               exit 1
@@ -421,63 +408,88 @@ jobs:
           # --timeout 只作用于无 TIMEOUT 属性的测试（contract.basics）；
           # http.loopback/http.lifecycle 的 TIMEOUT 60/120 测试属性优先级更高，保持不变。
           # 保持与现役门禁一致的 180：contract.basics 无实测耗时证据就收紧会造成门禁 flake。
-          # Issue #8：全量 ctest 追加 7 个正式 RPC 用例（单项 TIMEOUT 最高 180s），外框由 5
-          # 上调到 8 分钟以留足余量（仍 < release job 45 分钟上限）。
           ctest -j1 --output-on-failure --timeout 180
         timeout-minutes: 8
 
-      # Issue #8：无 wire 配置独立门禁——不传 BBT_PROTOBUF_PREFIX（prefix 真为空），RPC
-      # 工厂 stub 编入 HTTP target，bbt_infra_rpc 不导出。单独 build 目录（不改 Release
-      # 主 build 目录），只 build+运行 rpc.runtime_no_wire，并断言 HTTP 归档与 no_wire
-      # 二进制均不含 protobuf 符号（保留「HTTP 不传染 protobuf 检查」）。不新增 job/runner。
-      - name: "无 wire 配置门禁（prefix 为空，独立 build，仅 rpc.runtime_no_wire）"
+      - name: "新 RPC/HTTP Release 编译与完整契约门禁"
         run: |
           set -euo pipefail
-          NO_WIRE_BUILD_DIR="${BUILD_DIR}-no-wire"
-          rm -rf "$NO_WIRE_BUILD_DIR" && mkdir -p "$NO_WIRE_BUILD_DIR"
-          cmake -S "$GITHUB_WORKSPACE/infra" -B "$NO_WIRE_BUILD_DIR" -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
+          RPC_BUILD_DIR="${BUILD_DIR}-rpc-release"
+          # cache-meta 已归一 fork/bypass；runner 无 ccache 时直接编译（不装工具）。
+          LAUNCHER=""
+          if [ "${{ steps.cache-meta.outputs.enabled }}" = "true" ] && \
+             command -v ccache >/dev/null 2>&1; then
+            LAUNCHER="-DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+          fi
+          cmake -S "$GITHUB_WORKSPACE/infra" -B "$RPC_BUILD_DIR" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release $LAUNCHER \
+            -DBUILD_TESTING=ON -DBBT_INFRA_HTTP_NET=ON -DBBT_INFRA_RPC_NET=ON \
             -DBOOST_ROOT="$BOOST_PREFIX" -DCMAKE_PREFIX_PATH="$BOOST_PREFIX" \
-            -DBBT_COROUTINE_SOURCE_DIR="$COROUTINE_DIR" \
-            -DBBT_CORE_SOURCE_DIR="$CORE_DIR" \
-            -DBBT_HIREDIS_PREFIX="$DEPS_PREFIX/hiredis" \
-            -DBBT_MONGOCXX_PREFIX="$DEPS_PREFIX/mongocxx" \
-            -DBBT_MONGOC_PREFIX="$DEPS_PREFIX/mongoc" \
-            > "$NO_WIRE_BUILD_DIR/configure.log" 2>&1
-          # prefix 必须真为空：configure 日志须出现 stub 分支说明，否则 wire 被静默带入。
-          if ! grep -q "跳过 bbt_infra_rpc 模块" "$NO_WIRE_BUILD_DIR/configure.log"; then
-            echo "FAIL: 无 wire 配置未走 stub 分支（BBT_PROTOBUF_PREFIX 未真正为空）" >&2
-            sed -n '1,80p' "$NO_WIRE_BUILD_DIR/configure.log" >&2
+            -DBBT_COROUTINE_SOURCE_DIR="$COROUTINE_DIR" -DBBT_PROTOBUF_PREFIX="$PROTOBUF_PREFIX"
+          cmake --build "$RPC_BUILD_DIR" --parallel "$JOBS" --target \
+            bbt_infra_rpc_net_header_selfcheck bbt_infra_http_net_header_selfcheck \
+            Test_rpc_net_wire Test_rpc_net_roundtrip Test_rpc_net_faults Test_rpc_net_lifetime rpc_net_example \
+            Test_http_net_contract Test_http_net_regressions Test_http_net_server Test_http_net_stop_regressions http_net_example
+          ctest --test-dir "$RPC_BUILD_DIR" -N --show-only=json-v1 -R '^(rpc|http)\.net\.' > "$RPC_BUILD_DIR/registered.json"
+          ctest --test-dir "$RPC_BUILD_DIR" -j1 -R '^(rpc|http)\.net\.' \
+            --no-tests=error --output-on-failure --timeout 180 --output-junit "$RPC_BUILD_DIR/rpc-http.xml"
+          python3 - "$RPC_BUILD_DIR" <<'PY'
+          import json, sys, xml.etree.ElementTree as ET
+          from pathlib import Path
+          build = Path(sys.argv[1])
+          names = [t['name'] for t in json.loads((build / 'registered.json').read_text())['tests']]
+          required = set(['rpc.net.association', 'rpc.net.budget_local_min', 'rpc.net.cancel_post_commit', 'rpc.net.cancelled', 'rpc.net.client_close', 'rpc.net.client_input', 'rpc.net.close_drops_inflight', 'rpc.net.consumer', 'rpc.net.inflight_authorization', 'rpc.net.malformed_reply', 'rpc.net.released_client_handle', 'rpc.net.reuse', 'rpc.net.roundtrip', 'rpc.net.server_lifecycle', 'rpc.net.server_malformed', 'rpc.net.transport_defaults', 'rpc.net.transport_errors', 'rpc.net.unknown_outcome', 'rpc.net.wire_malformed', 'rpc.net.wire_reject', 'rpc.net.wire_roundtrip', 'http.net.bad_stream_retire', 'http.net.body_limit', 'http.net.chunked', 'http.net.close_cancel_race', 'http.net.consumer', 'http.net.cross_origin', 'http.net.eof_truncated', 'http.net.fragment_body', 'http.net.fragment_header', 'http.net.get_post_reuse', 'http.net.handoff_concurrency', 'http.net.head_interim', 'http.net.input_boundary', 'http.net.keepalive_expiry', 'http.net.per_read_total', 'http.net.phase_timeouts', 'http.net.physical_budget', 'http.net.physical_budget_two', 'http.net.physical_cancel', 'http.net.pool_queue_timeout', 'http.net.preexpired_cancelled', 'http.net.server_close_timeout', 'http.net.server_incoming_deadline', 'http.net.server_inflight_limit', 'http.net.server_physical_capacity', 'http.net.server_reply_drain', 'http.net.server_security', 'http.net.server_start_capacity', 'http.net.server_stop_authorization', 'http.net.server_wire', 'http.net.stop_regressions'])
+          if len(names) != len(set(names)) or not required <= set(names):
+              raise SystemExit('FAIL: RPC/HTTP registered tests missing or duplicated')
+          cases = list(ET.parse(build / 'rpc-http.xml').getroot().iter('testcase'))
+          if len(cases) != len(names) or {c.get('name') for c in cases} != set(names):
+              raise SystemExit('FAIL: RPC/HTTP registered and executed tests differ')
+          if any(c.find(t) is not None for c in cases for t in ('skipped', 'failure', 'error')):
+              raise SystemExit('FAIL: RPC/HTTP skipped or failed tests')
+          print(f'RPC/HTTP: {len(cases)} passed, 0 failed, 0 skipped')
+          PY
+        timeout-minutes: 15
+
+      - name: "HTTP-only 无 protobuf 依赖及 RPC 缺前缀拒绝门禁"
+        run: |
+          set -euo pipefail
+          NO_WIRE_BUILD_DIR="${BUILD_DIR}-http-no-wire"
+          LAUNCHER=""
+          if [ "${{ steps.cache-meta.outputs.enabled }}" = "true" ] && \
+             command -v ccache >/dev/null 2>&1; then
+            LAUNCHER="-DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+          fi
+          cmake -S "$GITHUB_WORKSPACE/infra" -B "$NO_WIRE_BUILD_DIR" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release $LAUNCHER \
+            -DBUILD_TESTING=ON -DBBT_INFRA_HTTP_NET=ON -DBBT_INFRA_RPC_NET=OFF \
+            -DBBT_PROTOBUF_PREFIX= -DBOOST_ROOT="$BOOST_PREFIX" -DCMAKE_PREFIX_PATH="$BOOST_PREFIX" \
+            -DBBT_COROUTINE_SOURCE_DIR="$COROUTINE_DIR"
+          cmake --build "$NO_WIRE_BUILD_DIR" --parallel "$JOBS" --target Test_http_net_contract
+          ctest --test-dir "$NO_WIRE_BUILD_DIR" -N --show-only=json-v1 > "$NO_WIRE_BUILD_DIR/registered.json"
+          python3 - "$NO_WIRE_BUILD_DIR" <<'PY'
+          import json, pathlib, subprocess, sys
+          build = pathlib.Path(sys.argv[1])
+          names = [t['name'] for t in json.loads((build / 'registered.json').read_text())['tests']]
+          if any(n.startswith('rpc.') for n in names):
+              raise SystemExit('FAIL: HTTP-only unexpectedly registers RPC')
+          archives = list(build.rglob('libbbt_infra_http_net.a'))
+          if len(archives) != 1:
+              raise SystemExit('FAIL: HTTP archive missing or duplicated')
+          syms = subprocess.check_output(['nm', '-C', str(archives[0])], text=True)
+          if any(s in syms for s in ('protobuf', 'rpc_envelope')):
+              raise SystemExit('FAIL: HTTP archive depends on protobuf')
+          PY
+          ctest --test-dir "$NO_WIRE_BUILD_DIR" -j1 -R '^http\.net\.get_post_reuse$' --no-tests=error --output-on-failure
+          REJECT_DIR="${BUILD_DIR}-rpc-missing-prefix"
+          mkdir -p "$REJECT_DIR"
+          if cmake -S "$GITHUB_WORKSPACE/infra" -B "$REJECT_DIR" -G Ninja \
+            -DBBT_INFRA_HTTP_NET=ON -DBBT_INFRA_RPC_NET=ON -DBBT_PROTOBUF_PREFIX= \
+            -DBOOST_ROOT="$BOOST_PREFIX" -DCMAKE_PREFIX_PATH="$BOOST_PREFIX" \
+            -DBBT_COROUTINE_SOURCE_DIR="$COROUTINE_DIR" > "$REJECT_DIR/rejection.log" 2>&1; then
+            echo 'FAIL: RPC without locked protobuf unexpectedly configured' >&2
             exit 1
           fi
-          # wire-only RPC 测试不得注册（rpc.payload 与 rpc.runtime_no_wire 是设计内、始终注册）。
-          for t in rpc.runtime rpc.runtime_faults rpc.runtime_lifetime \
-                   rpc.runtime_roundtrip rpc.wire_contract rpc.wire_roundtrip; do
-            if ctest --test-dir "$NO_WIRE_BUILD_DIR" -N -R "^${t}$" | grep -q "Test.*: ${t}$"; then
-              echo "FAIL: 无 wire 配置仍注册了 wire RPC 测试 ${t}" >&2
-              exit 1
-            fi
-          done
-          cmake --build "$NO_WIRE_BUILD_DIR" --parallel "$JOBS" \
-            --target Test_rpc_runtime_no_wire
-          # 「HTTP 不传染 protobuf」：无 wire 下 HTTP 归档与 no_wire 二进制均不得含
-          # protobuf/rpc_envelope 符号（wire 配置的 HTTP 闭包不变式见
-          # docs/decisions/0009-rpc-runtime-v1.md）。
-          python3 - "$NO_WIRE_BUILD_DIR" <<'PY'
-          import pathlib, subprocess, sys
-          build = pathlib.Path(sys.argv[1])
-          for art in (build / 'src' / 'libbbt_infra_http.a',
-                      build / 'tests' / 'Test_rpc_runtime_no_wire'):
-              if not art.exists():
-                  raise SystemExit(f'FAIL: 缺无 wire 产物 {art}')
-              syms = subprocess.check_output(['nm', '-C', str(art)], text=True)
-              for bad in ('protobuf', 'rpc_envelope'):
-                  if bad in syms:
-                      raise SystemExit(f'FAIL: 无 wire {art} 含 {bad}（HTTP 被 protobuf 传染）')
-          print('无 wire: HTTP 归档与 no_wire 二进制均无 protobuf 符号 (ok)')
-          PY
-          ctest --test-dir "$NO_WIRE_BUILD_DIR" -j1 -R '^rpc\.runtime_no_wire$' \
-            --no-tests=error --output-on-failure --timeout 120
+          grep -q '需要显式 BBT_PROTOBUF_PREFIX' "$REJECT_DIR/rejection.log"
         timeout-minutes: 12
 
       # Release 侧观测符号不变式：三份归档必须存在且**无** bbt::infra::debug:: 符号。
@@ -594,7 +606,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-  # #62 + Issue #8：Debug 定向门禁（8 项既有 + 7 项正式 RPC = 15 项，零跳过）。下载同一
+  # #62 + RPC 迁移：Debug 旧模块9项与独立新RPC/HTTP契约，均零跳过。下载同一
   # prepared deps；不改 runner、不新增依赖下载；缺项/跳过/失败均判负。job 名保持现役
   # check 名不变（避免破坏 required context）。
   debug:
@@ -627,7 +639,7 @@ jobs:
             --expect-sha "${{ needs.prepare-deps.outputs.bundle_sha256 }}" \
             --dest "$GITHUB_WORKSPACE"
 
-      - name: "Debug 配置与构建（8 项既有 + 7 项 RPC + peers）"
+      - name: "Debug 旧模块配置与构建（8 项既有 + payload）"
         run: |
           set -euo pipefail
           DEBUG_BUILD_DIR="${BUILD_DIR}-debug"
@@ -644,17 +656,14 @@ jobs:
             -DBBT_COROUTINE_SOURCE_DIR="$COROUTINE_DIR" -DBBT_CORE_SOURCE_DIR="$CORE_DIR" \
             -DBBT_HIREDIS_PREFIX="$DEPS_PREFIX/hiredis" \
             -DBBT_MONGOCXX_PREFIX="$DEPS_PREFIX/mongocxx" \
-            -DBBT_MONGOC_PREFIX="$DEPS_PREFIX/mongoc" \
-            -DBBT_PROTOBUF_PREFIX="$PROTOBUF_PREFIX"
+            -DBBT_MONGOC_PREFIX="$DEPS_PREFIX/mongoc"
           cmake --build "$DEBUG_BUILD_DIR" --parallel "$JOBS" --target \
             Test_contract_basics Test_http_session_lifetime_probe \
             Test_http_timer_rearm_probe Test_http_inflight_close_probe \
             Test_http_child_unregister Test_redis_unit Test_redis_cotcp_binding Test_mongo_unit \
-            Test_rpc_payload Test_rpc_runtime Test_rpc_runtime_faults Test_rpc_runtime_lifetime \
-            Test_rpc_runtime_roundtrip Test_rpc_wire_contract Test_rpc_wire_roundtrip \
-            bbt_rpc_runtime_peer bbt_rpc_wire_peer
+            Test_rpc_payload
 
-      - name: "Debug 门禁（符号、15 项测试与零跳过）"
+      - name: "Debug 旧模块门禁（符号、9 项测试与零跳过）"
         run: |
           set -euo pipefail
           DEBUG_BUILD_DIR="${BUILD_DIR}-debug"
@@ -672,7 +681,7 @@ jobs:
                   raise SystemExit(f'FAIL: Debug {archive} 缺 debug 观测符号（STRINGENT_DEBUG 未生效）')
           print('Debug 归档: 三模块均含 debug 观测符号 (ok)')
           PY
-          RX='^(contract\.basics|http\.session_lifetime|http\.timer_rearm|http\.inflight_close|http\.child_unregister|redis\.unit|redis\.cotcp_binding|mongo\.unit|rpc\.payload|rpc\.runtime|rpc\.runtime_faults|rpc\.runtime_lifetime|rpc\.runtime_roundtrip|rpc\.wire_contract|rpc\.wire_roundtrip)$'
+          RX='^(contract\.basics|http\.session_lifetime|http\.timer_rearm|http\.inflight_close|http\.child_unregister|redis\.unit|redis\.cotcp_binding|mongo\.unit|rpc\.payload)$'
           ctest --test-dir "$DEBUG_BUILD_DIR" -j1 -R "$RX" \
             --no-tests=error --output-on-failure --timeout 180 \
             --output-junit "$DEBUG_BUILD_DIR/diagnostics.xml"
@@ -680,17 +689,56 @@ jobs:
           import sys, xml.etree.ElementTree as ET
           expected = {'contract.basics', 'http.session_lifetime', 'http.timer_rearm',
                       'http.inflight_close', 'http.child_unregister', 'redis.unit',
-                      'redis.cotcp_binding', 'mongo.unit', 'rpc.payload', 'rpc.runtime',
-                      'rpc.runtime_faults', 'rpc.runtime_lifetime', 'rpc.runtime_roundtrip',
-                      'rpc.wire_contract', 'rpc.wire_roundtrip'}
+                      'redis.cotcp_binding', 'mongo.unit', 'rpc.payload'}
           cases = list(ET.parse(sys.argv[1]).getroot().iter('testcase'))
           if len(cases) != len(expected) or {c.get('name') for c in cases} != expected:
               raise SystemExit('FAIL: Debug diagnostics test set is incomplete or duplicated')
           if any(c.find(tag) is not None for c in cases for tag in ('skipped', 'failure', 'error')):
               raise SystemExit('FAIL: Debug diagnostics contain skipped/failed/error cases')
-          print('Debug diagnostics: 15 passed, 0 failed, 0 skipped')
+          print('Debug diagnostics: 9 passed, 0 failed, 0 skipped')
           PY
         timeout-minutes: 12
+
+      - name: "新 RPC/HTTP Debug 编译与完整契约门禁"
+        run: |
+          set -euo pipefail
+          RPC_BUILD_DIR="${BUILD_DIR}-rpc-debug"
+          # 与本 job 旧模块构建同一判定：cache 开关 + 非 fork + runner 自带 ccache；
+          # 任一不满足直接编译（不装工具、不放宽测试）。
+          LAUNCHER=""
+          if [ "${{ env.CACHE_ENABLED }}" = "true" ] && \
+             [ "${{ github.event_name }}" != "pull_request" -o "${{ github.event.pull_request.head.repo.full_name }}" = "${{ github.repository }}" ] && \
+             command -v ccache >/dev/null 2>&1; then
+            LAUNCHER="-DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+          fi
+          cmake -S "$GITHUB_WORKSPACE/infra" -B "$RPC_BUILD_DIR" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug $LAUNCHER \
+            -DBUILD_TESTING=ON -DBBT_INFRA_HTTP_NET=ON -DBBT_INFRA_RPC_NET=ON \
+            -DBOOST_ROOT="$BOOST_PREFIX" -DCMAKE_PREFIX_PATH="$BOOST_PREFIX" \
+            -DBBT_COROUTINE_SOURCE_DIR="$COROUTINE_DIR" -DBBT_PROTOBUF_PREFIX="$PROTOBUF_PREFIX"
+          cmake --build "$RPC_BUILD_DIR" --parallel "$JOBS" --target \
+            bbt_infra_rpc_net_header_selfcheck bbt_infra_http_net_header_selfcheck \
+            Test_rpc_net_wire Test_rpc_net_roundtrip Test_rpc_net_faults Test_rpc_net_lifetime rpc_net_example \
+            Test_http_net_contract Test_http_net_regressions Test_http_net_server Test_http_net_stop_regressions http_net_example
+          ctest --test-dir "$RPC_BUILD_DIR" -N --show-only=json-v1 -R '^(rpc|http)\.net\.' > "$RPC_BUILD_DIR/registered.json"
+          ctest --test-dir "$RPC_BUILD_DIR" -j1 -R '^(rpc|http)\.net\.' \
+            --no-tests=error --output-on-failure --timeout 180 --output-junit "$RPC_BUILD_DIR/rpc-http.xml"
+          python3 - "$RPC_BUILD_DIR" <<'PY'
+          import json, sys, xml.etree.ElementTree as ET
+          from pathlib import Path
+          build = Path(sys.argv[1])
+          names = [t['name'] for t in json.loads((build / 'registered.json').read_text())['tests']]
+          required = set(['rpc.net.association', 'rpc.net.budget_local_min', 'rpc.net.cancel_post_commit', 'rpc.net.cancelled', 'rpc.net.client_close', 'rpc.net.client_input', 'rpc.net.close_drops_inflight', 'rpc.net.consumer', 'rpc.net.inflight_authorization', 'rpc.net.malformed_reply', 'rpc.net.released_client_handle', 'rpc.net.reuse', 'rpc.net.roundtrip', 'rpc.net.server_lifecycle', 'rpc.net.server_malformed', 'rpc.net.transport_defaults', 'rpc.net.transport_errors', 'rpc.net.unknown_outcome', 'rpc.net.wire_malformed', 'rpc.net.wire_reject', 'rpc.net.wire_roundtrip', 'http.net.bad_stream_retire', 'http.net.body_limit', 'http.net.chunked', 'http.net.close_cancel_race', 'http.net.consumer', 'http.net.cross_origin', 'http.net.eof_truncated', 'http.net.fragment_body', 'http.net.fragment_header', 'http.net.get_post_reuse', 'http.net.handoff_concurrency', 'http.net.head_interim', 'http.net.input_boundary', 'http.net.keepalive_expiry', 'http.net.per_read_total', 'http.net.phase_timeouts', 'http.net.physical_budget', 'http.net.physical_budget_two', 'http.net.physical_cancel', 'http.net.pool_queue_timeout', 'http.net.preexpired_cancelled', 'http.net.server_close_timeout', 'http.net.server_incoming_deadline', 'http.net.server_inflight_limit', 'http.net.server_physical_capacity', 'http.net.server_reply_drain', 'http.net.server_security', 'http.net.server_start_capacity', 'http.net.server_stop_authorization', 'http.net.server_wire', 'http.net.stop_regressions'])
+          if len(names) != len(set(names)) or not required <= set(names):
+              raise SystemExit('FAIL: RPC/HTTP registered tests missing or duplicated')
+          cases = list(ET.parse(build / 'rpc-http.xml').getroot().iter('testcase'))
+          if len(cases) != len(names) or {c.get('name') for c in cases} != set(names):
+              raise SystemExit('FAIL: RPC/HTTP registered and executed tests differ')
+          if any(c.find(t) is not None for c in cases for t in ('skipped', 'failure', 'error')):
+              raise SystemExit('FAIL: RPC/HTTP skipped or failed tests')
+          print(f'RPC/HTTP: {len(cases)} passed, 0 failed, 0 skipped')
+          PY
+        timeout-minutes: 15
 
   # 新 TCP 独立入口；不能用旧模块 Release/Debug 绿色替代 NetworkOnly 覆盖。
   network:
