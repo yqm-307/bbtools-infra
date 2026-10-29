@@ -8,7 +8,7 @@ net 公共契约与内部责任流；不改变既有 Engine 生命周期模型�
 
 ### `net::ReclaimReceipt`（Connection.hpp）
 
-一次带句柄 `CoDial` 的物理回收观察句柄，值语义，默认无效：
+`Engine::CoDial` 返回包（`ConnectionResult::reclaim`）里的物理回收观察句柄，值语义，默认无效：
 
 - 无效句柄（默认构造）：`Valid()=false`、`Released()=true` —— 没有已提交资源责任。
 - 有效句柄 `Released()=false`：本次建连/物理 socket 责任仍存活（排队、建连中、
@@ -25,22 +25,27 @@ Engine 成环，持句柄不阻碍回收。内部共享记录（`ReclaimRecord`�
 - 有效句柄：仅底层 fd 已物理关闭且 owner 对本连接的资源责任清理后为 `true`。
 
 `Closed()` 保持既有逻辑接纳语义（可能先于物理收口）；`Released()` 不取代
-`Closed()`。对带句柄 CoDial 交付的连接，`Released()` 与其 receipt 的
-`Released()` 同一记录、同终态。
+`Closed()`。对 `Engine::CoDial` 交付的连接，`Released()` 与其
+`ConnectionResult::reclaim` 的 `Released()` 同一记录、同终态。
 
-### 带句柄 `CoDial` 重载（CoConnection.hpp）
+### `Engine::CoDial` 返回的回收观察（ConnectionResult.hpp）
 
 ```cpp
-std::error_code CoDial(Engine&, const Address&, Connection& out,
-                       ReclaimReceipt& receipt,
-                       const bbt::coroutine::WaitOptions& options = {});
+struct ConnectionResult {
+    std::error_code error;
+    CoTcpConnection connection;   // 失败时无效，不覆盖调用者原句柄
+    ReclaimReceipt reclaim;       // 本次 socket 责任的物理回收观察
+};
+ConnectionResult Engine::CoDial(const Address&,
+                                const bbt::coroutine::WaitOptions& = {});
 ```
 
-- 每次调用先把 receipt 重置为本次；执行域非法/提交未接纳（上下文、Idle、
+- 每次调用 `reclaim` 描述本次提交：执行域非法/提交未接纳（上下文、Idle、
   容量、投递失败等）句柄保持无效（`Released()=true`，无已提交责任）。
 - 提交接纳后，无论后续超时/取消/未交付/Close 竞态，句柄有效并描述本次真实
-  物理 socket 责任；失败不改 `out`，不遗留不可观察的责任（最终释放必可达）。
-- 原无句柄 `CoDial` 转发至本重载并丢弃句柄，门禁与等待首胜语义不变。
+  物理 socket 责任；`error` 非空时 `connection` 无效，不遗留不可观察的责任
+  （最终释放必可达）。
+- 不关心回收的消费者可忽略 `reclaim` 字段，门禁与等待首胜语义不变。
 
 ## 内部责任流（实现要点）
 

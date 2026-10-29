@@ -56,7 +56,7 @@ result<std::shared_ptr<RpcServer>> ListenRpc(
 
 | 现有位置 | 处理 | 原因 |
 |---|---|---|
-| `bbtools-infra/include/bbt/infra/rpc/RpcWire.hpp` / `src/rpc/RpcWire.cc` | 保留为 wire 唯一真源，并由 runtime adapter 调用 | #8 已冻结 body profile；不复制字节规则 |
+| `bbtools-infra/bbt/infra/rpc/RpcWire.hpp` / `bbt/infra/rpc/RpcWire.cc` | 保留为 wire 唯一真源，并由 runtime adapter 调用 | #8 已冻结 body profile；不复制字节规则 |
 | `bbt-framework/framework/src/host/RpcHttpBridge.cc` 的正式 ProtoWireV1 发送 | 后续改为调用 infra `RpcClient` | 通用发送、wire、关联和错误属于 infra |
 | `bbt-framework/framework/src/host/RpcWireBridge.cc` 的正式入站 | 后续改为 `RpcServer` handler 适配 | infra 提供 envelope/期限，framework 保留业务分发 |
 | `bbt-framework/framework/src/host/RpcHttpBridge.cc` 的 LegacyHeaders | 暂留 framework 迁移期桥 | 不把旧 header 协议复制进 infra；退出/默认切换另行裁决 |

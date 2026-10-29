@@ -1,6 +1,6 @@
 # 0010：gnet 网络基础与 R2 TCP 契约
 
-**状态：已合入主线**（PR #84，合入提交 `99d0821a0175c43d9ec2fff78de1f90af068f92b`）。下表为核心契约，当前实现覆盖 TCP server/client 的 raw 与 Co 两条入口；HTTP/RPC/Redis/Mongo/config 消费者迁移、高层 UDP、Reactor 级 Release/sanitizer/长时压力仍未做。当前执行模型及生命周期真源见 [网络执行域设计](../architecture/gnet-network-execution.md)。文末逐符号表保留为迁移分析记录，不再以 gnet 签名强制约束新 API，也不作为交付状态来源（交付状态以 README 与本文「当前实现落点」为准）。
+**状态：已合入主线**（R2 底座 PR #84，合入提交 `99d0821a0175c43d9ec2fff78de1f90af068f92b`；`ICoConnection` 成员接口收口 PR #104）。下表为核心契约，当前实现覆盖 TCP server/client 的 raw 与 Co 两条入口；HTTP/RPC/Redis/Mongo/config 消费者迁移、高层 UDP、Reactor 级 Release/sanitizer/长时压力仍未做。当前执行模型及生命周期真源见 [网络执行域设计](../architecture/gnet-network-execution.md)。文末逐符号表保留为迁移分析记录，不再以 gnet 签名强制约束新 API，也不作为交付状态来源（交付状态以 README 与本文「当前实现落点」为准）。
 
 ## 当前范围与版本
 
@@ -18,7 +18,7 @@
 | driver / owner | 自有 Asio context，各 Reactor 自动绑定一个空闲已登记 P 槽；槽不足回滚，不抢占、扩 worker、缩数量或回退网络线程 |
 | 布局 | 普通 server 一个 main + N 个 sub，N 是 sub 数，启动报告全部槽需求；client-only 无 accept main；P 仍可执行业务协程，连接 owner 固定 |
 | 原始回调 | OnAccept/OnConnect/OnRead/OnWrite/OnClose 在 owner 的非业务协程边界短、非阻塞、不可挂起地运行；同连接不重入，不锁内/递归调用用户代码 |
-| 同步接口 | CoRead/CoWrite/Accept/Dial 复用同一异步能力和既有 CoWaiter/Chan；不自动为每条连接建业务协程，不建第二收包内核 |
+| 同步接口 | `Engine::CoAccept`/`Engine::CoDial` 交付 `CoTcpConnection`，协程读写为 `ICoConnection` 成员（`Read`/`Write`/`AsyncWrite`/`WaitClosed`/`Status`），复用同一异步能力和既有 CoWaiter/Chan；不自动为每条连接建业务协程，不建第二收包内核 |
 | 接收真源 | 并发安全接收 ring 保持 TCP 顺序及未消费数据；OnRead 只是可合并通知，EOF/错误持久可查询，不作为业务包边界 |
 | 读取与 view | TryRead 原子复制/消费；竞争 Busy、空且无终态 WouldBlock，均零消费；组合 Peek/Consume 在短保护内，不跨挂起/外借 view；保护释放持久通知、登记后复查，不阻塞 P |
 | 缓冲寿命 | 显式连接关闭/Engine 收口后已收数据仍可读；Conn/ring/操作结果独立于 socket/context 存活，无强环、UAF 或虚假 drain |
@@ -32,40 +32,43 @@
 | 关闭约束 | owner 正常收口→控制域同代同步解绑→必要时独占清理→context 存活时拆 backend→销毁 context；不等上层业务任务/外部句柄归零，不承诺硬 deadline、不建 reaper/Stop |
 | driver Failed | 控制域有限间隔查询所持 token，封口并同代解绑后清理；不在控制域伪调 owner 回调，以 Engine 错误与冻结状态/内部完成订阅为替代出口；不做自动迁移/重绑 |
 
-上表的接口名和状态名表达职责与约束；当前公共头见下节「当前实现落点」。`ticker`、`edge_triggered_io`、`bind_to_device`、`multicast_interface_index`、`lock_os_thread` 这五个字段已随「API 冻结候选」从 `Options` 删除，现在是**编译期**拒绝（不存在入口），不再是 `Run` 里识别后返回 `operation_not_supported`。
+上表的接口名和状态名表达职责与约束；当前公共头见下节「当前实现落点」。`ticker`、`edge_triggered_io`、`bind_to_device`、`multicast_interface_index`、`lock_os_thread` 这五个字段已从 `Options` 删除（PR #104），现在是**编译期**拒绝（不存在入口），不再是 `Run` 里识别后返回 `operation_not_supported`。
 
 ## 当前实现落点
 
-> 本节与下节「API 冻结候选」描述的是**工作区候选**（分支 `refactor/net-minimal-api-freeze`，基于 `c35a2a25`），**尚未提交、未推送、未经 PR CI、未正式冻结**；main 上仍是 PR #84 的形态。差异见 §「API 冻结候选」。
-
-- 公共头：`<bbt/infra/net/Engine.hpp>`（`Engine`/`EngineConfig`/`RuntimeProgress`/`EnginePhase`）、`RawHandler.hpp`、`Connection.hpp`、`CoConnection.hpp`、`Types.hpp`、`ReadAccess.hpp`、`Options.hpp`、`LoadBalancing.hpp`、`Address.hpp`、`NativeSocket.hpp`、`Error.hpp`、`ICoObject.hpp`/`CoObject.hpp`/`Annotations.hpp`；内部部件在 `detail/`（`ReactorDriver`、`DriverBinder`、`ReceiveRing`、`OutboundQueue`、`EventRingBuffer`、`WakeHub`、`ConnectionState`、`OptionsNormalize`、`TestAccess`、`EngineTestAccess`），不进公共自检。高层 UDP 只有 `<bbt/infra/net/Udp.hpp>` 的编译拒绝入口。
+- 公共头：`<bbt/infra/net/Engine.hpp>`（`Engine`/`EngineConfig`/`RuntimeProgress`/`EnginePhase`）、`RawHandler.hpp`、`Connection.hpp`、`ICoConnection.hpp`、`CoTcpConnection.hpp`、`ConnectionResult.hpp`、`Buffer.hpp`、`WriteOperation.hpp`、`CoConnection.hpp`（聚合注释头，原自由函数已删）、`Types.hpp`、`ReadAccess.hpp`、`Options.hpp`、`LoadBalancing.hpp`、`Address.hpp`、`NativeSocket.hpp`、`Error.hpp`、`ICoObject.hpp`/`CoObject.hpp`/`Annotations.hpp`；内部部件在 `detail/`（`ReactorDriver`、`DriverBinder`、`ReceiveRing`、`OutboundQueue`、`EventRingBuffer`、`WakeHub`、`ConnectionState`、`OptionsNormalize`、`TestAccess`、`EngineTestAccess`），不进公共自检。高层 UDP 只有 `<bbt/infra/net/Udp.hpp>` 的编译拒绝入口。
 - 目标：`bbt::infra_net`（STATIC），依赖 `bbt_coroutine` 与 Boost 头，不引入新第三方依赖。
-- 测试面：`tests/net/` 的 `net_foundation`/`net_primitives`/`net_allocation`/`reactor_driver`/`r2_tcp`/`b4_contract`/`freeze_contract`/`net_foundation_consumer` 与 `example_co_net_service_roundtrip`，由 `scripts/ci/check_network_tests.py` 强制「注册集 = 实跑集、零跳过」。
-- 旧 `Client`/`EventHandler`/`CoTcpConnection`/`ICoConnection`/`Action`/`Engine::Stop`/`CloseMode` 已删除，不保留兼容壳；生命周期入口只有 `Run` 与 `RequestClose`（其余是观测、建连与 Run 前配置入口）。
+- 测试面：`tests/net/` 的 `net_foundation`/`net_primitives`/`net_allocation`/`reactor_driver`/`r2_tcp`/`b4_contract`/`freeze_contract`/`ico_write_close`/`net_accept_stop`/`reclaim_receipt`/`net_foundation_consumer` 与 `example_co_net_service_roundtrip`，由 `scripts/ci/check_network_tests.py` 强制「注册集 = 实跑集、零跳过」。
+- 协程消费面收口为 `ICoConnection`/`CoTcpConnection` 成员接口（[PR #104](https://github.com/yqm-307/bbtools-infra/pull/104) 合入）：`Engine::CoAccept`/`Engine::CoDial` 返回 `ConnectionResult{error, connection, reclaim}`，`connection` 为 `CoTcpConnection`（实现 `ICoConnection`）；成员 `Read` 交付 owning `Buffer`（`ReadOutcome{state,data,error}`），`Write` 返回 `WriteReport{wait_error,outcome,operation}`，`AsyncWrite` 返回 `WriteOperation`（拒绝票内联 `Rejected/0/具体原因`），另有 `RequestClose`/`WaitClosed`/`Status`（`ConnectionStatus` 聚合）与非虚投影 `Valid`/`IsClosed`/`IsReleased`。`CoRead`/`CoWrite`/`CoAccept`/`CoDial` 自由函数与 `Engine::WaitConnect`/`WaitAccepted`/`AsyncConnectAwaitable` 公共入口已删除（两段式收为 `CoDial` 内部细节）。
+- 更早的 `Client`/`EventHandler`/`Action`/`Engine::Stop`/`CloseMode` 与旧 `CoTcpConnection`/`ICoConnection` 已删除，不保留兼容壳；生命周期入口只有 `Run` 与 `RequestClose`（其余是观测、建连与 Run 前配置入口）。
 - 未交付：HTTP/RPC/Redis/Mongo/config 消费者迁移、TLS、ReusePort 跨 loop 验收、非 Linux 平台、Release/sanitizer/长时压力、Engine 级 graceful drain。
 
-## API 冻结候选（工作区候选，未提交）
+## 冻结公共面与迁移（候选已由 PR #104 合入）
 
-> **状态：候选，尚未生效。** 下列内容描述分支 `refactor/net-minimal-api-freeze`（基线 `c35a2a25a5a9a74634d04ab4fa02b2691d40c85c`）工作区里的未提交改动：**未 commit、未 push、未经 PR CI，因此不是已冻结契约**。完整候选的独立审查及修复后增量复审已完成，本地聚焦验证通过；正式冻结仍待 PR CI。main 上仍是 PR #84 的形态（含 `Connection::State()`、`Engine::WaitConnect`/`WaitAccepted`/`AsyncConnectAwaitable`、公共 `NormalizeOptions` 与 12 个历史 Options 字段）。本节不改写上面的历史分析，只标出「若该候选被合入，冻结面与非兼容迁移是这些」。
+> **状态：已合入主线**（PR #104）。本节原描述分支 `refactor/net-minimal-api-freeze`（基线 `c35a2a25a5a9a74634d04ab4fa02b2691d40c85c`）的收口清单，现已落地；落地时协程面进一步收口为 `ICoConnection` 成员接口——下表 `CoConnection.hpp` 一行的自由函数不再存在，等价入口是 `Engine::CoAccept`/`Engine::CoDial` + `ICoConnection::Read`/`Write`/`AsyncWrite`/`WaitClosed`/`Status`（终评见 [2026-10-29 终评](2026-10-29-icoconn-interface-final-review.md)）。其余符号面不变。
 
 冻结含义：只冻结下面列出的**源级公共符号及其行为**；不承诺稳定 ABI、内部布局、测试接缝、安装包或导出 CMake 包。允许以后兼容新增；不允许改已有方法含义、默认值、错误/副作用边界来冒充兼容。`Options` 继续是公开 aggregate，不引入 builder；推荐具名赋值，未来新增字段须评估位置初始化/structured binding 的源码兼容影响。
 
-**真源顺序**：符号与签名以 `bbt/infra/net/*.hpp` 的实际内容为准，本节只是这份候选的收口清单摘要（逐项核对过，不是另一份可独立演进的契约）；候选合入后，若本节与头文件不一致，以头文件为准并回头修本节。
+**真源顺序**：符号与签名以 `bbt/infra/net/*.hpp` 的实际内容为准，本节只是这份收口的清单摘要（逐项核对过，不是另一份可独立演进的契约）；若本节与头文件不一致，以头文件为准并回头修本节。
 
-### 本候选收口并冻结的公共头与符号（逐个对照实际头文件）
+### 本次收口并冻结的公共头与符号（逐个对照实际头文件）
 
 | 头 | 冻结的符号 |
 |---|---|
-| `Engine.hpp` | `EnginePhase`（Idle/Starting/Running/Closing/Stopped）、`RuntimeProgress`（Unspecified/Independent）、`EngineConfig`（`listen_addresses`/`options`/`runtime_progress`）、`Engine`：构造 `explicit Engine(std::shared_ptr<RawHandler>)`、`Run`、`RequestClose`、`Phase`、`LastError`、`LastFailure`、`LocalAddresses`、`CountConnections`、`HandlerErrorCount`、`ReactorOwnerIds`、`AsyncConnect`、`EnableAcceptHandoff` |
+| `Engine.hpp` | `EnginePhase`（Idle/Starting/Running/Closing/Stopped）、`RuntimeProgress`（Unspecified/Independent）、`EngineConfig`（`listen_addresses`/`options`/`runtime_progress`）、`Engine`：构造 `explicit Engine(std::shared_ptr<RawHandler>)`、`Run`、`RequestClose`、`Phase`、`LastError`、`LastFailure`、`LocalAddresses`、`CountConnections`、`HandlerErrorCount`、`ReactorOwnerIds`、`AsyncConnect`、`EnableAcceptHandoff`、`RequestStopAccepting`、`AcceptingStopped`、`CoAccept`、`CoDial` |
 | `RawHandler.hpp` | `WriteResult{operation,sent,error}`、`RawHandler`（`OnAccept`/`OnConnect`/`OnRead`/`OnWrite`/`OnClose`，全部有默认空实现） |
-| `Connection.hpp` | `Connection`：`Valid`、`Id`、`AsyncWrite`、`TryRead`、`TryAccess`、`ReadableBytes`、`ReadError`、`ReadEof`、`LastWriteError`、`WriteAcceptance`、`Closed`、`CloseReason`、`RequestClose`；`WriteOperation`：`Valid`、`Id`、`Query` |
+| `Connection.hpp` | `Connection`：`Valid`、`Id`、`AsyncWrite`、`TryRead`、`TryAccess`、`ReadableBytes`、`ReadError`、`ReadEof`、`LastWriteError`、`WriteAcceptance`、`Closed`、`CloseReason`、`RequestClose`、`Released`；`ReclaimReceipt`（`Valid`/`Released`） |
 | `ReadAccess.hpp` | 独立类型 `ReadAccess`：`operator bool`、`Busy`、`WouldBlock`、`Eof`、`Error`、`ErrorCode`、`Size`、`Peek`、`Consume`、`CopyAll`、`ConsumeInto`；只可移动，不可复制 |
 | `Types.hpp` | `ReadStatus`（Ok/Busy/WouldBlock/Eof/Error）、`ReadResult{status,bytes,error}`、`WritePhase`（InFlight/Done/Rejected/Unknown）、`WriteOutcome{phase,sent,error}`、`AcceptanceState`（Open/Settling/Closed） |
 | `Options.hpp` | `Options` 的 13 个字段（清单见下节「值层与并发接缝的现行口径」第一条）；仅值语义 |
-| `CoConnection.hpp` | 自由函数 `CoRead`、`CoWrite`、`CoAccept`、`CoDial` |
+| `ICoConnection.hpp` | `ConnectionStatus`、`ReadState`/`ReadOutcome`、`ICoConnection`（`Read`/`AsyncWrite`/`Write`/`RequestClose`/`WaitClosed`/`Status` + 非虚 `Valid`/`IsClosed`/`IsReleased`）；PR #104 落地后替代原 `CoConnection.hpp` 自由函数 `CoRead`/`CoWrite`/`CoAccept`/`CoDial` |
+| `CoTcpConnection.hpp` | `CoTcpConnection`（`ICoConnection` 的 TCP 值包装；`Raw()` 返回底层 `Connection`） |
+| `ConnectionResult.hpp` | `ConnectionResult{error, connection, reclaim}`：`Engine::CoAccept`/`Engine::CoDial` 的返回包 |
+| `Buffer.hpp` | `Buffer`：owning 已取走字节（`Size`/`SegmentCount`/`Segment`/`MutableData`/`CopyTo`），可跨协程移交 |
+| `WriteOperation.hpp` | `WriteOperation`（`Valid`/`Id`/`Query`/`Wait`）、`WriteReport{wait_error, outcome, operation}` |
 | `Error.hpp` | `NetErrc`（Eof/WouldBlock/Busy/WriteSettling/Rejected/Closed）、`NetErrorCategory`、`make_error_code`、`is_error_code_enum` 特化 |
 
-本候选未改动内容的公共头：`Address.hpp`、`NativeSocket.hpp`、`LoadBalancing.hpp`、`ICoObject.hpp`、`CoObject.hpp`、`Annotations.hpp`（仍属公共面、仍被使用，例如 `Options::lb` 取 `LoadBalancing`、`NativeSocket` 仍提供原语与 socket 选项），它们的源码级定义不在本次收口范围内，因此不因本候选获得或失去任何保证。`Udp.hpp` 仍是纯 `#error` 的编译拒绝入口，不是 API。
+本次未改动内容的公共头：`Address.hpp`、`NativeSocket.hpp`、`LoadBalancing.hpp`、`ICoObject.hpp`、`CoObject.hpp`、`Annotations.hpp`（仍属公共面、仍被使用，例如 `Options::lb` 取 `LoadBalancing`、`NativeSocket` 仍提供原语与 socket 选项），它们的源码级定义不在本次收口范围内，因此不因本次收口获得或失去任何保证。`Udp.hpp` 仍是纯 `#error` 的编译拒绝入口，不是 API。
 
 ### 删除与迁移表
 
@@ -74,40 +77,41 @@
 | 旧公共入口 | 现状 | 迁移到哪里 |
 |---|---|---|
 | `Connection::State()` | 删除（内部状态不外露） | 消费者无需它；维护者测试用 `detail/TestAccess.hpp` 的 `ConnectionTestAccess::StateOf` |
-| `Connection(std::shared_ptr<ConnectionState>)` 公共构造 | 改为 private + friend（Engine/Reactor/ConnCore/CoAccess/TestAccess） | 用默认构造 `Connection{}`，或从 `CoAccept`/`CoDial`/`OnAccept`/`OnConnect` 取得；测试用 `ConnectionTestAccess::Make` |
-| `WriteOperation(std::shared_ptr<WriteOpRecord>)` 公共构造 | 改为 private | 默认构造 + `Connection::AsyncWrite` 产出；测试用 `ConnectionTestAccess::MakeWrite` |
+| `Connection(std::shared_ptr<ConnectionState>)` 公共构造 | 改为 private + friend（Engine/Reactor/ConnCore/CoAccess/TestAccess） | 用默认构造 `Connection{}`，或从 `Engine::CoAccept`/`Engine::CoDial`/`OnAccept`/`OnConnect` 取得；测试用 `ConnectionTestAccess::Make` |
+| `WriteOperation(std::shared_ptr<WriteOpRecord>)` 公共构造 | 改为 private | 默认构造 + `Connection::AsyncWrite`/`ICoConnection::AsyncWrite` 产出；测试用 `ConnectionTestAccess::MakeWrite` |
 | `ReceiveRing::ReadStatus` / `ReceiveRing::ReadResult`（经 `Connection::TryRead` 返回） | 删除内嵌定义，改由公共 `Types.hpp` 提供 | `Connection::TryRead` 现在返回 `net::ReadResult`；枚举与成员含义不变 |
 | `ReceiveRing::ReadAccess`（经 `Connection::TryAccess` 返回） | 删除内嵌类型 | 公共独立类型 `net::ReadAccess`，功能与成员一致，构造仍为内部 |
-| `Engine::AsyncConnectAwaitable` | 删除 | Co 建连只用 `CoDial`；raw 建连只用 `AsyncConnect` |
-| `Engine::WaitConnect` | 收回为 private `CoWaitConnect` | 用 `CoDial`；两段式（提交 → 领取）是内部细节，不公开中间 ID |
-| `Engine::WaitAccepted` | 收回为 private `CoWaitAccepted` | 用 `CoAccept` |
+| `CoConnection.hpp` 自由函数 `CoRead`/`CoWrite`/`CoAccept`/`CoDial` | 删除（PR #104） | `ICoConnection::Read`/`Write`/`AsyncWrite`/`WaitClosed`（`CoTcpConnection` 视图）+ `Engine::CoAccept`/`Engine::CoDial` |
+| `Engine::AsyncConnectAwaitable` | 删除 | Co 建连只用 `Engine::CoDial`；raw 建连只用 `AsyncConnect` |
+| `Engine::WaitConnect` | 收回为 private `CoWaitConnect` | 用 `Engine::CoDial`；两段式（提交 → 领取）是内部细节，不公开中间 ID |
+| `Engine::WaitAccepted` | 收回为 private `CoWaitAccepted` | 用 `Engine::CoAccept` |
 | 公共 `NormalizedOptions` / `NormalizeOptions(Options, int cpu_count, ...)` | 移入 `detail/OptionsNormalize.hpp`，去 `cpu_count` 参数 | 公共面只留 `Options`；纯值层测试经内部头进行 |
 | `Options::multicast_interface_index`、`bind_to_device`、`multicore`、`read_buffer_cap`、`write_buffer_cap`、`lock_os_thread`、`ticker`、`log_path`、`log_level`、`logger`、`edge_triggered_io`、`edge_triggered_io_chunk` | 删除（无替代） | 不再提供这些能力；`num_event_loop` 不接受 CPU 自动推导，段容量由内部算法决定 |
 | `net::LogLevel`、`net::LoggerCallback` | 删除（只服务已删字段） | 无替代；不引入日志框架 |
 | `SetCoDialBarrierForTest`（公共内联全局函数） | 从公共面移除 | `detail/TestAccess.hpp` 的 `CoTestAccess::SetDialBarrier` |
 | `bbt/infra/net/EngineTestAccess.hpp`（公共路径头） | 移到 `bbt/infra/net/detail/EngineTestAccess.hpp` | 仅测试包含 detail 头；公共路径不再存在该头 |
 
-`Engine` 的 `Run`/`RequestClose`/`Phase`/`LastError`/`LastFailure`/`LocalAddresses`/`CountConnections`/`HandlerErrorCount`/`ReactorOwnerIds`/`EnableAcceptHandoff`/`AsyncConnect` 与四个 Co 入口的**函数名与参数保持**，只收敛语义与注释（见下）。
+`Engine` 的 `Run`/`RequestClose`/`Phase`/`LastError`/`LastFailure`/`LocalAddresses`/`CountConnections`/`HandlerErrorCount`/`ReactorOwnerIds`/`EnableAcceptHandoff`/`AsyncConnect` 与 `Engine::CoAccept`/`Engine::CoDial` 的**函数名与参数保持**，只收敛语义与注释（见下）。
 
 ### 行为契约要点（逐条对应实现与测试）
 
 1. **ID 是 Engine 内身份**：`Connection::Id()` 只在创建它的 Engine 内唯一，不是跨 Engine/跨进程身份，也不是取消/等待/查找句柄；无效句柄 `Id()` 为 0。建连操作 ID 同样只在本次 Engine 内唯一，且不再公开给 Co 消费者。
 2. **`WritePhase::Done` 不表示成功**：`Done` 只表示该次发送已到终态，成功还须 `outcome.error` 为空；`InFlight` 已接纳未终态；`Rejected` 未提交；`Unknown` 只来自无效写句柄的 `Query`。`WriteOutcome` 是「回 X 时采样」，不表示返回时仍在途。
 3. **`ReadAccess` 守卫寿命**：守卫私有持连接状态强引用，因此 Engine 收口、调用者释放最后一个 `Connection` 之后仍可 `Size`/`Peek`/`Consume`/析构；内部解锁与 Notify 一定早于最后一个状态引用释放；移动后源对象不再持锁、不再承担通知责任；移动赋值先安全释放旧守卫。`Peek` 视图只在守卫有效且底层内容未被 `Consume`/`ConsumeInto` 改变时有效，不得跨挂起、不得外借。
-4. **无 handler 的 `AsyncConnect` 拒绝且零提交**：在提交前返回 `operation_not_supported`，`out_connect_id` 保持原值，不产生本次 `OnConnect`；Co 建连走 `CoDial`。
+4. **无 handler 的 `AsyncConnect` 拒绝且零提交**：在提交前返回 `operation_not_supported`，`out_connect_id` 保持原值，不产生本次 `OnConnect`；Co 建连走 `Engine::CoDial`。
 5. **raw 建连的 ID 与回调早到**：成功返回只表示本次提交已接纳，`out_connect_id` 必为本次非零操作 ID；正常 owner 推进下成功或失败由 `OnConnect` 恰一次交付，回调的 `operation` 等于该 `out_connect_id`；**回调可能先于函数返回**，调用者不得假设「先拿 id 再建表」，必须以回调自带的 `operation` 关联。所有提交拒绝路径（无 handler、非 Running/已封口、容量满、投递失败）保持 `out_connect_id` 原值且不产生本次回调。driver Failed 时不伪调 owner 回调。
-6. **Co 失败不覆盖输出**：`CoRead` 失败不改 `out` 且不消费；`CoWrite` 每次进入先置 `Rejected/0/{}` 与无效 `operation`，任何提前返回都写本次语义、不泄露上次结果；`CoAccept`/`CoDial` 用临时 `Connection`，成功才交付，失败不覆盖调用者原有句柄（原连接仍可读自己的字节）。
+6. **Co 失败不覆盖输出**：`ICoConnection::Read` 失败不交付 `Buffer` 且不消费；`ICoConnection::Write` 的 `WriteReport` 每次调用覆盖本次语义（先置 `Rejected/0/{}` 与无效 `operation`，不泄露上次结果）；`Engine::CoAccept`/`Engine::CoDial` 用临时 `Connection`，成功才交付 `result.connection`，失败不覆盖调用者原有句柄（原连接仍可读自己的字节）。
 7. **`LocalAddresses` 与 `Starting`**：`Running`/`Closing` 返回本代快照；`Starting` 可返回当前快照、可能尚未安装 listener 因而为空（**这不是「无监听」结论**）；`Idle`/`Stopped` 返回 `operation_not_permitted` 且不改写 `out`。
 8. **handler + handoff 共存**：同一连接既通知 `OnAccept` 也进 handoff 队列，二者 `Id()` 相同；两个读取者并存时只保证线性化的字节前缀，不自动路由。server 布局要求 handler 与 handoff 至少一个存在：都没有时 `Run` 在 driver 绑定/socket 副作用之前返回 `operation_not_permitted`。
-9. **`CoAccept` 判定优先级是契约**（先于任何状态判定 = 执行域 gate）：`0` 执行域非法 → `operation_not_permitted`；`1` 已封口/`Closing`/`Stopped` → `operation_canceled`（终态优先，`Stopped` 不被当作 client-only）；`2` `Idle`/`Starting` → `operation_not_permitted`；`3` `Running` 未开 handoff → `operation_not_permitted`；`4` `Running` + handoff 但无 main accept owner → `operation_not_supported`。失败不覆盖调用者原 `out`。
-10. **执行域 gate**：四个 Co 入口在任何消费、接纳、提交、创建等待责任之前校验当前执行域，非协程上下文（普通线程、runtime idle、raw owner 回调）统一 `operation_not_permitted`，包括带现成数据/零长度写/已就绪 accept 的快路径；gate 不构造 `CoObject`、不创建 Processer、不产生网络副作用。
+9. **`Engine::CoAccept` 判定优先级是契约**（先于任何状态判定 = 执行域 gate）：`0` 执行域非法 → `operation_not_permitted`；`1` 已封口/`Closing`/`Stopped` → `operation_canceled`（终态优先，`Stopped` 不被当作 client-only）；`2` `Idle`/`Starting` → `operation_not_permitted`；`3` `Running` 未开 handoff → `operation_not_permitted`；`4` `Running` + handoff 但无 main accept owner → `operation_not_supported`。`error` 非空时 `result.connection` 无效。
+10. **执行域 gate**：全部协程成员入口（`Engine::CoAccept`/`Engine::CoDial` 与 `ICoConnection::Read`/`Write`/`WaitClosed`）在任何消费、接纳、提交、创建等待责任之前校验当前执行域，非协程上下文（普通线程、runtime idle、raw owner 回调）统一 `operation_not_permitted`，包括带现成数据/零长度写/已就绪 accept 的快路径；gate 不构造 `CoObject`、不创建 Processer、不产生网络副作用。
 11. **`Run` 的前置错误码**：在协程上下文或已登记 Processer 上调用 → `operation_not_permitted`；runtime 未初始化 → `operation_not_supported`；未声明 `RuntimeProgress::Independent` → `operation_not_permitted`；都发生在绑定/socket 副作用之前。
-12. **等待不是取消**：`WaitOptions` 的 deadline 只影响本次等待，不撤销已接纳的 I/O；容量等待超时=未提交；已接纳后等待超时/取消只结束等待，owner 继续推进，`WriteOperation::Query()` 仍可查终态。`CoDial` 凡是未交付就离开的路径都由内部归还 claim 并让 owner 回收未交付 fd（资源回滚，不是对已交付连接的自动关闭策略）；`CoAccept` 的等待超时/取消不弹走供其它等待者取得的连接，只是本次不交付。
+12. **等待不是取消**：`WaitOptions` 的 deadline 只影响本次等待，不撤销已接纳的 I/O；容量等待超时=未提交；已接纳后等待超时/取消只结束等待，owner 继续推进，`WriteOperation::Query()` 仍可查终态。`Engine::CoDial` 凡是未交付就离开的路径都由内部归还 claim 并让 owner 回收未交付 fd（资源回滚，不是对已交付连接的自动关闭策略）；`Engine::CoAccept` 的等待超时/取消不弹走供其它等待者取得的连接，只是本次不交付。
 13. **`WaitStatus` 逐项映射**：`Completed`（继续复查）、`TimedOut`→`timed_out`、`Cancelled`→`operation_canceled`、`InvalidContext`→`operation_not_permitted`、`AlreadyWaiting`→`device_or_resource_busy`、`RuntimeUnavailable`→`operation_not_supported`；上游将来新增而未列出的状态显式返回 `operation_not_supported`，不吞成 `io_error`。
 
-### 该候选的验证边界（不虚报）
+### 验证边界（不虚报）
 
-已实测（本工作区、本地）：
+候选分支的本地实测记录（该分支工作区，已随 PR #104 合入）：
 
 ```sh
 cmake --build <build> --target bbt_infra_net_header_selfcheck bbt_infra_net --parallel 3
@@ -118,9 +122,9 @@ git diff --check         → exit 0
 
 `net.freeze_public_surface` 是正/负编译门禁：1 个只用公共头（不 include 任何 `detail/`）的正向 TU 先证明环境有效，再由 25 个 `public_surface_negative/neg_*.cc` 逐项证明被删/收回的符号**真实编译失败**（失败原因须出现在首条 error 附近，不用 `WILL_FAIL`）。
 
-最终本地验收：冒烟 2 项、冻结契约 9 项、直接耦合回归 37 项、coroutine-first 消费链 5 项、binder/driver 回归 13 项，共 66 个不同用例全部通过、零跳过；注册选集与 JUnit 实跑名单逐名一致。独立完整候选审查及修复后增量复审（T5）已完成，首轮发现均已关闭。
+候选期本地验收：冒烟 2 项、冻结契约 9 项、直接耦合回归 37 项、coroutine-first 消费链 5 项、binder/driver 回归 13 项，共 66 个不同用例全部通过、零跳过；注册选集与 JUnit 实跑名单逐名一致。独立完整候选审查及修复后增量复审（T5）已完成，首轮发现均已关闭。该验收绑定候选分支 SHA；PR #104 的远端 CI 结果以该 PR run 为准，不由本记录转记。
 
-**未做，因此不得声称**：未提交/未推送/未开 PR、**未经 PR CI**；未跑 Release/ASAN/TSAN 或长时压力；未跑本地全量 `ctest`（按仓库规则本地只跑冒烟 + 本次功能 + 直接耦合，全量走 PR CI）；非 Linux 平台、TLS、高层 UDP、HTTP/RPC/Redis/Mongo/config 消费者迁移均未覆盖。注册集当时为 120 项（含 9 个 `net.freeze_*`），其中一次整集实跑全过的记录属当时事实，不构成本候选后续增量的持续门禁。
+**未覆盖，因此不得声称**：Release/ASAN/TSAN 或长时压力；本地全量 `ctest`（按仓库规则本地只跑冒烟 + 本次功能 + 直接耦合，全量走 PR CI）；非 Linux 平台、TLS、高层 UDP、HTTP/RPC/Redis/Mongo/config 消费者迁移。注册集当时为 120 项（含 9 个 `net.freeze_*`），其中一次整集实跑全过的记录属当时事实，不构成持续门禁。
 
 ## 复用、兼容与验证
 
@@ -176,7 +180,7 @@ CI：`.github/workflows/ci.yml` 的 `network` job 已接入（不属于旧 Relea
 
 NetworkOnly 对新建/复用两类 coroutine target 统一补 target 级公共头 include；复用分支解 alias、realpath 核真实 SOURCE_DIR，与固定源码路径不一致时 configure 明确失败。tests/net 提供真实 coroutine-first parent consumer（configure/build/run/DSO 来源核验）与 mismatch 负向 fixture。
 
-原语层必验项已由 `net.*` 注册集覆盖：单头 C++17、身份派生、普通/TLS-enabled idle/受管协程、无隐式 Processer 反例；TCP/UDP IPv4/IPv6/Unix real roundtrip（`NativeSocket` 原语层，不等于 `Engine` 端到端）；flags、dup、partial/EAGAIN/EINPROGRESS、EOF/truncation、失败回收；CTest 闭包、残留 prefix 负向配置、仓外 add_subdirectory consumer、diff hygiene。非 Linux、EINTR 注入与 `Engine` 上的 IPv6/Unix 端到端不由上述用例推定；multicast/BindToDevice 已不是 `Options` 字段（见「API 冻结候选」），因此没有对应配置项可测。
+原语层必验项已由 `net.*` 注册集覆盖：单头 C++17、身份派生、普通/TLS-enabled idle/受管协程、无隐式 Processer 反例；TCP/UDP IPv4/IPv6/Unix real roundtrip（`NativeSocket` 原语层，不等于 `Engine` 端到端）；flags、dup、partial/EAGAIN/EINPROGRESS、EOF/truncation、失败回收；CTest 闭包、残留 prefix 负向配置、仓外 add_subdirectory consumer、diff hygiene。非 Linux、EINTR 注入与 `Engine` 上的 IPv6/Unix 端到端不由上述用例推定；multicast/BindToDevice 已不是 `Options` 字段（见「冻结公共面与迁移」），因此没有对应配置项可测。
 
 面向用户的示例验收要求（`examples/co_net_service` 已满足的部分见该目录 README）：
 
@@ -220,7 +224,7 @@ D3/D4 是分析期的阶段标签（P3/P4），阶段编号已随交付取消，
 | Run、Rotate | 现行 `Engine::Run(EngineConfig)`：单/多地址监听、自动绑槽、失败回滚并清理已创建资源；运行中重复 Run → `device_or_resource_busy`，收口后 Run → `operation_canceled`。无 `Rotate` | 已由 R2 实现 |
 | 全局 Stop、Engine.Stop | **未采用**：R2 不提供 `Engine::Stop`，收口只有 `Engine::RequestClose` + `Run` 返回；不等待用户回调、资源随所有权销毁、不停止 runtime、不建全局 registry 的原则保留 | 分析期计划；现行口径见「当前核心契约」Engine 生命周期行 |
 | Engine.Validate、CountConnections | `Engine::LastError()`/`LastFailure()`/`Phase()` 表达启动与收口错误，`CountConnections()` 报当前连接数 | 已由 R2 实现 |
-| Engine.Register、RegisteredResult | 未提供；等价能力为 `EnableAcceptHandoff(capacity)` + `WaitAccepted` 的有界 handoff（满则暂停 accept，不丢 fd），以及 `AsyncConnect`/`WaitConnect` 的 connect 结果交付 | 分析期计划（以 handoff 形态落地） |
+| Engine.Register、RegisteredResult | 未提供；等价能力为 `EnableAcceptHandoff(capacity)` + `Engine::CoAccept` 的有界 handoff（满则暂停 accept，不丢 fd），以及 `AsyncConnect`/`Engine::CoDial` 的 connect 结果交付 | 分析期计划（以 handoff 形态落地） |
 | NewNetConnContext、FromNetConnContext、NewNetAddrContext、FromNetAddrContext | 未提供 Go 式 context 注入；不复制 string-key context 协议 | 未采用 |
 | Engine.Dup、DupListener | 未提供；`EngineConfig::listen_addresses` 直接支持多 listener，`NativeSocket::Dup` 仍是原语 | 未采用（多地址已由配置表达） |
 | EventLoop.Register、Enroll | 内部化为 Engine 的 sub owner 选择 + 唯一 fd 移交（`detail/ReactorDriver`）；不公开 Enroll 入口 | 分析期计划（内部形态已实现） |
@@ -231,9 +235,9 @@ D3/D4 是分析期的阶段标签（P3/P4），阶段编号已随交付取消，
 | Context、SetContext、SafeContext、SetSafeContext | 未提供 per-connection context 注入；用户数据由使用者自己在 `Connection::Id()` 之外维护映射，`shared_ptr` 不等于对象同步 | 分析期计划 |
 | EventLoop、LocalAddr、RemoteAddr | `Engine::LocalAddresses()` 返回实际绑定地址快照（值语义，不传播 Asio 对象）；无公开 owner 句柄 | 分析期计划（地址快照已实现） |
 | Wake、CloseWithCallback、Close | 未提供 `CloseWithCallback`/Close(opt)。`Connection::RequestClose(reason)` 只封口并唤 owner；`AsyncWrite` 的终态经 `OnWrite` 与 `WriteOperation::Query()` 观察 | 分析期计划 |
-| SetDeadline、SetReadDeadline、SetWriteDeadline | 不提供连接级 deadline；协程等待用 coroutine 的 `WaitOptions`（`CoRead`/`CoWrite`/`CoAccept`/`CoDial` 均为参数），不改 Reader/Writer 语义 | R（固定参考同不支持） |
+| SetDeadline、SetReadDeadline、SetWriteDeadline | 不提供连接级 deadline；协程等待用 coroutine 的 `WaitOptions`（`ICoConnection::Read`/`Write`/`WaitClosed` 与 `Engine::CoAccept`/`Engine::CoDial` 均为参数），不改 Reader/Writer 语义 | R（固定参考同不支持） |
 | NewClient、Start、Stop | **未采用**：R2 不提供独立 `Client` 类型，client-only 即 `EngineConfig::listen_addresses` 为空的 Engine，不复制第二套 runtime | 分析期计划 |
-| Client.Dial、DialContext、Enroll、EnrollContext | 现行形态为 `Engine::AsyncConnect`（raw：`OnConnect` 唯一交付）+ `Engine::AsyncConnectAwaitable`/`WaitConnect`（未配置 handler 时）；不移植 Go context | 已由 R2 实现覆盖 |
+| Client.Dial、DialContext、Enroll、EnrollContext | 现行形态为 `Engine::AsyncConnect`（raw：`OnConnect` 唯一交付）+ `Engine::CoDial`（未配置 handler 时）；不移植 Go context | 已由 R2 实现覆盖 |
 | EventHandler、BuiltinEventEngine | **未采用**：R2 只有 `RawHandler`（`OnAccept/OnConnect/OnRead/OnWrite/OnClose` 默认空实现，在 owner 非业务协程边界短、非阻塞、不可挂起），没有 `OnBoot`/`OnTick`/`OnShutdown*`/`Action`。业务事件若要挂起须由使用者自行转发到自己的协程 | 分析期计划（曾是 `EventHandler`） |
 | Action.None/Close/Shutdown | **未采用**：R2 没有 `Action` 枚举与 `OnShutdown`/`OnShutdownRequest`。可复用的原则只有两条：连接收口只执行一次且不可重开；库不替使用者决定「是否关闭整个 Engine」，该决定归宿主控制域（现为 `Engine::RequestClose`） | 分析期计划 |
 | main/sub reactor、连接 owner | main 与各 sub 由已登记 Processer driver 槽推进各自 Asio context（不自建线程）；接纳后按 LB 唯一交接；业务协程可迁移 Processer，不是 fd owner，也不重复驱动 runtime 共享 context | 已由 R2 实现（`detail/ReactorDriver`）；ReusePort/UDP/client 布局见执行域设计 |
@@ -263,7 +267,7 @@ D3/D4 是分析期的阶段标签（P3/P4），阶段编号已随交付取消，
 
 ### Options（覆盖 options.go 的全部字段；WithX 是同字段配置语法）
 
-> 历史对照：本表记录分析期口径。**与现行候选不一致的行**（`MulticastInterfaceIndex`、`BindToDevice`、`ReadBufferCap`、`WriteBufferCap`、`LockOSThread`、`Ticker`、`LogPath`、`LogLevel`、`Logger`、`EdgeTriggeredIO`、`EdgeTriggeredIOChunk`、`Options`/`WithOptions` 行里的公共 `NormalizeOptions`）已随「API 冻结候选」删除或内部化——这些字段现在**不存在于 `Options`**，是编译期拒绝而非 `Run` 里返回 `operation_not_supported`；现行 13 字段清单见上文「值层与并发接缝的现行口径」。
+> 历史对照：本表记录分析期口径。**与现行形态不一致的行**（`MulticastInterfaceIndex`、`BindToDevice`、`ReadBufferCap`、`WriteBufferCap`、`LockOSThread`、`Ticker`、`LogPath`、`LogLevel`、`Logger`、`EdgeTriggeredIO`、`EdgeTriggeredIOChunk`、`Options`/`WithOptions` 行里的公共 `NormalizeOptions`）已随 PR #104 删除或内部化——这些字段现在**不存在于 `Options`**，是编译期拒绝而非 `Run` 里返回 `operation_not_supported`；现行 13 字段清单见上文「值层与并发接缝的现行口径」。
 
 | 字段 / With 方法 | C++ 去向 | 状态 |
 |---|---|---|

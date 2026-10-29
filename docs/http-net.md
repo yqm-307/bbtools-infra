@@ -4,7 +4,7 @@
 
 ## 定位
 
-`bbt::infra::http` 是 HTTPX（0.28.1）AsyncClient 语义到本仓原生有栈协程 + `bbt::infra::net` 的映射：单一协程 `Client`、内建连接池，普通用户只面对 URL/params/headers/body/timeout 与 `result<Response>`，不接触 Engine Run/Ready/WaitStopped。Beast 只承担 HTTP 编解码；网络只经 `bbt::infra::net` 公开 Co 接口（CoDial/CoRead/CoWrite），不触碰 Asio socket/native fd/net detail。旧 `bbt::infra_http`（Asio 形态）不受影响，消费者不切换。
+`bbt::infra::http` 是 HTTPX（0.28.1）AsyncClient 语义到本仓原生有栈协程 + `bbt::infra::net` 的映射：单一协程 `Client`、内建连接池，普通用户只面对 URL/params/headers/body/timeout 与 `result<Response>`，不接触 Engine Run/Ready/WaitStopped。Beast 只承担 HTTP 编解码；网络只经 `bbt::infra::net` 协程成员接口（`Engine::CoDial` + `ICoConnection::Read`/`Write`），不触碰 Asio socket/native fd/net detail。旧 `bbt::infra_http`（Asio 形态）不受影响，消费者不切换。
 
 ## 构建与消费
 
@@ -28,7 +28,7 @@ ctest --test-dir <私有 build 目录> -j1 -R 'http\.net\.' --output-on-failure 
 #include <bbt/coroutine/coroutine.hpp>
 #include <bbt/coroutine/syntax/Async.hpp>
 #include <bbt/infra/http/Client.hpp>
-#include <bbt/infra/net/CoConnection.hpp>
+#include <bbt/infra/net/CoTcpConnection.hpp>
 #include <bbt/infra/net/Engine.hpp>
 
 namespace http = bbt::infra::http;
@@ -96,22 +96,22 @@ auto stopped = server->WaitStopped(deadline);
 // 最后由应用另行 engine->RequestClose()、Run 返回与 runner.join()。
 ```
 
-- Engine 的接纳端专用于本 Server；不得并置第二个 CoAccept 消费者或 raw reader。Create 在 Idle 调用；不隐式 Run、监听或创建线程。应用 handler 是 `std::function<result<Response>(IncomingCallContext, IncomingRequest)>`，request 全部 owning；未认证 `peer_principal` 恒空，不用 IP 冒充身份。
-- 一 accept 协程、一连接一顺序 session；不同连接并发。请求 parser 与回复 serializer 均使用 Beast，网络只用公开 CoAccept/CoRead/CoWrite。保留 pipeline 多读字节；支持分片、chunked、HEAD、204/304、对端 FIN 后完整请求回复。HTTP/1.1 origin-form；不提供路由框架。
+- Engine 的接纳端专用于本 Server；不得并置第二个 `Engine::CoAccept` 消费者或 raw reader。Create 在 Idle 调用；不隐式 Run、监听或创建线程。应用 handler 是 `std::function<result<Response>(IncomingCallContext, IncomingRequest)>`，request 全部 owning；未认证 `peer_principal` 恒空，不用 IP 冒充身份。
+- 一 accept 协程、一连接一顺序 session；不同连接并发。请求 parser 与回复 serializer 均使用 Beast，网络只用公开 `Engine::CoAccept` 与 `ICoConnection::Read`/`Write`。保留 pipeline 多读字节；支持分片、chunked、HEAD、204/304、对端 FIN 后完整请求回复。HTTP/1.1 origin-form；不提供路由框架。
 - StopAccepting 与 handler 授权在同一短锁内仲裁；不持锁调用 handler 或挂起。门前授权继续 handler+回复，门后已有连接也不能授权新请求；关闭 idle/半包连接并请求 net 独立停止监听，不 RequestClose 整个 Engine。
 - Drain 必须先停止接纳，从授权计到 handler 真实返回及回复写 Done 且无 error，或封写后明确放弃。不是 handler 返回即排空，也不代表 peer 应用已读到回复。Close 幂等强制封本 Server 连接、不强杀 handler。Drain/WaitStopped 仅 native 宿主调用；协程/已登记 Processer 域返回 InvalidContext，不惰性创建域。
 - WaitStopped 同时检查 callback 最后捕获销毁、全部连接 `Released()` 与 listener `AcceptingStopped()`；共享 Engine 可以仍 Running。Stats 的 sessions 包含逻辑已关但未物理回收的 retiring，额度只在 task_done + Released 后复用；不是计数 0 假装 fd 已释放。超时保留共享状态和任务责任，宿主须继续驱动；永久不让出的 handler 无强杀保证。
 - ServerOptions 复用 NetworkLimits；连接/inflight/header/body/target/handoff 有界，incoming_timeout/write_timeout 都有限且至多 24h。总期限从每个请求开始解析前起算，覆盖读取、handler 与回复授权；handler 晚返不再起写，写期限取总期限与 write_timeout 较早者。超限或坏流本阶段明确断开，不承诺生成 4xx。
 - HTTP/1.1 要求唯一合法 Host；当前 Host 接受 ASCII DNS 标签/数值 host（IPv6 必须方括号，可选十进制 port），拒绝 userinfo、空白、路径和畸形端口。target 校验 origin-form URI 字符及百分号转义。CONNECT、Upgrade、Expect 明确拒绝并关连接，Expect 在读完 header、等待 body 之前拒绝。
-- handler 异常或错误 result 隔离为 500；非法状态（仅接受 200–599）、CR/LF/控制字节头及用户 Content-Length/Transfer-Encoding/Connection/Upgrade/Trailer 明确断开。Beast 负责 framing；HEAD 保留表示长度但不发 body，204/304 不发 body。大响应以有界块 CoWrite，只有 Rejected + 无 operation 的零提交容量错误才减半重试，不重放已接纳写；每块复查期限与 Close 并让出。
+- handler 异常或错误 result 隔离为 500；非法状态（仅接受 200–599）、CR/LF/控制字节头及用户 Content-Length/Transfer-Encoding/Connection/Upgrade/Trailer 明确断开。Beast 负责 framing；HEAD 保留表示长度但不发 body，204/304 不发 body。大响应以有界块 `conn.Write`，只有 Rejected + 无 operation 的零提交容量错误才减半重试，不重放已接纳写；每块复查期限与 Close 并让出。
 - 本地 `Test_http_net_server` 覆盖 wire（分片/chunked/pipeline/HEAD/204/304/FIN）、停止授权及 idle/半包、回复写屏障 Drain、Close 超时责任、入站期限晚返、安全、Start/登记失败、inflight 门禁及 owner 扣留物理回收额度。每例在进程退出前验证 HTTP 任务/连接、listener、Run/join 及 socket 基线归还。私有注入仅用于确定性阶段，不替代真实 TCP 字节。
 - CI 尚未接线；TLS、HTTP/2、流式、代理、DNS 解析、路由框架、永久阻塞 handler 的抢占以及跨平台/sanitizer/压力验证不在本批。
 
 ## 契约要点
 
-- **超时**：`Timeout` 四档 connect/read/write/pool，单档三态 `PhaseTimeout::Inherit/Milliseconds/Disabled`；Client 默认四档均 5s（显式逐字段）。请求级 `RequestOptions::timeout` 分档覆盖，Inherit 档取 Client 档。总绝对 deadline 单一真源是 `CallOptions.deadline`；各阶段期限 = min(总 deadline, 实际阶段开始时刻 + 阶段档)。pool 等待不消耗后续 connect/write/read 档；read 档从每次 CoRead 开始起算，总 deadline 不因读到字节重置。拨号/写入/读取及缓存快路径前预检总 deadline 和协程取消。
+- **超时**：`Timeout` 四档 connect/read/write/pool，单档三态 `PhaseTimeout::Inherit/Milliseconds/Disabled`；Client 默认四档均 5s（显式逐字段）。请求级 `RequestOptions::timeout` 分档覆盖，Inherit 档取 Client 档。总绝对 deadline 单一真源是 `CallOptions.deadline`；各阶段期限 = min(总 deadline, 实际阶段开始时刻 + 阶段档)。pool 等待不消耗后续 connect/write/read 档；read 档从每次 `conn.Read` 开始起算，总 deadline 不因读到字节重置。拨号/写入/读取及缓存快路径前预检总 deadline 和协程取消。
 - **连接池**：origin（scheme/host/port）匹配；HTTP/1.1 一条连接一次一个活动请求。`PoolLimits{max_connections, max_keepalive_connections, keepalive_expiry, max_queue}` 为全局配额。完整响应且 keepalive 才回池；写超时未终态/读中断/取消/协议错一律退役；合法 EOF 定界响应正常返回但不复用，不自动重放请求。空闲 stale 检查只用公开观察（`Closed/ReadEof/ReadError/ReadableBytes>0`），keepalive 过期惰性判定（Acquire/Release/Stats 的 sweep 内执行，无后台 reaper）。
-- **物理记账**：Dialing/Active/Idle/Retiring 同列表，`entries.size()` 是本池资源预算。成功连接只在 net `Connection::Released()` 后出账；失败/取消/未交付拨号保留 `ReclaimReceipt`，只在其 `Released()` 后出账。逻辑 `Closed()` 不能代替物理释放，排队者在资源回收前不得重开连接。`PoolStats`（active/idle/dialing/retiring/waiting/budget）是公开观测面。
+- **物理记账**：Dialing/Active/Idle/Retiring 同列表，`entries.size()` 是本池资源预算。成功连接只在底层 `Connection::Released()`（与 `conn.IsReleased()` 同一真源）后出账；失败/取消/未交付拨号保留 `ConnectionResult::reclaim`（`ReclaimReceipt`），只在其 `Released()` 后出账。逻辑 `Closed()` 不能代替物理释放，排队者在资源回收前不得重开连接。`PoolStats`（active/idle/dialing/retiring/waiting/budget）是公开观测面。
 - **排队**：有界 `max_queue`，满即 `Overloaded`；CoWaiter 登记→锁内复查→Notify，锁永不跨挂起；Notify 不等于获得，恢复后锁内领取，孤儿 handoff 回池。分配行为：快路径先扫同 origin 空闲；归还把名额交队首同 origin 等待者；异 origin 被空闲连接占满预算时，退役一条异 origin 空闲连接，真实回收后再拨号。不承诺严格 FIFO 公平。排队者唤醒源：同 origin 完整归还、封口、池超时，以及 20ms 有界重试切片（预算释放没有事件源，切片保证活性）。
 - **错误面**：沿用 `bbt::infra::ErrorCode`——未提交前的排队/连接/期限超时 `TimedOut`、排队满 `Overloaded`、建连失败 `TransportError`、坏流 `ProtocolError`、封口 `Closed`、协程取消 `Cancelled`（保留请求阶段事实）；请求字节完整写出后的读超时/连接中断按 `OutcomeUnknown`（`Error.request_phase=RequestCommitted`，请求可能已生效）。已接纳但写入尚未终态时也不能认定零发送，不自动重试。
 - **关闭**：`Close()` 立即逻辑封口、拒绝新请求、唤醒全部排队者（`Closed`）、退役空闲连接；在飞请求按已持有借用完成或失败；不关共享 Engine，不假装物理排空（退役 fd 由 Engine owner 收口）。析构=Close。

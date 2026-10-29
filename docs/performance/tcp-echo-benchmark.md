@@ -14,7 +14,7 @@ driver.py (本机编排)
 ```
 
 - `tcp_echo_server`：raw（`RawHandler` 短回调 + 每连接 pending 发送队列）/
-  co（`WaitAccepted`/`CoRead`/`CoWrite` 协程）两种模式；`--port=0` 动态分配；
+  co（`Engine::CoAccept` + `conn.Read`/`conn.Write` 协程）两种模式；`--port=0` 动态分配；
   stdout 先 `PORT=<n>`，期间应答 stdin `stat`/`fin_overhead` 查询各回一行
   JSON，最终 `quit`/EOF 收口后输出完整 JSON。CPU/RSS 由本进程 `/proc/self`
   采样（`proc_ok=false` 时 driver 判该运行无效，不拿 0 冒充）。
@@ -65,8 +65,8 @@ warmup]` 窗口内跑真实流量但不计 completed/bytes/latency/conns_ok）�
 - raw `OnRead` 见到读终态（Eof/Error）先把 ring 剩余数据全部拆帧入
   pending（不丢尾帧 echo），pending 空即 `RequestClose`；未空登记
   eof_pending 由 `OnWrite` 排空后关（不丢已收数据的 echo）。
-- co `CoRead` 返回 `Eof`/`Closed` 时其顺序 `CoWrite` 已全终态，直接
-  `RequestClose`；`CoWrite` 良性先关同样 `RequestClose`。
+- co `conn.Read` 返回 `Eof`/`Closed` 时其顺序 `conn.Write` 已全终态，直接
+  `RequestClose`；`conn.Write` 良性先关同样 `RequestClose`。
 - 收口后 `active_conns!=0`、conn/accept 协程超时未退都算 teardown 不全
   → server 退出码非零（不再仅 WARN 放行）；co 任务用活动计数器
   （condvar）记账，不积累历史 future。

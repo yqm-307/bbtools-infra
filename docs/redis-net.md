@@ -51,7 +51,7 @@ key/value 二进制安全；拒绝空 key 和空 DEL 列表。PING 只接受 PON
 | 事实 | 结果与后续动作 |
 |---|---|
 | 非协程 / 未连接 / 已封口 | InvalidContext / RuntimeUnavailable / Closed，零提交 |
-| CoDial 拒连 / deadline / 取消 | TransportError / TimedOut / Cancelled，不发布连接；失败不代表 fd 已回收 |
+| `Engine::CoDial` 拒连 / deadline / 取消 | TransportError / TimedOut / Cancelled，不发布连接；失败不代表 fd 已回收 |
 | Engine 不可用或有 RawHandler | RuntimeUnavailable，保留 net 原始错误码 |
 | 写未接纳 | 按原因 Closed、TimedOut、Cancelled、Overloaded 或 TransportError，不一概映射 Overloaded |
 | 写已接纳，没有可信完整回复 | OutcomeUnknown，`details["cause"]` 保存物理错误类别，`backend_category/backend_code` 保留后端原因；不填 request_phase，不推断 Redis 未执行 |
@@ -71,7 +71,7 @@ key/value 二进制安全；拒绝空 key 和空 DEL 列表。PING 只接受 PON
 
 ## 关闭与宿主收尾
 
-Close/析构在短锁内封口，返回前对已发布连接 RequestClose，不等物理 fd、在途 CoDial 或任务结束。合法域中此后新操作返回 Closed；IsClosed 只表示逻辑封口。Close 不关闭共享 Engine，关闭 A 后 B 仍能正常操作。
+Close/析构在短锁内封口，返回前对已发布连接 RequestClose，不等物理 fd、在途 `CoDial` 或任务结束。合法域中此后新操作返回 Closed；IsClosed 只表示逻辑封口。Close 不关闭共享 Engine，关闭 A 后 B 仍能正常操作。
 
 在途 Connect 可能继续到原 deadline/owner 完成；迟到成功在同一锁内复查封口，Close 已胜就请求回收局部连接并返回 Closed。库没有后台 owner 协程或捕获公开句柄的 net 回调。宿主须从提交时就登记所有 API 任务，注册失败也必须明确记为终态。
 
@@ -83,7 +83,7 @@ Close/析构在短锁内封口，返回前对已发布连接 RequestClose，不�
 
 `tests/redis_net` 注册计划的九个稳定契约名称，另有分帧、断连、解析/Feed/意外帧/取消/超限回归及公开示例。真实 Redis 用例通过同步 hiredis helper 只对本次唯一 key 做 LPUSH，再用公开 Get 观察 WRONGTYPE，同流 Ping/Get 验证继续同步；同时验证二进制数据和 256 KiB 回复。受控 TCP 只补充分帧、断连和生命周期时序。
 
-测试使用真实 CoDial 提交屏障、真实完整请求接收、被扣留的回复、owner 回收屏障、weak 句柄、reader 分配/释放计数、完整任务集、Run/Stopped、总 fd/socket 基线。每例有有限 watchdog，成功失败都清理自有 keys。原始日志、机器结果与本机绝对路径留在私有交接目录，不进入仓库。
+测试使用真实 `CoDial` 提交屏障、真实完整请求接收、被扣留的回复、owner 回收屏障、weak 句柄、reader 分配/释放计数、完整任务集、Run/Stopped、总 fd/socket 基线。每例有有限 watchdog，成功失败都清理自有 keys。原始日志、机器结果与本机绝对路径留在私有交接目录，不进入仓库。
 
 PR #95 的本地独立验收限于 Linux/WSL、IPv4 RESP2：新 Redis 测试、公开示例及直接耦合 net 选集合计 25/25，通过且零跳过；仓外只链接公开目标的消费程序完成真实命令、清键读回和宿主排空。验证按进入目标阶段、触发事件、检查结果与资源收口构造，方法见[开发指南](development.md#测试要证明什么)。
 
