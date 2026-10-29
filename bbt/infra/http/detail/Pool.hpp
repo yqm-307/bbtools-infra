@@ -28,8 +28,10 @@
 
 #include <bbt/coroutine/coroutine.hpp>
 #include <bbt/coroutine/sync/CoWaiter.hpp>
+#include <bbt/infra/NetError.hpp>
 #include <bbt/infra/Result.hpp>
-#include <bbt/infra/net/CoConnection.hpp>
+#include <bbt/infra/net/Connection.hpp>
+#include <bbt/infra/net/Engine.hpp>
 
 #include <bbt/infra/http/Client.hpp>
 #include <bbt/infra/http/detail/Http11.hpp>
@@ -59,7 +61,7 @@ public:
                    std::uint64_t max_body_bytes)
         : m_state(std::make_shared<State>(std::move(engine), limits, max_body_bytes)) {}
 
-    // 借用一条 origin 匹配连接：快路径 / 预算内新建（CoDial）/ 有界排队。
+    // 借用一条 origin 匹配连接：快路径 / 预算内新建（Engine::CoDial）/ 有界排队。
     bbt_co_async(result<Lease>) Acquire(const Origin& origin, const net::Address& address,
                                         const PhaseDeadlines& deadlines) {
         const auto state = m_state;
@@ -86,7 +88,7 @@ public:
                 return result<Lease>::ok(std::move(lease));
             }
         }
-        // 预算内新建（Dialing 名额锁内预留、锁外 CoDial）。
+        // 预算内新建（Dialing 名额锁内预留、锁外 Engine::CoDial）。
         {
             std::unique_lock<std::mutex> lock(state->mutex);
             if (state->closed) { return result<Lease>::err(ClosedError()); }
@@ -424,19 +426,20 @@ private:
         }
     };
 
-    // 完成预留的 Dialing entry：锁外 CoDial，失败/封口在锁内出账。
+    // 完成预留的 Dialing entry：锁外 Engine::CoDial，失败/封口在锁内出账。
     static result<Lease> DialReserved(const std::shared_ptr<State>& state, Entry* dial_entry,
                                       const Origin& origin, const PhaseDeadlines& deadlines) {
-        net::Connection connection;
-        net::ReclaimReceipt reclaim;
+        net::ConnectionResult dialed;
         auto error = CheckCall(deadlines.total);
         if (!error) {
-            error = net::CoDial(*state->engine, dial_entry->address, connection, reclaim,
-                               {StageDeadline(deadlines.timeout.connect, deadlines.total)});
+            dialed = state->engine->CoDial(
+                dial_entry->address,
+                {StageDeadline(deadlines.timeout.connect, deadlines.total)});
+            error = dialed.error;
         }
         std::lock_guard<std::mutex> lock(state->mutex);
         if (error) {
-            dial_entry->reclaim = std::move(reclaim);
+            dial_entry->reclaim = std::move(dialed.reclaim);
             state->RetireLocked(*dial_entry);
             if (error == std::errc::operation_canceled) {
                 return result<Lease>::err(MakeError(ErrorCode::Cancelled, "http pool: connect cancelled"));
@@ -445,18 +448,21 @@ private:
                 return result<Lease>::err(
                     MakeError(ErrorCode::TimedOut, "http pool: connect timeout"));
             }
+            // 拨号错误走公共桥 NetToError：容量满（no_buffer_space）归
+            // Overloaded 而非 TransportError；backend_category/backend_code
+            // 保留底层事实。pool 只覆盖 canceled/timed_out/closed 阶段语义。
             return result<Lease>::err(
-                MakeError(ErrorCode::TransportError,
-                          "http pool: connect failed: " + error.message()));
+                NetToError(error, "http pool: connect failed: " + error.message()));
         }
-        dial_entry->connection = connection;
-        dial_entry->reclaim = std::move(reclaim);
+        dial_entry->connection = dialed.connection.Raw();
+        dial_entry->reclaim = std::move(dialed.reclaim);
         if (state->closed) {
             state->RetireLocked(*dial_entry);
             return result<Lease>::err(ClosedError());
         }
         try {
-            dial_entry->http = std::make_shared<Http11Connection>(connection, state->body_limit);
+            dial_entry->http = std::make_shared<Http11Connection>(
+                dial_entry->connection, state->body_limit);
             Lease lease{dial_entry->http, origin};
             dial_entry->phase = Entry::Phase::Active;
             return result<Lease>::ok(std::move(lease));

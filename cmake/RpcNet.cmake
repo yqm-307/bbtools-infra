@@ -195,4 +195,4 @@ set_target_properties(bbt_infra_rpc_proto PROPERTIES
     POSITION_INDEPENDENT_CODE ON)
 
 # RPC core 模块本体 + 测试/示例注册。
-add_subdirectory("${PROJECT_SOURCE_DIR}/bbt/infra/rpc" rpc_net)
+add_subdirectory("${PROJECT_SOURCE_DIR}/bbt/infra/rpc" bbt_infra_rpc_net)

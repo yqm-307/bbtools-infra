@@ -6,19 +6,30 @@
 
 #include <bbt/coroutine/coroutine.hpp>
 
+#include <bbt/infra/NetError.hpp>
+
 namespace bbt::infra::http {
 namespace detail {
 namespace {
 
 using R = result<Http11Connection::ExchangeResult>;
 
+// 底层分类经 A5 公共桥 NetToError；committed 是 HTTP 自身阶段事实
+// （请求字节已完整写出、回复丢失），桥无从知晓，按契约在此结算为
+// OutcomeUnknown。Cancelled 先于 committed 判定（与重构前一致：已提交后
+// 取消仍是取消而非未知结果）；未 committed 的确定失败直接用桥的基础分类。
 Error CallError(std::error_code cause, const char* message, bool committed) {
-    const auto code = cause == std::errc::operation_canceled ? ErrorCode::Cancelled
-                    : committed ? ErrorCode::OutcomeUnknown
-                    : cause == std::errc::timed_out ? ErrorCode::TimedOut
-                    : ErrorCode::TransportError;
-    auto error = MakeError(code, std::string("http client: ") + message);
-    if (committed) { error.request_phase = RequestPhase::RequestCommitted; }
+    auto error = NetToError(cause, std::string("http client: ") + message);
+    // committed 是阶段事实：无论错误码如何分类（含已提交后取消），调用方
+    // 都需要 request_phase 判定非幂等请求能否机械重试——始终结算。
+    if (committed) {
+        error.request_phase = RequestPhase::RequestCommitted;
+    }
+    if (error.code != ErrorCode::Cancelled && committed) {
+        // Cancelled 保留错误码优先级（已提交后取消仍是取消而非未知结果），
+        // 但不再吞相位事实。
+        error.code = ErrorCode::OutcomeUnknown;
+    }
     return error;
 }
 
@@ -93,18 +104,19 @@ result<void> Http11Connection::WriteRequest(const std::string& bytes,
     if (const auto gate = CheckCall(deadline)) {
         return result<void>::err(CallError(gate, "write rejected before submission", false));
     }
-    net::WriteOutcome outcome;
-    net::WriteOperation operation;
-    const auto error = net::CoWrite(m_connection, bytes, {deadline}, outcome, operation);
-    if (!error && outcome.phase == net::WritePhase::Done && !outcome.error) {
+    net::CoTcpConnection connection{m_connection};
+    const auto report = connection.Write(bytes, {deadline});
+    const auto& outcome = report.outcome;
+    if (!report.wait_error && outcome.phase == net::WritePhase::Done && !outcome.error) {
         return result<void>::ok();
     }
     const bool committed = outcome.phase == net::WritePhase::Done && !outcome.error;
-    auto failure = CallError(error ? error : outcome.error, "write did not complete", committed);
+    auto failure = CallError(report.wait_error ? report.wait_error : outcome.error,
+                             "write did not complete", committed);
     if (!committed) {
         failure.request_phase = RequestPhase::Writing;
         // 已接纳仍在发送，等待结束不等于撤销；不能诱导调用方当作零提交重试。
-        if (operation.Valid() && outcome.phase == net::WritePhase::InFlight &&
+        if (report.operation.Valid() && outcome.phase == net::WritePhase::InFlight &&
             failure.code != ErrorCode::Cancelled) {
             failure.code = ErrorCode::OutcomeUnknown;
         }
@@ -139,25 +151,28 @@ result<Http11Connection::ExchangeResult> Http11Connection::ReadResponse(
             if (const auto gate = CheckCall(deadlines.total)) {
                 return R::err(CallError(gate, "response read rejected", true));
             }
-            std::string bytes;
-            const auto error = net::CoRead(
-                m_connection, bytes, {StageDeadline(deadlines.timeout.read, deadlines.total)});
-            if (error == net::make_error_code(net::NetErrc::Eof)) {
+            net::CoTcpConnection connection{m_connection};
+            const auto read = connection.Read(
+                {StageDeadline(deadlines.timeout.read, deadlines.total)});
+            if (read.state == net::ReadState::Eof) {
                 // Beast put_eof 前置 got_some()：对端一个响应字节都没发就断开
                 // 时不能喂空 parser（会 abort）。请求已完整写出，回复丢失，按
                 // 未知结果交付（请求可能已生效）。
+                const auto eof_error = net::make_error_code(net::NetErrc::Eof);
                 if (!parser.got_some()) {
-                    return R::err(CallError(error, "peer closed without response", true));
+                    return R::err(CallError(eof_error, "peer closed without response", true));
                 }
                 boost::system::error_code eof;
                 parser.put_eof(eof);
                 if (eof || !parser.is_done()) {
-                    return R::err(CallError(error, "peer closed with incomplete response", true));
+                    return R::err(CallError(eof_error, "peer closed with incomplete response", true));
                 }
                 break;
             }
-            if (error) { return R::err(CallError(error, "response read failed", true)); }
-            pending += bytes;
+            if (read.state == net::ReadState::Error) {
+                return R::err(CallError(read.error, "response read failed", true));
+            }
+            read.data.AppendTo(pending);
         }
         const auto status = parser.get().result_int();
         if (status == 101) { return R::err(ProtocolError("protocol upgrade unsupported")); }

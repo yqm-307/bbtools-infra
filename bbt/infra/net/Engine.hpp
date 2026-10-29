@@ -34,6 +34,7 @@
 
 #include <bbt/infra/net/Address.hpp>
 #include <bbt/infra/net/Connection.hpp>
+#include <bbt/infra/net/ConnectionResult.hpp>
 #include <bbt/infra/net/Options.hpp>
 #include <bbt/infra/net/RawHandler.hpp>
 
@@ -127,6 +128,17 @@ public:
     // 时为 true；只证明 listener 停止，不证明全部已交付/未交付 fd 或业务
     // 任务已释放（后者仍走 Connection::Released 与 Engine 最终收口）。
     bool AcceptingStopped() const noexcept;
+
+    // ---- Co 成员入口（终评 §2：协程消费面收口为成员，自由函数后续退役）----
+    // 判定优先级与语义与旧 CoAccept/CoDial 自由函数完全等价（详见
+    // CoConnection.hpp 注释）：执行域 gate 先于一切状态判定；终态（sealed/
+    // Closing/Stopped → operation_canceled）先于 Idle/Starting 与
+    // client-only；失败不覆盖 result.connection，reclaim 按提交阶段描述本次
+    // socket 责任。实现落 Engine.cc，经既有 CoSubmitConnect/CoWaitConnect/
+    // CoWaitAccepted 私有步骤完成，不新增第二路径。
+    ConnectionResult CoAccept(const bbt::coroutine::WaitOptions& options = {});
+    ConnectionResult CoDial(const Address& address,
+                            const bbt::coroutine::WaitOptions& options = {});
 
 private:
     friend class EngineTestAccess;

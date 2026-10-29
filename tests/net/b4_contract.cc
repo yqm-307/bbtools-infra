@@ -15,8 +15,11 @@
 //   lb_subs                   LB 分配真实落到两个 sub owner
 //   fairness                  热连接 + 第二连接 + 业务协程同时进展
 
-#include <bbt/infra/net/CoConnection.hpp>
+#include <bbt/infra/net/CoTcpConnection.hpp>
 #include <bbt/infra/net/Engine.hpp>
+#include <bbt/infra/net/ICoConnection.hpp>
+#include <bbt/infra/net/ConnectionResult.hpp>
+#include <bbt/infra/net/WriteOperation.hpp>
 #include <bbt/infra/net/NativeSocket.hpp>
 #include <bbt/infra/net/RawHandler.hpp>
 #include <bbt/infra/net/detail/CoInternal.hpp>
@@ -319,9 +322,9 @@ static void RingReleaseNotify() {
     CHECK(bool(held));
     std::atomic<int> result{-1};
     auto task = Task([&] {
-        std::string out;
-        const auto error = CoRead(connection, out, Until(500ms));
-        if (!error && out == "release!") {
+        CoTcpConnection conn{connection};
+        const auto read = conn.Read(Until(500ms));
+        if (read.state == ReadState::Data && read.data.CopyTo() == "release!") {
             result.store(0);
         }
     });
@@ -465,9 +468,9 @@ static void WaitAcceptedExistingOut() {
 
     std::atomic<int> result{-1};
     auto task = Task([&] {
-        Connection out;
-        auto error = CoAccept(engine, out, Until(3000ms));
-        if (error || !out.Valid()) { result.store(1); return; }
+        auto res = engine.CoAccept(Until(3000ms));
+        if (res.error || !res.connection.Valid()) { result.store(1); return; }
+        Connection out = res.connection.Raw();
         // 无更多 handoff：既有 out 有效不能算本轮成功。
         // 内部等待步骤（公共面只留 CoAccept）：既有 out 有效不算本轮成功。
         const auto second = CoAccess::WaitAccepted(engine, out, Until(40ms));
@@ -588,13 +591,12 @@ static void HandoffFullResume() {
     std::atomic<int> accepted{0};
     auto task = Task([&] {
         for (int i = 0; i < 3; ++i) {
-            Connection connection;
-            const auto error = CoAccept(engine, connection, Until(3000ms));
-            if (error || !connection.Valid()) {
+            auto res = engine.CoAccept(Until(3000ms));
+            if (res.error || !res.connection.Valid()) {
                 return;
             }
             accepted.fetch_add(1);
-            connection.RequestClose();
+            res.connection.RequestClose();
         }
     });
     Get(task);
@@ -727,23 +729,34 @@ static void CoReadAppendFaultNonEmptyOut() {
     CHECK(state->ring.TryAppend("co-payload").status == ReadStatus::Ok);
     auto out = std::make_shared<std::string>("existing");
     std::atomic<int> result{-1};
-    ReceiveRing::SetAppendFaultForTest([] { throw std::bad_alloc(); });
+    // 成员 Read 的分配点在 TryPopAll 的 takeout/segments 元数据：注入
+    // operator new 失败覆盖「分配失败零消费、不改 out」的同一契约。
     auto task = Task([&] {
-        const auto error = CoRead(connection, *out, Until(500ms));
-        if (error) {
-            result.store(0);
+        CoTcpConnection conn{connection};
+        g_fail_alloc = true;
+        try {
+            const auto read = conn.Read(Until(500ms));
+            g_fail_alloc = false;
+            if (read.state == ReadState::Error) {
+                result.store(0);
+            }
+        } catch (const std::bad_alloc&) {
+            g_fail_alloc = false;
+            result.store(0);  // 分配失败未交付任何数据，等价 Error 路径
         }
     });
     Get(task);
-    ReceiveRing::SetAppendFaultForTest({});
     CHECK(result.load() == 0);
     CHECK(state->ring.Size() == 10);   // 未消费
     CHECK(*out == "existing");
-    // 重试必须在协程域内（CoRead 在非法域一律 operation_not_permitted）。
+    // 重试必须在协程域内（Read 在非法域一律 operation_not_permitted）。
     auto retry_out = std::make_shared<std::string>();
     std::atomic<int> retry_result{-1};
     auto retry_task = Task([&] {
-        if (!CoRead(connection, *retry_out, Until(500ms))) {
+        CoTcpConnection conn{connection};
+        const auto read = conn.Read(Until(500ms));
+        if (read.state == ReadState::Data) {
+            read.data.AppendTo(*retry_out);
             retry_result.store(0);
         }
     });
@@ -758,11 +771,11 @@ static void CoReadIdleNoSpin() {
     auto state = std::make_shared<ConnectionState>(1, 4096, 1024, 4, nullptr);
     Connection connection = ConnectionTestAccess::Make(state);
     std::atomic<int> result{-1};
-    std::string out;
     const auto before = state->ring.AccessGeneration();
     auto task = Task([&] {
-        const auto error = CoRead(connection, out, bbt::coroutine::WaitOptions{});
-        if (!error && out == "x") {
+        CoTcpConnection conn{connection};
+        const auto read = conn.Read(bbt::coroutine::WaitOptions{});
+        if (read.state == ReadState::Data && read.data.CopyTo() == "x") {
             result.store(0);
         }
     });
@@ -1051,15 +1064,15 @@ static void CoReadRapid() {
     std::atomic<int> total{0};
     std::atomic<int> result{-1};
     auto task = Task([&] {
+        CoTcpConnection conn{connection};
         for (;;) {
-            std::string data;
-            const auto error = CoRead(connection, data, Until(5000ms));
-            if (error) {
-                result.store(error.value());
+            const auto read = conn.Read(Until(5000ms));
+            if (read.state != ReadState::Data) {
+                result.store(read.error.value());
                 break;
             }
-            if (total.fetch_add(static_cast<int>(data.size())) + static_cast<int>(data.size())
-                >= kCount) {
+            const auto size = static_cast<int>(read.data.Size());
+            if (total.fetch_add(size) + size >= kCount) {
                 result.store(0);
                 break;
             }
@@ -1138,19 +1151,17 @@ static void WriteCapacityAfterDrain() {
     std::atomic<int> a_result{-1};
     std::atomic<int> b_result{-1};
     auto task_a = Task([&] {
-        WriteOutcome outcome;
-        WriteOperation op;
-        if (!CoWrite(connection, "a", Until(2000ms), outcome, op)
-            && outcome.phase == WritePhase::Done) {
+        CoTcpConnection conn{connection};
+        const auto report = conn.Write("a", Until(2000ms));
+        if (!report.wait_error && report.outcome.phase == WritePhase::Done) {
             a_result.store(0);
         }
     });
     CHECK(WaitUntil([&] { return state->HasPendingWrites(); }, 1000ms));
     auto task_b = Task([&] {
-        WriteOutcome outcome;
-        WriteOperation op;
-        if (!CoWrite(connection, "b", Until(2000ms), outcome, op)
-            && outcome.phase == WritePhase::Done) {
+        CoTcpConnection conn{connection};
+        const auto report = conn.Write("b", Until(2000ms));
+        if (!report.wait_error && report.outcome.phase == WritePhase::Done) {
             b_result.store(0);
         }
     });
@@ -1178,10 +1189,9 @@ static void WriteCapacityAfterPartial() {
     CHECK(!TryAccept(*state, std::string(8, 'x'), first));
     std::atomic<int> second_result{-1};
     auto task = Task([&] {
-        WriteOutcome outcome;
-        WriteOperation op;
-        if (!CoWrite(connection, "y", Until(2000ms), outcome, op)
-            && outcome.phase == WritePhase::Done) {
+        CoTcpConnection conn{connection};
+        const auto report = conn.Write("y", Until(2000ms));
+        if (!report.wait_error && report.outcome.phase == WritePhase::Done) {
             second_result.store(0);
         }
     });
@@ -1518,7 +1528,10 @@ static void CoBusyReleasePhases() {
         auto shared_out = std::make_shared<std::string>();
         std::atomic<int> read_result{-1};
         auto read_task = Task([&] {
-            if (!CoRead(connection, *shared_out, Until(1000ms))) {
+            CoTcpConnection conn{connection};
+            const auto read = conn.Read(Until(1000ms));
+            if (read.state == ReadState::Data) {
+                read.data.AppendTo(*shared_out);
                 read_result.store(0);
             }
         });
@@ -1543,10 +1556,10 @@ static void CoBusyReleasePhases() {
         auto hold = ConnectionTestAccess::HoldForTest(state);
         CHECK(bool(hold));
         std::atomic<int> result{-1};
-        std::string out;
         auto task = Task([&] {
-            std::string local;
-            if (!CoRead(connection, local, Until(2000ms)) && local.size() == 256) {
+            CoTcpConnection conn{connection};
+            const auto read = conn.Read(Until(2000ms));
+            if (read.state == ReadState::Data && read.data.Size() == 256) {
                 result.store(0);
             }
         });
@@ -1567,8 +1580,9 @@ static void CoBusyReleasePhases() {
         CHECK(bool(hold));
         std::atomic<int> result{-1};
         auto task = Task([&] {
-            std::string local;
-            if (!CoRead(connection, local, Until(2000ms)) && local.size() == 256) {
+            CoTcpConnection conn{connection};
+            const auto read = conn.Read(Until(2000ms));
+            if (read.state == ReadState::Data && read.data.Size() == 256) {
                 result.store(0);
             }
         });
@@ -1596,10 +1610,11 @@ static void CoWouldBlockClosedRace() {
     });
     std::atomic<int> result{-1};
     auto task = Task([&] {
-        std::string out;
-        const auto error = CoRead(connection, out, Until(2000ms));
-        if (error == make_error_code(NetErrc::Eof)
-            || error == make_error_code(NetErrc::Closed)) {
+        CoTcpConnection conn{connection};
+        const auto read = conn.Read(Until(2000ms));
+        if (read.state == ReadState::Eof
+            || (read.state == ReadState::Error
+                && read.error == make_error_code(NetErrc::Closed))) {
             result.store(0);
         }
     });
@@ -1631,20 +1646,19 @@ static void CoPingpongStrict() {
     std::atomic<int> server_rounds{0};
     std::atomic<int> client_rounds{0};
     auto server_task = Task([&] {
-        Connection connection;
-        if (CoAccept(server, connection, Until(5000ms))) { server_error.store(1); return; }
+        const auto res = server.CoAccept(Until(5000ms));
+        if (res.error || !res.connection.Valid()) { server_error.store(1); return; }
+        CoTcpConnection conn = res.connection;
         for (int i = 0; i < kRounds; ++i) {
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
             std::string data;
             while (data.size() < kPayload) {
-                std::string chunk;
-                if (CoRead(connection, chunk, At(deadline))) { server_error.store(2); return; }
-                data += chunk;
+                const auto read = conn.Read(At(deadline));
+                if (read.state != ReadState::Data) { server_error.store(2); return; }
+                read.data.AppendTo(data);
             }
-            WriteOutcome outcome;
-            WriteOperation operation;
-            if (CoWrite(connection, data, At(deadline), outcome, operation)
-                || outcome.phase != WritePhase::Done) {
+            const auto report = conn.Write(data, At(deadline));
+            if (report.wait_error || report.outcome.phase != WritePhase::Done) {
                 server_error.store(3);
                 return;
             }
@@ -1653,26 +1667,25 @@ static void CoPingpongStrict() {
         server_error.store(0);
     });
     auto client_task = Task([&] {
-        Connection connection;
-        if (CoDial(client, addresses[0], connection, Until(5000ms))) {
+        const auto res = client.CoDial(addresses[0], Until(5000ms));
+        if (res.error || !res.connection.Valid()) {
             client_error.store(1);
             return;
         }
+        CoTcpConnection conn = res.connection;
         const std::string payload(kPayload, 'p');
         for (int i = 0; i < kRounds; ++i) {
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-            WriteOutcome outcome;
-            WriteOperation operation;
-            if (CoWrite(connection, payload, At(deadline), outcome, operation)
-                || outcome.phase != WritePhase::Done) {
+            const auto report = conn.Write(payload, At(deadline));
+            if (report.wait_error || report.outcome.phase != WritePhase::Done) {
                 client_error.store(2);
                 return;
             }
             std::string echoed;
             while (echoed.size() < kPayload) {
-                std::string chunk;
-                if (CoRead(connection, chunk, At(deadline))) { client_error.store(3); return; }
-                echoed += chunk;
+                const auto read = conn.Read(At(deadline));
+                if (read.state != ReadState::Data) { client_error.store(3); return; }
+                read.data.AppendTo(echoed);
             }
             client_rounds.fetch_add(1);
         }
@@ -1890,8 +1903,9 @@ static void CoReadHubFullBounded() {
     std::atomic<int> result{-2};
     // 无 deadline：若满额被实现成库内自激重试，此 Get 会一直不返回。
     auto task = Task([&] {
-        std::string out;
-        result.store(CoRead(connection, out, bbt::coroutine::WaitOptions{}).value());
+        CoTcpConnection conn{connection};
+        const auto read = conn.Read(bbt::coroutine::WaitOptions{});
+        result.store(read.error.value());
     });
     Get(task);
     CHECK(result.load() == std::make_error_code(std::errc::no_buffer_space).value());
@@ -1900,7 +1914,10 @@ static void CoReadHubFullBounded() {
     auto cleanup_out = std::make_shared<std::string>();
     std::atomic<int> cleanup_result{-1};
     auto cleanup_task = Task([&] {
-        if (!CoRead(connection, *cleanup_out, Until(500ms))) {
+        CoTcpConnection conn{connection};
+        const auto read = conn.Read(Until(500ms));
+        if (read.state == ReadState::Data) {
+            read.data.AppendTo(*cleanup_out);
             cleanup_result.store(0);
         }
     });
@@ -2059,13 +2076,12 @@ static void CoDialFastComplete() {
     std::atomic<int> result{-1};
     std::string failure;
     auto task = Task([&] {
-        Connection connection;
-        const auto error = CoDial(client, address, connection, Until(2000ms));
-        if (!error && connection.Valid()) {
+        auto res = client.CoDial(address, Until(2000ms));
+        if (!res.error && res.connection.Valid()) {
             result.store(0);
-            connection.RequestClose();
+            res.connection.RequestClose();
         } else {
-            result.store(error.value());
+            result.store(res.error.value());
         }
     });
     Get(task);
@@ -2088,9 +2104,8 @@ static void CoDialTimeoutRecycles() {
     EngineTestAccess::SetConnectDeliveryDelay(client, std::chrono::milliseconds(200));
     std::atomic<int> result{-2};
     auto task = Task([&] {
-        Connection connection;
-        const auto error = CoDial(client, address, connection, Until(30ms));
-        result.store(error.value());
+        const auto res = client.CoDial(address, Until(30ms));
+        result.store(res.error.value());
     });
     Get(task);
     CHECK(result.load() == std::make_error_code(std::errc::timed_out).value());
@@ -2100,10 +2115,10 @@ static void CoDialTimeoutRecycles() {
     const auto fds_after_first = CountFds();
     std::atomic<int> second{-2};
     auto task2 = Task([&] {
-        Connection connection;
-        second.store(CoDial(client, address, connection, Until(2000ms)).value());
-        if (connection.Valid()) {
-            connection.RequestClose();
+        auto res = client.CoDial(address, Until(2000ms));
+        second.store(res.error.value());
+        if (res.connection.Valid()) {
+            res.connection.RequestClose();
         }
     });
     Get(task2);
@@ -2126,8 +2141,8 @@ static void CoDialCancelPostFailureRetries() {
     EngineTestAccess::SetCancelPostFailureOnce(client);
     std::atomic<int> result{-2};
     auto task = Task([&] {
-        Connection connection;
-        result.store(CoDial(client, address, connection, Until(30ms)).value());
+        const auto res = client.CoDial(address, Until(30ms));
+        result.store(res.error.value());
     });
     Get(task);
     CHECK(result.load() == std::make_error_code(std::errc::timed_out).value());
@@ -2253,13 +2268,12 @@ static void AsyncConnectPublicFastComplete() {
 
     std::atomic<int> result{-2};
     auto task = Task([&] {
-        Connection connection;
-        const auto error = CoDial(client, address, connection, Until(2000ms));
-        if (!error && connection.Valid()) {
+        auto res = client.CoDial(address, Until(2000ms));
+        if (!res.error && res.connection.Valid()) {
             result.store(0);
-            connection.RequestClose();
+            res.connection.RequestClose();
         } else {
-            result.store(error.value());
+            result.store(res.error.value());
         }
     });
     Get(task);
@@ -2614,8 +2628,8 @@ static void CoDialRawRejected() {
     CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
     std::atomic<int> result{-2};
     auto task = Task([&] {
-        Connection connection;
-        result.store(CoDial(client, address, connection, Until(1000ms)).value());
+        const auto res = client.CoDial(address, Until(1000ms));
+        result.store(res.error.value());
     });
     Get(task);
     CHECK(result.load() == std::make_error_code(std::errc::operation_not_supported).value());

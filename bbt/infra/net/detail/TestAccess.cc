@@ -19,8 +19,9 @@ std::shared_ptr<ConnectionState> ConnectionTestAccess::StateOf(const Connection&
     return connection.m_state;
 }
 
-WriteOperation ConnectionTestAccess::MakeWrite(std::shared_ptr<WriteOpRecord> record) {
-    return WriteOperation(std::move(record));
+WriteOperation ConnectionTestAccess::MakeWrite(std::shared_ptr<WriteOpRecord> record,
+                                               std::shared_ptr<ConnectionState> state) {
+    return WriteOperation(std::move(record), std::move(state));
 }
 
 ReadAccess ConnectionTestAccess::HoldForTest(std::shared_ptr<ConnectionState> state) {

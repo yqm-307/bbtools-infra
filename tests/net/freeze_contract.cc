@@ -18,8 +18,9 @@
 // 本文件除公共头外只经 detail/TestAccess、detail/CoInternal、detail/EngineTestAccess
 // 注入交错与内部状态；这些接缝不回到公共面，也不被公共 consumer 引用。
 
-#include <bbt/infra/net/CoConnection.hpp>
+#include <bbt/infra/net/CoTcpConnection.hpp>
 #include <bbt/infra/net/Engine.hpp>
+#include <bbt/infra/net/ICoConnection.hpp>
 #include <bbt/infra/net/NativeSocket.hpp>
 #include <bbt/infra/net/RawHandler.hpp>
 #include <bbt/infra/net/ReadAccess.hpp>
@@ -335,14 +336,20 @@ struct GateProbe {
 GateProbe RunAllCoEntries(Connection& connection, Engine& accept_engine, Engine& dial_engine,
                           const Address& dial_address) {
     GateProbe probe;
-    probe.read_error = CoRead(connection, probe.read_out, Until(50ms));
-    WriteOperation operation;
-    probe.write_error = CoWrite(connection, std::string(4, 'w'), Until(50ms), probe.outcome, operation);
-    probe.operation_valid = operation.Valid();
-    Connection accepted;
-    probe.accept_error = CoAccept(accept_engine, accepted, Until(50ms));
-    Connection dialed;
-    probe.dial_error = CoDial(dial_engine, dial_address, dialed, Until(50ms));
+    CoTcpConnection co_conn{connection};
+    const auto read = co_conn.Read(Until(50ms));
+    probe.read_error = read.error;
+    if (read.state == ReadState::Data) {
+        read.data.AppendTo(probe.read_out);
+    }
+    const auto report = co_conn.Write(std::string(4, 'w'), Until(50ms));
+    probe.write_error = report.wait_error;
+    probe.outcome = report.outcome;
+    probe.operation_valid = report.operation.Valid();
+    const auto accepted = accept_engine.CoAccept(Until(50ms));
+    probe.accept_error = accepted.error;
+    const auto dialed = dial_engine.CoDial(dial_address, Until(50ms));
+    probe.dial_error = dialed.error;
     return probe;
 }
 
@@ -442,10 +449,10 @@ static void CoContextGate() {
     // 已就绪 handoff 仍可被合法域（协程）取走：证明拒绝路径零出队。
     std::atomic<int> accepted{-1};
     auto task = Task([&] {
-        Connection got;
-        if (!CoAccept(server, got, Until(3000ms)) && got.Valid()) {
+        auto res = server.CoAccept(Until(3000ms));
+        if (!res.error && res.connection.Valid()) {
             accepted.store(1);
-            got.RequestClose();
+            res.connection.RequestClose();
         }
     });
     Get(task);
@@ -457,14 +464,20 @@ static void CoContextGate() {
         auto pos_state = std::make_shared<ConnectionState>(8, 4096, 1024, 4, nullptr);
         CHECK(pos_state->ring.TryAppend("in-domain").status == ReadStatus::Ok);
         Connection pos = ConnectionTestAccess::Make(pos_state);
+        CoTcpConnection co_pos{pos};
         std::string out;
-        if (CoRead(pos, out, Until(2000ms)) || out != "in-domain") {
+        const auto read = co_pos.Read(Until(2000ms));
+        if (read.state == ReadState::Data) {
+            read.data.AppendTo(out);
+        }
+        if (out != "in-domain") {
             return;
         }
         // 已接纳后无 owner 推进：允许 timed_out + InFlight（本次 op 有效可查）。
-        WriteOutcome outcome;
-        WriteOperation operation;
-        const auto write_error = CoWrite(pos, "x", Until(300ms), outcome, operation);
+        const auto report = co_pos.Write("x", Until(300ms));
+        const auto write_error = report.wait_error;
+        const auto outcome = report.outcome;
+        const auto operation = report.operation;
         const bool accepted_in_flight =
             write_error == std::make_error_code(std::errc::timed_out)
             && outcome.phase == WritePhase::InFlight && operation.Valid();
@@ -473,11 +486,11 @@ static void CoContextGate() {
         if (!accepted_in_flight && !done_locally) {
             return;
         }
-        Connection dialed;
-        if (CoDial(host, server_addresses[0], dialed, Until(3000ms)) || !dialed.Valid()) {
+        auto res = host.CoDial(server_addresses[0], Until(3000ms));
+        if (res.error || !res.connection.Valid()) {
             return;
         }
-        dialed.RequestClose();
+        res.connection.RequestClose();
         positive.store(1);
     });
     Get(positive_task);
@@ -721,7 +734,10 @@ static void WriteOutputReuse() {
 
         // 2) 无效连接：必须覆盖为本次 Rejected + op 无效，不泄露上次 Done。
         Connection invalid;
-        const auto invalid_error = CoWrite(invalid, "x", Until(50ms), outcome, operation);
+        const auto invalid_report = CoTcpConnection{invalid}.Write("x", Until(50ms));
+        const auto invalid_error = invalid_report.wait_error;
+        outcome = invalid_report.outcome;
+        operation = invalid_report.operation;
         if (invalid_error != make_error_code(NetErrc::Closed)
             || outcome.phase != WritePhase::Rejected || operation.Valid()) {
             return;
@@ -730,7 +746,10 @@ static void WriteOutputReuse() {
         // 3) 超大写（> max_outbound_bytes）：Rejected/no_buffer_space，op 无效。
         progress.store(4);
         const std::string oversized(257, 'o');
-        const auto oversized_error = CoWrite(connection, oversized, Until(500ms), outcome, operation);
+        const auto oversized_report = CoTcpConnection{connection}.Write(oversized, Until(500ms));
+        const auto oversized_error = oversized_report.wait_error;
+        outcome = oversized_report.outcome;
+        operation = oversized_report.operation;
         if (oversized_error != std::make_error_code(std::errc::no_buffer_space)
             || outcome.phase != WritePhase::Rejected || operation.Valid()) {
             return;
@@ -740,7 +759,10 @@ static void WriteOutputReuse() {
         progress.store(5);
         Connection closed_conn = ConnectionTestAccess::Make(state);
         state->MarkClosed(std::make_error_code(std::errc::operation_canceled));
-        const auto closed_error = CoWrite(closed_conn, "y", Until(50ms), outcome, operation);
+        const auto closed_report = CoTcpConnection{closed_conn}.Write("y", Until(50ms));
+        const auto closed_error = closed_report.wait_error;
+        outcome = closed_report.outcome;
+        operation = closed_report.operation;
         if (closed_error != make_error_code(NetErrc::Closed)
             || outcome.phase != WritePhase::Rejected || operation.Valid()) {
             return;
@@ -762,9 +784,10 @@ static void WriteOutputReuse() {
         Connection in_flight = ConnectionTestAccess::Make(in_flight_state);
         std::atomic<int> inflight_result{-1};
         auto inflight_task = Task([&] {
-            WriteOutcome outcome;
-            WriteOperation operation;
-            const auto error = CoWrite(in_flight, std::string(8, 'd'), Until(30ms), outcome, operation);
+            const auto report = CoTcpConnection{in_flight}.Write(std::string(8, 'd'), Until(30ms));
+            const auto error = report.wait_error;
+            const auto outcome = report.outcome;
+            const auto operation = report.operation;
             if (error == std::make_error_code(std::errc::timed_out)
                 && outcome.phase == WritePhase::InFlight && operation.Valid()) {
                 inflight_result.store(0);
@@ -780,11 +803,12 @@ static void WriteOutputReuse() {
         Connection alloc_conn = ConnectionTestAccess::Make(alloc_state);
         std::atomic<int> alloc_result{-1};
         auto alloc_task = Task([&] {
-            WriteOutcome outcome;
-            WriteOperation operation;
             g_fail_alloc = true;
-            const auto error = CoWrite(alloc_conn, "zz", Until(500ms), outcome, operation);
+            const auto report = CoTcpConnection{alloc_conn}.Write("zz", Until(500ms));
             g_fail_alloc = false;
+            const auto error = report.wait_error;
+            const auto outcome = report.outcome;
+            const auto operation = report.operation;
             if (error == std::make_error_code(std::errc::not_enough_memory)
                 && outcome.phase == WritePhase::Rejected && outcome.sent == 0
                 && outcome.error == std::make_error_code(std::errc::not_enough_memory)
@@ -810,9 +834,10 @@ static void WriteOutputReuse() {
         }
         std::atomic<int> full_result{-1};
         auto full_task = Task([&] {
-            WriteOutcome outcome;
-            WriteOperation operation;
-            const auto error = CoWrite(full_conn, "yy", Until(500ms), outcome, operation);
+            const auto report = CoTcpConnection{full_conn}.Write("yy", Until(500ms));
+            const auto error = report.wait_error;
+            const auto outcome = report.outcome;
+            const auto operation = report.operation;
             if (error == std::make_error_code(std::errc::no_buffer_space)
                 && outcome.phase == WritePhase::Rejected && !operation.Valid()) {
                 full_result.store(0);
@@ -830,8 +855,6 @@ static void WriteOutputReuse() {
         Connection failed_conn = ConnectionTestAccess::Make(failed_state);
         std::atomic<int> failed_result{-1};
         auto failed_task = Task([&] {
-            WriteOutcome outcome;
-            WriteOperation operation;
             std::thread pump([&] {
                 std::this_thread::sleep_for(20ms);
                 failed_state->PumpWrites(4, 4096,
@@ -840,11 +863,14 @@ static void WriteOutputReuse() {
                         return -1;
                     });
             });
-            const auto error = CoWrite(failed_conn, "boom", Until(2000ms), outcome, operation);
+            const auto report = CoTcpConnection{failed_conn}.Write("boom", Until(2000ms));
             pump.join();
-            // 本地完成路径：返回的就是该次发送错误（EPIPE），outcome 同为 Done+EPIPE；
-            // 这与"等待超时但仍在途"（timed_out + InFlight）是不同的两个结果。
-            if (error.value() == EPIPE && outcome.phase == WritePhase::Done
+            const auto wait_error = report.wait_error;
+            const auto outcome = report.outcome;
+            const auto operation = report.operation;
+            // 本地完成路径：等待正常结束（wait_error 为空），发送错误落在
+            // outcome.error（EPIPE）；这与"等待超时但仍在途"是不同的两个结果。
+            if (!wait_error && outcome.phase == WritePhase::Done
                 && outcome.error.value() == EPIPE && outcome.sent == 0
                 && operation.Valid()) {
                 failed_result.store(0);
@@ -869,8 +895,12 @@ static void OutputPreservation() {
         std::string out = "keep";
         std::atomic<int> result{-1};
         auto task = Task([&] {
-            const auto error = CoRead(connection, out, Until(30ms));
-            if (error == std::make_error_code(std::errc::timed_out) && out == "keep") {
+            const auto read = CoTcpConnection{connection}.Read(Until(30ms));
+            if (read.state == ReadState::Data) {
+                read.data.AppendTo(out);
+            }
+            if (read.state == ReadState::Error
+                && read.error == std::make_error_code(std::errc::timed_out) && out == "keep") {
                 result.store(0);
             }
         });
@@ -878,19 +908,28 @@ static void OutputPreservation() {
         CHECK(result.load() == 0);
         CHECK(state->ring.Size() == 0);
     }
-    // 2) CoRead 分配失败：out 与 ring 双不变（强保证）。
+    // 2) Read 分配失败：out 与 ring 双不变（强保证）。成员 Read 的分配点在
+    // TryPopAll 的 takeout/segments 元数据（pop-all 移交不复制载荷），注入
+    // operator new 失败覆盖同一「分配失败零消费」契约。
     {
         auto state = std::make_shared<ConnectionState>(2, 4096, 1024, 4, nullptr);
         CHECK(state->ring.TryAppend("payload").status == ReadStatus::Ok);
         Connection connection = ConnectionTestAccess::Make(state);
         auto out = std::make_shared<std::string>("existing");
-        ReceiveRing::SetAppendFaultForTest([] { throw std::bad_alloc(); });
         auto task = Task([&] {
-            const auto error = CoRead(connection, *out, Until(500ms));
-            CHECK(static_cast<bool>(error));
+            g_fail_alloc = true;
+            try {
+                const auto read = CoTcpConnection{connection}.Read(Until(500ms));
+                g_fail_alloc = false;
+                CHECK(static_cast<bool>(read.error));
+                if (read.state == ReadState::Data) {
+                    read.data.AppendTo(*out);
+                }
+            } catch (const std::bad_alloc&) {
+                g_fail_alloc = false;  // 分配失败未交付任何数据，等价 Error 路径
+            }
         });
         Get(task);
-        ReceiveRing::SetAppendFaultForTest({});
         CHECK(*out == "existing");
         CHECK(state->ring.Size() == 7);
     }
@@ -906,12 +945,12 @@ static void OutputPreservation() {
         Connection original = ConnectionTestAccess::Make(original_state);
         std::atomic<int> result{-1};
         auto task = Task([&] {
-            Connection out = original;
-            const auto error = CoAccept(engine, out, Until(100ms));
+            auto res = engine.CoAccept(Until(100ms));
             std::string tail;
-            if (error == std::make_error_code(std::errc::operation_not_permitted)
-                && out.Valid() && out.Id() == original.Id()
-                && out.TryRead(tail).status == ReadStatus::Ok && tail == "original") {
+            if (res.error == std::make_error_code(std::errc::operation_not_permitted)
+                && !res.connection.Valid()
+                && original.Valid()
+                && original.TryRead(tail).status == ReadStatus::Ok && tail == "original") {
                 result.store(0);
             }
         });
@@ -933,11 +972,11 @@ static void OutputPreservation() {
         Connection original = ConnectionTestAccess::Make(original_state);
         std::atomic<int> result{-1};
         auto task = Task([&] {
-            Connection out = original;
-            const auto error = CoDial(host, dead, out, Until(500ms));
+            auto res = host.CoDial(dead, Until(500ms));
             std::string tail;
-            if (error && out.Valid() && out.Id() == original.Id()
-                && out.TryRead(tail).status == ReadStatus::Ok && tail == "kept") {
+            if (res.error && !res.connection.Valid()
+                && original.Valid()
+                && original.TryRead(tail).status == ReadStatus::Ok && tail == "kept") {
                 result.store(0);
             }
         });
@@ -1220,10 +1259,10 @@ static void ConnectDelivery() {
         CHECK(WaitUntil([&] { return co_client.Phase() == EnginePhase::Running; }, 3000ms));
         std::atomic<int> client_result{-1};
         auto task = Task([&] {
-            Connection out;
-            if (!CoDial(co_client, address, out, Until(3000ms)) && out.Valid()) {
+            auto res = co_client.CoDial(address, Until(3000ms));
+            if (!res.error && res.connection.Valid()) {
                 client_result.store(0);
-                out.RequestClose();
+                res.connection.RequestClose();
             }
         });
         Get(task);
@@ -1237,10 +1276,10 @@ static void ConnectDelivery() {
         CHECK(WaitUntil([&] { return co_server.Phase() == EnginePhase::Running; }, 3000ms));
         std::atomic<int> server_result{-1};
         auto server_task = Task([&] {
-            Connection out;
-            if (!CoDial(co_server, address, out, Until(3000ms)) && out.Valid()) {
+            auto res = co_server.CoDial(address, Until(3000ms));
+            if (!res.error && res.connection.Valid()) {
                 server_result.store(0);
-                out.RequestClose();
+                res.connection.RequestClose();
             }
         });
         Get(server_task);
@@ -1254,9 +1293,9 @@ static void ConnectDelivery() {
         CHECK(WaitUntil([&] { return raw_client.Phase() == EnginePhase::Running; }, 3000ms));
         std::atomic<int> rejected{-1};
         auto reject_task = Task([&] {
-            Connection out;
-            const auto error = CoDial(raw_client, address, out, Until(1000ms));
-            if (error == std::make_error_code(std::errc::operation_not_supported) && !out.Valid()) {
+            auto res = raw_client.CoDial(address, Until(1000ms));
+            if (res.error == std::make_error_code(std::errc::operation_not_supported)
+                && !res.connection.Valid()) {
                 rejected.store(0);
             }
         });
@@ -1292,8 +1331,7 @@ static void ConnectFailureCleanup() {
             EngineTestAccess::FailNextConnectWaiterCreateOnce(client);
             std::atomic<int> value{-2};
             auto task = Task([&] {
-                Connection out;
-                value.store(CoDial(client, address, out, Until(1000ms)).value());
+                value.store(client.CoDial(address, Until(1000ms)).error.value());
             });
             Get(task);
             CHECK(value.load() == std::make_error_code(std::errc::not_enough_memory).value());
@@ -1307,10 +1345,10 @@ static void ConnectFailureCleanup() {
         CHECK(WaitUntil([&] { return CountFds() <= fds_after_first; }, 3000ms));
         std::atomic<int> recovered{-2};
         auto recovered_task = Task([&] {
-            Connection out;
-            if (!CoDial(client, address, out, Until(3000ms)) && out.Valid()) {
+            auto res = client.CoDial(address, Until(3000ms));
+            if (!res.error && res.connection.Valid()) {
                 recovered.store(0);
-                out.RequestClose();
+                res.connection.RequestClose();
             }
         });
         Get(recovered_task);
@@ -1353,8 +1391,7 @@ static void ConnectFailureCleanup() {
         EngineTestAccess::SetConnectDeliveryDelay(client, std::chrono::milliseconds(200));
         std::atomic<int> timed_out{-2};
         auto timeout_task = Task([&] {
-            Connection out;
-            timed_out.store(CoDial(client, address, out, Until(30ms)).value());
+            timed_out.store(client.CoDial(address, Until(30ms)).error.value());
         });
         Get(timeout_task);
         CHECK(timed_out.load() == std::make_error_code(std::errc::timed_out).value());
@@ -1363,10 +1400,10 @@ static void ConnectFailureCleanup() {
         const auto fds_after = CountFds();
         std::atomic<int> recovered{-2};
         auto recovered_task = Task([&] {
-            Connection out;
-            if (!CoDial(client, address, out, Until(3000ms)) && out.Valid()) {
+            auto res = client.CoDial(address, Until(3000ms));
+            if (!res.error && res.connection.Valid()) {
                 recovered.store(0);
-                out.RequestClose();
+                res.connection.RequestClose();
             }
         });
         Get(recovered_task);
@@ -1385,8 +1422,7 @@ static void ConnectFailureCleanup() {
         EngineTestAccess::SetCancelPostFailureOnce(client);
         std::atomic<int> result{-2};
         auto task = Task([&] {
-            Connection out;
-            result.store(CoDial(client, address, out, Until(30ms)).value());
+            result.store(client.CoDial(address, Until(30ms)).error.value());
         });
         Get(task);
         CHECK(result.load() == std::make_error_code(std::errc::timed_out).value());
@@ -1430,9 +1466,8 @@ static void ConnectFailureCleanup() {
         // Co 侧同 Engine 一律拒绝（raw 唯一交付），且不影响已交付连接。
         std::atomic<int> rejected{-1};
         auto task = Task([&] {
-            Connection out;
-            const auto error = CoDial(client, address, out, Until(1000ms));
-            if (error == std::make_error_code(std::errc::operation_not_supported)) {
+            auto res = client.CoDial(address, Until(1000ms));
+            if (res.error == std::make_error_code(std::errc::operation_not_supported)) {
                 rejected.store(0);
             }
         });
@@ -1488,10 +1523,10 @@ static void ConnectFailureCleanup() {
             {
                 std::atomic<int> baseline{-1};
                 auto warm = Task([&] {
-                    Connection out;
-                    if (!CoDial(client, address, out, Until(3000ms)) && out.Valid()) {
+                    auto res = client.CoDial(address, Until(3000ms));
+                    if (!res.error && res.connection.Valid()) {
                         baseline.store(0);
-                        out.RequestClose();
+                        res.connection.RequestClose();
                     }
                 });
                 Get(warm);
@@ -1545,12 +1580,12 @@ static void ConnectFailureCleanup() {
             std::atomic<int> dial_errc{-99};
             std::atomic<int> dial_out_kept{-1};
             auto dial_task = Task([&] {
-                Connection out = dial_original;
-                const auto error = CoDial(client, address, out, Until(3000ms));
-                dial_errc.store(error.value());
+                auto res = client.CoDial(address, Until(3000ms));
+                dial_errc.store(res.error.value());
                 std::string tail;
-                if (out.Valid() && out.Id() == dial_original.Id()
-                    && out.TryRead(tail).status == ReadStatus::Ok && tail == "held-dial") {
+                if (!res.connection.Valid() && dial_original.Valid()
+                    && dial_original.TryRead(tail).status == ReadStatus::Ok
+                    && tail == "held-dial") {
                     dial_out_kept.store(0);
                 }
             });
@@ -1568,10 +1603,10 @@ static void ConnectFailureCleanup() {
             EngineTestAccess::SetConnectStartDelay(client, std::chrono::milliseconds(0));
             std::atomic<int> recovered{-1};
             auto recovered_task = Task([&] {
-                Connection out;
-                if (!CoDial(client, address, out, Until(3000ms)) && out.Valid()) {
+                auto res = client.CoDial(address, Until(3000ms));
+                if (!res.error && res.connection.Valid()) {
                     recovered.store(0);
-                    out.RequestClose();
+                    res.connection.RequestClose();
                 }
             });
             Get(recovered_task);
@@ -1653,12 +1688,11 @@ static void AcceptConfiguration() {
         std::atomic<int> errc{0};
         std::atomic<int> kept{-1};
         auto task = Task([&] {
-            Connection out = original;
-            const auto error = CoAccept(engine, out, Until(3000ms));
-            errc.store(error.value());
+            auto res = engine.CoAccept(Until(3000ms));
+            errc.store(res.error.value());
             std::string tail;
-            if (out.Valid() && out.Id() == original.Id()
-                && out.TryRead(tail).status == ReadStatus::Ok && tail == "accept-kept") {
+            if (!res.connection.Valid() && original.Valid()
+                && original.TryRead(tail).status == ReadStatus::Ok && tail == "accept-kept") {
                 kept.store(0);
             }
         });
@@ -1774,11 +1808,11 @@ static void AcceptConfiguration() {
         std::atomic<std::uint64_t> handoff_id{0};
         std::atomic<int> result{-1};
         auto task = Task([&] {
-            Connection out;
-            if (!CoAccept(engine, out, Until(3000ms)) && out.Valid()) {
-                handoff_id.store(out.Id());
+            auto res = engine.CoAccept(Until(3000ms));
+            if (!res.error && res.connection.Valid()) {
+                handoff_id.store(res.connection.Raw().Id());
                 result.store(0);
-                out.RequestClose();
+                res.connection.RequestClose();
             }
         });
         Get(task);
@@ -1812,12 +1846,12 @@ static void AcceptConfiguration() {
         std::atomic<int> accepted{0};
         auto task = Task([&] {
             for (int i = 0; i < 3; ++i) {
-                Connection connection;
-                if (CoAccept(engine, connection, Until(3000ms)) || !connection.Valid()) {
+                auto res = engine.CoAccept(Until(3000ms));
+                if (res.error || !res.connection.Valid()) {
                     return;
                 }
                 accepted.fetch_add(1);
-                connection.RequestClose();
+                res.connection.RequestClose();
             }
         });
         Get(task);
@@ -1842,10 +1876,11 @@ static void AcceptConfiguration() {
         auto client = ConnectClient(addresses[0]);
         std::atomic<int> result{-1};
         auto task = Task([&] {
-            Connection out;
-            if (CoAccept(engine, out, Until(3000ms)) || !out.Valid()) {
+            auto res = engine.CoAccept(Until(3000ms));
+            if (res.error || !res.connection.Valid()) {
                 return;
             }
+            Connection out = res.connection.Raw();
             const auto second = CoAccess::WaitAccepted(engine, out, Until(40ms));
             if (second == std::make_error_code(std::errc::timed_out)) {
                 result.store(0);

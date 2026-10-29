@@ -14,7 +14,9 @@ target_include_directories(bbt_infra_http_net
            # 公开头仍引用旧公开头树的 NetworkTypes/Result（include/bbt/infra/）。
            "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>")
 target_compile_features(bbt_infra_http_net PUBLIC cxx_std_17)
-target_link_libraries(bbt_infra_http_net PUBLIC bbt::infra_net PRIVATE Boost::headers)
+target_link_libraries(bbt_infra_http_net
+    PUBLIC bbt::infra_net bbt::infra_common
+    PRIVATE Boost::headers)
 target_compile_options(bbt_infra_http_net PRIVATE -Wall -Wextra -Wpedantic)
 
 # 公开头自给编译自检：公开头各自单独成 TU（detail 内部头不列入）。

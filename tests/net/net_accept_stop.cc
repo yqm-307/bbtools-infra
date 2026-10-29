@@ -6,8 +6,9 @@
 // 进程退出经 bbt_net_test::RunTestProcessExit 收口（同 tests/net 其它 runtime
 // 用例）：每 case 业务资源在 _Exit 前已显式 close/join，不把 OS 代清当证据。
 
-#include <bbt/infra/net/CoConnection.hpp>
+#include <bbt/infra/net/CoTcpConnection.hpp>
 #include <bbt/infra/net/Engine.hpp>
+#include <bbt/infra/net/ICoConnection.hpp>
 #include <bbt/infra/net/NativeSocket.hpp>
 #include <bbt/infra/net/RawHandler.hpp>
 #include <bbt/infra/net/detail/EngineTestAccess.hpp>
@@ -224,11 +225,10 @@ void StopRunningDeliveredConnRW() {
     std::atomic<int> accept_result{-2};
     auto accepted_connection = std::make_shared<Connection>();
     auto task = Task([&] {
-        Connection connection;
-        const auto error = CoAccept(engine, connection, Until(5000ms));
-        accept_result.store(error ? error.value() : 0);
-        if (!error && connection.Valid()) {
-            *accepted_connection = connection;
+        auto res = engine.CoAccept(Until(5000ms));
+        accept_result.store(res.error ? res.error.value() : 0);
+        if (!res.error && res.connection.Valid()) {
+            *accepted_connection = res.connection.Raw();
             accepted_ready.store(true);
         }
     });
@@ -245,18 +245,17 @@ void StopRunningDeliveredConnRW() {
     // 已交付句柄上先读"ping"再原文回写（Co 入口须在协程域）。
     std::atomic<int> rw_result{-2};
     auto rw_task = Task([&] {
+        CoTcpConnection co_conn{*accepted_connection};
         std::string data;
-        const auto error = CoRead(*accepted_connection, data, Until(5000ms));
-        if (error || data != "ping") {
-            rw_result.store(error ? error.value() : -1);
+        auto read = co_conn.Read(Until(5000ms));
+        if (read.state != ReadState::Data || read.data.CopyTo() != "ping") {
+            rw_result.store(read.error ? read.error.value() : -1);
             return;
         }
-        WriteOutcome outcome;
-        WriteOperation operation;
-        const auto write_error =
-            CoWrite(*accepted_connection, data, Until(3000ms), outcome, operation);
-        if (write_error || outcome.phase != WritePhase::Done || outcome.error) {
-            rw_result.store(write_error ? write_error.value() : -2);
+        data = read.data.CopyTo();
+        auto report = co_conn.Write(data, Until(3000ms));
+        if (report.wait_error || report.outcome.phase != WritePhase::Done || report.outcome.error) {
+            rw_result.store(report.wait_error ? report.wait_error.value() : -2);
             return;
         }
         rw_result.store(0);
@@ -311,11 +310,10 @@ void StopWakesCoAcceptWaiters() {
     std::atomic<int> result{-2};
     Connection out;
     auto task = Task([&] {
-        Connection connection;
-        const auto error = CoAccept(engine, connection, Until(5000ms));
-        result.store(error ? error.value() : -1);
-        if (!error) {
-            out = std::move(connection);
+        auto res = engine.CoAccept(Until(5000ms));
+        result.store(res.error ? res.error.value() : -1);
+        if (!res.error) {
+            out = res.connection.Raw();
         }
     });
     CHECK(WaitUntil([&] { return waiter_registered.load(); }, 3000ms));
@@ -347,11 +345,10 @@ void StopLateCoAcceptRejected() {
         std::atomic<int> co_result{-2};
         Connection co_out;
         auto task = Task([&] {
-            Connection connection;
-            const auto error = CoAccept(idle, connection, Until(1000ms));
-            co_result.store(error ? error.value() : -1);
-            if (!error) {
-                co_out = std::move(connection);
+            auto res = idle.CoAccept(Until(1000ms));
+            co_result.store(res.error ? res.error.value() : -1);
+            if (!res.error) {
+                co_out = res.connection.Raw();
             }
         });
         Get(task);
@@ -388,11 +385,10 @@ void StopLateCoAcceptRejected() {
         std::atomic<int> co_result{-2};
         Connection co_out;
         auto task = Task([&] {
-            Connection connection;
-            const auto error = CoAccept(engine, connection, Until(1000ms));
-            co_result.store(error ? error.value() : -1);
-            if (!error) {
-                co_out = std::move(connection);
+            auto res = engine.CoAccept(Until(1000ms));
+            co_result.store(res.error ? res.error.value() : -1);
+            if (!res.error) {
+                co_out = res.connection.Raw();
             }
         });
         Get(task);
@@ -447,26 +443,24 @@ void StopClientOnlyDialContinues(bool before_run = false) {
     std::atomic<int> dial_result{-2}, exchange_result{-2};
     Connection connection;
     auto task = Task([&] {
-        ReclaimReceipt receipt;
-        auto result = CoDial(client, address, connection, receipt, Until(3000ms));
-        dial_result.store(result ? result.value() : 0);
-        if (result) { return; }
-        WriteOutcome outcome;
-        WriteOperation operation;
-        result = CoWrite(connection, "ping", Until(3000ms), outcome, operation);
-        if (result || outcome.phase != WritePhase::Done || outcome.error) {
+        auto res = client.CoDial(address, Until(3000ms));
+        dial_result.store(res.error ? res.error.value() : 0);
+        if (res.error) { return; }
+        connection = res.connection.Raw();
+        CoTcpConnection co_conn{connection};
+        auto report = co_conn.Write("ping", Until(3000ms));
+        if (report.wait_error || report.outcome.phase != WritePhase::Done || report.outcome.error) {
             exchange_result.store(-1);
             return;
         }
         std::string response;
         while (response.size() < 4) {
-            std::string part;
-            result = CoRead(connection, part, Until(3000ms));
-            if (result || part.empty()) {
+            auto read = co_conn.Read(Until(3000ms));
+            if (read.state != ReadState::Data || read.data.Empty()) {
                 exchange_result.store(-1);
                 return;
             }
-            response += part;
+            read.data.AppendTo(response);
         }
         exchange_result.store(response == "pong" ? 0 : -1);
     });

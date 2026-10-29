@@ -2,7 +2,7 @@
 add_executable(Test_rpc_net_wire Test_rpc_net_wire.cc)
 target_link_libraries(Test_rpc_net_wire PRIVATE bbt::infra_rpc_net Boost::headers)
 target_compile_options(Test_rpc_net_wire PRIVATE -Wall -Wextra -Wpedantic)
-foreach(_case wire_roundtrip wire_reject wire_malformed)
+foreach(_case wire_roundtrip wire_reject wire_malformed wire_request_phase)
     add_test(NAME rpc.net.${_case} COMMAND Test_rpc_net_wire ${_case})
     set_tests_properties(rpc.net.${_case} PROPERTIES TIMEOUT 30 LABELS "rpc_net")
 endforeach()

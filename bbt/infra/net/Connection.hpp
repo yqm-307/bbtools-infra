@@ -23,11 +23,11 @@
 
 #include <bbt/infra/net/ReadAccess.hpp>
 #include <bbt/infra/net/Types.hpp>
+#include <bbt/infra/net/WriteOperation.hpp>
 
 namespace bbt::infra::net {
 
 class ConnectionState;
-struct WriteOpRecord;
 struct ReclaimRecord;  // detail：物理回收共享释放记录，布局不出公共面
 struct CoAccess;       // detail：Co 内部步骤门面（唯一内部构造入口）
 
@@ -53,25 +53,6 @@ private:
     explicit ReclaimReceipt(std::shared_ptr<ReclaimRecord> record);
 
     std::shared_ptr<ReclaimRecord> m_record;
-};
-
-// 单次已接纳发送的观察句柄：持操作记录，终态在句柄寿命内永久可查；
-// 释放句柄不取消已接纳发送。不是通用 Future/Task 平台。
-// 无效句柄（未接纳或已被复用覆盖）的 Query 为 Unknown/0/空。
-class WriteOperation {
-public:
-    WriteOperation() = default;
-
-    bool Valid() const noexcept;
-    std::uint64_t Id() const noexcept;
-    WriteOutcome Query() const;
-
-private:
-    friend class Connection;
-    friend class ConnectionTestAccess;
-    explicit WriteOperation(std::shared_ptr<WriteOpRecord> record);
-
-    std::shared_ptr<WriteOpRecord> m_record;
 };
 
 class Connection {

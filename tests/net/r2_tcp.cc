@@ -13,8 +13,12 @@
 //   write_fifo_prefix    OutboundQueue 部分写 FIFO/真实前缀/错误结算/Settling/Close
 //   co_read_timeout      CoRead 超时不消费
 
-#include <bbt/infra/net/CoConnection.hpp>
+#include <bbt/infra/net/Connection.hpp>
+#include <bbt/infra/net/ConnectionResult.hpp>
+#include <bbt/infra/net/CoTcpConnection.hpp>
 #include <bbt/infra/net/Engine.hpp>
+#include <bbt/infra/net/ICoConnection.hpp>
+#include <bbt/infra/net/WriteOperation.hpp>
 #include <bbt/infra/net/NativeSocket.hpp>
 #include <bbt/infra/net/RawHandler.hpp>
 #include <bbt/infra/net/detail/ConnectionState.hpp>
@@ -365,16 +369,15 @@ static void CoAcceptReadWrite() {
 
     std::atomic<int> result{-1};
     auto task = Task([&] {
-        Connection connection;
-        auto error = CoAccept(engine, connection, Until(3000ms));
-        if (error) { result.store(1); return; }
-        std::string data;
-        error = CoRead(connection, data, Until(3000ms));
-        if (error) { result.store(2); return; }
-        WriteOutcome outcome;
-        WriteOperation operation;
-        error = CoWrite(connection, data, Until(3000ms), outcome, operation);
-        if (error || outcome.phase != WritePhase::Done) { result.store(3); return; }
+        auto res = engine.CoAccept(Until(3000ms));
+        if (res.error) { result.store(1); return; }
+        CoTcpConnection connection = res.connection;
+        auto read = connection.Read(Until(3000ms));
+        if (read.state != ReadState::Data) { result.store(2); return; }
+        auto report = connection.Write(read.data.CopyTo(), Until(3000ms));
+        if (report.wait_error || report.outcome.phase != WritePhase::Done) {
+            result.store(3); return;
+        }
         connection.RequestClose();
         result.store(0);
     });
@@ -406,16 +409,17 @@ static void CoDial() {
 
     std::atomic<int> result{-1};
     auto task = Task([&] {
-        Connection connection;
-        auto error = CoDial(client, addresses[0], connection, Until(3000ms));
-        if (error) { result.store(1); return; }
-        WriteOutcome outcome;
-        WriteOperation operation;
-        error = CoWrite(connection, "dial", Until(3000ms), outcome, operation);
-        if (error || outcome.phase != WritePhase::Done) { result.store(2); return; }
-        std::string data;
-        error = CoRead(connection, data, Until(3000ms));
-        if (error || data != "dial") { result.store(3); return; }
+        auto res = client.CoDial(addresses[0], Until(3000ms));
+        if (res.error) { result.store(1); return; }
+        CoTcpConnection connection = res.connection;
+        auto report = connection.Write("dial", Until(3000ms));
+        if (report.wait_error || report.outcome.phase != WritePhase::Done) {
+            result.store(2); return;
+        }
+        auto read = connection.Read(Until(3000ms));
+        if (read.state != ReadState::Data || read.data.CopyTo() != "dial") {
+            result.store(3); return;
+        }
         connection.RequestClose();
         result.store(0);
     });
@@ -511,11 +515,11 @@ static void WriteTimeout() {
               == std::make_error_code(std::errc::no_buffer_space));
         std::atomic<int> result{-1};
         auto task = Task([&] {
-            WriteOutcome outcome;
-            WriteOperation operation;
-            const auto error = CoWrite(connection, std::string(1, 'c'), Until(30ms), outcome, operation);
-            if (error == std::make_error_code(std::errc::timed_out)
-                && outcome.phase == WritePhase::Rejected && !operation.Valid()) {
+            CoTcpConnection co_conn{connection};
+            const auto report = co_conn.Write(std::string(1, 'c'), Until(30ms));
+            if (report.wait_error == std::make_error_code(std::errc::timed_out)
+                && report.outcome.phase == WritePhase::Rejected
+                && !report.operation.Valid()) {
                 result.store(0);
             }
         });
@@ -528,11 +532,12 @@ static void WriteTimeout() {
         std::atomic<int> result{-1};
         auto operation_holder = std::make_shared<WriteOperation>();
         auto task = Task([&] {
-            WriteOutcome outcome;
-            const auto error = CoWrite(connection, std::string(8, 'd'), Until(30ms),
-                                       outcome, *operation_holder);
-            if (error == std::make_error_code(std::errc::timed_out)
-                && outcome.phase == WritePhase::InFlight && operation_holder->Valid()) {
+            CoTcpConnection co_conn{connection};
+            const auto report = co_conn.Write(std::string(8, 'd'), Until(30ms));
+            *operation_holder = report.operation;
+            if (report.wait_error == std::make_error_code(std::errc::timed_out)
+                && report.outcome.phase == WritePhase::InFlight
+                && operation_holder->Valid()) {
                 result.store(0);
             }
         });
@@ -577,9 +582,8 @@ static void CloseWaitersSettle() {
 
     std::atomic<int> accept_result{-1};
     auto task = Task([&] {
-        Connection connection;
-        const auto error = CoAccept(engine, connection, bbt::coroutine::WaitOptions{});
-        accept_result.store(error == std::make_error_code(std::errc::operation_canceled) ? 0 : 1);
+        const auto res = engine.CoAccept(bbt::coroutine::WaitOptions{});
+        accept_result.store(res.error == std::make_error_code(std::errc::operation_canceled) ? 0 : 1);
     });
     std::this_thread::sleep_for(30ms);
     runner.CloseAndJoin();
@@ -592,11 +596,11 @@ static void CloseWaitersSettle() {
     CHECK(!connection.AsyncWrite(std::string(64, 'x'), warm));
     std::atomic<int> write_result{-1};
     auto write_task = Task([&] {
-        WriteOutcome outcome;
-        WriteOperation operation;
-        const auto error = CoWrite(connection, std::string(8, 'y'),
-                                   bbt::coroutine::WaitOptions{}, outcome, operation);
-        if (error == make_error_code(NetErrc::Closed) && outcome.phase == WritePhase::Rejected) {
+        CoTcpConnection co_conn{connection};
+        const auto report = co_conn.Write(std::string(8, 'y'),
+                                          bbt::coroutine::WaitOptions{});
+        if (report.wait_error == make_error_code(NetErrc::Closed)
+            && report.outcome.phase == WritePhase::Rejected) {
             write_result.store(0);
         }
     });
@@ -717,8 +721,11 @@ static void CoReadTimeout() {
     std::atomic<int> result{-1};
     auto out = std::make_shared<std::string>();
     auto task = Task([&] {
-        const auto error = CoRead(connection, *out, Until(30ms));
-        if (error == std::make_error_code(std::errc::timed_out) && out->empty()) {
+        CoTcpConnection co_conn{connection};
+        const auto read = co_conn.Read(Until(30ms));
+        if (read.state == ReadState::Error
+            && read.error == std::make_error_code(std::errc::timed_out)
+            && read.data.Empty() && out->empty()) {
             result.store(0);
         }
     });

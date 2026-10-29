@@ -85,6 +85,11 @@ public:
     bool OwnerReleased() const noexcept {
         return m_owner_released->released.load(std::memory_order_acquire);
     }
+    // 本连接回收责任的共享记录：ReclaimReceipt 凭它观察同一真源
+    // （Released() 与 Connection::Released() 同终态）。
+    const std::shared_ptr<ReclaimRecord>& OwnerReleasedRecord() const noexcept {
+        return m_owner_released;
+    }
     // 仅 owner/控制域在 fd 真实关闭且本连接责任清理后调用；幂等。
     void MarkOwnerReleased() noexcept {
         m_owner_released->released.store(true, std::memory_order_release);
@@ -319,22 +324,30 @@ public:
                 m_close_reason = reason;
             }
             m_close_requested = true;
+            // 未发完写必须以 Done+非空错误结算：默认空 reason 只描述关闭
+            // 意图，不能让未完整发送的写冒充本地成功（已完成写早已带着
+            // 空错误进 m_pending_terminal，不受此影响）。
+            const std::error_code settle =
+                reason ? reason : std::make_error_code(std::errc::operation_canceled);
+            bool settled_any = false;
             while (!m_ops.empty()) {
                 auto& op = m_ops.front();
                 {
                     std::lock_guard<std::mutex> record_lock(op->mutex);
                     op->terminal = true;
-                    op->error = reason;
+                    op->error = settle;
                 }
-                m_pending_terminal.push_back(CompletedWrite{op->id, op->sent, reason});
+                m_pending_terminal.push_back(CompletedWrite{op->id, op->sent, settle});
                 m_ops.pop_front();
+                settled_any = true;
             }
             // 所有已接纳责任结算后才发布 Closed；若中途异常可重入继续。
             m_acceptance = AcceptanceState::Closed;
             if (m_queue.TotalBytes() != 0) {
                 m_queue.ConsumeSent(m_queue.TotalBytes());
             }
-            m_last_error = reason;
+            // 有未发完写被结算时 m_last_error 与其同口径（无 op 则保持原 reason）。
+            m_last_error = settled_any ? settle : reason;
             notify = true;
             publish_read_closed = !m_read_closed_published;
         }
@@ -375,16 +388,48 @@ public:
         return m_write_hub.Create();
     }
     bool AddWriteWaiter(const std::shared_ptr<bbt::coroutine::sync::CoWaiter>& waiter) {
-        return m_write_hub.Add(waiter);
+        const bool added = m_write_hub.Add(waiter);
+        if (added) {
+            if (auto& hook = WriteAddHookForTest()) {
+                hook();
+            }
+        }
+        return added;
     }
     std::shared_ptr<bbt::coroutine::sync::CoWaiter> RegisterWriteWaiter() {
         return m_write_hub.Register();
+    }
+    // close hub 的等待订阅必须走 Create/Add 两段：Add 放进
+    // WaitWithCallback 的 on_registered（此时 runtime 已登记事件），
+    // 不能直接拿 RegisterCloseWaiter 在登记前注册——否则早到
+    // MarkClosed 的 NotifyAll 落在未登记事件上丢失（与 ring/write hub
+    // 同一模式）。
+    std::shared_ptr<bbt::coroutine::sync::CoWaiter> CreateCloseWaiter() {
+        return m_close_hub.Create();
+    }
+    bool AddCloseWaiter(const std::shared_ptr<bbt::coroutine::sync::CoWaiter>& waiter) {
+        const bool added = m_close_hub.Add(waiter);
+        if (added) {
+            if (auto& hook = CloseAddHookForTest()) {
+                hook();
+            }
+        }
+        return added;
     }
     std::shared_ptr<bbt::coroutine::sync::CoWaiter> RegisterCloseWaiter() {
         return m_close_hub.Register();
     }
     std::shared_ptr<bbt::coroutine::sync::CoWaiter> RegisterReadWaiter() {
         return ring.RegisterWaiter();
+    }
+    // 测试接缝：对应 hub Add 成功后调用（在 on_registered 内、等待者
+    // 已随 runtime 登记），用于确定性制造「等待已挂起后再触发事件」的
+    // 屏障，替代 sleep（正常为空）。与 ReceiveRing 的 AfterAddHook 同模式。
+    static void SetWriteAddHookForTest(std::function<void()> hook) {
+        WriteAddHookForTest() = std::move(hook);
+    }
+    static void SetCloseAddHookForTest(std::function<void()> hook) {
+        CloseAddHookForTest() = std::move(hook);
     }
     void WakeOwner() {
         if (owner_dirty) {
@@ -393,6 +438,15 @@ public:
     }
 
 private:
+    static std::function<void()>& WriteAddHookForTest() {
+        static std::function<void()> hook;
+        return hook;
+    }
+    static std::function<void()>& CloseAddHookForTest() {
+        static std::function<void()> hook;
+        return hook;
+    }
+
     std::size_t PendingCountLocked() const noexcept {
         return m_pending_terminal.size();
     }

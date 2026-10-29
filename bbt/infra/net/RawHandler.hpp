@@ -48,7 +48,11 @@ public:
         (void)result;
     }
 
-    // 物理 fd 关闭后通知；同连接最多一次。
+    // 物理 fd 已关闭后由 owner 通知；同连接最多一次。reason 是 owner 发布
+    // 的关闭原因。本回调只证明 fd 已关——不等于本连接全部责任已清：raw
+    // 回调/Co 等待者可能仍在进行；物理出账事实以 Connection::Released()
+    // （或带句柄 CoDial 的 ReclaimReceipt::Released()）为准，不得在本回调
+    // 内把它当成已真。driver Failed 路径冻结收口，不伪调本回调。
     virtual void OnClose(Connection connection, std::error_code reason) {
         (void)connection;
         (void)reason;

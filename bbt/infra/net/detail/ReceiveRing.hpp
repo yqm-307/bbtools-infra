@@ -33,9 +33,11 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 #include <bbt/coroutine/sync/CoWaiter.hpp>
 
+#include <bbt/infra/net/Buffer.hpp>
 #include <bbt/infra/net/Error.hpp>
 #include <bbt/infra/net/Types.hpp>
 #include <bbt/infra/net/detail/EventRingBuffer.hpp>
@@ -104,6 +106,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(m_detached_mutex);
             try {
+                EnsureTransferableStorage(m_detached, data.size());
                 m_detached.append(data.data(), data.size());
             } catch (...) {
                 return false;  // 调用者保留 m_recv_hold 责任
@@ -141,6 +144,9 @@ public:
     }
 
     // owner：追加已读字节；Busy 时调用者应改走 AppendDeferred（不丢字节）。
+    // 分配失败（grant→pop→append 交错下需要重新 grow backing）折成
+    // Error+not_enough_memory 返回，不向 owner 抛异常——异常会绕过
+    // SubmitReceivedOwner 的 m_recv_hold 登记分支导致已 recv 字节丢失。
     ReadResult TryAppend(std::string_view data) {
         if (data.empty()) {
             return {ReadStatus::Ok, 0, {}};
@@ -149,7 +155,12 @@ public:
         if (!lock.owns_lock()) {
             return {ReadStatus::Busy, 0, {}};
         }
-        const auto error = m_ring.Append(data);
+        std::error_code error;
+        try {
+            error = m_ring.Append(data);
+        } catch (...) {
+            error = std::make_error_code(std::errc::not_enough_memory);
+        }
         if (!error) {
             m_size.store(m_ring.Size() + m_pending.size(), std::memory_order_release);
         }
@@ -176,6 +187,7 @@ public:
             return false;  // Busy：字节仍由 owner 持有，绝不覆盖/丢弃
         }
         try {
+            EnsureTransferableStorage(m_pending, data.size());
             m_pending.append(data.data(), data.size());
         } catch (...) {
             return false;  // 真实分配失败：同样保留 owner hold
@@ -236,6 +248,69 @@ public:
         NotifyRelease();
         if (result.status == ReadStatus::Ok) {
             NotifyDataChanged();
+        } else {
+            WakeOwnerOnly();
+        }
+        return result;
+    }
+
+    // ---- pop-all 移交（ICoConnection::Read 的唯一取数路径）----
+    // 一次移交取走的全部已发布字节：ring 整段存储（含绕环两段）+ deferred
+    // pending + 关闭前 detached 尾部。segments 按 FIFO 顺序给出 Buffer-ready
+    // 段视图，全部指向本对象内 ring/pending/detached 持有的存储——共享一个
+    // backing，由外层 Buffer 持有本对象保活。本类型是 detail 私有，布局不进
+    // 公共面。segments 在 pop 事务内一次 reserve 完成，Read 侧不再需要
+    // post-pop 分配（P1-1：段元数据分配必须先于 pop 首个变更步骤）。
+    struct PopAllTakeout {
+        std::shared_ptr<const boost::circular_buffer<char>> ring;  // 空 ring 时为 nullptr
+        std::string pending;
+        std::string detached;
+        std::vector<BufferSegment> segments;
+    };
+    struct PopAllResult {
+        ReadStatus status{ReadStatus::WouldBlock};
+        std::error_code error;
+        std::shared_ptr<PopAllTakeout> takeout;  // status==Ok 时非空
+    };
+
+    // 原子取走线性化点上全部已发布可读字节（ring+pending+detached）并移交
+    // backing：不复制载荷（ring 存储整体 move，pending/detached string 移动）。
+    // 成功瞬间 Size/额度立即归零释放，不等 takeout 析构；Buffer 持有的数据
+    // 不再计入 max_inbound_bytes。
+    //   - Busy：保护竞争，零消费，重试语义与 TryRead 相同。
+    //   - 空且无终态 WouldBlock；Eof/Error 终态按既有优先级（尾先交尽才终态）。
+    //   - Error+not_enough_memory：准备分配失败，ring/pending/detached 与
+    //     额度全部不变（所有可失败步骤先于首个变更步骤）。
+    PopAllResult TryPopAll() {
+        RetryPendingNotification();
+        std::unique_lock<std::mutex> lock(m_mutex, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            RequestRawRetry();  // 与 TryRead 同责：保护释放后补投 OnRead
+            return {ReadStatus::Busy, {}, {}};
+        }
+        // 不做 FlushPendingLocked：pending/detached 以自有 backing 一并移交；
+        // FIFO 不变量——pending 非空时 owner 已停 recv，ring 内必然更旧；
+        // detached 是关闭前 hold 尾部，最新。
+        PopAllResult result;
+        const std::size_t total = m_ring.Size() + m_pending.size()
+            + m_detached_size.load(std::memory_order_acquire);
+        if (total == 0) {
+            const ReadResult terminal = TerminalLocked();
+            result.status = terminal.status;
+            result.error = terminal.error;
+        } else {
+            try {
+                result.takeout = BuildTakeoutLocked(total);
+                result.status = ReadStatus::Ok;
+            } catch (...) {
+                result.status = ReadStatus::Error;
+                result.error = std::make_error_code(std::errc::not_enough_memory);
+            }
+        }
+        lock.unlock();
+        NotifyRelease();
+        if (result.status == ReadStatus::Ok) {
+            NotifyDataChanged();  // 容量释放 + 新真源形态：owner 与 data 等待者都醒
         } else {
             WakeOwnerOnly();
         }
@@ -429,6 +504,71 @@ private:
             consumed = available;
         }
         return error;
+    }
+
+    // 让 pending/detached 持有可整体转移的堆 backing：SSO 内联缓冲跟随
+    // string 对象本身，move 只能逐字节复制、段指针仍指向旧对象——移交契约
+    // 「不复制载荷」只对独立堆存储成立。data() 落在对象区间内即内联缓冲，
+    // 与具体 STL 的 SSO 容量无关；唯一处理是提前 reserve 出堆块。
+    static void EnsureTransferableStorage(std::string& storage, std::size_t need) {
+        const auto* obj = reinterpret_cast<const unsigned char*>(&storage);
+        auto is_inline = [obj](const std::string& s) {
+            const auto* p = reinterpret_cast<const unsigned char*>(s.data());
+            return p >= obj && p < obj + sizeof(s);
+        };
+        // 先按 need 预备容量（短串的常见路径只需要一次 reserve）；之后按
+        // 「data() 是否仍在对象内」判定内联缓冲，与实现无关地收敛到堆——
+        // 每次失败只把容量抬高越过当前上限，若干步内必出 SSO。
+        storage.reserve(need);
+        while (is_inline(storage)) {
+            storage.reserve(storage.capacity() + 1);
+        }
+    }
+
+    // 调用者持数据锁。可失败步骤全部先于首个变更步骤：
+    //   1) make_shared<PopAllTakeout> 分配；2) segments.reserve；3) TakeStorage
+    //      分配（其内部 move 不抛；失败时 m_ring 不变）。
+    // 之后的 string 移动、计数归零、指针登记都不抛——移交要么整单成功，
+    // 要么零副作用失败。失败时 m_ring/m_pending/m_detached/额度保持调用前。
+    std::shared_ptr<PopAllTakeout> BuildTakeoutLocked(std::size_t total) {
+        auto takeout = std::make_shared<PopAllTakeout>();
+        // 固定 4（ring 两段 + pending + detached）：reserve 之后所有 push_back
+        // 都不抛——必须在首个变更步骤（TakeStorage）之前完成全部可能分配。
+        takeout->segments.reserve(4);
+        // ring 存储整体移交（空 ring 时 TakeStorage 也合法，但跳过可省一次分配）。
+        if (m_ring.Size() != 0) {
+            takeout->ring = m_ring.TakeStorage();  // 此后无更多可失败步骤
+            const auto one = takeout->ring->array_one();
+            const auto two = takeout->ring->array_two();
+            if (one.second != 0) {
+                takeout->segments.push_back({one.first, one.second});
+            }
+            if (two.second != 0) {
+                takeout->segments.push_back({two.first, two.second});
+            }
+        }
+        if (!m_pending.empty()) {
+            takeout->pending = std::move(m_pending);  // 堆存储零拷贝；SSO 内联移动
+            takeout->segments.push_back({takeout->pending.data(), takeout->pending.size()});
+            // deferred 追加的预分配契约在移交后延续：尽力回留容量，失败只丢
+            // 快路径（AppendDeferred 自带 not_enough_memory → owner hold 重试）。
+            try {
+                m_pending.reserve(takeout->pending.capacity());
+            } catch (...) {}
+        }
+        {
+            std::lock_guard<std::mutex> detached_lock(m_detached_mutex);
+            if (!m_detached.empty()) {
+                takeout->detached = std::move(m_detached);
+                takeout->segments.push_back(
+                    {takeout->detached.data(), takeout->detached.size()});
+                m_detached_size.store(0, std::memory_order_release);
+            }
+        }
+        m_pending_size.store(0, std::memory_order_release);
+        m_size.store(0, std::memory_order_release);  // 额度立即释放
+        (void)total;  // 校验用：segments 总长应等于 total（debug 断言留给测试核）
+        return takeout;
     }
 
     // 调用者持数据锁：把 pending 合入 ring（已收字节，不丢）；成功 clear 但

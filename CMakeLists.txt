@@ -11,194 +11,62 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# 在任何旧目标/可选包发现之前分流；残留 prefix 不得重新启用上层模块。
+# --- 公共依赖段（一次定义）----------------------------------------------------
+# 新模块开关不再是互斥分流：公共依赖（bbt_infra_common / bbt_infra_internal_debug /
+# coroutine 源码接入 + pin / AsyncMisuse / Threads）在 cmake/Common.cmake 统一定义，
+# 普通模式与 NETWORK_ONLY 共用同一套 target 与同一棵 pin 过的 coroutine 树。
+# 新协议模块公开头仍引用旧公开头树的 NetworkTypes/Result 等值层类型，common
+# 属于公共面而非旧栈——因此「新 HTTP + common + config」可在同一
+# add_subdirectory 消费里链接，不再被开关互斥断开。
 option(BBT_INFRA_NETWORK_ONLY "只构建新 gnet 网络基础及其实际依赖闭包" OFF)
 option(BBT_INFRA_REDIS_NET "构建基于新 net 的 Redis 窄适配及其依赖闭包" OFF)
 option(BBT_INFRA_HTTP_NET "构建基于新 net 的 HTTP 客户端窄适配及其依赖闭包" OFF)
 option(BBT_INFRA_RPC_NET "构建消费新 HTTP 的 RPC core（wire + Client/Server）及其依赖闭包" OFF)
-if(BBT_INFRA_NETWORK_ONLY OR BBT_INFRA_REDIS_NET OR BBT_INFRA_HTTP_NET OR BBT_INFRA_RPC_NET)
+
+# 旧栈/普通模式选择开关（P1-6）：声明并真实消费。OFF 的模块不接入 src/ 对应
+# 切片；默认 ON 保持既有「普通模式全量」语义。
+#
+# NETWORK_ONLY 冲突判定（P1-6）：先判「显式 -D 传入」再声明 option——
+# option() 之后开关一定已在 cache，「用户 -D=ON」与「option 默认 ON」在
+# 取值上不可区分。判据：cache 条目的 HELPSTRING 不等于本 option 的文档串
+# 即为外部显式设置（-D 不给条目写文档串；option() 会写入下方一致的串）。
+set(_bbt_doc_net          "构建新 gnet 网络基础（普通模式与 NETWORK_ONLY 共用真源）")
+set(_bbt_doc_config       "构建 config 动态配置模块（src/config）")
+set(_bbt_doc_mongo        "构建 Mongo 模块（需 BBT_MONGOCXX_PREFIX/BBT_MONGOC_PREFIX）")
+set(_bbt_doc_legacy       "构建旧 HTTP/TCP/UDP/transport 栈（src/{http,tcp,udp,transport}）")
+if(BBT_INFRA_NETWORK_ONLY)
+    # BBT_INFRA_NET 不是冲突项：network-only 闭包本身就构建 net——
+    # 它属于「开启的正是本闭包内容」而非旧栈选择。
+    foreach(_pair IN ITEMS "BBT_INFRA_CONFIG|${_bbt_doc_config}"
+                           "BBT_INFRA_MONGO|${_bbt_doc_mongo}"
+                           "BBT_INFRA_LEGACY_STACK|${_bbt_doc_legacy}")
+        string(REGEX MATCH "^[^|]+" _conflicting "${_pair}")
+        string(REGEX MATCH "[^|]+$" _doc "${_pair}")
+        if(DEFINED CACHE{${_conflicting}} AND ${_conflicting})
+            get_property(_help CACHE ${_conflicting} PROPERTY HELPSTRING)
+            if(NOT _help STREQUAL _doc)
+                message(FATAL_ERROR
+                    "BBT_INFRA_NETWORK_ONLY=ON 与 ${_conflicting}=ON 冲突："
+                    "network-only 闭包不接入旧栈/旧模块。请显式 "
+                    "-D${_conflicting}=OFF 或移除该开关。")
+            endif()
+        endif()
+    endforeach()
+endif()
+
+option(BBT_INFRA_NET "${_bbt_doc_net}" ON)
+option(BBT_INFRA_CONFIG "${_bbt_doc_config}" ON)
+option(BBT_INFRA_MONGO "${_bbt_doc_mongo}" ON)
+option(BBT_INFRA_LEGACY_STACK "${_bbt_doc_legacy}" ON)
+
+include(cmake/Common.cmake)
+
+# NETWORK_ONLY=ON 走严格闭包：net + 显式打开的新协议模块，不接入旧 src/ 栈、
+# 不探测旧模块前缀（BBT_INFRA_REDIS_NET 等是「额外接入新协议」而非旧 Redis）。OFF
+# 时继续普通模式：旧栈全量 + 新协议开关按需叠加（各 *_NET 开关语义不变）。
+if(BBT_INFRA_NETWORK_ONLY)
     include(cmake/NetworkOnly.cmake)
     return()
-endif()
-
-# --- 内部 debug 观测层开关（PR #70 review 整改）--------------------------------
-# 与 bbtools-coroutine 的 STRINGENT_DEBUG（其 add_definitions）对齐，但修正两处
-# review 指出的边界：
-#   1) 配置边界：宏只在 **Debug 配置** 生效。用生成器表达式 $<CONFIG:Debug> 固化，
-#      单/多配置生成器一致；Release（及任何非 Debug 配置）结构上不可能带上该宏
-#      ⇒ 结构上零开销，不依赖使用者记得关 option，也不会「只开 option 就让 Release
-#      带宏还宣称零开销」。option 只作为 Debug 下的显式开关。
-#   2) 传播机制：用目标级 INTERFACE compile definition（经 bbt::infra_internal_debug
-#      这一 INTERFACE 库）随链接接口传播，而不是目录级 add_compile_definitions
-#      （后者是目录属性，不随 target/链接接口传播，无法保证外部 add_subdirectory
-#      父级或链接消费者与库 TU 的宏取值一致 ⇒ 潜在 ODR/ABI 混配）。只有真正链接
-#      该 INTERFACE 的三个模块库及其内部测试消费者拿到宏，不污染无关 target。
-option(BBT_INFRA_STRINGENT_DEBUG
-    "启用 bbtools-infra 内部 debug 观测层（仅 Debug 配置定义宏）" OFF)
-add_library(bbt_infra_internal_debug INTERFACE)
-add_library(bbt::infra_internal_debug ALIAS bbt_infra_internal_debug)
-if(BBT_INFRA_STRINGENT_DEBUG)
-    target_compile_definitions(bbt_infra_internal_debug INTERFACE
-        $<$<CONFIG:Debug>:BBT_INFRA_STRINGENT_DEBUG>)
-    message(STATUS
-        "bbtools-infra: 内部 debug 观测层已启用（仅 Debug 配置定义 "
-        "BBT_INFRA_STRINGENT_DEBUG）")
-else()
-    message(STATUS "bbtools-infra: 内部 debug 观测层已关闭（BBT_INFRA_STRINGENT_DEBUG=OFF）")
-endif()
-
-# 公共契约头库：header-only，向外暴露 include/
-add_library(bbt_infra_common INTERFACE)
-add_library(bbt::infra_common ALIAS bbt_infra_common)
-target_include_directories(bbt_infra_common INTERFACE
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>)
-target_compile_features(bbt_infra_common INTERFACE cxx_std_17)
-
-# --- 上游源码依赖接入：bbtools-coroutine / bbtools-core -----------------------
-# 两个上游仓当前都不导出可消费的 CMake 包（core 没有 install/export 规则），源码
-# 消费只能经显式路径 add_subdirectory 接入，不能依赖机器上的隐式安装产物。正式接入
-# 待上游提供固定 SHA 的消费方式后收敛。禁止把本机私有绝对路径写进默认值或提交内容。
-set(BBT_COROUTINE_SOURCE_DIR "" CACHE PATH
-    "本机/候选分支开发用：bbtools-coroutine 源码树路径（含顶层 CMakeLists.txt 与 bbt/）")
-set(BBT_CORE_SOURCE_DIR "" CACHE PATH
-    "源码消费用：bbtools-core 源码树路径（含顶层 CMakeLists.txt 与 bbt/core/）")
-
-# 以源码方式接入一个未导出包的上游。上游用目录级 include_directories（不导出 use
-# requirements）、cmake_minimum_required(<3.5)、且默认会把自己的单测/示例注册进来；
-# 这里统一收敛：临时遮蔽上游开关、临时给出 CMAKE_POLICY_VERSION_MINIMUM，并把上游
-# 源码根补成目标级接口，使消费经正式 target 传播而不是全局编译/链接 flags。
-function(bbt_add_source_dependency _target _src_dir _bin_subdir)
-    if(NOT EXISTS "${_src_dir}/CMakeLists.txt")
-        message(FATAL_ERROR
-            "源码依赖 '${_src_dir}' 无效：未找到顶层 CMakeLists.txt")
-    endif()
-
-    # ARGN 是上游默认 ON 的开关（NEED_TEST/ENABLE_EXAMPLE 等）：不遮蔽就会把上游
-    # 单测/示例注册进本仓 ctest（其可执行目标并不在本构建内编译）。上游
-    # cmake_minimum_required(3.1/3.2) 使其作用域内 CMP0077=OLD：option() 不看普通
-    # 变量，必须临时改 CACHE 再还原；还原必须基于 CACHE 原值——调用方（例如
-    # bbt-framework）可能用 -DNEED_TEST=ON 传入 CACHE，若读作用域内变量，会把调用
-    # 方的开关静默改成 OFF。
-    set(_shadowed "")
-    set(_saved_names "")
-    set(_saved_values "")
-    foreach(_opt IN LISTS ARGN)
-        if(DEFINED CACHE{${_opt}})
-            list(APPEND _saved_names "${_opt}")
-            list(APPEND _saved_values "$CACHE{${_opt}}")
-        endif()
-        list(APPEND _shadowed "${_opt}")
-        set(${_opt} OFF CACHE BOOL "temporarily shadowed for source dependency" FORCE)
-    endforeach()
-
-    # 上游 cmake_minimum_required(3.1/3.2)：CMake ≥4 已移除对 <3.5 的兼容，configure
-    # 直接报错。按 CMake 官方提示只在依赖作用域内临时给出 CMAKE_POLICY_VERSION_MINIMUM
-    # （函数作用域，返回即自动还原；3.5 远小于 CMP0077 的 3.13，上游 option() 的 OLD
-    # 语义不变，上面的遮蔽仍然必要）。
-    set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
-    add_subdirectory("${_src_dir}"
-                     "${CMAKE_BINARY_DIR}/_deps/${_bin_subdir}"
-                     EXCLUDE_FROM_ALL)
-
-    # 上游目录级 include_directories 不导出头路径：把上游源码根补成目标级接口，
-    # 链接该 target 的消费者经 use requirements 拿到头，而不是靠全局 -I。
-    # SYSTEM 使上游头告警不计入本仓告警面；BUILD_INTERFACE 使其不进安装接口。
-    target_include_directories(${_target} SYSTEM INTERFACE
-        "$<BUILD_INTERFACE:${_src_dir}>")
-
-    foreach(_opt IN LISTS _shadowed)
-        list(FIND _saved_names "${_opt}" _saved_index)
-        if(_saved_index GREATER -1)
-            list(GET _saved_values ${_saved_index} _saved_value)
-            set(${_opt} "${_saved_value}" CACHE BOOL
-                "上游 option 语义；对本仓无作用" FORCE)
-        else()
-            unset(${_opt} CACHE)
-        endif()
-    endforeach()
-endfunction()
-
-# T1 pin：固定 commit 由 cmake/coroutine.sha 唯一提供（include 时读取并校验
-# 40hex 格式）；git-only 核验对普通/回退两条路径都可见（pin 值在回退分支
-# 只用于「无法核验」的如实警告文案，不静默声明锁版）。
-include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/CoroutinePin.cmake")
-if(BBT_COROUTINE_SOURCE_DIR)
-    if(NOT EXISTS "${BBT_COROUTINE_SOURCE_DIR}/CMakeLists.txt")
-        message(FATAL_ERROR
-            "BBT_COROUTINE_SOURCE_DIR='${BBT_COROUTINE_SOURCE_DIR}' 无效："
-            "未找到顶层 CMakeLists.txt")
-    endif()
-    get_filename_component(_bbt_co_expected "${BBT_COROUTINE_SOURCE_DIR}" REALPATH)
-
-    # 复用分支：pin 声明目录之前先核已建 target 的真实 SOURCE_DIR——声明
-    # 目录核验过了不代表实际链接的是同一棵树（与 NetworkOnly.cmake 同函数）。
-    bbt_coroutine_verify_existing_target("${_bbt_co_expected}")
-
-    # 源码消费的声明目录（复用分支已证明 == 实际来源）必须先命中固定 commit
-    # （git HEAD+tracked/staged 干净+消费面无 untracked 源码），再做接入。
-    bbt_coroutine_pin_verify("${_bbt_co_expected}")
-    unset(_bbt_co_expected)
-
-    # core 必须在 coroutine 之前接入：coroutine 顶层直接
-    # target_link_libraries(bbt_coroutine ... bbt_core)，此刻 bbt_core 若还不是
-    # target，CMake 只会记下裸库名 -lbbt_core（隐式依赖机器上的安装产物），之后再
-    # 定义同名 target 也不会把它升级成正式依赖。
-    if(NOT BBT_CORE_SOURCE_DIR)
-        # 未显式给出时按「多仓并排检出」布局在上游/本仓同级目录探测，且必须同时
-        # 具备顶层 CMakeLists.txt 与 bbt/core/，避免绑定到同名空目录或错误源码树。
-        foreach(_anchor "${BBT_COROUTINE_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}")
-            get_filename_component(_sibling "${_anchor}/../bbtools-core" ABSOLUTE)
-            if(EXISTS "${_sibling}/CMakeLists.txt" AND IS_DIRECTORY "${_sibling}/bbt/core")
-                set(BBT_CORE_SOURCE_DIR "${_sibling}")
-                break()
-            endif()
-        endforeach()
-    endif()
-    if(BBT_CORE_SOURCE_DIR AND NOT TARGET bbt_core)
-        bbt_add_source_dependency(bbt_core "${BBT_CORE_SOURCE_DIR}" bbtools-core
-            NEED_TEST ENABLE_EXAMPLE)
-        message(STATUS
-            "bbtools-infra: bbtools-core 源码接入 '${BBT_CORE_SOURCE_DIR}'")
-    endif()
-
-    if(NOT TARGET bbt_coroutine)
-        bbt_add_source_dependency(bbt_coroutine "${BBT_COROUTINE_SOURCE_DIR}"
-            bbtools-coroutine NEED_TEST)
-    endif()
-    target_link_libraries(bbt_infra_common INTERFACE bbt_coroutine)
-
-    # 契约校验：coroutine 仍按核心库名消费 core（拆分前形态）时，本构建必须已有
-    # 真实 bbt_core target，否则链接期会退化成机器上的隐式 -lbbt_core 与隐式
-    # /usr/local 头文件——本仓不做静默兜底。coroutine 拆分自闭环后不再引用
-    # bbt_core，此处自动放行。
-    if(NOT TARGET bbt_core)
-        file(READ "${BBT_COROUTINE_SOURCE_DIR}/CMakeLists.txt" _bbt_co_cmake)
-        if(_bbt_co_cmake MATCHES "(^|[^_A-Za-z0-9])bbt_core([^_A-Za-z0-9]|$)")
-            message(FATAL_ERROR
-                "bbtools-coroutine('${BBT_COROUTINE_SOURCE_DIR}') 依赖 bbtools-core，"
-                "但本构建未提供 bbt_core target。bbtools-core 当前没有 install/export "
-                "规则，不能经 find_package 获得；请显式传 "
-                "-DBBT_CORE_SOURCE_DIR=<bbtools-core 源码树路径>。")
-        endif()
-    endif()
-else()
-    # 回退：查找已安装的 bbt_coroutine 包（导出 bbt_coroutine 目标）。
-    # T1 pin 边界：已安装包不含可核验源码 SHA——本路径无法证明消费的是
-    # 固定 commit，故不冒充「已锁版」；优化闭环的正式证据只认
-    # BBT_COROUTINE_SOURCE_DIR 源码消费（其 pin 核验见上方 include）。
-    find_package(bbt_coroutine CONFIG QUIET)
-    if(NOT TARGET bbt_coroutine)
-        message(FATAL_ERROR
-            "未找到 bbt_coroutine。本机/候选分支开发请显式传 "
-            "-DBBT_COROUTINE_SOURCE_DIR=<bbtools-coroutine 源码树路径>；"
-            "已安装包需提供 bbt_coroutineConfig.cmake 并导出 bbt_coroutine 目标。")
-    endif()
-    message(FATAL_ERROR
-        "[bbt-infra-pin] 已安装 bbt_coroutine 包不经源码 SHA 核验："
-        "无法证明消费固定 ${BBT_COROUTINE_PINNED_SHA}。"
-        "锁版证据/正式消费请用 -DBBT_COROUTINE_SOURCE_DIR 源码接入。")
-    target_link_libraries(bbt_infra_common INTERFACE bbt_coroutine)
 endif()
 
 # --- hiredis 依赖接入（Issue #6，Redis 模块）---------------------------------
@@ -235,7 +103,7 @@ if(BBT_MONGOCXX_PREFIX OR BBT_MONGOC_PREFIX)
             "只给一个会导致 find_dependency 回落系统路径。")
     endif()
 endif()
-if(BBT_MONGOCXX_PREFIX)
+if(BBT_INFRA_MONGO AND BBT_MONGOCXX_PREFIX)
     if(BBT_MONGOC_PREFIX)
         # file(GLOB) 返回列表：多命中时 IS_DIRECTORY 对整条列表为假，旧写法
         # 会把「命中多个版本目录」误报成「未找到」。这里按命中数区分：0 命中
@@ -294,8 +162,27 @@ if(BBT_MONGOCXX_PREFIX)
         PATHS "${BBT_MONGOCXX_PREFIX}" NO_DEFAULT_PATH)
 endif()
 
-include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/AsyncMisuseErrors.cmake")
 add_subdirectory(src)
+
+# 新协议模块按开关叠加接入：BBT_INFRA_*_NET 不再触发互斥分流，普通模式下与
+# 旧栈/common/config 同图共存（各模块 cmake/*.cmake 只做模块接入与其私有
+# 前缀门禁，不重复公共依赖）。模块目录经 PROJECT_SOURCE_DIR 绝对路径接入。
+# BBT_INFRA_NET=ON 也要求 net 基础 target（P1-6：开关须真实消费）。
+# 先确定测试开关：模块内 tests/examples 子目录按 BUILD_TESTING 注册，
+# include(CTest) 必须先于模块接入（否则 BUILD_TESTING 未定义、测试被静默跳过）。
+include(CTest)
+if(BBT_INFRA_NET OR BBT_INFRA_REDIS_NET OR BBT_INFRA_HTTP_NET OR BBT_INFRA_RPC_NET)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/NetBase.cmake")
+endif()
+if(BBT_INFRA_REDIS_NET)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/RedisNet.cmake")
+endif()
+if(BBT_INFRA_HTTP_NET)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/HttpNet.cmake")
+endif()
+if(BBT_INFRA_RPC_NET)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/RpcNet.cmake")
+endif()
 
 # Issue #27：最小真实消费示例（examples/）；不影响库目标与测试注册。
 add_subdirectory(examples)
@@ -303,6 +190,7 @@ add_subdirectory(examples)
 # 每个公共头单独编译 TU，验证头文件自给
 set(BBT_INFRA_PUBLIC_HEADERS
     Result.hpp
+    NetError.hpp
     ICoObject.hpp
     ICoNetwork.hpp
     ICoCloseable.hpp
@@ -337,10 +225,13 @@ foreach(_hdr IN LISTS BBT_INFRA_PUBLIC_HEADERS)
 endforeach()
 add_library(bbt_infra_header_selfcheck STATIC ${_selfcheck_srcs})
 target_link_libraries(bbt_infra_header_selfcheck PRIVATE bbt::infra_common)
+# A5 接缝头 NetError.hpp 跨 include/ 值层与 bbt/infra/net/ 原始错误码：
+# 自检只补编译期可见性（项目根 include 路径），不引入链接依赖。
+target_include_directories(bbt_infra_header_selfcheck PRIVATE
+    "${PROJECT_SOURCE_DIR}")
 target_compile_options(bbt_infra_header_selfcheck PRIVATE -Wall -Wextra)
 set_target_properties(bbt_infra_header_selfcheck PROPERTIES LINKER_LANGUAGE CXX)
 
-include(CTest)
 if(BUILD_TESTING)
     add_subdirectory(tests)
 endif()

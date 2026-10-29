@@ -77,6 +77,25 @@ foreach(_case guard_lifetime co_context_gate options_contract write_output_reuse
         WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/runtime")
 endforeach()
 
+# A3/A4 成员化 ICoConnection 写/关闭观察：AsyncWrite 拒绝票、成员 Write
+# （等容量→接纳→等本地完成）、WriteOperation::Wait、WaitClosed close hub、
+# Status 投影、RequestClose 默认 reason 下未发完写非成功、facade 释放后 op
+# 可查、driver Failed 唤醒。所有等待挂起由 ConnectionState 的
+# Write/CloseAddHookForTest 屏障证明后才触发终态，不靠 sleep。
+add_executable(Test_net_ico_write_close ico_write_close.cc)
+target_link_libraries(Test_net_ico_write_close PRIVATE bbt::infra_net Boost::headers)
+target_compile_options(Test_net_ico_write_close PRIVATE -Wall -Wextra -Wpedantic)
+target_link_options(Test_net_ico_write_close PRIVATE -rdynamic)
+foreach(_case member_write_done async_write_reject_ticket
+        write_unsubmitted_timeout write_accepted_timeout write_accepted_cancel
+        op_wait_partial_error write_zero_len close_default_reason
+        facade_released_op_queryable waitclosed_driver_failed
+        waitclosed_late_no_miss status_projection)
+    add_test(NAME net.ico_${_case} COMMAND Test_net_ico_write_close ${_case})
+    set_tests_properties(net.ico_${_case} PROPERTIES TIMEOUT 60
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/runtime")
+endforeach()
+
 # D1 公共面正/负编译门禁：正向 TU 只用公共头；负向 TU 逐项证明被删除/收回的
 # 符号真实编译失败。不用 WILL_FAIL（会把任意失败翻成通过）。
 add_test(NAME net.freeze_public_surface COMMAND ${CMAKE_COMMAND}
@@ -176,6 +195,45 @@ foreach(_case pending_not_flushed_before_next_recv pending_without_next_recv_is_
               pending_pause_recovers_at_low_water)
     add_test(NAME net.${_case} COMMAND Test_net_append_busy_hook --run_test=net_append_busy_hook/${_case})
     set_tests_properties(net.${_case} PROPERTIES TIMEOUT 90)
+endforeach()
+
+# A2 pop-all 移交契约（Boost.Test + detail 接缝）：
+# TryPopAll 的绕环/pending/detached 分段移交、Busy 零消费、额度即时释放、
+# 分配失败不变、尾先交尽再 Eof，以及 CoTcpConnection::Read 的 gate/挂起/
+# 超时/EOF 路径。自定义 operator new 仅本目标 thread_local 注入分配失败。
+add_executable(Test_net_popall detail/pop_all.cc)
+target_link_libraries(Test_net_popall PRIVATE bbt::infra_net Boost::headers)
+target_include_directories(Test_net_popall PRIVATE ${PROJECT_SOURCE_DIR})
+target_compile_features(Test_net_popall PRIVATE cxx_std_17)
+target_compile_options(Test_net_popall PRIVATE -Wall -Wextra -Wpedantic)
+target_link_options(Test_net_popall PRIVATE -rdynamic)
+foreach(_case wrap_two_segments_one_backing pending_moves_as_own_segment
+              detached_tail_after_pending busy_contention_zero_consume
+              quota_releases_immediately alloc_failure_keeps_ring_and_quota
+              tail_delivered_before_eof no_pollute_after_pop
+              read_gate_rejects_non_coroutine read_waits_and_delivers_across_wakeup
+              read_timeout_does_not_consume read_buffer_identity_and_eof_drain
+              multi_reader_linearizes zero_payload_copy_probe)
+    add_test(NAME net.popall_${_case}
+        COMMAND Test_net_popall --run_test=net_popall/${_case})
+    set_tests_properties(net.popall_${_case} PROPERTIES TIMEOUT 45)
+endforeach()
+
+# infra-ico-conn 独立审查 6 个 confirmed defect 的修复后契约断言（原
+# 「缺陷存在」断言已翻转）：post-pop OOM 不丢字节、append OOM 不抛出、
+# SSO 移交不复制、拷贝删除、公共构造收回、CoAccept reclaim 同事实源。
+add_executable(Test_net_repro_buffer_oom detail/repro_buffer_oom.cc)
+target_link_libraries(Test_net_repro_buffer_oom PRIVATE bbt::infra_net Boost::headers)
+target_include_directories(Test_net_repro_buffer_oom PRIVATE ${PROJECT_SOURCE_DIR})
+target_compile_features(Test_net_repro_buffer_oom PRIVATE cxx_std_17)
+target_compile_options(Test_net_repro_buffer_oom PRIVATE -Wall -Wextra -Wpedantic)
+target_link_options(Test_net_repro_buffer_oom PRIVATE -rdynamic)
+foreach(_case d1_read_post_pop_oom_no_loss d2_grant_pop_append_oom_no_throw
+              d3_sso_payload_not_copied d4_copy_assign_deleted
+              d5_public_ctor_forge_denied d6_coaccept_reclaim_valid_ticket)
+    add_test(NAME net.repro_oom_${_case}
+        COMMAND Test_net_repro_buffer_oom --run_test=net_repro_buffer_oom/${_case})
+    set_tests_properties(net.repro_oom_${_case} PROPERTIES TIMEOUT 60)
 endforeach()
 
 # 仓外式最小消费：只依赖新 target，不包含旧 infra 头。

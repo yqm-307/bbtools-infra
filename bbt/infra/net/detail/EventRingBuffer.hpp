@@ -14,6 +14,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <memory>
 #include <boost/circular_buffer.hpp>
 #include <string>
 #include <string_view>
@@ -213,6 +214,19 @@ public:
             data.append(two.first, two.second);
         }
         return EventSnapshot(std::move(data));
+    }
+
+    // pop-all 移交：把当前 storage（含绕环两段）整体移入共享 backing，
+    // 不复制载荷；返回的 const 对象不可再修改，array_one()/array_two()
+    // 指针在其寿命内保持有效。成功后本对象回到空、容量 0，下一次
+    // Append/Reserve 按需重新增长——额度（Size 语义）在移交成功瞬间释放，
+    // 不等 backing 析构。
+    // 失败（make_shared 分配失败）时本对象内容完全不变；move 构造不抛。
+    std::shared_ptr<const boost::circular_buffer<char>> TakeStorage()
+    {
+        // boost::circular_buffer 的移动构造转移底层分配指针；移后 storage_
+        // Size/Capacity 为 0（与类头移动语义注释一致），可直接复用追加。
+        return std::make_shared<const boost::circular_buffer<char>>(std::move(storage_));
     }
 
     void Clear() noexcept { storage_.clear(); }
