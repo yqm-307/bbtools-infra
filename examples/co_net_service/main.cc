@@ -107,7 +107,7 @@ int main() {
         // 公开读取守卫：读空后立即再取一次保护应得到 WouldBlock（不是 Busy）；
         // 守卫持连接状态强引用，释放 connection 之后仍可安全 Size/析构。
         auto drained = connection.TryAccess();
-        if (!drained && drained.WouldBlock()) {
+        if (drained.WouldBlock() || drained.Eof()) {
             echo_drained.store(1);
         }
         conn.RequestClose();
