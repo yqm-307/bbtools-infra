@@ -2,13 +2,13 @@
 
 // HTTP/1.1 连接交换层（内部部件，仅 http 模块实现 TU 包含）：
 //   - 序列化/解析交给 Beast（request_serializer + response_parser 手工喂养）；
-//   - 网络 I/O 只经 bbt::infra::net 公开 Co 接口（CoWrite/CoRead），不触碰
-//     Asio socket/native fd/net detail；
+//   - 网络 I/O 只经 bbt::infra::net 协程成员接口（CoTcpConnection::Write/Read），
+//     不触碰 Asio socket/native fd/net detail；
 //   - 一条连接同一时刻只承载一个活动请求（Active 独占由池保证）；
-//   - 超时语义：write 档从实际写开始，read 档从每次 CoRead 开始起算；
+//   - 超时语义：write 档从实际写开始，read 档从每次 Read 开始起算；
 //     各自与不重置的调用总 deadline 取 min，池等待不消耗后续阶段档。
 //
-// 请求阶段事实（Result.hpp RequestPhase）：CoWrite 终态成功前失败=确定失败
+// 请求阶段事实（Result.hpp RequestPhase）：Write 终态成功前失败=确定失败
 // （Writing）；请求字节已完整写出后（Done 且无错误）的读侧失败按 OutcomeUnknown
 // 交付（请求可能已生效，回复丢失）。任何失败路径连接不可复用，由池退役。
 
@@ -22,7 +22,9 @@
 
 #include <bbt/coroutine/sync/CoWaiter.hpp>
 #include <bbt/infra/Result.hpp>
-#include <bbt/infra/net/CoConnection.hpp>
+#include <bbt/infra/net/CoTcpConnection.hpp>
+#include <bbt/infra/net/Connection.hpp>
+#include <bbt/infra/net/ICoConnection.hpp>
 
 #include <bbt/infra/http/Client.hpp>
 

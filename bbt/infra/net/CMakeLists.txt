@@ -1,6 +1,6 @@
 add_library(bbt_infra_net STATIC
     CoObject.cc Address.cc NativeSocket.cc LoadBalancing.cc
-    Connection.cc ReadAccess.cc CoConnection.cc
+    Connection.cc ReadAccess.cc CoConnection.cc CoTcpConnection.cc
     Engine.cc detail/ReactorDriver.cc detail/DriverBinder.cc detail/OptionsNormalize.cc
     detail/TestAccess.cc)
 add_library(bbt::infra_net ALIAS bbt_infra_net)
@@ -19,7 +19,9 @@ target_compile_options(bbt_infra_net PRIVATE -Wall -Wextra -Wpedantic)
 # net.udp_high_level_compile_reject 做正/负编译对照验证。
 set(_headers Annotations.hpp ICoObject.hpp CoObject.hpp Address.hpp NativeSocket.hpp
     Options.hpp LoadBalancing.hpp Types.hpp ReadAccess.hpp Connection.hpp RawHandler.hpp
-    Engine.hpp CoConnection.hpp Error.hpp)
+    Engine.hpp CoConnection.hpp Error.hpp
+    Buffer.hpp WriteOperation.hpp ConnectionResult.hpp ICoConnection.hpp
+    CoTcpConnection.hpp)
 set(_selfcheck_sources "")
 foreach(_header IN LISTS _headers)
     set(_source "${CMAKE_CURRENT_BINARY_DIR}/selfcheck/${_header}.cc")

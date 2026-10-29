@@ -1,75 +1,24 @@
-# network-only 不消费旧 common/transport，也不探测 bbtools-core。
-set(BBT_COROUTINE_SOURCE_DIR "" CACHE PATH "bbtools-coroutine 固定源码树")
-if(NOT EXISTS "${BBT_COROUTINE_SOURCE_DIR}/bbt/coroutine/coroutine.hpp")
-    message(FATAL_ERROR "network-only 需要显式 BBT_COROUTINE_SOURCE_DIR")
-endif()
-function(bbt_infra_add_net_coroutine)
-    # 遮蔽上游所有额外目标，再原样还原调用者 cache。
-    set(_options NEED_TEST NEED_EXAMPLE NEED_BENCHMARK NEED_DEBUG)
-    foreach(_option IN LISTS _options)
-        if(DEFINED CACHE{${_option}})
-            set(_had_${_option} TRUE)
-            set(_saved_${_option} "$CACHE{${_option}}")
-        endif()
-        set(${_option} OFF CACHE BOOL "network source dependency only" FORCE)
-    endforeach()
-    add_subdirectory("${BBT_COROUTINE_SOURCE_DIR}"
-        "${CMAKE_CURRENT_BINARY_DIR}/_deps/bbtools-coroutine" EXCLUDE_FROM_ALL)
-    foreach(_option IN LISTS _options)
-        if(_had_${_option})
-            set(${_option} "${_saved_${_option}}" CACHE BOOL "upstream option" FORCE)
-        else()
-            unset(${_option} CACHE)
-        endif()
-    endforeach()
-endfunction()
-get_filename_component(_net_co_expected "${BBT_COROUTINE_SOURCE_DIR}" REALPATH)
-include("${CMAKE_CURRENT_LIST_DIR}/CoroutinePin.cmake")
-set(_net_co_real bbt_coroutine)
-if(NOT TARGET bbt_coroutine)
-    # 新建分支：声明目录就是要消费的真实来源，先 pin 再 add_subdirectory。
-    bbt_coroutine_pin_verify("${_net_co_expected}")
-    bbt_infra_add_net_coroutine()
-else()
-    # L2：复用已有 target 必须核真实 SOURCE_DIR（解 alias、realpath 符号链接），
-    # 拒绝把不明/其他来源的 target 拼上本版本公共头（标记 [bbt-infra-net] 供
-    # net.consumer_source_dir_mismatch 断言，勿改文案）。
-    get_target_property(_net_co_alias bbt_coroutine ALIASED_TARGET)
-    if(_net_co_alias)
-        set(_net_co_real "${_net_co_alias}")
-    endif()
-    get_target_property(_net_co_source "${_net_co_real}" SOURCE_DIR)
-    if(NOT _net_co_source OR _net_co_source MATCHES "NOTFOUND$")
-        message(FATAL_ERROR "[bbt-infra-net] 已有 bbt_coroutine 没有真实 SOURCE_DIR（可能是 imported/同名 target）；拒绝不明来源")
-    endif()
-    get_filename_component(_net_co_actual "${_net_co_source}" REALPATH)
-    if(NOT _net_co_actual STREQUAL _net_co_expected)
-        message(FATAL_ERROR "[bbt-infra-net] 已有 bbt_coroutine 来源(${_net_co_actual})与固定 BBT_COROUTINE_SOURCE_DIR(${_net_co_expected})不一致")
-    endif()
-    # 复用分支：核完同源后对真实来源 pin（等价新建分支的声明目录核验）。
-    bbt_coroutine_pin_verify("${_net_co_actual}")
-endif()
-# L2：新建/复用两分支统一补 target 级公共头使用要求（幂等）。上游只有目录级
-# include，覆盖不到 coroutine-first 嵌入父级链接 bbt::infra_net 的消费目标。
-target_include_directories("${_net_co_real}" SYSTEM INTERFACE
-    "$<BUILD_INTERFACE:${BBT_COROUTINE_SOURCE_DIR}>")
-unset(_net_co_real)
-unset(_net_co_alias)
-unset(_net_co_source)
-unset(_net_co_actual)
-unset(_net_co_expected)
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    message(FATAL_ERROR "新 net socket 基础目前仅验证 Linux；不静默承诺其他平台")
-endif()
-include("${CMAKE_CURRENT_LIST_DIR}/AsyncMisuseErrors.cmake")
-find_package(Boost 1.90 REQUIRED)
-find_package(Threads REQUIRED)
-add_subdirectory(bbt/infra/net)
+# BBT_INFRA_NETWORK_ONLY=ON：严格的新 net + 显式声明的新协议闭包。
+# 与普通模式共用公共段（cmake/Common.cmake：common/internal_debug/coroutine
+# 源码接入/pin/AsyncMisuse/Threads 全部只定义一次）；本文件只负责 net 本体与
+# 逐协议开关的接入，不探测旧 src/ 栈、bbtools-core、hiredis/mongo/protobuf
+# （除非对应 *_NET 开关显式打开）。
+#
+# 目标图（按需闭包）：
+#   bbt::infra_net            始终
+#   bbt::infra_redis_net      BBT_INFRA_REDIS_NET（需 BBT_HIREDIS_PREFIX）
+#   bbt::infra_http_net       BBT_INFRA_HTTP_NET
+#   bbt::infra_rpc_net        BBT_INFRA_RPC_NET（需 BBT_INFRA_HTTP_NET +
+#                             BBT_PROTOBUF_PREFIX）
+
+include("${CMAKE_CURRENT_LIST_DIR}/NetBase.cmake")
 # 先确定测试开关：include(CTest) 定义 BUILD_TESTING。示例自身的 CTest 注册依赖它，
 # 只有这样才能做到「测试开关关闭时不注册、也不强启测试」。
 include(CTest)
 # P5 推荐协程网络示例：network-only 下唯一直达示例入口（examples/ 目录其余示例依赖旧模块）。
 add_subdirectory(examples/co_net_service)
+# ICoConnection 成员化收口消费示例（终评 §2 组合验收）：只依赖 bbt::infra_net。
+add_subdirectory(examples/ico_connection)
 if(BUILD_TESTING)
     add_subdirectory(tests/net)
 endif()

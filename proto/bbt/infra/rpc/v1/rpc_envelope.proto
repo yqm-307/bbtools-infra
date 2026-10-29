@@ -50,6 +50,19 @@ enum RpcErrorCode {
     RPC_ERROR_CODE_INTERNAL_ERROR   = 16;
 }
 
+// 出站请求阶段（decisions/0008 的 Error::request_phase 事实带过 wire）：
+// 与 include/bbt/infra/Result.hpp 的 RequestPhase 一一对应，序号固定，
+// 新增成员只能追加。UNSPECIFIED 保留为 0：不映射任何本地阶段（本地
+// NotStarted 是合法值 0 的 wire 形态），解码端视为非法值 → ProtocolError。
+enum RpcRequestPhase {
+    RPC_REQUEST_PHASE_UNSPECIFIED        = 0;  // 解码端视为 ProtocolError
+    RPC_REQUEST_PHASE_NOT_STARTED        = 1;
+    RPC_REQUEST_PHASE_CONNECTING         = 2;
+    RPC_REQUEST_PHASE_WRITING            = 3;
+    RPC_REQUEST_PHASE_REQUEST_COMMITTED  = 4;
+    RPC_REQUEST_PHASE_REPLY_TERMINAL     = 5;
+}
+
 message RpcError {
     RpcErrorCode code            = 1;
     string       domain          = 2;   // 默认 "infra"；上层域语义归上层
@@ -62,6 +75,10 @@ message RpcError {
     // 结构化详情：最多 16 项，键 ≤64 UTF-8 字节，值 ≤256 UTF-8 字节，
     // 不允许重复键。超出由发送端在编码前拒绝，接收端在解码后复检。
     repeated MetadataEntry details = 8;
+    // Error::request_phase 事实（decisions/0008）：optional 保留存在位——
+    // 缺字段解码为 nullopt（该错误不来自出站 operation），绝不补成
+    // NotStarted/未提交；UNSPECIFIED 与未识别枚举值按 ProtocolError 拒绝。
+    optional RpcRequestPhase request_phase = 9;
 }
 
 // ---------------------------------------------------------------------------

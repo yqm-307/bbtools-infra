@@ -86,6 +86,15 @@ function(bbt_coroutine_pin_verify _dir)
             "bbtools-coroutine 在 ${_expected} 的干净检出。")
     endif()
 
+    # stub 树（git archive 输出、无 .git）必须直接拒绝——rev-parse 会向上
+    # 发现父级 .git 误判为 git 检出。先核 .git 存在再跑 rev-parse。
+    if(NOT EXISTS "${_dir}/.git")
+        message(FATAL_ERROR
+            "[bbt-infra-pin] ${_dir} 不是可核验的 git 检出：无 .git。"
+            "请指向 bbtools-coroutine 在 ${_expected} 的 git 检出"
+            "（git clone + git checkout <sha>）。")
+    endif()
+
     execute_process(
         COMMAND "${GIT_EXECUTABLE}" -C "${_dir}" rev-parse HEAD
         RESULT_VARIABLE _rc OUTPUT_VARIABLE _head ERROR_VARIABLE _err
@@ -104,7 +113,8 @@ function(bbt_coroutine_pin_verify _dir)
     endif()
 
     execute_process(
-        COMMAND "${GIT_EXECUTABLE}" -C "${_dir}" diff --quiet HEAD --
+        COMMAND "${CMAKE_COMMAND}" -E env "GIT_CEILING_DIRECTORIES=${_dir}"
+                "${GIT_EXECUTABLE}" -C "${_dir}" diff --quiet HEAD --
         RESULT_VARIABLE _dirty OUTPUT_VARIABLE _out ERROR_VARIABLE _derr)
     if(NOT _dirty EQUAL 0)
         message(FATAL_ERROR
@@ -114,7 +124,8 @@ function(bbt_coroutine_pin_verify _dir)
 
     # tracked 干净之外，已暂存（cached）差异也属漂移。
     execute_process(
-        COMMAND "${GIT_EXECUTABLE}" -C "${_dir}" diff --cached --quiet
+        COMMAND "${CMAKE_COMMAND}" -E env "GIT_CEILING_DIRECTORIES=${_dir}"
+                "${GIT_EXECUTABLE}" -C "${_dir}" diff --cached --quiet
         RESULT_VARIABLE _staged OUTPUT_VARIABLE _sout ERROR_VARIABLE _serr)
     if(NOT _staged EQUAL 0)
         message(FATAL_ERROR
@@ -125,7 +136,8 @@ function(bbt_coroutine_pin_verify _dir)
     # 源码输入——顶层 CMakeLists.txt、cmake/、bbt/ 下的新增条目——会改变实际
     # 消费内容，同样拒绝（干净检出之外混入的源码不是固定版本的一部分）。
     execute_process(
-        COMMAND "${GIT_EXECUTABLE}" -C "${_dir}" status --porcelain --
+        COMMAND "${CMAKE_COMMAND}" -E env "GIT_CEILING_DIRECTORIES=${_dir}"
+                "${GIT_EXECUTABLE}" -C "${_dir}" status --porcelain --
                 CMakeLists.txt cmake bbt
         RESULT_VARIABLE _porc OUTPUT_VARIABLE _porcelain ERROR_VARIABLE _perr)
     if(NOT _porc EQUAL 0)

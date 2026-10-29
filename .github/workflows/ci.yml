@@ -809,7 +809,9 @@ jobs:
             bbt_infra_net_header_selfcheck Test_net_primitives Test_net_allocation \
             Test_net_foundation Test_net_reactor_driver Test_net_r2 Test_net_b4_contract Test_net_freeze Test_net_append_busy_hook \
             net_foundation_consumer Example_co_net_service \
-            Test_net_reclaim_receipt Test_net_accept_stop net_accept_stop_fd
+            Test_net_reclaim_receipt Test_net_accept_stop net_accept_stop_fd \
+            Test_net_ico_write_close Test_net_popall Test_net_repro_buffer_oom \
+            Example_ico_connection
 
       - name: "network-only 全注册集实跑与零跳过核对"
         timeout-minutes: 10

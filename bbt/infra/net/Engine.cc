@@ -665,7 +665,16 @@ private:
     // m_recv_buf（m_recv_hold），下次 owner 推进重试，绝不再 recv 覆盖。
     bool SubmitReceivedOwner(const char* data, std::size_t size) {
         const std::string_view received(data, size);
-        const auto appended = m_state->ring.TryAppend(received);
+        // TryAppend 在 grant→pop→append 交错下可能重新分配 backing；分配失败
+        // 抛 bad_alloc 而非返回 error——异常必须与错误返回同责登记 m_recv_hold，
+        // 不能让已 recv 字节随异常穿过 owner 读泵丢失。
+        ReadResult appended;
+        try {
+            appended = m_state->ring.TryAppend(received);
+        } catch (...) {
+            m_recv_hold.store(size, std::memory_order_release);
+            return false;
+        }
         if (appended.status == ReadStatus::Busy) {
             m_owner->InvokeAppendBusyHook();  // 测试：Busy 后/deferred 前（正常为空）
             if (!m_state->ring.AppendDeferred(received)) {
@@ -2955,6 +2964,65 @@ std::error_code Engine::CoSubmitConnect(const Address& address, std::uint64_t& o
                                         const std::shared_ptr<ReclaimRecord>& reclaim) {
     // 带责任记录的提交：记录随 post 捕获流经 owner 各真实 close/转交点。
     return StartConnectImpl(m_impl, address, out_connect_id, /*awaitable=*/true, reclaim);
+}
+
+// ---- Co 成员入口（终评 §2）：薄转发到既有私有步骤，不新增第二路径。----
+// 判定优先级/语义与旧 CoAccept/CoDial 自由函数一致（gate → 终态 → 配置）。
+// 成员形态返回 ConnectionResult{error, conn, reclaim}：失败不覆盖 conn，
+// reclaim 按提交阶段描述本次 socket 责任（提交前拒绝=无效，提交接纳后=
+// 有效且 Released() 与连接同终态）。
+
+ConnectionResult Engine::CoAccept(const bbt::coroutine::WaitOptions& options) {
+    ConnectionResult result;
+    // gate 先于一切状态判定（与旧 CoAccept 自由函数同契约）：非法域即使
+    // handoff 已有连接也返回 operation_not_permitted。
+    if (const auto gate = RequireCoroutineContext()) {
+        result.error = gate;
+        return result;
+    }
+    Connection conn;
+    result.error = CoWaitAccepted(conn, options);
+    if (!result.error) {
+        // reclaim 与交付连接同一真源：accept 连接在 AdoptFdOnOwner 建立的
+        // owner record 就是 Connection::Released() 的事实——reclaim 取同一
+        // 记录才满足「receipt 与连接 IsReleased 同一事实源」。
+        if (const auto state = CoAccess::StateOf(conn)) {
+            result.reclaim = CoAccess::MakeReceipt(state->OwnerReleasedRecord());
+        }
+        result.connection = CoTcpConnection(std::move(conn));
+    }
+    return result;
+}
+
+ConnectionResult Engine::CoDial(const Address& address,
+                                const bbt::coroutine::WaitOptions& options) {
+    ConnectionResult result;
+    // gate 先于提交（与旧 CoDial 自由函数同契约）：非法域不创建责任记录、
+    // 不产生任何提交副作用，reclaim 保持无效（Released()=true，无责任）。
+    if (const auto gate = RequireCoroutineContext()) {
+        result.error = gate;
+        return result;
+    }
+    // 提交前预分配共享释放记录：一旦接纳，无论超时/取消/未交付/Close 竞态，
+    // 记录都随提交流经 owner 各真实 close 点，描述本次物理 socket 责任。
+    auto record = std::make_shared<ReclaimRecord>(false);
+    std::uint64_t id = 0;
+    if (const auto error = CoSubmitConnect(address, id, record)) {
+        record->released.store(true, std::memory_order_release);
+        result.error = error;
+        result.reclaim = ReclaimReceipt{};  // 提交前拒绝：无已提交责任
+        return result;
+    }
+    if (auto& barrier = DialBarrierForTest()) {
+        barrier();  // 测试：强制 owner 完成早于领取 attach
+    }
+    Connection conn;
+    result.error = CoWaitConnect(id, conn, options);
+    result.reclaim = CoAccess::MakeReceipt(std::move(record));
+    if (!result.error) {
+        result.connection = CoTcpConnection(std::move(conn));
+    }
+    return result;
 }
 
 // ---- EngineTestAccess（私有测试接缝，非产品 API）----

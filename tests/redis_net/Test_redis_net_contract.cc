@@ -183,7 +183,9 @@ void UnknownDisconnect() {
     auto value = host.Call([&] { return bbt_co_await cli->Ping(Until()); });
     CHECK(!value);
     CheckUnknown(value.error(), "TransportError");
-    CHECK(value.error().backend_category == "net" && value.error().backend_code != 0);
+    // A5：backend_category 存真实 ec.category().name()（bbt.net EOF 断开），
+    // 不再是旧的固定 "net" 字面量。
+    CHECK(value.error().backend_category == "bbt.net" && value.error().backend_code != 0);
     ExpectCode(host.Call([&] { return bbt_co_await cli->Ping(Until()); }), ErrorCode::TransportError);
     host.Connect(cli);  // 显式重连必须换连接与 reader，不能凭 Valid() 返回伪成功。
     CHECK(host.Call([&] { return bbt_co_await cli->Ping(Until()); }));
@@ -200,7 +202,9 @@ void ConnectFailureOwned() {
     auto cli = host.Make(refused.address);
     auto failed = host.Call([&] { return bbt_co_await cli->Connect(Until()); });
     ExpectCode(failed, ErrorCode::TransportError);
-    CHECK(failed.error().backend_category == "net");
+    // A5：ECONNREFUSED 经 net 的 FromBoost 折成 std::system_category，
+    // backend_category 存真实类别名。
+    CHECK(failed.error().backend_category == "system");
     CHECK(failed.error().backend_code == std::make_error_code(std::errc::connection_refused).value());
     ExpectCode(host.Call([&] { return bbt_co_await cli->Ping(Until()); }), ErrorCode::RuntimeUnavailable);
     cli.reset();
@@ -583,7 +587,8 @@ void FramingAndFaults() {
         auto value = Get(pending);
         CHECK(!value);
         CheckUnknown(value.error(), "Cancelled");
-        CHECK(value.error().backend_category == "net");
+        // A5：operation_canceled 经 generic 类别上报真实类别名。
+        CHECK(value.error().backend_category == "generic");
         CHECK(value.error().backend_code == std::make_error_code(std::errc::operation_canceled).value());
         release.store(true);
         peer.Join();

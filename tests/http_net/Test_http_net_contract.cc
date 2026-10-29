@@ -326,6 +326,64 @@ void BadStreamRetire() {
     std::cout << "bad_stream_retire protocol_error=1 retired=1 redial=1\n";
 }
 
+// F1：省略最终 CallOptions 走真实成功请求（Deadline::max() 缺省），且显式
+// CallOptions{}（epoch 期限）在池/I/O 前拒绝、对端零请求。两种形态分别证明
+// 「省略参数」与「显式过期」是不同语义。
+void OmittedCallOptionsDeadline() {
+    Watchdog watchdog;
+    HttpPeer peer;
+    Host host;
+    const auto sockets_base = SocketCount();
+    auto created = http::Client::Create(host.engine, ClientOptionsFor(peer, {}));
+    CHECK(created);
+    auto client = std::move(created).value();
+
+    // 省略 call：Get 双参形态，真实成功（先前缺省 epoch 必 TimedOut）。
+    auto omitted_get = host.Call([&] {
+        return bbt_co_await client->Get("/omitted", http::RequestOptions{});
+    });
+    CHECK(omitted_get);
+    CHECK(omitted_get.value().status_code == 200);
+    CHECK(omitted_get.value().body == "peer-default");
+
+    // 省略 call：Send 直接形态（BuildRequest 产物复用同一路径）。
+    auto built = host.Call([&] {
+        auto prepared = client->BuildRequest("GET", "/omitted-send", http::RequestOptions{});
+        CHECK(prepared);
+        return bbt_co_await client->Send(prepared.value());
+    });
+    CHECK(built);
+    CHECK(built.value().body == "peer-default");
+    CHECK(peer.accept_total() == 1);
+    CHECK(peer.requests_total() == 2);
+
+    // 显式 CallOptions{}：deadline=epoch 已过期，CheckCall 在池借用与序列化
+    // 发送之前拒绝；对端观察零新请求（accept/requests 不变）。
+    const auto accepts_before = peer.accept_total();
+    const auto requests_before = peer.requests_total();
+    auto expired = host.Call([&] {
+        return bbt_co_await client->Get("/expired", http::RequestOptions{}, CallOptions{});
+    });
+    ExpectCode(expired, ErrorCode::TimedOut);
+    CHECK(peer.accept_total() == accepts_before);
+    CHECK(peer.requests_total() == requests_before);
+
+    // Send 路径同样显式过期拒绝。
+    auto expired_send = host.Call([&] {
+        auto prepared = client->BuildRequest("GET", "/expired-send", http::RequestOptions{});
+        CHECK(prepared);
+        return bbt_co_await client->Send(prepared.value(), CallOptions{});
+    });
+    ExpectCode(expired_send, ErrorCode::TimedOut);
+    CHECK(peer.requests_total() == requests_before);
+
+    client->Close();
+    peer.Stop();
+    host.Finish();
+    CHECK(WaitUntil([&] { return SocketCount() <= sockets_base; }));
+    std::cout << "omitted_call_options get_ok=1 send_ok=1 expired_rejected=2 peer_zero_new=1\n";
+}
+
 // keepalive 过期：expiry=0 → 响应后连接立即过期，下一请求必须新建连接
 // （httpcore immediate_expiry 的等价验收，走真实 sweep 而不是 mock）。
 void KeepaliveExpiry() {
@@ -389,6 +447,7 @@ int Run(int argc, char** argv) {
         else if (test_case == "close_cancel_race") { CloseCancelRace(); }
         else if (test_case == "bad_stream_retire") { BadStreamRetire(); }
         else if (test_case == "keepalive_expiry") { KeepaliveExpiry(); }
+        else if (test_case == "omitted_call_options") { OmittedCallOptionsDeadline(); }
         else { CHECK(false); }
     } catch (const std::exception& error) {
         std::cerr << "http_net_test exception: " << error.what() << '\n';

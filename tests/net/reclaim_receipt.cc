@@ -13,8 +13,11 @@
 // 屏障语义：不靠固定 sleep 证明阶段；未交付窗口由 delivery-delay seam 与
 // 服务端真实 accept 共同证明。
 
-#include <bbt/infra/net/CoConnection.hpp>
 #include <bbt/infra/net/Engine.hpp>
+#include <bbt/infra/net/CoTcpConnection.hpp>
+#include <bbt/infra/net/ICoConnection.hpp>
+#include <bbt/infra/net/ConnectionResult.hpp>
+#include <bbt/infra/net/Connection.hpp>
 #include <bbt/infra/net/NativeSocket.hpp>
 #include <bbt/infra/net/RawHandler.hpp>
 #include <bbt/infra/net/detail/EngineTestAccess.hpp>
@@ -168,13 +171,13 @@ void CoDialSuccessCloseReleased() {
     std::atomic<int> result{-2};
     std::atomic<bool> initially_released{true};
     auto task = Task([&] {
-        Connection connection;
-        ReclaimReceipt receipt;
-        const auto error = CoDial(client, address, connection, receipt, Until(2000ms));
-        if (error || !connection.Valid()) {
-            result.store(error ? error.value() : -1);
+        auto res = client.CoDial(address, Until(2000ms));
+        if (res.error || !res.connection.Valid()) {
+            result.store(res.error ? res.error.value() : -1);
             return;
         }
+        Connection connection = res.connection.Raw();
+        ReclaimReceipt receipt = res.reclaim;
         // 已交付连接：句柄与连接共用同一回收记录，物理 fd 仍开 → 未释放。
         initially_released.store(receipt.Released());
         CHECK(receipt.Valid());
@@ -193,13 +196,13 @@ void CoDialSuccessCloseReleased() {
     // 收口可经句柄独立观察：再次拨号后关闭，同终态；释放后可续拨号。
     std::atomic<int> second{-2};
     auto task2 = Task([&] {
-        Connection connection;
-        ReclaimReceipt receipt;
-        const auto error = CoDial(client, address, connection, receipt, Until(2000ms));
-        if (error || !connection.Valid()) {
-            second.store(error ? error.value() : -1);
+        auto res = client.CoDial(address, Until(2000ms));
+        if (res.error || !res.connection.Valid()) {
+            second.store(res.error ? res.error.value() : -1);
             return;
         }
+        Connection connection = res.connection.Raw();
+        ReclaimReceipt receipt = res.reclaim;
         second.store(0);
         connection.RequestClose();
         CHECK(WaitUntil([&] { return connection.Released() && receipt.Released(); }, 2000ms));
@@ -226,9 +229,9 @@ void CoDialTimeoutUndelivered() {
     std::atomic<int> result{-2};
     auto receipt = std::make_shared<ReclaimReceipt>();  // 跨协程存活，主线程可观察
     auto task = Task([&] {
-        Connection connection;
-        const auto error = CoDial(client, address, connection, *receipt, Until(40ms));
-        result.store(error.value());
+        auto res = client.CoDial(address, Until(40ms));
+        *receipt = res.reclaim;
+        result.store(res.error.value());
     });
     Get(task);
     CHECK(result.load() == std::make_error_code(std::errc::timed_out).value());
@@ -251,11 +254,10 @@ void CoDialTimeoutUndelivered() {
     const auto fds_steady = CountFds();
     std::atomic<int> second{-2};
     auto task2 = Task([&] {
-        Connection connection;
-        ReclaimReceipt receipt;
-        second.store(CoDial(client, address, connection, receipt, Until(2000ms)).value());
-        if (connection.Valid()) {
-            connection.RequestClose();
+        auto res = client.CoDial(address, Until(2000ms));
+        second.store(res.error.value());
+        if (res.connection.Valid()) {
+            res.connection.RequestClose();
         }
     });
     Get(task2);
@@ -282,10 +284,10 @@ void DialRefusedReleased() {
     std::atomic<int> result{-2};
     auto receipt = std::make_shared<ReclaimReceipt>();  // 跨协程存活，主线程可观察
     auto task = Task([&] {
-        Connection connection;
-        const auto error = CoDial(client, refused, connection, *receipt, Until(2000ms));
-        result.store(error.value());
-        CHECK(!connection.Valid());  // 失败不覆盖 out 原值（原为无效）
+        auto res = client.CoDial(refused, Until(2000ms));
+        *receipt = res.reclaim;
+        result.store(res.error.value());
+        CHECK(!res.connection.Valid());  // 失败时 connection 无效（不覆盖调用者原值）
     });
     Get(task);
     CHECK(result.load() != 0);  // 真实拒连错误（ECONNREFUSED），不是等待超时
@@ -303,13 +305,11 @@ void DialPreSubmitRejections() {
     // 1) 执行域非法：gate 先于一切状态/责任，句柄保持无效。
     {
         Engine idle{std::shared_ptr<RawHandler>()};
-        Connection out;
-        ReclaimReceipt receipt;
-        const auto error = CoDial(idle, Loopback(1), out, receipt, Until(50ms));
-        CHECK(error == std::make_error_code(std::errc::operation_not_permitted));
-        CHECK(!receipt.Valid());
-        CHECK(receipt.Released());
-        CHECK(!out.Valid());
+        auto res = idle.CoDial(Loopback(1), Until(50ms));
+        CHECK(res.error == std::make_error_code(std::errc::operation_not_permitted));
+        CHECK(!res.reclaim.Valid());
+        CHECK(res.reclaim.Released());
+        CHECK(!res.connection.Valid());
     }
     StartRuntime(2);
     Address address;
@@ -321,13 +321,11 @@ void DialPreSubmitRejections() {
     EngineTestAccess::SetConnectPostFailureOnce(client);
     std::atomic<int> post_result{-2};
     auto post_task = Task([&] {
-        Connection out;
-        ReclaimReceipt receipt;
-        const auto error = CoDial(client, address, out, receipt, Until(500ms));
-        post_result.store(error.value());
-        CHECK(!receipt.Valid());
-        CHECK(receipt.Released());
-        CHECK(!out.Valid());
+        auto res = client.CoDial(address, Until(500ms));
+        post_result.store(res.error.value());
+        CHECK(!res.reclaim.Valid());
+        CHECK(res.reclaim.Released());
+        CHECK(!res.connection.Valid());
     });
     Get(post_task);
     CHECK(post_result.load() == std::make_error_code(std::errc::operation_canceled).value());
@@ -339,20 +337,18 @@ void DialPreSubmitRejections() {
     std::atomic<int> first_result{-2};
     auto first_receipt = std::make_shared<ReclaimReceipt>();
     auto first_task = Task([&] {
-        Connection connection;
-        first_result.store(CoDial(client, address, connection,
-                                  *first_receipt, Until(3000ms)).value());
+        auto res = client.CoDial(address, Until(3000ms));
+        *first_receipt = res.reclaim;
+        first_result.store(res.error.value());
     });
     CHECK(WaitUntil([&] { return EngineTestAccess::ConnectTableSize(client) == 1; }, 2000ms));
     std::atomic<int> second_result{-2};
     auto second_task = Task([&] {
-        Connection out;
-        ReclaimReceipt receipt;
-        const auto error = CoDial(client, address, out, receipt, Until(200ms));
-        second_result.store(error.value());
-        CHECK(!receipt.Valid());  // 提交前容量拒绝：无本次责任
-        CHECK(receipt.Released());
-        CHECK(!out.Valid());
+        auto res = client.CoDial(address, Until(200ms));
+        second_result.store(res.error.value());
+        CHECK(!res.reclaim.Valid());  // 提交前容量拒绝：无本次责任
+        CHECK(res.reclaim.Released());
+        CHECK(!res.connection.Valid());
     });
     Get(second_task);
     CHECK(second_result.load() == std::make_error_code(std::errc::no_buffer_space).value());
@@ -387,13 +383,13 @@ void ReleasedNotBeforePhysicalClose() {
     });
     std::atomic<int> result{-2};
     auto task = Task([&] {
-        Connection connection;
-        ReclaimReceipt receipt;
-        const auto error = CoDial(client, address, connection, receipt, Until(2000ms));
-        if (error || !connection.Valid()) {
-            result.store(error ? error.value() : -1);
+        auto res = client.CoDial(address, Until(2000ms));
+        if (res.error || !res.connection.Valid()) {
+            result.store(res.error ? res.error.value() : -1);
             return;
         }
+        Connection connection = res.connection.Raw();
+        ReclaimReceipt receipt = res.reclaim;
         result.store(0);
         connection.RequestClose();
         // 关闭请求先于 owner 推进被屏障挡住：此刻 fd 仍开、责任未收口。
@@ -428,12 +424,13 @@ void EngineStopReleases() {
     auto delivered_connection = std::make_shared<Connection>();
     auto delivered_receipt = std::make_shared<ReclaimReceipt>();
     auto delivered_task = Task([&] {
-        const auto error = CoDial(client, address, *delivered_connection,
-                                  *delivered_receipt, Until(2000ms));
-        if (error || !delivered_connection->Valid()) {
-            delivered_result.store(error ? error.value() : -1);
+        auto res = client.CoDial(address, Until(2000ms));
+        if (res.error || !res.connection.Valid()) {
+            delivered_result.store(res.error ? res.error.value() : -1);
             return;
         }
+        *delivered_connection = res.connection.Raw();
+        *delivered_receipt = res.reclaim;
         delivered_result.store(0);
         // 保持连接存活不关（协程随即退出，观察交给主线程）：Engine 收尾必须
         // 代为收口。
@@ -444,9 +441,9 @@ void EngineStopReleases() {
     EngineTestAccess::SetConnectStartDelay(client, std::chrono::milliseconds(5000));
     auto pending_receipt = std::make_shared<ReclaimReceipt>();
     auto pending_task = Task([&] {
-        Connection connection;
-        pending_result.store(CoDial(client, address, connection,
-                                    *pending_receipt, Until(3000ms)).value());
+        auto res = client.CoDial(address, Until(3000ms));
+        *pending_receipt = res.reclaim;
+        pending_result.store(res.error.value());
     });
     CHECK(WaitUntil([&] { return EngineTestAccess::ConnectTableSize(client) == 1; }, 2000ms));
     runner.CloseAndJoin();
@@ -476,12 +473,11 @@ void DriverFailedReleases() {
     EngineTestAccess::SetConnectStartDelay(client, std::chrono::milliseconds(5000));
     std::atomic<int> result{-2};
     auto task = Task([&] {
-        Connection connection;
-        ReclaimReceipt receipt;
-        result.store(CoDial(client, address, connection, receipt, Until(3000ms)).value());
-        CHECK(receipt.Valid());
+        auto res = client.CoDial(address, Until(3000ms));
+        result.store(res.error.value());
+        CHECK(res.reclaim.Valid());
         // driver 中止 → 控制域封口解绑，占位责任必须可达释放。
-        CHECK(WaitUntil([&] { return receipt.Released(); }, 3000ms));
+        CHECK(WaitUntil([&] { return res.reclaim.Released(); }, 3000ms));
     });
     CHECK(WaitUntil([&] { return EngineTestAccess::ConnectTableSize(client) == 1; }, 2000ms));
     CHECK(!EngineTestAccess::InjectDriverFailure(client));
@@ -520,8 +516,9 @@ void DriverFailedWithLiveFd() {
         ReclaimReceipt receipt;
         std::error_code dial_error;
         auto task = Task([&] {
-            Connection connection;
-            dial_error = CoDial(client, address, connection, receipt, Until(50ms));
+            auto res = client.CoDial(address, Until(50ms));
+            receipt = res.reclaim;
+            dial_error = res.error;
         });
         Get(task);
         CHECK(dial_error == std::errc::timed_out && receipt.Valid() && !receipt.Released());

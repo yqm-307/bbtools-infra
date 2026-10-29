@@ -3,7 +3,7 @@ add_executable(Test_http_net_contract Test_http_net_contract.cc)
 target_link_libraries(Test_http_net_contract PRIVATE bbt::infra_http_net)
 target_compile_options(Test_http_net_contract PRIVATE -Wall -Wextra -Wpedantic)
 foreach(_case get_post_reuse pool_queue_timeout close_cancel_race bad_stream_retire
-        keepalive_expiry)
+        keepalive_expiry omitted_call_options)
     add_test(NAME http.net.${_case} COMMAND Test_http_net_contract ${_case})
     set_tests_properties(http.net.${_case} PROPERTIES TIMEOUT 30 LABELS "http_net")
 endforeach()

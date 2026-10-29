@@ -10,8 +10,8 @@
 //     一次性装配并最终收口。多个 Client 可共享同一 Engine，池/默认配置互不共享。
 //   - HTTP 4xx/5xx 是有效 Response（不是错误）；result 错误只表达传输/排队/
 //     装配失败。错误码沿用 bbt::infra::ErrorCode。
-//   - 编解码用 Beast；网络只经 bbt::infra::net 公开 Co 接口（CoDial/CoRead/
-//     CoWrite），不触碰 Asio socket/native fd/net detail。
+//   - 编解码用 Beast；网络只经 bbt::infra::net 协程成员接口（Engine::CoDial、
+//     CoTcpConnection::Read/Write），不触碰 Asio socket/native fd/net detail。
 //
 // 里程碑范围（诚实边界，未实现不得暗示）：
 //   - 支持：GET/POST/Request（任意方法）、raw body、base_url/默认与请求级
@@ -134,7 +134,7 @@ struct PreparedRequest {
     std::string method;
     std::string url;            // 合并 base_url 后的绝对 URL
     std::string target_for_wire;  // origin-form（path[?query]），HTTP/1.1 wire 目标
-    net::Address address;       // 数值地址（CoDial 用）
+    net::Address address;       // 数值地址（Engine::CoDial 用）
     std::string host_header;    // 默认 Host（无用户覆盖时）
     Headers headers;
     std::string body;
@@ -166,15 +166,23 @@ public:
                                          const RequestOptions& options) const;
 
     // 以下入口挂起等待，须在协程上下文调用（bbt_co_await 消费）。
+    // 省略 call 时默认无总期限（Deadline::max()），各阶段默认超时限速仍生效；
+    // 显式传 CallOptions{} 表示已过期（deadline 为 epoch），会被拒绝——
+    // 省略与显式零值是两种语义，不是同一缺省。
     bbt_co_async(result<Response>) Get(std::string_view url, const RequestOptions& options,
-                                       const CallOptions& call = {});
+                                       const CallOptions& call = {
+                                           bbt::coroutine::Deadline::max()});
     bbt_co_async(result<Response>) Post(std::string_view url, RequestBody body,
                                         const RequestOptions& options,
-                                        const CallOptions& call = {});
+                                        const CallOptions& call = {
+                                            bbt::coroutine::Deadline::max()});
     bbt_co_async(result<Response>) Request(std::string_view method, std::string_view url,
                                            const RequestOptions& options,
-                                           const CallOptions& call = {});
-    bbt_co_async(result<Response>) Send(const PreparedRequest& request, const CallOptions& call = {});
+                                           const CallOptions& call = {
+                                               bbt::coroutine::Deadline::max()});
+    bbt_co_async(result<Response>) Send(const PreparedRequest& request,
+                                        const CallOptions& call = {
+                                            bbt::coroutine::Deadline::max()});
 
     // 立即逻辑封口：拒绝新请求、唤醒全部排队等待者（Closed）、退役空闲连接；
     // 幂等不可重开。在飞请求按已持有借用完成或失败；不关共享 Engine，不假装

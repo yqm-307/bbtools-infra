@@ -4,6 +4,10 @@
 find_package(Boost REQUIRED)
 find_package(Threads REQUIRED)
 
+# P1-6：旧栈/模块选择开关真实消费——OFF 的切片不建 target、不注册测试。
+# 新协议 *_NET 模块由顶层经 cmake/*.cmake 独立接入，不受本目录旧栈开关影响。
+if(BBT_INFRA_LEGACY_STACK)
+
 add_library(bbt_infra_http STATIC
     http/HttpDetail.cc
     http/HttpClientImpl.cc
@@ -62,10 +66,13 @@ endif()
 # 本 target 实现（CoTCP/CoUDP 符号经 transport owner 传递）。
 target_link_libraries(bbt_infra_http PUBLIC bbt::infra_transport)
 
+endif() # BBT_INFRA_LEGACY_STACK
+
 # --- Config 基础配置模块（Issue #35）------------------------------------------
 # 只依赖 bbt::infra_common（即 coroutine）；无第三方新依赖。公开面在
 # include/bbt/infra/config/，命名空间 bbt::infra::config。内存源、本地文件源、
 # watch 轮询均基于协程域，不新增 I/O 线程。
+if(BBT_INFRA_CONFIG)
 add_library(bbt_infra_config STATIC
     config/MemorySource.cc
     config/FileSource.cc
@@ -77,12 +84,15 @@ target_link_libraries(bbt_infra_config
     PUBLIC bbt::infra_common
     PRIVATE Threads::Threads)
 target_compile_options(bbt_infra_config PRIVATE -Wall -Wextra)
+endif() # BBT_INFRA_CONFIG
 
-# --- Redis 模块（Issue #6）---------------------------------------------------
+# --- Redis 模块（Issue #6，旧栈实现）------------------------------------------
 # hiredis 只允许经显式前缀接入：find_package 限定 NO_DEFAULT_PATH，
 # 不可能误链 /usr/local 等系统位置的同名库。未给前缀时跳过本模块
 # （不导出能假成功的 target），公共头仍可独立编译。
-if(BBT_HIREDIS_PREFIX)
+# 旧 Redis 实现依赖旧栈 CoTCP（LEGACY_STACK），其开关归旧栈，不由
+# BBT_INFRA_REDIS_NET（新窄适配）控制。
+if(BBT_INFRA_LEGACY_STACK AND BBT_HIREDIS_PREFIX)
     find_package(hiredis CONFIG REQUIRED
         PATHS "${BBT_HIREDIS_PREFIX}" NO_DEFAULT_PATH)
 
@@ -116,7 +126,7 @@ endif()
 # target 只有目录级可见性，顶层解析后 src/ 与 tests/ 均可见），嵌套
 # find_dependency(mongoc/bsoncxx) 经 <pkg>_DIR 钉到私有前缀。
 # 未给前缀时跳过本模块（不导出能假成功的 target），公共头仍可独立编译。
-if(BBT_MONGOCXX_PREFIX)
+if(BBT_INFRA_MONGO AND BBT_MONGOCXX_PREFIX)
     # mongo::mongocxx_shared 等 IMPORTED target 由顶层 find_package 提供
     # （目录级可见性，见根 CMakeLists.txt 的接入注释）。
     add_library(bbt_infra_mongo STATIC

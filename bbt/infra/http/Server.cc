@@ -12,7 +12,9 @@
 #include <bbt/coroutine/detail/Processer.hpp>
 #include <bbt/infra/http/detail/Http11.hpp>
 #include <bbt/infra/http/detail/ServerTestAccess.hpp>
-#include <bbt/infra/net/CoConnection.hpp>
+#include <bbt/infra/net/CoTcpConnection.hpp>
+#include <bbt/infra/net/Engine.hpp>
+#include <bbt/infra/net/ICoConnection.hpp>
 
 namespace bbt::infra::http {
 namespace {
@@ -262,9 +264,10 @@ struct Server::State : std::enable_shared_from_this<Server::State> {
             if (full) { bbtco_sleep(5); continue; }
             // 在取得连接前准备物理记账槽；接纳后不再首次分配责任记录。
             auto session = std::make_shared<Session>();
-            const auto error = net::CoAccept(*engine, session->connection, {Clock::now() + 50ms});
-            if (error == std::errc::timed_out) { continue; }
-            if (error) { Stop(false); return; }
+            const auto accept_result = engine->CoAccept({Clock::now() + 50ms});
+            if (accept_result.error == std::errc::timed_out) { continue; }
+            if (accept_result.error) { Stop(false); return; }
+            session->connection = accept_result.connection.Raw();
 
             {
                 std::lock_guard<std::mutex> lock(mutex);
@@ -299,18 +302,19 @@ struct Server::State : std::enable_shared_from_this<Server::State> {
             }
             if (detail::CheckCall(deadline)) { return false; }
             const auto count = std::min(chunk, bytes.size() - offset);
-            net::WriteOutcome outcome;
-            net::WriteOperation operation;
-            const auto error = net::CoWrite(session->connection, bytes.substr(offset, count),
-                                            {deadline}, outcome, operation);
+            net::CoTcpConnection connection{session->connection};
+            const auto report = connection.Write(bytes.substr(offset, count), {deadline});
+            const auto& outcome = report.outcome;
             // 公开 Rejected + 无 operation = 零提交；有界减半探到 net 可接纳上限。
             // 不在已接纳/可能发送的路径重试，也不假设 Engine 默认写额度。
-            if (error == std::errc::no_buffer_space && outcome.phase == net::WritePhase::Rejected &&
-                !operation.Valid() && count > 1) {
+            if (report.wait_error == std::errc::no_buffer_space &&
+                outcome.phase == net::WritePhase::Rejected && !report.operation.Valid() && count > 1) {
                 chunk = count / 2;
                 continue;
             }
-            if (error || outcome.phase != net::WritePhase::Done || outcome.error) { return false; }
+            if (report.wait_error || outcome.phase != net::WritePhase::Done || outcome.error) {
+                return false;
+            }
             offset += count;
             bbtco_yield;
         }
@@ -345,10 +349,13 @@ struct Server::State : std::enable_shared_from_this<Server::State> {
                     if (parser.is_done()) { break; }
                     if (consumed) { bbtco_yield; continue; }
                 }
-                std::string bytes;
-                const auto error = net::CoRead(session->connection, bytes, {deadline});
-                if (error) { return; } // EOF 前的完整请求已在上面交付；半包 EOF 明确放弃
-                pending += bytes;
+                net::CoTcpConnection connection{session->connection};
+                const auto read = connection.Read({deadline});
+                if (read.state != net::ReadState::Data) {
+                    // EOF 前的完整请求已在上面交付；半包 EOF/错误明确放弃。
+                    return;
+                }
+                read.data.AppendTo(pending);
                 bbtco_yield;
             }
             if (!ValidRequestHead(parser.get(), options.max_target_bytes)) { return; }

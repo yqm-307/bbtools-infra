@@ -3,6 +3,10 @@ target_link_libraries(Test_contract_basics PRIVATE bbt::infra_common)
 target_compile_options(Test_contract_basics PRIVATE -Wall -Wextra)
 add_test(NAME contract.basics COMMAND Test_contract_basics)
 
+# 旧栈测试切片（P1-6）：BBT_INFRA_LEGACY_STACK=OFF 时旧 http/tcp/udp/
+# transport/redis 全部 target 不存在，对应测试目标与注册一并跳过。
+if(BBT_INFRA_LEGACY_STACK)
+
 # --- CoTCP loopback（Issue #31）----------------------------------------------
 add_executable(Test_tcp_loopback Test_tcp_loopback.cc)
 target_link_libraries(Test_tcp_loopback
@@ -57,15 +61,21 @@ if(_bbt_tr_links MATCHES "infra_http")
         "（实际: ${_bbt_tr_links}）")
 endif()
 
+endif() # BBT_INFRA_LEGACY_STACK（前半：tcp/udp/transport）
+
 # --- waypoint 3-3 前置：infra 通用位置参数 payload codec（纯 header-only）。-----
-# 只链接 bbt::infra_common（header-only payload codec，无 protobuf 依赖），
-# 全配置注册；golden 期望字节来自旧 framework CoRpc.hpp 的 literal，且另有
-# 一次性旧源/新源字节级交叉验证（不进仓）。
-add_executable(Test_rpc_payload Test_rpc_payload.cc)
-target_link_libraries(Test_rpc_payload PRIVATE bbt::infra_common)
-target_compile_options(Test_rpc_payload PRIVATE -Wall -Wextra)
-add_test(NAME rpc.payload COMMAND Test_rpc_payload)
-set_tests_properties(rpc.payload PROPERTIES TIMEOUT 60)
+# 只链接 bbt::infra_common（header-only payload codec，无 protobuf 依赖）。
+# P1-7b：测试名带 rpc.* 前缀，注册与构建组合显式绑定——属于「默认旧栈或
+# RPC 闭包」的测试：HTTP_NET=ON 且 RPC_NET=OFF 的 HTTP-only 闭包不得
+# 注册任何 rpc.*（CI no_wire 门禁硬性要求）；其余组合（默认旧栈、
+# RPC 闭包）保持注册。
+if(BBT_INFRA_LEGACY_STACK AND (NOT BBT_INFRA_HTTP_NET OR BBT_INFRA_RPC_NET))
+    add_executable(Test_rpc_payload Test_rpc_payload.cc)
+    target_link_libraries(Test_rpc_payload PRIVATE bbt::infra_common)
+    target_compile_options(Test_rpc_payload PRIVATE -Wall -Wextra)
+    add_test(NAME rpc.payload COMMAND Test_rpc_payload)
+    set_tests_properties(rpc.payload PROPERTIES TIMEOUT 60)
+endif()
 
 # 实测 detail::CoPollEvent 单事件上 FD readable + custom wakeup + timeout
 # 组合的确定性四场景。使用 detail 非稳定头与非公开组合路径，仅用于能力裁决，
@@ -78,6 +88,8 @@ set_tests_properties(iowait.probe PROPERTIES TIMEOUT 60)
 
 # --- Config 基础配置模块测试（Issue #35）--------------------------------------
 # unit：Value 类型化读取/指纹、内存源版本、文件源读取/更新/格式错误（无需调度器）。
+# P1-6：随 BBT_INFRA_CONFIG 开关注册。
+if(BBT_INFRA_CONFIG)
 add_executable(Test_config_unit Test_config_unit.cc)
 target_link_libraries(Test_config_unit PRIVATE
     bbt::infra_config Boost::boost Threads::Threads)
@@ -92,7 +104,9 @@ target_link_libraries(Test_config_watch PRIVATE
 target_compile_options(Test_config_watch PRIVATE -Wall -Wextra)
 add_test(NAME config.watch COMMAND Test_config_watch)
 set_tests_properties(config.watch PROPERTIES TIMEOUT 120)
+endif()
 
+if(BBT_INFRA_LEGACY_STACK)
 # N1b-1：真实 HTTP/1.1 loopback 闭环（Boost.Beast + Asio）。
 # 与上游单测一致：Boost.Test 经 included/unit_test.hpp 静态内嵌。
 find_package(Boost REQUIRED)
@@ -210,6 +224,8 @@ target_link_libraries(Test_http_failure_close
 target_compile_options(Test_http_failure_close PRIVATE -Wall -Wextra)
 add_test(NAME http.failure_close COMMAND Test_http_failure_close)
 set_tests_properties(http.failure_close PROPERTIES TIMEOUT 120)
+
+endif() # BBT_INFRA_LEGACY_STACK（后半：旧 http 协议切片测试）
 
 # --- Redis 模块测试（Issue #6）：仅在构建 bbt_infra_redis 时注册。
 # 单元套件不依赖外部 Redis（内置 FakeRedis/静默对端）；live 套件按
@@ -342,6 +358,7 @@ endif()
 # ForceCloseAfterQuiescence 强制收口）随 Stop 语义一起删除：新契约下 runtime
 # 进程寿命常驻、Close 同步收口，已无「硬停后强制关闭」入口，不再保留目标。
 
+if(BBT_INFRA_LEGACY_STACK)
 # --- Issue #31 收尾验收缺口剩余项：DNS 在途到期（非调用前已过期）。
 # 晚到结果只能间接验证：名额不重复归还且 DNS 通道仍可用；本用例未直接观察
 # worker 侧「丢弃晚到结果」的分支。需要 src 内部装配面（DNS 扣持接缝）与协议
@@ -369,3 +386,4 @@ target_link_libraries(Test_transport_runtime_no_loop
 target_compile_options(Test_transport_runtime_no_loop PRIVATE -Wall -Wextra)
 add_test(NAME transport.runtime_no_loop COMMAND Test_transport_runtime_no_loop)
 set_tests_properties(transport.runtime_no_loop PROPERTIES TIMEOUT 60)
+endif() # BBT_INFRA_LEGACY_STACK（尾部 transport 测试）

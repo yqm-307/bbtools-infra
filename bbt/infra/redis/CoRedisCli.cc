@@ -8,8 +8,10 @@
 #include <bbt/coroutine/syntax/Async.hpp>
 #include <hiredis/hiredis.h>
 
-#include <bbt/infra/net/CoConnection.hpp>
-#include <bbt/infra/net/Error.hpp>
+#include <bbt/infra/NetError.hpp>
+#include <bbt/infra/net/CoTcpConnection.hpp>
+#include <bbt/infra/net/Engine.hpp>
+#include <bbt/infra/net/ICoConnection.hpp>
 #include "detail/RedisDetail.hpp"
 
 namespace bbt::infra::redis {
@@ -42,19 +44,15 @@ const char* CauseName(ErrorCode code) {
     }
 }
 
+// 底层分类交给 A5 公共桥 NetToError；closed/runtime_unavailable 是 Redis
+// 客户端自身事实（close 封口、engine 非 Running），桥无从知晓，仍在此覆盖。
 Error NetError(std::error_code code, bool closed, bool runtime_unavailable = false) {
-    ErrorCode mapped = ErrorCode::TransportError;
-    if (closed || code == net::NetErrc::Closed) { mapped = ErrorCode::Closed; }
-    else if (runtime_unavailable || code == std::errc::operation_not_supported) { mapped = ErrorCode::RuntimeUnavailable; }
-    else if (code == std::errc::timed_out) { mapped = ErrorCode::TimedOut; }
-    else if (code == std::errc::operation_canceled) { mapped = ErrorCode::Cancelled; }
-    else if (code == std::errc::operation_not_permitted) { mapped = ErrorCode::InvalidContext; }
-    else if (code == std::errc::invalid_argument) { mapped = ErrorCode::InvalidArgument; }
-    else if (code == std::errc::no_buffer_space || code == std::errc::device_or_resource_busy ||
-             code == net::NetErrc::Busy || code == net::NetErrc::WriteSettling) { mapped = ErrorCode::Overloaded; }
-    auto error = MakeError(mapped, "redis net: " + code.message());
-    error.backend_category = "net";
-    error.backend_code = code.value();
+    auto error = NetToError(code, "redis net: " + code.message());
+    // 优先级与旧映射一致：Closed（含 NetErrc::Closed，桥已给）> RuntimeUnavailable。
+    if (closed) { error.code = ErrorCode::Closed; }
+    else if (runtime_unavailable && error.code != ErrorCode::Closed) {
+        error.code = ErrorCode::RuntimeUnavailable;
+    }
     return error;
 }
 
@@ -69,7 +67,7 @@ bool ExpectedReply(const std::string& command, const RawReply& reply) {
 
 struct CoRedisCli::State {
     // mutex 保护接纳/发布/封口；活动操作独占 reader，Close 在 busy 时不能释放它。
-    // 这一个位置同时串行化 Connect 与五个命令，锁永不跨 CoDial/CoWrite/CoRead。
+    // 这一个位置同时串行化 Connect 与五个命令，锁永不跨 CoDial/Write/Read。
     std::mutex mutex;
     const std::shared_ptr<net::Engine> engine;
     const net::Address address;
@@ -120,24 +118,24 @@ struct CoRedisCli::State {
             connection = {};
         }
         Active active{*this};
-        net::Connection local;
-        const auto error = net::CoDial(*engine, address, local, {options.deadline});
+        auto dialed = engine->CoDial(address, {options.deadline});
         std::lock_guard<std::mutex> lock(mutex);
         if (closed) {
-            local.RequestClose();
+            dialed.connection.RequestClose();
             return result<void>::err(ClosedError());
         }
-        if (error) {
-            return result<void>::err(NetError(error, false, engine->Phase() != net::EnginePhase::Running));
+        if (dialed.error) {
+            return result<void>::err(
+                NetError(dialed.error, false, engine->Phase() != net::EnginePhase::Running));
         }
         // 只有显式建连成功才恢复流；失败期间不发布任何可用连接。
         if (!reader) { reader.reset(redisReaderCreate()); }
         if (!reader) {
-            local.RequestClose();
+            dialed.connection.RequestClose();
             return result<void>::err(MakeError(ErrorCode::InternalError, "redis: reader allocation failed"));
         }
         broken = false;
-        connection = std::move(local);
+        connection = dialed.connection.Raw();
         return result<void>::ok();
     }
 
@@ -186,14 +184,14 @@ struct CoRedisCli::State {
         }
         const std::string command(formatted, static_cast<std::size_t>(size));
         const bbt::coroutine::WaitOptions wait{options.deadline};
-        net::WriteOutcome outcome;
-        net::WriteOperation operation;
-        auto error = net::CoWrite(local, command, wait, outcome, operation);
-        if (error) {
+        net::CoTcpConnection co{local};
+        const auto report = co.Write(command, wait);
+        if (report.wait_error) {
             bool sealed;
             { std::lock_guard<std::mutex> lock(mutex); sealed = closed; }
-            auto cause = NetError(error, sealed);
-            if (operation.Valid() || outcome.phase != net::WritePhase::Rejected) {
+            auto cause = NetError(report.wait_error, sealed);
+            if (report.operation.Valid() ||
+                report.outcome.phase != net::WritePhase::Rejected) {
                 return result<RawReply>::err(Fail(std::move(cause), true));
             }
             if (cause.code == ErrorCode::Closed || cause.code == ErrorCode::TransportError) {
@@ -202,15 +200,18 @@ struct CoRedisCli::State {
             return result<RawReply>::err(std::move(cause));
         }
 
-        // CoRead 返回可用字节而非一条 RESP 帧。整个循环复用同一个绝对 deadline。
+        // Read 交付一次可用字节而非一条 RESP 帧。整个循环复用同一个绝对 deadline。
         for (;;) {
-            std::string bytes;
-            error = net::CoRead(local, bytes, wait);
-            if (error) {
+            const auto read = co.Read(wait);
+            if (read.state != net::ReadState::Data) {
                 bool sealed;
                 { std::lock_guard<std::mutex> lock(mutex); sealed = closed; }
-                return result<RawReply>::err(Fail(NetError(error, sealed), true));
+                // EOF 与错误统一按流断裂处理：Eof 时 error 为空，补 NetErrc::Eof。
+                const auto cause = read.state == net::ReadState::Eof
+                    ? net::make_error_code(net::NetErrc::Eof) : read.error;
+                return result<RawReply>::err(Fail(NetError(cause, sealed), true));
             }
+            const auto bytes = read.data.CopyTo();
             if (redisReaderFeed(reader.get(), bytes.data(), bytes.size()) != REDIS_OK) {
                 return result<RawReply>::err(Fail(redis_detail::ClassifyHiredisError(
                     reader->err, reader->errstr, "redis: reader feed failed"), true));

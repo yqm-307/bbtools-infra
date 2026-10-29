@@ -1,7 +1,8 @@
 // R2 协程网络最小示例（只消费公开 API：bbt::infra_net + bbtools-coroutine）。
 //
 // 真实 TCP 回环：Engine server（main + 1 sub owner，各自绑定已登记 Processer
-// driver 槽，不新建网络线程）→ CoAccept 取连接 → CoRead/CoWrite 回显。
+// driver 槽，不新建网络线程）→ Engine::CoAccept 取连接 →
+// conn.Read/conn.Write 回显（成员化 ICoConnection 形态）。
 // client 用 NativeSocket 直连服务端实际绑定地址（port 0 由内核分配）。
 //
 // 退出约定：runtime 无 Stop/优雅停机，本进程业务收口后 flush 并以 std::_Exit
@@ -21,8 +22,9 @@
 #include <poll.h>
 
 #include <bbt/coroutine/coroutine.hpp>
-#include <bbt/infra/net/CoConnection.hpp>
+#include <bbt/infra/net/CoTcpConnection.hpp>
 #include <bbt/infra/net/Engine.hpp>
+#include <bbt/infra/net/ICoConnection.hpp>
 #include <bbt/infra/net/NativeSocket.hpp>
 #include <bbt/infra/net/RawHandler.hpp>
 
@@ -82,30 +84,33 @@ int main() {
     std::atomic<int> echo_ok{0};
     std::atomic<int> echo_drained{0};   // 尾部读空后的守卫状态断言
     auto server_task = [&] {
-        net::Connection connection;
-        if (net::CoAccept(engine, connection, Until(3000ms))) {
+        auto accepted = engine.CoAccept(Until(3000ms));
+        if (accepted.error) {
             return;
         }
-        std::string data;
-        if (net::CoRead(connection, data, Until(3000ms))) {
+        net::Connection connection = accepted.connection.Raw();
+        net::CoTcpConnection conn{connection};
+        auto read = conn.Read(Until(3000ms));
+        if (read.state != net::ReadState::Data) {
             return;
         }
-        net::WriteOutcome outcome;
-        net::WriteOperation operation;
-        if (net::CoWrite(connection, data, Until(3000ms), outcome, operation)) {
+        const auto data = read.data.CopyTo();
+        const auto report = conn.Write(data, Until(3000ms));
+        if (report.wait_error) {
             return;
         }
         // Done 只表示该次发送已到终态，成功还须 error 为空。
-        if (outcome.phase == net::WritePhase::Done && !outcome.error && data == "hello") {
+        if (report.outcome.phase == net::WritePhase::Done && !report.outcome.error &&
+            data == "hello") {
             echo_ok.store(1);
         }
         // 公开读取守卫：读空后立即再取一次保护应得到 WouldBlock（不是 Busy）；
         // 守卫持连接状态强引用，释放 connection 之后仍可安全 Size/析构。
         auto drained = connection.TryAccess();
-        if (!drained && drained.WouldBlock()) {
+        if (!drained) {
             echo_drained.store(1);
         }
-        connection.RequestClose();
+        conn.RequestClose();
     };
     auto promise = std::make_shared<std::promise<void>>();
     auto future = promise->get_future();

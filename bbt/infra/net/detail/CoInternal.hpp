@@ -9,6 +9,7 @@
 // 四层 namespace 禁止：本头不新增命名空间层级，全部落在 bbt::infra::net。
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <system_error>
 
@@ -35,8 +36,14 @@ std::error_code RequireCoroutineContext();
 // operation_not_supported，不吞成 io_error。
 std::error_code WaitStatusError(bbt::coroutine::WaitStatus status);
 
-// Engine 私有 Co 步骤与连接内部状态的门面：CoConnection.cc 是唯一调用方。
-// 两段式建连（提交 → 领取）在此收口，公共面只留 CoDial。
+// 拨号私有 test 屏障的存储引用：Engine::CoDial 在提交后、领取 attach 前调用。
+// 定义在 CoConnection.cc；CoTestAccess::SetDialBarrier 是唯一写入者。
+// 返回的 function 正常为空（无屏障）。
+std::function<void()>& DialBarrierForTest();
+
+// Engine 私有 Co 步骤与连接内部状态的门面：CoConnection.cc 与 Engine.cc
+// 是唯一调用方。两段式建连（提交 → 领取）在此收口，公共面只留
+// Engine::CoDial/CoAccept。
 struct CoAccess {
     // 返回连接内部状态的强引用：Co 等待必须在挂起期间保活 ring/hub。
     static std::shared_ptr<ConnectionState> StateOf(const Connection& connection);

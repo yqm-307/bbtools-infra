@@ -110,8 +110,12 @@ ctest --test-dir <build> -j1 -R '^rpc\.net\.' --output-on-failure
 
 ## 测试覆盖（`tests/rpc_net/`，CTest `rpc.net.*`）
 
-- `Test_rpc_net_wire`：profile 编解码往返（含 Error 分支字段）、值层拒绝
-  （budget/metadata/outcome/关联字段）、畸形字节与 HTTP 绑定形状拒绝。
+- `Test_rpc_net_wire`：profile 编解码往返（含 Error 分支字段与
+  `Error.request_phase` 全阶段往返）、值层拒绝（budget/metadata/outcome/
+  关联字段/非法阶段值）、畸形字节与 HTTP 绑定形状拒绝；缺 `request_phase`
+  字段解码回 `nullopt`（旧 peer 兼容），UNSPECIFIED/未识别值按
+  `ProtocolError` 拒绝；远端阶段只透传为远端事实，本地提交程度仍由本地
+  传输错误路径携带（不改写）。
 - `Test_rpc_net_roundtrip`：真实双端（双 Engine、真实 loopback TCP）成功回程、
   位置参数 payload 编解码、metadata 透传、并发关联不串线、local-min 预算、
   同连接复用（handler 计数 + 池 idle/budget）。

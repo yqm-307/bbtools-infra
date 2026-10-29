@@ -68,6 +68,54 @@ ErrorCode FromProtoErrorCode(pbv1::RpcErrorCode c) {
     return ErrorCode::ProtocolError;
 }
 
+// --- 出站请求阶段映射（decisions/0008 的 Error::request_phase 事实）------------
+// wire 把 UNSPECIFIED 保留为 0（非法值 → ProtocolError），本地合法阶段从
+// 1 起排——与 Result.hpp 的 RequestPhase 声明序一致，序号不经枚举值直接互转。
+
+// 返回可检查结果：非法本地阶段值不得静默编码为 present-UNSPECIFIED——
+// 接收端对 UNSPECIFIED 判 ProtocolError，发送端必须在边界先拒。
+bool ToProtoRequestPhase(RequestPhase p, pbv1::RpcRequestPhase* out) {
+    switch (p) {
+        case RequestPhase::NotStarted:
+            *out = pbv1::RPC_REQUEST_PHASE_NOT_STARTED;       return true;
+        case RequestPhase::Connecting:
+            *out = pbv1::RPC_REQUEST_PHASE_CONNECTING;        return true;
+        case RequestPhase::Writing:
+            *out = pbv1::RPC_REQUEST_PHASE_WRITING;           return true;
+        case RequestPhase::RequestCommitted:
+            *out = pbv1::RPC_REQUEST_PHASE_REQUEST_COMMITTED; return true;
+        case RequestPhase::ReplyTerminal:
+            *out = pbv1::RPC_REQUEST_PHASE_REPLY_TERMINAL;    return true;
+    }
+    return false;
+}
+
+// 返回值：nullopt 表示字段缺席（合法，解码为 nullopt）；带值的 optional
+// 表示已识别阶段；UNSPECIFIED/未识别值经失败分支返回 ProtocolError。
+result<std::optional<RequestPhase>> FromProtoRequestPhase(
+    const pbv1::RpcError& pe) {
+    if (!pe.has_request_phase())
+        return result<std::optional<RequestPhase>>::ok(std::nullopt);
+    switch (pe.request_phase()) {
+        case pbv1::RPC_REQUEST_PHASE_NOT_STARTED:
+            return result<std::optional<RequestPhase>>::ok(RequestPhase::NotStarted);
+        case pbv1::RPC_REQUEST_PHASE_CONNECTING:
+            return result<std::optional<RequestPhase>>::ok(RequestPhase::Connecting);
+        case pbv1::RPC_REQUEST_PHASE_WRITING:
+            return result<std::optional<RequestPhase>>::ok(RequestPhase::Writing);
+        case pbv1::RPC_REQUEST_PHASE_REQUEST_COMMITTED:
+            return result<std::optional<RequestPhase>>::ok(RequestPhase::RequestCommitted);
+        case pbv1::RPC_REQUEST_PHASE_REPLY_TERMINAL:
+            return result<std::optional<RequestPhase>>::ok(RequestPhase::ReplyTerminal);
+        case pbv1::RPC_REQUEST_PHASE_UNSPECIFIED:
+        default:
+            break;
+    }
+    // 阶段是单调机器事实，未知值不得静默吞掉：与 error code 同规则，拒绝。
+    return result<std::optional<RequestPhase>>::err(MakeError(
+        ErrorCode::ProtocolError, "unrecognized request_phase value"));
+}
+
 // --- metadata 校验 -----------------------------------------------------------
 
 bool HasMetaPrefix(const std::string& key) {
@@ -122,6 +170,14 @@ result<void> ValidateErrorBranch(const Error& err) {
     if (err.message.size() > kMaxValueBytes)
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
             "error message exceeds max bytes"));
+    // present 的 request_phase 必须是本地合法阶段：非法值此前被静默编码成
+    // present-UNSPECIFIED，接收端必拒（ProtocolError）——来源侧在边界先拒。
+    if (err.request_phase.has_value()) {
+        pbv1::RpcRequestPhase ignored;
+        if (!ToProtoRequestPhase(*err.request_phase, &ignored))
+            return result<void>::err(MakeError(ErrorCode::ProtocolError,
+                "request_phase value is not a valid local phase"));
+    }
     // ValidateErrorDetails 用 ProtocolError 表达结构违规（decisions/0002 与
     // Result.hpp:157-177 的冻结语义）：重复键、非法 UTF-8、超限 details
     // 必须原样保留 ProtocolError，不得改写为 InvalidArgument（R1 Issue-2）。
@@ -198,6 +254,17 @@ result<void> FillProto(const RpcWireEnvelope& env,
             pe->set_backend_category(env.error.backend_category);
             pe->set_backend_code(env.error.backend_code);
             pe->set_transferred_bytes(env.error.transferred_bytes);
+            // request_phase 只在携带时写：nullopt 不落字段，wire 上保持缺席，
+            // 旧 peer 按未知字段忽略、新 peer 解回 nullopt（不补 NotStarted）。
+            // 合法性已由 ValidateErrorBranch 拒绝非法本地值；此处断言式复验，
+            // 任何绕过校验的新调用路径也不得产出 present-UNSPECIFIED。
+            if (env.error.request_phase.has_value()) {
+                pbv1::RpcRequestPhase phase;
+                if (!ToProtoRequestPhase(*env.error.request_phase, &phase))
+                    return result<void>::err(MakeError(ErrorCode::ProtocolError,
+                        "request_phase value is not a valid local phase"));
+                pe->set_request_phase(phase);
+            }
             for (const auto& [k, v] : env.error.details) {
                 auto* de = pe->add_details();
                 de->set_key(k);
@@ -239,6 +306,10 @@ result<RpcWireEnvelope> FromProto(const pbv1::RpcEnvelopeMsg& in,
             env.error.backend_category  = pe.backend_category();
             env.error.backend_code      = pe.backend_code();
             env.error.transferred_bytes = pe.transferred_bytes();
+            auto phase = FromProtoRequestPhase(pe);
+            if (!phase)
+                return result<RpcWireEnvelope>::err(phase.error());
+            env.error.request_phase = phase.value();
             env.error.details.reserve(pe.details_size());
             for (const auto& de : pe.details())
                 env.error.details.emplace_back(de.key(), de.value());

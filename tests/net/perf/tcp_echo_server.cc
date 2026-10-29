@@ -24,7 +24,7 @@
 // 读终态时，先把 ring 中剩余数据全部拆帧并入 pending，再按以下规则收尾：
 //   pending 仍有待发 echo → 登记进 eof_pending 等 OnWrite 把队列排空后
 //   RequestClose（不丢未发 echo）；pending 已空 → 立即 RequestClose。
-// co 模式 CoRead 返回 Eof/Closed 前其顺序 CoWrite 已终态，直接 RequestClose。
+// co 模式 Read 返回 Eof/Closed 前其顺序 Write 已终态，直接 RequestClose。
 //
 // 进程退出：coroutine runtime 无 Stop/静态析构收口（已知限制，见
 // tests/net/ProcessRuntimeTestMain.hpp）；本进程在 engine join + 自有任务全部
@@ -39,10 +39,13 @@
 // 样本与内存有界：不存 per-request 数据，无逐帧 stdout；conn 任务用活动计数器
 // （condvar）记账，不积累历史 future 容器。
 
-#include <bbt/infra/net/CoConnection.hpp>
+#include <bbt/infra/net/ConnectionResult.hpp>
+#include <bbt/infra/net/CoTcpConnection.hpp>
 #include <bbt/infra/net/Engine.hpp>
+#include <bbt/infra/net/ICoConnection.hpp>
 #include <bbt/infra/net/RawHandler.hpp>
 #include <bbt/infra/net/detail/ReceiveRing.hpp>
+#include <bbt/infra/net/detail/TestAccess.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -181,7 +184,9 @@ struct RawEchoHandler : RawHandler {
             ++g_active_conns;
         }
         auto slot = std::make_shared<Slot>();
-        slot->state = connection.State();
+        // 身份令牌：公共面已删除 Connection::State()，经测试接缝取同一
+        // shared_ptr 身份防 Id 复用后误删后继 slot（语义不变）。
+        slot->state = ConnectionTestAccess::StateOf(connection);
         std::lock_guard<std::mutex> lk(mu);
         // Id 可复用：同 id 旧连接的 slot 可能仍在表（其 OnClose 未到达）——
         // 直接覆盖是对的，旧连接的数据面已终态；旧 OnClose 到达时按 state 识别。
@@ -275,7 +280,7 @@ struct RawEchoHandler : RawHandler {
         for (;;) {
             std::string data;
             const auto result = connection.TryRead(data);
-            if (result.status == ReceiveRing::ReadStatus::Ok) {
+            if (result.status == ReadStatus::Ok) {
                 if (data.empty()) break;  // Ok 但无数据：本批已尽
                 g_metrics.bytes_in.fetch_add(data.size());
                 if (!DrainToPending(*slot, data.data(), data.size())) {
@@ -285,13 +290,13 @@ struct RawEchoHandler : RawHandler {
                 }
                 continue;
             }
-            if (result.status == ReceiveRing::ReadStatus::Busy ||
-                result.status == ReceiveRing::ReadStatus::WouldBlock) {
+            if (result.status == ReadStatus::Busy ||
+                result.status == ReadStatus::WouldBlock) {
                 // Busy：他线程正在读，留待其释放触发的重投 OnRead；
                 // WouldBlock：本批可读数据已尽且无终态——正常中途，不关。
                 break;
             }
-            if (result.status == ReceiveRing::ReadStatus::Error) {
+            if (result.status == ReadStatus::Error) {
                 g_metrics.errors.fetch_add(1);
             }
             terminal = true;  // Eof / Error 终态
@@ -340,7 +345,8 @@ struct RawEchoHandler : RawHandler {
         // Id 复用：迟到的 OnClose 只删属于自己 state 的 slot——同 id 已有新连接
         // 登记时，表中 slot 属于新连接，不得擦除（否则新连接 OnRead 提前返回，
         // echo 永远不到 → 对端 3s 超时，conns 负载尾部稳定丢 clients 个连接）。
-        if (it != parsers.end() && it->second->state == connection.State()) {
+        if (it != parsers.end() &&
+            it->second->state == ConnectionTestAccess::StateOf(connection)) {
             // 丢弃未发出的 echo（对端已走）；如实计数不静默。
             const auto dropped = it->second->pending.size();
             if (dropped > 0) {
@@ -350,7 +356,7 @@ struct RawEchoHandler : RawHandler {
         }
         const auto eit = eof_pending.find(connection.Id());
         if (eit != eof_pending.end() &&
-            eit->second->state == connection.State()) {
+            eit->second->state == ConnectionTestAccess::StateOf(connection)) {
             eof_pending.erase(eit);
         }
         {
@@ -376,28 +382,32 @@ void CoServeConnection(Connection connection) {
     } guard;
     FrameParser parser;
     std::uint64_t expected_seq = 0;
+    CoTcpConnection co_conn{connection};
     for (;;) {
         if (g_stop.load()) { connection.RequestClose(); return; }
         std::string data;
         bbt::coroutine::WaitOptions opts;
         opts.deadline = std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(g_read_timeout_ms);
-        const auto err = CoRead(connection, data, opts);
-        if (err == std::make_error_code(std::errc::timed_out)) {
+        const auto read = co_conn.Read(opts);
+        if (read.state == ReadState::Error &&
+            read.error == std::make_error_code(std::errc::timed_out)) {
             continue;
         }
-        if (err == make_error_code(NetErrc::Eof) ||
-            err == make_error_code(NetErrc::Closed)) {
-            // 产品契约：EOF 不关闭写侧——本协程的顺序 CoWrite 在读到 EOF 前
+        if (read.state == ReadState::Eof ||
+            (read.state == ReadState::Error &&
+             read.error == make_error_code(NetErrc::Closed))) {
+            // 产品契约：EOF 不关闭写侧——本协程的顺序 Write 在读到 EOF 前
             // 已全部终态，此处 RequestClose 是连接释放的唯一发起方。
             connection.RequestClose();
             return;
         }
-        if (err) {
+        if (read.state == ReadState::Error) {
             g_metrics.errors.fetch_add(1);
             connection.RequestClose();
             return;
         }
+        read.data.AppendTo(data);
         g_metrics.bytes_in.fetch_add(data.size());
         if (!parser.Feed(data.data(), data.size())) {
             g_metrics.frames_bad.fetch_add(1);
@@ -421,11 +431,13 @@ void CoServeConnection(Connection connection) {
                 connection.RequestClose();
                 return;
             }
-            WriteOutcome outcome;
-            WriteOperation op;
             bbt::coroutine::WaitOptions wopts;
             wopts.deadline = std::chrono::steady_clock::now() + 5000ms;
-            const auto werr = CoWrite(connection, frame, wopts, outcome, op);
+            const auto report = co_conn.Write(frame, wopts);
+            // 有效写错误：等待失败取 wait_error；等待完成但发送未确认取
+            // outcome.error（与旧 CoWrite err+outcome 终态同口径）。
+            const auto werr = report.wait_error
+                ? report.wait_error : report.outcome.error;
             if (werr) {
                 if (werr == make_error_code(NetErrc::Closed) ||
                     werr == make_error_code(NetErrc::Eof)) {
@@ -445,8 +457,8 @@ void CoServeConnection(Connection connection) {
             }
             g_metrics.completed.fetch_add(1);
         }
-        // fin 的 echo 已被 CoWrite 确认后 RequestClose：单向 transfer 的收尾。
-        // （上一轮 CoRead 的对端 EOF 路径同样显式关——EOF 不触发写侧关闭。）
+        // fin 的 echo 已被 Write 确认后 RequestClose：单向 transfer 的收尾。
+        // （上一轮 Read 的对端 EOF 路径同样显式关——EOF 不触发写侧关闭。）
         if (close_after) {
             connection.RequestClose();
             return;
@@ -558,12 +570,12 @@ int RunServer(int argc, char** argv) {
         TrackTaskBegin();
         g_scheduler->RegistCoroutineTask(65536, [&engine] {
             while (!g_stop.load()) {
-                Connection c;
                 bbt::coroutine::WaitOptions opts;
                 opts.deadline = std::chrono::steady_clock::now() + 200ms;
-                const auto err = engine.WaitAccepted(c, opts);
-                if (err == std::make_error_code(std::errc::timed_out)) continue;
-                if (err) break;
+                const auto res = engine.CoAccept(opts);
+                if (res.error == std::make_error_code(std::errc::timed_out)) continue;
+                if (res.error) break;
+                const Connection c = res.connection.Raw();
                 g_metrics.accepted.fetch_add(1);
                 TrackTaskBegin();
                 g_scheduler->RegistCoroutineTask(65536, [c] {

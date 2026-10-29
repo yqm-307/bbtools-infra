@@ -14,7 +14,7 @@ target_include_directories(bbt_infra_rpc_net
            "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>")
 target_compile_features(bbt_infra_rpc_net PUBLIC cxx_std_17)
 target_link_libraries(bbt_infra_rpc_net
-    PUBLIC bbt::infra_http_net
+    PUBLIC bbt::infra_http_net bbt::infra_common
     PRIVATE bbt_infra_rpc_proto)
 target_compile_options(bbt_infra_rpc_net PRIVATE -Wall -Wextra -Wpedantic)
 

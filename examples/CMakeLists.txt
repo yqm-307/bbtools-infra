@@ -3,16 +3,22 @@
 # 不为示例新增第三方依赖，Redis/Mongo 示例仅在对应模块 target 存在时注册。
 
 find_package(Threads REQUIRED)
+
+# 示例随模块开关注册（P1-6）：模块 target 不存在时对应示例跳过。
+if(BBT_INFRA_LEGACY_STACK)
 add_executable(Example_http_loopback http_loopback.cc)
 target_link_libraries(Example_http_loopback PRIVATE
     bbt::infra_http Threads::Threads)
 target_compile_options(Example_http_loopback PRIVATE -Wall -Wextra)
+endif()
 
 # Config 模块消费示例（Issue #35）：读取 → 上层校验 → 接受/拒绝；无新依赖。
+if(BBT_INFRA_CONFIG)
 add_executable(Example_config_consume config_consume.cc)
 target_link_libraries(Example_config_consume PRIVATE
     bbt::infra_config Threads::Threads)
 target_compile_options(Example_config_consume PRIVATE -Wall -Wextra)
+endif()
 
 # Redis/Mongo 调用形态示例：同时依赖两个模块 target；任一前缀未接入时
 # 对应模块 target 不存在，本示例随之跳过（公共头仍可独立编译）。
@@ -31,4 +37,10 @@ endif()
 # 此处 add_test 不会被 enable_testing() 生效。
 if(TARGET bbt::infra_mongo)
     add_subdirectory(mongo_client)
+endif()
+
+# ICoConnection 成员化收口消费示例（终评 §2 组合验收）：只链接 bbt::infra_net。
+# bbt::infra_net 只在任一 *_NET 协议开关打开时存在；旧栈默认构建不引入。
+if(TARGET bbt::infra_net)
+    add_subdirectory(ico_connection)
 endif()
