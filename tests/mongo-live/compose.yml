@@ -8,7 +8,7 @@
 # 也不改变 CRUD 行为。
 services:
   mongo:
-    image: mongo:8.0
+    image: mongo:7.0
     command:
       - "mongod"
       - "--wiredTigerCacheSizeGB"
