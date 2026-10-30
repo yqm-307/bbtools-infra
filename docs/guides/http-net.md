@@ -1,6 +1,6 @@
 # HTTP net 客户端与服务端（`bbt::infra_http_net`）
 
-> 状态：实验性未提交候选，本地聚焦验证，待独立审查，未接 CI；不代表整个 HTTP 迁移已交付。本文描述当前实现，不是冻结契约；接口以 `bbt/infra/http/Client.hpp`、`Server.hpp` 为准。
+> 状态：实验性候选，本地聚焦验证，待独立审查；不代表整个 HTTP 迁移已交付。本文描述当前实现，不是冻结契约；接口以 `bbt/infra/http/Client.hpp`、`Server.hpp` 为准。
 
 ## 定位
 
@@ -18,9 +18,9 @@ cmake --build <私有 build 目录> --target bbt_infra_http_net_header_selfcheck
 ctest --test-dir <私有 build 目录> -j1 -R 'http\.net\.' --output-on-failure --no-tests=error
 ```
 
-- 目标：`bbt::infra_http_net`（alias）；示例 `http_net_example`（CTest 名 `http.net.consumer`）；契约测试 `Test_http_net_contract` 与 `Test_http_net_regressions`（用例名分发，`http.net.*`，LABELS `http_net`）。
+- 目标：`bbt::infra_http_net`（alias）；示例 `http_net_example`（CTest 名 `example_http_net_consumer`）；契约测试 `Test_http_net_contract`/`Test_http_net_regressions`/`Test_http_net_server`/`Test_http_net_stop_regressions`（用例名分发，`http.net.*`，LABELS `unit`）。
 - 依赖：仅 `bbt::infra_net`（含 Boost::headers，Beast header-only），无新第三方依赖；coroutine 消费受 `cmake/coroutine.sha` pin 门禁约束。
-- CI：未接入（`BBT_INFRA_HTTP_NET` 不在任何 workflow 中），CI 全绿不代表本模块已验证。
+- CI：`BBT_INFRA_HTTP_NET` 已由 Release/Debug 门禁的新 RPC/HTTP 闭包覆盖（`scripts/ci/release_gate.sh`/`debug_gate.sh` → `run_ctest_label.sh --regex '^(rpc|http)\.net\.'`）；HTTP-only 闭包另验证不引入 protobuf。
 
 ## 最小消费
 
@@ -105,7 +105,7 @@ auto stopped = server->WaitStopped(deadline);
 - HTTP/1.1 要求唯一合法 Host；当前 Host 接受 ASCII DNS 标签/数值 host（IPv6 必须方括号，可选十进制 port），拒绝 userinfo、空白、路径和畸形端口。target 校验 origin-form URI 字符及百分号转义。CONNECT、Upgrade、Expect 明确拒绝并关连接，Expect 在读完 header、等待 body 之前拒绝。
 - handler 异常或错误 result 隔离为 500；非法状态（仅接受 200–599）、CR/LF/控制字节头及用户 Content-Length/Transfer-Encoding/Connection/Upgrade/Trailer 明确断开。Beast 负责 framing；HEAD 保留表示长度但不发 body，204/304 不发 body。大响应以有界块 `conn.Write`，只有 Rejected + 无 operation 的零提交容量错误才减半重试，不重放已接纳写；每块复查期限与 Close 并让出。
 - 本地 `Test_http_net_server` 覆盖 wire（分片/chunked/pipeline/HEAD/204/304/FIN）、停止授权及 idle/半包、回复写屏障 Drain、Close 超时责任、入站期限晚返、安全、Start/登记失败、inflight 门禁及 owner 扣留物理回收额度。每例在进程退出前验证 HTTP 任务/连接、listener、Run/join 及 socket 基线归还。私有注入仅用于确定性阶段，不替代真实 TCP 字节。
-- CI 尚未接线；TLS、HTTP/2、流式、代理、DNS 解析、路由框架、永久阻塞 handler 的抢占以及跨平台/sanitizer/压力验证不在本批。
+- TLS、HTTP/2、流式、代理、DNS 解析、路由框架、永久阻塞 handler 的抢占以及跨平台/sanitizer/压力验证不在本批。
 
 ## 契约要点
 
@@ -136,4 +136,4 @@ auto stopped = server->WaitStopped(deadline);
 - 回收由 net owner 异步推进；retiring 期间仍占名额，不能因等待结束就假定资源已释放。多个 Client 的池独立，各自预算不构成共享 Engine 的全局 fd 上限。
 - 排队者不因「预算释放」被即时唤醒，20ms 重查切片会增加分配延迟；这是重查节拍，不是在任意调度压力下的严格延迟上界。
 - 只实现完整 HTTP/1.1 消息：支持分片、chunked、HEAD、有限中间 1xx 与 EOF 定界；101 升级显式拒绝，最多接受 16 个中间响应。多余尾随字节不复用。CONNECT 隧道不支持。
-- CI 未接线；跨平台未验证（net 层当前仅 Linux）。
+- 跨平台未验证（net 层当前仅 Linux）。

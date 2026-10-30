@@ -2,15 +2,15 @@
 
 ## 状态与范围
 
-日期：2026-09-19。关联 Issue：#6（拆分 #3：CoRedisCli 协程客户端与真实 Redis 验收）、父任务 #3、契约文档 `0002-co-network-contract-v1.md`。本决策记录当前 Redis 最小切片，不限制后续主流 API 扩展。后续公共 API 应迁移到 `bbt::infra::redis` 与 `include/bbt/infra/redis/`；实现必须基于 bbtools-coroutine 现有等待/恢复模型，不使用 C++20 `co_await`/`Task<T>` 作为公共接口示例。配置读取、动态 watch 和分布式配置治理不属于本客户端决策，基础配置机制见 `0006-infra-foundation-and-dynamic-config.md`。
+日期：2026-09-19。关联 Issue：#6（拆分 #3：CoRedisCli 协程客户端与真实 Redis 验收）、父任务 #3、契约文档 `0002-co-network-contract.md`。本决策记录当前 Redis 最小切片，不限制后续主流 API 扩展。后续公共 API 应迁移到 `bbt::infra::redis` 与 `include/bbt/infra/redis/`；实现必须基于 bbtools-coroutine 现有等待/恢复模型，不使用 C++20 `co_await`/`Task<T>` 作为公共接口示例。配置读取、动态 watch 和分布式配置治理不属于本客户端决策，基础配置机制见 `0006-infra-foundation-and-dynamic-config.md`。
 
 ### 后续目标规格
 
-[0005：CoTCP/CoUDP 与第三方 Binding](0005-co-io-adapter-contract-v1.md) 提出 hiredis transport 函数表直接协程绑定的候选路径。本文 async + strand 描述的是本决策落笔时的实现（其后已由 CoTCP owner binding 取代，见修订记录）；下文“同步 API + Hook 被明确禁止”限定于旧 async context 不得混用同步调用，不是禁止独立构建并验证新的 transport Binding。0005 §8 目标路径需验证锁、线程局部状态、关闭时序与物理收口，未验收前不得写成已迁移。
+[0005：CoTCP/CoUDP 与第三方 Binding](0005-co-io-adapter-contract.md) 提出 hiredis transport 函数表直接协程绑定的候选路径。本文 async + strand 描述的是本决策落笔时的实现（其后已由 CoTCP owner binding 取代，见修订记录）；下文“同步 API + Hook 被明确禁止”限定于旧 async context 不得混用同步调用，不是禁止独立构建并验证新的 transport Binding。0005 §8 目标路径需验证锁、线程局部状态、关闭时序与物理收口，未验收前不得写成已迁移。
 
 ### 修订记录（2026-10-01：进程寿命运行时 + owner 同步 Close）
 
-本文原结论中依赖 `CompletionSignal`/`CancellationToken`/运行时代际/`Scheduler::Stop()` 的表述（§选型理由、§执行域与生命周期不变量、§测试架构、§未覆盖与已知差异）已被上游 coroutine 的**进程寿命运行时**（候选 HEAD `03430a5`）与 infra 的**同步 `Close()`** 契约取代。**保留**的是单连接生命周期与 cleanup 时序；**被取代**的是“请求等待靠 `CompletionSignal`、关闭靠 `RequestClose`/`WaitClosed`、运行时靠代际/Stop”的旧依赖。请求完成改按 operation state + `CoWaiter::WaitWithCallback`/`Notify` 口径描述，superseded by [0002 修订记录](0002-co-network-contract-v1.md) 与本文下方改写。**当前实现已由 CoTCP owner binding 取代**（`9e68967`「converge CoTCP client lifecycle」已合入 main，见下方「CoTCP owner binding 迁移记录」）：CoTCP 承担 Dial/读写/等待/关闭，hiredis 只做同步 RESP2 编解码；下文的 async + strand 描述自此为历史记录。
+本文原结论中依赖 `CompletionSignal`/`CancellationToken`/运行时代际/`Scheduler::Stop()` 的表述（§选型理由、§执行域与生命周期不变量、§测试架构、§未覆盖与已知差异）已被上游 coroutine 的**进程寿命运行时**（候选 HEAD `03430a5`）与 infra 的**同步 `Close()`** 契约取代。**保留**的是单连接生命周期与 cleanup 时序；**被取代**的是“请求等待靠 `CompletionSignal`、关闭靠 `RequestClose`/`WaitClosed`、运行时靠代际/Stop”的旧依赖。请求完成改按 operation state + `CoWaiter::WaitWithCallback`/`Notify` 口径描述，superseded by [0002 修订记录](0002-co-network-contract.md) 与本文下方改写。**当前实现已由 CoTCP owner binding 取代**（`9e68967`「converge CoTCP client lifecycle」已合入 main，见下方「CoTCP owner binding 迁移记录」）：CoTCP 承担 Dial/读写/等待/关闭，hiredis 只做同步 RESP2 编解码；下文的 async + strand 描述自此为历史记录。
 
 ### CoTCP owner binding 迁移记录（已合入 main）
 
@@ -34,7 +34,7 @@ Redis 客户端已收敛为「唯一 `CoRedisCliImpl` + 内部窄 `RedisCotcpCon
   失败或不确定结果。该选项不绕过显式生命周期（首次未 Connect / 主动 Disconnect /
   Close 均不隐式建连）。`RedisCotcpConn` 自身永不自动重连，重建只发生在 owner 决定
   路径（与
-  [0005 §8.1](0005-co-io-adapter-contract-v1.md)「禁止 binding 绕过 binding 自动
+  [0005 §8.1](0005-co-io-adapter-contract.md)「禁止 binding 绕过 binding 自动
   reconnect」一致）。
 - **单 owner 严格串行**：任一时刻至多一条命令在途；`max_inflight` 当前只做装配期容量
   校验，不构成 pipeline 流控；`max_queue` 仍是排队容量上限（耗尽返回 `Overloaded`）。

@@ -16,7 +16,7 @@
 （登记等待 → 一次投递回调 → 挂起）+ adapter 路径 `Notify`（可带载荷），结果放 operation state；
 「运行时是否在跑」用 `Scheduler::IsInitialized()`。本文其余职责边界结论（infra 只提供基础机制、
 schema/热切换归 framework、不新增隐藏 io context/线程）**继续有效**。superseded by
-[0002 修订记录](0002-co-network-contract-v1.md)。
+[0002 修订记录](0002-co-network-contract.md)。
 
 ## 定位
 
