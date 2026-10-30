@@ -1,5 +1,6 @@
 #include <bbt/infra/redis/CoRedisCli.hpp>
 
+#include <algorithm>
 #include <limits>
 #include <mutex>
 #include <utility>
@@ -56,12 +57,43 @@ Error NetError(std::error_code code, bool closed, bool runtime_unavailable = fal
     return error;
 }
 
-bool ExpectedReply(const std::string& command, const RawReply& reply) {
+// ExpectedReply 判定「回复形态是否属于该命令」。set_nil_ok 只用于带选项
+// 的 SET：NX/XX 条件不满足时服务端回 nil，是合法终态而非协议错误。
+bool ExpectedReply(const std::string& command, const RawReply& reply, bool set_nil_ok) {
     if (command == "PING") { return reply.type == RawReply::Type::Status && reply.str == "PONG"; }
-    if (command == "SET") { return reply.type == RawReply::Type::Status && reply.str == "OK"; }
-    if (command == "GET") { return reply.type == RawReply::Type::Bulk || reply.type == RawReply::Type::Nil; }
-    if (command == "EXISTS") { return reply.type == RawReply::Type::Integer && (reply.integer == 0 || reply.integer == 1); }
-    return command == "DEL" && reply.type == RawReply::Type::Integer && reply.integer >= 0;
+    if (command == "SET") {
+        if (reply.type == RawReply::Type::Status && reply.str == "OK") { return true; }
+        return set_nil_ok && reply.type == RawReply::Type::Nil;
+    }
+    if (command == "GET" || command == "HGET") {
+        return reply.type == RawReply::Type::Bulk || reply.type == RawReply::Type::Nil;
+    }
+    if (command == "EXISTS" || command == "HEXISTS") {
+        return reply.type == RawReply::Type::Integer && (reply.integer == 0 || reply.integer == 1);
+    }
+    if (command == "DEL" || command == "HDEL") {
+        return reply.type == RawReply::Type::Integer && reply.integer >= 0;
+    }
+    if (command == "PEXPIRE") {
+        return reply.type == RawReply::Type::Integer && (reply.integer == 0 || reply.integer == 1);
+    }
+    if (command == "PTTL" || command == "INCR" || command == "DECR" ||
+        command == "INCRBY" || command == "DECRBY" || command == "HSET") {
+        return reply.type == RawReply::Type::Integer;
+    }
+    // HGETALL 契约是 field/value 对：除一维数组外还要求元素数为偶数且
+    // 无 nil 元素；奇数或含 nil 的完整数组同样按协议错误退役（fail-close，
+    // 不静默丢尾或把 nil 折叠成空串）。
+    if (command == "HGETALL") {
+        if (reply.type != RawReply::Type::Array) { return false; }
+        if (reply.elements.size() % 2 != 0) { return false; }
+        return std::none_of(reply.elements.begin(), reply.elements.end(),
+                            [](const RawReply::Element& e) { return e.is_nil; });
+    }
+    if (command == "AUTH" || command == "SELECT") {
+        return reply.type == RawReply::Type::Status && reply.str == "OK";
+    }
+    return false;
 }
 } // namespace
 
@@ -71,14 +103,17 @@ struct CoRedisCli::State {
     std::mutex mutex;
     const std::shared_ptr<net::Engine> engine;
     const net::Address address;
+    const RedisHandshake handshake;
     net::Connection connection;
     Reader reader{redisReaderCreate(), &redisReaderFree};
     bool closed{false};
     bool busy{false};
     bool broken{false};
 
-    State(std::shared_ptr<net::Engine> target, net::Address endpoint)
-        : engine(std::move(target)), address(std::move(endpoint)) {}
+    State(std::shared_ptr<net::Engine> target, net::Address endpoint,
+          RedisHandshake shake)
+        : engine(std::move(target)), address(std::move(endpoint)),
+          handshake(std::move(shake)) {}
 
     struct Active {
         State& state;
@@ -119,60 +154,90 @@ struct CoRedisCli::State {
         }
         Active active{*this};
         auto dialed = engine->CoDial(address, {options.deadline});
-        std::lock_guard<std::mutex> lock(mutex);
-        if (closed) {
-            dialed.connection.RequestClose();
-            return result<void>::err(ClosedError());
-        }
-        if (dialed.error) {
-            return result<void>::err(
-                NetError(dialed.error, false, engine->Phase() != net::EnginePhase::Running));
-        }
-        // 只有显式建连成功才恢复流；失败期间不发布任何可用连接。
-        if (!reader) { reader.reset(redisReaderCreate()); }
-        if (!reader) {
-            dialed.connection.RequestClose();
-            return result<void>::err(MakeError(ErrorCode::InternalError, "redis: reader allocation failed"));
-        }
-        broken = false;
-        connection = dialed.connection.Raw();
-        return result<void>::ok();
-    }
-
-    bbt_co_async(result<RawReply>) Execute(std::vector<std::string> args, CallOptions options) {
-        if (bbt::coroutine::GetLocalCoroutineId() == 0) { return result<RawReply>::err(ContextError()); }
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            if (closed) { return result<RawReply>::err(ClosedError()); }
-        }
-        // 参数拥有于本调用，编码后不借用调用者的 key/value/options。
-        if ((args.size() == 1 && args[0] == "DEL") || args.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
-            return result<RawReply>::err(MakeError(ErrorCode::InvalidArgument, "redis: invalid key list"));
-        }
-        for (std::size_t i = 1; i < args.size(); ++i) {
-            if ((args[0] == "DEL" || i == 1) && args[i].empty()) {
-                return result<RawReply>::err(MakeError(ErrorCode::InvalidArgument, "redis: empty key"));
-            }
-        }
         net::Connection local;
         {
             std::lock_guard<std::mutex> lock(mutex);
-            if (closed) { return result<RawReply>::err(ClosedError()); }
-            if (busy) { return result<RawReply>::err(BusyError()); }
-            if (broken || (connection.Valid() && connection.Closed())) {
-                broken = true;
-                connection.RequestClose();
-                reader.reset();
-                return result<RawReply>::err(MakeError(ErrorCode::TransportError, "redis: explicit Connect required"));
+            if (closed) {
+                dialed.connection.RequestClose();
+                return result<void>::err(ClosedError());
             }
-            if (!connection.Valid()) {
-                return result<RawReply>::err(MakeError(ErrorCode::RuntimeUnavailable, "redis: not connected"));
+            if (dialed.error) {
+                return result<void>::err(
+                    NetError(dialed.error, false, engine->Phase() != net::EnginePhase::Running));
             }
-            busy = true;
+            // 只有显式建连成功才恢复流；失败期间不发布任何可用连接。
+            if (!reader) { reader.reset(redisReaderCreate()); }
+            if (!reader) {
+                dialed.connection.RequestClose();
+                return result<void>::err(MakeError(ErrorCode::InternalError, "redis: reader allocation failed"));
+            }
+            broken = false;
+            connection = dialed.connection.Raw();
+            // 握手全程用锁内快照的本地句柄：Close 可能与握手 I/O 并发，不在
+            // 挂起恢复后读写共享成员 connection；句柄共享同一底层状态，
+            // Close 对成员的 RequestClose 仍会封掉这条连接的在途 I/O。
             local = connection;
         }
-        Active active{*this};
-        if (local.ReadableBytes() != 0) { return result<RawReply>::err(Fail(ProtocolError(), false)); }
+        // 连接级握手：配置后在每次建连（含显式重连）内按 AUTH 再 SELECT
+        // 顺序各等 +OK。仍占本次活动位置与同一绝对 deadline，不流水线；
+        // 锁不跨挂起——握手 I/O 在锁外执行。
+        // 失败返回原样错误（RemoteError 不回密码），随后标记 broken 使后续
+        // 命令按「显式 Connect required」处理；未配置时零动作。
+        if (const auto outcome = bbt_co_await RunHandshake(options, local); !outcome) {
+            // 握手失败即退役连接：显式置 broken，后续命令按
+            // 「explicit Connect required」处理，client 仍可 Close。
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                broken = true;
+                connection.RequestClose();
+                connection = {};
+                reader.reset();
+            }
+            return result<void>::err(outcome.error());
+        }
+        // 握手成功后的线性化复查：Close 在握手期间胜出时 Connect 不得返回
+        // 成功——与 Close 共用同一状态锁的线性化点，退役本次已发布连接。
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (closed) {
+                broken = true;
+                connection.RequestClose();
+                connection = {};
+                reader.reset();
+                return result<void>::err(ClosedError());
+            }
+        }
+        return result<void>::ok();
+    }
+
+    // 仅在 Connect 的活动位置内调用；非空结果表示握手失败（错误原样上抛，
+    // 随后统一置 broken）。错误消息与 details 不含密码。local 为发布锁内
+    // 快照的本地句柄，握手期间不再访问共享成员 connection。
+    bbt_co_async(result<void>) RunHandshake(const CallOptions& options,
+                                            const net::Connection& local) {
+        if (!handshake.password.empty()) {
+            std::vector<std::string> args{"AUTH"};
+            if (!handshake.username.empty()) { args.push_back(handshake.username); }
+            args.push_back(handshake.password);
+            auto reply = bbt_co_await RedisRoundtrip(std::move(args), options, false, local);
+            if (!reply) { return result<void>::err(std::move(reply.error())); }
+        }
+        if (handshake.database >= 0) {
+            auto reply = bbt_co_await RedisRoundtrip(
+                {"SELECT", std::to_string(handshake.database)}, options, false, local);
+            if (!reply) { return result<void>::err(std::move(reply.error())); }
+        }
+        return result<void>::ok();
+    }
+
+    // 已接纳的一次命令全量写 + 分帧读一条完整回复：编码、写、读循环、解析
+    // 与错误分类集中于此；失败按现有规则退役整条流（Fail）。调用方须已
+    // 置 busy 并持本连接 local 句柄（Connect 握手与 Execute 共用本函数）。
+    // set_nil_ok 见 ExpectedReply：带选项 SET 的 nil 回复是合法终态。
+    bbt_co_async(result<RawReply>) RedisRoundtrip(std::vector<std::string> args,
+                                                const CallOptions& options,
+                                                bool set_nil_ok,
+                                                net::Connection local) {
         std::vector<const char*> argv;
         std::vector<std::size_t> lengths;
         for (const auto& arg : args) { argv.push_back(arg.data()); lengths.push_back(arg.size()); }
@@ -227,12 +292,66 @@ struct CoRedisCli::State {
             // 无流水线：同批次回复之后的任何额外字节都没有请求归属。
             if (reader->len != reader->pos) { return result<RawReply>::err(Fail(ProtocolError(), true)); }
             auto decoded = redis_detail::DecodeReply(reply.get());
-            if (!decoded) { return decoded; } // 完整 Redis ERROR 保持流同步。
-            if (!ExpectedReply(args[0], decoded.value())) {
+            if (!decoded) {
+                if (decoded.error().code == ErrorCode::RemoteError) { return decoded; } // 完整 Redis ERROR 保持流同步。
+                return result<RawReply>::err(Fail(std::move(decoded.error()), true));
+            }
+            if (!ExpectedReply(args[0], decoded.value(), set_nil_ok)) {
                 return result<RawReply>::err(Fail(ProtocolError(), true));
             }
             return decoded;
         }
+    }
+
+    // 参数先全量校验再锁内接纳；set_nil_ok 透传给 RedisRoundtrip 的
+    // ExpectedReply（见上）。HDEL 与 DEL 一样要求列表非空。
+    bbt_co_async(result<RawReply>) Execute(std::vector<std::string> args,
+                                         CallOptions options,
+                                         bool set_nil_ok = false) {
+        if (bbt::coroutine::GetLocalCoroutineId() == 0) { return result<RawReply>::err(ContextError()); }
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (closed) { return result<RawReply>::err(ClosedError()); }
+        }
+        // 参数拥有于本调用，编码后不借用调用者的 key/value/options。
+        // args[0] 是命令名；以下参数（i>=1）才做 key/field 空值校验：
+        //   - DEL/HDEL：全部后续参数为 key/field，须非空且列表非空；
+        //   - HSET/HGET/HEXISTS：args[1] key 与 args[2] field 都须非空；
+        //   - 其余命令：第一个参数（key）须非空，value/delta 等允许空串。
+        const bool list_command = args[0] == "DEL" || args[0] == "HDEL";
+        if ((args.size() == 1 && list_command) ||
+            args.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+            return result<RawReply>::err(MakeError(ErrorCode::InvalidArgument, "redis: invalid key list"));
+        }
+        const bool hash_field_command =
+            args[0] == "HSET" || args[0] == "HGET" || args[0] == "HEXISTS";
+        for (std::size_t i = 1; i < args.size(); ++i) {
+            if (!args[i].empty()) { continue; }
+            if (list_command || i == 1 || (hash_field_command && i == 2)) {
+                return result<RawReply>::err(MakeError(ErrorCode::InvalidArgument,
+                    "redis: empty key or field"));
+            }
+        }
+        net::Connection local;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (closed) { return result<RawReply>::err(ClosedError()); }
+            if (busy) { return result<RawReply>::err(BusyError()); }
+            if (broken || (connection.Valid() && connection.Closed())) {
+                broken = true;
+                connection.RequestClose();
+                reader.reset();
+                return result<RawReply>::err(MakeError(ErrorCode::TransportError, "redis: explicit Connect required"));
+            }
+            if (!connection.Valid()) {
+                return result<RawReply>::err(MakeError(ErrorCode::RuntimeUnavailable, "redis: not connected"));
+            }
+            busy = true;
+            local = connection;
+        }
+        Active active{*this};
+        if (local.ReadableBytes() != 0) { return result<RawReply>::err(Fail(ProtocolError(), false)); }
+        return bbt_co_await RedisRoundtrip(std::move(args), options, set_nil_ok, std::move(local));
     }
 };
 
@@ -240,11 +359,18 @@ CoRedisCli::CoRedisCli(std::shared_ptr<State> state) noexcept : state_(std::move
 CoRedisCli::~CoRedisCli() noexcept { Close(); }
 
 result<std::shared_ptr<CoRedisCli>> CoRedisCli::Create(std::shared_ptr<net::Engine> engine, net::Address address) {
+    return Create(std::move(engine), std::move(address), RedisHandshake{});
+}
+
+result<std::shared_ptr<CoRedisCli>> CoRedisCli::Create(std::shared_ptr<net::Engine> engine, net::Address address, RedisHandshake handshake) {
     if (!engine || !address.Valid() ||
         (address.Family() != net::AddressFamily::IPv4 && address.Family() != net::AddressFamily::IPv6)) {
         return result<std::shared_ptr<CoRedisCli>>::err(MakeError(ErrorCode::InvalidArgument, "redis: Engine and IP address required"));
     }
-    auto state = std::make_shared<State>(std::move(engine), std::move(address));
+    if (handshake.database < -1 || handshake.database > kMaxDatabase) {
+        return result<std::shared_ptr<CoRedisCli>>::err(MakeError(ErrorCode::InvalidArgument, "redis: handshake database out of range"));
+    }
+    auto state = std::make_shared<State>(std::move(engine), std::move(address), std::move(handshake));
     if (!state->reader) {
         return result<std::shared_ptr<CoRedisCli>>::err(MakeError(ErrorCode::InternalError, "redis: reader allocation failed"));
     }
@@ -301,5 +427,132 @@ bbt_co_async(result<std::uint64_t>) CoRedisCli::Delete(std::vector<std::string> 
     auto value = bbt_co_await state->Execute(std::move(keys), options);
     if (!value) { return result<std::uint64_t>::err(std::move(value.error())); }
     return result<std::uint64_t>::ok(static_cast<std::uint64_t>(value.value().integer));
+}
+
+bbt_co_async(result<bool>) CoRedisCli::Set(std::string_view key, std::string_view value,
+                                           const SetOptions& set_options, const CallOptions& options) {
+    const auto state = state_;
+    // 选项先本地校验再编码：越界零接纳（InvalidArgument），什么都不发。
+    if (set_options.expire &&
+        (*set_options.expire <= std::chrono::milliseconds{0} ||
+         *set_options.expire > kMaxSetExpire)) {
+        return result<bool>::err(MakeError(ErrorCode::InvalidArgument, "redis: SET expire out of range"));
+    }
+    std::vector<std::string> args{"SET", std::string(key), std::string(value)};
+    if (set_options.expire) {
+        args.emplace_back("PX");
+        args.push_back(std::to_string(set_options.expire->count()));
+    }
+    switch (set_options.condition) {
+    case SetOptions::Condition::NX: args.emplace_back("NX"); break;
+    case SetOptions::Condition::XX: args.emplace_back("XX"); break;
+    case SetOptions::Condition::None: break;
+    }
+    auto reply = bbt_co_await state->Execute(std::move(args), options, true);
+    if (!reply) { return result<bool>::err(std::move(reply.error())); }
+    // nil 回复表示条件不满足（NX/XX），是合法终态而非错误。
+    return result<bool>::ok(reply.value().type == RawReply::Type::Status);
+}
+
+bbt_co_async(result<bool>) CoRedisCli::Expire(std::string_view key, std::chrono::milliseconds ttl,
+                                              const CallOptions& options) {
+    const auto state = state_;
+    if (ttl <= std::chrono::milliseconds{0}) {
+        return result<bool>::err(MakeError(ErrorCode::InvalidArgument, "redis: expire must be positive"));
+    }
+    auto value = bbt_co_await state->Execute(
+        {"PEXPIRE", std::string(key), std::to_string(ttl.count())}, options);
+    if (!value) { return result<bool>::err(std::move(value.error())); }
+    return result<bool>::ok(value.value().integer == 1);
+}
+
+bbt_co_async(result<TtlResult>) CoRedisCli::Ttl(std::string_view key, const CallOptions& options) {
+    const auto state = state_;
+    auto value = bbt_co_await state->Execute({"PTTL", std::string(key)}, options);
+    if (!value) { return result<TtlResult>::err(std::move(value.error())); }
+    const auto ms = value.value().integer;
+    if (ms == -2) { return result<TtlResult>::ok({TtlResult::State::KeyMissing, {}}); }
+    if (ms == -1) { return result<TtlResult>::ok({TtlResult::State::NoExpiry, {}}); }
+    if (ms < 0) { return result<TtlResult>::err(MakeError(ErrorCode::ProtocolError, "redis: unexpected PTTL value")); }
+    return result<TtlResult>::ok({TtlResult::State::Expires, std::chrono::milliseconds{ms}});
+}
+
+bbt_co_async(result<std::int64_t>) CoRedisCli::Incr(std::string_view key, const CallOptions& options) {
+    const auto state = state_;
+    auto value = bbt_co_await state->Execute({"INCR", std::string(key)}, options);
+    if (!value) { return result<std::int64_t>::err(std::move(value.error())); }
+    return result<std::int64_t>::ok(value.value().integer);
+}
+bbt_co_async(result<std::int64_t>) CoRedisCli::Decr(std::string_view key, const CallOptions& options) {
+    const auto state = state_;
+    auto value = bbt_co_await state->Execute({"DECR", std::string(key)}, options);
+    if (!value) { return result<std::int64_t>::err(std::move(value.error())); }
+    return result<std::int64_t>::ok(value.value().integer);
+}
+bbt_co_async(result<std::int64_t>) CoRedisCli::IncrBy(std::string_view key, std::int64_t delta, const CallOptions& options) {
+    const auto state = state_;
+    auto value = bbt_co_await state->Execute({"INCRBY", std::string(key), std::to_string(delta)}, options);
+    if (!value) { return result<std::int64_t>::err(std::move(value.error())); }
+    return result<std::int64_t>::ok(value.value().integer);
+}
+bbt_co_async(result<std::int64_t>) CoRedisCli::DecrBy(std::string_view key, std::int64_t delta, const CallOptions& options) {
+    const auto state = state_;
+    auto value = bbt_co_await state->Execute({"DECRBY", std::string(key), std::to_string(delta)}, options);
+    if (!value) { return result<std::int64_t>::err(std::move(value.error())); }
+    return result<std::int64_t>::ok(value.value().integer);
+}
+
+bbt_co_async(result<bool>) CoRedisCli::HSet(std::string_view key, std::string_view field,
+                                            std::string_view value, const CallOptions& options) {
+    const auto state = state_;
+    auto reply = bbt_co_await state->Execute(
+        {"HSET", std::string(key), std::string(field), std::string(value)}, options);
+    if (!reply) { return result<bool>::err(std::move(reply.error())); }
+    return result<bool>::ok(reply.value().integer == 1);
+}
+bbt_co_async(result<std::optional<std::string>>) CoRedisCli::HGet(std::string_view key,
+                                                                   std::string_view field,
+                                                                   const CallOptions& options) {
+    const auto state = state_;
+    auto value = bbt_co_await state->Execute({"HGET", std::string(key), std::string(field)}, options);
+    if (!value) { return result<std::optional<std::string>>::err(std::move(value.error())); }
+    if (value.value().type == RawReply::Type::Nil) { return result<std::optional<std::string>>::ok(std::nullopt); }
+    return result<std::optional<std::string>>::ok(std::move(value.value().str));
+}
+bbt_co_async(result<std::uint64_t>) CoRedisCli::HDel(std::string_view key, std::vector<std::string> fields,
+                                                     const CallOptions& options) {
+    const auto state = state_;
+    if (fields.empty()) {
+        return result<std::uint64_t>::err(MakeError(ErrorCode::InvalidArgument, "redis: empty field list"));
+    }
+    std::vector<std::string> args;
+    args.reserve(fields.size() + 2);
+    args.emplace_back("HDEL");
+    args.emplace_back(key);
+    for (auto& field : fields) { args.push_back(std::move(field)); }
+    auto value = bbt_co_await state->Execute(std::move(args), options);
+    if (!value) { return result<std::uint64_t>::err(std::move(value.error())); }
+    return result<std::uint64_t>::ok(static_cast<std::uint64_t>(value.value().integer));
+}
+bbt_co_async(result<bool>) CoRedisCli::HExists(std::string_view key, std::string_view field,
+                                               const CallOptions& options) {
+    const auto state = state_;
+    auto value = bbt_co_await state->Execute({"HEXISTS", std::string(key), std::string(field)}, options);
+    if (!value) { return result<bool>::err(std::move(value.error())); }
+    return result<bool>::ok(value.value().integer == 1);
+}
+bbt_co_async(result<HashEntries>) CoRedisCli::HGetAll(std::string_view key, const CallOptions& options) {
+    const auto state = state_;
+    auto value = bbt_co_await state->Execute({"HGETALL", std::string(key)}, options);
+    if (!value) { return result<HashEntries>::err(std::move(value.error())); }
+    const auto& elements = value.value().elements;
+    HashEntries entries;
+    entries.reserve(elements.size() / 2);
+    for (std::size_t i = 0; i + 1 < elements.size(); i += 2) {
+        entries.emplace_back(elements[i].str, elements[i + 1].str);
+    }
+    // 奇数/含 nil 的数组已被 ExpectedReply 拒绝并退役连接（不会到达这里）：
+    // 能进配对循环的元素必定偶数且非 nil。
+    return result<HashEntries>::ok(std::move(entries));
 }
 } // namespace bbt::infra::redis

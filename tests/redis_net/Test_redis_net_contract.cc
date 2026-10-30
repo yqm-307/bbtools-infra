@@ -1,5 +1,6 @@
 #include "TestSupport.hpp"
 #include <bbt/infra/redis/detail/PoolTestAccess.hpp>
+#include <bbt/infra/redis/detail/RedisDetail.hpp>
 #include "../net/ProcessRuntimeTestMain.hpp"
 
 #include <bbt/coroutine/detail/Coroutine.hpp>
@@ -738,6 +739,7 @@ void PoolClose() {
 }
 
 #include "PoolCases.hpp"
+#include "DataPlaneCases.hpp"
 
 int Run(int argc, char** argv) {
     Watchdog watchdog;
@@ -786,6 +788,15 @@ int Run(int argc, char** argv) {
         else if (name == "pool_concurrent") { PoolConcurrent(); }
         else if (name == "pool_overloaded") { PoolOverloaded(); }
         else if (name == "pool_close") { PoolClose(); }
+        else if (name == "set_options_contract") { SetOptionsContract(); }
+        else if (name == "expire_ttl_contract") { ExpireTtlContract(); }
+        else if (name == "incr_family_contract") { IncrFamilyContract(); }
+        else if (name == "hash_contract") { HashContract(); }
+        else if (name == "handshake_auth_select") { HandshakeAuthSelect(); }
+        else if (name == "pool_new_commands") { PoolNewCommands(); }
+        else if (name == "pool_handshake_auth") { PoolHandshakeAuth(); }
+        else if (name == "hgetall_protocol_faults") { HgetallProtocolFaults(); }
+        else if (name == "close_during_handshake") { CloseDuringHandshake(); }
         else { throw std::runtime_error("unknown case: " + name); }
         CHECK(!RealRedis::CleanupFailed());
         CHECK(g_readers.load() == 0 && g_reader_created.load() == g_reader_freed.load());

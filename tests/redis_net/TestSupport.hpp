@@ -25,6 +25,7 @@
 #include <memory>
 #include <mutex>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -267,6 +268,8 @@ public:
         m_keys.push_back(key);
         return key;
     }
+    // 本用例唯一 key 前缀（也用作 ACL 键域 ~<prefix>*）。
+    const std::string& Prefix() const { return m_prefix; }
     Reply Command(std::vector<std::string> args) {
         std::vector<const char*> argv;
         std::vector<std::size_t> lengths;

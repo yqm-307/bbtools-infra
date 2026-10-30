@@ -19,6 +19,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <bbt/coroutine/syntax/Async.hpp>
 
@@ -36,6 +37,26 @@ inline constexpr std::size_t kMongoLimitsMaxWorkerThreads = 8;
 inline constexpr std::size_t kMongoLimitsMaxQueue         = 1000000;
 inline constexpr std::chrono::milliseconds kMongoLimitsMaxTimeout{
     std::chrono::minutes{10}};
+
+// ---- 多文档数据面的公共上限（一次性内存物化边界；违规在接纳前返回 ----
+// ---- InvalidArgument，零接纳、什么都不发）----
+// InsertMany 批量上限：文档数 ≤ 500 且提交的总 BSON 字节 ≤ 8 MiB
+// （依据：MongoDB 单条命令/文档的 16 MiB BSON 上限，预留约一半余量给
+// 命令封套与 insert 参数，防止单次调用物化出接近协议上限的命令）。
+inline constexpr std::size_t kMongoLimitsMaxInsertDocs      = 500;
+inline constexpr std::size_t kMongoLimitsMaxInsertTotalBytes =
+    8u * 1024u * 1024u;
+// 单份 BSON 输入文档的上限：filter/update/sort/projection 以及 InsertMany
+// 列表中的单文档均不得超 8 MiB（同一命令输入预算，依据同上）。超限在
+// CollSubmit 之前拒绝，越界零接纳。
+inline constexpr std::size_t kMongoLimitsMaxInputDocBytes   =
+    kMongoLimitsMaxInsertTotalBytes;
+// Find 必填 limit 的上界：单次物化 ≤ 1000 行且返回文档总字节 ≤ 16 MiB
+// （依据：一页数据的内存物化上限，杜绝无界游标物化 OOM；更大结果集
+// 走分页或流式，属已知 ceiling，需要时再扩）。
+inline constexpr std::size_t kMongoLimitsMaxFindLimit       = 1000;
+inline constexpr std::size_t kMongoLimitsMaxFindResultBytes =
+    16u * 1024u * 1024u;
 
 // CoMongoDb 装配参数（owner 级资源预算）。本切片一个 owner 绑定一组
 // worker + 一条接纳队列 + 一个生效 URI 的 pool lease；database/
@@ -109,17 +130,56 @@ inline result<void> ValidateMongoTarget(const MongoTarget& t) {
     return result<void>::ok();
 }
 
+// FindOptions：多文档 Find 的谓词选项。limit **必填**（调用方必须显式给出），
+// 杜绝无界游标物化——limit==0 或 > kMongoLimitsMaxFindLimit 都在接纳前
+// 返回 InvalidArgument；skip 为分页偏移（0 起），> INT64_MAX 无法交给
+// driver，同样在接纳前 InvalidArgument（不另设分页上限——driver 的
+// int64 表示范围即边界）。sort/projection 为可选 BSON 文档（MongoDocument），
+// bytes 为空视为未设置；filter/sort/projection 任一字节数超
+// kMongoLimitsMaxInputDocBytes 也在接纳前 InvalidArgument。
+// 返回侧另有一道硬上限：命中文档累计 BSON 字节超
+// kMongoLimitsMaxFindResultBytes 时返回明确错误（RemoteError，
+// domain_code="result_too_large"）而不是 OOM。
+struct FindOptions {
+    std::size_t      limit = 0;                  // 必填：每页行数上限
+    std::size_t      skip = 0;                   // 分页偏移
+    MongoDocument    sort{};                     // 可选：BSON sort 文档
+    MongoDocument    projection{};               // 可选：BSON projection 文档
+};
+
+// InsertMany 的回执：有序批量插入的服务端结果。
+// 部分成功契约（调用方据此观察）：
+//   - 全部成功 → ok(result)，inserted == docs.size()；
+//   - 有序插入中途失败（如重复 _id）→ err(RemoteError)，此前已成功的
+//     文档**已保留**在服务端；调用方通过错误通道观察部分成功：
+//     Error.details["inserted_count"] 携带服务端回执的已写入数（来自
+//     raw reply 的 nInserted/n，或 ordered 写入时首个 writeErrors.index，
+//     三键任一可用时给出；服务端均未给出时该键缺省），
+//     Error.details["requested_count"] 携带请求总数，
+//     Error.details["failed_index"] 携带首个失败下标（服务端给出时）；
+//     domain_code/backend_code 仍承载服务端 codeName/code。
+struct MongoInsertManyResult {
+    std::uint64_t inserted = 0;
+};
+
 // CoMongoColl：集合句柄（轻量目标值 + owner 引用）。句柄不拥有
 // worker/队列/pool；Close() 只封该句柄的接纳与新命令前置校验（幂等、
 // 任意线程），不影响同 owner 的兄弟句柄，也不等待 owner 在途归零。
 //
-// 等待入口：4 个 CRUD 用上游 bbt_co_async 标记返回类型，调用方必须经
+// 等待入口：CRUD 用上游 bbt_co_async 标记返回类型，调用方必须经
 // bbt_co_await 消费（`auto r = bbt_co_await coll->FindOne(...)`）。标记只
 // 附加返回类型、不改变实现与语义；只有写了 await 的表达式才会在非协程域先撞
 // AwaitHelper 的 std::logic_error（早于本组件的 InvalidContext 校验）。漏写
 // await 直接持有返回值的调用不被静态拦住、函数体照常执行，故这不是协程外
 // 调用的完整静态强制。
 // Create/Start/Collection/Close 不挂起，保持裸 result<void>/void。
+//
+// 空 filter 的语义边界（本任务的一条设计决定，可被推翻）：
+//   - UpdateMany / DeleteMany 一律拒绝空 filter（bytes 为空或 `{}` 空
+//     文档）→ InvalidArgument：防止一句空谓词误改/误删全集合。要全量
+//     更新/删除须写显式匹配条件（如 `{"_id":{"$exists":true}}`）；
+//   - Find / CountDocuments 的空 filter 是合法的「全集合」谓词；
+//   - InsertOne/FindOne/UpdateOne/DeleteOne 沿用既有校验（bytes 空拒绝）。
 class CoMongoColl : public ICoNetwork, public ICoCloseable {
 public:
     // 句柄级命令：语义与 CoMongoCli 同名方法一致，差别只在目标集合
@@ -132,6 +192,44 @@ public:
         const MongoDocument& filter, const MongoDocument& update,
         const CallOptions&   options) = 0;
     virtual bbt_co_async(result<std::uint64_t>) DeleteOne(
+        const MongoDocument& filter, const CallOptions& options) = 0;
+
+    // ---- 多文档数据面（data-plane-1030）----
+    // InsertMany：有序批量插入。空列表、文档数 > kMongoLimitsMaxInsertDocs、
+    // 总 BSON 字节 > kMongoLimitsMaxInsertTotalBytes、列表内含空/非法文档
+    // → InvalidArgument（零接纳）。全部成功 → inserted == docs.size()；
+    // 中途失败 → RemoteError + details 计数（见 MongoInsertManyResult 注释）。
+    virtual bbt_co_async(result<MongoInsertManyResult>) InsertMany(
+        const std::vector<MongoDocument>& docs,
+        const CallOptions&                options) = 0;
+
+    // Find：多文档读取。filter 可为空（匹配全部）；options.limit 必填且
+    // ≤ kMongoLimitsMaxFindLimit，options.skip ≤ INT64_MAX，filter/sort/
+    // projection 各自 BSON ≤ kMongoLimitsMaxInputDocBytes，否则
+    // InvalidArgument（零接纳）。返回按游标顺序物化的命中页；无匹配返回
+    // 空 vector（不是 NotFound）。返回总字节超
+    // kMongoLimitsMaxFindResultBytes → RemoteError(domain_code=
+    // "result_too_large")。
+    virtual bbt_co_async(result<std::vector<MongoDocument>>) Find(
+        const MongoDocument& filter, const FindOptions& find_options,
+        const CallOptions&   options) = 0;
+
+    // UpdateMany：复用 UpdateOne 的 update 文档校验；空 filter 一律
+    // InvalidArgument（语义边界见类注释）；filter/update 任一 BSON 超
+    // kMongoLimitsMaxInputDocBytes 同样 InvalidArgument（零接纳）。
+    // 返回 matched/modified/upserted。
+    virtual bbt_co_async(result<MongoUpdateResult>) UpdateMany(
+        const MongoDocument& filter, const MongoDocument& update,
+        const CallOptions&   options) = 0;
+
+    // DeleteMany：空 filter 一律 InvalidArgument；filter BSON 超
+    // kMongoLimitsMaxInputDocBytes 同样 InvalidArgument。返回删除数量。
+    virtual bbt_co_async(result<std::uint64_t>) DeleteMany(
+        const MongoDocument& filter, const CallOptions& options) = 0;
+
+    // CountDocuments：精确计数。filter 可为空（统计全集合）；filter BSON
+    // 超 kMongoLimitsMaxInputDocBytes → InvalidArgument。
+    virtual bbt_co_async(result<std::uint64_t>) CountDocuments(
         const MongoDocument& filter, const CallOptions& options) = 0;
 };
 

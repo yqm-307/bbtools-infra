@@ -1,4 +1,4 @@
-// Issue #7 真实 MongoDB 容器验收（docker compose 起 mongo:8.0，
+// Issue #7 真实 MongoDB 容器验收（docker compose 起 mongo:7.0，
 // cpus<=0.75 / mem_limit<=512m / wiredTigerCacheSizeGB=0.25 / 动态项目名，
 // 编排见 tests/mongo-live/run.sh）：
 //
@@ -46,6 +46,15 @@
 #include <bsoncxx/document/view.hpp>
 #include <bsoncxx/json.hpp>
 #include <bsoncxx/types.hpp>
+
+// dp_* 用例的 RAII 清理只落自有命名空间（每次运行独占 db/collection）：
+// 需要 drop_collection + list_collection_names 读回——client 经进程级
+// MongoPoolLease（MongoProcess.hpp 既有机制）借用，复用已建立的
+// instance/pool；mongocxx 类型仅测试侧使用，不进公开面。
+#include <mongocxx/v1/client.hpp>
+#include <mongocxx/v1/collection.hpp>
+#include <mongocxx/v1/database.hpp>
+#include <mongocxx/v1/pool.hpp>
 
 #include <bbt/core/thread/Lock.hpp>
 #include <bbt/coroutine/detail/Define.hpp>
@@ -314,6 +323,102 @@ long long NowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
+}
+
+// ---- data-plane-1030：每次运行独占命名空间 + RAII 清理 ----
+// 每个 dp_* 与阻塞注入用例使用每次运行独占的 db/collection
+// （bbt_dp_<pid>_<seq>_<tag>.c），互不触碰共享 bbt_live 的任何文档；
+// 结束经 DpNsGuard 在成功与 BOOST_REQUIRE 异常路径上都 drop 自有
+// collection 并读回 list_collection_names 确认为空。client 经进程级
+// MongoPoolLease（MongoProcess.hpp 既有机制）借用，复用已建立的
+// instance/pool——mongocxx 类型仅测试侧使用，不进公开面。
+//
+// 清理失败必须让用例失败：清理动作收进 Finish()（noexcept、幂等），
+// 用例末尾显式 BOOST_CHECK(ns.Finish()) 断言；析构兜底调用 Finish()
+// 覆盖 BOOST_REQUIRE 异常展开路径，失败同时记入共享原子
+// g_dp_ns_cleanup_failed——日志不再能掩盖残留，析构自身不抛。
+std::atomic_bool g_dp_ns_cleanup_failed{false};
+
+std::string DpDbName(const char* tag) {
+    static std::atomic_int seq{0};
+    return "bbt_dp_" + std::to_string(::getpid()) + "_" +
+           std::to_string(seq.fetch_add(1)) + "_" + tag;
+}
+
+class DpNsGuard {
+public:
+    explicit DpNsGuard(std::string dbname) : m_db(std::move(dbname)) {}
+    ~DpNsGuard() noexcept { (void)Finish(); }
+    // drop 自有 collection 并读回确认为空；true=清理完成。任意失败
+    // （缺 URI、pool 获取失败、drop 抛异常、读回仍列出集合）返回 false
+    // 并置位 g_dp_ns_cleanup_failed。
+    bool Finish() noexcept {
+        if (m_cleaned)
+            return !m_failed;
+        m_cleaned = true;
+        const char* uri = EnvOr("BBT_TEST_MONGO_URI");
+        if (uri == nullptr) {
+            m_failed = true;
+            g_dp_ns_cleanup_failed.store(true);
+            return false;
+        }
+        // AcquireMongoPool 以 URI 为键复用进程级 instance/pool：同一 env
+        // URI 本用例 owner 已建立过 lease，此处直接共享。
+        auto lease = mongo_detail::AcquireMongoPool(uri);
+        if (!lease) {
+            std::fprintf(stderr, "dp guard: acquire pool failed: %s\n",
+                         lease.error().message.c_str());
+            m_failed = true;
+            g_dp_ns_cleanup_failed.store(true);
+            return false;
+        }
+        try {
+            auto cli = lease.value()->pool.acquire();
+            auto db  = cli->database(m_db);
+            db.collection("c").drop();
+            bool gone = true;
+            for (auto&& name : db.list_collection_names())
+                if (name == "c")
+                    gone = false;
+            if (!gone) {
+                std::fprintf(stderr,
+                             "dp guard: collection c still listed in %s\n",
+                             m_db.c_str());
+                m_failed = true;
+                g_dp_ns_cleanup_failed.store(true);
+            }
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "dp guard: drop %s failed: %s\n",
+                         m_db.c_str(), e.what());
+            m_failed = true;
+            g_dp_ns_cleanup_failed.store(true);
+        }
+        return !m_failed;
+    }
+    const std::string& Name() const { return m_db; }
+    DpNsGuard(const DpNsGuard&)            = delete;
+    DpNsGuard& operator=(const DpNsGuard&) = delete;
+
+private:
+    std::string m_db;
+    bool        m_cleaned = false;
+    bool        m_failed  = false;
+};
+
+// 兜底断言：dp 用例的清理失败（含异常展开路径上析构记录的那部分）
+// 经共享原子暴露；每个 dp_* 用例末尾调用，保证清理失败无法静默变绿。
+void CheckDpCleanup() {
+    BOOST_CHECK_MESSAGE(
+        !g_dp_ns_cleanup_failed.load(),
+        "DpNsGuard 清理失败：自有命名空间可能残留（见 stderr 细节）");
+}
+
+// 唯一集合句柄：db 名每次运行独占，collection 固定 "c"。
+std::shared_ptr<mongo::CoMongoColl> DpColl(
+    const std::shared_ptr<mongo::CoMongoDb>& db, const std::string& dbname) {
+    auto h = db->Collection({dbname, "c"});
+    BOOST_REQUIRE(h);
+    return std::move(h).value();
 }
 
 // 显式 Close 并在有界窗口内确认真实收口（driver 同步调用不可强杀：
@@ -1206,6 +1311,686 @@ BOOST_AUTO_TEST_CASE(t_backend_blocked_owner_close_closed) {
     BOOST_REQUIRE(WaitUntil([&] { return db2->IsClosed(); }, 15000));
     BOOST_CHECK(db2->IsClosed());
     BOOST_CHECK_EQUAL(rt2->LiveWorkersForTest(), std::size_t{0});
+}
+
+// ==================== 多文档数据面 live（data-plane-1030）====================
+// 真实服务端验收：命名空间隔离与 RAII 清理用上面的 DpDbName/DpNsGuard/
+// DpColl（定义见文件头部匿名 ns）。断言全部读回（Find/Count），不只
+// 断言回执计数。
+
+namespace {
+
+// details 中首个 key 的值（缺省返回 nullopt，不把「缺省」当 0）。
+std::optional<std::string> DetailOf(const Error& e, const char* key) {
+    for (const auto& kv : e.details)
+        if (kv.first == key)
+            return kv.second;
+    return std::nullopt;
+}
+
+// 文档字段（int32/int64 统一按 int64 读）。
+std::optional<std::int64_t> FieldInt(const MongoDocument& d, const char* k) {
+    bsoncxx::document::view v{d.bytes.data(), d.bytes.size()};
+    const auto e = v[k];
+    if (!e)
+        return std::nullopt;
+    if (e.type() == bsoncxx::type::k_int32) return e.get_int32().value;
+    if (e.type() == bsoncxx::type::k_int64) return e.get_int64().value;
+    return std::nullopt;
+}
+
+bool HasField(const MongoDocument& d, const char* k) {
+    bsoncxx::document::view v{d.bytes.data(), d.bytes.size()};
+    return static_cast<bool>(v[k]);
+}
+
+} // namespace
+
+// InsertMany：全量成功 + 有序中途失败（重复 _id）三段证明——
+//   doc1 新 _id 成功、doc2 重复已有 _id 中止、doc3 未执行；
+//   失败后 Find/Count 读回：doc1 在、doc3 不在。details.requested_count
+//   承载请求总数，inserted_count/failed_index 服务端给出时才断言。
+BOOST_AUTO_TEST_CASE(t_dp_insert_many) {
+    if (!LiveEnabled() || !PhaseIs('A')) {
+        BOOST_TEST_MESSAGE("skip: 需要 BBT_TEST_MONGO_URI 且 PHASE=A");
+        return;
+    }
+    auto d = mongo::CoMongoDb::Create(LiveRuntimeConfig(2, 16));
+    BOOST_REQUIRE(d);
+    auto db = std::move(d).value();
+    OwnerCloseGuard g{db};
+    BOOST_REQUIRE(db->Start());
+    DpNsGuard ns{DpDbName("im")};
+    auto coll = DpColl(db, ns.Name());
+
+    const std::string tag = "bbt:dp:im";
+    // 预置一条会与批量第二条撞 _id 的文档。
+    const MongoDocument seed =
+        JsonDoc("{\"_id\":\"" + tag + ":seed\",\"k\":0}");
+    {
+        std::optional<result<void>> ins;
+        BOOST_REQUIRE(RunInCoroutine(
+            [&] { ins.emplace(bbt_co_await coll->InsertOne(seed, Opt())); }));
+        BOOST_REQUIRE(ins && *ins);
+    }
+
+    // 全量成功：3 条新 _id。
+    {
+        std::vector<MongoDocument> docs;
+        for (int i = 0; i < 3; ++i)
+            docs.push_back(JsonDoc("{\"_id\":\"" + tag + ":ok:" +
+                                   std::to_string(i) + "\",\"k\":" +
+                                   std::to_string(i) + "}"));
+        std::optional<result<mongo::MongoInsertManyResult>> r;
+        BOOST_REQUIRE(RunInCoroutine(
+            [&] { r.emplace(bbt_co_await coll->InsertMany(docs, Opt())); }));
+        BOOST_REQUIRE(r && *r);
+        BOOST_CHECK_EQUAL(r->value().inserted, 3u);
+    }
+    // 读回证明 3 条全在。
+    {
+        mongo::FindOptions fo;
+        fo.limit = 10;
+        const auto filter = JsonDoc("{\"_id\":{\"$regex\":\"^" + tag + ":ok:\"}}");
+        std::optional<result<std::vector<MongoDocument>>> f;
+        BOOST_REQUIRE(RunInCoroutine(
+            [&] { f.emplace(bbt_co_await coll->Find(filter, fo, Opt())); }));
+        BOOST_REQUIRE(f && *f);
+        BOOST_CHECK_EQUAL(f->value().size(), 3u);
+    }
+
+    // 有序中途失败：第 1 条新 _id 成功、第 2 条重复已有 seed 中止、
+    // 第 3 条未执行。
+    const std::string id_first  = tag + ":first";
+    const std::string id_third  = tag + ":third";
+    std::optional<result<mongo::MongoInsertManyResult>> r;
+    {
+        std::vector<MongoDocument> docs{
+            JsonDoc("{\"_id\":\"" + id_first + "\",\"k\":1}"),
+            JsonDoc("{\"_id\":\"" + tag + ":seed\",\"k\":2}"),   // 重复
+            JsonDoc("{\"_id\":\"" + id_third + "\",\"k\":3}"),   // 未执行
+        };
+        BOOST_REQUIRE(RunInCoroutine(
+            [&] { r.emplace(bbt_co_await coll->InsertMany(docs, Opt())); }));
+    }
+    BOOST_REQUIRE(!*r);
+    BOOST_CHECK(r->error().code == ErrorCode::RemoteError);
+    BOOST_CHECK_EQUAL(r->error().domain_code, "DuplicateKey");
+    BOOST_CHECK_EQUAL(r->error().backend_code, 11000);
+    // 本层补齐的请求总数恒在。
+    auto req = DetailOf(r->error(), "requested_count");
+    BOOST_REQUIRE(req.has_value());
+    BOOST_CHECK_EQUAL(*req, "3");
+    // 服务端给出 inserted_count/failed_index 时逐值断言（契约：给出时才有）。
+    if (auto v = DetailOf(r->error(), "inserted_count"))
+        BOOST_CHECK_EQUAL(*v, "1");
+    if (auto v = DetailOf(r->error(), "failed_index"))
+        BOOST_CHECK_EQUAL(*v, "1");
+
+    // 读回证明部分成功契约：first 已写入、third 不存在。
+    {
+        mongo::FindOptions fo;
+        fo.limit = 10;
+        std::optional<result<std::vector<MongoDocument>>> f;
+        BOOST_REQUIRE(RunInCoroutine([&] {
+            f.emplace(bbt_co_await coll->Find(
+                JsonDoc("{\"_id\":\"" + id_first + "\"}"), fo, Opt()));
+        }));
+        BOOST_REQUIRE(f && *f);
+        BOOST_CHECK_EQUAL(f->value().size(), 1u);
+    }
+    {
+        mongo::FindOptions fo;
+        fo.limit = 10;
+        std::optional<result<std::vector<MongoDocument>>> f;
+        BOOST_REQUIRE(RunInCoroutine([&] {
+            f.emplace(bbt_co_await coll->Find(
+                JsonDoc("{\"_id\":\"" + id_third + "\"}"), fo, Opt()));
+        }));
+        BOOST_REQUIRE(f && *f);
+        BOOST_CHECK_EQUAL(f->value().size(), 0u);
+    }
+
+    // 命名空间由 DpNsGuard::Finish 显式清理并断言（析构兜底异常路径）。
+    coll->Close();
+    BOOST_CHECK(ns.Finish());
+    CheckDpCleanup();
+}
+
+// Find 逐项语义：sort 顺序、projection 字段集合、skip/limit 页大小、
+// 无匹配空 vector、空 filter 全集合——全部经读回文档断言，不回执猜测。
+BOOST_AUTO_TEST_CASE(t_dp_find_semantics) {
+    if (!LiveEnabled() || !PhaseIs('A')) {
+        BOOST_TEST_MESSAGE("skip: 需要 BBT_TEST_MONGO_URI 且 PHASE=A");
+        return;
+    }
+    auto d = mongo::CoMongoDb::Create(LiveRuntimeConfig(2, 16));
+    BOOST_REQUIRE(d);
+    auto db = std::move(d).value();
+    OwnerCloseGuard g{db};
+    BOOST_REQUIRE(db->Start());
+    DpNsGuard ns{DpDbName("find")};
+    auto coll = DpColl(db, ns.Name());
+
+    const std::string tag = "bbt:dp:find";
+    {
+        std::vector<MongoDocument> docs;
+        for (int i = 0; i < 5; ++i)
+            docs.push_back(JsonDoc("{\"_id\":\"" + tag + ":" +
+                                   std::to_string(i) + "\",\"k\":" +
+                                   std::to_string(i) +
+                                   ",\"v\":\"x" + std::to_string(i) + "\"}"));
+        std::optional<result<mongo::MongoInsertManyResult>> r;
+        BOOST_REQUIRE(RunInCoroutine(
+            [&] { r.emplace(bbt_co_await coll->InsertMany(docs, Opt())); }));
+        BOOST_REQUIRE(r && *r);
+    }
+    const auto all = JsonDoc("{\"_id\":{\"$regex\":\"^" + tag + ":\"}}");
+
+    // sort：{k:-1} 降序——读回每条的 k 逐项核对 4,3,2,1,0。
+    {
+        mongo::FindOptions fo;
+        fo.limit = 10;
+        fo.sort  = JsonDoc("{\"k\":-1}");
+        std::optional<result<std::vector<MongoDocument>>> f;
+        BOOST_REQUIRE(RunInCoroutine(
+            [&] { f.emplace(bbt_co_await coll->Find(all, fo, Opt())); }));
+        BOOST_REQUIRE(f && *f);
+        BOOST_REQUIRE_EQUAL(f->value().size(), 5u);
+        for (std::size_t i = 0; i < 5; ++i) {
+            auto k = FieldInt(f->value()[i], "k");
+            BOOST_REQUIRE(k.has_value());
+            BOOST_CHECK_EQUAL(*k, static_cast<std::int64_t>(4 - i));
+        }
+    }
+    // sort：{k:1} 升序 0..4。
+    {
+        mongo::FindOptions fo;
+        fo.limit = 10;
+        fo.sort  = JsonDoc("{\"k\":1}");
+        std::optional<result<std::vector<MongoDocument>>> f;
+        BOOST_REQUIRE(RunInCoroutine(
+            [&] { f.emplace(bbt_co_await coll->Find(all, fo, Opt())); }));
+        BOOST_REQUIRE(f && *f);
+        BOOST_REQUIRE_EQUAL(f->value().size(), 5u);
+        for (std::size_t i = 0; i < 5; ++i) {
+            auto k = FieldInt(f->value()[i], "k");
+            BOOST_REQUIRE(k.has_value());
+            BOOST_CHECK_EQUAL(*k, static_cast<std::int64_t>(i));
+        }
+    }
+    // projection {v:0,_id:0}：返回文档只有 k，没有 v/_id（字段集合精确）。
+    {
+        mongo::FindOptions fo;
+        fo.limit = 10;
+        fo.sort  = JsonDoc("{\"k\":1}");
+        fo.projection = JsonDoc("{\"v\":0,\"_id\":0}");
+        std::optional<result<std::vector<MongoDocument>>> f;
+        BOOST_REQUIRE(RunInCoroutine(
+            [&] { f.emplace(bbt_co_await coll->Find(all, fo, Opt())); }));
+        BOOST_REQUIRE(f && *f);
+        BOOST_REQUIRE_EQUAL(f->value().size(), 5u);
+        for (const auto& doc : f->value()) {
+            BOOST_CHECK(HasField(doc, "k"));
+            BOOST_CHECK(!HasField(doc, "v"));
+            BOOST_CHECK(!HasField(doc, "_id"));
+        }
+    }
+    // skip/limit：升序 skip=1 limit=2 → 命中 k==1,2（页边界）。
+    {
+        mongo::FindOptions fo;
+        fo.limit = 2;
+        fo.skip  = 1;
+        fo.sort  = JsonDoc("{\"k\":1}");
+        std::optional<result<std::vector<MongoDocument>>> f;
+        BOOST_REQUIRE(RunInCoroutine(
+            [&] { f.emplace(bbt_co_await coll->Find(all, fo, Opt())); }));
+        BOOST_REQUIRE(f && *f);
+        BOOST_REQUIRE_EQUAL(f->value().size(), 2u);
+        BOOST_CHECK_EQUAL(*FieldInt(f->value()[0], "k"), 1);
+        BOOST_CHECK_EQUAL(*FieldInt(f->value()[1], "k"), 2);
+    }
+    // 无匹配 → 空 vector（不是 NotFound）。
+    {
+        mongo::FindOptions fo;
+        fo.limit = 10;
+        std::optional<result<std::vector<MongoDocument>>> f;
+        BOOST_REQUIRE(RunInCoroutine([&] {
+            f.emplace(bbt_co_await coll->Find(
+                JsonDoc("{\"_id\":\"bbt:dp:find:none\"}"), fo, Opt()));
+        }));
+        BOOST_REQUIRE(f && *f);
+        BOOST_CHECK_EQUAL(f->value().size(), 0u);
+    }
+    // 空 filter（未初始化 MongoDocument）匹配全部 5 条。
+    {
+        mongo::FindOptions fo;
+        fo.limit = 10;
+        std::optional<result<std::vector<MongoDocument>>> f;
+        BOOST_REQUIRE(RunInCoroutine(
+            [&] { f.emplace(bbt_co_await coll->Find(MongoDocument{}, fo, Opt())); }));
+        BOOST_REQUIRE(f && *f);
+        BOOST_CHECK_EQUAL(f->value().size(), 5u);
+    }
+
+    coll->Close();
+    BOOST_CHECK(ns.Finish());
+    CheckDpCleanup();
+}
+
+// Find 返回字节上限（kMongoLimitsMaxFindResultBytes=16 MiB）：48 条各
+// ~400 KiB 的文档累计 ~19 MiB，逐条物化时总字节越界——返回明确
+// RemoteError(domain_code="result_too_large") 而不是 OOM/截断。
+BOOST_AUTO_TEST_CASE(t_dp_find_result_bytes) {
+    if (!LiveEnabled() || !PhaseIs('A')) {
+        BOOST_TEST_MESSAGE("skip: 需要 BBT_TEST_MONGO_URI 且 PHASE=A");
+        return;
+    }
+    auto d = mongo::CoMongoDb::Create(LiveRuntimeConfig(2, 16));
+    BOOST_REQUIRE(d);
+    auto db = std::move(d).value();
+    OwnerCloseGuard g{db};
+    BOOST_REQUIRE(db->Start());
+    DpNsGuard ns{DpDbName("bytes")};
+    auto coll = DpColl(db, ns.Name());
+
+    // 每条约 400 KiB × 8 条/批 × 6 批共 48 条 ~19 MiB：每批 ~3.2 MiB 在
+    // InsertMany 的 8 MiB 上限内合法写入；Find 累计 ~19 MiB > 16 MiB
+    // 结果物化上限，逐条累加越界即 RemoteError。
+    const std::string tag = "bbt:dp:bytes";
+    const std::string big(400 * 1024, 'x');
+    for (int batch = 0; batch < 6; ++batch) {
+        std::vector<MongoDocument> docs;
+        for (int i = 0; i < 8; ++i)
+            docs.push_back(JsonDoc(
+                "{\"_id\":\"" + tag + ":" + std::to_string(batch * 8 + i) +
+                "\",\"pad\":\"" + big + "\"}"));
+        std::optional<result<mongo::MongoInsertManyResult>> r;
+        BOOST_REQUIRE(RunInCoroutine(
+            [&] { r.emplace(bbt_co_await coll->InsertMany(docs, Opt(30000))); }));
+        BOOST_REQUIRE(r && *r);
+    }
+    // 命中文档累计字节超 kMongoLimitsMaxFindResultBytes → RemoteError。
+    mongo::FindOptions fo;
+    fo.limit = mongo::kMongoLimitsMaxFindLimit;   // 行数界内，字节超限
+    std::optional<result<std::vector<MongoDocument>>> f;
+    BOOST_REQUIRE(RunInCoroutine([&] {
+        f.emplace(bbt_co_await coll->Find(MongoDocument{}, fo, Opt(30000)));
+    }));
+    BOOST_REQUIRE(!*f);
+    BOOST_CHECK(f->error().code == ErrorCode::RemoteError);
+    BOOST_CHECK_EQUAL(f->error().domain_code, "result_too_large");
+
+    coll->Close();
+    BOOST_CHECK(ns.Finish());
+    CheckDpCleanup();
+}
+
+// UpdateMany：matched/modified 回执 + 读回断言；空 filter 拒绝不删全表。
+BOOST_AUTO_TEST_CASE(t_dp_update_many) {
+    if (!LiveEnabled() || !PhaseIs('A')) {
+        BOOST_TEST_MESSAGE("skip: 需要 BBT_TEST_MONGO_URI 且 PHASE=A");
+        return;
+    }
+    auto d = mongo::CoMongoDb::Create(LiveRuntimeConfig(2, 16));
+    BOOST_REQUIRE(d);
+    auto db = std::move(d).value();
+    OwnerCloseGuard g{db};
+    BOOST_REQUIRE(db->Start());
+    DpNsGuard ns{DpDbName("upd")};
+    auto coll = DpColl(db, ns.Name());
+
+    const std::string tag = "bbt:dp:upd";
+    {
+        std::vector<MongoDocument> docs;
+        for (int i = 0; i < 4; ++i)
+            docs.push_back(JsonDoc("{\"_id\":\"" + tag + ":" +
+                                   std::to_string(i) + "\",\"v\":0}"));
+        std::optional<result<mongo::MongoInsertManyResult>> r;
+        BOOST_REQUIRE(RunInCoroutine(
+            [&] { r.emplace(bbt_co_await coll->InsertMany(docs, Opt())); }));
+        BOOST_REQUIRE(r && *r);
+    }
+    const auto all = JsonDoc("{\"_id\":{\"$regex\":\"^" + tag + ":\"}}");
+
+    // matched==4、modified==4：全部命中并被修改。
+    {
+        std::optional<result<MongoUpdateResult>> u;
+        BOOST_REQUIRE(RunInCoroutine([&] {
+            u.emplace(bbt_co_await coll->UpdateMany(
+                all, JsonDoc("{\"$set\":{\"v\":9}}"), Opt()));
+        }));
+        BOOST_REQUIRE(u && *u);
+        BOOST_CHECK_EQUAL(u->value().matched, 4);
+        BOOST_CHECK_EQUAL(u->value().modified, 4);
+    }
+    // 读回：v 已全为 9。
+    {
+        mongo::FindOptions fo;
+        fo.limit = 10;
+        std::optional<result<std::vector<MongoDocument>>> f;
+        BOOST_REQUIRE(RunInCoroutine(
+            [&] { f.emplace(bbt_co_await coll->Find(all, fo, Opt())); }));
+        BOOST_REQUIRE(f && *f);
+        BOOST_REQUIRE_EQUAL(f->value().size(), 4u);
+        for (const auto& doc : f->value()) {
+            auto v = FieldInt(doc, "v");
+            BOOST_REQUIRE(v.has_value());
+            BOOST_CHECK_EQUAL(*v, 9);
+        }
+    }
+    // matched==2、modified==2：谓词 {v:9,_id 前缀 0|1} 只命中两条——
+    // 用显式 filter 证明多文档谓词收窄。
+    {
+        std::optional<result<MongoUpdateResult>> u;
+        BOOST_REQUIRE(RunInCoroutine([&] {
+            u.emplace(bbt_co_await coll->UpdateMany(
+                JsonDoc("{\"_id\":{\"$in\":[\"" + tag + ":0\",\"" + tag +
+                        ":1\"]}}"),
+                JsonDoc("{\"$set\":{\"v\":7}}"), Opt()));
+        }));
+        BOOST_REQUIRE(u && *u);
+        BOOST_CHECK_EQUAL(u->value().matched, 2);
+        BOOST_CHECK_EQUAL(u->value().modified, 2);
+    }
+    // 空 filter → InvalidArgument，不接触服务端（集合仍 4 条）。
+    {
+        std::optional<result<MongoUpdateResult>> u;
+        BOOST_REQUIRE(RunInCoroutine([&] {
+            u.emplace(bbt_co_await coll->UpdateMany(
+                MongoDocument{}, JsonDoc("{\"$set\":{\"v\":0}}"), Opt()));
+        }));
+        BOOST_REQUIRE(!*u);
+        BOOST_CHECK(u->error().code == ErrorCode::InvalidArgument);
+        std::optional<result<std::uint64_t>> cnt;
+        BOOST_REQUIRE(RunInCoroutine(
+            [&] { cnt.emplace(bbt_co_await coll->CountDocuments(all, Opt())); }));
+        BOOST_REQUIRE(cnt && *cnt);
+        BOOST_CHECK_EQUAL(cnt->value(), 4u);
+    }
+
+    coll->Close();
+    BOOST_CHECK(ns.Finish());
+    CheckDpCleanup();
+}
+
+// DeleteMany：返回删除数 + 读回；无匹配删除返回 0。
+BOOST_AUTO_TEST_CASE(t_dp_delete_many) {
+    if (!LiveEnabled() || !PhaseIs('A')) {
+        BOOST_TEST_MESSAGE("skip: 需要 BBT_TEST_MONGO_URI 且 PHASE=A");
+        return;
+    }
+    auto d = mongo::CoMongoDb::Create(LiveRuntimeConfig(2, 16));
+    BOOST_REQUIRE(d);
+    auto db = std::move(d).value();
+    OwnerCloseGuard g{db};
+    BOOST_REQUIRE(db->Start());
+    DpNsGuard ns{DpDbName("del")};
+    auto coll = DpColl(db, ns.Name());
+
+    const std::string tag = "bbt:dp:del";
+    {
+        std::vector<MongoDocument> docs;
+        for (int i = 0; i < 3; ++i)
+            docs.push_back(JsonDoc("{\"_id\":\"" + tag + ":" +
+                                   std::to_string(i) + "\"}"));
+        std::optional<result<mongo::MongoInsertManyResult>> r;
+        BOOST_REQUIRE(RunInCoroutine(
+            [&] { r.emplace(bbt_co_await coll->InsertMany(docs, Opt())); }));
+        BOOST_REQUIRE(r && *r);
+    }
+    const auto all = JsonDoc("{\"_id\":{\"$regex\":\"^" + tag + ":\"}}");
+
+    // DeleteMany 删全部 → 返回 3，读回 CountDocuments==0。
+    {
+        std::optional<result<std::uint64_t>> r;
+        BOOST_REQUIRE(RunInCoroutine(
+            [&] { r.emplace(bbt_co_await coll->DeleteMany(all, Opt())); }));
+        BOOST_REQUIRE(r && *r);
+        BOOST_CHECK_EQUAL(r->value(), 3u);
+        std::optional<result<std::uint64_t>> cnt;
+        BOOST_REQUIRE(RunInCoroutine(
+            [&] { cnt.emplace(bbt_co_await coll->CountDocuments(all, Opt())); }));
+        BOOST_REQUIRE(cnt && *cnt);
+        BOOST_CHECK_EQUAL(cnt->value(), 0u);
+    }
+    // 无匹配删除 → 0。
+    {
+        std::optional<result<std::uint64_t>> r;
+        BOOST_REQUIRE(RunInCoroutine([&] {
+            r.emplace(bbt_co_await coll->DeleteMany(
+                JsonDoc("{\"_id\":\"bbt:dp:del:none\"}"), Opt()));
+        }));
+        BOOST_REQUIRE(r && *r);
+        BOOST_CHECK_EQUAL(r->value(), 0u);
+    }
+    // 空 filter → InvalidArgument。
+    {
+        std::optional<result<std::uint64_t>> r;
+        BOOST_REQUIRE(RunInCoroutine(
+            [&] { r.emplace(bbt_co_await coll->DeleteMany(MongoDocument{}, Opt())); }));
+        BOOST_REQUIRE(!*r);
+        BOOST_CHECK(r->error().code == ErrorCode::InvalidArgument);
+    }
+    coll->Close();
+    BOOST_CHECK(ns.Finish());
+    CheckDpCleanup();
+}
+
+// CountDocuments：带 filter 精确计数、空 filter 统计全集合。
+BOOST_AUTO_TEST_CASE(t_dp_count_documents) {
+    if (!LiveEnabled() || !PhaseIs('A')) {
+        BOOST_TEST_MESSAGE("skip: 需要 BBT_TEST_MONGO_URI 且 PHASE=A");
+        return;
+    }
+    auto d = mongo::CoMongoDb::Create(LiveRuntimeConfig(2, 16));
+    BOOST_REQUIRE(d);
+    auto db = std::move(d).value();
+    OwnerCloseGuard g{db};
+    BOOST_REQUIRE(db->Start());
+    DpNsGuard ns{DpDbName("cnt")};
+    auto coll = DpColl(db, ns.Name());
+
+    const std::string tag = "bbt:dp:cnt";
+    {
+        std::vector<MongoDocument> docs;
+        for (int i = 0; i < 3; ++i)
+            docs.push_back(JsonDoc("{\"_id\":\"" + tag + ":" +
+                                   std::to_string(i) + "\",\"t\":\"s\"}"));
+        docs.push_back(JsonDoc("{\"_id\":\"" + tag + ":o\",\"t\":\"x\"}"));
+        std::optional<result<mongo::MongoInsertManyResult>> r;
+        BOOST_REQUIRE(RunInCoroutine(
+            [&] { r.emplace(bbt_co_await coll->InsertMany(docs, Opt())); }));
+        BOOST_REQUIRE(r && *r);
+    }
+    const auto all = JsonDoc("{\"_id\":{\"$regex\":\"^" + tag + ":\"}}");
+
+    // 带 filter：t==s 命中 3。
+    {
+        std::optional<result<std::uint64_t>> r;
+        BOOST_REQUIRE(RunInCoroutine([&] {
+            r.emplace(bbt_co_await coll->CountDocuments(
+                JsonDoc("{\"t\":\"s\",\"_id\":{\"$regex\":\"^" + tag + ":\"}}"),
+                Opt()));
+        }));
+        BOOST_REQUIRE(r && *r);
+        BOOST_CHECK_EQUAL(r->value(), 3u);
+    }
+    // 空 filter：统计全集合（4 条）。
+    {
+        std::optional<result<std::uint64_t>> r;
+        BOOST_REQUIRE(RunInCoroutine([&] {
+            r.emplace(bbt_co_await coll->CountDocuments(MongoDocument{}, Opt()));
+        }));
+        BOOST_REQUIRE(r && *r);
+        BOOST_CHECK_EQUAL(r->value(), 4u);
+    }
+    // 显式 {} 空文档同样合法（全集合）。
+    {
+        std::optional<result<std::uint64_t>> r;
+        BOOST_REQUIRE(RunInCoroutine([&] {
+            r.emplace(bbt_co_await coll->CountDocuments(JsonDoc("{}"), Opt()));
+        }));
+        BOOST_REQUIRE(r && *r);
+        BOOST_CHECK_EQUAL(r->value(), 4u);
+    }
+
+    coll->Close();
+    BOOST_CHECK(ns.Finish());
+    CheckDpCleanup();
+}
+
+// data-plane-1030 修复：新 Find 入口「已进入 native driver 后再 Close」的
+// 真实后端阶段证据。failCommand(blockConnection) 把目标 find 停在服务端
+// 应答上，waitForFailPoint 握手确认命令确已进入该阻塞（不靠执行槽计数或
+// sleep 猜阶段），随后独立线程发起 owner Close：
+//   - 在途 Find 先收到 Closed 逻辑终态（Close 返回前、driver 仍在执行槽内）；
+//   - Close 返回当刻 IsClosed + worker/执行槽归零（非提前宣告）；
+//   - 迟到 driver 结果不覆盖已交付的 Closed。
+// 缺 BBT_MONGO_CTL_EVAL 时显式失败，不静默变绿（同 #34 两例）。
+BOOST_AUTO_TEST_CASE(t_dp_find_blocked_owner_close) {
+    if (!LiveEnabled() || !PhaseIs('A')) {
+        BOOST_TEST_MESSAGE("skip: 需要 BBT_TEST_MONGO_URI 且 PHASE=A");
+        return;
+    }
+    BOOST_REQUIRE_MESSAGE(
+        ControlPrefix() != nullptr,
+        "BBT_MONGO_CTL_EVAL 未注入：无法在后端确认命令进入阻塞，不得 skip 变绿");
+
+    constexpr int kBlockMs = 8000;
+    auto d = mongo::CoMongoDb::Create(BlockRuntimeConfig(1));
+    BOOST_REQUIRE(d);
+    auto db = std::move(d).value();
+    OwnerCloseGuard close_guard{db};
+    BOOST_REQUIRE(db->Start());
+    DpNsGuard ns{DpDbName("fclose")};
+    auto coll = DpColl(db, ns.Name());
+    auto rt   = RuntimeOfColl(coll);
+    BOOST_REQUIRE(rt);
+
+    // 健康基线：注入前该 owner 上真实 CRUD 闭环（新入口）。
+    {
+        struct BaseState {
+            std::atomic_bool                     done{false};
+            std::optional<result<void>>          ins;
+            std::optional<result<std::uint64_t>> del;
+        };
+        const MongoDocument base =
+            JsonDoc(R"({"_id":"bbt:dp:fb:base","v":"base"})");
+        const MongoDocument basef = JsonDoc(R"({"_id":"bbt:dp:fb:base"})");
+        auto                bst   = std::make_shared<BaseState>();
+        BOOST_REQUIRE(RunHeapOp(bst, [coll, base, basef](BaseState& s) {
+            s.ins.emplace(bbt_co_await coll->InsertOne(base, Opt()));
+            s.del.emplace(bbt_co_await coll->DeleteOne(basef, Opt()));
+        }));
+        BOOST_REQUIRE(bst->ins && *bst->ins);
+        BOOST_REQUIRE(bst->del && *bst->del && bst->del->value() == 1u);
+    }
+
+    struct FindOpState {
+        std::atomic_bool                      done{false};
+        std::atomic_bool                      inflight_at_return{false};
+        std::atomic<long long>                t_op_done_ns{0};
+        std::optional<result<std::vector<MongoDocument>>> out;
+    };
+    auto op = std::make_shared<FindOpState>();
+
+    FailpointGuard fp;
+    auto           arm = MongoExec(ArmBlockingFailpoint("find", kBlockMs));
+    fp.Armed();
+    const auto base_count =
+        arm.rc == 0 ? JsonIntField(arm.out, "count") : std::nullopt;
+    BOOST_REQUIRE_MESSAGE(
+        arm.rc == 0 && JsonIntField(arm.out, "ok") == 1 && base_count.has_value(),
+        "注入 failCommand 失败: rc=" << arm.rc << " out=" << arm.out);
+    const int target = *base_count + 1;
+    BOOST_TEST_MESSAGE("dp-find-close arm_count=" << *base_count
+                                                  << " wait_target=" << target);
+
+    // 启动在途 Find（长 deadline：只能由 owner Close 结束）。
+    mongo::FindOptions fo;
+    fo.limit = 1;
+    bool launched = false;
+    g_scheduler->RegistCoroutineTask(
+        [op, coll, rt, fo] {
+            op->out.emplace(
+                bbt_co_await coll->Find(MongoDocument{}, fo, Opt(30000)));
+            // Closed 逻辑终态交付当刻：driver 仍在执行槽内。
+            op->inflight_at_return.store(
+                rt->DriverCallsInFlightForTest() == 1);
+            op->t_op_done_ns.store(NowNs());
+            op->done.store(true);
+        },
+        launched);
+    BOOST_REQUIRE(launched);
+
+    // 后端握手 + 在途确认：确认 Close 发生在该 op 已进入 native driver
+    // 调用、停在服务端阻塞期间（不是「worker 刚取出、driver 未调用」）。
+    auto hs = MongoExec(WfpHandshake(target));
+    BOOST_TEST_MESSAGE("dp-find-close handshake out=" << hs.out);
+    BOOST_REQUIRE_MESSAGE(
+        hs.rc == 0 && JsonIntField(hs.out, "ok") == 1,
+        "后端未确认目标命令进入阻塞: rc=" << hs.rc << " out=" << hs.out);
+    BOOST_CHECK_EQUAL(rt->DriverCallsInFlightForTest(), std::size_t{1});
+
+    // owner Close 从独立控制线程发起；JoinGuard 保证任何失败先 join。
+    struct CloserState {
+        std::atomic_bool       closed_done{false};
+        std::atomic_bool       closed_at_return{false};
+        std::atomic<long long> t_close_start_ns{0};
+        std::atomic<long long> t_close_end_ns{0};
+        std::atomic<long long> workers_at_return{-1};
+        std::atomic<long long> inflight_at_close_return{-1};
+    };
+    auto      cst = std::make_shared<CloserState>();
+    JoinGuard joiner{std::thread([db, rt, cst] {
+        cst->t_close_start_ns.store(NowNs());
+        db->Close();
+        cst->t_close_end_ns.store(NowNs());
+        cst->closed_at_return.store(db->IsClosed());
+        cst->workers_at_return.store(
+            static_cast<long long>(rt->LiveWorkersForTest()));
+        cst->inflight_at_close_return.store(
+            static_cast<long long>(rt->DriverCallsInFlightForTest()));
+        cst->closed_done.store(true);
+    })};
+
+    // Closed 逻辑终态先于 Close 返回交付（在途 driver 仍占用执行槽）。
+    BOOST_REQUIRE(WaitUntil([&] { return op->done.load(); }, 30000));
+    BOOST_REQUIRE(op->out.has_value() && !*op->out);
+    BOOST_CHECK(op->out->error().code == ErrorCode::Closed);
+    BOOST_CHECK(op->inflight_at_return.load());
+
+    BOOST_REQUIRE(WaitUntil([&] { return cst->closed_done.load(); }, 30000));
+    joiner.Join();   // 显式 join：等真实 driver 物理落定；析构兜底
+
+    // Close 返回当刻：物理收口已完成（IsClosed + worker/执行槽归零）。
+    BOOST_CHECK(cst->closed_at_return.load());
+    BOOST_CHECK(db->IsClosed());
+    BOOST_CHECK_EQUAL(cst->workers_at_return.load(), static_cast<long long>(0));
+    BOOST_CHECK_EQUAL(cst->inflight_at_close_return.load(),
+                      static_cast<long long>(0));
+    BOOST_CHECK_EQUAL(rt->LiveWorkersForTest(), std::size_t{0});
+    // 逻辑 Closed 先于 Close 返回；Close 等待了 driver 真实返回（非提前宣告）。
+    BOOST_CHECK(op->t_op_done_ns.load() < cst->t_close_end_ns.load());
+    const auto waited_ms =
+        (cst->t_close_end_ns.load() - cst->t_close_start_ns.load()) / 1000000;
+    BOOST_TEST_MESSAGE("dp find owner close waited_ms=" << waited_ms);
+    BOOST_CHECK(waited_ms >= 1000);
+    // 迟到 driver 结果不覆盖已交付的 Closed。
+    BOOST_CHECK(op->out->error().code == ErrorCode::Closed);
+
+    // 注入计数核准：本次 arm 到 disarm 恰好拦截一次（delta==1），并显式解除。
+    auto       off       = MongoExec(kFailpointOff);
+    const auto off_count = JsonIntField(off.out, "count");
+    BOOST_TEST_MESSAGE("dp-find-close disarm out=" << off.out);
+    BOOST_REQUIRE_MESSAGE(off_count.has_value(),
+                          "disarm 回读失败: rc=" << off.rc << " out=" << off.out);
+    BOOST_CHECK_EQUAL(*off_count - *base_count, 1);
+
+    coll->Close();
+    BOOST_CHECK(ns.Finish());
+    CheckDpCleanup();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

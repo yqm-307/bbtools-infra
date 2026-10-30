@@ -61,7 +61,10 @@ class MongoCollImpl;
 // sig 只承担「等待/唤醒」（CoWaiter，唯一等待位、跨线程 Notify 安全）；
 // 协议结果与终态一律落在本对象，等待者恢复后自己读 outcome。
 struct MongoOp : std::enable_shared_from_this<MongoOp> {
-    enum class Kind { InsertOne, FindOne, UpdateOne, DeleteOne };
+    enum class Kind {
+        InsertOne, FindOne, UpdateOne, DeleteOne,
+        InsertMany, Find, UpdateMany, DeleteMany, CountDocuments,
+    };
     // kQueued 在 runtime 队列等 worker（含已登记未派发）；kRunning 已被
     // 取出、driver 调用进行中；kDone 后端不再访问（未派发摘出 / driver 已返回）。
     enum class Phase : int { kQueued = 0, kRunning = 1, kDone = 2 };
@@ -70,7 +73,12 @@ struct MongoOp : std::enable_shared_from_this<MongoOp> {
     std::shared_ptr<MongoCollImpl>       handle;
     Kind                                 kind;
     MongoDocument                        doc;     // insert 文档 / 谓词
-    MongoDocument                        update;  // 仅 UpdateOne
+    MongoDocument                        update;  // UpdateOne/UpdateMany
+    std::vector<MongoDocument>           docs;    // 仅 InsertMany
+    std::size_t                          find_limit = 0;  // 仅 Find（必填）
+    std::size_t                          find_skip = 0;   // 仅 Find
+    MongoDocument                        find_sort;       // 仅 Find
+    MongoDocument                        find_projection; // 仅 Find
     bbt::coroutine::sync::CoWaiter::SPtr sig;
     std::optional<result<MongoOpOutcome>> outcome;
     // 首次发布即逻辑终态：Finish 经 CAS 保证只落定一次（worker 完成
@@ -120,10 +128,17 @@ public:
     // 命令提交（调用协程）：校验→登记→（on_registered 内）入队→挂起；
     // 返回结果载荷或提前失败错误（未接触 worker/driver 也可产生的失败）。
     // handle 为目标集合来源；调用方须保证其处于接纳态（MongoCollImpl 已校验）。
+    // docs/find_limit/find_skip/find_sort/find_projection 为可选扩展载荷：
+    // docs 仅 InsertMany 携带，find_* 仅 Find 携带；其余 kind 保持默认。
     result<MongoOpOutcome> Submit(std::shared_ptr<MongoCollImpl> handle,
                                   MongoOp::Kind kind, MongoDocument doc,
                                   MongoDocument      update,
-                                  const CallOptions& options);
+                                  const CallOptions& options,
+                                  std::vector<MongoDocument> docs = {},
+                                  std::size_t find_limit = 0,
+                                  std::size_t find_skip = 0,
+                                  MongoDocument find_sort = {},
+                                  MongoDocument find_projection = {});
 
     // 同步关闭（幂等、任意线程可调用）：取得关闭权者封口 → 唤醒全部挂起
     // 业务等待者 → 唯一配对 finalizer 等待真实物理落定（在途 driver 返回
@@ -322,6 +337,20 @@ public:
         const MongoDocument& filter, const MongoDocument& update,
         const CallOptions&   options) override;
     bbt_co_async(result<std::uint64_t>) DeleteOne(
+        const MongoDocument& filter, const CallOptions& options) override;
+
+    bbt_co_async(result<mongo::MongoInsertManyResult>) InsertMany(
+        const std::vector<MongoDocument>& docs,
+        const CallOptions&                options) override;
+    bbt_co_async(result<std::vector<MongoDocument>>) Find(
+        const MongoDocument& filter, const mongo::FindOptions& find_options,
+        const CallOptions&   options) override;
+    bbt_co_async(result<MongoUpdateResult>) UpdateMany(
+        const MongoDocument& filter, const MongoDocument& update,
+        const CallOptions&   options) override;
+    bbt_co_async(result<std::uint64_t>) DeleteMany(
+        const MongoDocument& filter, const CallOptions& options) override;
+    bbt_co_async(result<std::uint64_t>) CountDocuments(
         const MongoDocument& filter, const CallOptions& options) override;
 
     // 句柄关闭只做接纳门禁：封口后新命令前置校验返回 Closed；已提交的
