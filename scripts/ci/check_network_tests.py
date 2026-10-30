@@ -4,7 +4,6 @@ import json
 import sys
 import xml.etree.ElementTree as ET
 
-
 REQUIRED = {
     'example_co_net_service_roundtrip', 'example_ico_connection_roundtrip',
     'net.consumer',
@@ -12,16 +11,16 @@ REQUIRED = {
     'net.consumer_coroutine_first_run', 'net.consumer_source_dir_mismatch',
     'net.udp_high_level_compile_reject', 'net.buffer_allocation',
     'net.reactor_driver_bind', 'net.reactor_driver_failed',
-    'net.r2_raw_roundtrip', 'net.r2_co_accept_read_write', 'net.r2_co_dial',
-    'net.b4_co_pingpong_strict', 'net.b4_request_close_write_error_intent',
-    'net.b4_request_close_write_readiness', 'net.b4_sealed_write_error_read_publication',
+    'net.tcp_raw_roundtrip', 'net.tcp_co_accept_read_write', 'net.tcp_co_dial',
+    'net.co_pingpong_strict', 'net.request_close_write_error_intent',
+    'net.request_close_write_readiness', 'net.sealed_write_error_read_publication',
 }
 
 
 def check(registration, report):
     names = [test['name'] for test in registration['tests']]
     expected = set(names)
-    # R10 基线为 111 项；新增可自动纳入，删除须显式评审此覆盖下限。
+    # 基线 111 项；新增可自动纳入，删除须显式评审此覆盖下限。
     if len(names) < 111 or len(names) != len(expected) or not REQUIRED <= expected:
         raise ValueError('network-only 注册集缺项或重复（至少111项且关键入口齐全）')
     if any(not (name.startswith('net.') or name.startswith('example_'))
