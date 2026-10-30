@@ -19,7 +19,7 @@ mongocxx、bsoncxx 或底层线程类型。
 
 `examples/config_consumer/` 是一个**独立 CMake 工程**（不被本仓构建引用），只 include
 `bbt/infra/config/` 公共头、只链接 `bbt::infra_config`，用于从仓外视角复核模块 target 可独立
-消费；命令、实测结果与覆盖边界见该目录 `README.md` 与 [docs/config-watch-v1.md](../docs/config-watch-v1.md)。
+消费；命令、实测结果与覆盖边界见该目录 `README.md` 与 [docs/guides/config-watch.md](../docs/guides/config-watch.md)。
 watch 的关闭/去重/drain 与 owner 同步 `Close()` 资源边界不在示例中，由 `tests/Test_config_watch.cc`（`config.watch`）覆盖。
 
 `Example_redis_mongo_shape` 只在 `bbt::infra_redis` 与 `bbt::infra_mongo`

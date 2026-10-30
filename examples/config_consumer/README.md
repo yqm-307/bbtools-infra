@@ -9,7 +9,7 @@
 （`add_subdirectory`），但只链接 `bbt::infra_config`，并关闭 infra 自身单测
 （`BUILD_TESTING=OFF`）。
 
-## 有界命令（实测见 `docs/config-watch-v1.md`）
+## 有界命令（实测见 `docs/guides/config-watch.md`）
 
 ```bash
 # 依赖：固定 SHA 7bcda3b078f975ff2978424be7f6ba38e04fb7f6（main HEAD，进程寿命运行时）的 bbtools-coroutine 源码树
@@ -30,4 +30,4 @@ TMPDIR=<build>/config-consumer-run <build>/config-consumer/config_consumer
 
 本 consumer 只覆盖同步读取面（不启动 Scheduler）。watch 的关闭/去重/drain、强制 Stop
 资源边界与在途关闭交错在 `tests/Test_config_watch.cc`（`config.watch`）中覆盖，
-契约与未覆盖矩阵见 `docs/config-watch-v1.md`。
+契约与未覆盖矩阵见 `docs/guides/config-watch.md`。
