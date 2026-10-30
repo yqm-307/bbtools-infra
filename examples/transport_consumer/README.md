@@ -39,5 +39,5 @@ cmake --build <build>/transport-consumer --target transport_consumer --parallel 
 （`udp.loopback`）、`tests/Test_transport_runtime.cc`（`transport.runtime`）、
 `tests/Test_tcp_runtime_factory.cc`（`tcp.runtime_factory`）、
 `tests/Test_transport_acceptance.cc`（`transport.acceptance`，DNS 在途到期）中覆盖，契约见
-`docs/decisions/0005-co-io-adapter-contract-v1.md`。旧硬停语义用例
+`docs/decisions/0005-co-io-adapter-contract.md`。旧硬停语义用例
 （`tests/Test_hardstop_*.cc`）已随 `Scheduler::Stop` 删除，不再是覆盖项。

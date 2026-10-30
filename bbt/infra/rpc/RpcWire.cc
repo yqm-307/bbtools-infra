@@ -16,7 +16,7 @@ namespace {
 
 // proto 生成物保留 wire 版本 namespace（bbt::infra::rpc::v1，与 proto
 // package bbt.infra.rpc.v1 对应）；公开 C++ API 收敛在 bbt::infra::rpc。
-// 内部实现显式引用生成类型，不把 v1 透传到公开面。
+// 内部实现显式引用生成类型，不把 wire 版本名透传到公开面。
 namespace pbv1 = ::bbt::infra::rpc::v1;
 
 // --- 错误域映射 -------------------------------------------------------------
@@ -68,7 +68,7 @@ ErrorCode FromProtoErrorCode(pbv1::RpcErrorCode c) {
     return ErrorCode::ProtocolError;
 }
 
-// --- 出站请求阶段映射（decisions/0008 的 Error::request_phase 事实）------------
+// --- 出站请求阶段映射（docs/decisions/0008-request-phase-outcome-unknown.md 的 Error::request_phase 事实）------------
 // wire 把 UNSPECIFIED 保留为 0（非法值 → ProtocolError），本地合法阶段从
 // 1 起排——与 Result.hpp 的 RequestPhase 声明序一致，序号不经枚举值直接互转。
 
@@ -178,9 +178,9 @@ result<void> ValidateErrorBranch(const Error& err) {
             return result<void>::err(MakeError(ErrorCode::ProtocolError,
                 "request_phase value is not a valid local phase"));
     }
-    // ValidateErrorDetails 用 ProtocolError 表达结构违规（decisions/0002 与
+    // ValidateErrorDetails 用 ProtocolError 表达结构违规（docs/decisions/0002-co-network-contract.md 与
     // Result.hpp:157-177 的冻结语义）：重复键、非法 UTF-8、超限 details
-    // 必须原样保留 ProtocolError，不得改写为 InvalidArgument（R1 Issue-2）。
+    // 必须原样保留 ProtocolError，不得改写为 InvalidArgument。
     if (auto r = ValidateErrorDetails(err); !r)
         return r;
     return result<void>::ok();
@@ -204,7 +204,7 @@ result<void> FillProto(const RpcWireEnvelope& env,
         !detail::IsValidUtf8(env.response_schema))
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
             "identifier fields not valid UTF-8"));
-    // Issue #8：remaining_budget_ms 为 0 明确拒绝（不取本地预算兜底）；
+    // wire 契约（docs/decisions/0009-rpc-runtime.md）：remaining_budget_ms 为 0 明确拒绝（不取本地预算兜底）；
     // 越界同样拒绝。接收端 local-min clamp 由上层 listener 完成，本层只钉死
     // wire 上的合法范围 1..kMaxRemainingBudgetMs。
     if (env.remaining_budget_ms == 0)
@@ -217,7 +217,7 @@ result<void> FillProto(const RpcWireEnvelope& env,
         return r;
     // 请求方向不允许携带 outcome：success=false 的 request 会被静默丢弃
     // error 分支（编码端不写 outcome，解码端按 request 无 outcome 解读），
-    // 违反 wire 边界。编码前显式拒绝（R1 kanban_run_63 Issue-1）。
+    // 违反 wire 边界。编码前显式拒绝。
     if (!is_response && !env.success)
         return result<void>::err(MakeError(ErrorCode::InvalidArgument,
             "request envelope must not carry failure outcome "

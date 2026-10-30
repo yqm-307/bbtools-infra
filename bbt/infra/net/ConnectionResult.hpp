@@ -1,6 +1,6 @@
 #pragma once
 
-// Engine::CoAccept / CoDial 的返回包（终评 §2）：一次 Co 建连/收连接的
+// Engine::CoAccept / CoDial 的返回包（docs/decisions/0012-icoconn-member-interface.md）：一次 Co 建连/收连接的
 // 完整结算——错误码 + 连接句柄 + 物理回收观察句柄。
 //
 // 语义与旧 CoAccept/CoDial 自由函数完全等价，只是形态收口为值包：

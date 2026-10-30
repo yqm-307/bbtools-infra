@@ -1,4 +1,7 @@
 #pragma once
+// co-io-adapter/v1：受管/直接 TCP transport 公共面。
+// CoTCP 是已连接 TCP 的协程 I/O 句柄，CoTCPListener 是监听/接纳句柄；
+// socket、等待与关闭收口隐藏于 src/tcp/ 实现，本头只出现 infra/标准库类型。
 
 #include <cstddef>
 #include <cstdint>
@@ -35,7 +38,7 @@ class CoTCP final : public ICoNetwork, public ICoCloseable,
 public:
     using SPtr = std::shared_ptr<CoTCP>;
 
-    // co-io-adapter/v1 §4.0.1：未受 Runtime 托管的直接 transport 入口
+    // co-io-adapter/v1 transport 契约：未受 Runtime 托管的直接 transport 入口
     // （无 Capacity/在途账本语义）。受管路径另经 src 内部装配面
     // （detail::TransportWiring）装配受管 dial 等待段接缝。
     static result<SPtr> DialTCP(std::string host, std::uint16_t port,
@@ -55,7 +58,7 @@ public:
     IoResult WriteAll(ConstBytes src, const CallOptions& options);
 
     // 幂等、任意线程可调用；返回即物理资源已释放（fd 已关、后端不再访问），
-    // 未发送数据直接丢弃、不 flush、不重开。实现口径（§1）：
+    // 未发送数据直接丢弃、不 flush、不重开。实现口径（关闭契约）：
     //   1) 原子封口并唤醒全部挂起 op（detail::CloseWaiters::
     //      SealWakeAndDrainRegistrations：挂起 op 在事件登记成功后自行登记，
     //      封口后登记失败者自行 Notify，不丢唤醒）；
@@ -94,7 +97,7 @@ private:
                                    const CallOptions& options);
     // WriteAll 的重试循环主体：与 _ReadSome/_WriteSome 共用入口门禁，但
     // **不**在自身入口占名额——在途粒度是每一轮内部单次写尝试（每轮
-    // admit/归还，见 0005 §4.0.1.7）；已写字节数经 error.transferred_bytes
+    // admit/归还，见 docs/decisions/0005-co-io-adapter-contract.md）；已写字节数经 error.transferred_bytes
     // 回报。公共 WriteAll(ConstBytes) 只做 IoProgress 映射。
     result<std::size_t> _WriteAll(const void* buffer, std::size_t size,
                                   const CallOptions& options);
@@ -103,7 +106,7 @@ private:
     // 等待者）；返回本次调用是否完成收口。closed hook 由调用方在锁外跑一次。
     bool _SettleClosedLocked() noexcept;
     void _EndIo() noexcept;
-    // §4.0.1.7：归还本对象仍持有的在途名额（m_mtx held；幂等）。
+    // 在途配额契约：归还本对象仍持有的在途名额（m_mtx held；幂等）。
     // op 正常结束经 _EndIo 归还 1；封口时仍挂起的 op（有界排空超时或同线程
     // 恢复）由 Close 的 DrainQuota 兜底归还剩余名额。
     void _DrainQuotaLocked() noexcept {
@@ -121,7 +124,7 @@ private:
     std::atomic_bool m_closing{false};
     bool m_closed{false};
     int m_inflight{0};
-    // §4.0.1.7：本对象已 admit 未归还的 Runtime 在途名额（m_mtx 保护）。
+    // 在途配额契约：本对象已 admit 未归还的 Runtime 在途名额（m_mtx 保护）。
     std::size_t m_quota_held{0};
     mutable std::mutex m_mtx;
     // Close 的在途排空等待（等待兴趣登记期 fd 有效）与并发 Close 的收口等待
@@ -136,15 +139,15 @@ private:
     //   m_wait_entry_gate_for_test / m_io_wait_registered_gate_for_test 仅供
     //   测试确定性观察，生产路径不安装（空 std::function 零开销）。
     std::function<void()> m_closed_hook;   // 物理关闭落定通知（Runtime 托管记账）
-    // §4.0.1.7 在途配额（仅受管对象注入）：admit/release 经 shared_ptr
+    // 在途配额（仅受管对象注入）：admit/release 经 shared_ptr
     // 账本与 Runtime 配对；scope 保活账本，对象侧 teardown/析构归还剩余名额，
     // 不依赖协程栈 RAII。
     std::function<bool()> m_inflight_admit;
     std::function<void()> m_inflight_release;
     std::shared_ptr<void> m_inflight_scope;
-    // §4.0.1.7 测试接缝：名额登记完成、进入首次等待前回调一次。
+    // 在途配额测试接缝：名额登记完成、进入首次等待前回调一次。
     std::function<void()> m_wait_entry_gate_for_test;
-    // §4.0.1.7 F3 测试接缝：数据路径挂起落定后回调（_WaitFd on_registered），
+    // 在途配额数据路径挂起测试接缝：数据路径挂起落定后回调（_WaitFd on_registered），
     // 证明 op 真实挂在 fd 等待上。
     std::function<void()> m_io_wait_registered_gate_for_test;
 };
@@ -182,7 +185,7 @@ private:
     void _CloseFd() noexcept;              // m_mtx held；物理释放（幂等）
     bool _SettleClosedLocked() noexcept;   // m_mtx held；物理收口恰好一次
     void _EndIo() noexcept;
-    // §4.0.1.7：归还本 listener 仍持有的在途名额（m_mtx held；幂等）。
+    // 在途配额契约：归还本 listener 仍持有的在途名额（m_mtx held；幂等）。
     void _DrainQuotaLocked() noexcept {
         if (m_inflight_release && m_quota_held > 0) {
             const auto n = m_quota_held;
@@ -202,9 +205,9 @@ private:
     std::atomic_bool m_closing{false};
     bool m_closed{false};
     int m_inflight{0};
-    // §4.0.1.7：已 admit 未归还的 Runtime 在途名额（m_mtx 保护）。
+    // 在途配额契约：已 admit 未归还的 Runtime 在途名额（m_mtx 保护）。
     std::size_t m_quota_held{0};
-    // §4.0.1.7：本 listener 已 m_accept_admit 未出账的连接容量预留数
+    // 在途配额契约：本 listener 已 m_accept_admit 未出账的连接容量预留数
     // （m_mtx 保护）。
     std::size_t m_accept_reserved{0};
     mutable std::mutex m_mtx;
@@ -218,12 +221,12 @@ private:
     std::function<bool()> m_accept_admit;
     std::function<void()> m_accept_release;
     std::function<bool(std::shared_ptr<CoTCP>)> m_accept_adopt;
-    // §4.0.1.7 在途配额（语义同 CoTCP 同名成员）：Accept 的 admit 先于
+    // 在途配额（语义同 CoTCP 同名成员）：Accept 的 admit 先于
     // m_accept_admit 判定，未托管 listener 不装钩（Unlimited 语义）。
     std::function<bool()> m_inflight_admit;
     std::function<void()> m_inflight_release;
     std::shared_ptr<void> m_inflight_scope;
-    // §4.0.1.7 测试接缝：名额登记完成、首次 accept4/等待前回调一次。
+    // 在途配额测试接缝：名额登记完成、首次 accept4/等待前回调一次。
     std::function<void()> m_wait_entry_gate_for_test;
     // 测试接缝：Accept 已成功取得 child、尚未执行 owner adopt 前回调一次。
     std::function<void()> m_accept_adopt_gate_for_test;

@@ -2,7 +2,7 @@
 // bbtools-infra：RPC 位置参数 payload codec 公共面（co-network/v1 通用下层算法）。
 //
 // 本头把 framework `CoRpc.hpp`（基线 bd9c4905 的 rpc_detail 通用区间）的
-// 位置参数 codec 收敛为 infra 唯一实现，供 waypoint 3-3 消费侧迁移前置：
+// 位置参数 codec 收敛为 infra 唯一实现，供消费侧迁移前置：
 //   * 字节规则、schema 常量、错误码与 EncodeOne/DecodeOne/DecodeAt/
 //     DecodeTuple/EncodeTuple 语义与旧实现逐位一致（count/tag/length 小端，
 //     schema bbt.rpc.positional/v1）；
@@ -14,7 +14,7 @@
 // namespace 收敛到 bbt::infra::rpc（AGENTS.md「namespace 不超过三层」），
 // 无 bbt-framework 依赖。
 //
-// 兼容基线与迁移映射见 docs/decisions/0009-rpc-runtime-v1.md「codec 兼容映射」。
+// 兼容基线与迁移映射见 docs/decisions/0009-rpc-runtime.md「codec 兼容映射」。
 // 旧源 pin：framework rev bd9c490541ccad10cf32e15b91bb40104aa86118，
 //   blob oid 08d1c954553f625ef396e534d898d6a2697ac232，
 //   sha256 ae37d61fdcfe604f0c08ba518fffd3721a2d56f51202b471177ae19b071cf0d4。

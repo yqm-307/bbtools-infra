@@ -8,7 +8,7 @@
 //   * HTTP body 绑定改为消费 bbt::infra::http 公开值类型
 //     （http::IncomingRequest / http::Response）；旧 bbt::infra::HttpRequest/
 //     HttpResponse 绑定随旧 RPC 兼容壳删除；
-//   * protobuf 生成物仍不出现在公共头（adapter 边界，AGENTS.md §4）；
+//   * protobuf 生成物仍不出现在公共头（adapter 边界，AGENTS.md）；
 //     实现经 PIMPL 隔在本模块 .cc 内。
 //
 // protoc/runtime 同源锁定见 cmake/RpcNet.cmake 的接入注释（BBT_INFRA_RPC_NET）。
@@ -31,22 +31,22 @@ namespace bbt::infra::rpc {
 inline constexpr std::uint32_t kRpcWireProfileVersion = 1;
 
 // HTTP 绑定：固定 POST path 与 Content-Type。headers 只承担标准传输语义，
-// 禁止 x-bbt-* 成为协议字段（Issue #8 Profile 约束）。
+// 禁止 x-bbt-* 成为协议字段（wire Profile 约束，见 docs/decisions/0009-rpc-runtime.md）。
 inline constexpr char kRpcWireHttpPath[]        = "/rpc";
 inline constexpr char kRpcWireContentType[]     = "application/x-protobuf";
 inline constexpr char kRpcWireContentTypeKey[]  = "Content-Type";
 
-// metadata 前缀白名单（#2 契约）：仅这三组注册前缀可出现在 envelope.metadata。
+// metadata 前缀白名单（docs/decisions/0002-co-network-contract.md 契约）：仅这三组注册前缀可出现在 envelope.metadata。
 inline constexpr char kMetaPrefixFw[]    = "fw.";
 inline constexpr char kMetaPrefixRoute[] = "route.";
 inline constexpr char kMetaPrefixTrace[] = "trace.";
-// 每项上限与条数上限沿用 #2：最多 32 项，键 ≤64 UTF-8 字节，值 ≤256 UTF-8 字节。
+// 每项上限与条数上限沿用该契约：最多 32 项，键 ≤64 UTF-8 字节，值 ≤256 UTF-8 字节。
 inline constexpr std::size_t kMaxMetadataItems = 32;
 inline constexpr std::size_t kMaxMetadataKeyBytes   = 64;
 inline constexpr std::size_t kMaxMetadataValueBytes = 256;
 
 // remaining_budget_ms：有上限的无符号毫秒，wire 上合法范围
-// 1..kMaxRemainingBudgetMs。0 明确拒绝（Issue #8），越界同样拒绝；
+// 1..kMaxRemainingBudgetMs。0 明确拒绝（wire 契约），越界同样拒绝；
 // 发送端由本地 deadline 换算、至少 1ms；接收端按本地 handler 预算取 min，
 // clamp 发生在上层（rpc::Server），本层只钉死 wire 合法范围。
 // 上限沿用 NetworkLimits::incoming_timeout 的语义边界（不超过 24h）。

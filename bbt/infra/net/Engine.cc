@@ -1253,7 +1253,7 @@ template <class Handler>
 bool Reactor::TryPost(Handler&& handler) {
     // 提交门：持 driver 租约跨 sealed 检查与 post，使「资格→入队」与
     // ReleaseDriver 的 reset 线性化。hold 只覆盖一次短 post（Asio do_run_one
-    // 在 complete 前解锁，不构成 scheduler 反序死锁；独立复审已确认），
+    // 在 complete 前解锁，不构成 scheduler 反序死锁），
     // 不会跨同步解绑：ReleaseDriver 等该锁，post 返回即释放。
     std::lock_guard<std::mutex> lock(m_driver_mutex);
     if (m_sealed.load() || m_impl->IsSealed() || !m_driver) {
@@ -1879,9 +1879,9 @@ void Reactor::MarkDirty(const std::shared_ptr<ConnCore>& core) {
         }
     }
     {
-        // 复用连接登记的窄节点：入队不分配（F8.1）。registry 移除与 dirty 入链
+        // 复用连接登记的窄节点：入队不分配。registry 移除与 dirty 入链
         // 用同一锁序（dirty -> m_mutex）共同登记/撤销：节点已 RemoveConn 时拒绝
-        // 入链，避免晚 Wake 把已析构 core 裸指针挂链（R5）。
+        // 入链，避免晚 Wake 把已析构 core 裸指针挂链。
         std::lock_guard<std::mutex> dirty_lock(m_dirty_mutex);
         if (m_sealed.load()) {
             core->m_dirty_queued.store(false);
@@ -1981,7 +1981,7 @@ void Reactor::RemoveConn(const std::shared_ptr<ConnCore>& core) {
     {
         // 与 MarkDirty 真正共门：解链与 registry 擦除在同一 dirty→registry
         // 锁域内原子完成。若两段之间释放 dirty 锁，MarkDirty 可看到 registry
-        // 仍在而重新入链，随后 erase 使裸节点悬空（R5 父级补充）。
+        // 仍在而重新入链，随后 erase 使裸节点悬空。
         std::lock_guard<std::mutex> dirty_lock(m_dirty_mutex);
         if (core->m_dirty_linked) {
             ConnCore* node = m_dirty_head;
@@ -2966,7 +2966,7 @@ std::error_code Engine::CoSubmitConnect(const Address& address, std::uint64_t& o
     return StartConnectImpl(m_impl, address, out_connect_id, /*awaitable=*/true, reclaim);
 }
 
-// ---- Co 成员入口（终评 §2）：薄转发到既有私有步骤，不新增第二路径。----
+// ---- Co 成员入口（docs/decisions/0012-icoconn-member-interface.md）：薄转发到既有私有步骤，不新增第二路径。----
 // 判定优先级/语义与旧 CoAccept/CoDial 自由函数一致（gate → 终态 → 配置）。
 // 成员形态返回 ConnectionResult{error, conn, reclaim}：失败不覆盖 conn，
 // reclaim 按提交阶段描述本次 socket 责任（提交前拒绝=无效，提交接纳后=

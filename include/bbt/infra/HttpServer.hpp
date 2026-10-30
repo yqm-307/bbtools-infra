@@ -1,5 +1,5 @@
 #pragma once
-// co-network/v1 N1b-1：HTTP/1.1 服务端公共面。
+// co-network/v1：HTTP/1.1 服务端公共面。
 // 业务 handler 只在 infra 提供的协程执行环境调用；I/O 回调不直接跑业务。
 
 #include <bbt/infra/ICoCloseable.hpp>

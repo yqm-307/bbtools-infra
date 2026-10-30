@@ -48,9 +48,9 @@ constexpr std::uint32_t kCrcIpv4 = 2116851123u;         // "127.0.0.1:12345"
 constexpr std::uint32_t kCrcIpv6 = 2030060662u;         // "[::1]:80"
 constexpr std::uint32_t kCrcUnixAbstract = 3208599909u; // "@example"
 
-// ---------------------------------------------------------------------------
+//
 // buffer：EventRingBuffer / EventSnapshot / OutboundQueue
-// ---------------------------------------------------------------------------
+//
 
 static void CheckRingMatchesModel(const EventRingBuffer& ring, const std::string& model) {
     CHECK(ring.Size() == model.size());
@@ -418,9 +418,9 @@ static void TestOutboundQueueBasics() {
     CHECK(views[0] == "reusable");
 }
 
-// ---------------------------------------------------------------------------
+//
 // fix1 回归：FIFO 保序 / 几何契约 / move 不变量 / 参考模型
-// ---------------------------------------------------------------------------
+//
 
 static std::string QueueBytes(const OutboundQueue& q) {
     std::string_view views[16] = {};
@@ -433,7 +433,7 @@ static std::string QueueBytes(const OutboundQueue& q) {
 }
 
 static void TestOutboundQueueFifoOrdering() {
-    // P1 回归：spill 非空时新数据必须排在逻辑队尾，不得复用 ring 已释放
+    // 回归：spill 非空时新数据必须排在逻辑队尾，不得复用 ring 已释放
     // 空位插队（缺陷形态：cdijEFGH）。
     {
         OutboundQueue q(4, 32, 4);
@@ -725,9 +725,9 @@ static void TestBuffer() {
     TestOutboundQueueModelFuzz();
 }
 
-// ---------------------------------------------------------------------------
+//
 // options：内部归一化 NormalizeOptions（detail 头；不是公共配置 API）
-// ---------------------------------------------------------------------------
+//
 
 static NormalizedOptions NormalizeOrThrow(const Options& in) {
     NormalizedOptions out;
@@ -931,9 +931,9 @@ static void TestOptions() {
 }
 
 
-// ---------------------------------------------------------------------------
+//
 // load_balancing：三算法纯选择
-// ---------------------------------------------------------------------------
+//
 
 static void TestRoundRobin() {
     std::error_code ec;

@@ -1,53 +1,53 @@
-// Issue #37：HTTP 出站连接与在途配额的原子接纳及物理归还回归。
-// 关闭面按进程寿命运行时修订（契约 §1）：owner 主动同步 Close()，
+// docs/decisions/0002-co-network-contract.md：HTTP 出站连接与在途配额的原子接纳及物理归还回归。
+// 关闭面按进程寿命运行时修订（契约）：owner 主动同步 Close()，
 // 没有 RequestClose/WaitClosed/CloseStatus、没有取消令牌、没有
 // CompletionSignal，也没有 Scheduler::Stop()。每个用例的 runtime 在
 // 用例内显式 Close() 并以 IsClosed/账本归零断言物理收口。
 //
-// 与 transport #32 的 CoTCP/CoUDP 在途门禁是不同入口：本套件只覆盖
+// 与 transport docs/decisions/0005-co-io-adapter-contract.md 的 CoTCP/CoUDP 在途门禁是不同入口：本套件只覆盖
 // HTTP 出站路径（HttpClientImpl::Request → ClientOp），不复用传输层
 // socket 计数，也不依赖 handler 端 max_inflight。
 //
 // 覆盖验收点：
-//   t_overloaded_when_inflight_full     — max_inflight=1 时第二个在途
-//                                          请求确定性 Overloaded，服务端
-//                                          不接到超额请求（red/green 主线）。
-//   t_overloaded_when_connections_full  — max_connections=1 单独隔离验证，
-//                                          不依赖 handler 限流。
-//   t_quota_shared_across_clients       — 同一 Runtime 下多个 HttpClient
-//                                          共享同一预算（owner 作用域）。
-//   t_quota_isolated_across_runtimes    — 两个独立 client Runtime 同时在途，
-//                                          各自独立预算；一个满额不影响另一个
-//                                          （多 Runtime 作用域隔离）。
-//   t_released_on_normal_completion     — 正常完成后名额归还，可再接纳。
-//   t_released_on_peer_failure          — 对端断开/畸形响应等发起失败后
-//                                          名额归还。
-//   t_released_on_deadline              — 本地 deadline 到点后名额归还；
-//                                          归还发生在等待完成项物理收口后
-//                                          才允许再接纳，不在调用方超时返回
-//                                          的瞬间。
-//   t_released_on_client_close          — client Close() 中止在途请求后
-//                                          名额归还。
-//   t_runtime_close_releases            — Runtime Close() 中止在途后名额
-//                                          归还，不依赖协程栈析构。
-//   t_no_reuse_before_physical_close    — 名额在 op 物理收口（UnregisterOp，
-//                                          finished && inflight==0）前不
-//                                          复用：裸对端 accept 后持有不响应
-//                                          压住 client 真实 async_read 完成
-//                                          项；io 域冻结期间直读注入账本
-//                                          （held==1 / releases==0）且真实
-//                                          TryAdmitHttpRequest 必须拒绝
-//                                          （Overloaded），放行后 Close()
-//                                          收口，名额恰好归还一次。
-//   t_unregister_exactly_once           — 并发 Finish/IoAsyncDone 与重复
-//                                          UnregisterOp 对同一 op 恰好归还
-//                                          一次（erase 守门回归）。
-//   t_register_op_failure_releases      — admit 成功后 RegisterOp 拒绝
-//                                          （io_dead）时名额经 guard 归还，
-//                                          不泄漏。
-//   t_admit_failure_no_leak_no_double_release — release 复制先于 admit：
-//                                          admit 拒绝/抛异常时 guard 不误
-//                                          归还，覆盖 m_release 复制窗口两侧。
+// t_overloaded_when_inflight_full — max_inflight=1 时第二个在途
+// 请求确定性 Overloaded，服务端
+// 不接到超额请求（red/green 主线）。
+// t_overloaded_when_connections_full — max_connections=1 单独隔离验证，
+// 不依赖 handler 限流。
+// t_quota_shared_across_clients — 同一 Runtime 下多个 HttpClient
+// 共享同一预算（owner 作用域）。
+// t_quota_isolated_across_runtimes — 两个独立 client Runtime 同时在途，
+// 各自独立预算；一个满额不影响另一个
+// （多 Runtime 作用域隔离）。
+// t_released_on_normal_completion — 正常完成后名额归还，可再接纳。
+// t_released_on_peer_failure — 对端断开/畸形响应等发起失败后
+// 名额归还。
+// t_released_on_deadline — 本地 deadline 到点后名额归还；
+// 归还发生在等待完成项物理收口后
+// 才允许再接纳，不在调用方超时返回
+// 的瞬间。
+// t_released_on_client_close — client Close() 中止在途请求后
+// 名额归还。
+// t_runtime_close_releases — Runtime Close() 中止在途后名额
+// 归还，不依赖协程栈析构。
+// t_no_reuse_before_physical_close — 名额在 op 物理收口（UnregisterOp，
+// finished && inflight==0）前不
+// 复用：裸对端 accept 后持有不响应
+// 压住 client 真实 async_read 完成
+// 项；io 域冻结期间直读注入账本
+// （held==1 / releases==0）且真实
+// TryAdmitHttpRequest 必须拒绝
+// （Overloaded），放行后 Close()
+// 收口，名额恰好归还一次。
+// t_unregister_exactly_once — 并发 Finish/IoAsyncDone 与重复
+// UnregisterOp 对同一 op 恰好归还
+// 一次（erase 守门回归）。
+// t_register_op_failure_releases — admit 成功后 RegisterOp 拒绝
+// （io_dead）时名额经 guard 归还，
+// 不泄漏。
+// t_admit_failure_no_leak_no_double_release — release 复制先于 admit：
+// admit 拒绝/抛异常时 guard 不误
+// 归还，覆盖 m_release 复制窗口两侧。
 //
 // 同步纪律：跨线程/协程一律原子标志 + WaitUntil（带总预算）与
 // CountDownLatch；handler 内的等待用 CoWaiter（等待位 + 跨线程 Notify），
@@ -86,7 +86,7 @@
 #include <bbt/infra/NetworkTypes.hpp>
 #include <bbt/infra/Result.hpp>
 
-// Issue #37 复审回归：直接驱动 impl 层（注入配额钩子、io 域顺序探针、
+// docs/decisions/0002-co-network-contract.md 回归：直接驱动 impl 层（注入配额钩子、io 域顺序探针、
 // 并发收口），需要 src/ 内部头——经 CMake target_include_directories 引入，
 // 仅本测试目标使用，不进公开契约面。
 #include "detail/IoSupport.hpp"
@@ -102,9 +102,9 @@ namespace {
 constexpr std::size_t kTestMaxBody = 64 * 1024;
 constexpr int         kBudgetMs    = 15000;
 
-// ---------------------------------------------------------------------------
+//
 // 协程/同步助手
-// ---------------------------------------------------------------------------
+//
 
 bool Spawn(std::function<void()> fn) {
     bool ok = false;
@@ -152,14 +152,14 @@ bool Close(const std::shared_ptr<ICoCloseable>& obj) {
     return obj->IsClosed();
 }
 
-// ---------------------------------------------------------------------------
+//
 // 可控门闩服务端：handler 进入时 active 计数 +1，每个请求持有独立等待位
 // （CoWaiter：只等/唤醒，无取消令牌），测试侧统一放行。
 // auto_release=true 时 handler 立即放行（用于「名额归还后可再接纳」的后续
 // 请求，不再压门闩）。
 // 服务端 Runtime 给足容量，瓶颈只可能出在 client 出站侧——这是接纳
 // 缺口测试，不是服务端压测。
-// ---------------------------------------------------------------------------
+//
 struct GateSignal {
     std::atomic_bool released{false};
     bbt::coroutine::sync::CoWaiter::SPtr waiter{
@@ -646,7 +646,7 @@ BOOST_AUTO_TEST_CASE(t_released_on_deadline) {
     }));
     BOOST_REQUIRE((*out1).has_value());
     BOOST_REQUIRE(!(*out1).value());   // result 是 error
-    // #64：服务端 handler 已进入 ⇒ 请求已完整写出 ⇒ 本端期限先到是未知，
+    // docs/decisions/0008-request-phase-outcome-unknown.md：服务端 handler 已进入 ⇒ 请求已完整写出 ⇒ 本端期限先到是未知，
     // 不再是 TimedOut（期限不证明远端未执行）。
     BOOST_CHECK((*out1)->error().code == ErrorCode::OutcomeUnknown);
     BOOST_REQUIRE((*out1)->error().request_phase.has_value());
@@ -698,7 +698,7 @@ BOOST_AUTO_TEST_CASE(t_released_on_client_close) {
     }));
     BOOST_REQUIRE((*out1).has_value());
     BOOST_CHECK(!(*out1).value());   // 被中止的请求是 error
-    // #64：服务端 handler 已进入 ⇒ 请求已完整写出；owner Close 中止等待，
+    // docs/decisions/0008-request-phase-outcome-unknown.md：服务端 handler 已进入 ⇒ 请求已完整写出；owner Close 中止等待，
     // 但请求可能已生效，故是未知而不是 Closed。
     BOOST_CHECK((*out1)->error().code == ErrorCode::OutcomeUnknown);
     BOOST_REQUIRE((*out1)->error().request_phase.has_value());
@@ -749,10 +749,10 @@ BOOST_AUTO_TEST_CASE(t_runtime_close_releases) {
     BOOST_REQUIRE(Close(server.rt));
 }
 
-// ---------------------------------------------------------------------------
-// 复审回归（t_41dbfb61）：以下用例直接驱动 HttpClientImpl，经 SetQuotaHooks
+//
+// 回归（t_41dbfb61）：以下用例直接驱动 HttpClientImpl，经 SetQuotaHooks
 // 注入可计数的 admit/release，不依赖 NetworkRuntimeImpl 的内部计数。
-// ---------------------------------------------------------------------------
+//
 namespace {
 
 // 注入式配额账本：模拟 owner 预算（上限 cap）。admit/release 调用次数与
@@ -807,23 +807,23 @@ NewImplClient(const std::shared_ptr<FakeBudget>& budget,
 } // namespace
 
 // 物理收口前不复用名额（真实异步完成项版，t_434bb4d5/t_cf78b9a1/t_afc896ec
-// 复审要求）：
+// 要求）：
 // 用真实 HttpClientImpl::Request 驱动完整 async 链，而非手工模拟
 // inflight——裸对端 accept 后挂起不写响应，client 发起真实
 // async_resolve/connect/write/read，read 完成项确实在途未落定。
 // 新契约下不再有取消令牌：窗口的确定性靠「冻结 io 域」而不是「唤醒
 // 调用方」——调用方在窗口内保持挂起即可，不需要它先返回。
-//   1. 裸对端 accept 后持有不响应 → client 的连接/写已完成，async_read
-//      在途（SetReadArmedHookForTest 直接观测到「read 已真实发起」）；
-//   2. 把 io_hold 投进同一 strand 并等它开始执行——strand 串行派发，
-//      此后任何完成项/投递都不可能被派发，物理收口（UnregisterOp→
-//      归还名额）在窗口内不可能发生；
-//   3. 窗口内直读注入账本：held==1 且 releases==0（未物理收口 ⇒ 名额
-//      仍占、未归还），且第二个真实 Request 必须 Overloaded
-//      （TryAdmitHttpRequest 看到的仍是占用中的名额）；
-//   4. 放行 io_hold → Close()：teardown 在 io 域 Abort/Finish 催出 read
-//      完成项 → IoAsyncDone 归零 → UnregisterOp 恰好归还一次；Close
-//      返回即 m_ops 空，账本 held==0、releases==1。
+// 1. 裸对端 accept 后持有不响应 → client 的连接/写已完成，async_read
+// 在途（SetReadArmedHookForTest 直接观测到「read 已真实发起」）；
+// 2. 把 io_hold 投进同一 strand 并等它开始执行——strand 串行派发，
+// 此后任何完成项/投递都不可能被派发，物理收口（UnregisterOp→
+// 归还名额）在窗口内不可能发生；
+// 3. 窗口内直读注入账本：held==1 且 releases==0（未物理收口 ⇒ 名额
+// 仍占、未归还），且第二个真实 Request 必须 Overloaded
+// （TryAdmitHttpRequest 看到的仍是占用中的名额）；
+// 4. 放行 io_hold → Close()：teardown 在 io 域 Abort/Finish 催出 read
+// 完成项 → IoAsyncDone 归零 → UnregisterOp 恰好归还一次；Close
+// 返回即 m_ops 空，账本 held==0、releases==1。
 // 同步纪律：io_hold 用 RAII 保证断言失败时仍放行、peer 线程仍 join。
 BOOST_AUTO_TEST_CASE(t_no_reuse_before_physical_close) {
     // 裸对端：listen/accept，accept 后不写响应也不 close，让 client
@@ -949,7 +949,7 @@ BOOST_AUTO_TEST_CASE(t_no_reuse_before_physical_close) {
     }));
     BOOST_REQUIRE((*out1).has_value());
     BOOST_REQUIRE(!(*out1).value());
-    // #64：read_armed 已触发 ⇒ 写侧已完成（请求完整写出）⇒ 本端放弃等待
+    // docs/decisions/0008-request-phase-outcome-unknown.md：read_armed 已触发 ⇒ 写侧已完成（请求完整写出）⇒ 本端放弃等待
     // （cancel）得到未知，而不是 Closed。
     BOOST_CHECK((*out1)->error().code == ErrorCode::OutcomeUnknown);
     BOOST_REQUIRE((*out1)->error().request_phase.has_value());
@@ -1054,10 +1054,10 @@ BOOST_AUTO_TEST_CASE(t_register_op_failure_releases) {
 // std::function 复制可抛 bad_alloc——旧顺序「admit 成功后才复制
 // release」在复制抛异常时名额无归还责任者而泄漏。修复后 release
 // 复制先于 admit 完成：
-//   A) admit 返回 Overloaded：release 复制已完成但 admit 未占名额，
-//      guard 析构不应归还（releases==0），名额账本仍为空。
-//   B) admit 自身抛异常（模拟 owner 侧钩子故障）：异常穿过 Request
-//      边界前名额未占用，release 不误调（releases==0）。
+// A) admit 返回 Overloaded：release 复制已完成但 admit 未占名额，
+// guard 析构不应归还（releases==0），名额账本仍为空。
+// B) admit 自身抛异常（模拟 owner 侧钩子故障）：异常穿过 Request
+// 边界前名额未占用，release 不误调（releases==0）。
 // 两个方向共同证明「release 先备好 + admit 失败不误归还」，结合
 // t_register_op_failure_releases 的「admit 成功后异常路径必归还」，
 // 覆盖窗口两侧。
@@ -1068,7 +1068,7 @@ BOOST_AUTO_TEST_CASE(t_admit_failure_no_leak_no_double_release) {
     std::shared_ptr<HttpClient> client = impl;
 
     // A) admit 确定性拒绝：release 已复制到 guard 但名额未占，
-    //    guard 析构不得归还（否则 releases 误增/账本下溢）。
+    // guard 析构不得归还（否则 releases 误增/账本下溢）。
     std::optional<result<HttpResponse>> out;
     BOOST_REQUIRE(RunInCoroutine([&] {
         out.emplace(client->Request(
@@ -1104,7 +1104,7 @@ BOOST_AUTO_TEST_CASE(t_admit_failure_no_leak_no_double_release) {
     BOOST_REQUIRE(Close(impl));
 }
 
-// ---------------------------------------------------------------------------
+//
 // B1 根因回归（实际 connect 后的用户非阻塞态）。
 // 修复前：Begin 在 socket 未 open 时 non_blocking(true) 无效；range
 // async_connect 会对每个 endpoint close/reopen socket，令
@@ -1115,7 +1115,7 @@ BOOST_AUTO_TEST_CASE(t_admit_failure_no_leak_no_double_release) {
 // 返回；修复前 io 线程卡在 poll(-1) 持门，Close 永不返回。断言同时覆盖
 // 物理资源（对端观测 FIN、注入账本归还）与等待/终态（Closed 落定），
 // 不只看 IsClosed 或耗时。
-// ---------------------------------------------------------------------------
+//
 namespace {
 
 std::pair<int, std::uint16_t> MakeRawListener(int backlog) {
@@ -1328,7 +1328,7 @@ BOOST_AUTO_TEST_CASE(t_b1_read_partial_eagain_close_bounded) {
         [&] { return rdy->load(std::memory_order_acquire); }, 5000));
     BOOST_REQUIRE((*out).has_value());
     BOOST_REQUIRE(!(*out).value());          // 不完整响应不得成功
-    // #64：read_armed 已触发 ⇒ 请求已完整写出；不完整响应不构成可信终态，
+    // docs/decisions/0008-request-phase-outcome-unknown.md：read_armed 已触发 ⇒ 请求已完整写出；不完整响应不构成可信终态，
     // 故 owner Close 收口后是未知而不是 Closed。
     BOOST_CHECK((*out)->error().code == ErrorCode::OutcomeUnknown);
     BOOST_REQUIRE((*out)->error().request_phase.has_value());
@@ -1337,7 +1337,7 @@ BOOST_AUTO_TEST_CASE(t_b1_read_partial_eagain_close_bounded) {
     BOOST_CHECK(peer.FinAll(3000));
 }
 
-// ---------------------------------------------------------------------------
+//
 // B1-r2 直接回归：连接 op 的失败收口必须先物理释放再注销。
 // 父验收实证（--wrap=ioctl 注入真实连接后的 FIONBIO 失败）：修复前 OnConnect
 // 失败分支直接 Finish，op 先离开 m_ops，owner Close 快照为空，socket 与 8MiB
@@ -1353,7 +1353,7 @@ BOOST_AUTO_TEST_CASE(t_b1_read_partial_eagain_close_bounded) {
 // 调用。故设置用户非阻塞态失败分支由 scratch 探针
 // （http-b1-r2/nonblocking-failure-probe.cc，--wrap=ioctl）动态覆盖 fd
 // EBADF/无发送，本用例覆盖同一收口不变量的可直接触发分支。
-// ---------------------------------------------------------------------------
+//
 BOOST_AUTO_TEST_CASE(t_b1_connect_failure_physical_release) {
     // 先占一个端口再立刻关闭：loopback 上该端口无监听者 ⇒ connect 必然
     // ECONNREFUSED（不依赖外部网络或时序）。
@@ -1401,7 +1401,7 @@ BOOST_AUTO_TEST_CASE(t_b1_connect_failure_physical_release) {
     }));
     BOOST_REQUIRE(WaitUntil([&] { return op->finished.load(); }, 10000));
 
-    // 发布序同步（F1）：ClientOp::Finish 先 finished.exchange(true)，随后才写
+    // 发布序同步：ClientOp::Finish 先 finished.exchange(true)，随后才写
     // outcome、经 MaybeUnregister→UnregisterOp→on_unregister 归还配额
     // （++unregistered、budget->Release()）。finished 的 exchange 只对「其之前」
     // 的写入建立 happens-before——恰好覆盖 Abort 写下的 body/buffer/socket/

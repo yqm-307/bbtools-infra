@@ -1,6 +1,6 @@
 #pragma once
 
-// 公共写句柄与写报告（终评 §2）：ICoConnection::Write/AsyncWrite 的
+// 公共写句柄与写报告（docs/decisions/0012-icoconn-member-interface.md）：ICoConnection::Write/AsyncWrite 的
 // 观察与等待面；与 Connection 同源的稳定值语义，拆出独立头以便
 // CoTcpConnection/ICoConnection 只依赖本头而不是整个 Connection.hpp。
 //
@@ -30,7 +30,7 @@ struct WriteOpRecord;  // detail：写操作共享记录，布局不出公共面
 // 单次已接纳发送的观察/等待句柄：值语义，默认无效。持记录强引用，
 // 连接句柄释放后仍可 Query/Wait；不是通用 Future/Task 平台。
 //
-// 拒绝票（终评 §2）：ICoConnection::AsyncWrite 的拒绝路径不分配操作
+// 拒绝票（docs/decisions/0012-icoconn-member-interface.md）：ICoConnection::AsyncWrite 的拒绝路径不分配操作
 // 记录，把拒绝原因内联进票（m_rejection 非空、record 为空）——
 // !Valid() 不再足以推断 Query()==Unknown；无身份且无拒绝原因才是
 // Unknown。释放票不取消发送，也不延长 Engine/fd 寿命。

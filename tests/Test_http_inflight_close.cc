@@ -1,23 +1,23 @@
-// Issue #62 补充回归探针：在途 handler 与 peer-FIN / owner Close/Teardown 并发。
+// 补充回归探针：在途 handler 与 peer-FIN / owner Close/Teardown 并发。
 //
 // 覆盖 fix review 明确列出的两个缺口（现有 timer-rearm 探针未覆盖）：
-//   Case A（peer-FIN in-flight）：请求已被接纳、handler 尚未返回时，客户端半关闭
-//     （send 后 shutdown(SHUT_WR)）让服务端看到对端 FIN。断言：OnPeerWatch 走完
-//     收口（会话反登记、DebugSessionCount→0）、服务端 listener 仍 OPEN（只有会话被
-//     关，不是全局 Close）、handler 退出后其回投不触碰已关 socket（sanitizer 无报错）。
-//   Case B（Close vs in-flight）：handler 在途时另一线程调用 server->Close()。
-//     断言：同步 Close 契约（返回即封口+物理 teardown+有界 drain）、handler 退出、
-//     会话归零、连接被拒、且 Close 是「drain 归零」返回而不是 5s 超时返回。
-//   Case B2（Teardown vs in-flight）：直接并发调用 Teardown()（不走 Close），
-//     断言同步中止在途会话（计数归零）但对象未 MarkClosed（IsClosed 仍 false），
-//     随后 handler 退出、Close 收口；Teardown 幂等重入无副作用。
+// Case A（peer-FIN in-flight）：请求已被接纳、handler 尚未返回时，客户端半关闭
+// （send 后 shutdown(SHUT_WR)）让服务端看到对端 FIN。断言：OnPeerWatch 走完
+// 收口（会话反登记、DebugSessionCount→0）、服务端 listener 仍 OPEN（只有会话被
+// 关，不是全局 Close）、handler 退出后其回投不触碰已关 socket（sanitizer 无报错）。
+// Case B（Close vs in-flight）：handler 在途时另一线程调用 server->Close()。
+// 断言：同步 Close 契约（返回即封口+物理 teardown+有界 drain）、handler 退出、
+// 会话归零、连接被拒、且 Close 是「drain 归零」返回而不是 5s 超时返回。
+// Case B2（Teardown vs in-flight）：直接并发调用 Teardown()（不走 Close），
+// 断言同步中止在途会话（计数归零）但对象未 MarkClosed（IsClosed 仍 false），
+// 随后 handler 退出、Close 收口；Teardown 幂等重入无副作用。
 //
 // 受控在途窗口：handler 进入后经条件变量挂起，由测试线程显式释放；不用固定 sleep，
 // 全部等待都有预算（Conns 阻塞有界，不会永久挂起），不把永久阻塞 handler 当成功。
 //
 // 无第三方测试框架：失败打印 stderr 并以独立非零退出；等待全部有界。
 // sanitizer 覆盖：本目标以 ASan/UBSan（及 TSan 尝试）构建运行时，取消/关闭/晚到
-//   回投期间若出现悬垂访问由 sanitizer 直接报出（扫描 stderr 日志，不只看退出码）。
+// 回投期间若出现悬垂访问由 sanitizer 直接报出（扫描 stderr 日志，不只看退出码）。
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -58,7 +58,7 @@ void Check(bool cond, const char* expr, int line) {
     ++g_checks;
     if (!cond) {
         ++g_failures;
-        std::fprintf(stderr, "FAIL inflight-probe line %d: %s\n", line, expr);
+        std::fprintf(stderr, "FAIL inflight_close line %d: %s\n", line, expr);
     }
 }
 #define CHECK(cond) Check(static_cast<bool>(cond), #cond, __LINE__)
@@ -399,7 +399,7 @@ int main() {
     RunCaseB();
     RunCaseB2();
 
-    std::fprintf(stderr, "inflight-probe: checks=%d failures=%d\n", g_checks,
+    std::fprintf(stderr, "inflight_close: checks=%d failures=%d\n", g_checks,
                  g_failures);
     return g_failures == 0 ? 0 : 1;
 }

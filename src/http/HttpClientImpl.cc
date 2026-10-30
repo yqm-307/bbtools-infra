@@ -38,7 +38,7 @@ ClientOp::ClientOp(const std::shared_ptr<HttpClientImpl>& owner_,
 void ClientOp::Begin(std::string host, std::uint16_t port) {
     std::lock_guard<std::recursive_mutex> io_gate(engine->IoGate());
     if (finished || !owner->IsOpenForIo()) {
-        // #55 F2：已封口/已落定的早退也是失败出口，先物理释放再注销。
+        // 失败收口契约：已封口/已落定的早退也是失败出口，先物理释放再注销。
         FailFinish(result<HttpResponse>::err(
             MakeError(ErrorCode::Closed, "http client is closing")));
         return;
@@ -46,7 +46,7 @@ void ClientOp::Begin(std::string host, std::uint16_t port) {
     // 用户非阻塞态不在此建立：socket 尚未 open 时 non_blocking() 返回
     // bad_descriptor 且不置位（B1）；每个 endpoint 的 async_connect 会
     // close/open socket，位也必须在那之后重建，见 OnConnect。
-    // Issue #64：本次 operation 从此踏入 Connecting；此前（含参数/配额/封口
+    // request_phase 契约（docs/decisions/0008-request-phase-outcome-unknown.md）：本次 operation 从此踏入 Connecting；此前（含参数/配额/封口
     // 拒绝与投递失败）阶段保持 NotStarted——这些路径上的失败都是确定失败。
     phase.store(RequestPhase::Connecting);
 
@@ -75,7 +75,7 @@ void ClientOp::Begin(std::string host, std::uint16_t port) {
 
 void ClientOp::OnResolve(boost::system::error_code ec,
                          tcp::resolver::results_type  results) {
-    // #56 H1 测试 seam：在取 IoGate 之前门控「解析完成项进入处理」，使用例
+    // resolver 寿命契约测试 seam：在取 IoGate 之前门控「解析完成项进入处理」，使用例
     // 能在 backend 查询已完成、回调尚未推进的时刻与 Close 竞争。生产恒空。
     if (on_resolve)
         on_resolve();
@@ -94,7 +94,7 @@ void ClientOp::OnResolve(boost::system::error_code ec,
             ClassifyBackendError(ec, "http request: resolve failed")));
         return;
     }
-    // #57 H2：接管 endpoint 迭代，逐条在本门内连接，避免 range composed
+    // 串行 connect 契约：接管 endpoint 迭代，逐条在本门内连接，避免 range composed
     // operation 的内部 close/open 与跨线程 Abort/Close 并发触碰 socket。
     endpoints     = std::move(results);
     next_endpoint = 0;
@@ -105,7 +105,7 @@ void ClientOp::TryStartConnect() {
     std::lock_guard<std::recursive_mutex> io_gate(engine->IoGate());
     if (finished)
         return;
-    // #57 H2 测试 seam：门控「连接内部步骤」（同一 IoGate 内）。生产恒空。
+    // 串行 connect 契约测试 seam：门控「连接内部步骤」（同一 IoGate 内）。生产恒空。
     if (on_connect_attempt)
         on_connect_attempt();
     // 门控期间 Close/Abort 可能已落定：必须复查，绝不在封口后重开 socket。
@@ -166,7 +166,7 @@ void ClientOp::OnConnect(boost::system::error_code ec) {
         if (!socket.is_open())
             connect_ec = asio::error::operation_aborted;
 
-        // #57 H2：本 endpoint 失败。若还有下一个 endpoint（且非本地中止），
+        // 串行 connect 契约：本 endpoint 失败。若还有下一个 endpoint（且非本地中止），
         // 在同一门内推进重试；否则先物理释放再落定失败。
         if (connect_ec != asio::error::operation_aborted &&
             next_endpoint + 1 < endpoints.size()) {
@@ -174,7 +174,7 @@ void ClientOp::OnConnect(boost::system::error_code ec) {
             TryStartConnect();
             return;
         }
-        // #55 F2 共同根因：失败收口必须先物理释放再注销，否则 MaybeUnregister
+        // 失败收口共同根因：失败收口必须先物理释放再注销，否则 MaybeUnregister
         // 先把 op 移出 owner m_ops，owner Close 的快照随即为空，socket/body
         // 只能等 op 析构才释放——违反「不能依赖析构」。FailFinish 在同一
         // IoGate 内先 Abort（关 socket/resolver + ReleaseBuffers）再 Finish。
@@ -203,11 +203,11 @@ void ClientOp::OnConnect(boost::system::error_code ec) {
         return;
     }
     try {
-        // Issue #64：进入写出阶段。此后直到 PumpWrite 判定 serializer
+        // request_phase 契约（docs/decisions/0008-request-phase-outcome-unknown.md）：进入写出阶段。此后直到 PumpWrite 判定 serializer
         // is_done() 为止，任何失败（写中断/被中止）都仍在「未完整写出」侧，
         // 保持确定失败。
         phase.store(RequestPhase::Writing);
-        // 测试 seam（#64 F-1/F-3）：写出阶段已进入、尚未写出任何字节，同一
+        // 测试 seam（request_phase 契约）：写出阶段已进入、尚未写出任何字节，同一
         // IoGate 内通知一次。用例据此得到「客户端已进入写出」的因果事件（不靠
         // accept 计数猜 Connecting/Writing），或在同一门内停放 io 域以确定性
         // 构造与放弃/Close 的先后。生产恒空。
@@ -257,7 +257,7 @@ void ClientOp::PumpWrite() {
             return;
         }
     }
-    // Issue #64：完整写出的唯一线性化点。serializer->is_done() 为真表示请求
+    // request_phase 契约（docs/decisions/0008-request-phase-outcome-unknown.md）：完整写出的唯一线性化点。serializer->is_done() 为真表示请求
     // 消息（头 + body）的全部字节已由 socket.send 交给内核；此后再失去可信
     // 回复终态即为 OutcomeUnknown。不在 connect 成功、也不在首次 send 之前
     // 发布——那时请求可能一字节都没发出去。
@@ -356,7 +356,7 @@ void ClientOp::PumpRead() {
                 return;
             }
             if (parser->is_done()) {
-                // Issue #64：可信回复终态已取得（完整响应，含明确 4xx/5xx）。
+                // request_phase 契约（docs/decisions/0008-request-phase-outcome-unknown.md）：可信回复终态已取得（完整响应，含明确 4xx/5xx）。
                 phase.store(RequestPhase::ReplyTerminal);
                 HttpResponse out;
                 const auto&  res = parser->get();
@@ -406,10 +406,10 @@ void ClientOp::PumpRead() {
 
 void ClientOp::Finish(result<HttpResponse> r) noexcept {
     // 首个落定者独占 outcome 写入与 Notify；完成/取消/deadline/
-    // owner close 竞争时先到者的逻辑终态不被覆盖（契约 §128）。
+    // owner close 竞争时先到者的逻辑终态不被覆盖。
     if (finished.exchange(true))
         return;
-    // Issue #64：终态错误绑定本次落定的请求阶段，并在请求已完整写出时把
+    // request_phase 契约（docs/decisions/0008-request-phase-outcome-unknown.md）：终态错误绑定本次落定的请求阶段，并在请求已完整写出时把
     // 「失去可信回复终态」升级为 OutcomeUnknown。调用方提前放弃（期限/协程
     // 取消）时已自行决定过阶段，SealError 对已带阶段者不再改写。
     if (!r)
@@ -432,7 +432,7 @@ void ClientOp::MaybeUnregister() {
 }
 
 void ClientOp::ReleaseBuffers() noexcept {
-    // 冻结契约 §6：丢弃未发送数据并同步释放本 op 载荷。
+    // resource-close-boundary 冻结契约：丢弃未发送数据并同步释放本 op 载荷。
     // 顺序：serializer（引用 request）→ request body → parser → flat_buffer。
     // 以上都不被任何在途完成项引用（在途的只有 socket/resolver 的就绪/组合
     // 操作壳），因此此处释放不会造成悬垂。
@@ -443,9 +443,9 @@ void ClientOp::ReleaseBuffers() noexcept {
     parser.reset();
     buffer.clear();
     buffer.shrink_to_fit();
-    // endpoint 解析结果是本 op 的载荷快照（H2 逐条连接用）：一并释放，避免
+    // endpoint 解析结果是本 op 的载荷快照（供逐条连接使用）：一并释放，避免
     // 离开 m_ops 后仍占住解析结果内存。resolver 对象本身不属于本方法——
-    // 其寿命见 .hpp 中的 H1 说明，绝不在此销毁。
+    // 其寿命见 .hpp 中的 resolver 寿命说明，绝不在此销毁。
     endpoints = {};
 }
 
@@ -460,7 +460,7 @@ void ClientOp::Abort() noexcept {
     boost::system::error_code ec;
     // resolver::cancel 无 error_code 重载且未标 noexcept：
     // noexcept 边界内必须兜底，避免异常逃逸成 terminate。
-    // 注意（#56 H1）：cancel 只催出完成项，不 join Asio 解析服务线程；
+    // 注意（resolver 寿命契约）：cancel 只催出完成项，不 join Asio 解析服务线程；
     // 本 op 由完成 handler 捕获的 shared_from_this() 保活，故晚到完成项
     // 必然落在仍存活的对象上，只走 !op_armed 早退。
     try {
@@ -472,7 +472,7 @@ void ClientOp::Abort() noexcept {
 }
 
 void ClientOp::FailFinish(result<HttpResponse> r) noexcept {
-    // #55 F2 共同根因的唯一收口机制：所有失败路径都先物理释放再注销。
+    // 失败收口共同根因的唯一收口机制：所有失败路径都先物理释放再注销。
     // 顺序不可交换——Finish 经 MaybeUnregister 在 finished && inflight==0
     // 时把 op 移出 owner m_ops；若先 Finish，op 离开 m_ops 时 socket 仍
     // open、body/parser/flat_buffer 仍被持有，owner Close 的快照随即为空，
@@ -499,7 +499,7 @@ result<HttpResponse> HttpClientImpl::Request(HttpRequest request,
     if (!parsed)
         return result<HttpResponse>::err(std::move(parsed).error());
 
-    // Issue #37：在登记 op / 发起任何 async_* 之前，向 owner 原子预留
+    // HTTP 出站配额契约（docs/decisions/0002-co-network-contract.md）：在登记 op / 发起任何 async_* 之前，向 owner 原子预留
     // max_connections/max_inflight 名额。名额不足立即 Overloaded——
     // 此时还没建 socket/resolver，也没向 io 域投递，满足「拒绝路径
     // 不建活跃连接」。admit 为空表示本 client 不接 owner 预算。
@@ -537,7 +537,7 @@ result<HttpResponse> HttpClientImpl::Request(HttpRequest request,
     // 测试 seam：把注入的 read-armed 通知交给本 op；写发生在 TryPost
     // （向 io 域派发 Begin）之前，io 域读到的必然是最新值。
     op->on_read_armed = m_read_armed_hook;
-    // 测试 seam（#64）：同上，写发生在 TryPost（向 io 域派发 Begin）之前。
+    // 测试 seam（request_phase 契约）：同上，写发生在 TryPost（向 io 域派发 Begin）之前。
     op->on_write_started = m_write_started_hook;
 
     http::request<http::string_body>& breq = op->request;
@@ -555,7 +555,7 @@ result<HttpResponse> HttpClientImpl::Request(HttpRequest request,
     const std::string   host = parsed.value().host;
     const std::uint16_t port = parsed.value().port;
 
-    // 契约 §2 请求完成范式：先登记等待事件 → 再执行一次投递回调 → 随后挂起。
+    // 请求完成契约范式：先登记等待事件 → 再执行一次投递回调 → 随后挂起。
     // on_registered 在事件登记成功后、协程真正 park 前调用：其内同步登记
     // op 并投递 Begin（登记先于 post，Close 与提交竞态也能被明确拒绝）。
     // Begin 若在该窗口内落定，Notify 走 PENDING 早到路径，不丢唤醒。
@@ -588,9 +588,9 @@ result<HttpResponse> HttpClientImpl::Request(HttpRequest request,
         // outcome 已由 Finish 写入；Notify 与 Wait 经等待位建立可见性。
         return std::move(*op->outcome);
     }
-    // Issue #64：调用方放弃时刻的阶段事实即分界——请求尚未完整写出时保持确定
+    // request_phase 契约（docs/decisions/0008-request-phase-outcome-unknown.md）：调用方放弃时刻的阶段事实即分界——请求尚未完整写出时保持确定
     // 失败（TimedOut/Cancelled），已完整写出时升级为 OutcomeUnknown。
-    // F-1（独立审查必修）：放弃决定必须与「后端不再推进」是同一线性化点。若只
+    // （独立审查必修）：放弃决定必须与「后端不再推进」是同一线性化点。若只
     // 读一次阶段快照就返回、把 Abort 异步投递出去，快照与「未来完整写出」之间
     // 没有同步关系：快照时未提交 ⇒ 返回确定失败，而被投递的 io 域仍可
     // Begin/OnConnect/PumpWrite 把请求字节完整交给内核（甚至收到完整响应）。

@@ -1,7 +1,7 @@
 #pragma once
 // transport_detail::TransportRuntimeImpl：TransportRuntime 的唯一实现。
 //
-// P2：基础 transport 的资源托管与配额账本（容量名额、在途账本、受管对象
+// 基础 transport 的资源托管与配额账本（容量名额、在途账本、受管对象
 // 强持有与物理关闭收口、受管 DialTCP 等待段的关闭唤醒/归还）集中在此，从
 // http/NetworkRuntimeImpl 移出后不再有第二份实现。本头仅供 src/ 内部使用，
 // 不安装、不进公开面。
@@ -62,7 +62,7 @@ public:
         return m_transport_count;
     }
 
-    // 测试接缝（Issue #32）：公开面无这两个槽位；源码内与测试经
+    // 测试接缝（在途账本契约）：公开面无这两个槽位；源码内与测试经
     // detail::TransportWiring 转到本实现（见 src/detail/TransportWiring.hpp）。
     std::size_t InflightQuotaHeldForTest() const noexcept {
         return m_inflight_quota->Held();
@@ -70,13 +70,13 @@ public:
     void SetDialWaitEntryGateForTest(std::function<void()> gate) noexcept {
         m_dial_wait_entry_gate_for_test = std::move(gate);
     }
-    // R1 探针：在途工厂装配计数（m_transport_mtx 保护）。用于确定性断言
+    // 探针：在途工厂装配计数（m_transport_mtx 保护）。用于确定性断言
     // 「owner Close 已封口且等到在途工厂归零」。生产路径不使用。
     std::size_t PendingFactoriesForTest() noexcept {
         std::lock_guard<std::mutex> lk(m_transport_mtx);
         return m_pending_factories;
     }
-    // R1 探针：owner 级关闭唤醒登记是否已封口。用于受控交错回归在「Close 已
+    // 探针：owner 级关闭唤醒登记是否已封口。用于受控交错回归在「Close 已
     // 封口、尚未返回」处确定性放行被暂停的工厂线程。生产路径不使用。
     bool CloseSealedForTest() noexcept {
         return m_close_waiters->Closed();
@@ -86,11 +86,11 @@ private:
     enum State : int { kCreated = 0, kRunning = 1, kClosingOrClosed = 2 };
 
     result<void> CheckUsableForFactory() const;
-    // co-io-adapter/v1 §4.0.1.7 容量原子预留（m_transport_mtx）：已封口 →
+    // co-io-adapter/v1 在途配额契约：容量原子预留（m_transport_mtx）：已封口 →
     // Closed，超 max_connections → Overloaded；成功时名额已计入，并登记
-    // 「在途工厂」（R1：资源装配进行中）。
+    // 「在途工厂」（资源装配进行中）。
     result<void> ReserveConnectionSlot(std::string_view factory) noexcept;
-    // R1：在途工厂账本注销 + 终态再判定（工厂每一条返回路径恰好调用一次）。
+    // 在途工厂账本注销 + 终态再判定（工厂每一条返回路径恰好调用一次）。
     void EndFactory() noexcept;
     // 物理关闭落定回调（任意线程，经各受管对象 ClosedHook 触发）。child 是
     // 稳定身份：登记/移除/计数按同一身份一次性配对。
@@ -106,7 +106,7 @@ private:
     std::atomic<int>               m_state{kCreated};
     std::condition_variable        m_close_cv;   // 并发 Close 的落定等待
 
-    // 测试接缝钩子（Issue #32 F2）：受管 DialTCP 挂起落定后回调；见
+    // 测试接缝钩子（在途账本契约）：受管 DialTCP 挂起落定后回调；见
     // src/detail/TransportWiring.hpp。生产路径不安装。
     std::function<void()>          m_dial_wait_entry_gate_for_test;
 
@@ -115,7 +115,7 @@ private:
     //                    ClosedHook 按稳定身份移除，运行期间不积累历史对象）。
     //   m_transport_count 真实 socket 名额（listener/accepted/dialed TCP、UDP）。
     //   m_transport_sealed 封口后工厂拒绝；根因是「拒绝路径不建活跃连接」。
-    //   m_pending_factories 在途工厂（R1）：从容量预留到 child 交接/自行关闭之间
+    //   m_pending_factories 在途工厂：从容量预留到 child 交接/自行关闭之间
     //                    的装配过程。Close 封口后等待它归零才收口，保证不遗漏
     //                    「已预留名额、fd 尚未交接」的在途资源。
     // 未完成受管 DialTCP 的等待段名额归还职责在协程自身返回路径（运行时不再
@@ -129,7 +129,7 @@ private:
     bool                                           m_closed_published{false}; // 终态只发布一次
     std::condition_variable                        m_pending_cv;   // 在途工厂排空等待
 
-    // §4.0.1.7：本 owner 的在途账本（max_inflight）。覆盖受管 DialTCP 等待
+    // 在途配额契约：本 owner 的在途账本（max_inflight）。覆盖受管 DialTCP 等待
     // 段、CoTCPListener::Accept 与 TCP/UDP 可等待数据操作；Try* 不占名额。
     // 经 shared_ptr 与各受管对象共享，关闭期由对象侧归还剩余名额——见
     // detail::InflightLedger 注释。

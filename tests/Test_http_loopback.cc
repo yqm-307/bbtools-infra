@@ -1,4 +1,4 @@
-// N1b-1：真实 HTTP/1.1 loopback 闭环验收。
+// 真实 HTTP/1.1 loopback 闭环验收。
 // 覆盖契约边界：200/404 为有效响应、4xx/5xx 不是网络错误、
 // 超限/畸形 framing/断连为 Error、重复 header 保留、https 显式拒绝、
 // 非协程调用 InvalidContext、本地期限映射。
@@ -399,7 +399,7 @@ BOOST_AUTO_TEST_CASE(t_malformed_response_is_error) {
 }
 
 BOOST_AUTO_TEST_CASE(t_disconnect_after_full_write_is_outcome_unknown) {
-    // 对端 accept 后直接关闭、一字节不读。#64 分界：TCP 允许在收到 FIN 后继续
+    // 对端 accept 后直接关闭、一字节不读。docs/decisions/0008-request-phase-outcome-unknown.md 分界：TCP 允许在收到 FIN 后继续
     // 写，RST 也只能由「本端数据到达已关闭的对端 socket」触发，因此本端请求
     // 字节必然完整写出（写侧无错误），此后没有可信回复终态 —— 结果是
     // OutcomeUnknown（请求可能已生效），而不是「未发送」的确定失败。

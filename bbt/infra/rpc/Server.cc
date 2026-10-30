@@ -1,5 +1,5 @@
 // RPC core 入站服务端实现：组合公开 http::Server，不引用 HTTP 内部头。
-// 解析/local-min/关联/错误信封语义沿用旧 RPC runtime 契约（0009 §3）。
+// 解析/local-min/关联/错误信封语义沿用旧 RPC runtime 契约（docs/decisions/0009-rpc-runtime.md）。
 
 #include <bbt/infra/rpc/Server.hpp>
 

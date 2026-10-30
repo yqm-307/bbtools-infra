@@ -1,9 +1,9 @@
 #pragma once
 
-// R2 Reactor driver（detail 私有部件，不是公共 API）。
+// Reactor driver（detail 私有部件，不是公共 API）。
 //
-// 契约：docs/architecture/gnet-network-execution.md §2/§3 与 coroutine 核心契约
-// §11（tcp-r2 依赖树 HEAD ae2cc1a0ad02de0027c3cab5d36402139f7aabd3）。
+// 契约：docs/architecture/gnet-network-execution.md 与上游 coroutine 核心契约
+// （依赖树 HEAD ae2cc1a0ad02de0027c3cab5d36402139f7aabd3）。
 // 每个 Reactor owner 占一个已登记 Processer 的 driver 槽，由该 P 的
 // OnTick/Wait（非业务协程边界、worker 线程）推进自有 Asio context；
 // 本类不创建任何线程。Wake 允许任意线程并发/嵌套调用，为 noexcept、

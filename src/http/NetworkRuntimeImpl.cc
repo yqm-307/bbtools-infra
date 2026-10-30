@@ -20,7 +20,7 @@ namespace http_detail {
 namespace {
 
 // CreateObjectInfo 前置条件是「运行时已初始化」（不再有运行时代际）；
-// 实现已收敛到 detail（Issue #6 起与 Redis 模块共用）。
+// 实现已收敛到 detail（与 Redis 模块共用）。
 result<bbt::coroutine::CoObjectInfo> NewObjectInfo(std::string kind) {
     return bbt::infra::detail::NewObjectInfo(std::move(kind));
 }
@@ -46,7 +46,7 @@ result<void> NetworkRuntimeImpl::Start() {
                                        : ErrorCode::Closed,
             m_state.load() == kRunning ? "runtime already started"
                                        : "runtime is closing or closed"));
-    // P2：transport owner 在同一次 Start 中启动。失败回滚状态，保留
+    // transport owner 在同一次 Start 中启动。失败回滚状态，保留
     // 「待 scheduler 就绪后重试 Start」的既有语义。
     auto transport_ready = m_transport->Start();
     if (!transport_ready) {
@@ -70,7 +70,7 @@ result<void> NetworkRuntimeImpl::CheckUsableForFactory() const {
 }
 
 // ---------------------------------------------------------------------------
-// P2：受管 TCP/UDP 工厂整体转发给 transport owner（bbt_infra_transport）。
+// 受管 TCP/UDP 工厂整体转发给 transport owner（bbt_infra_transport）。
 // 容量名额（max_connections）、在途账本（max_inflight）、受管对象强持有与
 // 物理关闭收口、受管 DialTCP 等待段的归还都由该 owner 独占实现；
 // 本切片不保留第二份账本，也不重复 transport 的关闭实现。参数校验、
@@ -109,7 +109,7 @@ result<void> NetworkRuntimeImpl::CheckAndAdoptLocked(
     return result<void>::ok();
 }
 
-// Issue #37：HTTP 出站原子接纳。检查与递增在同一 m_lifecycle_mtx
+// HTTP 出站配额契约（docs/decisions/0002-co-network-contract.md）：原子接纳。检查与递增在同一 m_lifecycle_mtx
 // 临界区内，与 CheckAndAdoptLocked 共用一把锁——接纳判定与「runtime
 // 正在关闭」互斥，保证超额判定不被并发请求或关闭穿透。
 // 不引入排队：名额不足立即 Overloaded，此时还没有创建 socket/resolver，
@@ -154,7 +154,7 @@ result<std::shared_ptr<HttpClient>> NetworkRuntimeImpl::CreateHttpClient() {
         m_engine, std::move(info).value());
     std::weak_ptr<NetworkRuntimeImpl> weak =
         std::static_pointer_cast<NetworkRuntimeImpl>(shared_from_this());
-    // Issue #37：HTTP 出站配额挂到 Runtime owner——同一 runtime 下所有
+    // HTTP 出站配额契约（docs/decisions/0002-co-network-contract.md）：配额挂到 Runtime owner——同一 runtime 下所有
     // HttpClient 共享同一预算，避免多 client 各自绕过总量。admit 在
     // 登记 op 之前原子预留；release 在 op 物理收口时被调一次。
     impl->SetQuotaHooks(
@@ -171,7 +171,7 @@ result<std::shared_ptr<HttpClient>> NetworkRuntimeImpl::CreateHttpClient() {
         });
     // 关闭 hook 携带子对象弱引用：物理关闭后按稳定身份反登记；
     // hook 内 lock 出的强引用兼作移除期间的保活，避免本回调成为
-    // 最后一个强引用时在持锁路径上析构自身（Issue #38）。
+    // 最后一个强引用时在持锁路径上析构自身（稳定身份反登记契约）。
     std::weak_ptr<ICoCloseable> child =
         std::static_pointer_cast<ICoCloseable>(impl);
     impl->SetClosedHook([weak, child] {
@@ -234,7 +234,7 @@ result<std::shared_ptr<HttpServer>> NetworkRuntimeImpl::ListenHttp(
     return result<std::shared_ptr<HttpServer>>::ok(std::move(impl));
 }
 
-// 幂等、任意线程；返回即物理释放（契约 §1）：
+// 幂等、任意线程；返回即物理释放（关闭契约）：
 //   封口（拒新子对象）→ 逐个同步 Close 子对象（各自同步收口，返回即其
 //   fd/缓冲已释放）→ transport owner 同步收口 → 封口 io 域（纯标志，跨
 //   线程安全）→ 一次性 closed hook。
@@ -291,7 +291,7 @@ void NetworkRuntimeImpl::OnChildClosed(const ICoCloseable* child) noexcept {
 
 } // namespace http_detail
 
-// 契约冻结的装配入口（见 0002 契约 N0 段）：Create 只校验装配参数，
+// 契约冻结的装配入口（见 docs/decisions/0002-co-network-contract.md）：Create 只校验装配参数，
 // Start 才真正占用资源；二者均在控制线程使用，不挂起协程。
 result<std::shared_ptr<NetworkRuntime>>
 NetworkRuntime::Create(NetworkLimits limits) {
@@ -304,7 +304,7 @@ NetworkRuntime::Create(NetworkLimits limits) {
         return result<std::shared_ptr<NetworkRuntime>>::err(
             std::move(info).error());
     auto engine = std::make_shared<http_detail::HttpIoEngine>(limits);
-    // P2：transport owner 独立创建——它的实现目标（bbt_infra_transport）不
+    // transport owner 独立创建——它的实现目标（bbt_infra_transport）不
     // 链接 HTTP，也不引用 HTTP 的任何类型/符号；本入口只做组合。
     auto transport = TransportRuntime::Create(limits);
     if (!transport)

@@ -4,7 +4,7 @@
 // 仅供 src/http/ 实现使用，不安装、不进公开面。
 //
 // 通用执行域/关闭态机/WaitStatus 映射在 src/detail/IoSupport.hpp
-// （Issue #6 起与 Redis 模块共用一份实现）；下列 using 保持
+// （与 Redis 模块共用一份实现）；下列 using 保持
 // http_detail:: 旧名，http 实现无需改名。
 
 #include <cstdint>
@@ -72,7 +72,7 @@ bool IsHttpErrorCode(const boost::system::error_code& ec) noexcept;
 Error ClassifyBackendError(const boost::system::error_code& ec,
                            std::string message);
 
-// Issue #64：该错误码在「请求已完整写出」之后是否表达「回复丢失」，而不是
+// request_phase 契约（docs/decisions/0008-request-phase-outcome-unknown.md）：该错误码在「请求已完整写出」之后是否表达「回复丢失」，而不是
 // 对端已给出（或本地输入已决定）的确定判决。
 //  - true：TransportError（eof/reset/partial/连接被中止）、TimedOut（调用方
 //    期限先到）、Cancelled（等待被本地中止）、Closed（owner Close 收口）、

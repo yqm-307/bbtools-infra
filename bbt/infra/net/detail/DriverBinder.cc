@@ -161,7 +161,7 @@ std::error_code DriverBinder::UnbindSlots(std::vector<DriverSlot>& slots) {
             }
         }
         // Ok：确已解绑。StaleToken：上游契约保证该代归属已不存在，同样安全移出
-        // （旧 token 不能解绑新一代，见核心契约 §11.2/§11.4）。其它状态保留责任。
+        // （旧 token 不能解绑新一代，见上游 coroutine 核心契约）。其它状态保留责任。
         if (status == ProcesserDriverStatus::Ok
             || status == ProcesserDriverStatus::StaleToken) {
             slot = std::move(slots.back());

@@ -1,4 +1,4 @@
-// ICoConnection 成员化收口最小消费示例（终评 §2 组合验收）：
+// ICoConnection 成员化收口最小消费示例：
 // 只消费公开 target（bbt::infra_net + bbtools-coroutine）与公开头；
 // 不触碰 net detail 或 raw ring 接口。
 //

@@ -5,5 +5,6 @@ target_compile_options(Example_co_net_service PRIVATE -Wall -Wextra)
 
 if(BUILD_TESTING)
     add_test(NAME example_co_net_service_roundtrip COMMAND Example_co_net_service)
-    set_tests_properties(example_co_net_service_roundtrip PROPERTIES TIMEOUT 60)
+    set_tests_properties(example_co_net_service_roundtrip PROPERTIES TIMEOUT 60
+        LABELS "integration")
 endif()

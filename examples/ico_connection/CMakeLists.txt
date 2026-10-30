@@ -8,5 +8,6 @@ target_compile_options(Example_ico_connection PRIVATE -Wall -Wextra)
 
 if(BUILD_TESTING)
     add_test(NAME example_ico_connection_roundtrip COMMAND Example_ico_connection)
-    set_tests_properties(example_ico_connection_roundtrip PROPERTIES TIMEOUT 60)
+    set_tests_properties(example_ico_connection_roundtrip PROPERTIES TIMEOUT 60
+        LABELS "integration")
 endif()

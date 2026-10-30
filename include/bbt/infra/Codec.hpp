@@ -1,5 +1,5 @@
 #pragma once
-// co-network/v1 N0：RPC 编解码定制点。
+// co-network/v1：RPC 编解码定制点。
 // Codec<T> 主模板只声明不提供实现：业务在公开业务协议头给出显式特化，
 // 且必须在 binder/call 实例化前可见；不使用 ADL 或动态注册表。
 // SchemaId 返回静态寿命、非空、显式版本化的稳定 ID。

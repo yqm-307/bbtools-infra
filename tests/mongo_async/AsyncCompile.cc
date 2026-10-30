@@ -1,7 +1,7 @@
 // Mongo 新入口 async/await 正负编译门禁（与 tests/redis_net 同规约）：
-//   - 正例：4 个 CRUD + 5 个多文档入口经 bbt_co_await 消费，必须可编译；
-//   - 负例（-DBBT_NEGATIVE_ASYNC）：漏写 bbt_co_await、把 async 包装直接当
-//     result 访问，必须编译失败（否则「标记」形同虚设）。
+// - 正例：4 个 CRUD + 5 个多文档入口经 bbt_co_await 消费，必须可编译；
+// - 负例（-DBBT_NEGATIVE_ASYNC）：漏写 bbt_co_await、把 async 包装直接当
+// result 访问，必须编译失败（否则「标记」形同虚设）。
 // 只做 -fsyntax-only，不链接、不需要后端；包含面只有公开头，公开头出现的
 // coroutine 依赖是消费方本来就需要的（Async.hpp）。
 #include <bbt/infra/mongo/Bson.hpp>

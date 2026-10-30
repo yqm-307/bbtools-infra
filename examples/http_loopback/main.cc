@@ -1,6 +1,6 @@
-// Issue #27：最小真实消费示例（无外部 Redis/Mongo 依赖，可独立编译运行）。
+// 最小真实消费示例（无外部 Redis/Mongo 依赖，可独立编译运行）。
 //
-// 演示 bbtools-infra 当前公开面（co-network/v1 N1b-1）的完整生命周期：
+// 演示 bbtools-infra 当前公开面的完整生命周期：
 //
 //   Scheduler::Start → NetworkRuntime::Create/Start → ListenHttp/CreateHttpClient
 //   → 协程内 HttpClient::Request（deadline 预算）→ server.StopAccepting

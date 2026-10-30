@@ -1,4 +1,4 @@
-// F0 回归测试：accept4 内核成功后、Engine 接管 fd 前若被 RequestStopAccepting，
+// 回归测试：accept4 内核成功后、Engine 接管 fd 前若被 RequestStopAccepting，
 // fd 必须被物理关闭（不仅 CountConnections 为 0，真实 fd 句柄亦不可再用）。
 // 通过 --wrap=syscall 在内核 accept4 返回成功但 Engine 尚未取 fd 的窗口暂停，
 // 与原 accept-stop-fd-probe 同一路径，但以正式用例形式断言并 exit 0。
@@ -112,7 +112,7 @@ int main() {
                 std::printf("PHASE accept_stopped=%d connections=%zu\n",
                             stopped, engine.CountConnections());
 
-                // F0 核心断言：已 accept 但未交付的 fd 必须被物理关闭。
+                // 核心断言：已 accept 但未交付的 fd 必须被物理关闭。
                 const int fd = acquired.load();
                 const bool fd_closed = (fd >= 0) && (::fcntl(fd, F_GETFD) < 0);
                 std::printf("RESULT run_error=%d stopped=%d connections=%zu "

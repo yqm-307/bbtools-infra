@@ -3,7 +3,7 @@
 // 并发安全接收 ring（detail 私有部件）：复用 EventRingBuffer 的存储与游标，
 // 增加最小同步访问面。
 //
-// 数据/通知分类（R2 §5 needs-retry）：
+// 数据/通知分类：
 //   - 数据变化（append/EOF/error/close/消费释放容量）通知 data hub + owner wake；
 //   - 仅保护释放（TryReserve/空读/空 TryAccess/一次性操作结束）只递增访问代次
 //     并通知 release hub，不通知 data hub、不唤醒 owner。Busy 等待者按代次复查，
@@ -260,7 +260,7 @@ public:
     // 段视图，全部指向本对象内 ring/pending/detached 持有的存储——共享一个
     // backing，由外层 Buffer 持有本对象保活。本类型是 detail 私有，布局不进
     // 公共面。segments 在 pop 事务内一次 reserve 完成，Read 侧不再需要
-    // post-pop 分配（P1-1：段元数据分配必须先于 pop 首个变更步骤）。
+    // post-pop 分配（段元数据分配必须先于 pop 首个变更步骤）。
     struct PopAllTakeout {
         std::shared_ptr<const boost::circular_buffer<char>> ring;  // 空 ring 时为 nullptr
         std::string pending;

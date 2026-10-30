@@ -1,14 +1,14 @@
 // net 物理回收观察句柄契约（ReclaimReceipt / Connection::Released / 带句柄 CoDial）。
 //
-// 覆盖（对应 httpx 独立审查 F5/F11 的 net 侧最小支撑）：
-//   receipt_invalid_default          默认句柄无效即 Released；无效 Connection Released=true
-//   codial_success_close_released    成功交付：句柄与连接同终态；真实 close 后才 Released；可续拨号
-//   codial_timeout_undelivered       阶段屏障：已真实连接未交付时 Valid&&!Released；回收后可观察 true
-//   dial_refused_released            fd 已建后拒连：真实 close 先于释放标记，返回时已 Released
-//   dial_pre_submit_rejections       上下文/投递失败/容量拒绝：句柄保持无效；无 fd 占位最终收口
-//   released_not_before_physical_close  ShutdownOwner 关 backend 前句柄/连接都未 Released
-//   engine_stop_releases             Engine seal：已交付连接与未交付占位都可达释放
-//   driver_failed_releases           driver 中止：pending 拨号责任仍收口
+// 覆盖（对应 httpx 独立审查 / 的 net 侧最小支撑）：
+// receipt_invalid_default 默认句柄无效即 Released；无效 Connection Released=true
+// codial_success_close_released 成功交付：句柄与连接同终态；真实 close 后才 Released；可续拨号
+// codial_timeout_undelivered 阶段屏障：已真实连接未交付时 Valid&&!Released；回收后可观察 true
+// dial_refused_released fd 已建后拒连：真实 close 先于释放标记，返回时已 Released
+// dial_pre_submit_rejections 上下文/投递失败/容量拒绝：句柄保持无效；无 fd 占位最终收口
+// released_not_before_physical_close ShutdownOwner 关 backend 前句柄/连接都未 Released
+// engine_stop_releases Engine seal：已交付连接与未交付占位都可达释放
+// driver_failed_releases driver 中止：pending 拨号责任仍收口
 //
 // 屏障语义：不靠固定 sleep 证明阶段；未交付窗口由 delivery-delay seam 与
 // 服务端真实 accept 共同证明。
@@ -331,7 +331,7 @@ void DialPreSubmitRejections() {
     CHECK(post_result.load() == std::make_error_code(std::errc::operation_canceled).value());
     CHECK(EngineTestAccess::ConnectTableSize(client) == 0);
     // 3) 容量零接纳：占位 pending 未建 fd，第二拨号拒绝且句柄无效；
-    //    占位者被 seal 收口后其句柄仍可达释放（主线程观察，不占 S 线程）。
+    // 占位者被 seal 收口后其句柄仍可达释放（主线程观察，不占 S 线程）。
     EngineTestAccess::SetConnectLimit(client, 1);
     EngineTestAccess::SetConnectStartDelay(client, std::chrono::milliseconds(5000));
     std::atomic<int> first_result{-2};

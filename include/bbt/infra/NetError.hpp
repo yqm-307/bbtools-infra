@@ -1,7 +1,7 @@
 #pragma once
-// co-network/v1 A5 错误桥：net 的 std::error_code/NetErrc 到协议层
+// co-network/v1 错误桥：net 的 std::error_code/NetErrc 到协议层
 // result<T>/Error 的**唯一权威基础分类**接缝。
-// 契约来源：docs/decisions/2026-10-29-icoconn-interface-final-review.md A5。
+// 契约来源：docs/decisions/0012-icoconn-member-interface.md「错误体系/NetToError」。
 //
 // 使用边界：
 //   - 只由协议/适配层（HTTP/Redis/未来的 adapter）include；net 原语头不

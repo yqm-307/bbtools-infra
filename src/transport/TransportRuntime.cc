@@ -16,7 +16,7 @@ namespace transport_detail {
 
 namespace {
 
-// co-io-adapter/v1 §4.0.1.7：容量名额归还，只在真实物理关闭落定后调用一次。
+// co-io-adapter/v1 在途配额契约：容量名额归还，只在真实物理关闭落定后调用一次。
 void ReleaseTransportSlot(std::mutex& mtx, std::size_t& count) noexcept {
     std::lock_guard<std::mutex> lk(mtx);
     if (count > 0) --count;
@@ -57,7 +57,7 @@ result<void> TransportRuntimeImpl::CheckUsableForFactory() const {
     if (!m_close.IsOpen())
         return result<void>::err(
             MakeError(ErrorCode::Closed, "transport runtime is closing or closed"));
-    // §4.0.1.7（Issue #32）：工厂同样受运行时可用性门禁——运行时未初始化时
+    // 在途账本契约：工厂同样受运行时可用性门禁——运行时未初始化时
     // 不再产出新对象（对象钉住运行时的等待基础设施）。
     if (!RuntimeRunning())
         return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable,
@@ -65,7 +65,7 @@ result<void> TransportRuntimeImpl::CheckUsableForFactory() const {
     return result<void>::ok();
 }
 
-// §4.0.1.7：容量原子预留。检查与递增在同一临界区内完成，超限立即拒绝、
+// 在途配额契约：容量原子预留。检查与递增在同一临界区内完成，超限立即拒绝、
 // 不静默排队；调用方在失败或物理关闭落定时回退/归还一次。
 result<void> TransportRuntimeImpl::ReserveConnectionSlot(
     std::string_view factory) noexcept {
@@ -77,13 +77,13 @@ result<void> TransportRuntimeImpl::ReserveConnectionSlot(
         return result<void>::err(MakeError(ErrorCode::Overloaded,
             std::string(factory) + ": max_connections exceeded"));
     ++m_transport_count;
-    // R1：与容量名额同临界区登记「在途工厂」。此后到 EndFactory 之间 fd 可能
+    // 与容量名额同临界区登记「在途工厂」。此后到 EndFactory 之间 fd 可能
     // 已创建但尚未交接 child，Close 必须等该计数归零才收口，不能快照遗漏。
     ++m_pending_factories;
     return result<void>::ok();
 }
 
-// R1：工厂每一条返回路径注销在途工厂（与 ReserveConnectionSlot 配对），随后
+// 工厂每一条返回路径注销在途工厂（与 ReserveConnectionSlot 配对），随后
 // 重判终态。仅注销，不释放容量名额——名额由 ReleaseTransportSlot 或 child
 // 物理关闭落定（ClosedHook）负责。
 void TransportRuntimeImpl::EndFactory() noexcept {
@@ -113,7 +113,7 @@ result<std::shared_ptr<CoTCP>> TransportRuntimeImpl::DialTCP(
     if (!reserved)
         return result<std::shared_ptr<CoTCP>>::err(std::move(reserved).error());
 
-    // §4.0.1.7（Issue #32）：受管 DialTCP 的等待段（DNS 解析 + 非阻塞
+    // 在途账本契约：受管 DialTCP 的等待段（DNS 解析 + 非阻塞
     // connect 等待）占一个在途名额；容量满立即 Overloaded，不排队不挂起。
     if (!m_inflight_quota->TryAdmit()) {
         ReleaseTransportSlot(m_transport_mtx, m_transport_count);
@@ -256,7 +256,7 @@ result<std::shared_ptr<CoTCPListener>> TransportRuntimeImpl::ListenTCP(
                 if (rt_locked && child_locked)
                     rt_locked->OnTransportClosed(child_locked.get());
             });
-            // §4.0.1.7：接纳的 socket 同样挂本 owner 在途账本——其
+            // 在途配额契约：接纳的 socket 同样挂本 owner 在途账本——其
             // ReadSome/WriteSome/WriteAll 占用同一 max_inflight 预算。
             detail::TransportWiring::SetInflightHooks(*accepted,
                 [quota = rt->m_inflight_quota] { return quota->TryAdmit(); },
@@ -265,7 +265,7 @@ result<std::shared_ptr<CoTCPListener>> TransportRuntimeImpl::ListenTCP(
             rt->m_tcp_children.push_back(std::move(accepted));
             return true;
         });
-    // §4.0.1.7：listener 的 Accept 占用同一 max_inflight 账本。
+    // 在途配额契约：listener 的 Accept 占用同一 max_inflight 账本。
     detail::TransportWiring::SetInflightHooks(*listener,
         [quota = m_inflight_quota] { return quota->TryAdmit(); },
         [quota = m_inflight_quota] { quota->Release(); },
@@ -308,7 +308,7 @@ result<std::shared_ptr<CoUDP>> TransportRuntimeImpl::BindUDP(
                 if (rt && object)
                     rt->OnTransportClosed(object.get());
             });
-            // §4.0.1.7：UDP 的 Receive/Send 挂起段占同一 max_inflight 账本。
+            // 在途配额契约：UDP 的 Receive/Send 挂起段占同一 max_inflight 账本。
             detail::TransportWiring::SetInflightHooks(*socket,
                 [quota = m_inflight_quota] { return quota->TryAdmit(); },
                 [quota = m_inflight_quota] { quota->Release(); },
@@ -348,7 +348,7 @@ void TransportRuntimeImpl::Close() noexcept {
     // 同步 Close：对象各自封口 → 唤醒自身挂起 op → 等待在途计数归零 → 物理
     // 释放。一个 socket 只有一个物理关闭责任方（对象自己），本 owner 只调用。
     m_close_waiters->CloseAndWakeAll();
-    // R1：等待在途工厂排空后才收口——工厂要么已把 child 交接进 m_tcp_children
+    // 等待在途工厂排空后才收口——工厂要么已把 child 交接进 m_tcp_children
     // （此时也已被上面快照之外的「sealed 路径」自行物理关闭），要么在途 fd 尚未
     // 交接；两者都在 EndFactory 前完成物理关闭/交接，故 Close 返回当刻不可能有
     // 遗漏的 pending fd。谓词与通知同用 m_transport_mtx。
@@ -444,7 +444,7 @@ void TransportWiring::SetDialWaitEntryGateForTest(
 
 } // namespace detail
 
-// P2 公开装配入口：Create 只校验装配参数并建立身份；Start 才实际允许工厂
+// 公开装配入口：Create 只校验装配参数并建立身份；Start 才实际允许工厂
 // 产出资源。二者均在控制线程使用，不挂起协程。
 result<std::shared_ptr<TransportRuntime>>
 TransportRuntime::Create(NetworkLimits limits) {

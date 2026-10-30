@@ -14,8 +14,8 @@ project(infra_perf_baseline_consumer LANGUAGES CXX)
 # 必要输入（全部显式，无默认探测）：
 #   BBT_BASELINE_BUILD_DIR   B0 已构建 build 目录（含 libbbt_infra_net.a）
 #   BBT_BASELINE_SOURCE_DIR  B0 源码树（公共头 bbt/infra/net/*.hpp 在其内）
-#   BBT_COROUTINE_SOURCE_DIR 固定 coroutine 源码树
-#   BBT_PERF_HARNESS_SRC     candidate tests/net/perf 源目录
+# BBT_COROUTINE_SOURCE_DIR 固定 coroutine 源码树
+# BBT_PERF_HARNESS_SRC candidate tests/net/perf 源目录
 # 可选：BBT_PERF_SMOKE=ON 注册冒烟 ctest。
 
 if(POLICY CMP0167)

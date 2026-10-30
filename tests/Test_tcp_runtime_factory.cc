@@ -110,7 +110,7 @@ int ReserveFreeTcpPort() {
 
 BOOST_AUTO_TEST_SUITE(tcp_runtime_factory)
 
-// co-io-adapter/v1 §4.0.1：工厂要求 Runtime 已 Start（Create 只校验参数）。
+// co-io-adapter/：工厂要求 Runtime 已 Start（Create 只校验参数）。
 BOOST_AUTO_TEST_CASE(t_factory_rejects_before_start) {
     EnsureRuntime();
 
@@ -128,13 +128,13 @@ BOOST_AUTO_TEST_CASE(t_factory_rejects_before_start) {
     auto started = runtime->Start();
     BOOST_REQUIRE(started);
 
-    // backlog 0 非法（§4.0.1.7：1..INT_MAX）。
+    // backlog 0 非法（1..INT_MAX）。
     auto bad_backlog = runtime->ListenTCP(SocketAddress{"127.0.0.1", 0}, 0);
     BOOST_REQUIRE(!bad_backlog);
     BOOST_CHECK_EQUAL(static_cast<int>(bad_backlog.error().code),
                       static_cast<int>(ErrorCode::InvalidArgument));
 
-    // 空 ip 非法（§4.0.1.4：通配必须显式写数值地址）。
+    // 空 ip 非法（通配必须显式写数值地址）。
     auto bad_ip = runtime->ListenTCP(SocketAddress{"", 0}, 16);
     BOOST_REQUIRE(!bad_ip);
     BOOST_CHECK_EQUAL(static_cast<int>(bad_ip.error().code),
@@ -144,7 +144,7 @@ BOOST_AUTO_TEST_CASE(t_factory_rejects_before_start) {
     BOOST_CHECK(runtime->IsClosed());
 }
 
-// co-io-adapter/v1 §4.0.1.7：容量门禁，超限 Overloaded，不静默排队；
+// co-io-adapter/：容量门禁，超限 Overloaded，不静默排队；
 // 物理关闭后释放容量，可再次成功。
 BOOST_AUTO_TEST_CASE(t_capacity_gate_overload_then_release) {
     EnsureRuntime();
@@ -185,7 +185,7 @@ BOOST_AUTO_TEST_CASE(t_capacity_gate_overload_then_release) {
     BOOST_CHECK(runtime->IsClosed());
 }
 
-// co-io-adapter/v1 §4.0.1.3：Runtime DialTCP 数值地址直连（不经 DNS），
+// co-io-adapter/：Runtime DialTCP 数值地址直连（不经 DNS），
 // 真实 loopback 读写闭环；受管引用在连接关闭后仍可查询 IsClosed。
 BOOST_AUTO_TEST_CASE(t_runtime_dial_numeric_loopback) {
     EnsureRuntime();
@@ -228,7 +228,7 @@ BOOST_AUTO_TEST_CASE(t_runtime_dial_numeric_loopback) {
         client_ok.store(write && write.value().bytes == 5 && read && read.value().bytes == 5 &&
                         std::string(response, 5) == "world");
         client->Close();
-        // 受管引用：关闭后引用仍可用于查询（§4.0.1.2）——Close 返回即物理
+        // 受管引用：关闭后引用仍可用于查询——Close 返回即物理
         // 收口，关闭后不存在任何等待接口。
         done.Down();
     };
@@ -269,7 +269,7 @@ BOOST_AUTO_TEST_CASE(t_dial_hostname_localhost_end_to_end) {
         done.Down();
     };
 
-    // co-io-adapter/v1 §4.0.1.4：真实主机名 "localhost" 经 transport 接管的
+    // co-io-adapter/：真实主机名 "localhost" 经 transport 接管的
     // DNS 解析（getaddrinfo Hook → DnsResolver::AwaitBounded worker）；等待有
     // deadline/cancel，超时后 worker 仍完成不可取消的 libc 工作，结果由状态回收。
     // 解析成功后连接 loopback。
@@ -292,7 +292,7 @@ BOOST_AUTO_TEST_CASE(t_dial_hostname_localhost_end_to_end) {
     BOOST_CHECK(runtime->IsClosed());
 }
 
-// co-io-adapter/v1 §4：hostname 解析失败的 Error 映射——
+// co-io-adapter/：hostname 解析失败的 Error 映射——
 // 确定性快败（非法主机名 EAI_NONAME）→ TransportError + backend_category="dns"；
 // 与既有 Unavailable(getaddrinfo) 数值快路径区分。
 BOOST_AUTO_TEST_CASE(t_dial_hostname_failure_mapping) {
@@ -325,7 +325,7 @@ BOOST_AUTO_TEST_CASE(t_dial_hostname_failure_mapping) {
     BOOST_CHECK(runtime->IsClosed());
 }
 
-// co-io-adapter/v1 §4：解析等待使用本次调用的同一绝对 deadline——
+// co-io-adapter/：解析等待使用本次调用的同一绝对 deadline——
 // hostname 解析等待必须受 CallOptions.deadline 约束（TimedOut），不能无界挂起。
 BOOST_AUTO_TEST_CASE(t_dial_hostname_deadline_bounded) {
     EnsureRuntime();
@@ -417,8 +417,8 @@ BOOST_AUTO_TEST_CASE(t_accept_capacity_gate_and_closed_runtime) {
     BOOST_CHECK_EQUAL(static_cast<int>(after.error().code), static_cast<int>(ErrorCode::Closed));
 }
 
-// co-io-adapter/v1 §4.0.1.4：ListenTCP 只接受数值地址。主机名必须在入口
-// 立即 InvalidArgument 拒绝，不得落到未接管的同步 getaddrinfo（§4.0.1.3）；
+// co-io-adapter/：ListenTCP 只接受数值地址。主机名必须在入口
+// 立即 InvalidArgument 拒绝，不得落到未接管的同步 getaddrinfo；
 // 断言并覆盖「拒绝发生在容量预留之前」——max_connections=1 下被拒调用不消耗
 // 容量，随后数值地址仍可成功绑定。
 BOOST_AUTO_TEST_CASE(t_listen_tcp_rejects_non_numeric_address) {
@@ -447,7 +447,7 @@ BOOST_AUTO_TEST_CASE(t_listen_tcp_rejects_non_numeric_address) {
     BOOST_CHECK(runtime->IsClosed());
 }
 
-// co-io-adapter/v1 §5 与 §4.0.1.2：冻结公开名 bbt::infra::CoUDP 与
+// co-io-adapter/ 与：冻结公开名 bbt::infra::CoUDP 与
 // NetworkRuntime::BindUDP 可编译可链接；交付对象由 Runtime 强持有并占用
 // max_connections 容量，物理关闭（ClosedHook → OnTransportClosed）后释放，
 // 与 TCP 工厂同一门禁语义。
@@ -543,11 +543,11 @@ BOOST_AUTO_TEST_CASE(t_numeric_connect_refused_preserves_errno) {
     BOOST_CHECK(runtime->IsClosed());
 }
 
-// ---------------------------------------------------------------------------
-// Issue #32：Runtime 级 max_inflight 验收矩阵
-// ---------------------------------------------------------------------------
+//
+// docs/decisions/0005-co-io-adapter-contract.md：Runtime 级 max_inflight 验收矩阵
+//
 
-// §4.0.1.7：max_inflight=1 下第一个挂起 Accept 占满唯一名额，第二个并发
+// max_inflight=1 下第一个挂起 Accept 占满唯一名额，第二个并发
 // Accept 立即 Overloaded、不排队不挂起；listener 关闭后名额归还。
 // 确定性：测试接缝 SetWaitEntryGateForTest 在名额登记完成后、等待进入前
 // 触发——主线程在 latch 上确认第一笔名额已入账后再发起第二次调用；
@@ -612,7 +612,7 @@ BOOST_AUTO_TEST_CASE(t_max_inflight_one_second_accept_overloaded) {
     BOOST_CHECK_EQUAL(impl->InflightQuotaHeldForTest(), 0u);
 }
 
-// §4.0.1.7：账本是 Runtime 作用域——跨 listener 的并发 Accept 共享同一
+// 账本是 Runtime 作用域——跨 listener 的并发 Accept 共享同一
 // max_inflight 预算；任一 listener 挂起占名额时，另一 listener 的 Accept
 // 也必须 Overloaded（不是 per-object 各自限额）。
 BOOST_AUTO_TEST_CASE(t_max_inflight_shared_across_listeners) {
@@ -670,7 +670,7 @@ BOOST_AUTO_TEST_CASE(t_max_inflight_shared_across_listeners) {
     BOOST_CHECK_EQUAL(impl->InflightQuotaHeldForTest(), 0u);
 }
 
-// §4.0.1.7：UDP 可等待 op 走同一账本。max_inflight=1 下挂起 Receive 占
+// UDP 可等待 op 走同一账本。max_inflight=1 下挂起 Receive 占
 // 名额后：第二个 Receive 与跨 op 的 Send 都立即 Overloaded；名额归还后
 // Receive 正常挂起（deadline 到期按 TimedOut 落定），Try* 不经账本。
 BOOST_AUTO_TEST_CASE(t_max_inflight_udp_receive_and_send_overloaded) {
@@ -766,7 +766,7 @@ BOOST_AUTO_TEST_CASE(t_max_inflight_udp_receive_and_send_overloaded) {
     BOOST_CHECK_EQUAL(impl->InflightQuotaHeldForTest(), 0u);
 }
 
-// §4.0.1.7：UDP 挂起 op 归还名额后，后续 Receive 恢复可挂起语义
+// UDP 挂起 op 归还名额后，后续 Receive 恢复可挂起语义
 // （非 Overloaded）；这里用短 deadline 让挂起的 Receive 以 TimedOut 落定，
 // 证明「名额归还 → 新 op 重新走完整等待路径」而不是被账本残留卡死。
 BOOST_AUTO_TEST_CASE(t_max_inflight_udp_recover_after_release) {
@@ -824,11 +824,11 @@ BOOST_AUTO_TEST_CASE(t_max_inflight_udp_recover_after_release) {
     BOOST_CHECK_EQUAL(impl->InflightQuotaHeldForTest(), 0u);
 }
 
-// §4.0.1.7：受管 DialTCP 等待段占名额。覆盖三条终态路径的归还：
-//   1) 名额占满 → DialTCP 立即 Overloaded（不进入 DNS/connect）；
-//   2) connect 失败（refused）→ 等待段名额归还；
-//   3) 成功 DialTCP 交付 → 等待段名额在交付时归还（账本归零），且交付的
-//      连接可用（真实 loopback 读写闭环）。
+// 受管 DialTCP 等待段占名额。覆盖三条终态路径的归还：
+// 1) 名额占满 → DialTCP 立即 Overloaded（不进入 DNS/connect）；
+// 2) connect 失败（refused）→ 等待段名额归还；
+// 3) 成功 DialTCP 交付 → 等待段名额在交付时归还（账本归零），且交付的
+// 连接可用（真实 loopback 读写闭环）。
 BOOST_AUTO_TEST_CASE(t_max_inflight_dial_overload_and_release) {
     EnsureRuntime();
 
@@ -949,10 +949,10 @@ BOOST_AUTO_TEST_CASE(t_max_inflight_dial_overload_and_release) {
     BOOST_CHECK_EQUAL(impl->InflightQuotaHeldForTest(), 0u);
 }
 
-// §4.0.1.7：受管 DialTCP 等待段的两个终态归还路径。
-//   1) owner Close 唤醒在途等待段：owner 级 CloseWaiters 封口并唤醒 connect
-//      等待段（不再有取消令牌），dial 走正常失败返回路径归还等待段名额；
-//   2) 过期 deadline → TimedOut + 账本归零。
+// 受管 DialTCP 等待段的两个终态归还路径。
+// 1) owner Close 唤醒在途等待段：owner 级 CloseWaiters 封口并唤醒 connect
+// 等待段（不再有取消令牌），dial 走正常失败返回路径归还等待段名额；
+// 2) 过期 deadline → TimedOut + 账本归零。
 // 确定性：SetDialWaitEntryGateForTest 在协程挂起进等待段后才触发
 // dial_parked——Close 必然落在「等待中」，不是「尚未发起」。
 BOOST_AUTO_TEST_CASE(t_max_inflight_dial_close_wakes_and_deadline_release) {
@@ -1021,7 +1021,7 @@ BOOST_AUTO_TEST_CASE(t_max_inflight_dial_close_wakes_and_deadline_release) {
     BOOST_CHECK(runtime2->IsClosed());
 }
 
-// §4.0.1.7 F3：挂起的 TCP ReadSome/WriteSome 在同一账本计费——
+// 挂起的 TCP ReadSome/WriteSome 在同一账本计费——
 // 连接交付后 op 各占名额、结束归还；容量占满时第三个 op Overloaded。
 // WriteSome 的真实挂起用「缩小双端缓冲 + 对端不读 + 超大 payload」达成：
 // 经 SetIoWaitRegisteredGateForTest 证明协程已停在 fd 可写等待，
@@ -1187,7 +1187,7 @@ BOOST_AUTO_TEST_CASE(t_max_inflight_suspended_tcp_io_quota) {
     BOOST_CHECK_EQUAL(impl->InflightQuotaHeldForTest(), 0u);
 }
 
-// §4.0.1.7：WriteAll 的在途粒度是它内部的单次写尝试（每轮在进入等待前
+// WriteAll 的在途粒度是它内部的单次写尝试（每轮在进入等待前
 // admit、该轮返回即归还；轮间名额可被其他 op 取走），不是整个 WriteAll 一个
 // 名额。因此多轮 WriteAll 可能在已写入若干字节后中途失败，错误里的
 // transferred_bytes 保留已写字节数——调用方不得假设 WriteAll 在途原子性。
@@ -1303,7 +1303,7 @@ BOOST_AUTO_TEST_CASE(t_max_inflight_writeall_multiround_partial_failure) {
     BOOST_CHECK_EQUAL(impl->InflightQuotaHeldForTest(), 0u);
 }
 
-// §4.0.1.7：未受 Runtime 托管的直接 transport 入口（CoUDP::BindUDP 静态
+// 未受 Runtime 托管的直接 transport 入口（CoUDP::BindUDP 静态
 // 工厂）不注入账本钩子——无限额语义：同一对象上的挂起 Receive 不经过
 // 账本判定，只能按 WaitStatus 落定（短 deadline → TimedOut），永远不可
 // 返回 Overloaded；max_inflight 只是 Runtime 预算，不是 transport 全局

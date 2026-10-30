@@ -19,7 +19,7 @@
 // （统一 gate、ConnectionState、Engine 私有等待步骤、拨号测试屏障）不能经
 // 公共头传出；同时避免把 <bbt/coroutine/coroutine.hpp> 带进消费 TU。
 // CoRead/CoWrite/CoAccept/CoDial 自由函数已删除：协程消费面收口为
-// Engine::CoAccept/CoDial 与 CoTcpConnection 成员（终评 §2）。
+// Engine::CoAccept/CoDial 与 CoTcpConnection 成员（docs/decisions/0012-icoconn-member-interface.md）。
 
 namespace bbt::infra::net {
 

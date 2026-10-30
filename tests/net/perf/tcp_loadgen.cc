@@ -1,26 +1,26 @@
 // infra-perf 闭环：纯 POSIX TCP 负载发生器（独立进程，与 server 分离）。
 //
 // 进程契约（与 scripts/bench/driver.py 对齐）：
-//   argv  --mode=pingpong|transfer|conns --port=PORT [--clients=N]
-//         [--payload-bytes=N] [--duration-ms=N] [--warmup-ms=N] [--sample-cap=N]
-//   工作  连接 127.0.0.1:port，按模式发确定性帧，校验 echo 内容/序号，记录每
-//         次 completed 往返时延（有界样本）。非阻塞 socket + poll 驱动；每客户
-//         端一个连接，clients 个 worker 线程。
-//   结束  达到 duration（或 conns 模式完成全部迭代）→ 输出单行 JSON 到 stdout，
-//         关闭全部 socket。退出码非零当 errors/校验失败/未完成超时>0。
-//   协议  与服务端同一 perf_common.hpp 帧；pingpong=一问一答，transfer=单向大
-//         块发送并以 echo 字节数吞吐计，conns=多连接建连+单帧往返。
+// argv --mode=pingpong|transfer|conns --port=PORT [--clients=N]
+// [--payload-bytes=N] [--duration-ms=N] [--warmup-ms=N] [--sample-cap=N]
+// 工作 连接 127.0.0.1:port，按模式发确定性帧，校验 echo 内容/序号，记录每
+// 次 completed 往返时延（有界样本）。非阻塞 socket + poll 驱动；每客户
+// 端一个连接，clients 个 worker 线程。
+// 结束 达到 duration（或 conns 模式完成全部迭代）→ 输出单行 JSON 到 stdout，
+// 关闭全部 socket。退出码非零当 errors/校验失败/未完成超时>0。
+// 协议 与服务端同一 perf_common.hpp 帧；pingpong=一问一答，transfer=单向大
+// 块发送并以 echo 字节数吞吐计，conns=多连接建连+单帧往返。
 //
 // 统一测量窗（三负载一致，冻结口径）：
-//   wall_start → [warmup_ms 预热窗：建立连接并跑真实流量，但不计任何业务指标]
-//              → warm_end → [duration_ms 测量窗：completed/bytes/时延/conns/CPU
-//              全部从零起算] → 结束（drain/teardown 在测量窗外，drain 收到的
-//              合法 echo 仍计 bytes_in/completed——是测量窗内发出工作的完成）。
-//   warm_end 由各 worker 本地时钟判定（连接建立前起算，预热连接在测量窗内
-//   复用）；正式运行时 driver 优先用「独立预热进程 + 测量进程 warmup=0」的
-//   服务端同进程双调用形态（见 driver.py --warmup-ms 文档），本内建 warmup
-//   是等价的单机降级路径。/proc 自身采样只在 ProcObserver 窗口内有效：
-//   proc_ok=false 时本进程测量整体无效，如实上报而非拿 0 冒充。
+// wall_start → [warmup_ms 预热窗：建立连接并跑真实流量，但不计任何业务指标]
+// → warm_end → [duration_ms 测量窗：completed/bytes/时延/conns/CPU
+// 全部从零起算] → 结束（drain/teardown 在测量窗外，drain 收到的
+// 合法 echo 仍计 bytes_in/completed——是测量窗内发出工作的完成）。
+// warm_end 由各 worker 本地时钟判定（连接建立前起算，预热连接在测量窗内
+// 复用）；正式运行时 driver 优先用「独立预热进程 + 测量进程 warmup=0」的
+// 服务端同进程双调用形态（见 driver.py --warmup-ms 文档），本内建 warmup
+// 是等价的单机降级路径。/proc 自身采样只在 ProcObserver 窗口内有效：
+// proc_ok=false 时本进程测量整体无效，如实上报而非拿 0 冒充。
 //
 // 帧序完整性：每连接 seq 校验覆盖全部三负载（含 transfer drain 段）——服务端
 // 逐帧回显即逐帧对账；seq 乱序/重复/缺失与内容错一样计 seq_bad 并终止该连接。

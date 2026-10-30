@@ -1,5 +1,5 @@
 #pragma once
-// mongo 模块内部支撑（Issue #7）：完成回投用的共享 executor strand 封装、
+// mongo 模块内部支撑：完成回投用的共享 executor strand 封装、
 // 同步关闭的挂起等待者登记、受管对象关闭态机、WaitStatus 映射与对象身份工厂。
 // 与 http_detail / redis_detail 的同名机制同构但独立副本——各模块实现互不
 // 引用，本头仅供 src/mongo/ 使用，不安装、不进公开面。
@@ -9,7 +9,7 @@
 // 本模块的阻塞 driver 调用不落在 io 域（worker 线程承担），io 域只用
 // 于完成回投——TryPost 是「发起型投递」的唯一入口，Seal 后一律拒绝。
 //
-// 关闭约定（进程寿命运行时修订，与契约 §1 一致）：
+// 关闭约定（进程寿命运行时修订，与关闭契约一致）：
 //  - Close() 由 owner 主动同步发起：封口 → 唤醒全部挂起业务等待者
 //    （CloseWaiters）→ 在自身锁 + condition_variable 上有界等待在途归零
 //    → 一次性跑 closed hook。跨线程调用安全，幂等。

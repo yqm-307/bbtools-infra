@@ -1,18 +1,18 @@
-// A3/A4：ICoConnection 成员写/关闭观察聚焦验证（契约行为，不是“跑过”）。
+// /：ICoConnection 成员写/关闭观察聚焦验证（契约行为，不是“跑过”）。
 //
 // 覆盖（每条用例以真实屏障证明「等待已挂起」后再触发事件，不靠 sleep）：
-//   member_write_done           成员 Write 等首胜后采到 Done+空错
-//   async_write_reject_ticket   AsyncWrite 拒绝票 Query=Rejected/0/具体原因
-//   write_unsubmitted_timeout   容量等待超时未提交（Rejected+无效 op）
-//   write_accepted_timeout      已接纳超时仍在途，op 终态后可查
-//   write_accepted_cancel       已接纳等待被协程取消，发送不撤销
-//   op_wait_partial_error       部分发送后错误结算 Done+error+真实前缀
-//   write_zero_len              零长写立即可采 Done
-//   close_default_reason        RequestClose({}) 未发完写 Done+非空错误
-//   facade_released_op_queryable facade 释放后 op 终态仍可查/可 Wait
-//   waitclosed_driver_failed    driver Failed 唤醒 WaitClosed，不伪调 OnClose
-//   waitclosed_late_no_miss     已关闭后 WaitClosed 立即成功（晚到不丢）
-//   status_projection           valid/read_eof/write/closed/released 采样
+// member_write_done 成员 Write 等首胜后采到 Done+空错
+// async_write_reject_ticket AsyncWrite 拒绝票 Query=Rejected/0/具体原因
+// write_unsubmitted_timeout 容量等待超时未提交（Rejected+无效 op）
+// write_accepted_timeout 已接纳超时仍在途，op 终态后可查
+// write_accepted_cancel 已接纳等待被协程取消，发送不撤销
+// op_wait_partial_error 部分发送后错误结算 Done+error+真实前缀
+// write_zero_len 零长写立即可采 Done
+// close_default_reason RequestClose({}) 未发完写 Done+非空错误
+// facade_released_op_queryable facade 释放后 op 终态仍可查/可 Wait
+// waitclosed_driver_failed driver Failed 唤醒 WaitClosed，不伪调 OnClose
+// waitclosed_late_no_miss 已关闭后 WaitClosed 立即成功（晚到不丢）
+// status_projection valid/read_eof/write/closed/released 采样
 
 #include <bbt/infra/net/CoTcpConnection.hpp>
 #include <bbt/infra/net/Engine.hpp>

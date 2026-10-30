@@ -168,7 +168,7 @@ result<void> RedisCotcpConn::WriteAllBytes(const std::string& bytes,
             ConstBytes{bytes.data() + sent, bytes.size() - sent}, options);
         if (!w) {
             Error e             = std::move(w).error();
-            // 已写字节数随错误回报（契约 §8.1：累计已发送量交回 owner，
+            // 已写字节数随错误回报（co-io-adapter/v1 契约：累计已发送量交回 owner，
             // 出错即令连接不可复用，不自动重发）。当前路径通过 WriteSome，
             // 其错误不会额外回报已写字节；保留 max 写法以防底层接口日后补充
             // 跨层计数时被本地累计量覆盖，避免复用半条 RESP2 帧。

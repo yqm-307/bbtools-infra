@@ -41,9 +41,9 @@ runtime 无 Stop/优雅停机，示例业务收口后以 `std::_Exit` 结束进�
 runtime 资源回收证据。
 
 > 示例源码只 include 公共头、只链接 `bbt::infra_net`。公共 API 收口已由
-> [PR #104](https://github.com/yqm-307/bbtools-infra/pull/104) 合入（新增
+> PR 合入（新增
 > `Types.hpp`/`ReadAccess.hpp`/`ICoConnection.hpp`/`CoTcpConnection.hpp`，删除
 > `Connection::State()`、公开 `WaitConnect`/`WaitAccepted`/`AsyncConnectAwaitable`
 > 与 `CoRead`/`CoWrite`/`CoAccept`/`CoDial` 自由函数）；符号与迁移清单见
 > [决策 0010](../../docs/decisions/0010-gnet-network-foundation.md) 与
-> [2026-10-29 接口终评](../../docs/decisions/2026-10-29-icoconn-interface-final-review.md)。
+> [ICoConnection 接口终评](../../docs/decisions/0012-icoconn-member-interface.md)。

@@ -1,5 +1,5 @@
 #pragma once
-// B 级 owner binding 候选（co-io-adapter/v1 §8/§10「B：非阻塞 owner binding」形态）：
+// B 级 owner binding 候选（co-io-adapter/v1 owner binding 契约「B：非阻塞 owner binding」形态）：
 // hiredis 只负责 RESP2 命令编码与 reply 解码，CoTCP 独占 socket 的 Dial / 读写 /
 // 等待 / 关闭。
 //

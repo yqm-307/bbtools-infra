@@ -1,6 +1,6 @@
 #pragma once
 
-// 受管协程连接的公共接口（终评 §2，成员化收口）：协程消费面只依赖
+// 受管协程连接的公共接口（docs/decisions/0012-icoconn-member-interface.md，成员化收口）：协程消费面只依赖
 // 本接口与值类型，不再经 CoRead/CoWrite/CoAccept/CoDial 自由函数。
 //
 // 定位：这是「协议无关的单连接协程视图」——只表达 Read/Write/关闭/状态
@@ -38,7 +38,7 @@
 
 namespace bbt::infra::net {
 
-// 连接状态投影（终评 §2）：诊断/资源观察值，每字段来自既有真源，
+// 连接状态投影（docs/decisions/0012-icoconn-member-interface.md）：诊断/资源观察值，每字段来自既有真源，
 // 跨方向分别采样，不承诺原子总快照。需要一致结论的调用方应等
 // WaitClosed/IsReleased 终态；不可用一次 Status 来证明下一次操作必成功。
 struct ConnectionStatus {

@@ -45,7 +45,7 @@ const char* CauseName(ErrorCode code) {
     }
 }
 
-// 底层分类交给 A5 公共桥 NetToError；closed/runtime_unavailable 是 Redis
+// 底层分类交给公共桥 NetToError；closed/runtime_unavailable 是 Redis
 // 客户端自身事实（close 封口、engine 非 Running），桥无从知晓，仍在此覆盖。
 Error NetError(std::error_code code, bool closed, bool runtime_unavailable = false) {
     auto error = NetToError(code, "redis net: " + code.message());

@@ -1,4 +1,4 @@
-// Issue #31 独立消费验证：只 include bbt/infra 公共头与 coroutine/core 基础头，
+// 独立消费验证：只 include bbt/infra 公共头与 coroutine/core 基础头，
 // 只链接 bbt::infra_transport（不链接 HTTP/Redis/Mongo，也不 include 任何
 // src 内部装配头），证明受管 TCP/UDP 消费者可从仓外独立构建并运行。
 //

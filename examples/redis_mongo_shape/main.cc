@@ -1,4 +1,4 @@
-// Issue #27：Redis/Mongo 调用形态示例（静态形态演示）。
+// Redis/Mongo 调用形态示例（静态形态演示）。
 //
 // 本文件演示 CoRedisCli / CoMongoCli 的真实公开 API 调用形态：装配校验 →
 // Scheduler 内 Create（Redis 另需协程内显式 Connect）→ 协程内命令（deadline）
@@ -110,7 +110,7 @@ void RedisShape() {
     redis->Close();
 }
 
-// Mongo 形态（Issue #40 owner + 集合句柄）：一个 CoMongoDb owner 承载
+// Mongo 形态（owner + 集合句柄）：一个 CoMongoDb owner 承载
 // worker 组/接纳队列/pool lease，多个集合句柄共享同一组执行资源。
 // InsertOne → FindOne → 关闭。MongoDocument.bytes 是一份完整良构
 // BSON；这里用最小合法文档 {"x":1}（BSON：int32 len + 0x10 int32

@@ -1,8 +1,8 @@
 #pragma once
 
-// R2 自动槽绑定（detail 私有部件，不是公共 API）。
+// 自动槽绑定（detail 私有部件，不是公共 API）。
 //
-// 契约：gnet-network-execution.md §2「Engine 自动枚举并绑定空闲已登记 P；
+// 契约：docs/architecture/gnet-network-execution.md「Engine 自动枚举并绑定空闲已登记 P；
 // 查询空槽不是预留，以注册成功的同代 token 为准。槽不足或竞争失败回滚本次
 // 绑定，不抢占、不扩 worker、不缩数量、不退回独立网络线程。」
 //

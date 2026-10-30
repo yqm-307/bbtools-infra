@@ -1,6 +1,6 @@
 #pragma once
 
-// Co 薄封装（R2）：协程消费面已收口为成员接口（终评 §2）——
+// Co 薄封装：协程消费面已收口为成员接口（docs/decisions/0012-icoconn-member-interface.md）——
 //   - 建连/收连接：Engine::CoDial / Engine::CoAccept（ConnectionResult.hpp）；
 //   - 单连接读写：ICoConnection / CoTcpConnection（Read→Buffer、
 //     Write→WriteReport、AsyncWrite→WriteOperation、WaitClosed、Status）。

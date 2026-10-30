@@ -1,36 +1,36 @@
-// Issue #6 单元验收（不依赖真实 Redis/容器）：
+// docs/decisions/0003-redis-client-hiredis-dependency.md 单元验收（不依赖真实 Redis/容器）：
 //
-//   t_create_before_scheduler     — 运行时未初始化（从未 Start）时 Create →
-//                                   RuntimeUnavailable（对象身份需要已
-//                                   初始化的运行时）。
-//   t_setup_scheduler             — 启动 Scheduler（共享 executor 来源）。
-//                                  进程寿命运行时：整个可执行文件只 Start
-//                                   一次，无 Stop/重启。
-//   t_config_validation           — 非法装配逐项 InvalidArgument。
-//   t_command_prechecks           — 非协程 InvalidContext；未 Connect
-//                                   RuntimeUnavailable；空键/空表
-//                                   InvalidArgument；Close 后 Closed。
-//   t_no_lazy_connect_without_connect — 未 Connect 的命令返回错误且服务端无连接
-//                                   （命令不得隐式建连）；显式 Connect 后才可用。
-//   t_connect_disconnect_lifecycle — 显式生命周期状态机：Connect（幂等）/
-//                                   ConnectStatus（只读）/Disconnect（同步收口、
-//                                   可再次 Connect）/Close（终态、拒绝 Connect）。
-//   t_fake_redis_commands         — FakeRedis 预置 RESP 应答：PING/GET
-//                                   （bulk+nil）/SET/EXISTS/DEL 全链路
-//                                   解码与服务端错误映射（RemoteError）。
-//   t_capacity_overloaded         — 静默服务端占满 inflight 与 pending：
-//                                   确定性 Overloaded。
-//   t_deadline_only               — 静默服务端下超时 TimedOut；Close 不覆盖
-//                                   首个逻辑终态。
-//   t_refused_connect             — 连接拒绝 → Connect 报 TransportError 且状态
-//                                   Failed；后续命令 sticky TransportError；
-//                                   再次显式 Connect 仍可尝试（不进入终态）。
-//   t_close_during_inflight       — 在途命令随 owner Close() 落定 Closed；
-//                                   Close() 返回即封口且在途 operation/
-//                                   connection 归零（IsClosed）。
-//   t_thread_count_stable         — 4 个 client 不新增线程（共享
-//                                   executor，无 io_thread）。
-//   t_invalid_context_plain       — 普通线程直接调命令 → InvalidContext。
+// t_create_before_scheduler — 运行时未初始化（从未 Start）时 Create →
+// RuntimeUnavailable（对象身份需要已
+// 初始化的运行时）。
+// t_setup_scheduler — 启动 Scheduler（共享 executor 来源）。
+// 进程寿命运行时：整个可执行文件只 Start
+// 一次，无 Stop/重启。
+// t_config_validation — 非法装配逐项 InvalidArgument。
+// t_command_prechecks — 非协程 InvalidContext；未 Connect
+// RuntimeUnavailable；空键/空表
+// InvalidArgument；Close 后 Closed。
+// t_no_lazy_connect_without_connect — 未 Connect 的命令返回错误且服务端无连接
+// （命令不得隐式建连）；显式 Connect 后才可用。
+// t_connect_disconnect_lifecycle — 显式生命周期状态机：Connect（幂等）/
+// ConnectStatus（只读）/Disconnect（同步收口、
+// 可再次 Connect）/Close（终态、拒绝 Connect）。
+// t_fake_redis_commands — FakeRedis 预置 RESP 应答：PING/GET
+// （bulk+nil）/SET/EXISTS/DEL 全链路
+// 解码与服务端错误映射（RemoteError）。
+// t_capacity_overloaded — 静默服务端占满 inflight 与 pending：
+// 确定性 Overloaded。
+// t_deadline_only — 静默服务端下超时 TimedOut；Close 不覆盖
+// 首个逻辑终态。
+// t_refused_connect — 连接拒绝 → Connect 报 TransportError 且状态
+// Failed；后续命令 sticky TransportError；
+// 再次显式 Connect 仍可尝试（不进入终态）。
+// t_close_during_inflight — 在途命令随 owner Close() 落定 Closed；
+// Close() 返回即封口且在途 operation/
+// connection 归零（IsClosed）。
+// t_thread_count_stable — 4 个 client 不新增线程（共享
+// executor，无 io_thread）。
+// t_invalid_context_plain — 普通线程直接调命令 → InvalidContext。
 //
 // 显式生命周期（不做 Lazy）：连接只在协程内显式 Connect 时建立；Disconnect 不是
 // Close 别名（同步收口连接但保留配置、可再次 Connect）；Close 是 ICoCloseable 终态。

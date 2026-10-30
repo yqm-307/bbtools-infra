@@ -1,5 +1,5 @@
 #pragma once
-// co-redis/v1（bbtools-infra#6）：协程原生 Redis 客户端公共面。
+// co-redis/v1：协程原生 Redis 客户端公共面。
 // hiredis 类型、线程、io_context、fd 全部隐藏于 src/redis/ 实现，
 // 本头只出现 infra/标准库类型。
 

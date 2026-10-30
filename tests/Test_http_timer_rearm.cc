@@ -1,19 +1,19 @@
-// Issue #62 回归探针：keep-alive deadline timer cancel/re-arm 的记账不变式。
+// 回归探针：keep-alive deadline timer cancel/re-arm 的记账不变式。
 //
 // 断言目标（每个 outstanding timer completion 恰好递减一次 inflight）：
-//   N 条并发入站连接，每条在【同一条连接】上顺序发 >=2 条 keep-alive 请求。
-//   第 2 条请求的回复写完后，PumpWrite 会在同一个 io handler 内同步调用
-//   BeginRead()，此时上一条 deadline timer 的 cancel 产生的 aborted
-//   completion 尚未派发、而新 timer 已 arm——这是「旧完成项 / 新 watchdog
-//   共用状态」的确定性重叠窗口。随后对端主动 FIN（一半先 shutdown(WR)，
-//   一半直接 close），再调用 owner Close()。
+// N 条并发入站连接，每条在【同一条连接】上顺序发 >=2 条 keep-alive 请求。
+// 第 2 条请求的回复写完后，PumpWrite 会在同一个 io handler 内同步调用
+// BeginRead()，此时上一条 deadline timer 的 cancel 产生的 aborted
+// completion 尚未派发、而新 timer 已 arm——这是「旧完成项 / 新 watchdog
+// 共用状态」的确定性重叠窗口。随后对端主动 FIN（一半先 shutdown(WR)，
+// 一半直接 close），再调用 owner Close()。
 //
 // 修复前：旧 aborted completion 消费新 timer 的记账，inflight 永久多计，
-//   已关闭会话无法反登记 -> DebugSessionCount() 永不为 0，Close() 被
-//   kCloseDrainTimeout(5s) 卡满。修复后：注册会话数归 0，Close() 快速返回。
+// 已关闭会话无法反登记 -> DebugSessionCount() 永不为 0，Close() 被
+// kCloseDrainTimeout(5s) 卡满。修复后：注册会话数归 0，Close() 快速返回。
 //
 // sanitizer 覆盖：本目标以 ASan/UBSan 构建运行时，取消/重挂期间若出现
-//   悬垂访问由 sanitizer 直接报出（扫描 stderr 日志，不只看退出码）。
+// 悬垂访问由 sanitizer 直接报出（扫描 stderr 日志，不只看退出码）。
 //
 // 无第三方测试框架：失败打印 stderr 并以非零退出；等待全部有界（无 sleep
 // 驱动时序，只用有预算的轮询），不会无限挂起。
@@ -56,7 +56,7 @@ void Check(bool cond, const char* expr, int line) {
     ++g_checks;
     if (!cond) {
         ++g_failures;
-        std::fprintf(stderr, "FAIL probe line %d: %s\n", line, expr);
+        std::fprintf(stderr, "FAIL timer_rearm line %d: %s\n", line, expr);
     }
 }
 #define CHECK(cond) Check(static_cast<bool>(cond), #cond, __LINE__)
@@ -209,7 +209,7 @@ int main() {
     const bool drained =
         WaitUntil([&] { return impl->DebugSessionCount() == 0; }, 5000);
     std::fprintf(stderr,
-                 "probe: handler_calls=%d registered_sessions=%zu drained=%d\n",
+                 "timer_rearm: handler_calls=%d registered_sessions=%zu drained=%d\n",
                  g_handler_calls.load(), impl->DebugSessionCount(),
                  drained ? 1 : 0);
     CHECK(drained);
@@ -221,7 +221,7 @@ int main() {
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - t0)
                         .count();
-    std::fprintf(stderr, "probe: Close() took %lld ms\n",
+    std::fprintf(stderr, "timer_rearm: Close() took %lld ms\n",
                  static_cast<long long>(ms));
     CHECK(ms < 2500);
     CHECK(server->IsClosed());
@@ -233,7 +233,7 @@ int main() {
         ::close(refused);
 
     runtime->Close();
-    std::fprintf(stderr, "probe: checks=%d failures=%d\n", g_checks,
+    std::fprintf(stderr, "timer_rearm: checks=%d failures=%d\n", g_checks,
                  g_failures);
     return g_failures == 0 ? 0 : 1;
 }

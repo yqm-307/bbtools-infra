@@ -1,21 +1,21 @@
-// A2 pop-all 移交契约：ReceiveRing::TryPopAll + CoTcpConnection::Read 的
+// pop-all 移交契约：ReceiveRing::TryPopAll + CoTcpConnection::Read 的
 // 零拷贝 backing 移交与故障/交错边界。
 //
 // 覆盖：
-//   wrap              绕环两段以同一 backing 分段移交，FIFO 与逐段指针一致
-//   pending           deferred 尾部以自有段移交（FIFO：ring → pending）
-//   detached          关闭前 staged 尾部尾随 pending（FIFO：ring → pending → detached）
-//   busy_zero         他方持保护时 TryPopAll 返回 Busy 且 ring 零变化
-//   quota             移交成功瞬间 Size/额度归零，reserve 立即恢复
-//   alloc_fail        准备分配失败：Error 且 ring/pending/额度全部不变
-//   tail_before_eof   尾部先交尽，下一次才 Eof（MarkClosed 后残留仍可读）
-//   no_pollute        pop 后新 deferred/append 字节不写入已交付段
-//   identity          Buffer 段指针即移交存储；Read 交付与 TryPopAll 同 backing
-//   gate              非协程域 Read 返回 operation_not_permitted、零消费
-//   wait              协程内 Read 挂起-唤醒收到真实数据
-//   timeout           Read 超时不消费
-//   eof_invalid       尾部先交付再 Eof；无效句柄得 Error
-//   multi_reader      两个读者线性化：先取者全拿，后者 WouldBlock
+// wrap 绕环两段以同一 backing 分段移交，FIFO 与逐段指针一致
+// pending deferred 尾部以自有段移交（FIFO：ring → pending）
+// detached 关闭前 staged 尾部尾随 pending（FIFO：ring → pending → detached）
+// busy_zero 他方持保护时 TryPopAll 返回 Busy 且 ring 零变化
+// quota 移交成功瞬间 Size/额度归零，reserve 立即恢复
+// alloc_fail 准备分配失败：Error 且 ring/pending/额度全部不变
+// tail_before_eof 尾部先交尽，下一次才 Eof（MarkClosed 后残留仍可读）
+// no_pollute pop 后新 deferred/append 字节不写入已交付段
+// identity Buffer 段指针即移交存储；Read 交付与 TryPopAll 同 backing
+// gate 非协程域 Read 返回 operation_not_permitted、零消费
+// wait 协程内 Read 挂起-唤醒收到真实数据
+// timeout Read 超时不消费
+// eof_invalid 尾部先交付再 Eof；无效句柄得 Error
+// multi_reader 两个读者线性化：先取者全拿，后者 WouldBlock
 //
 // 线程约定：不用 std::this_thread::sleep_for（走 coroutine hook 路径）；等待
 // 一律 steady_clock + yield 有界轮询。退出边界同 append_busy_hook.cc。
@@ -130,7 +130,7 @@ std::future<void> Task(std::function<void()> callback) {
         } catch (...) {
             promise->set_exception(std::current_exception());
         }
-    }, "net.popall");
+    }, "net.pop_all");
     return future;
 }
 
@@ -157,7 +157,7 @@ std::unique_ptr<ReceiveRing> MakeWrappedRing() {
 
 }  // namespace
 
-BOOST_AUTO_TEST_SUITE(net_popall)
+BOOST_AUTO_TEST_SUITE(net_pop_all)
 
 BOOST_AUTO_TEST_CASE(wrap_two_segments_one_backing) {
     auto ring = MakeWrappedRing();
@@ -394,10 +394,10 @@ BOOST_AUTO_TEST_CASE(multi_reader_linearizes) {
 }
 
 // 零载荷复制探针：payload 足够大（8K + 1K pending + 1K detached）使
-// 元数据分配（takeout 对象 ≈200B + segments 预留 + string move  bookkeeping）
+// 元数据分配（takeout 对象 ≈200B + segments 预留 + string move bookkeeping）
 // 必然 ≪ payload；若有任何路径按载荷规模复制，计数必 ≥ payload 并被证伪。
 // 断言：g_alloc_bytes ≪ payload（< payload/8），同时段内容与 FIFO 完整。
-BOOST_AUTO_TEST_CASE(zero_payload_copy_probe) {
+BOOST_AUTO_TEST_CASE(zero_payload_copy) {
     auto state = MakeState(16 * 1024);
     BOOST_REQUIRE(state->ring.TryAppend(std::string(8192, 'p')).status == ReadStatus::Ok);
     BOOST_REQUIRE(state->ring.AppendDeferred(std::string(1024, 'q')));

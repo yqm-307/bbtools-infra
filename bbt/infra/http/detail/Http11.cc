@@ -14,7 +14,7 @@ namespace {
 
 using R = result<Http11Connection::ExchangeResult>;
 
-// 底层分类经 A5 公共桥 NetToError；committed 是 HTTP 自身阶段事实
+// 底层分类经公共桥 NetToError；committed 是 HTTP 自身阶段事实
 // （请求字节已完整写出、回复丢失），桥无从知晓，按契约在此结算为
 // OutcomeUnknown。Cancelled 先于 committed 判定（与重构前一致：已提交后
 // 取消仍是取消而非未知结果）；未 committed 的确定失败直接用桥的基础分类。

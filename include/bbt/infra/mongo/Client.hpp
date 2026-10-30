@@ -1,5 +1,5 @@
 #pragma once
-// mongo owner/v1（bbtools-infra#40）：协程原生 MongoDB 资源 owner 公共面。
+// mongo owner/v1（见 docs/decisions/0007-mongo-owner-handles.md）：协程原生 MongoDB 资源 owner 公共面。
 //
 // 归属模型：MongoRuntime 显式拥有连接配置、进程级 pool lease、有界
 // worker 组、接纳队列与关闭排空；集合句柄（CoMongoColl）只是

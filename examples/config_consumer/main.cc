@@ -1,4 +1,4 @@
-// Issue #35 独立消费验证（随候选保存的可重现入口，见同目录 README.md）：
+// 独立消费验证（随候选保存的可重现入口，见同目录 README.md）：
 // 只 include bbt/infra/config 公共头，只链接 bbt::infra_config target。
 // 证明最小公共契约与模块 target 可被独立程序消费，不泄漏 framework 或第三方类型。
 //

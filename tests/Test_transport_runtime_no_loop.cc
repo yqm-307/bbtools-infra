@@ -2,12 +2,12 @@
 #define BOOST_TEST_MAIN
 #include <boost/test/included/unit_test.hpp>
 
-// R1 受控交错回归（NO_LOOP 自驱动边界）：
+// 受控交错回归（NO_LOOP 自驱动边界）：
 //
 // 契约：TransportRuntime::Close() 返回当刻必须已物理关闭全部受管资源；
 // 并发/重复 Close 返回当刻都观察 Closed。
 //
-// R1 风险假设：TransportRuntimeImpl::Close 在封口、唤醒挂起的受管 DialTCP 后
+// 风险假设：TransportRuntimeImpl::Close 在封口、唤醒挂起的受管 DialTCP 后
 // 直接 m_pending_cv.wait(m_pending_factories == 0)。若 DialTCP 被唤醒后（在
 // NO_LOOP/手动 Tick 调度模式下）必须依赖「同一个调用方继续驱动 poller」才能
 // 走到 EndFactory，则当 Close 就运行在该控制线程上时会自等待。
@@ -21,12 +21,12 @@
 // 受管 transport 名额=0，且被唤醒的 dial 的 socket fd 已物理关闭。
 //
 // 关键机制证据（上游 bbtools-coroutine）：
-//   owner Close -> CloseWaiters::CloseAndWakeAll -> CoWaiter::Notify
-//   -> CoPoller::NotifyCustomEvent -> CoPollEvent::Trigger(POLL_EVENT_CUSTOM)
-//   ->（PARKED）_Complete 同步回调 -> Coroutine::OnCoPollEvent
-//   -> Scheduler::OnActiveCoroutine（入全局队列）
-//   -> Processer::_Run 线程出队并 Resume（NO_LOOP 下 processer 线程由
-//      Scheduler::Start 的 _CreateProcessers 创建并常驻）。
+// owner Close -> CloseWaiters::CloseAndWakeAll -> CoWaiter::Notify
+// -> CoPoller::NotifyCustomEvent -> CoPollEvent::Trigger(POLL_EVENT_CUSTOM)
+// ->（PARKED）_Complete 同步回调 -> Coroutine::OnCoPollEvent
+// -> Scheduler::OnActiveCoroutine（入全局队列）
+// -> Processer::_Run 线程出队并 Resume（NO_LOOP 下 processer 线程由
+// Scheduler::Start 的 _CreateProcessers 创建并常驻）。
 // 唤醒→恢复不经过 PollOnce/LoopOnce，也无需 Close 调用方继续 Tick，因此
 // 「唤醒挂起 DialTCP 后等待在途工厂归零」不会自等待。
 
@@ -55,7 +55,7 @@
 #include <bbt/infra/CoTCP.hpp>
 #include <bbt/infra/TransportRuntime.hpp>
 
-#include "detail/TransportWiring.hpp"   // src 内部装配面：R1 探针与 dial 等待入口 gate
+#include "detail/TransportWiring.hpp"   // src 内部装配面： 探针与 dial 等待入口 gate
 
 using bbt::coroutine::SCHE_START_OPT_SCHE_NO_LOOP;
 using bbt::infra::CallOptions;
@@ -272,7 +272,7 @@ BOOST_AUTO_TEST_CASE(t_close_unblocks_parked_dial_without_driver_tick) {
     BOOST_CHECK_EQUAL(dial_code->load(), static_cast<int>(ErrorCode::Closed));
 
     // 在途 dial 的 socket fd 在 Close 返回后已物理关闭（_DialTcp 错误路径
-    // ::close(fd)）：打开的 socket 数必须减少。
+    // :close(fd)）：打开的 socket 数必须减少。
     const std::size_t sockets_after = CountOpenSockets();
     BOOST_CHECK_MESSAGE(sockets_after < sockets_before,
         "在途 dial 的 socket fd 未物理关闭（before=" << sockets_before

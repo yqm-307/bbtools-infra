@@ -1,17 +1,17 @@
-// R2 TCP/Co 聚焦验证（契约行为，不是“跑过”）。
+// TCP/Co 聚焦验证（契约行为，不是“跑过”）。
 //
 // 覆盖：
-//   raw_roundtrip        port0 raw server/client、sub owner 身份、无协程上下文
-//   co_accept_read_write CoAccept/CoRead/CoWrite 同一内核
-//   co_dial              CoDial 真实建连往返
-//   close_retained       关闭后已收尾部可读、Engine 收口后残留 Conn 安全
-//   write_backpressure   有界发送 no_buffer_space
-//   write_timeout        容量超时未提交 / 完成超时仍在途可查
-//   multi_listener       多 listen 地址真实服务
-//   close_waiters_settle no-deadline CoAccept / CoWrite 容量等待在关闭时结算
-//   ring_combined        ReceiveRing 同保护 Peek+Consume、Busy 零消费、释放代次
-//   write_fifo_prefix    OutboundQueue 部分写 FIFO/真实前缀/错误结算/Settling/Close
-//   co_read_timeout      CoRead 超时不消费
+// raw_roundtrip port0 raw server/client、sub owner 身份、无协程上下文
+// co_accept_read_write CoAccept/CoRead/CoWrite 同一内核
+// co_dial CoDial 真实建连往返
+// close_retained 关闭后已收尾部可读、Engine 收口后残留 Conn 安全
+// write_backpressure 有界发送 no_buffer_space
+// write_timeout 容量超时未提交 / 完成超时仍在途可查
+// multi_listener 多 listen 地址真实服务
+// close_waiters_settle no-deadline CoAccept / CoWrite 容量等待在关闭时结算
+// ring_combined ReceiveRing 同保护 Peek+Consume、Busy 零消费、释放代次
+// write_fifo_prefix OutboundQueue 部分写 FIFO/真实前缀/错误结算/Settling/Close
+// co_read_timeout CoRead 超时不消费
 
 #include <bbt/infra/net/Connection.hpp>
 #include <bbt/infra/net/ConnectionResult.hpp>
@@ -96,7 +96,7 @@ static std::future<void> Task(std::function<void()> callback) {
         } catch (...) {
             promise->set_exception(std::current_exception());
         }
-    }, "net.r2");
+    }, "net.tcp");
     return future;
 }
 

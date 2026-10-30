@@ -1,5 +1,5 @@
 #pragma once
-// P2：基础 transport 的资源托管与配额 owner。
+// 基础 transport 的资源托管与配额 owner。
 //
 // TransportRuntime 只托管基础 TCP/UDP transport —— 容量名额
 // （max_connections）、在途账本（max_inflight）、受管对象的强持有与物理
@@ -56,7 +56,7 @@ namespace udp {
 class CoUDP;
 } // namespace udp
 
-// 按 co-io-adapter/v1 §4 冻结名书写工厂签名，类型与 tcp::/udp:: 实现一致。
+// 按 co-io-adapter/v1 冻结名书写工厂签名，类型与 tcp::/udp:: 实现一致。
 using tcp::CoTCP;
 using tcp::CoTCPListener;
 using udp::CoUDP;

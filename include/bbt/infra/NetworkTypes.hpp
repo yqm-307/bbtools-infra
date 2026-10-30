@@ -1,6 +1,6 @@
 #pragma once
-// co-network/v1 N0：调用选项、装配值类型与协议消息形态。
-// 签名冻结见 docs/decisions/0002-co-network-contract-v1.md。
+// co-network/v1：调用选项、装配值类型与协议消息形态。
+// 签名冻结见 docs/decisions/0002-co-network-contract.md。
 
 #include <chrono>
 #include <cstddef>
@@ -66,7 +66,7 @@ struct RpcAddress {
     std::string endpoint;
 };
 
-// co-io-adapter/v1 §4：非拥有缓冲视图与传输结果值类型。
+// co-io-adapter/v1 冻结面：非拥有缓冲视图与传输结果值类型。
 struct MutableBytes { void* data; std::size_t size; };
 struct ConstBytes { const void* data; std::size_t size; };
 struct TcpEndpoint {

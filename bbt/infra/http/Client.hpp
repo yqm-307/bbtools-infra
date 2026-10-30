@@ -2,7 +2,7 @@
 
 // HTTPX 形态原生协程 HTTP 客户端（bbt::infra::http）：单一有栈协程 Client、
 // 内建连接池，调用形态借鉴 httpx AsyncClient；不是其完整功能兼容实现。
-// 已支持范围与验证入口见 docs/http-net.md，未实现能力在下文逐项声明。
+// 已支持范围与验证入口见 docs/guides/http-net.md，未实现能力在下文逐项声明。
 //
 // 职责边界：
 //   - Client 只装配，不联网、不建线程、不建 Engine、无全局单例；执行底座

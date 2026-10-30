@@ -1,46 +1,35 @@
-# examples/：Issue #27 最小真实消费示例。
-# 目标形态：examples/ 目录 + add_executable 直接链接公开 target；
-# 不为示例新增第三方依赖，Redis/Mongo 示例仅在对应模块 target 存在时注册。
-
+# examples/：每个示例一个目录，附 README（演示什么、怎么跑、期望输出）。
+# 示例只演示用法；断言与验收放进 tests/，不在示例中用断言充当测试。
+# CI 编译全部示例；依赖外部服务的示例只编译、不在普通 CI 中运行。
+# 示例随模块 target 注册，目标缺失时跳过；不为示例新增第三方依赖。
 find_package(Threads REQUIRED)
 
-# 示例随模块开关注册（P1-6）：模块 target 不存在时对应示例跳过。
+# HTTP loopback（旧栈）：无外部依赖，可独立编译运行。
 if(BBT_INFRA_LEGACY_STACK)
-add_executable(Example_http_loopback http_loopback.cc)
-target_link_libraries(Example_http_loopback PRIVATE
-    bbt::infra_http Threads::Threads)
-target_compile_options(Example_http_loopback PRIVATE -Wall -Wextra)
+    add_subdirectory(http_loopback)
 endif()
 
-# Config 模块消费示例（Issue #35）：读取 → 上层校验 → 接受/拒绝；无新依赖。
+# config 首切片：无新依赖。
 if(BBT_INFRA_CONFIG)
-add_executable(Example_config_consume config_consume.cc)
-target_link_libraries(Example_config_consume PRIVATE
-    bbt::infra_config Threads::Threads)
-target_compile_options(Example_config_consume PRIVATE -Wall -Wextra)
+    add_subdirectory(config_consume)
 endif()
 
-# Redis/Mongo 调用形态示例：同时依赖两个模块 target；任一前缀未接入时
-# 对应模块 target 不存在，本示例随之跳过（公共头仍可独立编译）。
-# CoRedisCli::Create 与 CoMongoCli::Create 分属两模块实现，须同时链接。
+# Redis/Mongo 调用形态：同时依赖两个模块 target；任一缺失时跳过。
 if(TARGET bbt::infra_redis AND TARGET bbt::infra_mongo)
-    add_executable(Example_redis_mongo_shape redis_mongo_shape.cc)
-    target_link_libraries(Example_redis_mongo_shape PRIVATE
-        bbt::infra_redis bbt::infra_mongo Threads::Threads)
-    target_compile_options(Example_redis_mongo_shape PRIVATE -Wall -Wextra)
+    add_subdirectory(redis_mongo_shape)
 endif()
 
-# Mongo 公开 target 消费示例（Mongo 适配迁移）：只链接 bbt::infra_mongo、
-# 只含公开头；真实 CRUD 由 BBT_TEST_MONGO_URI 注入的真实后端驱动，未注入时
-# 打印 skip: 并返回 77。Release CI 的全量构建给出「公开消费可编译」证据。
-# ctest 注册在 tests/CMakeLists.txt——examples/ 早于 include(CTest) 处理，
-# 此处 add_test 不会被 enable_testing() 生效。
+# Mongo 公开 target 消费：只链接 bbt::infra_mongo，真实后端由 BBT_TEST_MONGO_URI 注入。
 if(TARGET bbt::infra_mongo)
     add_subdirectory(mongo_client)
 endif()
 
-# ICoConnection 成员化收口消费示例（终评 §2 组合验收）：只链接 bbt::infra_net。
-# bbt::infra_net 只在任一 *_NET 协议开关打开时存在；旧栈默认构建不引入。
+# ICoConnection 成员化收口 + co_net_service 协程网络：只链接 bbt::infra_net。
 if(TARGET bbt::infra_net)
+    add_subdirectory(co_net_service)
     add_subdirectory(ico_connection)
 endif()
+
+# 新协议示例（http_net/redis_net/rpc_net）的唯一注册方是各协议模块 CMake
+# （bbt/infra/{http,redis,rpc}/CMakeLists.txt，经 cmake/*Net.cmake 接入）；
+# 这里不再重复 add_subdirectory，否则普通模式会报重复 target/test 名。

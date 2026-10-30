@@ -12,21 +12,26 @@ mongocxx、bsoncxx 或底层线程类型。
 
 | 示例 | 目标 | 外部依赖 | 说明 |
 | --- | --- | --- | --- |
-| `http_loopback.cc` | `Example_http_loopback` | 无（loopback） | NetworkRuntime 完整生命周期：装配 → HTTP loopback → 关闭边界 |
-| `config_consume.cc` | `Example_config_consume` | 无 | 配置首切片：本地文件/内存源读取 → 上层校验 → 接受/拒绝；格式错误不发布伪成功 |
-| `redis_mongo_shape.cc` | `Example_redis_mongo_shape` | 链接 hiredis + mongocxx（经 `bbt::infra_redis` + `bbt::infra_mongo`） | Redis/Mongo 命令调用形态与错误/缺失分支；不连真实服务 |
-| `mongo_client/main.cc` | `mongo_client_example` | 链接 mongocxx（经 `bbt::infra_mongo`）；真实 MongoDB 由 `BBT_TEST_MONGO_URI` 注入 | 公开 target 消费闭环：`MongoDocument::FromJson` → `bbt_co_await` 的 `InsertOne`/`FindOne` → 类型化 getter + canonical `ToJson` → `DeleteOne` 并读回未命中；只含公开头 |
+| `http_loopback/` | `Example_http_loopback` | 无（loopback） | NetworkRuntime 完整生命周期：装配 → HTTP loopback → 关闭边界 |
+| `config_consume/` | `Example_config_consume` | 无 | 配置首切片：本地文件/内存源读取 → 上层校验 → 接受/拒绝；格式错误不发布伪成功 |
+| `redis_mongo_shape/` | `Example_redis_mongo_shape` | 同时存在 `bbt::infra_redis` 与 `bbt::infra_mongo` 时链接 hiredis + mongocxx（经两模块 target） | Redis/Mongo 命令调用形态与错误/缺失分支；不连真实服务 |
+| `mongo_client/` | `mongo_client_example` | 链接 mongocxx（经 `bbt::infra_mongo`）；真实 MongoDB 由 `BBT_TEST_MONGO_URI` 注入 | 公开 target 消费闭环：`MongoDocument::FromJson` → `bbt_co_await` 的 `InsertOne`/`FindOne` → 类型化 getter + canonical `ToJson` → `DeleteOne` 并读回未命中；只含公开头 |
+| `co_net_service/` | `Example_co_net_service` | 无（loopback TCP，只链接 `bbt::infra_net`） | R2 风格真实 TCP 回环：Engine server → 协程 CoAccept/Read/Write → 读空守卫 → RequestClose；client 直连回显 |
+| `http_net/` | `http_net_example` | `BBT_INFRA_HTTP_NET=ON`（`bbt::infra_http_net`） | 新 Client → 新 Server：GET/404/POST 往返与连接复用，StopAccepting→Drain→Close→WaitStopped |
+| `ico_connection/` | `Example_ico_connection` | 无（loopback TCP，只链接 `bbt::infra_net`） | ICoConnection 成员化收口：CoAccept/CoDial → Read/Buffer/Write/WriteReport → WaitClosed/Status |
+| `redis_net/` | `redis_net_example` | `BBT_INFRA_REDIS_NET=ON`（`bbt::infra_redis_net`，需 hiredis） | Redis 单连接与连接池：PING/SET/GET/Delete/Exists，唯一 key 清理；无真实 Redis 时按 deadline 报错 |
+| `rpc_net/` | `rpc_net_example` | `BBT_INFRA_RPC_NET=ON`（`bbt::infra_rpc_net`，需 HTTP_NET+PROTOBUF） | rpc::Client ↔ rpc::Server 真实 loopback TCP 回声与业务错误往返，StopAccepting→Drain→Close→WaitStopped |
 
 `examples/config_consumer/` 是一个**独立 CMake 工程**（不被本仓构建引用），只 include
 `bbt/infra/config/` 公共头、只链接 `bbt::infra_config`，用于从仓外视角复核模块 target 可独立
-消费；命令、实测结果与覆盖边界见该目录 `README.md` 与 [docs/config-watch-v1.md](../docs/config-watch-v1.md)。
+消费；命令、实测结果与覆盖边界见该目录 `README.md` 与 [docs/guides/config-watch.md](../docs/guides/config-watch.md)。
 watch 的关闭/去重/drain 与 owner 同步 `Close()` 资源边界不在示例中，由 `tests/Test_config_watch.cc`（`config.watch`）覆盖。
 
 `Example_redis_mongo_shape` 只在 `bbt::infra_redis` 与 `bbt::infra_mongo`
 两个 target 都存在（即同时配置了 `BBT_HIREDIS_PREFIX`、
 `BBT_MONGOCXX_PREFIX` 与 `BBT_MONGOC_PREFIX`）时注册，并同时链接两个模块
 target（`CoRedisCli::Create` 与 `mongo::CoMongoDb::Create` 分属两模块实现；
-公共契约均为 header-only）。Mongo 侧演示 Issue #40 的 owner + 集合句柄形态：
+公共契约均为 header-only）。Mongo 侧演示 owner + 集合句柄形态：
 一个 `mongo::CoMongoDb` 承载 worker/队列/pool，`Collection()` 取轻量句柄。
 
 `examples/mongo_client/` 是 Mongo 公开入口的最小真实消费示例：只 include
