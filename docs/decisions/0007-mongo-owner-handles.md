@@ -12,7 +12,7 @@
 新命令 → `Closed`）；owner 同步 `Close()` 返回即 ops 清空且 worker 全退；等待经
 `CoWaiter::WaitWithCallback` + `WaitOptions`（结果放 operation state），不再有 `CompletionSignal`。
 本文资源归属结论（owner 集中预算、句柄轻量、公共面不泄漏 mongocxx/线程）**继续有效**。superseded by
-[0002 修订记录](0002-co-network-contract-v1.md)。
+[0002 修订记录](0002-co-network-contract.md)。
 
 本文固定 Issue #40 的资源归属取舍：Mongo 模块由「一个 client 一组
 worker」改为「显式 owner + 轻量集合句柄」，保留 Issue #7 裁决的

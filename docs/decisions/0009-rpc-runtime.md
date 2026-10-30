@@ -4,7 +4,7 @@
 > **2026-10-28 分支状态注记**：本文记录的 `bbt::infra::RpcClient/RpcServer` 运行时
 > 壳（HTTP-backed 工厂、`NetworkRuntime::CreateRpcClient/ListenRpc`）已在
 > RPC core 迁移分支删除并改建于新 `bbt::infra::http` 栈
-> （`bbt::infra_rpc_net`，见 [docs/rpc-net.md](../rpc-net.md)）；本文其余内容
+> （`bbt::infra_rpc_net`，见 [docs/guides/rpc-net.md](../guides/rpc-net.md)）；本文其余内容
 > （wire profile、payload codec、预算与关联语义）仍是现行契约的历史依据。
 > framework 侧接线与预算验收已在 Issue #2 的交接评论公开（framework `deps.lock` 固定本仓该 SHA）。第 6 节的本地证据是候选期实测记录，不能替代合入后 PR CI 与 framework 集成的结论。
 

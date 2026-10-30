@@ -6,8 +6,8 @@
 消费侧自检为 `scripts/resource_prefix_verify/`（消费者 CMake 校验 imported target
 与运行版本）。framework 资源 CI 只消费前缀路径，不在自身仓内复制依赖构建逻辑。
 
-决策依据：[0003 Redis/hiredis](decisions/0003-redis-client-hiredis-dependency.md)、
-[0004 Mongo/mongocxx](decisions/0004-mongo-client-mongocxx-dependency.md)。
+决策依据：[0003 Redis/hiredis](../decisions/0003-redis-client-hiredis-dependency.md)、
+[0004 Mongo/mongocxx](../decisions/0004-mongo-client-mongocxx-dependency.md)。
 不发布 bundle/镜像、不新增 runner、不引入新包管理器：脚本在调用方给定的私有前缀内
 从公开源码构建，不写 `/usr/local`、不 `sudo`、不改 runner 镜像。
 

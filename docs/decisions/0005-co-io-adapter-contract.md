@@ -17,7 +17,7 @@
 
 本文不实现 TCP/UDP 库，不定义 Redis、KCP、HTTP 或 Mongo 的业务 API，不创建通用 `IMiddlewareCli`、万能协议插件平台或动态注册表。
 
-现有通信层总契约 `docs/decisions/0002-co-network-contract-v1.md` 继续拥有网络 Runtime、公共错误和关闭语义；本文补充其中缺失的 transport/adapter 执行契约。两者冲突时，以本文对 I/O 执行边界的较新明确规定为准，并在实施 Issue 中记录迁移。
+现有通信层总契约 `docs/decisions/0002-co-network-contract.md` 继续拥有网络 Runtime、公共错误和关闭语义；本文补充其中缺失的 transport/adapter 执行契约。两者冲突时，以本文对 I/O 执行边界的较新明确规定为准，并在实施 Issue 中记录迁移。
 
 ### 1.1 修订记录（2026-10-01：进程寿命运行时 + owner 同步 Close）
 
@@ -41,7 +41,7 @@
   不再访问”。不能证明物理归零的第三方 Binding 仍须采用自己的 worker/有界策略，且不得冒充
   已 `Closed`。
 
-superseded by：本文修订记录 + [0002 修订记录](0002-co-network-contract-v1.md)。
+superseded by：本文修订记录 + [0002 修订记录](0002-co-network-contract.md)。
 本契约（进程寿命运行时 + owner 同步 `Close()`）已合入 main（close/stop 迁移 `02567ed`）；
 本记录只陈述契约与迁移状态，不代表实现已被完整验收。
 
@@ -593,7 +593,7 @@ Mongo 维持 `0004` 的 C 级 worker bridge 例外：这是当前实现的兼容
 已核对的现有事实：
 
 - `bbtools-coroutine/agent-docs/2026-09-07-core-runtime-contract.md`：EventLoop/Poller 负责等待与事件交付，Hook 是适配层，不以 Hook 数量代替兼容验证；Stop 不展开挂起协程栈。
-- `bbtools-infra/docs/decisions/0002-co-network-contract-v1.md`：现有 Runtime、错误、关闭和在途资源契约。
+- `bbtools-infra/docs/decisions/0002-co-network-contract.md`：现有 Runtime、错误、关闭和在途资源契约。
 - `bbtools-infra/docs/decisions/0003-redis-client-hiredis-dependency.md`：hiredis 依赖选型与连接生命周期约束（当前实现为 CoTCP owner binding，`9e68967` 取代原 async + strand）。
 - `bbtools-infra/docs/decisions/0004-mongo-client-mongocxx-dependency.md`：当前 Mongo synchronous driver + worker bridge 决策。
 - hiredis 固定 commit `616f2286ba5503f74ae96e720623fa11dbc690af` 的 `redisContextFuncs`、`redisBufferRead`、`redisBufferWrite`、`redisGetReply` 和 `redisFree` 路径。
