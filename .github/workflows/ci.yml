@@ -168,13 +168,13 @@ jobs:
         timeout-minutes: 25
         env:
           BUILD_DIR: ${{ github.workspace }}/build-debug_gate
-          LAUNCHER: ${{ env.CACHE_ENABLED == 'true' && '-DCMAKE_CXX_COMPILER_LAUNCHER=ccache' || '' }}
+          LAUNCHER: ${{ steps.cache-meta.outputs.enabled == 'true' && '-DCMAKE_CXX_COMPILER_LAUNCHER=ccache' || '' }}
         run: bash infra/scripts/ci/debug_gate.sh
       - name: "network_gate 门禁（构建 + 注册集实跑零跳过）"
         timeout-minutes: 25
         env:
           BUILD_DIR: ${{ github.workspace }}/build-network_gate
-          LAUNCHER: ${{ env.CACHE_ENABLED == 'true' && '-DCMAKE_CXX_COMPILER_LAUNCHER=ccache' || '' }}
+          LAUNCHER: ${{ steps.cache-meta.outputs.enabled == 'true' && '-DCMAKE_CXX_COMPILER_LAUNCHER=ccache' || '' }}
         run: bash infra/scripts/ci/network_gate.sh
       - name: "network-test-results artifact 恒上传"
         if: ${{ always() }}
@@ -191,7 +191,7 @@ jobs:
         timeout-minutes: 25
         env:
           BUILD_DIR: ${{ github.workspace }}/build-redis_net_gate
-          LAUNCHER: ${{ env.CACHE_ENABLED == 'true' && '-DCMAKE_CXX_COMPILER_LAUNCHER=ccache' || '' }}
+          LAUNCHER: ${{ steps.cache-meta.outputs.enabled == 'true' && '-DCMAKE_CXX_COMPILER_LAUNCHER=ccache' || '' }}
         run: bash infra/scripts/ci/redis_net_gate.sh
       - name: "redis-net-test-results artifact 恒上传"
         if: ${{ always() }}

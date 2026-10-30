@@ -18,6 +18,9 @@ if [ "${EVENT_NAME:-}" = "pull_request" ] && \
 elif [ "${CACHE_ENABLED:-}" != "true" ]; then
     echo "cache-bypass / cache-enabled=false：不启用 ccache launcher"
     echo "enabled=false" >> "${GITHUB_OUTPUT:-/dev/stdout}"
+elif ! command -v ccache >/dev/null 2>&1; then
+    echo "runner 未安装 ccache：不启用 ccache launcher（不假定镜像自带）"
+    echo "enabled=false" >> "${GITHUB_OUTPUT:-/dev/stdout}"
 else
     echo "enabled=true" >> "${GITHUB_OUTPUT:-/dev/stdout}"
 fi
