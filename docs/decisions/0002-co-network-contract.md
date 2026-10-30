@@ -33,7 +33,7 @@ owner/framework manager 主动调用的同步 `Close()`**。本记录为准，**
   + adapter 路径 `Notify`（可带载荷）唤醒；**结果与通知分离**，业务结果放各模块自己的
   operation state（详见下方「请求完成」）。
 
-superseded by：本修订记录 + [0005 §6.3/§6.4](0005-co-io-adapter-contract-v1.md)（跨线程同步
+superseded by：本修订记录 + [0005 §6.3/§6.4](0005-co-io-adapter-contract.md)（跨线程同步
 `Close()` 的实现口径）。本契约**已合入 main**（close/stop 迁移 `02567ed`）：`ICoCloseable.hpp`、
 `NetworkTypes.hpp`、`src/detail/IoSupport.hpp` 与模块头/实现、tests、examples 的公开调用链均已迁到
 本契约（旧公开入口 `RequestClose`/`WaitClosed`/`ReleaseClosed`/`CloseStatus` 已删除，见 §附记），
@@ -41,7 +41,7 @@ superseded by：本修订记录 + [0005 §6.3/§6.4](0005-co-io-adapter-contract
 
 ### 后续目标规格
 
-[0005：CoTCP/CoUDP 与第三方 Binding](0005-co-io-adapter-contract-v1.md) 补充目标 I/O 执行边界：proc 执行实际收发和协议，sche 只检测等待条件并唤醒。本文的公共错误、逻辑终态、关闭和资源寿命契约继续有效；末尾 Asio/Beast 实现附记描述旧实现，不代表新模型已完成迁移。0005 已通过独立只读规格终审，但仍是未实现、未完成兼容验收的目标规格。
+[0005：CoTCP/CoUDP 与第三方 Binding](0005-co-io-adapter-contract.md) 补充目标 I/O 执行边界：proc 执行实际收发和协议，sche 只检测等待条件并唤醒。本文的公共错误、逻辑终态、关闭和资源寿命契约继续有效；末尾 Asio/Beast 实现附记描述旧实现，不代表新模型已完成迁移。0005 已通过独立只读规格终审，但仍是未实现、未完成兼容验收的目标规格。
 
 ## 概念与分层
 
@@ -108,7 +108,7 @@ Error.details 是错误分支的结构化详情，RPC 错误信封必须无损�
 Open → Closing → Closed，不重开。`Close()` 由资源 owner/framework manager 主动调用，**幂等**、
 同步完成物理释放后返回；未发送数据直接丢弃、不做 flush。没有 `RequestClose`/`WaitClosed`/
 `CloseStatus` 的等待结果：没有「等待关闭完成」的入口，也没有部分关闭结果枚举。跨线程同步
-`Close()` 的实现口径见 [0005 §6.4](0005-co-io-adapter-contract-v1.md)：封口并唤醒挂起等待者 →
+`Close()` 的实现口径见 [0005 §6.4](0005-co-io-adapter-contract.md)：封口并唤醒挂起等待者 →
 在自身锁上以 `std::condition_variable` **有界**等待在途计数归零 → 物理释放并跑一次 closed hook。
 
 `IsClosed()` 为真（`Closed`）表示后端不会再访问该组件拥有的操作资源；独立业务调用者仍须结束
@@ -180,7 +180,7 @@ Redis/HTTP/Mongo/TCP/UDP 共用同一请求完成口径：
 
 ### 关闭顺序与宿主装配（修订见「修订记录」）
 
-coroutine 运行时按进程寿命存在，**不参与业务资源收口**，也不再有 `Scheduler::Stop()`：由宿主强持有 Runtime，正常顺序为 运行时初始化（`Scheduler::IsInitialized()`）→ NetworkRuntime::Create/Start → 使用 → server.StopAccepting → 等待 handler 结束 → framework manager 主动同步 `Runtime.Close()`（返回即物理收口）→ 释放已关闭网络对象。operation 清理不得依赖协程栈。不默认让全局静态析构承担关闭。若在途 drain 达到实现上限（[0005 §6.4](0005-co-io-adapter-contract-v1.md) 的有界等待）仍未归零，宿主必须继续强持有 Runtime/操作并保持驱动可用；不得按正常栈退出析构它们，收尾由 framework 的 run 契约决定。
+coroutine 运行时按进程寿命存在，**不参与业务资源收口**，也不再有 `Scheduler::Stop()`：由宿主强持有 Runtime，正常顺序为 运行时初始化（`Scheduler::IsInitialized()`）→ NetworkRuntime::Create/Start → 使用 → server.StopAccepting → 等待 handler 结束 → framework manager 主动同步 `Runtime.Close()`（返回即物理收口）→ 释放已关闭网络对象。operation 清理不得依赖协程栈。不默认让全局静态析构承担关闭。若在途 drain 达到实现上限（[0005 §6.4](0005-co-io-adapter-contract.md) 的有界等待）仍未归零，宿主必须继续强持有 Runtime/操作并保持驱动可用；不得按正常栈退出析构它们，收尾由 framework 的 run 契约决定。
 
 ## N2：RPC 编解码与定址传输，不含服务治理
 

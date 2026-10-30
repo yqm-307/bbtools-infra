@@ -1,36 +1,40 @@
 # AGENTS.md — bbtools-infra
 
-## 定位与权威入口
+<!-- bbtools:common:begin -->
+依赖方向固定为 `bbt-framework → bbtools-infra → bbtools-coroutine`，禁止反向依赖、环依赖和引用兄弟模块内部实现。
+新 worktree/clone 不会带入未提交规范；开工先核对实际规范快照与依赖版本。
+共享公共契约由单一负责人协调；并行写任务使用独立工作区、索引、build 和依赖目录，保留他人已有改动。
+统一以 C++17 为基线；优先标准库与 Boost 1.90，模板适度，namespace 不超过三层（`bbt::{大模块}::{小模块}`）。
+本地构建并发固定为 2；使用共享队列 `flock /tmp/bbt-build.lock`，构建显式 `--parallel 2`，configure 使用 ccache；测试用 `ctest -j1`。
+本地验证必须覆盖冒烟、本次功能及直接耦合测试；本地不跑全量，完整测试走 PR CI。
+只改获授权范围，不覆盖他人已有改动；Issue/任务存在不等于实施授权；commit、push、PR、付费调用、部署与破坏性操作须先获用户授权。
+提交标题使用 `<type>(<scope>): <简洁中文说明>`，单次提交不混无关变更；目标测试通过且无新增警告后才允许 commit。交付前检查无意外改动并报告未覆盖项。Agent author 固定写法：`git commit --author="agent <agent@users.noreply.github.com>"`。
+不直推 `main`、不自行合并或发布；受保护文件（含 `AGENTS.md`）及公共契约/权限/并发关键改动须独立审查。远端写入后回读确认目标对象。
+文档一事一处、代码与对应文档同一 PR 更新；README 只保留状态与入口；ADR 使用唯一递增编号，合入后只追加取代关系。
+注释说明 WHY，不重复 WHAT；必须保留时序与所有权约束，公开头文件开头说明职责；不留 Issue/PR、审查/阶段代号、契约行号或临时版本号。
+新依赖、CI/发布变更、公共接口或数据布局破坏性变更、系统安装或运行基础设施操作，先确认。
+<!-- bbtools:common:end -->
 
-- 本仓是现代 C++ 工具层与基础接入层，负责第三方适配、执行域、错误映射、连接/资源生命周期及基础动态配置；不承载 framework 的 App/Service、业务 schema、发现治理、灰度发布或配置生效策略，也不是 IaC 仓。
-- [README](README.md) 是模块交付状态与使用入口的真源；[docs/decisions](docs/decisions/) 保存稳定取舍，公开头与模块文档维护契约，Issue/PR/Review 记录需求、进度和验收。未验能力不得写成已交付；不在本文件重复状态表。
-- 实现、测试、依赖接入或迁移前，须阅读并遵守[开发指南](docs/development.md)的相关章节；它承接本文件的操作规范。普通任务最小充分实现，不自动进入 SDD，不强制新跟踪系统或固定模板。
-- 网络执行域与资源所有权见[网络执行模型](docs/architecture/gnet-network-execution.md)；新 Redis 入口见[Redis net 文档](docs/redis-net.md)；CI 入口与覆盖见[CI 说明](docs/ci/infra-ci-v1.md)。按任务读取，不全量预载。
-- 跨仓基调遵循 framework 的 `bbt-framework/docs/architecture/distributed-framework-baseline.md`；本仓只实现 infra 机制。team 的分工摘要不替代本仓契约。主 Issue：https://github.com/yqm-307/bbtools-infra/issues/1 。
+## 定位
 
-## 编码与架构约束
+本仓是现代 C++ 工具层与基础接入层：第三方适配、执行域、错误映射、连接/资源生命周期与基础动态配置。不承载 framework 的 App/Service、业务 schema、发现治理、灰度发布或配置生效策略，也不是 IaC 仓。
 
-1. **依赖方向**：`bbt-framework → bbtools-infra → bbtools-coroutine`，禁止反向依赖；模块依赖显式、可测试且无环，不引用兄弟模块内部实现。`bbtools-core` 已冻结，不新增 `bbt_core` 依赖；具体目标只链接实际需要的能力。
-2. **C++17**：不静默提升标准；公共示例使用现有有栈协程模型，不使用 C++20 `co_await`/`Task<T>`。adapter 使用 RAII、智能指针/值语义、chrono、类型安全错误和明确的取消/生命周期。
-3. **namespace 不超过三层**：`bbt::{大模块}::{小模块}`；Redis/Mongo 新 API 固定为 `bbt::infra::redis`、`bbt::infra::mongo`，配置为 `bbt::infra::config`。公共头不出现 App/Service 等上层类型。
-4. **复用优先**：按标准库、Boost 1.90、仓内能力、必要新依赖的顺序评估；保留自研须有语义、性能、平台或生命周期的可复核差异理由。不得为少一个依赖重造复杂协议或安全组件。
-5. **模板适度、基础库尽量 header-only**：模板服务类型安全与复用；不引入技巧性元编程。有稳定 ABI、重状态、I/O、平台隔离或明显编译成本时可保留编译单元并说明理由。
-6. **adapter 边界**：第三方类型、异常和线程模型默认不进入公共 API；无法隔离时显式说明并评审兼容影响。adapter 负责 I/O、取消/关闭、错误映射及资源寿命；coroutine 只负责运行时等待/唤醒和自身对象安全。回调/控制反转不改变依赖方向，不建万能协议平台。
+## 真源入口（按任务读取，不全量预载）
 
-## 开发与验收门禁
+- 状态与文档地图：[README.md](README.md)；模块交付状态以 README 表格为准。
+- 操作规范：[docs/guides/development.md](docs/guides/development.md)（隔离、接口职责、测试口径、本地验证、审查交付、旧仓迁移）。
+- 编码与维护细则：[docs/conventions.md](docs/conventions.md)；C++ 格式唯一真源 `.clang-format`。
+- 网络执行域契约：[docs/architecture/gnet-network-execution.md](docs/architecture/gnet-network-execution.md)；稳定取舍见 [docs/decisions/](docs/decisions/)。
+- 模块契约/构建/边界：[docs/guides/redis-net.md](docs/guides/redis-net.md)、[docs/guides/http-net.md](docs/guides/http-net.md)、[docs/guides/rpc-net.md](docs/guides/rpc-net.md)、[docs/guides/config-watch.md](docs/guides/config-watch.md)。
+- CI 编排与覆盖：[docs/guides/ci.md](docs/guides/ci.md) 与 [.github/workflows/ci.yml](.github/workflows/ci.yml)。
+- 跨仓基调：framework 的 `bbt-framework/docs/architecture/distributed-framework-baseline.md`；本仓只实现 infra 机制。主 Issue：https://github.com/yqm-307/bbtools-infra/issues/1 。
 
-- 新公共入口先用最小消费示例确认调用方式、错误及关闭责任，再定义契约测试和实现真实后端；不默认多模块同时实现。等待结束、逻辑关闭与物理回收须按各模块契约区分，不为 adapter 资源问题要求上游改造。
-- 一任务一位实现负责人；实现与必要编译冒烟连续完成，最终变更独立审查。共享公共契约由一位负责人协调，并行写任务使用独立工作区、索引、build 和依赖目录；保留他人脏改动。
-- 并发与生命周期测试须证明进入目标阶段，再触发故障/关闭，检查结果和资源收口；固定 sleep、用例名称及通过数量不替代阶段证据。fixture 只补充时序控制，不替代真实后端集成。
-- 本地必跑冒烟、本次功能和直接耦合测试，不跑全量；全量走 PR CI。新 configure 使用 ccache，构建按目标并**固定 `--parallel 2`**；具体命令、队列与例外串行规则见[本地验证](docs/development.md#本地验证)。禁止 bare `--parallel`、bare `ninja`、`make -j$(nproc)`。
-- 新目标/测试须核对构建开关、注册集合及 CI 执行路径；未接入时明确列未覆盖。CI 全绿只证明实际执行的范围，不能替代新路径验收，也不自动授权修改 CI。
-- 交付须给实际 build/test/consume 命令、版本、结果和未验项；平台及依赖支持逐项验证，不从第三方声明推定。文档改动运行 `git diff --check`；远端写入回读精确对象与 SHA。
-- 文档用中文，标识符、命令、错误原文保留。长期决策与必要摘要入仓；构建产物、原始日志、会话、凭据及私有路径不入仓，私有记忆不作公共交接前提。
+## 本仓特有门禁
 
-## 权限与协作边界
-
-- 验收标准明确的 Issue 可直接实现并走 PR。独立审查通过后可自主 commit、推送功能分支并创建 PR；不直推 main、不自行合并或发布。
-- 新依赖、公共接口破坏、CI/发布、系统安装、运行基础设施，以及旧仓归档/只读/删除/重命名或消费者切换，须先确认；Issue 创建不等于这些操作已获授权。缺环境/授权时明确 BLOCKED，不用 stub、跳过断言、放宽检查或扩大权限伪装完成。
-- 用户可直接与本仓 Agent 确认任务，无需经 Alice 转交；跨仓契约与相关拥有者协调，不能代改其他仓。framework 外程序可直接消费本仓；经 framework 使用时不得绕过其生命周期、配置或安全约束。
-- 测试优先自有进程与动态端口；共享服务须声明复用/互斥和清理边界，不终止他人进程，不覆盖共享前缀。无法隔离的既有构建先报告阻塞，不擅改入口。
-- 新 worktree/clone 不携带未提交规范；开工核对实际规范与依赖版本，未发布规范由授权交接者提供明确快照及适用范围。旧仓迁移、上游支撑缺口与交接要求见[开发指南](docs/development.md)。
+- `bbt_core` 依赖已冻结不再新增（`BBT_CORE_SOURCE_DIR` 仅为过渡兼容开关）；细则见 `docs/conventions.md` 第三节。新增 Redis/Mongo 公共 API 固定 `bbt::infra::redis`、`bbt::infra::mongo`，配置为 `bbt::infra::config`。
+- adapter 边界：第三方类型、异常、线程模型不进入公共 API；adapter 负责 I/O、取消/关闭、错误映射与资源寿命，coroutine 只负责运行时等待/唤醒。等待结束、逻辑关闭与物理回收按各模块契约区分。
+- coroutine 消费 pin 在 `cmake/coroutine.sha`，由 `bbt_coroutine_pin_verify()` 核验；新协议闭包构建开关 `BBT_INFRA_HTTP_NET` / `BBT_INFRA_REDIS_NET` / `BBT_INFRA_RPC_NET`。
+- 公开头一般在 `include/`；新 net/Redis 模块例外，公开头与实现并置于 `bbt/infra/net/`、`bbt/infra/redis/`，由公开 target 导出仓根 include 路径。
+- 并发/生命周期测试先证明进入目标阶段，再触发故障/关闭并检查结果与资源收口；fixture 不替代真实后端集成。Redis/Mongo live 容器编排归 Release job，普通 PR 不跑。
+- 用户可直接与本仓 Agent 确认任务；跨仓契约与相关拥有者协调，不能代改其他仓。framework 外程序可直接消费本仓；经 framework 使用不得绕过其生命周期、配置或安全约束。
+- 旧仓（bbtools-http/rpc/network/conet）只作历史素材；归档、只读、删除、重命名或消费者切换须先确认，规则详见 development.md「旧仓迁移与支撑缺口」。

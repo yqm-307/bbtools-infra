@@ -97,7 +97,7 @@ ctest --test-dir <build> -j1 -R '^rpc\.net\.' --output-on-failure
 
 - 目标：`bbt::infra_rpc_net`（alias，STATIC：`RpcWire.cc`/`Client.cc`/`Server.cc`）；
   公开头自检 `bbt_infra_rpc_net_header_selfcheck`；示例 `rpc_net_example`
-  （CTest 名 `rpc.net.consumer`）。
+  （CTest 名 `example_rpc_net_consumer`）。
 - 依赖：`bbt::infra_http_net`（PUBLIC）+ `bbt_infra_rpc_proto`（PRIVATE，
   protoc/runtime 同源 3.21.12 锁定与 SHA256/pkg-config 核验集中在
   `cmake/RpcNet.cmake`，是 network-only 闭包内 protobuf 锁定的唯一真源）。
