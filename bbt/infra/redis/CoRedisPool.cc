@@ -17,6 +17,18 @@ Error ContextError() { return MakeError(ErrorCode::InvalidContext, "redis pool: 
 
 } // namespace
 
+// 命令包装共用样板：按现有借还语义借连接（失败原样透传），把借到的
+// client 交给 invoke，返回其终态；离开作用域时 Borrow RAII 按实际流
+// 健康状态归还或退役，不改变既有命令的可观察行为。
+template <typename R, typename Invoke>
+bbt_co_async(R) CoRedisPool::RunBorrowed(const CallOptions& options, Invoke&& invoke) {
+    const auto state = state_;
+    auto acquired = bbt_co_await Acquire(options);
+    if (!acquired) { return R::err(std::move(acquired.error())); }
+    auto borrow = std::move(acquired).value();
+    return bbt_co_await invoke(*borrow.client); // borrow 析构归还。
+}
+
 // State：公开句柄与 State 各自持有 shared_ptr；命令入口先拷贝 state 再挂起，
 // 恢复后不再访问公开句柄。每个等待者持独立 CoWaiter（单等待位语义），归还方
 // 锁内 handoff 连接后 Notify，无 native 条件变量等待，不阻塞 worker。
@@ -203,7 +215,9 @@ bbt_co_async(result<void>) CoRedisPool::Connect(const CallOptions& options) {
         }
     }
     for (std::size_t remaining = targets.size(); remaining > 0; --remaining) {
-        auto created = CoRedisCli::Create(state->engine, state->address);
+        // 每条连接（含修复/重建）都用池配置的握手走三参 Create；
+        // 握手配置非法或握手失败时下方 rollback 统一归还预算。
+        auto created = CoRedisCli::Create(state->engine, state->address, state->options.handshake);
         if (!created) {
             for (auto& item : established) { item->Close(); }
             std::lock_guard<std::mutex> lock(state->mutex);
@@ -353,54 +367,88 @@ bbt_co_async(result<CoRedisPool::Borrow>) CoRedisPool::Acquire(const CallOptions
 }
 
 bbt_co_async(result<void>) CoRedisPool::Ping(const CallOptions& options) {
-    const auto state = state_;
-    auto acquired = bbt_co_await Acquire(options);
-    if (!acquired) { return result<void>::err(std::move(acquired.error())); }
-    auto borrow = std::move(acquired).value();
-    auto value = bbt_co_await borrow.client->Ping(options);
-    if (!value) { return result<void>::err(std::move(value.error())); }
-    return result<void>::ok(); // borrow 析构归还。
+    return bbt_co_await RunBorrowed<result<void>>(options,
+        [&](CoRedisCli& client) { return client.Ping(options); });
 }
 
 bbt_co_async(result<std::optional<std::string>>) CoRedisPool::Get(std::string_view key, const CallOptions& options) {
-    const auto state = state_;
-    using R = result<std::optional<std::string>>;
-    auto acquired = bbt_co_await Acquire(options);
-    if (!acquired) { return R::err(std::move(acquired.error())); }
-    auto borrow = std::move(acquired).value();
-    auto value = bbt_co_await borrow.client->Get(key, options);
-    if (!value) { return R::err(std::move(value.error())); }
-    return R::ok(std::move(value).value());
+    return bbt_co_await RunBorrowed<result<std::optional<std::string>>>(options,
+        [&](CoRedisCli& client) { return client.Get(key, options); });
 }
 
 bbt_co_async(result<void>) CoRedisPool::Set(std::string_view key, std::string_view value, const CallOptions& options) {
-    const auto state = state_;
-    auto acquired = bbt_co_await Acquire(options);
-    if (!acquired) { return result<void>::err(std::move(acquired.error())); }
-    auto borrow = std::move(acquired).value();
-    auto reply = bbt_co_await borrow.client->Set(key, value, options);
-    if (!reply) { return result<void>::err(std::move(reply.error())); }
-    return result<void>::ok();
+    return bbt_co_await RunBorrowed<result<void>>(options,
+        [&](CoRedisCli& client) { return client.Set(key, value, options); });
+}
+
+bbt_co_async(result<bool>) CoRedisPool::Set(std::string_view key, std::string_view value, const SetOptions& set_options, const CallOptions& options) {
+    return bbt_co_await RunBorrowed<result<bool>>(options,
+        [&](CoRedisCli& client) { return client.Set(key, value, set_options, options); });
 }
 
 bbt_co_async(result<bool>) CoRedisPool::Exists(std::string_view key, const CallOptions& options) {
-    const auto state = state_;
-    auto acquired = bbt_co_await Acquire(options);
-    if (!acquired) { return result<bool>::err(std::move(acquired.error())); }
-    auto borrow = std::move(acquired).value();
-    auto value = bbt_co_await borrow.client->Exists(key, options);
-    if (!value) { return result<bool>::err(std::move(value.error())); }
-    return result<bool>::ok(std::move(value).value());
+    return bbt_co_await RunBorrowed<result<bool>>(options,
+        [&](CoRedisCli& client) { return client.Exists(key, options); });
 }
 
 bbt_co_async(result<std::uint64_t>) CoRedisPool::Delete(std::vector<std::string> keys, const CallOptions& options) {
-    const auto state = state_;
-    auto acquired = bbt_co_await Acquire(options);
-    if (!acquired) { return result<std::uint64_t>::err(std::move(acquired.error())); }
-    auto borrow = std::move(acquired).value();
-    auto value = bbt_co_await borrow.client->Delete(std::move(keys), options);
-    if (!value) { return result<std::uint64_t>::err(std::move(value.error())); }
-    return result<std::uint64_t>::ok(std::move(value).value());
+    return bbt_co_await RunBorrowed<result<std::uint64_t>>(options,
+        [&](CoRedisCli& client) { return client.Delete(std::move(keys), options); });
+}
+
+bbt_co_async(result<bool>) CoRedisPool::Expire(std::string_view key, std::chrono::milliseconds ttl, const CallOptions& options) {
+    return bbt_co_await RunBorrowed<result<bool>>(options,
+        [&](CoRedisCli& client) { return client.Expire(key, ttl, options); });
+}
+
+bbt_co_async(result<TtlResult>) CoRedisPool::Ttl(std::string_view key, const CallOptions& options) {
+    return bbt_co_await RunBorrowed<result<TtlResult>>(options,
+        [&](CoRedisCli& client) { return client.Ttl(key, options); });
+}
+
+bbt_co_async(result<std::int64_t>) CoRedisPool::Incr(std::string_view key, const CallOptions& options) {
+    return bbt_co_await RunBorrowed<result<std::int64_t>>(options,
+        [&](CoRedisCli& client) { return client.Incr(key, options); });
+}
+
+bbt_co_async(result<std::int64_t>) CoRedisPool::Decr(std::string_view key, const CallOptions& options) {
+    return bbt_co_await RunBorrowed<result<std::int64_t>>(options,
+        [&](CoRedisCli& client) { return client.Decr(key, options); });
+}
+
+bbt_co_async(result<std::int64_t>) CoRedisPool::IncrBy(std::string_view key, std::int64_t delta, const CallOptions& options) {
+    return bbt_co_await RunBorrowed<result<std::int64_t>>(options,
+        [&](CoRedisCli& client) { return client.IncrBy(key, delta, options); });
+}
+
+bbt_co_async(result<std::int64_t>) CoRedisPool::DecrBy(std::string_view key, std::int64_t delta, const CallOptions& options) {
+    return bbt_co_await RunBorrowed<result<std::int64_t>>(options,
+        [&](CoRedisCli& client) { return client.DecrBy(key, delta, options); });
+}
+
+bbt_co_async(result<bool>) CoRedisPool::HSet(std::string_view key, std::string_view field, std::string_view value, const CallOptions& options) {
+    return bbt_co_await RunBorrowed<result<bool>>(options,
+        [&](CoRedisCli& client) { return client.HSet(key, field, value, options); });
+}
+
+bbt_co_async(result<std::optional<std::string>>) CoRedisPool::HGet(std::string_view key, std::string_view field, const CallOptions& options) {
+    return bbt_co_await RunBorrowed<result<std::optional<std::string>>>(options,
+        [&](CoRedisCli& client) { return client.HGet(key, field, options); });
+}
+
+bbt_co_async(result<std::uint64_t>) CoRedisPool::HDel(std::string_view key, std::vector<std::string> fields, const CallOptions& options) {
+    return bbt_co_await RunBorrowed<result<std::uint64_t>>(options,
+        [&](CoRedisCli& client) { return client.HDel(key, std::move(fields), options); });
+}
+
+bbt_co_async(result<bool>) CoRedisPool::HExists(std::string_view key, std::string_view field, const CallOptions& options) {
+    return bbt_co_await RunBorrowed<result<bool>>(options,
+        [&](CoRedisCli& client) { return client.HExists(key, field, options); });
+}
+
+bbt_co_async(result<HashEntries>) CoRedisPool::HGetAll(std::string_view key, const CallOptions& options) {
+    return bbt_co_await RunBorrowed<result<HashEntries>>(options,
+        [&](CoRedisCli& client) { return client.HGetAll(key, options); });
 }
 
 } // namespace bbt::infra::redis

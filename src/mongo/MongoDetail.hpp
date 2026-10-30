@@ -6,6 +6,7 @@
 
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <bsoncxx/v1/document/view.hpp>
 #include <bsoncxx/v1/exception-fwd.hpp>
@@ -22,10 +23,13 @@ namespace bbt::infra::mongo_detail {
 // 一次 CRUD 调用的结果载荷（worker 线程产出，协程消费）。
 struct MongoOpOutcome {
     std::optional<MongoDocument> doc;   // FindOne 命中（未命中为 nullopt）
+    std::vector<MongoDocument>   docs;  // Find 命中页（无匹配为空）
     std::int64_t matched  = 0;
     std::int64_t modified = 0;
     std::int64_t upserted = 0;
     std::int64_t deleted  = 0;
+    std::int64_t inserted = 0;          // InsertMany 已写入数
+    std::int64_t counted  = 0;          // CountDocuments 精确计数
 };
 
 // MongoDocument.bytes → bsoncxx 只读视图：空字节或结构不良构 →
@@ -36,6 +40,12 @@ result<bsoncxx::v1::document::view> ViewOf(const MongoDocument& doc,
 
 // document::view → 拥有型 MongoDocument（整段字节拷贝）。
 MongoDocument DocOf(bsoncxx::v1::document::view v);
+
+// 「空谓词」判定（UpdateMany/DeleteMany 的防全表改写门禁）：bytes 为空
+// （未初始化）或字节序列是结构良构的 `{}` 空文档（长度 5：int32 长度
+// + 结尾 0x00）都算空谓词；调用方须写显式匹配条件来表达「匹配全部」。
+// 不良构字节不算空谓词——由 ViewOf 的良构校验单独归类 InvalidArgument。
+bool IsEmptyBson(const MongoDocument& doc) noexcept;
 
 // mongocxx 异常 → 契约 Error：
 //   - v_noabi::operation_exception（CRUD 服务端失败的实际抛出类型）与

@@ -10,7 +10,10 @@ foreach(_case connect_failure_owned seal_during_connect_start close_invalidates_
         shared_engine_isolation host_drain_no_residue set_get_remote_error
         fragmented_reply unknown_disconnect framing_and_faults
         pool_connect pool_basic_commands pool_concurrent pool_overloaded pool_close
-        pool_stages pool_wait_exits pool_wait_windows pool_repair_waiter pool_connect_rollback)
+        pool_stages pool_wait_exits pool_wait_windows pool_repair_waiter pool_connect_rollback
+        set_options_contract expire_ttl_contract incr_family_contract hash_contract
+        handshake_auth_select pool_new_commands pool_handshake_auth hgetall_protocol_faults
+        close_during_handshake)
     add_test(NAME redis.net.${_case} COMMAND Test_redis_net_contract ${_case})
     set_tests_properties(redis.net.${_case} PROPERTIES TIMEOUT 30 LABELS "redis_net")
 endforeach()

@@ -26,14 +26,14 @@ bash tests/mongo-live/run.sh "$BUILD_DIR/tests/Test_mongo_live"
 ```
 
 - Redis A：PING、二进制 KV、服务端错误、32 并发冒烟、断连恢复、关闭；额外 CoTCP binding live：真实 RESP2 往返与 2 MiB 大值回归。
-- Mongo A：CRUD、not-found、重复键、驱动错误映射、16 并发冒烟、关闭与多集合 owner。
+- Mongo A：CRUD、not-found、重复键、驱动错误映射、16 并发冒烟、关闭与多集合 owner；多文档数据面 `t_dp_*` 7 例（`t_dp_insert_many` 有序批量与部分成功读回、`t_dp_find_semantics` sort/projection/skip/limit 与空 filter、`t_dp_find_result_bytes` 16 MiB 结果上限、`t_dp_update_many`、`t_dp_delete_many` 空 filter 拒绝、`t_dp_count_documents` 精确计数、`t_dp_find_blocked_owner_close` failCommand 握手确认进入 native 后 owner Close）。数据面用例每例独占临时库 `bbt_dp_<pid>_<seq>_<tag>`，`DpNsGuard` 清理（drop 并读回清空）失败会用例失败，只清理自有命名空间。
 - 两模块 B：停止容器后命令失败；C：恢复健康后新 client 恢复。
 - 每阶段只对该阶段的有效用例计验收；非该阶段的用例可能打印 phase skip，不得合并成每阶段全用例通过。无服务的前段 CTest live Skipped 不替代后段 live。
 - PR（含 fork）、push→main、workflow_dispatch 均在一次性 hosted ubuntu-24.04 执行；docs-only 可跳过 Release，code/unknown 必须执行。live 失败使 Release 失败，并进入唯一 result 汇聚，不产生另一个同名 check。
 - 顶层无权限，checkout job 仅 contents:read、persist-credentials:false；无 secrets/OIDC、生产地址或共享后端，不使用 pull_request_target。fork 平台审批机制未改变，不声称已执行真实 fork 或手动 run。
 - 仓库当前无 branch-protection required contexts；本任务不修改保护配置。合入验收必须人为核对精确 PR head 的 Release/Debug 与汇聚检查通过，不能把名字带 required 的注释当作平台强制保护。
 
-复用 compose 的 redis:7-alpine / mongo:8.0；Redis 0.5 CPU/256 MiB，Mongo 0.75 CPU/512 MiB、WiredTiger cache 0.25 GiB。使用独占 project、临时 loopback 端口、有限健康等待和测试时间。Release job 上限 45 分钟，Redis/Mongo 两个 live step 上限分别为 19/16 分钟（计入 timeout 的 kill-after 宽限）；这些是故障预算，不是正常耗时。只清理自有 project 的容器/卷/网络，不 prune 他人资源；一次性 hosted VM 回收是硬杀后的隔离边界，不推广到常驻 runner。镜像 tag 可变，日志记录实际镜像身份，不宣称 digest pin。
+复用 compose 的 redis:7-alpine / mongo:7.0（镜像版本以 tests/mongo-live/compose.yml 为准；本机验证曾用 mongo:8.0 临时容器，属已知差异）；Redis 0.5 CPU/256 MiB，Mongo 0.75 CPU/512 MiB、WiredTiger cache 0.25 GiB。使用独占 project、临时 loopback 端口、有限健康等待和测试时间。Release job 上限 45 分钟，Redis/Mongo 两个 live step 上限分别为 19/16 分钟（计入 timeout 的 kill-after 宽限）；这些是故障预算，不是正常耗时。只清理自有 project 的容器/卷/网络，不 prune 他人资源；一次性 hosted VM 回收是硬杀后的隔离边界，不推广到常驻 runner。镜像 tag 可变，日志记录实际镜像身份，不宣称 digest pin。
 
 ## #34 真实超时与 owner Close 补验（当前本地候选）
 

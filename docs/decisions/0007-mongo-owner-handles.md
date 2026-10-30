@@ -146,3 +146,80 @@ mongo-c-driver `2.5.4`（上游 commit `ad87ab88907a0105823469fb5d393ed717bed9ba
 - 0006（`bbt::infra::mongo` 命名空间/目录方向）落地：新公共头在
   `include/bbt/infra/mongo/Client.hpp`，实现继续在 `src/mongo/`；
 - 0005（co-io-adapter）不变：完成回投仍走共享 executor strand。
+
+### 增量：多文档数据面（2026-10-30，未合入，待独立审查）
+
+本增量为 `bbt::infra::mongo::CoMongoColl` 新增 5 个多文档入口：`InsertMany`、`Find`、
+`UpdateMany`、`DeleteMany`、`CountDocuments`（声明在 `include/bbt/infra/mongo/Client.hpp`；
+实现增量在 `src/mongo/MongoRuntime.{hpp,cc}` 与 `src/mongo/MongoDetail.{hpp,cc}`——后者
+只扩错误分类对 `inserted_count`/`failed_index` 的提取）。owner、pool lease、worker 组、
+有界接纳队列、终态发布与物理收口语义一行未改：5 个入口复用既有
+`CollSubmit → Submit → 有界队列 → worker → RunDriverCall → Publish/Finish` 同一管线；
+队列满 Overloaded、deadline/Close 竞争只发布一次逻辑终态、协程外 `bbt_co_await` 的
+`std::logic_error` 口径（同 2026-10-27 增量第 6 条）、错误映射（服务端回复→RemoteError，
+driver 侧失败→Unavailable，无效参数→InvalidArgument，pool wait 超时→Overloaded）全部沿用。
+现有 `InsertOne/FindOne/UpdateOne/DeleteOne` 签名与语义不变。
+
+1. **入口语义**：`InsertMany(docs, CallOptions) -> result<MongoInsertManyResult>`（有序
+   插入，返回已插入数）；`Find(filter, FindOptions, CallOptions) ->
+   result<std::vector<MongoDocument>>`（可选 sort/projection/skip，按游标顺序物化一页，
+   无匹配返回空 vector 而非 NotFound）；`UpdateMany(filter, update, CallOptions) ->
+   result<MongoUpdateResult>`（复用 UpdateOne 的 update 校验与结果结构，返回
+   matched/modified/upserted）；`DeleteMany(filter, CallOptions) -> result<std::uint64_t>`
+   （返回删除数）；`CountDocuments(filter, CallOptions) -> result<std::uint64_t>`（精确计数）。
+2. **有界上限（公共常量，越界一律接纳前 `InvalidArgument` 零接纳，什么都不发）**：
+   `kMongoLimitsMaxInsertDocs=500`、`kMongoLimitsMaxInsertTotalBytes=8 MiB`——依据单条
+   命令 16 MiB 的 BSON 协议上限，预留约一半余量给命令封套与 insert 参数，不物化接近
+   协议上限的命令；Find 的 `FindOptions::limit` **必填**且 `≤ kMongoLimitsMaxFindLimit=1000`
+   （`limit==0` 或超上界均拒绝，杜绝无界游标物化），返回文档累计字节超
+   `kMongoLimitsMaxFindResultBytes=16 MiB` → `RemoteError(domain_code="result_too_large")`
+   而非 OOM。更大结果集属已知 ceiling（分页/流式，后续按真实需求扩）。
+   独立审查后补：**输入侧同界**——`kMongoLimitsMaxInputDocBytes=8 MiB`（同值常量）限制
+   filter/update/sort/projection 及 InsertMany 单文档，全部在 `CollSubmit` 之前校验
+   （零接纳）；`FindOptions::skip` 上限即 driver int64 表示范围，`skip > INT64_MAX`
+   → `InvalidArgument`，不另设分页上限；InsertMany 累计与 Find 返回字节累计均改
+   `part > limit - total` 减法预算，杜绝 `size_t` 回绕绕过上限。
+3. **空 filter 拒绝（本任务的一条设计决定，可被推翻）**：`UpdateMany`/`DeleteMany` 一律
+   拒绝空 filter（bytes 为空或良构 `{}` 均算空，`IsEmptyBson` 判定）→ `InvalidArgument`：
+   防止一句空谓词误改/误删全集合；要全量更新/删除须写显式匹配条件（如
+   `{"_id":{"$exists":true}}`）。对照面：`Find`/`CountDocuments` 的空 filter 合法（匹配
+   全部/统计全集合）；`InsertOne/FindOne/UpdateOne/DeleteOne` 沿用既有 bytes 空拒绝。
+   该边界同时写在 `Client.hpp` 的 `CoMongoColl` 类注释，便于调用方发现与推翻。
+4. **部分成功契约（InsertMany）**：有序 `insert_many`（v1 默认 ordered=true）首个写错误
+   中止 → `RemoteError`，此前已写入的文档**保留**在服务端。调用方经错误通道观察：
+   `Error.details["requested_count"]`（本层补齐的请求总数，必然存在）、
+   `details["inserted_count"]`（服务端 raw reply 的 `nInserted`/`n`/ordered 时首个
+   `writeErrors.index` 三键回退，服务端未给出时该键缺省）、`details["failed_index"]`
+   （服务端给出时）；`domain_code`/`backend_code` 仍承载 codeName/code（如
+   `DuplicateKey`/`11000`）。live 实测：当前驱动版本 E11000 单点失败只回传
+   `requested_count`，`inserted_count`/`failed_index` 缺省——契约按「服务端给出时才有」
+   写明（`MongoInsertManyResult` 注释），调用方可靠回退是 `requested_count` +
+   复 `Find`/`CountDocuments` 读回核对。
+
+验证锚点（本轮实测，本机 `mongo:8.0` 临时容器）：
+
+- `mongo.unit` 新增 `mongo_data_plane` suite 5 例：`t_dp_param_validation`（InsertMany
+  空列表/>500 文档/含空文档/8 MiB 越界→InvalidArgument 与 ~7 MiB 穿过→Unavailable 的
+  字节边界对照、Find `limit==0`/>1000、UpdateMany/DeleteMany 空 filter 两种形态，全部
+  零接纳——队列深度与执行槽计数为 0）、`t_dp_invalid_context_plain`、
+  `t_dp_queue_overloaded`、`t_dp_handle_close_scoped`、`t_dp_owner_close_drains_inflight`
+  （在途 op 进入执行槽后 owner Close：唯一终态 Closed、`inflight_at_return` 证明晚到
+  driver 结果不覆盖、Close 返回即 worker/执行槽归零）。
+- `mongo.live` 新增 7 例（PHASE=A）：`t_dp_insert_many`（全量成功 + 重复 _id 中止 +
+  读回证明部分成功）、`t_dp_find_semantics`（sort 升降序、projection 字段集、skip/limit
+  页边界、空 filter 匹配全部）、`t_dp_find_result_bytes`（~19 MiB 超 16 MiB 上限 →
+  `result_too_large`）、`t_dp_update_many`、`t_dp_delete_many`、`t_dp_count_documents`、
+  `t_dp_find_blocked_owner_close`（failCommand blockConnection + waitForFailPoint 握手
+  确认新 Find 已进入 native driver 阻塞后再 owner Close，取代仅靠 phase==kRunning 的
+  执行槽口径）。
+  数据面用例每例独占临时库 `bbt_dp_<pid>_<seq>_<tag>`，`DpNsGuard` 经显式 `Finish()`
+  drop 并 `list_collection_names` 读回，清理失败置共享原子并让用例失败（`CheckDpCleanup`），
+  成功与异常路径都只清理自有命名空间，不触碰共享 `bbt_live`。
+- `mongo.async_compile`：5 个新入口经 `bbt_co_await` 的正例编译门禁。
+
+未覆盖（诚实边界）：本机验证用 `mongo:8.0`，CI compose 为 `mongo:7.0`
+（`tests/mongo-live/compose.yml`），7.0 上未实测；`mongo.live` 两个既有不稳定签名
+（`t_close_drains_inflight` 的 settled 0 != 16、`t_owner_multi_collection_live` 的
+WaitUntil ok==2）未消除，非本增量引入，本轮单次全过不构成已修；PHASE B/C 与 run.sh
+编排未在本增量中实跑。CI 路径：新 unit 用例落在 `mongo.unit` 全量 ctest，新 live 用例
+落在 `tests/mongo-live/run.sh` PHASE A（全量跑该二进制）；`.github/` 未改。

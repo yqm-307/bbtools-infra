@@ -1,5 +1,7 @@
 #pragma once
 
+#include <bbt/infra/redis/CoRedisCli.hpp>
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -16,8 +18,6 @@
 #include <bbt/coroutine/syntax/Async.hpp>
 
 namespace bbt::infra::redis {
-
-class CoRedisCli;
 
 // 固定大小连接池：命令内部借连接执行归还，业务无需手动 Acquire。
 // Create 只装配不联网；Connect 显式把全池建好才 Ready，部分失败回滚本次建连；
@@ -36,6 +36,9 @@ public:
     struct PoolOptions {
         std::size_t connections; // 固定连接数，Create 校验大于零。
         std::size_t max_waiters; // 排队上限；0 表示池满立即 Overloaded。
+        // 连接级握手配置：对池开的每条连接（含修复/重建）在 Connect 内生效；
+        // 非法配置在建连时由 CoRedisCli::Create 拒绝并按 rollback 归还预算。
+        RedisHandshake handshake{};
     };
 
     // 一次借用的 RAII guard：析构按实际流健康状态归还；坏流 Retire 关闭连接并
@@ -76,8 +79,20 @@ public:
     bbt_co_async(result<void>)    Ping(const CallOptions& options);
     bbt_co_async(result<std::optional<std::string>>) Get(std::string_view key, const CallOptions& options);
     bbt_co_async(result<void>)    Set(std::string_view key, std::string_view value, const CallOptions& options);
+    bbt_co_async(result<bool>)    Set(std::string_view key, std::string_view value, const SetOptions& set_options, const CallOptions& options);
     bbt_co_async(result<bool>)    Exists(std::string_view key, const CallOptions& options);
     bbt_co_async(result<std::uint64_t>) Delete(std::vector<std::string> keys, const CallOptions& options);
+    bbt_co_async(result<bool>)    Expire(std::string_view key, std::chrono::milliseconds ttl, const CallOptions& options);
+    bbt_co_async(result<TtlResult>) Ttl(std::string_view key, const CallOptions& options);
+    bbt_co_async(result<std::int64_t>) Incr(std::string_view key, const CallOptions& options);
+    bbt_co_async(result<std::int64_t>) Decr(std::string_view key, const CallOptions& options);
+    bbt_co_async(result<std::int64_t>) IncrBy(std::string_view key, std::int64_t delta, const CallOptions& options);
+    bbt_co_async(result<std::int64_t>) DecrBy(std::string_view key, std::int64_t delta, const CallOptions& options);
+    bbt_co_async(result<bool>)    HSet(std::string_view key, std::string_view field, std::string_view value, const CallOptions& options);
+    bbt_co_async(result<std::optional<std::string>>) HGet(std::string_view key, std::string_view field, const CallOptions& options);
+    bbt_co_async(result<std::uint64_t>) HDel(std::string_view key, std::vector<std::string> fields, const CallOptions& options);
+    bbt_co_async(result<bool>)    HExists(std::string_view key, std::string_view field, const CallOptions& options);
+    bbt_co_async(result<HashEntries>) HGetAll(std::string_view key, const CallOptions& options);
 
     // 立即逻辑封口并唤醒全部等待者；幂等不可重开。不关共享 Engine。
     void            Close() noexcept;
@@ -86,6 +101,10 @@ public:
 private:
     // 池内借出一条连接（快路径或 FIFO 等待 handoff）。命令包装共用。
     bbt_co_async(result<Borrow>) Acquire(const CallOptions& options);
+    // 命令包装共用样板（定义在 .cc，仅本翻译单元实例化）：借还语义与 Acquire/
+    // Borrow RAII 一致，把借到的 client 交给 invoke 并原样返回其终态。
+    template <typename R, typename Invoke>
+    bbt_co_async(R) RunBorrowed(const CallOptions& options, Invoke&& invoke);
 
     explicit        CoRedisPool(std::shared_ptr<State> state) noexcept;
     std::shared_ptr<State> state_;

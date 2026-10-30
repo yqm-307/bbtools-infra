@@ -1,5 +1,6 @@
 #include "mongo/MongoRuntime.hpp"
 
+#include <limits>
 #include <new>
 #include <system_error>
 
@@ -14,11 +15,15 @@
 #include <mongocxx/exception/exception.hpp>
 #include <mongocxx/exception/operation_exception.hpp>
 #include <mongocxx/v1/collection.hpp>
+#include <mongocxx/v1/cursor.hpp>
 #include <mongocxx/v1/database.hpp>
+#include <mongocxx/v1/delete_many_result.hpp>
 #include <mongocxx/v1/delete_one_result.hpp>
 #include <mongocxx/v1/find_options.hpp>
+#include <mongocxx/v1/insert_many_result.hpp>
 #include <mongocxx/v1/insert_one_result.hpp>
 #include <mongocxx/v1/server_error.hpp>
+#include <mongocxx/v1/update_many_result.hpp>
 #include <mongocxx/v1/update_one_result.hpp>
 
 namespace bbt::infra::mongo_detail {
@@ -161,7 +166,10 @@ result<void> MongoRuntime::PreCheck() const {
 
 result<MongoOpOutcome> MongoRuntime::Submit(
     std::shared_ptr<MongoCollImpl> handle, MongoOp::Kind kind,
-    MongoDocument doc, MongoDocument update, const CallOptions& options) {
+    MongoDocument doc, MongoDocument update, const CallOptions& options,
+    std::vector<MongoDocument> docs, std::size_t find_limit,
+    std::size_t find_skip, MongoDocument find_sort,
+    MongoDocument find_projection) {
     auto pre = PreCheck();
     if (!pre)
         return result<MongoOpOutcome>::err(std::move(pre).error());
@@ -175,6 +183,11 @@ result<MongoOpOutcome> MongoRuntime::Submit(
     auto op = std::make_shared<MongoOp>(shared_from_this(),
                                         std::move(handle), kind,
                                         std::move(doc), std::move(update));
+    op->docs            = std::move(docs);
+    op->find_limit      = find_limit;
+    op->find_skip       = find_skip;
+    op->find_sort       = std::move(find_sort);
+    op->find_projection = std::move(find_projection);
     op->sig = sig;
 
     // 登记先于等待：与 Close 的 teardown 竞态的提交能被明确拒绝，且
@@ -310,18 +323,45 @@ result<MongoOpOutcome> MongoRuntime::RunDriverCall(
     };
 #endif
     try {
-        auto doc_v = ViewOf(op.doc,
-                            op.kind == MongoOp::Kind::InsertOne
-                                ? "document"
-                                : "filter");
-        if (!doc_v)
-            return result<MongoOpOutcome>::err(std::move(doc_v).error());
+        // 谓词/文档视图：InsertMany 用 docs 列表，Find 允许空 filter
+        // （空 bytes 以空文档视图表达「匹配全部」），其余沿用既有校验。
+        bsoncxx::v1::document::view empty_doc_v{};
+        bsoncxx::v1::document::view doc_v{};
+        if (op.kind != MongoOp::Kind::InsertMany) {
+            const bool empty_ok =
+                op.kind == MongoOp::Kind::Find ||
+                op.kind == MongoOp::Kind::CountDocuments;
+            if (empty_ok && op.doc.bytes.empty()) {
+                doc_v = empty_doc_v;
+            } else {
+                auto dv = ViewOf(op.doc,
+                                 op.kind == MongoOp::Kind::InsertOne
+                                     ? "document"
+                                     : "filter");
+                if (!dv)
+                    return result<MongoOpOutcome>::err(std::move(dv).error());
+                doc_v = dv.value();
+            }
+        }
         bsoncxx::v1::document::view upd_v;
-        if (op.kind == MongoOp::Kind::UpdateOne) {
+        if (op.kind == MongoOp::Kind::UpdateOne ||
+            op.kind == MongoOp::Kind::UpdateMany) {
             auto uv = ViewOf(op.update, "update");
             if (!uv)
                 return result<MongoOpOutcome>::err(std::move(uv).error());
             upd_v = uv.value();
+        }
+        // InsertMany 的文档视图列表：接纳侧已挡空/越界，这里做最终良构校验。
+        std::vector<bsoncxx::v1::document::view> insert_docs;
+        if (op.kind == MongoOp::Kind::InsertMany) {
+            insert_docs.reserve(op.docs.size());
+            for (const auto& d : op.docs) {
+                auto dv = ViewOf(d, "document");
+                if (!dv)
+                    return result<MongoOpOutcome>::err(
+                        std::move(dv).error());
+                insert_docs.push_back(dv.value());
+            }
         }
 
 #ifdef BBT_INFRA_STRINGENT_DEBUG
@@ -367,17 +407,30 @@ result<MongoOpOutcome> MongoRuntime::RunDriverCall(
 #endif
         switch (op.kind) {
         case MongoOp::Kind::InsertOne: {
-            const auto r = coll.insert_one(doc_v.value());
+            const auto r = coll.insert_one(doc_v);
             if (!r)
                 return result<MongoOpOutcome>::err(MakeError(
                     ErrorCode::InternalError,
                     "mongo: insert_one returned empty result"));
             return result<MongoOpOutcome>::ok(std::move(out));
         }
+        case MongoOp::Kind::InsertMany: {
+            // 有序批量插入：ordered=true（v1 默认），首个写错误即中止；
+            // 此前已写入的文档保留在服务端——部分成功由 outcome.inserted
+            // 表达（bulk_write_exception 的 write_errors() 给出失败下标）。
+            const auto r = coll.insert_many(insert_docs);
+            if (!r)
+                return result<MongoOpOutcome>::err(MakeError(
+                    ErrorCode::InternalError,
+                    "mongo: insert_many returned empty result"));
+            out.inserted =
+                static_cast<std::int64_t>(r->inserted_count());
+            return result<MongoOpOutcome>::ok(std::move(out));
+        }
         case MongoOp::Kind::FindOne: {
             mongocxx::v1::find_options fo;
             fo.max_time(m_config.socket_timeout);
-            auto r = coll.find_one(doc_v.value(), fo);
+            auto r = coll.find_one(doc_v, fo);
             if (!r) {
                 out.doc = std::nullopt;
                 return result<MongoOpOutcome>::ok(std::move(out));
@@ -385,8 +438,45 @@ result<MongoOpOutcome> MongoRuntime::RunDriverCall(
             out.doc = DocOf(r->view());
             return result<MongoOpOutcome>::ok(std::move(out));
         }
+        case MongoOp::Kind::Find: {
+            mongocxx::v1::find_options fo;
+            fo.limit(static_cast<std::int64_t>(op.find_limit));
+            if (op.find_skip > 0)
+                fo.skip(static_cast<std::int64_t>(op.find_skip));
+            fo.max_time(m_config.socket_timeout);
+            if (!op.find_sort.bytes.empty()) {
+                auto sv = ViewOf(op.find_sort, "sort");
+                if (!sv)
+                    return result<MongoOpOutcome>::err(
+                        std::move(sv).error());
+                fo.sort(bsoncxx::v1::document::value{sv.value()});
+            }
+            if (!op.find_projection.bytes.empty()) {
+                auto pv = ViewOf(op.find_projection, "projection");
+                if (!pv)
+                    return result<MongoOpOutcome>::err(
+                        std::move(pv).error());
+                fo.projection(bsoncxx::v1::document::value{pv.value()});
+            }
+            auto cursor = coll.find(doc_v, fo);
+            std::size_t total = 0;
+            for (auto&& doc : cursor) {
+                const std::size_t n = doc.length();
+                // checked-add：减法预算在复制进 out.docs 之前判定，溢出/
+                // 超限不物化该文档，也不依赖 size_t 回绕后的比较。
+                if (n > mongo::kMongoLimitsMaxFindResultBytes - total) {
+                    Error e = MakeError(ErrorCode::RemoteError,
+                        "mongo: find result exceeds result-bytes cap");
+                    e.domain_code = "result_too_large";
+                    return result<MongoOpOutcome>::err(std::move(e));
+                }
+                total += n;
+                out.docs.push_back(DocOf(doc));
+            }
+            return result<MongoOpOutcome>::ok(std::move(out));
+        }
         case MongoOp::Kind::UpdateOne: {
-            const auto r = coll.update_one(doc_v.value(), upd_v);
+            const auto r = coll.update_one(doc_v, upd_v);
             if (!r)
                 return result<MongoOpOutcome>::err(MakeError(
                     ErrorCode::InternalError,
@@ -396,13 +486,38 @@ result<MongoOpOutcome> MongoRuntime::RunDriverCall(
             out.upserted = r->upserted_count();
             return result<MongoOpOutcome>::ok(std::move(out));
         }
+        case MongoOp::Kind::UpdateMany: {
+            const auto r = coll.update_many(doc_v, upd_v);
+            if (!r)
+                return result<MongoOpOutcome>::err(MakeError(
+                    ErrorCode::InternalError,
+                    "mongo: update_many returned empty result"));
+            out.matched  = r->matched_count();
+            out.modified = r->modified_count();
+            out.upserted = r->upserted_count();
+            return result<MongoOpOutcome>::ok(std::move(out));
+        }
         case MongoOp::Kind::DeleteOne: {
-            const auto r = coll.delete_one(doc_v.value());
+            const auto r = coll.delete_one(doc_v);
             if (!r)
                 return result<MongoOpOutcome>::err(MakeError(
                     ErrorCode::InternalError,
                     "mongo: delete_one returned empty result"));
             out.deleted = r->deleted_count();
+            return result<MongoOpOutcome>::ok(std::move(out));
+        }
+        case MongoOp::Kind::DeleteMany: {
+            const auto r = coll.delete_many(doc_v);
+            if (!r)
+                return result<MongoOpOutcome>::err(MakeError(
+                    ErrorCode::InternalError,
+                    "mongo: delete_many returned empty result"));
+            out.deleted = r->deleted_count();
+            return result<MongoOpOutcome>::ok(std::move(out));
+        }
+        case MongoOp::Kind::CountDocuments: {
+            out.counted =
+                static_cast<std::int64_t>(coll.count_documents(doc_v));
             return result<MongoOpOutcome>::ok(std::move(out));
         }
         }
@@ -581,12 +696,18 @@ namespace {
 // runtime，物理收口照常。
 result<MongoOpOutcome> CollSubmit(
     const std::shared_ptr<MongoCollImpl>& self, MongoOp::Kind kind,
-    MongoDocument doc, MongoDocument update, const CallOptions& options) {
+    MongoDocument doc, MongoDocument update, const CallOptions& options,
+    std::vector<MongoDocument> docs = {}, std::size_t find_limit = 0,
+    std::size_t find_skip = 0, MongoDocument find_sort = {},
+    MongoDocument find_projection = {}) {
     if (!self->Accepting())
         return result<MongoOpOutcome>::err(MakeError(
             ErrorCode::Closed, "mongo collection handle is closed"));
     return self->Runtime()->Submit(self, kind, std::move(doc),
-                                   std::move(update), options);
+                                   std::move(update), options,
+                                   std::move(docs), find_limit, find_skip,
+                                   std::move(find_sort),
+                                   std::move(find_projection));
 }
 
 } // namespace
@@ -648,6 +769,139 @@ bbt_co_async(result<std::uint64_t>) MongoCollImpl::DeleteOne(
     return result<std::uint64_t>::ok(
         static_cast<std::uint64_t>(r.value().deleted < 0 ? 0
                                                         : r.value().deleted));
+}
+
+// ===================== 多文档数据面（data-plane-1030）=====================
+
+bbt_co_async(result<mongo::MongoInsertManyResult>) MongoCollImpl::InsertMany(
+    const std::vector<MongoDocument>& docs, const CallOptions& options) {
+    // 接纳前边界（零接纳）：空列表 / 文档数 / 总字节 / 单文档空值。
+    if (docs.empty())
+        return result<mongo::MongoInsertManyResult>::err(
+            InvalidArg("mongo InsertMany: empty docs"));
+    if (docs.size() > mongo::kMongoLimitsMaxInsertDocs)
+        return result<mongo::MongoInsertManyResult>::err(InvalidArg(
+            "mongo InsertMany: docs count exceeds limit"));
+    std::size_t total = 0;
+    for (const auto& d : docs) {
+        if (d.bytes.empty())
+            return result<mongo::MongoInsertManyResult>::err(
+                InvalidArg("mongo InsertMany: empty document in docs"));
+        // checked-add：减法预算同时覆盖「单文档越界」与「累计溢出回绕」。
+        if (d.bytes.size() >
+            mongo::kMongoLimitsMaxInsertTotalBytes - total)
+            return result<mongo::MongoInsertManyResult>::err(InvalidArg(
+                "mongo InsertMany: total bytes exceeds limit"));
+        total += d.bytes.size();
+    }
+    auto r = CollSubmit(shared_from_this(), MongoOp::Kind::InsertMany,
+                        {}, {}, options, docs);
+    if (!r) {
+        Error e = std::move(r).error();
+        // 部分成功的请求侧事实：requested_count 服务端回执里没有，
+        // 由本层补齐；inserted_count/failed_index 来自服务端 raw reply。
+        e.details.emplace_back("requested_count",
+                               std::to_string(docs.size()));
+        return result<mongo::MongoInsertManyResult>::err(std::move(e));
+    }
+    mongo::MongoInsertManyResult out;
+    out.inserted = static_cast<std::uint64_t>(
+        r.value().inserted < 0 ? 0 : r.value().inserted);
+    return result<mongo::MongoInsertManyResult>::ok(out);
+}
+
+bbt_co_async(result<std::vector<MongoDocument>>) MongoCollImpl::Find(
+    const MongoDocument& filter, const mongo::FindOptions& find_options,
+    const CallOptions&   options) {
+    // limit 必填且有上界：无界游标物化在本层拒绝（零接纳）。
+    if (find_options.limit == 0)
+        return result<std::vector<MongoDocument>>::err(
+            InvalidArg("mongo Find: limit is required"));
+    if (find_options.limit > mongo::kMongoLimitsMaxFindLimit)
+        return result<std::vector<MongoDocument>>::err(InvalidArg(
+            "mongo Find: limit exceeds max find limit"));
+    // skip 的 driver 表示是 int64：>INT64_MAX 的值无法表达，须在接纳前
+    // 拒绝，不做实现相关的有符号收缩转换。
+    if (find_options.skip >
+        static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()))
+        return result<std::vector<MongoDocument>>::err(InvalidArg(
+            "mongo Find: skip exceeds int64 range"));
+    // BSON 输入预算（CollSubmit 之前，零接纳）：filter/sort/projection 各
+    // 自不超 kMongoLimitsMaxInputDocBytes。
+    if (filter.bytes.size() > mongo::kMongoLimitsMaxInputDocBytes ||
+        find_options.sort.bytes.size() >
+            mongo::kMongoLimitsMaxInputDocBytes ||
+        find_options.projection.bytes.size() >
+            mongo::kMongoLimitsMaxInputDocBytes)
+        return result<std::vector<MongoDocument>>::err(InvalidArg(
+            "mongo Find: input BSON exceeds limit"));
+    // sort/projection 的良构校验在 worker 侧 ViewOf 统一归类
+    // InvalidArgument；filter 空（未初始化或 {}）= 匹配全部。
+    auto r = CollSubmit(shared_from_this(), MongoOp::Kind::Find, filter, {},
+                        options, {}, find_options.limit, find_options.skip,
+                        find_options.sort, find_options.projection);
+    if (!r)
+        return result<std::vector<MongoDocument>>::err(
+            std::move(r).error());
+    return result<std::vector<MongoDocument>>::ok(std::move(r).value().docs);
+}
+
+bbt_co_async(result<MongoUpdateResult>) MongoCollImpl::UpdateMany(
+    const MongoDocument& filter, const MongoDocument& update,
+    const CallOptions&   options) {
+    // 空 filter（未初始化或 {}）一律拒绝：防止空谓词误改全集合；
+    // 要全量更新须写显式匹配条件。
+    if (IsEmptyBson(filter))
+        return result<MongoUpdateResult>::err(
+            InvalidArg("mongo UpdateMany: empty filter is not allowed"));
+    if (update.bytes.empty())
+        return result<MongoUpdateResult>::err(
+            InvalidArg("mongo UpdateMany: empty update"));
+    if (filter.bytes.size() > mongo::kMongoLimitsMaxInputDocBytes ||
+        update.bytes.size() > mongo::kMongoLimitsMaxInputDocBytes)
+        return result<MongoUpdateResult>::err(InvalidArg(
+            "mongo UpdateMany: input BSON exceeds limit"));
+    auto r = CollSubmit(shared_from_this(), MongoOp::Kind::UpdateMany,
+                        filter, update, options);
+    if (!r)
+        return result<MongoUpdateResult>::err(std::move(r).error());
+    MongoUpdateResult out;
+    out.matched  = r.value().matched;
+    out.modified = r.value().modified;
+    out.upserted = r.value().upserted;
+    return result<MongoUpdateResult>::ok(out);
+}
+
+bbt_co_async(result<std::uint64_t>) MongoCollImpl::DeleteMany(
+    const MongoDocument& filter, const CallOptions& options) {
+    if (IsEmptyBson(filter))
+        return result<std::uint64_t>::err(
+            InvalidArg("mongo DeleteMany: empty filter is not allowed"));
+    if (filter.bytes.size() > mongo::kMongoLimitsMaxInputDocBytes)
+        return result<std::uint64_t>::err(InvalidArg(
+            "mongo DeleteMany: input BSON exceeds limit"));
+    auto r = CollSubmit(shared_from_this(), MongoOp::Kind::DeleteMany,
+                        filter, {}, options);
+    if (!r)
+        return result<std::uint64_t>::err(std::move(r).error());
+    return result<std::uint64_t>::ok(
+        static_cast<std::uint64_t>(r.value().deleted < 0 ? 0
+                                                        : r.value().deleted));
+}
+
+bbt_co_async(result<std::uint64_t>) MongoCollImpl::CountDocuments(
+    const MongoDocument& filter, const CallOptions& options) {
+    // filter 空（未初始化或 {}）= 统计全集合，合法谓词。
+    if (filter.bytes.size() > mongo::kMongoLimitsMaxInputDocBytes)
+        return result<std::uint64_t>::err(InvalidArg(
+            "mongo CountDocuments: input BSON exceeds limit"));
+    auto r = CollSubmit(shared_from_this(), MongoOp::Kind::CountDocuments,
+                        filter, {}, options);
+    if (!r)
+        return result<std::uint64_t>::err(std::move(r).error());
+    return result<std::uint64_t>::ok(
+        static_cast<std::uint64_t>(r.value().counted < 0 ? 0
+                                                        : r.value().counted));
 }
 
 // ===================== CoMongoDb（owner 公共入口）=====================

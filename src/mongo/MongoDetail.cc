@@ -63,6 +63,17 @@ MongoDocument DocOf(bsoncxx::v1::document::view v) {
     return out;
 }
 
+bool IsEmptyBson(const MongoDocument& doc) noexcept {
+    if (doc.bytes.empty())
+        return true;
+    // 结构良构的空文档恰好 5 字节：int32 总长 + 终止符。
+    if (doc.bytes.size() == 5 &&
+        doc.bytes[0] == 5 && doc.bytes[1] == 0 && doc.bytes[2] == 0 &&
+        doc.bytes[3] == 0 && doc.bytes[4] == 0)
+        return true;
+    return false;
+}
+
 Error ClassifyDriverError(const mongocxx::v1::exception& e,
                           const char*                    what) {
     Error err;
@@ -189,6 +200,60 @@ Error ClassifyOperationError(
             err.backend_code = ce.get_int32().value;
         else if (ce && ce.type() == bsoncxx::v_noabi::type::k_int64)
             err.backend_code = ce.get_int64().value;
+        // 有序批量/写命令的部分成功：服务端回执里的 nInserted / nMatched /
+        // nModified / nDeleted 落进 details，调用方按结构化字段观察
+        // 「失败前已生效的写量」（契约：details["inserted_count"] 等）。
+        // writeErrors 数组存在时附带首个失败下标供定位。
+        auto put_count = [&](const char* name, const char* key) {
+            const auto n = raw[name];
+            if (n && (n.type() == bsoncxx::v_noabi::type::k_int32 ||
+                      n.type() == bsoncxx::v_noabi::type::k_int64)) {
+                const std::int64_t v =
+                    n.type() == bsoncxx::v_noabi::type::k_int32
+                        ? n.get_int32().value
+                        : n.get_int64().value;
+                err.details.emplace_back(key, std::to_string(v));
+            }
+        };
+        put_count("nInserted", "inserted_count");
+        put_count("nMatched", "matched_count");
+        put_count("nModified", "modified_count");
+        put_count("nRemoved", "deleted_count");
+        const auto we = raw["writeErrors"];
+        if (we && we.type() == bsoncxx::v_noabi::type::k_array) {
+            const auto arr = we.get_array().value;
+            for (const auto& w : arr) {
+                if (w.type() != bsoncxx::v_noabi::type::k_document)
+                    continue;
+                const auto idx = w["index"];
+                if (idx && (idx.type() == bsoncxx::v_noabi::type::k_int32 ||
+                            idx.type() == bsoncxx::v_noabi::type::k_int64)) {
+                    const std::int64_t v =
+                        idx.type() == bsoncxx::v_noabi::type::k_int32
+                            ? idx.get_int32().value
+                            : idx.get_int64().value;
+                    err.details.emplace_back("failed_index",
+                                             std::to_string(v));
+                    break;
+                }
+            }
+        }
+        // 有序批量写命令失败时服务端回执用「n」表示已生效写数（writeErrors
+        // 回执里没有 nInserted 字段）；nInserted 缺省时回退取 n，仍缺省则
+        // 用首个 writeErrors.index（ordered 写入：index 即已插入数）。
+        bool has_inserted = false;
+        for (const auto& d : err.details)
+            if (d.first == "inserted_count") { has_inserted = true; break; }
+        if (!has_inserted)
+            put_count("n", "inserted_count");
+        for (const auto& d : err.details)
+            if (d.first == "inserted_count") { has_inserted = true; break; }
+        if (!has_inserted)
+            for (const auto& d : err.details)
+                if (d.first == "failed_index") {
+                    err.details.emplace_back("inserted_count", d.second);
+                    break;
+                }
     } catch (...) {
     }
     if (err.domain_code == "server" &&
