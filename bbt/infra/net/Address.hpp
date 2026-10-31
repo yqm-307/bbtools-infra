@@ -26,6 +26,11 @@ public:
     std::string     ToString() const;
     bool            Valid() const noexcept { return m_size != 0; }
 
+    // 仅本机可达的监听地址：IPv4 127.0.0.0/8、IPv6 ::1、Unix 域 socket。
+    // 其他 IP（含 0.0.0.0、::、v4-mapped v6、不认识的 family）一律视为非
+    // loopback——fail-closed，靠名称/字符串比较容易漏判。
+    bool            IsLoopback() const noexcept;
+
 private:
     friend class NativeSocket;
     sockaddr_storage m_storage{};
