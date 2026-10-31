@@ -143,6 +143,24 @@ std::string Address::ToString() const {
 }
 
 
+bool Address::IsLoopback() const noexcept {
+    if (Family() == AddressFamily::Unix) return true;
+    if (Family() == AddressFamily::IPv4) {
+        sockaddr_in addr{};
+        std::memcpy(&addr, &m_storage, sizeof(addr));
+        return (ntohl(addr.sin_addr.s_addr) >> 24) == 127;
+    }
+    if (Family() == AddressFamily::IPv6) {
+        sockaddr_in6 addr{};
+        std::memcpy(&addr, &m_storage, sizeof(addr));
+        const auto& bytes = addr.sin6_addr.s6_addr;
+        for (int i = 0; i < 15; ++i)
+            if (bytes[i] != 0) return false;
+        return bytes[15] == 1;
+    }
+    return false;
+}
+
 Address Address::FromNative(const sockaddr* addr, socklen_t length) {
     Address out;
     if (addr == nullptr || length == 0 || static_cast<std::size_t>(length) > sizeof(sockaddr_storage)) {
