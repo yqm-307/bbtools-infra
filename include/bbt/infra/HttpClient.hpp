@@ -1,5 +1,5 @@
 #pragma once
-// co-network/v1 N1b-1：HTTP/1.1 客户端公共面。
+// co-network/v1：HTTP/1.1 客户端公共面。
 // Asio/Beast、线程、io_context 全部隐藏于 src/http/ 实现，不进公开头。
 
 #include <memory>
@@ -13,28 +13,28 @@ namespace bbt::infra {
 // HttpClient：出站 HTTP/1.1 组件，面向多 endpoint；连接按请求建立，
 // 首版不承诺连接复用。仅在协程上下文调用 Request，等待期间挂起当前协程。
 //
-// Issue #37：出站配额由所属 NetworkRuntime（资源 owner）统一持有——
+// HTTP 出站配额契约（docs/decisions/0002-co-network-contract.md）：出站配额由所属 NetworkRuntime（资源 owner）统一持有——
 // 同一 runtime 下所有 HttpClient 共享同一份 max_connections /
 // max_inflight 预算，不是每个 client 独立计量。Request 在发起任何
 // 底层 I/O 之前原子预留名额；名额不足立即返回 Error(Overloaded)，
 // 此时不创建 socket/resolver、不投递到 io 域、不排队。名额在请求
 // 物理收口后准确归还一次（覆盖正常完成、发起失败、deadline、协程级
 // 取消与 Close()），不依赖挂起协程的栈析构。本配额只覆盖
-// HTTP 出站路径，与 transport #32 的 CoTCP/CoUDP 在途门禁是不同入口。
+// HTTP 出站路径，与 transport 在途账本契约的 CoTCP/CoUDP 在途门禁是不同入口。
 //
 // 关闭：Close() 由 owner 主动同步调用（幂等、任意线程），返回即物理
 // 释放；无 RequestClose/WaitClosed。已发送请求在 Close 后立即以终态
 // 返回，迟到响应只消费不交付。
 //
-// Issue #64：错误结果携带请求阶段事实（Error::request_phase + RequestPhase），
+// request_phase 契约（docs/decisions/0008-request-phase-outcome-unknown.md）：错误结果携带请求阶段事实（Error::request_phase + RequestPhase），
 // 消费者据此机械区分「请求尚未完整写出」的确定失败与「已完整写出但回复丢失」
 // 的 OutcomeUnknown，不需要解析 message / errno / 日志顺序或用固定等待猜测。
 // 判定入口是公开的 IsRequestCommitted()；request_phase 为空表示该错误不来自
 // 出站 operation（上下文/参数/装配/已关闭拒绝）。分界与终态映射见
-// docs/decisions/0008-http-request-phase-outcome-unknown.md。
+// docs/decisions/0008-request-phase-outcome-unknown.md。
 class HttpClient : public ICoNetwork, public ICoCloseable {
 public:
-    // 语义边界（契约 §N1）：
+    // 语义边界（冻结契约）：
     //  - 正常 4xx/5xx 是有效 HttpResponse，不是网络异常；
     //  - 非法 framing/超限/断连返回 Error；不足一条消息不当成功响应；
     //  - 非协程调用返回 Error(InvalidContext)；Closed 后返回 Error(Closed)；

@@ -1,24 +1,24 @@
-// Issue #7 真实 MongoDB 容器验收（docker compose 起 mongo:7.0，
+// docs/decisions/0004-mongo-client-mongocxx-dependency.md 真实 MongoDB 容器验收（docker compose 起 mongo:7.0，
 // cpus<=0.75 / mem_limit<=512m / wiredTigerCacheSizeGB=0.25 / 动态项目名，
 // 编排见 tests/mongo-live/run.sh）：
 //
-//   BBT_TEST_MONGO_URI=mongodb://host:port/   必填，未设置整件跳过
-//   BBT_MONGO_PHASE=A|B|C                     默认 A：
-//     A = 容器在线（CRUD、not-found、duplicate-key、driver 错误映射、
-//         16 并发有界 smoke、close drain）
-//     B = 容器已停（命令必须失败而非悬挂/假成功）
-//     C = 容器重启后（新 client 亦可用）
+// BBT_TEST_MONGO_URI=mongodb://host:port/ 必填，未设置整件跳过
+// BBT_MONGO_PHASE=A|B|C 默认 A：
+// A = 容器在线（CRUD、not-found、duplicate-key、driver 错误映射、
+// 16 并发有界 smoke、close drain）
+// B = 容器已停（命令必须失败而非悬挂/假成功）
+// C = 容器重启后（新 client 亦可用）
 //
-// 有界 smoke 上限（Issue #7 验收）：并发 ≤16、单请求 deadline ≤3s、
+// 有界 smoke 上限（docs/decisions/0004-mongo-client-mongocxx-dependency.md 验收）：并发 ≤16、单请求 deadline ≤3s、
 // 总时长 ≤30s，成功/失败计数且 0 数据错误。
 // BSON 文档构造经 bsoncxx::from_json（仅测试侧依赖，不进公开面）。
 //
-// Issue #34 A 阶段追加「真实后端可观察在途命令」的超时与 owner Close 用例：
-//   BBT_MONGO_CTL_EVAL='docker compose ... exec -T mongo mongosh --quiet --eval'
-//   由 tests/mongo-live/run.sh 注入容器内 mongosh 控制通道，用例经它注入
-//   failCommand(blockConnection) 并以 waitForFailPoint 握手确认目标命令确实
-//   停在服务端应答上（不靠 sleep 猜测在途）；缺该通道时相关用例显式失败，
-//   不得静默 skip 变绿。
+// A 阶段追加「真实后端可观察在途命令」的超时与 owner Close 用例：
+// BBT_MONGO_CTL_EVAL='docker compose ... exec -T mongo mongosh --quiet --eval'
+// 由 tests/mongo-live/run.sh 注入容器内 mongosh 控制通道，用例经它注入
+// failCommand(blockConnection) 并以 waitForFailPoint 握手确认目标命令确实
+// 停在服务端应答上（不靠 sleep 猜测在途）；缺该通道时相关用例显式失败，
+// 不得静默 skip 变绿。
 
 #define BOOST_TEST_DYN_LINK
 #define BOOST_TEST_MAIN
@@ -66,7 +66,7 @@
 #include <bbt/infra/mongo/Bson.hpp>
 #include <bbt/infra/mongo/Client.hpp>
 
-// Issue #34：用例需要真实生产状态观测（runtime 的 worker/执行槽计数、
+// 用例需要真实生产状态观测（runtime 的 worker/执行槽计数、
 // MongoCollImpl::Runtime）——读取 src/mongo/ 内部头（仅本测试目标引入内部
 // include，不新增生产接缝，也不进入被测公共面）。
 #include "mongo/MongoRuntime.hpp"
@@ -175,7 +175,7 @@ std::shared_ptr<CoMongoCli> NewLiveClient(std::size_t workers = 2) {
     return cli;
 }
 
-// Issue #40 owner 配置的 live 形态：与 LiveConfig 相同的 URI/超时上界，
+// docs/decisions/0007-mongo-owner-handles.md owner 配置的 live 形态：与 LiveConfig 相同的 URI/超时上界，
 // 但不含 database/collection（目标由集合句柄携带）。
 mongo::MongoRuntimeConfig LiveRuntimeConfig(std::size_t workers = 2,
                                             std::size_t queue   = 32) {
@@ -192,11 +192,11 @@ mongo::MongoRuntimeConfig LiveRuntimeConfig(std::size_t workers = 2,
     return cfg;
 }
 
-// ---- Issue #34：真实后端可观察阻塞的测试控制通道 ----
+// ----：真实后端可观察阻塞的测试控制通道 ----
 //
 // 被测命令是否「在途（已进入 driver 且在服务端受阻）」必须在真实后端可观察，
 // 不能靠 sleep 猜测。这里用 mongod 自带的 failCommand failpoint：
-//   mode{times:1} + blockConnection + blockTimeMS
+// mode{times:1} + blockConnection + blockTimeMS
 // 让命中命令停在服务端连接的应答上（到点后照常执行，是延迟而非失败注入），
 // waitForFailPoint 则作为「目标命令确已进入该阻塞」的后端握手。控制通道经
 // run.sh 注入的容器内 mongosh 前缀执行（与 Redis live 的容器内 redis-cli
@@ -253,10 +253,10 @@ constexpr int kCtlTimeoutS   = 45;
 constexpr int kCtlKillAfterS = 10;
 
 // 在容器内经 mongosh 执行一段 admin JS，返回真实 rc 与 stdout（JSON）。
-//   - 走 popen（/bin/sh -c）：stdout 直接捕获、pclose 给真实退出码，
-//     不落可预测临时文件、不用未引号的 shell 重定向；
-//   - 前置 timeout --kill-after：控制命令真正有界；
-//   - 缺控制通道时 rc 保持 -1：调用方必须显式失败，不得当作通过。
+// - 走 popen（/bin/sh -c）：stdout 直接捕获、pclose 给真实退出码，
+// 不落可预测临时文件、不用未引号的 shell 重定向；
+// - 前置 timeout --kill-after：控制命令真正有界；
+// - 缺控制通道时 rc 保持 -1：调用方必须显式失败，不得当作通过。
 MongoCtl MongoExec(const std::string& js) {
     MongoCtl    r;
     const char* prefix = ControlPrefix();
@@ -303,7 +303,7 @@ std::string WfpHandshake(int times_entered) {
 const char* kFailpointOff =
     "JSON.stringify(db.adminCommand({configureFailPoint:'failCommand',mode:'off'}))";
 
-// #34 阻塞注入用 owner 配置：socket_timeout 必须大于注入的阻塞上界，
+// 阻塞注入用 owner 配置：socket_timeout 必须大于注入的阻塞上界，
 // 否则 driver 会在服务端阻塞结束前以 socket 超时返回，迟到结果就不是
 // 「服务端真实成功」而是 driver 错误，观测失去意义。
 mongo::MongoRuntimeConfig BlockRuntimeConfig(std::size_t workers = 1) {
@@ -430,7 +430,7 @@ void CloseAndCheck(const std::shared_ptr<CoMongoCli>& cli) {
     BOOST_CHECK(cli->IsClosed());
 }
 
-// ---- Issue #34 修复：异步结果的堆所有权与失败路径收口 ----
+// ---- 修复：异步结果的堆所有权与失败路径收口 ----
 //
 // 新增两例的所有异步状态一律 shared_ptr 堆所有权、协程按值捕获：即使某次
 // BOOST_REQUIRE 失败（Boost.Test 抛 execution_aborted）导致测试栈展开，协程
@@ -512,7 +512,7 @@ std::atomic_bool g_prepared{false};
 
 } // namespace
 
-// Issue #34：live 套件无 BBT_TEST_MONGO_URI 时必须显式标记 Skipped，不能
+// live 套件无 BBT_TEST_MONGO_URI 时必须显式标记 Skipped，不能
 // 以退出码 0 冒充通过（CTest 会把 0 记为 Passed）。套件内每个 case 用
 // BOOST_TEST_MESSAGE("skip: ...")+return 提前返回；Boost.Test 默认日志
 // 级别下该消息不打印，SKIP_REGULAR_EXPRESSION 匹配不到文本。故在全局
@@ -677,7 +677,7 @@ BOOST_AUTO_TEST_CASE(t_concurrent_smoke_16) {
                     "{\"_id\":\"" + id + "\",\"v\":\"payload" +
                     std::to_string(i) + "\"}");
                 const auto filter = JsonDoc("{\"_id\":\"" + id + "\"}");
-                // 单请求 deadline ≤3s（Issue #7 有界上限）。
+                // 单请求 deadline ≤3s（docs/decisions/0004-mongo-client-mongocxx-dependency.md 有界上限）。
                 auto s = cli->InsertOne(doc, Opt(3000));
                 if (!s) {
                     errors.fetch_add(1);
@@ -801,7 +801,7 @@ BOOST_AUTO_TEST_CASE(t_owner_multi_collection_live) {
         BOOST_TEST_MESSAGE("skip: 需要 BBT_TEST_MONGO_URI 且 PHASE=A");
         return;
     }
-    // Issue #40 live 验收：一个 owner（2 worker）上两个集合句柄并行
+    // docs/decisions/0007-mongo-owner-handles.md live 验收：一个 owner（2 worker）上两个集合句柄并行
     // 真实 CRUD，共享同一组执行资源。
     auto d = mongo::CoMongoDb::Create(LiveRuntimeConfig(2, 16));
     BOOST_REQUIRE(d);
@@ -960,15 +960,15 @@ BOOST_AUTO_TEST_CASE(t_public_bson_api_live) {
     BOOST_CHECK(db->IsClosed());
 }
 
-// Issue #34：真实后端可观察在途命令的 deadline 超时。
-//   - failCommand(blockConnection) 让目标 insert 真正停在服务端应答上，
-//     waitForFailPoint 握手（timesEntered = 本次 arm 返回 count + 1）确认
-//     「命令已进入该阻塞」，不靠 sleep 猜测在途；
-//   - 此时 driver 调用仍占用执行槽，CallOptions.deadline 到点只交付一次逻辑
-//     终态 TimedOut，不冒充物理收口；
-//   - 服务端阻塞结束后 driver 返回真实成功：迟到结果只消费不交付，客户端
-//     逻辑终态仍是 TimedOut，而该 insert 已在后端生效（两者同时成立）；
-//   - 原 owner 恢复真实 CRUD（worker 已释放，未进入关闭态）。
+// 真实后端可观察在途命令的 deadline 超时。
+// - failCommand(blockConnection) 让目标 insert 真正停在服务端应答上，
+// waitForFailPoint 握手（timesEntered = 本次 arm 返回 count + 1）确认
+// 「命令已进入该阻塞」，不靠 sleep 猜测在途；
+// - 此时 driver 调用仍占用执行槽，CallOptions.deadline 到点只交付一次逻辑
+// 终态 TimedOut，不冒充物理收口；
+// - 服务端阻塞结束后 driver 返回真实成功：迟到结果只消费不交付，客户端
+// 逻辑终态仍是 TimedOut，而该 insert 已在后端生效（两者同时成立）；
+// - 原 owner 恢复真实 CRUD（worker 已释放，未进入关闭态）。
 // 所有异步状态堆所有权 + 协程按值捕获（栈展开不悬空）；owner/failpoint 由
 // RAII 守卫在任意失败路径收口。
 BOOST_AUTO_TEST_CASE(t_backend_blocked_deadline_timedout) {
@@ -1119,13 +1119,13 @@ BOOST_AUTO_TEST_CASE(t_backend_blocked_deadline_timedout) {
     BOOST_CHECK_EQUAL(rt->LiveWorkersForTest(), std::size_t{0});
 }
 
-// Issue #34：真实后端可观察在途命令遇 owner Close。
-//   - 目标 find 被 failCommand(blockConnection) 停在服务端应答，握手（目标 =
-//     本次 arm 返回 count + 1）确认进入；
-//   - owner Close 从独立控制线程发起：该在途 op 先收到 Closed 逻辑终态
-//     （Close 返回前、driver 仍在执行槽内），Close 再等 driver 真实返回；
-//   - Close 返回当刻 IsClosed 成立、worker 归零、执行槽归零（非提前宣告）；
-//   - 迟到 driver 结果不覆盖 Closed；新 owner 真实 CRUD 恢复。
+// 真实后端可观察在途命令遇 owner Close。
+// - 目标 find 被 failCommand(blockConnection) 停在服务端应答，握手（目标 =
+// 本次 arm 返回 count + 1）确认进入；
+// - owner Close 从独立控制线程发起：该在途 op 先收到 Closed 逻辑终态
+// （Close 返回前、driver 仍在执行槽内），Close 再等 driver 真实返回；
+// - Close 返回当刻 IsClosed 成立、worker 归零、执行槽归零（非提前宣告）；
+// - 迟到 driver 结果不覆盖 Closed；新 owner 真实 CRUD 恢复。
 // 所有异步状态堆所有权 + 协程/线程按值捕获（栈展开不悬空）；closer 用析构即
 // join 的 JoinGuard（任何 BOOST_REQUIRE 失败都不 terminate、不 detach），
 // owner 用 OwnerCloseGuard、failpoint 用 FailpointGuard 在任意失败路径收口。
@@ -1347,9 +1347,9 @@ bool HasField(const MongoDocument& d, const char* k) {
 } // namespace
 
 // InsertMany：全量成功 + 有序中途失败（重复 _id）三段证明——
-//   doc1 新 _id 成功、doc2 重复已有 _id 中止、doc3 未执行；
-//   失败后 Find/Count 读回：doc1 在、doc3 不在。details.requested_count
-//   承载请求总数，inserted_count/failed_index 服务端给出时才断言。
+// doc1 新 _id 成功、doc2 重复已有 _id 中止、doc3 未执行；
+// 失败后 Find/Count 读回：doc1 在、doc3 不在。details.requested_count
+// 承载请求总数，inserted_count/failed_index 服务端给出时才断言。
 BOOST_AUTO_TEST_CASE(t_dp_insert_many) {
     if (!LiveEnabled() || !PhaseIs('A')) {
         BOOST_TEST_MESSAGE("skip: 需要 BBT_TEST_MONGO_URI 且 PHASE=A");
@@ -1844,10 +1844,10 @@ BOOST_AUTO_TEST_CASE(t_dp_count_documents) {
 // 真实后端阶段证据。failCommand(blockConnection) 把目标 find 停在服务端
 // 应答上，waitForFailPoint 握手确认命令确已进入该阻塞（不靠执行槽计数或
 // sleep 猜阶段），随后独立线程发起 owner Close：
-//   - 在途 Find 先收到 Closed 逻辑终态（Close 返回前、driver 仍在执行槽内）；
-//   - Close 返回当刻 IsClosed + worker/执行槽归零（非提前宣告）；
-//   - 迟到 driver 结果不覆盖已交付的 Closed。
-// 缺 BBT_MONGO_CTL_EVAL 时显式失败，不静默变绿（同 #34 两例）。
+// - 在途 Find 先收到 Closed 逻辑终态（Close 返回前、driver 仍在执行槽内）；
+// - Close 返回当刻 IsClosed + worker/执行槽归零（非提前宣告）；
+// - 迟到 driver 结果不覆盖已交付的 Closed。
+// 缺 BBT_MONGO_CTL_EVAL 时显式失败，不静默变绿（同 两例）。
 BOOST_AUTO_TEST_CASE(t_dp_find_blocked_owner_close) {
     if (!LiveEnabled() || !PhaseIs('A')) {
         BOOST_TEST_MESSAGE("skip: 需要 BBT_TEST_MONGO_URI 且 PHASE=A");

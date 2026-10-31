@@ -1,6 +1,6 @@
 #pragma once
 // HttpIoEngine：HTTP 后端 I/O 的串行执行域封装，不拥有 io_context 或线程。
-// 执行域本体在 src/detail/IoSupport.hpp（Issue #6 起与 Redis 模块共用），
+// 执行域本体在 src/detail/IoSupport.hpp（与 Redis 模块共用），
 // 本类只附加 HTTP 切片的 NetworkLimits；注释与清理约定见基类文件。
 //
 // 所有 Asio/Beast I/O 对象（socket/resolver/acceptor/timer）与发起型

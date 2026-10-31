@@ -5,13 +5,13 @@
 // （src/transport 与协议 owner src/http）与同仓测试；协议消费者（后续
 // binding、协议 Cli）永不调用它们。把它们放在公共头等于把 owner 实现细节
 // 与 ABI（新增 std::function 成员、虚方法槽位）钉进对外契约，而
-// co-io-adapter/v1 §4/§5 的冻结面并不含任何 Set*Hooks 或测试接缝。
+// co-io-adapter/v1 的冻结面并不含任何 Set*Hooks 或测试接缝。
 //
 // 约束：
 //   - 本头不安装、不进 INSTALL_INTERFACE；只由 src/ 内 target 与 tests
 //     经 PRIVATE include（${CMAKE_CURRENT_SOURCE_DIR}）包含。
 //   - 行为约束（谁在什么终态归还一次名额、admit 的门禁位置、关闭落定的
-//     唯一信号）留在 0005 §4.0.1.7 与各实现注释里；装配入口不再是公共 API。
+//     唯一信号）留在 docs/decisions/0005-co-io-adapter-contract.md 与各实现注释里；装配入口不再是公共 API。
 //   - 全部函数 noexcept 且不得阻塞：其调用点在数据路径等待段、scheduler
 //     恢复路径与关闭路径上。
 //
@@ -33,7 +33,7 @@
 
 namespace bbt::infra::detail {
 
-// Issue #32 F2：受管 DialTCP 的等待段接缝（仅 TransportRuntime 托管路径
+// 在途账本契约：受管 DialTCP 的等待段接缝（仅 TransportRuntime 托管路径
 // 装配；未托管静态入口以默认构造调用，零语义变化）。
 //   close_waiters         —— owner 级关闭唤醒登记：受管 dial 的 connect
 //                           等待段在事件登记成功后挂上它，owner->Close()
@@ -126,7 +126,7 @@ struct TransportWiring {
     static void SetClosedHook(tcp::CoTCP& owner, std::function<void()> hook) noexcept {
         owner.m_closed_hook = std::move(hook);
     }
-    // §4.0.1.7：Runtime 级在途配额注入（仅受管对象；未托管入口不装钩，
+    // 在途配额契约：Runtime 级在途配额注入（仅受管对象；未托管入口不装钩，
     // 亦无限额语义）。admit 在 _CheckEntry（参数/协程上下文/运行时可用性）
     // 通过、计入 m_inflight 之前调用——false 即 Overloaded，立即返回不挂起；
     // admit 通过的操作在 m_mtx 内登记 m_quota_held++，op 结束归还 1，
@@ -149,7 +149,7 @@ struct TransportWiring {
                                         std::function<void()> gate) noexcept {
         owner.m_wait_entry_gate_for_test = std::move(gate);
     }
-    // F3：ReadSome/WriteSome 数据路径每次进入 fd 等待（_WaitFd 内
+    // ReadSome/WriteSome 数据路径每次进入 fd 等待（_WaitFd 内
     // CoWaiter::Wait 的 on_registered，即协程真正挂起、事件已登记）后回调
     // 一次——与 wait-entry gate（等待循环入口）区分，本接缝证明「op 已真实
     // 挂起在 fd 等待」。约定同上。
@@ -157,7 +157,7 @@ struct TransportWiring {
                                                std::function<void()> gate) noexcept {
         owner.m_io_wait_registered_gate_for_test = std::move(gate);
     }
-    // F3：返回底层 fd 供测试调整 socket 选项（例如缩小 SO_SNDBUF 以确定性
+    // 返回底层 fd 供测试调整 socket 选项（例如缩小 SO_SNDBUF 以确定性
     // 触发 EAGAIN/suspended write）。不持有 m_mtx，返回的是对象生命周期内
     // 的原始 fd；测试须只在连接建立后、关闭前使用，不得关闭/改向。
     static int NativeFdForTest(const tcp::CoTCP& owner) noexcept {
@@ -205,7 +205,7 @@ struct TransportWiring {
     static void SetClosedHook(udp::CoUDP& owner, std::function<void()> hook) noexcept {
         owner.m_closed_hook = std::move(hook);
     }
-    // §4.0.1.7：admit 在 _CheckEntry 通过、计入 m_inflight 之前调用——
+    // 在途配额契约：admit 在 _CheckEntry 通过、计入 m_inflight 之前调用——
     // 返回 false 即 Overloaded，立即返回不挂起；quota_scope 保活 Runtime
     // 共享账本，对象侧 Close/析构归还，不依赖协程栈 RAII。
     static void SetInflightHooks(udp::CoUDP& owner,
@@ -273,9 +273,9 @@ struct TransportWiring {
     // （唯一实现是 transport_detail::TransportRuntimeImpl，本头不暴露实现
     // 类型）。
     static std::size_t InflightQuotaHeldForTest(TransportRuntime& owner) noexcept;
-    // R1 探针：owner 在途工厂装配计数（容量已预留、child 尚未交接/自行关闭）。
+    // 探针：owner 在途工厂装配计数（容量已预留、child 尚未交接/自行关闭）。
     static std::size_t PendingFactoriesForTest(TransportRuntime& owner) noexcept;
-    // R1 探针：owner 级关闭唤醒登记是否已封口。受控交错回归据此在「Close 已
+    // 探针：owner 级关闭唤醒登记是否已封口。受控交错回归据此在「Close 已
     // 封口、尚未返回」处确定性放行被暂停的工厂线程。
     static bool CloseSealedForTest(TransportRuntime& owner) noexcept;
     // 受管 DialTCP 的 DNS/connect 等待段在协程真正挂起后回调一次，用于确定性

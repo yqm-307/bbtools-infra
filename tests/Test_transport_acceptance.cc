@@ -2,7 +2,7 @@
 #define BOOST_TEST_MAIN
 #include <boost/test/included/unit_test.hpp>
 
-// Issue #31 收尾验收剩余项：DNS 在途到期（非调用前已过期）。
+// 收尾验收剩余项：DNS 在途到期（非调用前已过期）。
 //
 // 现有 deadline 用例用的都是「调用前已过期」的 deadline
 // （Test_tcp_runtime_factory::t_dial_hostname_deadline_bounded 等），不是
@@ -123,10 +123,10 @@ struct DnsHoldReleaser {
 
 /* ---------------------------------------------------------------------------
  * DNS 在途到期与晚到结果（间接口径）：
- *    worker 被扣持 → 解析等待确定在途 → deadline 到期（不是调用前已过期）
- *    → TimedOut + 名额归还；随后放行 worker，间接验证晚到结果不重复归还名额，
- *    且 DNS 通道仍可用（后续 dial 成功）。worker 侧「丢弃晚到结果」的分支没有
- *    外部可观察面，本用例不断言其被走到。
+ * worker 被扣持 → 解析等待确定在途 → deadline 到期（不是调用前已过期）
+ * → TimedOut + 名额归还；随后放行 worker，间接验证晚到结果不重复归还名额，
+ * 且 DNS 通道仍可用（后续 dial 成功）。worker 侧「丢弃晚到结果」的分支没有
+ * 外部可观察面，本用例不断言其被走到。
  * ------------------------------------------------------------------------- */
 BOOST_AUTO_TEST_CASE(t_dial_dns_inflight_deadline_and_late_result) {
     EnsureRuntime();

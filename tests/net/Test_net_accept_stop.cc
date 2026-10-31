@@ -334,7 +334,7 @@ void StopLateCoAcceptRejected() {
     StartRuntime(2);
 
     // A: Run 前（Idle）停止：CoAccept 返回 operation_not_permitted，out 不变；
-    //    Run 之后不允许新开监听，直接返回错误。
+    // Run 之后不允许新开监听，直接返回错误。
     {
         const Address address = BindTempPort();
         Engine idle(std::make_shared<NullHandler>());

@@ -1,29 +1,29 @@
 // infra-perf 闭环：bbt::infra_net TCP echo 基准服务端（raw / co 双模式，进程级）。
 //
 // 进程契约（与 scripts/bench/driver.py 对齐）：
-//   argv  --mode=raw|co [--port=PORT|0] [--runtime-workers=N] [--subs=N]
-//         [--accept-cap=N] [--read-timeout-ms=N]
-//   就绪  stdout 输出单行 "PORT=<实际端口>" 后进入服务；就绪行之外的诊断全部走
-//         stderr（不产生 per-request stdout）。
-//   stdin "stat"      → 回一行 {"role":"server_stat",...}（当前累计指标 +
-//         active_conns；测量窗边界快照用，无重置语义）
-//   stdin "fin_overhead" → 回一行 {"role":"fin_overhead","accepted":N,
-//         "echoed_fin":N}（fin 帧对账；driver 在 conns 稳态后查询，须
-//         echoed_fin==accepted）
-//   结束  stdin EOF / 首行 "quit" → g_stop、engine.RequestClose、join engine
-//         线程、收 accept/连接协程（各自带界等待）、输出单行 JSON 指标到 stdout
-//         后退出。退出码非零当 errors/frames_bad>0、engine 收口报错、或收口后
-//         仍有未完成 accept/conn 任务/未释放连接（teardown 不全 = 真实失败）。
-//   协议  共享 perf_common.hpp 流式帧（BBT0 magic + kind + conn + seq + stamp_ns
-//         + len + payload）。'F' fin：echo 回后对该连接 RequestClose（单向 transfer
-//         负载的收尾信号）。每 data 帧 echo 前做确定性内容 + 每连接 seq 单调校验
-//         （seq 必须从 0 起逐帧 +1；重复/缺失/乱序一律 frames_bad + RequestClose）。
+// argv --mode=raw|co [--port=PORT|0] [--runtime-workers=N] [--subs=N]
+// [--accept-cap=N] [--read-timeout-ms=N]
+// 就绪 stdout 输出单行 "PORT=<实际端口>" 后进入服务；就绪行之外的诊断全部走
+// stderr（不产生 per-request stdout）。
+// stdin "stat" → 回一行 {"role":"server_stat",...}（当前累计指标 +
+// active_conns；测量窗边界快照用，无重置语义）
+// stdin "fin_overhead" → 回一行 {"role":"fin_overhead","accepted":N,
+// "echoed_fin":N}（fin 帧对账；driver 在 conns 稳态后查询，须
+// echoed_fin==accepted）
+// 结束 stdin EOF / 首行 "quit" → g_stop、engine.RequestClose、join engine
+// 线程、收 accept/连接协程（各自带界等待）、输出单行 JSON 指标到 stdout
+// 后退出。退出码非零当 errors/frames_bad>0、engine 收口报错、或收口后
+// 仍有未完成 accept/conn 任务/未释放连接（teardown 不全 = 真实失败）。
+// 协议 共享 perf_common.hpp 流式帧（BBT0 magic + kind + conn + seq + stamp_ns
+// + len + payload）。'F' fin：echo 回后对该连接 RequestClose（单向 transfer
+// 负载的收尾信号）。每 data 帧 echo 前做确定性内容 + 每连接 seq 单调校验
+// （seq 必须从 0 起逐帧 +1；重复/缺失/乱序一律 frames_bad + RequestClose）。
 //
 // 关闭契约（产品）：对端 FIN 只是 MarkEof + OnRead——EOF 不关闭写侧，连接的
 // 最终释放必须由 handler 端 RequestClose 发起。因此 raw OnRead 见到 Eof/Error
 // 读终态时，先把 ring 中剩余数据全部拆帧并入 pending，再按以下规则收尾：
-//   pending 仍有待发 echo → 登记进 eof_pending 等 OnWrite 把队列排空后
-//   RequestClose（不丢未发 echo）；pending 已空 → 立即 RequestClose。
+// pending 仍有待发 echo → 登记进 eof_pending 等 OnWrite 把队列排空后
+// RequestClose（不丢未发 echo）；pending 已空 → 立即 RequestClose。
 // co 模式 Read 返回 Eof/Closed 前其顺序 Write 已终态，直接 RequestClose。
 //
 // 进程退出：coroutine runtime 无 Stop/静态析构收口（已知限制，见

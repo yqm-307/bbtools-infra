@@ -8,11 +8,11 @@
 // HTTP」的编译期证据，而不是只靠目录命名或注释声明。
 //
 // 覆盖（P2 验收要求：不只测静态容量超限）：
-//   1. owner 门禁与参数校验（Start 前拒绝、Start 后参数非法）
-//   2. 容量名额（max_connections）超限与「物理关闭后才归还」
-//   3. 真实 loopback 收发 + 完整关闭生命周期（Close 同步物理收口）
-//   4. 多 owner 配额隔离（同一进程两个 TransportRuntime 各自 max_inflight）
-//   5. 关闭期已接纳但未落定的 op（挂起 Accept）——名额归还 + 物理收口
+// 1. owner 门禁与参数校验（Start 前拒绝、Start 后参数非法）
+// 2. 容量名额（max_connections）超限与「物理关闭后才归还」
+// 3. 真实 loopback 收发 + 完整关闭生命周期（Close 同步物理收口）
+// 4. 多 owner 配额隔离（同一进程两个 TransportRuntime 各自 max_inflight）
+// 5. 关闭期已接纳但未落定的 op（挂起 Accept）——名额归还 + 物理收口
 //
 // 新契约（进程寿命运行时）：没有 Scheduler::Stop/restart、没有 WaitClosed。
 // 每个测试可执行文件只初始化一次 runtime，用例之间靠进程边界隔离；用例结束
@@ -182,10 +182,10 @@ struct WakeRegisterHandshake {
 
 BOOST_AUTO_TEST_SUITE(transport_runtime)
 
-// ---------------------------------------------------------------------------
+//
 // 1. owner 门禁：Create 只校验装配参数，Start 才放开工厂；参数非法在入口
-//    快返 InvalidArgument，且发生在容量预留之前。
-// ---------------------------------------------------------------------------
+// 快返 InvalidArgument，且发生在容量预留之前。
+//
 BOOST_AUTO_TEST_CASE(t_owner_gate_and_param_validation) {
     EnsureRuntime();
     CaseGuard guard;
@@ -244,10 +244,10 @@ BOOST_AUTO_TEST_CASE(t_owner_gate_and_param_validation) {
     BOOST_CHECK(owner->IsClosed());
 }
 
-// ---------------------------------------------------------------------------
+//
 // 2. 容量名额（max_connections）：listener/accepted/dialed/UDP 各算一个名额；
-//    超限 Overloaded、不排队；**物理关闭落定后才归还**，逻辑超时不提前归还。
-// ---------------------------------------------------------------------------
+// 超限 Overloaded、不排队；**物理关闭落定后才归还**，逻辑超时不提前归还。
+//
 BOOST_AUTO_TEST_CASE(t_capacity_gate_and_physical_release) {
     EnsureRuntime();
     CaseGuard guard;
@@ -299,10 +299,10 @@ BOOST_AUTO_TEST_CASE(t_capacity_gate_and_physical_release) {
     BOOST_CHECK(owner->IsClosed());
 }
 
-// ---------------------------------------------------------------------------
+//
 // 3. 真实 loopback 收发 + 完整关闭生命周期：受管连接可读写，owner Close 后
-//    交付对象物理关闭（IsClosed）、托管引用随物理关闭释放、工厂随后拒绝。
-// ---------------------------------------------------------------------------
+// 交付对象物理关闭（IsClosed）、托管引用随物理关闭释放、工厂随后拒绝。
+//
 BOOST_AUTO_TEST_CASE(t_loopback_data_path_and_close_lifecycle) {
     EnsureRuntime();
     CaseGuard guard;
@@ -352,7 +352,7 @@ BOOST_AUTO_TEST_CASE(t_loopback_data_path_and_close_lifecycle) {
         probe->client_ok.store(write && write.value().bytes == 5 && read &&
                                read.value().bytes == 5 &&
                                std::string(response, 5) == "world");
-        // 受管引用在关闭后仍可用于查询（§4.0.1.2）。
+        // 受管引用在关闭后仍可用于查询。
         client->Close();
         probe->done.Down();
     };
@@ -384,11 +384,11 @@ BOOST_AUTO_TEST_CASE(t_loopback_data_path_and_close_lifecycle) {
     guard.Unwind();
 }
 
-// ---------------------------------------------------------------------------
+//
 // 4. 配额隔离：同一进程两个 TransportRuntime 各自持有 max_inflight 预算，
-//    一个 owner 的挂起 op 占满自己的账本时不会影响另一个 owner。
-//    （Issue #37「多 Runtime 配额隔离」在 transport 侧的直接证据。）
-// ---------------------------------------------------------------------------
+// 一个 owner 的挂起 op 占满自己的账本时不会影响另一个 owner。
+// （docs/decisions/0002-co-network-contract.md「多 Runtime 配额隔离」在 transport 侧的直接证据。）
+//
 BOOST_AUTO_TEST_CASE(t_quota_isolated_between_owners) {
     EnsureRuntime();
     CaseGuard guard;
@@ -491,10 +491,10 @@ BOOST_AUTO_TEST_CASE(t_quota_isolated_between_owners) {
     BOOST_CHECK(b->IsClosed());
 }
 
-// ---------------------------------------------------------------------------
+//
 // 5. 关闭期已接纳但未落定的 op：挂起的 Accept 在 owner Close 时被唤醒走正常
-//    归还路径（名额归零），且对象在 Close 返回时已物理收口（IsClosed）。
-// ---------------------------------------------------------------------------
+// 归还路径（名额归零），且对象在 Close 返回时已物理收口（IsClosed）。
+//
 BOOST_AUTO_TEST_CASE(t_close_wakes_adopted_suspended_op) {
     EnsureRuntime();
     CaseGuard guard;
@@ -552,11 +552,11 @@ BOOST_AUTO_TEST_CASE(t_close_wakes_adopted_suspended_op) {
     BOOST_CHECK(owner->IsClosed());
 }
 
-// ---------------------------------------------------------------------------
+//
 // 6. 并发 Close：两个线程同时关闭同一 owner，两个调用者返回当刻都必须观察到
-//    同一真实终态（IsClosed），不得让后来者以独立 kCloseDrainTimeout 提前返回
-//    而聚合尚未物理收口。
-// ---------------------------------------------------------------------------
+// 同一真实终态（IsClosed），不得让后来者以独立 kCloseDrainTimeout 提前返回
+// 而聚合尚未物理收口。
+//
 BOOST_AUTO_TEST_CASE(t_concurrent_close_both_observe_closed) {
     EnsureRuntime();
     CaseGuard guard;
@@ -595,13 +595,13 @@ BOOST_AUTO_TEST_CASE(t_concurrent_close_both_observe_closed) {
     guard.Unwind();
 }
 
-// ---------------------------------------------------------------------------
-// 7. 并发 Close + 在途工厂（R1 聚合根因）：工厂（ListenTCP）与两个 Close 调用
-//    者竞争时，Close 封口后必须等「在途工厂」归零才收口——工厂要么把 child 交接
-//    进托管集合（随即被 Close 物理关闭），要么在 sealed 路径自行物理关闭刚创建的
-//    fd 并归还容量。断言：两个 Close 调用者返回当刻都观察同一 Closed 终态、无在途
-//    工厂残留、任何被产出的 listener 都已物理关闭。多轮覆盖两种交错。
-// ---------------------------------------------------------------------------
+//
+// 7. 并发 Close + 在途工厂（聚合根因）：工厂（ListenTCP）与两个 Close 调用
+// 者竞争时，Close 封口后必须等「在途工厂」归零才收口——工厂要么把 child 交接
+// 进托管集合（随即被 Close 物理关闭），要么在 sealed 路径自行物理关闭刚创建的
+// fd 并归还容量。断言：两个 Close 调用者返回当刻都观察同一 Closed 终态、无在途
+// 工厂残留、任何被产出的 listener 都已物理关闭。多轮覆盖两种交错。
+//
 BOOST_AUTO_TEST_CASE(t_concurrent_close_tracks_inflight_factory) {
     EnsureRuntime();
     int failures = 0;
@@ -760,18 +760,18 @@ BOOST_AUTO_TEST_CASE(t_accept_adopt_rejected_after_owner_close) {
     guard.Unwind();
 }
 
-// ---------------------------------------------------------------------------
+//
 // 9. 关闭登记竞态（TCP Accept）：可等待 op 已建立 fd 事件、正要向 close_waiters
-//    登记唤醒之际，另一线程发起对象级 Close。修复前的顺序是「先放行登记屏障
-//    （claim.release）再 Add」，封口 SealWakeAndDrainRegistrations 可在此窗口
-//    封口空 m_waiters、排空登记并物理 close fd——上游 Hook_Close 以
-//    POLL_EVENT_CLOSED 首胜，本组合等待被兜底成 Cancelled(4)。修复把 Add 压进
-//    屏障后：封口的排空谓词（registrations==0）只在唤醒登记落定后成立，物理
-//    close 不早于登记，自行 Notify 的 POLL_EVENT_CUSTOM 必先胜。
-//    gate 落在 Add 入口，故本用例确定性重叠两条路径（非概率重试）：
-//      - 登记落定前 Close 无法返回（封口被在册登记屏障挡住）；
-//      - op 以关闭语义 Closed 落定，而非 Cancelled。
-// ---------------------------------------------------------------------------
+// 登记唤醒之际，另一线程发起对象级 Close。修复前的顺序是「先放行登记屏障
+// （claim.release）再 Add」，封口 SealWakeAndDrainRegistrations 可在此窗口
+// 封口空 m_waiters、排空登记并物理 close fd——上游 Hook_Close 以
+// POLL_EVENT_CLOSED 首胜，本组合等待被兜底成 Cancelled(4)。修复把 Add 压进
+// 屏障后：封口的排空谓词（registrations==0）只在唤醒登记落定后成立，物理
+// close 不早于登记，自行 Notify 的 POLL_EVENT_CUSTOM 必先胜。
+// gate 落在 Add 入口，故本用例确定性重叠两条路径（非概率重试）：
+// - 登记落定前 Close 无法返回（封口被在册登记屏障挡住）；
+// - op 以关闭语义 Closed 落定，而非 Cancelled。
+//
 BOOST_AUTO_TEST_CASE(t_close_during_wake_registration_stays_closed_tcp) {
     EnsureRuntime();
     CaseGuard guard;
@@ -880,11 +880,11 @@ BOOST_AUTO_TEST_CASE(t_close_during_wake_registration_stays_closed_tcp) {
     guard.Unwind();
 }
 
-// ---------------------------------------------------------------------------
+//
 // 10. 关闭登记竞态（UDP Receive）：与 case 9 同一根因/同一 gate 位置，覆盖
-//     CoUDP::_Wait 的「先放行登记屏障再 Add」错序。断言同：登记落定前 Close
-//     不返回；Close 后挂起 Receive 以 Closed 落定。
-// ---------------------------------------------------------------------------
+// CoUDP::_Wait 的「先放行登记屏障再 Add」错序。断言同：登记落定前 Close
+// 不返回；Close 后挂起 Receive 以 Closed 落定。
+//
 BOOST_AUTO_TEST_CASE(t_close_during_wake_registration_stays_closed_udp) {
     EnsureRuntime();
     CaseGuard guard;

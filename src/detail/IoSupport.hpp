@@ -1,5 +1,5 @@
 #pragma once
-// infra 内部共享 I/O 支撑（Issue #6 抽取）：strand 执行域封装、
+// infra 内部共享 I/O 支撑：strand 执行域封装、
 // 受管对象关闭态机、同步关闭的挂起等待者登记、WaitStatus 映射与对象身份工厂。
 // HTTP（http_detail）与 Redis（redis_detail）模块共用一份实现，
 // 不拥有 io_context 或线程；本头仅供 src/ 内部使用，不安装、不进公开面。
@@ -484,13 +484,13 @@ inline result<bbt::coroutine::CoObjectInfo> NewObjectInfo(std::string kind) {
     }
 }
 
-// §4.0.1.7（Issue #32）：Runtime 级传输在途账本。覆盖受管 DialTCP
+// 在途账本契约：Runtime 级传输在途账本。覆盖受管 DialTCP
 // 等待段、CoTCPListener::Accept 与 TCP/UDP 可等待数据操作；Try* 不经
 // 账本。容量满立即拒绝（不排队），名额由对象在 op 结束时归还。
 //
 // Stop 安全：账本由 Runtime 与各受管对象经 shared_ptr 共享持有
 // （quota_scope）。Scheduler::Stop 对挂起协程直接销毁、不展开栈
-// （coroutine 契约 §6），因此归还不能依赖协程栈 RAII——对象侧用
+// （上游 coroutine 契约），因此归还不能依赖协程栈 RAII——对象侧用
 // m_quota_held 记录未归还名额，op 正常结束归还 1，Close/析构
 // 经 DrainQuota 一次性归还剩余，两种路径互补且无重复归还。
 struct InflightLedger {

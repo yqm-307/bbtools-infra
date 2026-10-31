@@ -1,19 +1,19 @@
-// B4 契约聚焦测试：针对父级处置中的真实根因做可判别回归。
+// 契约聚焦测试：针对父级处置中的真实根因做可判别回归。
 //
 // 覆盖：
-//   ring_alloc_no_consume     复制/分配失败不前移消费游标
-//   ring_release_notify       RAII/空读释放唤醒已登记 Busy 等待者
-//   hub_early_notify_retained 挂起前 Notify 未交付时 weak 项必须保留
-//   write_total_ops_bound     普通+零长+待派发合计受 max_ops
-//   write_query_monotonic     Query 与 writer 共锁、sent 单调、终态一次
-//   onwrite_throw_continues   用户 OnWrite 抛出后其余终态与 OnClose 仍兑现
-//   wait_accepted_existing_out 既有 out 有效不算本轮成功
-//   run_preconditions         未初始化/未声明独立推进零副作用拒绝
-//   engine_driver_failed      Engine 级 Failed 同步解绑/冻结/不伪回调
-//   invalid_options_rejected  保留字段非法值在绑定前拒绝（历史 ET/ticker 字段已删除）
-//   handoff_full_resume       容量 1 下先 reserve 再 accept、满后恢复
-//   lb_subs                   LB 分配真实落到两个 sub owner
-//   fairness                  热连接 + 第二连接 + 业务协程同时进展
+// ring_alloc_no_consume 复制/分配失败不前移消费游标
+// ring_release_notify RAII/空读释放唤醒已登记 Busy 等待者
+// hub_early_notify_retained 挂起前 Notify 未交付时 weak 项必须保留
+// write_total_ops_bound 普通+零长+待派发合计受 max_ops
+// write_query_monotonic Query 与 writer 共锁、sent 单调、终态一次
+// onwrite_throw_continues 用户 OnWrite 抛出后其余终态与 OnClose 仍兑现
+// wait_accepted_existing_out 既有 out 有效不算本轮成功
+// run_preconditions 未初始化/未声明独立推进零副作用拒绝
+// engine_driver_failed Engine 级 Failed 同步解绑/冻结/不伪回调
+// invalid_options_rejected 保留字段非法值在绑定前拒绝（历史 ET/ticker 字段已删除）
+// handoff_full_resume 容量 1 下先 reserve 再 accept、满后恢复
+// lb_subs LB 分配真实落到两个 sub owner
+// fairness 热连接 + 第二连接 + 业务协程同时进展
 
 #include <bbt/infra/net/CoTcpConnection.hpp>
 #include <bbt/infra/net/Engine.hpp>
@@ -133,7 +133,7 @@ static std::future<void> Task(std::function<void()> callback) {
         } catch (...) {
             promise->set_exception(std::current_exception());
         }
-    }, "net.b4");
+    }, "net.contract");
     return future;
 }
 
@@ -697,7 +697,7 @@ static void Fairness() {
 }
 
 
-// ---------------- B5 增量 ----------------
+// ---------------- 增量 ----------------
 
 static std::size_t CountFds() {
     return static_cast<std::size_t>(std::distance(
@@ -1105,7 +1105,7 @@ static void CoReadRapid() {
 }
 
 
-// ---------------- B6: F8 / F6 / F7 / fairness ----------------
+// ---------------- : / / / fairness ----------------
 
 static void WriteTerminalNoAlloc() {
     auto state = std::make_shared<ConnectionState>(1, 4096, 4096, 4, nullptr);
@@ -1540,7 +1540,7 @@ static void CoBusyReleasePhases() {
         CHECK(shared_out->size() == 256);
     }
     // 2) Busy 之后、waiter 创建之前释放：必须靠「TryAccess 之前采的旧代次」
-    //    在 on_registered 复查出差异；修复前采到已释放后的 G+1 → 超时。
+    // 在 on_registered 复查出差异；修复前采到已释放后的 G+1 → 超时。
     {
         auto state = make_state();
         Connection connection = ConnectionTestAccess::Make(state);
@@ -2244,7 +2244,7 @@ static void CallbackAuthBarriers() {
 
 
 
-// 公共建连单一交付（D5）：无 handler 的 Engine 上 AsyncConnect 零提交拒绝，
+// 公共建连单一交付：无 handler 的 Engine 上 AsyncConnect 零提交拒绝，
 // out_id 保持原值、不产生 OnConnect；同一 Engine 上 CoDial 才是正例交付。
 // 早到完成（owner 先完成、后领取）由 connect_complete_before_wait 经内部
 // 两段式覆盖，Scenario 不再依赖已删除的公开 awaitable 提交。
@@ -2922,7 +2922,7 @@ static void RequestCloseWriteReadiness() {
         void OnAccept(Connection connection) override { accepted.set_value(connection); }
         void OnWrite(Connection connection, WriteResult result) override {
             WriteOperation rejected;
-            // 内部状态断言经 TestAccess：公共句柄不再暴露 State()。
+            // 内部状态断言经 TestAccess：公共句柄不再暴露 State。
             const auto state = ConnectionTestAccess::StateOf(connection);
             write_checked.store(result.error.value() == EPIPE && result.sent == 0
                 && state && state->CloseRequested()

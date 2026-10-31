@@ -1,17 +1,17 @@
-// waypoint 3-3 前置：infra 通用位置参数 payload codec 契约测试。
+// 前置：infra 通用位置参数 payload codec 契约测试。
 //
 // 证据口径（不把「新 encoder → 新 decoder」当唯一证据）：
-//   1. golden 期望字节是从旧 framework 源 CoRpc.hpp（bd9c4905 的 rpc_detail）
-//      的字节规则独立写出的 literal；本测试只做 encode(值) == literal。
-//   2. decode 侧用同一 literal 独立解回值，证明解码不依赖新编码器。
-//   3. 旧源/新源字节级等价另有一次性交叉验证程序（不进仓）：
-//      scratch:infra-status-ab50534/rpc-payload-golden/old_vs_new.cc
-//      —— 直接编译旧 framework 头与新 infra 头对同批值逐字节比对。
+// 1. golden 期望字节是从旧 framework 源 CoRpc.hpp（bd9c4905 的 rpc_detail）
+// 的字节规则独立写出的 literal；本测试只做 encode(值) == literal。
+// 2. decode 侧用同一 literal 独立解回值，证明解码不依赖新编码器。
+// 3. 旧源/新源字节级等价另有一次性交叉验证程序（不进仓）：
+// scratch:infra-status-ab50534/rpc-payload-golden/old_vs_new.cc
+// —— 直接编译旧 framework 头与新 infra 头对同批值逐字节比对。
 //
 // 旧源 pin（内容寻址，可经 git cat-file / sha256sum 复核）：
-//   rev    bd9c490541ccad10cf32e15b91bb40104aa86118
-//   blob   08d1c954553f625ef396e534d898d6a2697ac232
-//   sha256 ae37d61fdcfe604f0c08ba518fffd3721a2d56f51202b471177ae19b071cf0d4
+// rev bd9c490541ccad10cf32e15b91bb40104aa86118
+// blob 08d1c954553f625ef396e534d898d6a2697ac232
+// sha256 ae37d61fdcfe604f0c08ba518fffd3721a2d56f51202b471177ae19b071cf0d4
 //
 // 无第三方测试框架依赖；只链接 bbt::infra_common（纯 header-only codec）。
 

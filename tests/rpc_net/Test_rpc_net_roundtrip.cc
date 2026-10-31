@@ -143,7 +143,7 @@ void Reuse() {
 }
 
 void TransportDefaults() {
-    // F2 回归：HTTP 共享 transport 的默认配置不得破坏固定 RPC profile——
+    // 回归：HTTP 共享 transport 的默认配置不得破坏固定 RPC profile——
     // 默认 Content-Type（大小写混排）、默认 params 都存在时，真实 rpc::Server
     // handler 仍必须成功；其他默认头（Authorization）不被清掉；无默认配置的
     // 正常控制例同样成功（绑定检查未放宽）。fixture 按阶段作用域收口，任意

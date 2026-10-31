@@ -1,6 +1,6 @@
 #pragma once
 
-// 公共读缓冲（终评 §2）：Read 交付的拥有式字节视图，真零拷贝移交语义。
+// 公共读缓冲（docs/decisions/0012-icoconn-member-interface.md）：Read 交付的拥有式字节视图，真零拷贝移交语义。
 //
 // 与旧 CoRead(std::string& out) 的本质差异：Buffer 持 owning backing，
 // 从 ReceiveRing/EventRingBuffer 取走的是真实存储（含绕环两段），不复制
@@ -12,7 +12,7 @@
 // 段列表；不隐式拼接。需要连续视图时 CopyTo 复制，或消费方逐段处理。
 //
 // 值语义：只可移动（移动后来源 Segments() 为空）；拷贝已删除——拷贝赋值
-// 在 backing/段表分步失败时会留下悬空段（P2-2a）。Buffer 不是环形游标视图——
+// 在 backing/段表分步失败时会留下悬空段。Buffer 不是环形游标视图——
 // 没有「读一半丢弃再 Peek」的游标，消费进度由调用者自己经 Segment::size
 // 推进。
 
@@ -39,8 +39,8 @@ public:
     Buffer() = default;
 
     // 值语义只保留移动：拷贝会在 backing 已换、段表分配失败时留下指向已释放
-    // 存储的旧段（P2-2a），且无法以「不可复制」之外的更弱方式伪造强保证——
-    // owning 不变量（段来自 backing）只允许经移交路径建立（P2-2b）。
+    // 存储的旧段，且无法以「不可复制」之外的更弱方式伪造强保证——
+    // owning 不变量（段来自 backing）只允许经移交路径建立。
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
     Buffer(Buffer&&) noexcept = default;

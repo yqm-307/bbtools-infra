@@ -1,20 +1,20 @@
-// Issue #55 (F2) / #56 (H1) / #57 (H2)：HTTP client 失败路径物理收口、
+// docs/decisions/0011-http-client-failure-connect-contract.md () / docs/decisions/0011-http-client-failure-connect-contract.md (H1) / docs/decisions/0011-http-client-failure-connect-contract.md (H2)：HTTP client 失败路径物理收口、
 // resolver 后台寿命边界、composed connect 串行化的决定性回归。
 //
 // 契约要点（与三张票的 R/S 对应）：
-//  - #55 F2：任何失败出口（resolve 失败 / 发起异常 / 写读失败 / 等待失败）
-//    都必须在 op 离开 owner m_ops（UnregisterOp→on_unregister）之前，先
-//    物理释放所拥有的 socket/body/parser/flat_buffer（Abort→Finish 次序）。
-//    取证不是 finished/IsClosed 标签，而是「在 op 离开 m_ops 的当刻」由
-//    on_unregister 内直读 socket.is_open()/request.body().size()/serializer
-//    是否仍在——这些状态由 Abort() 在同一 io 域线程先于 UnregisterOp 写下。
-//  - #56 H1：resolver 后台 getaddrinfo 不因 cancel() 返回而同步停止，本
-//    适配器不加阻塞 join 层；靠解析 handler 捕获的 self 保活 op，晚到完成项
-//    经 !op_armed 早退。Close 返回时本 op 自有可控资源（socket/载荷）已释放，
-//    与「后台查询状态」分开记录。
-//  - #57 H2：多 endpoint 连接不用 range composed operation，改在 IoGate 内
-//    逐条 close/open/async_connect，使其与跨线程 Abort/Close 串行；多
-//    endpoint 语义与错误分类不变。
+// - docs/decisions/0011-http-client-failure-connect-contract.md：任何失败出口（resolve 失败 / 发起异常 / 写读失败 / 等待失败）
+// 都必须在 op 离开 owner m_ops（UnregisterOp→on_unregister）之前，先
+// 物理释放所拥有的 socket/body/parser/flat_buffer（Abort→Finish 次序）。
+// 取证不是 finished/IsClosed 标签，而是「在 op 离开 m_ops 的当刻」由
+// on_unregister 内直读 socket.is_open()/request.body().size()/serializer
+// 是否仍在——这些状态由 Abort() 在同一 io 域线程先于 UnregisterOp 写下。
+// - docs/decisions/0011-http-client-failure-connect-contract.md H1：resolver 后台 getaddrinfo 不因 cancel() 返回而同步停止，本
+// 适配器不加阻塞 join 层；靠解析 handler 捕获的 self 保活 op，晚到完成项
+// 经 !op_armed 早退。Close 返回时本 op 自有可控资源（socket/载荷）已释放，
+// 与「后台查询状态」分开记录。
+// - docs/decisions/0011-http-client-failure-connect-contract.md H2：多 endpoint 连接不用 range composed operation，改在 IoGate 内
+// 逐条 close/open/async_connect，使其与跨线程 Abort/Close 串行；多
+// endpoint 语义与错误分类不变。
 //
 // 失败注入与门控都走内部 seam（io_fault / on_resolve / on_connect_attempt /
 // on_read_armed / SetEndpointsForTest），不靠 sleep 猜时序，不把模拟 DNS
@@ -300,10 +300,10 @@ BOOST_AUTO_TEST_CASE(t_start_scheduler) {
     BOOST_REQUIRE(g_scheduler->IsInitialized());
 }
 
-// ---------------------------------------------------------------------------
-// #55 F2：七类失败出口。每条走真实路径/注入，断言「Abort→Finish 且名额/
+//
+// docs/decisions/0011-http-client-failure-connect-contract.md：七类失败出口。每条走真实路径/注入，断言「Abort→Finish 且名额/
 // 资源在离开 m_ops 前已归还」。
-// ---------------------------------------------------------------------------
+//
 
 // E1 resolve 失败：非法数值 host（getaddrinfo 直接失败，不依赖外部 DNS）。
 BOOST_AUTO_TEST_CASE(t_f2_e1_resolve_failure_releases_before_unregister) {
@@ -334,7 +334,7 @@ BOOST_AUTO_TEST_CASE(t_f2_e1b_resolve_initiate_exception_releases) {
                 std::string::npos);
 }
 
-// E2 connect 发起异常：#57 H2 的单次 connect 发起处注入异常。
+// E2 connect 发起异常：docs/decisions/0011-http-client-failure-connect-contract.md H2 的单次 connect 发起处注入异常。
 BOOST_AUTO_TEST_CASE(t_f2_e2_connect_initiate_exception_releases) {
     auto budget = std::make_shared<FakeBudget>(1);
     const std::uint16_t dead = DeadPort();
@@ -496,9 +496,9 @@ BOOST_AUTO_TEST_CASE(t_f2_e7_pumpread_failure_releases) {
     ExpectReleasedBeforeUnregister(run, "E7 pumpread-fail");
 }
 
-// ---------------------------------------------------------------------------
-// #56 H1：resolver 后台寿命边界。
-// ---------------------------------------------------------------------------
+//
+// docs/decisions/0011-http-client-failure-connect-contract.md H1：resolver 后台寿命边界。
+//
 
 // S1/S3：解析完成项被门控（backend 查询已完成、回调处理尚未推进）时与
 // Close 竞争。Close 返回当刻：本 op 自有可控资源（socket/载荷）已释放、
@@ -584,9 +584,9 @@ BOOST_AUTO_TEST_CASE(t_h1_resolve_failure_vs_close_single_settlement) {
     BOOST_CHECK(run.impl->IsClosed());
 }
 
-// ---------------------------------------------------------------------------
-// #57 H2：composed connect 串行化。
-// ---------------------------------------------------------------------------
+//
+// docs/decisions/0011-http-client-failure-connect-contract.md H2：composed connect 串行化。
+//
 
 // S1：两 endpoint，第一个可控失败（死端口），第二个成功；断言回退到第二
 // 条、请求成功、前一次资源不残留、名额恰好归还一次。

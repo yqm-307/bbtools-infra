@@ -1,15 +1,15 @@
-// Issue #6 真实 Redis 容器验收（docker compose 起 redis:7-alpine，
+// docs/decisions/0003-redis-client-hiredis-dependency.md 真实 Redis 容器验收（docker compose 起 redis:7-alpine，
 // cpus<=0.5 / mem_limit<=256m / 动态项目名，编排见 tests/redis-live.sh）：
 //
-//   BBT_TEST_REDIS_ADDR=host:port   必填，未设置整件跳过（不伪造通过）
-//   BBT_REDIS_PHASE=A|B|C           默认 A：
-//     A = 容器在线（功能、错误、并发、close、进程内断连恢复）
-//     B = 容器已停（命令必须失败而非悬挂/假成功）
-//     C = 容器重启后（新 client 亦可用）
-//   BBT_REDIS_CTL='docker compose -p P -f FILE'  容器 stop/start 命令
-//     前缀（A 阶段断连恢复用），缺省则跳过 t_reconnect。
-//   BBT_REDIS_RCLI='... exec -T redis redis-cli' 容器内 redis-cli 命令
-//     前缀（WRONGTYPE 种子用），缺省则跳过 t_server_error。
+// BBT_TEST_REDIS_ADDR=host:port 必填，未设置整件跳过（不伪造通过）
+// BBT_REDIS_PHASE=A|B|C 默认 A：
+// A = 容器在线（功能、错误、并发、close、进程内断连恢复）
+// B = 容器已停（命令必须失败而非悬挂/假成功）
+// C = 容器重启后（新 client 亦可用）
+// BBT_REDIS_CTL='docker compose -p P -f FILE' 容器 stop/start 命令
+// 前缀（A 阶段断连恢复用），缺省则跳过 t_reconnect。
+// BBT_REDIS_RCLI='... exec -T redis redis-cli' 容器内 redis-cli 命令
+// 前缀（WRONGTYPE 种子用），缺省则跳过 t_server_error。
 //
 // 关闭语义（进程寿命修订）：Close() 幂等、任意线程可调用，返回即封口且
 // 在途 operation/connection 归零；IsClosed() 只读查询。无 RequestClose/
@@ -50,11 +50,11 @@
 #include <bbt/infra/CoRedisCli.hpp>
 #include <bbt/infra/CoTCP.hpp>
 
-// Issue #34：真实在途断言复用 src/redis 内部只读探针（BindingStateSnapshot /
+// 真实在途断言复用 src/redis 内部只读探针（BindingStateSnapshot /
 // TransportForTest 均为生产始终存在的真实状态面，不受 debug 开关影响）。
 // 仅本测试目标可见（tests/CMakeLists.txt 内 Test_redis_live 专属 include）。
 #include "redis/CoRedisCliImpl.hpp"
-// Issue #34：复用生产已有的 F3 数据路径「协程真实挂起在 fd 等待」接缝
+// 复用生产已有的 数据路径「协程真实挂起在 fd 等待」接缝
 // （detail::TransportWiring::SetIoWaitRegisteredGateForTest），仅测试安装。
 #include "detail/TransportWiring.hpp"
 
@@ -182,7 +182,7 @@ std::string BinaryPayload(int seed) {
 
 std::atomic_bool g_prepared{false};
 
-// ---- Issue #34：真实服务端等待（CLIENT PAUSE）下的强制超时 / owner Close 中断 ----
+// ----：真实服务端等待（CLIENT PAUSE）下的强制超时 / owner Close 中断 ----
 // 因果握手：Redis 原生 `CLIENT PAUSE <ms> ALL` 让服务端在窗口内挂起所有命令；
 // 命令在窗口内真实发出（TCP 已接受、服务端收到但不回复），故等待发生在服务端，
 // 不是「已过期入参/排队超时」冒充。观测复用生产真实状态面
@@ -192,17 +192,17 @@ std::atomic_bool g_prepared{false};
 
 constexpr int kServerPauseMs = 3000;
 
-// #34 R2：pause 窗口长度单一常量，避免字面量与 kServerPauseMs 漂移。
+// pause 窗口长度单一常量，避免字面量与 kServerPauseMs 漂移。
 std::string PauseArgs() {
     return std::string("CLIENT PAUSE ") + std::to_string(kServerPauseMs) + " ALL";
 }
 
-// #34 R4：新增控制命令自带 timeout（不改既有 Sys helper 的语义与调用点）。
+// 新增控制命令自带 timeout（不改既有 Sys helper 的语义与调用点）。
 int SysBounded(const std::string& prefix, const std::string& args) {
     return std::system(("timeout --kill-after=5 30 " + prefix + " " + args).c_str());
 }
 
-// #34：控制/等待失败要 fail closed——不论用例正常返回还是 BOOST_REQUIRE 抛错，
+// 控制/等待失败要 fail closed——不论用例正常返回还是 BOOST_REQUIRE 抛错，
 // 退出本用例时都 Close 本用例自有的 client（Close 幂等、任意线程可调用）。
 struct CloseOwnedClientsOnExit {
     std::vector<std::shared_ptr<CoRedisCli>> clients;
@@ -243,7 +243,7 @@ bool TransportPhysicallyClosed(const std::shared_ptr<CoRedisCliImpl>& impl) {
 
 } // namespace
 
-// Issue #34：live 套件无 BBT_TEST_REDIS_ADDR 时必须显式标记 Skipped，不能
+// live 套件无 BBT_TEST_REDIS_ADDR 时必须显式标记 Skipped，不能
 // 以退出码 0 冒充通过（CTest 会把 0 记为 Passed）。套件内每个 case 用
 // BOOST_TEST_MESSAGE("skip: ...")+return 提前返回；Boost.Test 默认日志
 // 级别下该消息不打印，SKIP_REGULAR_EXPRESSION 匹配不到文本。故在全局
@@ -550,7 +550,7 @@ BOOST_AUTO_TEST_CASE(t_fresh_client_after_restart) {
     CloseAndCheck(cli);
 }
 
-// ---- Issue #34：显式 Disconnect/Connect 恢复（无需服务端故障注入）--------------
+// ----：显式 Disconnect/Connect 恢复（无需服务端故障注入）--------------
 BOOST_AUTO_TEST_CASE(t_explicit_disconnect_reconnect_recovers) {
     if (!LiveEnabled() || !PhaseIs('A')) {
         BOOST_TEST_MESSAGE("skip: 需要 BBT_TEST_REDIS_ADDR 且 PHASE=A");
@@ -595,14 +595,14 @@ BOOST_AUTO_TEST_CASE(t_explicit_disconnect_reconnect_recovers) {
     CloseAndCheck(cli);
 }
 
-// ---- Issue #34：owner Close 与真实在途命令竞争 → Closed ------------------------
+// ----：owner Close 与真实在途命令竞争 → Closed ------------------------
 BOOST_AUTO_TEST_CASE(t_close_race_during_server_pause_settles_closed) {
     if (!LiveEnabled() || !PhaseIs('A')) {
         BOOST_TEST_MESSAGE("skip: 需要 BBT_TEST_REDIS_ADDR 且 PHASE=A");
         return;
     }
     const char* rcli = EnvOr("BBT_REDIS_RCLI");
-    // #34：真实服务端在途等待用例必须实跑；缺 RCLI 硬失败，不静默成绿。
+    // 真实服务端在途等待用例必须实跑；缺 RCLI 硬失败，不静默成绿。
     BOOST_REQUIRE_MESSAGE(rcli != nullptr,
         "redis.live #34: 缺 BBT_REDIS_RCLI，无法制造真实服务端在途等待");
 
@@ -619,9 +619,9 @@ BOOST_AUTO_TEST_CASE(t_close_race_during_server_pause_settles_closed) {
     auto old_transport = impl->TransportForTest();
     BOOST_REQUIRE_MESSAGE(old_transport, "健康 PING 后必须有真实 transport");
 
-    // R1：不以 registered>=1 作「已写出」证据——registered 与入队同刻成立，owner 可能
+    // 不以 registered>=1 作「已写出」证据——registered 与入队同刻成立，owner 可能
     // 尚未出队/编码/写出（review 建议的 queued==0 && registered>=1 亦不充分：出队后仍未
-    // 编码）。改用生产已有 F3 接缝：transport 数据路径协程真正挂起在 fd 等待
+    // 编码）。改用生产已有 接缝：transport 数据路径协程真正挂起在 fd 等待
     // （on_registered）时回调一次，只写堆原子、不阻塞。单条小 SET + 无其他 op ⇒ 小写一次
     // 写完（无 EAGAIN），ReadReply 才是唯一会挂起的 fd 等待，故命中即「命令已真实挂起在读等待」。
     auto io_wait = std::make_shared<std::atomic_bool>(false);
@@ -703,7 +703,7 @@ BOOST_AUTO_TEST_CASE(t_close_race_during_server_pause_settles_closed) {
     CloseAndCheck(fresh);
 }
 
-// ---- Issue #34：真实服务端在途等待 → 强制 TimedOut、物理收口、不复用、可恢复 ----
+// ----：真实服务端在途等待 → 强制 TimedOut、物理收口、不复用、可恢复 ----
 BOOST_AUTO_TEST_CASE(t_server_pause_forces_timedout_then_recover) {
     if (!LiveEnabled() || !PhaseIs('A')) {
         BOOST_TEST_MESSAGE("skip: 需要 BBT_TEST_REDIS_ADDR 且 PHASE=A");
@@ -726,7 +726,7 @@ BOOST_AUTO_TEST_CASE(t_server_pause_forces_timedout_then_recover) {
     auto old_transport = impl->TransportForTest();
     BOOST_REQUIRE_MESSAGE(old_transport, "健康 PING 后必须有真实 transport");
 
-    // R1：同 Close 用例——用既有 F3 fd 等待接缝证明「命令已真实挂起在读等待」，不用 registered。
+    // 同 Close 用例——用既有 fd 等待接缝证明「命令已真实挂起在读等待」，不用 registered。
     auto timed_wait = std::make_shared<std::atomic_bool>(false);
     detail::TransportWiring::SetIoWaitRegisteredGateForTest(
         *old_transport, [timed_wait] { timed_wait->store(true); });
@@ -745,7 +745,7 @@ BOOST_AUTO_TEST_CASE(t_server_pause_forces_timedout_then_recover) {
     // 因果握手：服务端声明挂起命令窗口（窗口 > 命令 deadline；单一常量）。
     BOOST_REQUIRE_EQUAL(SysBounded(rcli, PauseArgs()), 0);
 
-    // R3：见证命令与超时命令并发发起并绑定同一 pause 窗口——其成功返回即「服务端已恢复」的
+    // 见证命令与超时命令并发发起并绑定同一 pause 窗口——其成功返回即「服务端已恢复」的
     // 可观测信号，不再用 came->ms 的固定时序下限（易受 pause 尾段抖动影响）。
     auto came     = std::make_shared<PingOutcome>();
     bool wstarted = false;
@@ -773,10 +773,10 @@ BOOST_AUTO_TEST_CASE(t_server_pause_forces_timedout_then_recover) {
     // 在自身 deadline 到期（~700ms），早于 pause 结束（kServerPauseMs）：不是服务端回复。
     BOOST_CHECK_GE(timed->ms.load(), 600);
     BOOST_CHECK_LT(timed->ms.load(), kServerPauseMs);
-    // R1：超时命令确实已进入真实 fd 读等待（非仅入队/空转）。
+    // 超时命令确实已进入真实 fd 读等待（非仅入队/空转）。
     BOOST_CHECK_MESSAGE(timed_wait->load(),
         "超时命令必须已真实挂起在 fd 读等待（非仅入队）");
-    // R3 因果断言：超时命令落定当刻，见证命令仍被服务端挂起（同一 pause 窗口 ⇒ 不可能已回），
+    // 因果断言：超时命令落定当刻，见证命令仍被服务端挂起（同一 pause 窗口 ⇒ 不可能已回），
     // 不依赖固定时序下限。
     BOOST_CHECK_MESSAGE(!came->done.load(),
         "见证命令在超时时刻必须仍被服务端挂起（同一 pause 窗口）");

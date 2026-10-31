@@ -90,7 +90,7 @@ result<void> MongoRuntime::Start() {
             closed_during_start = true;
         } else {
             try {
-                // Issue #12 M1 回归接缝：reserve 前失败等价 reserve 抛
+                // 回归接缝：reserve 前失败等价 reserve 抛
                 // bad_alloc；第 N 个 worker 创建前失败等价 emplace_back
                 // 抛 system_error（此时已起 N 个 worker）。生产路径默认
                 // kSpawnFailNone，不进入任一分支。
@@ -199,7 +199,7 @@ result<MongoOpOutcome> MongoRuntime::Submit(
     bbt::coroutine::WaitOptions wait;
     wait.deadline = options.deadline;
 
-    // 范式（契约 §2）：先登记等待事件 → 在 on_registered 内登记
+    // 范式（请求完成契约）：先登记等待事件 → 在 on_registered 内登记
     // CloseWaiters 并做唯一一次入队投递 → 随后挂起。on_registered 只在
     // 事件登记成功后执行，其内自唤醒走 CoPollEvent PENDING 不丢唤醒；
     // 登记失败（deadline 已过/取消/上下文非法）则不执行投递，op 也就
@@ -548,7 +548,7 @@ result<MongoOpOutcome> MongoRuntime::RunDriverCall(
 
 void MongoRuntime::Publish(const std::shared_ptr<MongoOp>& op,
                            result<MongoOpOutcome>          r) {
-    // 完成回投共享 executor（Issue #7）：io 域落定逻辑终态并唤醒协程。
+    // 完成回投共享 executor：io 域落定逻辑终态并唤醒协程。
     if (m_engine.TryPost([op, rr = std::move(r)]() mutable {
             op->Finish(std::move(rr));
         }))

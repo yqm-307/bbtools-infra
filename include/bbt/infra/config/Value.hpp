@@ -1,6 +1,6 @@
 #pragma once
 // config/v1：最小结构化值——有序 string→string 映射 + 类型化读取 + 内容指纹。
-// 契约来源：docs/decisions/0006-infra-foundation-and-dynamic-config.md（bbtools-infra#35）。
+// 契约来源：docs/decisions/0006-infra-foundation-and-dynamic-config.md。
 // infra 只提供读取、类型转换与基础格式；业务 schema 校验归 framework。
 
 #include <cctype>

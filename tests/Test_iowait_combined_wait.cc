@@ -1,11 +1,11 @@
-// Issue #20 最小能力探针（probe only，非生产代码，不实现 IoWait/CoTCP/CoUDP）：
+// 最小能力探针（probe only，非生产代码，不实现 IoWait/CoTCP/CoUDP）：
 // 实测 bbtools-coroutine detail::CoPollEvent 是否支持在【同一事件】上组合
-//   FD readable（真实 socketpair）+ custom wakeup + timeout
+// FD readable（真实 socketpair）+ custom wakeup + timeout
 // 四个确定性场景：
-//   1. fd-first            FD 首胜（custom/timeout 已武装但未触发）
-//   2. custom-first        custom 首胜（FD 静默、timeout 兜底未到）
-//   3. custom-before-park  park 前 custom 触发不丢（onyield 回调内先 Trigger 后 Regist）
-//   4. timeout-first       timeout 首胜（FD 静默、无 custom）
+// 1. fd-first FD 首胜（custom/timeout 已武装但未触发）
+// 2. custom-first custom 首胜（FD 静默、timeout 兜底未到）
+// 3. custom-before-park park 前 custom 触发不丢（onyield 回调内先 Trigger 后 Regist）
+// 4. timeout-first timeout 首胜（FD 静默、无 custom）
 // 每场景由 GetLastResumeEvent() 唤醒掩码直接裁决唯一首胜原因。
 //
 // 稳定性声明：本测试使用 bbt::coroutine::detail 私有头，以及
@@ -55,9 +55,9 @@ void Check(bool cond, const char* expr, const char* file, int line) {
 using bbt::coroutine::detail::CoPollEvent;
 
 // 唤醒掩码数值空间（来自上游触发路径，实测口径）：
-//   FD readable → bbt::pollevent::EventOpt::READABLE(0x02，libevent 数值空间)
-//   timeout     → bbt::pollevent::EventOpt::TIMEOUT(0x01)
-//   custom      → detail::POLL_EVENT_CUSTOM(0x08，PollEventType 空间)
+// FD readable → bbt::pollevent::EventOpt::READABLE(0x02，libevent 数值空间)
+// timeout → bbt::pollevent::EventOpt::TIMEOUT(0x01)
+// custom → detail::POLL_EVENT_CUSTOM(0x08，PollEventType 空间)
 // 注意 FD/timer 与 custom 分属两个数值空间，这是掩码仲裁实现必须显式处理的差异。
 using bbt::coroutine::detail::POLL_EVENT_CUSTOM;
 using bbt::coroutine::detail::POLL_EVENT_READABLE;
@@ -217,7 +217,7 @@ void CheckCombinedArmed(const ProbeSnapshot& s, int expect_fd, int expect_timeou
 // 场景1：FD 首胜。控制线程在协程调度前先写对端（FD 先于事件武装即就绪），
 // custom 只在唤醒后才尝试触发、timeout 为 8s 兜底，故唯一可能的首胜是 READABLE。
 void ScenarioFdFirst() {
-    std::printf("[probe] === scenario 1: fd-first ===\n");
+    std::printf("[iowait] === scenario 1: fd-first ===\n");
     int fds[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
         CHECK(false && "socketpair failed");
@@ -228,7 +228,7 @@ void ScenarioFdFirst() {
     ProbeRecord rec;
     g_scheduler->RegistCoroutineTask(
         [&] { CoRunCombinedWait(fds[0], kLongTimeoutMs, PreParkTrigger::None, rec); },
-        "probe.fd-first");
+        "iowait.fd-first");
 
     CHECK(rec.WaitDone());
     const auto s = Snapshot(rec);
@@ -252,7 +252,7 @@ void ScenarioFdFirst() {
 // 经 CoPoller::NotifyCustomEvent 触发 custom。无论触发落在 park 前后
 //（INITED/ARMING/ARMED→PENDING 或 PARKED→直接完成），首胜都必须是 CUSTOM。
 void ScenarioCustomFirst() {
-    std::printf("[probe] === scenario 2: custom-first ===\n");
+    std::printf("[iowait] === scenario 2: custom-first ===\n");
     int fds[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
         CHECK(false && "socketpair failed");
@@ -262,7 +262,7 @@ void ScenarioCustomFirst() {
     ProbeRecord rec;
     g_scheduler->RegistCoroutineTask(
         [&] { CoRunCombinedWait(fds[0], kLongTimeoutMs, PreParkTrigger::None, rec); },
-        "probe.custom-first");
+        "iowait.custom-first");
 
     CHECK(rec.WaitForCreated());
     int notify_ret = -1000;
@@ -294,7 +294,7 @@ void ScenarioCustomFirst() {
 // Trigger 在 phase INITED 即发布 PENDING，Regist 见 PENDING 早退成功，
 // CommitPark 在 Processer 线程消费 PENDING 并以 CUSTOM 掩码完成唤醒。
 void ScenarioCustomBeforePark() {
-    std::printf("[probe] === scenario 3: custom-before-park ===\n");
+    std::printf("[iowait] === scenario 3: custom-before-park ===\n");
     int fds[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
         CHECK(false && "socketpair failed");
@@ -305,7 +305,7 @@ void ScenarioCustomBeforePark() {
     g_scheduler->RegistCoroutineTask(
         [&] { CoRunCombinedWait(fds[0], kLongTimeoutMs,
                                 PreParkTrigger::InOnYieldBeforeRegist, rec); },
-        "probe.custom-before-park");
+        "iowait.custom-before-park");
 
     CHECK(rec.WaitDone());
     const auto s = Snapshot(rec);
@@ -319,7 +319,7 @@ void ScenarioCustomBeforePark() {
 
 // 场景4：timeout 首胜。FD 静默、无 custom，短超时（150ms）成为唯一触发源。
 void ScenarioTimeoutFirst() {
-    std::printf("[probe] === scenario 4: timeout-first ===\n");
+    std::printf("[iowait] === scenario 4: timeout-first ===\n");
     int fds[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
         CHECK(false && "socketpair failed");
@@ -329,7 +329,7 @@ void ScenarioTimeoutFirst() {
     ProbeRecord rec;
     g_scheduler->RegistCoroutineTask(
         [&] { CoRunCombinedWait(fds[0], kShortTimeoutMs, PreParkTrigger::None, rec); },
-        "probe.timeout-first");
+        "iowait.timeout-first");
 
     CHECK(rec.WaitDone());
     const auto s = Snapshot(rec);
@@ -354,6 +354,6 @@ int main() {
     ScenarioCustomFirst();
     ScenarioCustomBeforePark();
 
-    std::printf("iowait.probe: %d checks, %d failures\n", g_checks, g_failures);
+    std::printf("iowait.combined_wait: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

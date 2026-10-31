@@ -2,7 +2,7 @@
 // Codec<void>/Codec<std::string>、ICoObject/ICoNetwork/ICoCloseable 可派生。
 // 无第三方测试框架依赖，失败时输出到 stderr 并以非零退出。
 //
-// 关闭面按进程寿命运行时修订（契约 §1）：ICoCloseable 只有
+// 关闭面按进程寿命运行时修订（契约）：ICoCloseable 只有
 // Close()/IsClosed()。RequestClose/WaitClosed/ReleaseClosed/CloseStatus、
 // CancellationToken、运行时代际都不再存在，本件不保留任何旧断言。
 // CallOptions / IncomingCallContext / WaitOptions 只携带 deadline——

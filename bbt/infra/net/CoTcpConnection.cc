@@ -60,7 +60,7 @@ ReadOutcome CoTcpConnection::Read(
         const std::uint64_t generation = state->ring.AccessGeneration();
         auto attempt = state->ring.TryPopAll();
         if (attempt.status == ReadStatus::Ok) {
-            // 段元数据在 pop 事务内已构造为 Buffer-ready（P1-1）：Read 不做任何
+            // 段元数据在 pop 事务内已构造为 Buffer-ready：Read 不做任何
             // post-pop 分配，直接把 takeout 与段表移进 Buffer——pop 已提交的
             // 字节在此后没有可失败的中间步骤。
             outcome.state = ReadState::Data;
@@ -131,7 +131,7 @@ WriteOperation CoTcpConnection::AsyncWrite(std::string data)
 {
     // 非挂起提交：全量接纳或零接纳。拒绝返回「拒绝票」——无效句柄
     // （Valid()=false）但 Query() 给出 Rejected/0/具体原因，不分配
-    // 操作记录（终评 §2）。
+    // 操作记录（docs/decisions/0012-icoconn-member-interface.md）。
     const auto state = CoAccess::StateOf(m_conn);
     if (!state) {
         return WriteOperation(nullptr, {}, make_error_code(NetErrc::Closed));

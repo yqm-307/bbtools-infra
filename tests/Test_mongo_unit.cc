@@ -1,30 +1,30 @@
-// Issue #7 单元验收（不依赖真实 MongoDB/容器）：
+// docs/decisions/0004-mongo-client-mongocxx-dependency.md 单元验收（不依赖真实 MongoDB/容器）：
 //
-//   t_setup_scheduler             — 启动 Scheduler（共享 executor 来源）。
-//   t_create_before_scheduler     — 运行时未初始化（从未 Start）时 Create →
-//                                   RuntimeUnavailable（对象身份需要已
-//                                   初始化的运行时）。
-//   t_config_validation           — 非法装配逐项 InvalidArgument。
-//   t_command_prechecks           — 未 Start RuntimeUnavailable；空文档/
-//                                   空 filter 空 update InvalidArgument；
-//                                   Close 后 Closed。
-//   t_invalid_context_plain       — 普通线程直接调命令 → InvalidContext。
-//   t_invalid_bson                — 不良构 BSON → InvalidArgument（校验在
-//                                   worker 内、driver 调用之前，不需要服务端）。
-//   t_server_unreachable          — server selection 超时 → Unavailable
-//                                   （driver 侧失败映射）。
-//   t_capacity_overloaded         — worker_threads=1 时一个 op 占住 worker
-//                                   （RunningDriverCalls 观测），queue=2 占满
-//                                   后第 4 个命令确定性 Overloaded。
-//   t_deadline_only               — 不可达地址下 deadline → TimedOut；逻辑
-//                                   返回时物理 driver 调用仍在进行（计数
-//                                   不变），不冒充物理收口。
-//   t_close_during_inflight       — 在途 driver 调用随 owner Close() 落定
-//                                   Closed；物理收口（driver 返回 + worker
-//                                   退出）才 IsClosed。
-//   t_worker_threads_bound        — 4 个并发 op 峰值 driver 调用 ≤ 2。
-//   t_owner_thread_identity       — 单 worker 跨两个集合的 acquire/use/release
-//                                   线程 identity 均相同（内部观测证据）。
+// t_setup_scheduler — 启动 Scheduler（共享 executor 来源）。
+// t_create_before_scheduler — 运行时未初始化（从未 Start）时 Create →
+// RuntimeUnavailable（对象身份需要已
+// 初始化的运行时）。
+// t_config_validation — 非法装配逐项 InvalidArgument。
+// t_command_prechecks — 未 Start RuntimeUnavailable；空文档/
+// 空 filter 空 update InvalidArgument；
+// Close 后 Closed。
+// t_invalid_context_plain — 普通线程直接调命令 → InvalidContext。
+// t_invalid_bson — 不良构 BSON → InvalidArgument（校验在
+// worker 内、driver 调用之前，不需要服务端）。
+// t_server_unreachable — server selection 超时 → Unavailable
+// （driver 侧失败映射）。
+// t_capacity_overloaded — worker_threads=1 时一个 op 占住 worker
+// （RunningDriverCalls 观测），queue=2 占满
+// 后第 4 个命令确定性 Overloaded。
+// t_deadline_only — 不可达地址下 deadline → TimedOut；逻辑
+// 返回时物理 driver 调用仍在进行（计数
+// 不变），不冒充物理收口。
+// t_close_during_inflight — 在途 driver 调用随 owner Close() 落定
+// Closed；物理收口（driver 返回 + worker
+// 退出）才 IsClosed。
+// t_worker_threads_bound — 4 个并发 op 峰值 driver 调用 ≤ 2。
+// t_owner_thread_identity — 单 worker 跨两个集合的 acquire/use/release
+// 线程 identity 均相同（内部观测证据）。
 //
 // 关闭语义（进程寿命修订）：RequestClose/WaitClosed/CloseStatus/取消令牌
 // 全部删除——Close() 幂等、任意线程可调用，封口 + 唤醒等待者 + 有界等待在途
@@ -33,13 +33,13 @@
 // 在有界窗口内确认真实收口。
 //
 // 两个验证面（观测数据已迁入 src/debug/InfraDebug.hpp）：
-//   Debug 面（BBT_INFRA_STRINGENT_DEBUG=ON）— 追加 debug 观测断言：运行中
-//     driver 调用计数/峰值（并发上限）、执行域取证（同一次调用
-//     acquire/use/release 同 worker）、以及「逻辑返回≠物理收口」的在途计数；
-//   Release 面（宏 OFF）— debug 组件与本用例的 debug 访问器根本不存在。用例
-//     退回真实生产状态与结果断言：LiveWorkersForTest() 、QueuedOpsForTest()
-//     （真实队列深度，用作同步）、IsClosed()、错误码、结果计数。故关掉宏不会
-//     让任何用例恒过。同步点一律用真实事件（队列深度/结果闩），不用 sleep。
+// Debug 面（BBT_INFRA_STRINGENT_DEBUG=ON）— 追加 debug 观测断言：运行中
+// driver 调用计数/峰值（并发上限）、执行域取证（同一次调用
+// acquire/use/release 同 worker）、以及「逻辑返回≠物理收口」的在途计数；
+// Release 面（宏 OFF）— debug 组件与本用例的 debug 访问器根本不存在。用例
+// 退回真实生产状态与结果断言：LiveWorkersForTest()、QueuedOpsForTest()
+// （真实队列深度，用作同步）、IsClosed()、错误码、结果计数。故关掉宏不会
+// 让任何用例恒过。同步点一律用真实事件（队列深度/结果闩），不用 sleep。
 
 #define BOOST_TEST_DYN_LINK
 #define BOOST_TEST_MAIN
@@ -70,17 +70,17 @@
 #include <bbt/infra/CoMongoCli.hpp>
 
 // impl 观测钩子分两类：
-//   - 真实生产状态（Release 下同样可用）：LiveWorkersForTest /
-//     QueuedOpsForTest（读 m_live_workers / m_queue）；
-//   - debug 观测层（src/debug/InfraDebug.hpp，仅 BBT_INFRA_STRINGENT_DEBUG
-//     下存在）：RunningDriverCallsForTest / PeakDriverCallsForTest /
-//     LastDriverThreadEvidenceForTest。
+// - 真实生产状态（Release 下同样可用）：LiveWorkersForTest /
+// QueuedOpsForTest（读 m_live_workers / m_queue）；
+// - debug 观测层（src/debug/InfraDebug.hpp，仅 BBT_INFRA_STRINGENT_DEBUG
+// 下存在）：RunningDriverCallsForTest / PeakDriverCallsForTest /
+// LastDriverThreadEvidenceForTest。
 // 各用例按「Debug 面（宏 ON，追加观测断言）/ Release 面（宏 OFF，退回真实
 // 状态与结果断言，不得恒过）」两面组织，见用例内 #ifdef。MongoRuntime 是
-// Issue #40 的资源 owner。
+// docs/decisions/0007-mongo-owner-handles.md 的资源 owner。
 #include "mongo/MongoRuntime.hpp"
 
-// Issue #12 M4：直接经真实 driver 构造非法 URI，核对 ClassifyDriverError
+// M4：直接经真实 driver 构造非法 URI，核对 ClassifyDriverError
 // 的输入错误分类（URI 解析离线完成，不需要服务端）。
 #include <mongocxx/v1/uri.hpp>
 
@@ -179,7 +179,7 @@ bool WaitUntil(const std::function<bool()>& pred, int budget_ms = kBudgetMs) {
     return true;
 }
 
-// 物理线程数（/proc/self/task）：Issue #12 M1 用它确定性观察 worker 组
+// 物理线程数（/proc/self/task）： M1 用它确定性观察 worker 组
 // 收口，替代「猜时序」的 sleep 断言。
 std::size_t ThreadCount() {
     std::size_t n = 0;
@@ -334,14 +334,14 @@ BOOST_AUTO_TEST_CASE(t_effective_uri_userinfo_decoy) {
 }
 
 BOOST_AUTO_TEST_CASE(t_driver_invalid_uri_is_invalid_argument) {
-    // Issue #12 M4：真实 driver 对非法 URI/选项抛 mongocxx::v1::exception
+    // M4：真实 driver 对非法 URI/选项抛 mongocxx::::exception
     // （mongoc 域，码 22 = MONGOC_ERROR_COMMAND_INVALID_ARG；mongoc 的
     // MONGOC_URI_ERROR 用它汇报无效 host specifier / 选项值非法）。经
     // ClassifyDriverError 必须稳定映射为调用方输入错误 InvalidArgument，
     // 而非 mongoc 通用 Unavailable。URI 解析离线完成，不需要服务端。
     const std::vector<std::string> rejected = {
-        "mongodb://127.0.0.1:99999999/bbt_ut",                  // 端口越界
-        "mongodb://127.0.0.1:abc/bbt_ut",                       // 端口非数字
+        "mongodb://127.0.0.1:99999999/bbt_ut", // 端口越界
+        "mongodb://127.0.0.1:abc/bbt_ut", // 端口非数字
         "mongodb://127.0.0.1:27017/bbt_ut?maxPoolSize=notanum", // 选项值非数字
     };
     for (const auto& uri : rejected) {
@@ -791,7 +791,7 @@ BOOST_AUTO_TEST_CASE(t_client_start_close_publish_pairing) {
 }
 
 BOOST_AUTO_TEST_CASE(t_worker_spawn_failure_finalizes) {
-    // Issue #12 M1 回归：worker 组启动失败（reserve 抛 bad_alloc 或第 N 个
+    // M1 回归：worker 组启动失败（reserve 抛 bad_alloc 或第 N 个
     // worker 创建抛 system_error）必须与 Close/析构共用同一 finalizer 完整
     // 收口——已起 worker 全部退出并 join、m_io_dead 置位、本 owner 的 pool
     // lease 归还、终态 Closed 发布；不得留下「线程已起但未收口」或半关闭态。
@@ -1330,16 +1330,16 @@ BOOST_AUTO_TEST_CASE(t_dp_owner_close_drains_inflight) {
 
 BOOST_AUTO_TEST_SUITE_END()
 
-// ==================== Issue #40：owner/句柄归属 ====================
+// ==================== docs/decisions/0007-mongo-owner-handles.md：owner/句柄归属 ====================
 //
 // 资源归属不变式（确定性探针，不靠压测）：
-//   - 同一 owner 的多个集合句柄共享同一 worker 组：句柄数增长时
-//     LiveWorkers 不变；
-//   - 不同 owner 各自持有 worker 组/队列/ops 表：互不可见；
-//   - max_queue=1 时跨集合共享背压：一个集合占住队列后，另一集合
-//     确定性 Overloaded；
-//   - 句柄关闭只停自身接纳，不动兄弟与 owner；owner Close() 在有界窗口
-//     内等物理收口（ops 清空 + worker 全退），不提前宣告 IsClosed。
+// - 同一 owner 的多个集合句柄共享同一 worker 组：句柄数增长时
+// LiveWorkers 不变；
+// - 不同 owner 各自持有 worker 组/队列/ops 表：互不可见；
+// - max_queue=1 时跨集合共享背压：一个集合占住队列后，另一集合
+// 确定性 Overloaded；
+// - 句柄关闭只停自身接纳，不动兄弟与 owner；owner Close() 在有界窗口
+// 内等物理收口（ops 清空 + worker 全退），不提前宣告 IsClosed。
 
 BOOST_AUTO_TEST_SUITE(mongo_owner)
 
@@ -1632,9 +1632,9 @@ BOOST_AUTO_TEST_CASE(t_handle_close_scoped) {
 
 BOOST_AUTO_TEST_CASE(t_owner_collection_requires_running) {
     // 公共契约「owner 必须 Running 才接纳句柄」的生命周期门禁：
-    //   Create 未 Start → Collection → RuntimeUnavailable；
-    //   Start 之后     → Collection 成功；
-    //   Close          → Collection → Closed。
+    // Create 未 Start → Collection → RuntimeUnavailable；
+    // Start 之后 → Collection 成功；
+    // Close → Collection → Closed。
     auto d = mongo::CoMongoDb::Create(MakeRtCfg(1, 4));
     BOOST_REQUIRE(d);
     auto db = std::move(d).value();
@@ -1659,11 +1659,11 @@ BOOST_AUTO_TEST_CASE(t_owner_collection_requires_running) {
 // ==================== 关闭 finalizer 确定性回归 ====================
 //
 // 覆盖 r4 未闭合的「提前 Closed / finalize 并发」：
-//   - Close 取关闭权但 driver 仍在途时不得提前 IsClosed；
-//   - 两个线程并发 Close 都在同一真实终态（join + lease 归还）之后返回，
-//     不重复 join/reset、不互相破坏；
-//   - Start 后立即 Close（无在途）可收口且不再接纳；
-//   - 同 URI 关闭其一不破坏兄弟 owner 仍持有的进程级 pool lease。
+// - Close 取关闭权但 driver 仍在途时不得提前 IsClosed；
+// - 两个线程并发 Close 都在同一真实终态（join + lease 归还）之后返回，
+// 不重复 join/reset、不互相破坏；
+// - Start 后立即 Close（无在途）可收口且不再接纳；
+// - 同 URI 关闭其一不破坏兄弟 owner 仍持有的进程级 pool lease。
 
 BOOST_AUTO_TEST_CASE(t_owner_close_not_premature_during_inflight) {
     auto db = NewOwner(MakeRtCfg(1, 8, 3000));
@@ -1826,7 +1826,7 @@ BOOST_AUTO_TEST_CASE(t_owner_same_uri_sibling_lease_preserved) {
 // 任何测试开关（沿用既有可内部触达的获取路径）。
 
 // (1) worker 组启动失败后，失败 owner 必须归还自己的 pool lease；lease 的
-//     最后持有者销毁后，进程级 pool 真正析构。
+// 最后持有者销毁后，进程级 pool 真正析构。
 BOOST_AUTO_TEST_CASE(t_spawn_failure_returns_pool_lease) {
     BOOST_REQUIRE(g_prepared.load());
 
@@ -1879,7 +1879,7 @@ BOOST_AUTO_TEST_CASE(t_spawn_failure_returns_pool_lease) {
 }
 
 // (2) 同 URI 共享进程级 lease：一个 owner 的 worker 组启动失败只归还它自己的
-//     lease 引用，不得强清仍存活的兄弟 owner 的 lease，也不得泄漏自身引用。
+// lease 引用，不得强清仍存活的兄弟 owner 的 lease，也不得泄漏自身引用。
 BOOST_AUTO_TEST_CASE(t_spawn_failure_lease_isolated_from_sibling) {
     BOOST_REQUIRE(g_prepared.load());
 
@@ -1929,13 +1929,13 @@ BOOST_AUTO_TEST_CASE(t_spawn_failure_lease_isolated_from_sibling) {
 }
 
 // (3) pool 创建/获取失败的可控门禁：失败留在 kCreated（可重试），不泄漏
-//     worker；释放占用后同一 owner 可重试成功。
+// worker；释放占用后同一 owner 可重试成功。
 BOOST_AUTO_TEST_CASE(t_pool_acquire_failure_gates_start) {
     BOOST_REQUIRE(g_prepared.load());
 
     // (A) 驱动侧创建失败：URI 通过装配校验（scheme 合法）但驱动拒绝解析/
-    //     选项 → Start 如实返回 InvalidArgument，owner 留在 kCreated（可
-    //     重试），未起任何 worker。真实驱动抛出点，非注入开关。
+    // 选项 → Start 如实返回 InvalidArgument，owner 留在 kCreated（可
+    // 重试），未起任何 worker。真实驱动抛出点，非注入开关。
     {
         auto cfg = MakeUriCfg("mongodb://127.0.0.1:99999999/bbt_ut");
         auto info = mongo_detail::NewObjectInfo("test.rt.bad_uri");
@@ -1951,8 +1951,8 @@ BOOST_AUTO_TEST_CASE(t_pool_acquire_failure_gates_start) {
     }
 
     // (B) 进程级 pool 上限：占满 kMongoMaxPools 个 distinct 存活 lease 后，
-    //     第 kMongoMaxPools+1 个获取被拒绝（真实计数门禁）；释放一个槽位后
-    //     同一 owner 重试 Start 成功。
+    // 第 kMongoMaxPools+1 个获取被拒绝（真实计数门禁）；释放一个槽位后
+    // 同一 owner 重试 Start 成功。
     std::vector<std::shared_ptr<mongo_detail::MongoPoolLease>> fills;
     for (std::size_t i = 0; i < mongo_detail::kMongoMaxPools; ++i) {
         auto cfg = MakeUriCfg("mongodb://127.0.0.1:1/fill_" +
@@ -2028,7 +2028,7 @@ BOOST_AUTO_TEST_CASE(t_bson_from_json_canonical_roundtrip) {
     BOOST_CHECK(relaxed.value().find("$numberInt") == std::string::npos);
 }
 
-// 契约 §4.2 的五行数值保真，逐条用实测断言固化。
+// 契约 的五行数值保真，逐条用实测断言固化。
 BOOST_AUTO_TEST_CASE(t_bson_numeric_fidelity) {
     // 1) JSON 写 7 → int32：canonical 出 $numberInt，relaxed 出裸 7。
     auto i32 = mongo::MongoDocument::FromJson(R"({"v":7})");

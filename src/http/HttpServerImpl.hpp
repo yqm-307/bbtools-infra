@@ -1,7 +1,7 @@
 #pragma once
 // HttpServerImpl：真实 HTTP/1.1 listener（Boost.Beast/Asio）。
 //
-// 执行域切分（契约 §N1 核心约束）：
+// 执行域切分（冻结契约核心约束）：
 //   - accept/read/write 全部在 engine 的 io 域（共享 executor 的 strand，
 //     由 Scheduler 事件循环线程推进）上由 Asio 完成 handler 推进；
 //   - 业务 HttpHandler 只在受管协程内调用：read 完成后经
@@ -21,7 +21,7 @@
 //     HTTP 首切片不信任任何自定义 deadline 头；协议无取消帧语义，不向
 //     对端承诺远端取消必达。
 //
-// 资源模型（冻结契约 resource-close-boundary §6：Close 直接丢弃未发送数据
+// 资源模型（resource-close-boundary 冻结契约：Close 直接丢弃未发送数据
 // 并同步释放 buffer，不做 flush）：
 //   - parser/serializer/message(buffer)/待发送 payload 全部是会话自身的
 //     owner 资源，只在本对象的方法调用（同一把 IoGate 内）被访问；
@@ -94,7 +94,7 @@ public:
     bool IsClosed() const noexcept { return closed; }
 
 #ifdef BBT_INFRA_STRINGENT_DEBUG
-    // debug 专用析构（issue #62 验收第 5 项）：向独立观测组件
+    // debug 专用析构：向独立观测组件
     // debug/InfraDebug.hpp 汇报会话生命周期计数。仅在 BBT_INFRA_STRINGENT_DEBUG
     // 下声明；默认/Release 构建里 HttpSession 没有用户声明析构，也无任何计数
     // 写入与相关符号。
@@ -162,7 +162,7 @@ public:
     // 协程线程写、io 域读 → atomic；close_after_write 仅 io 域触碰。
     std::atomic_bool                         reply_posted{false};
     bool                                     close_after_write{false};
-    // owner teardown 标记（Abort 置位）：冻结契约 §6——本对象 Close 直接
+    // owner teardown 标记（Abort 置位）：resource-close-boundary 冻结契约——本对象 Close 直接
     // 丢弃未发送数据并同步释放 buffer，不做 flush。因此 owner 路径必须强制
     // 同步断开，不得走 reply_posted 的「写完再关」延迟分支（该分支会让
     // Close 返回后 socket 仍存活且被后端继续写）。
@@ -253,7 +253,7 @@ public:
     // 回归/诊断的只读视图：当前仍登记的会话数（已 Start 未反登记）。它读的是
     // **生产状态** m_session_count（DrainedLocked 用其判定 drain，跨 io/调用线程
     // 故必须原子），不是 debug 观测数据，因此在 Release/默认构建下同样可用；
-    // 供 issue #62 的探针与 deadline timer 记账回归断言使用，不参与生产逻辑。
+    // 供会话生命周期观测的探针与 deadline timer 记账回归断言使用，不参与生产逻辑。
     std::size_t DebugSessionCount() const noexcept {
         return static_cast<std::size_t>(m_session_count.load());
     }

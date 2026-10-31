@@ -1,5 +1,5 @@
 #pragma once
-// co-network/v1 N1b-1：网络 Runtime 装配面。
+// co-network/v1：网络 Runtime 装配面。
 // Runtime 是资源拥有者；工厂返回的 shared_ptr 是受托管对象引用。
 //
 // RPC 不在本装配面上：RPC core 已迁移到新 bbt::infra::http 栈
@@ -25,14 +25,14 @@ namespace udp {
 class CoUDP;
 } // namespace udp
 
-// co-io-adapter/v1 §4 冻结名是 bbt::infra::CoTCP/CoTCPListener；首版实现
+// co-io-adapter/v1 冻结名是 bbt::infra::CoTCP/CoTCPListener；首版实现
 // 位于 bbt::infra::tcp（与 CoUDP 同规则）。经 using 声明把冻结名接上，
 // Runtime 工厂签名按契约名书写，类型与实现一致。
 using tcp::CoTCP;
 using tcp::CoTCPListener;
 using udp::CoUDP;
 
-// P2 归属说明：本入口是协议 owner + 兼容装配面。基础 TCP/UDP transport 的
+// 归属说明：本入口是协议 owner + 兼容装配面。基础 TCP/UDP transport 的
 // 资源托管与配额 owner 是 TransportRuntime（include/bbt/infra/
 // TransportRuntime.hpp，target bbt_infra_transport）：DialTCP/ListenTCP/
 // BindUDP 在这里只做转发，容量名额与在途账本不在本类内实现，也不存在第二份。
@@ -56,7 +56,7 @@ public:
     virtual result<std::shared_ptr<HttpServer>> ListenHttp(
         ListenAddress address, HttpHandler handler) = 0;
 
-    // co-io-adapter/v1 §4.0.1：受管 TCP 工厂。工厂返回的 shared_ptr 是
+    // co-io-adapter/v1 transport 契约：受管 TCP 工厂。工厂返回的 shared_ptr 是
     // 受托管引用；Runtime 强持有交付对象直至 Closed，超容量返回 Overloaded。
     // DialTCP 只能在受管 coroutine 内调用（可因 DNS/connect 挂起）；
     // ListenTCP 是控制线程配置操作，要求 Runtime 已 Start，backlog 1..INT_MAX。

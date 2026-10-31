@@ -1,12 +1,12 @@
 #pragma once
 // config/v1：最小 watch——在项目协程执行域内轮询 source，按 (version, revision)
-// 去重后回调消费者。契约来源：docs/decisions/0006（bbtools-infra#35），公开契约
-// 与边界整理见 docs/config-watch-v1.md。
+// 去重后回调消费者。契约来源：docs/decisions/0006-infra-foundation-and-dynamic-config.md，公开契约
+// 与边界整理见 docs/guides/config-watch.md。
 //
 // 覆盖：初始快照、版本更新、重复版本去重、失败/恢复通知、关闭与晚到通知收口。
 // 回调在协程域执行，不新增 I/O 线程、不在第三方线程执行应用逻辑。
 //
-// 关闭语义（F3 修订：Watcher 不是 ICoCloseable，不承诺同步物理释放）：
+// 关闭语义（Watcher 不是 ICoCloseable，不承诺同步物理释放）：
 //   - RequestClose() 幂等、可在任意域调用、非挂起：只封口并唤醒正在睡眠的
 //     轮询协程（detail::CloseWaiters + CoWaiter::Notify，跨线程安全）。返回
 //     即经过回调起点线性化点：此后不会再**开始**任何消费者回调（本次拍

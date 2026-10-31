@@ -427,7 +427,7 @@ BOOST_AUTO_TEST_CASE(watch_close_stops_loop_and_releases_source) {
     BOOST_CHECK(EnsureRuntime()); // 收尾后运行时仍常驻（进程寿命）
 }
 
-// F3：未封口的 WaitStopped 不是合法等待（轮询协程不会自行退出），返回
+// 未封口的 WaitStopped 不是合法等待（轮询协程不会自行退出），返回
 // InvalidArgument——关闭决定归 owner，不允许「等一个永不发生的事件」。
 BOOST_AUTO_TEST_CASE(watch_waitstopped_requires_request_close) {
     BOOST_REQUIRE(EnsureRuntime());
@@ -450,7 +450,7 @@ BOOST_AUTO_TEST_CASE(watch_waitstopped_requires_request_close) {
     BOOST_REQUIRE(stopped);
 }
 
-// F3：回调内 RequestClose 只完成逻辑封口（不提前 MarkClosed），外部
+// 回调内 RequestClose 只完成逻辑封口（不提前 MarkClosed），外部
 // WaitStopped 等到的是协程真实退出；回调内 WaitStopped 是等待自身，
 // 立即返回 InvalidContext。
 BOOST_AUTO_TEST_CASE(watch_request_close_from_callback_then_waitstopped) {
@@ -476,7 +476,7 @@ BOOST_AUTO_TEST_CASE(watch_request_close_from_callback_then_waitstopped) {
             if (n == 1) {
                 // Create 可在首个回调投递前返回（首个 initial 事件可在注册后
                 // 立即被另一线程调度）：等待测试发布 Watcher*，不读未发布值
-                // （P2-7：发布门在回调侧等 owner 线性化点，产品面不改契约）。
+                // （发布门在回调侧等 owner 线性化点，产品面不改契约）。
                 const auto deadline = std::chrono::steady_clock::now() +
                                       std::chrono::seconds(5);
                 while (!probe->create_returned.load(std::memory_order_acquire) &&
@@ -524,7 +524,7 @@ BOOST_AUTO_TEST_CASE(watch_request_close_from_callback_then_waitstopped) {
     BOOST_CHECK(probe->calls.load() == 1);
 }
 
-// F3：协程确实未退出时 WaitStopped 到期返回 TimedOut，不冒充完成；
+// 协程确实未退出时 WaitStopped 到期返回 TimedOut，不冒充完成；
 // 放行后同一 watcher 的 WaitStopped 成功（真实退出），不残留等待责任。
 BOOST_AUTO_TEST_CASE(watch_waitstopped_timeout_not_fake_completion) {
     BOOST_REQUIRE(EnsureRuntime());
@@ -564,7 +564,7 @@ BOOST_AUTO_TEST_CASE(watch_waitstopped_timeout_not_fake_completion) {
     BOOST_CHECK_EQUAL(source->reads.load(), reads_at_stop);
 }
 
-// P2-7 复现探针（非回归用例）：Watcher::Create 注册轮询协程后、返回前，
+// 复现探针（非回归用例）：Watcher::Create 注册轮询协程后、返回前，
 // 运行时可在另一线程调度首个 initial 回调。若回调首次执行时测试尚未
 // 发布 Watcher*（probe->watcher 仍为 nullptr），则
 // watch_request_close_from_callback_then_waitstopped 的 `w->WaitStopped()`

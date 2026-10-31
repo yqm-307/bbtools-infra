@@ -114,7 +114,7 @@ static void AddressAndOwnership() {
     CHECK(Ip("127.0.0.1", 65535).ToString() == "127.0.0.1:65535");
     CHECK(Ip("::1", 0).ToString() == "[::1]:0");
     CHECK(Ip("fe80::1%3", 1).ToString() == "[fe80::1%3]:1");
-    // L3：scope 严格校验——合法边界与 Boost atoi 回退曾误收的反例。
+    //scope 严格校验——合法边界与 Boost atoi 回退曾误收的反例。
     CHECK(Ip("fe80::1%4294967295", 1).ToString() == "[fe80::1%4294967295]:1"); // u32 上界
     CHECK(Ip("fe80::1%0", 1).ToString() == "[fe80::1]:1");                     // 0 合法，ToString 不输出
     const auto reject_ip = [&error](const std::string& host) {
@@ -464,7 +464,7 @@ static bool ContextNoCreate(bool upstream_only = false) {
 }
 
 static void NativeAcceptConnect() {
-    // L1：accept4/connect 在 Linux 原生 primitive 边界走 SYS_accept4/SYS_connect，
+    //accept4/connect 在 Linux 原生 primitive 边界走 SYS_accept4/SYS_connect，
     // 不经 coroutine Hook。受管协程内空 listener 必须立即 EAGAIN 且不让出执行权；
     // Connect 保留真实 EINPROGRESS pending（受管返回 0 即旧 Hook 缺陷回归）。
     const auto before = FdCount();
@@ -588,7 +588,7 @@ static void NativeAcceptConnect() {
 }
 
 static void FlagsContract() {
-    // R1：flags 只承诺保守 allowlist；未列出位在任何系统调用前拒绝（bytes=0，
+    //flags 只承诺保守 allowlist；未列出位在任何系统调用前拒绝（bytes=0，
     // 不发出/不消费报文），数据报 TRUNC 返回值只计拷贝字节。
     auto pair = ConnectPair(Ip("127.0.0.1"));
     CHECK(pair.client.Send("x", 1, 0x80000000).error == std::errc::operation_not_supported);

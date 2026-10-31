@@ -1,6 +1,6 @@
 #pragma once
 // config/v1：配置源抽象。只负责读带版本快照；变更监测由 Watcher 在协程域轮询驱动。
-// 契约来源：docs/decisions/0006-infra-foundation-and-dynamic-config.md（bbtools-infra#35）。
+// 契约来源：docs/decisions/0006-infra-foundation-and-dynamic-config.md。
 
 #include <memory>
 #include <string>
@@ -10,7 +10,7 @@
 
 namespace bbt::infra::config {
 
-// 读取失败必须返回错误结果，不得发布伪成功快照（Issue #35）。
+// 读取失败必须返回错误结果，不得发布伪成功快照（config 契约）。
 // 本接口不泄漏任何第三方/provider 类型；远程适配后续单独切片。
 class ISource {
 public:

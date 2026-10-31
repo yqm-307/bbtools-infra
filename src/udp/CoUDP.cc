@@ -131,7 +131,7 @@ CoUDP::CoUDP(int fd, bbt::coroutine::CoObjectInfo info) noexcept
 
 CoUDP::~CoUDP() {
     std::lock_guard<std::mutex> lock(m_mtx);
-    // §4.0.1.7：未走 Close 的析构兜底归还剩余名额，并物理释放。
+    // 在途配额契约：未走 Close 的析构兜底归还剩余名额，并物理释放。
     while (m_quota_held > 0) {
         --m_quota_held;
         if (m_inflight_release) m_inflight_release();
@@ -142,7 +142,7 @@ CoUDP::~CoUDP() {
 bbt::coroutine::CoObjectInfo CoUDP::GetObjectInfo() const { return m_info; }
 
 result<CoUDP::SPtr> CoUDP::BindUDP(SocketAddress local) {
-    // §4.0.1：控制线程配置操作；要求 coroutine 运行时已初始化（对象身份
+    // adapter 契约：控制线程配置操作；要求 coroutine 运行时已初始化（对象身份
     // 的前置条件是运行时已初始化，不再有代际）。
     if (local.ip.empty())
         return result<SPtr>::err(MakeError(ErrorCode::InvalidArgument,
@@ -170,7 +170,7 @@ result<CoUDP::SPtr> CoUDP::BindUDP(SocketAddress local) {
     if (::bind(fd, reinterpret_cast<const sockaddr*>(&addr.value()),
                sizeof(addr.value())) != 0) {
         const Error error = _Errno(ErrorCode::TransportError, "UDP bind failed");
-        ::close(fd); // §4.0.1.6：失败即无对象，内部负责 close 已创建的 FD
+        ::close(fd); // adapter 契约：失败即无对象，内部负责 close 已创建的 FD
         return result<SPtr>::err(error);
     }
 
@@ -188,8 +188,8 @@ result<CoUDP::SPtr> CoUDP::BindUDP(SocketAddress local) {
     return result<SPtr>::ok(std::move(object));
 }
 
-// §4 入口检查：参数 → 受管协程上下文 → coroutine 运行时是否已初始化；成立
-// 即返回，不挂起。§4 的 Try* 规则：Try* 只检查参数、上下文与关闭状态——只有
+// 入口契约检查：参数 → 受管协程上下文 → coroutine 运行时是否已初始化；成立
+// 即返回，不挂起。Try* 契约：Try* 只检查参数、上下文与关闭状态——只有
 // 协程方法要求「当前处于受管协程内」，运行时可用性对两类入口都成立。
 result<void> CoUDP::_CheckEntry(bool in_coroutine_only) const {
     if (in_coroutine_only && g_bbt_tls_coroutine_co == nullptr)
@@ -269,7 +269,7 @@ IoResult CoUDP::TrySend(ConstBytes packet, const SocketAddress& peer) {
     return IoResult::err(std::move(error));
 }
 
-// §5.2 组合等待：readable/writable interest + 绝对 deadline + close（对象级
+// 组合等待契约：readable/writable interest + 绝对 deadline + close（对象级
 // CloseWaiters）单轮一次性挂起。等待注册由上游 CoWaiter 完成（先登记后挂起，
 // 唤醒不丢失）；infra 不复制等待状态机。fd 就绪只表示「可以重试」，不是操作
 // 成功。封口唤醒以 Completed 抵达，本函数解释为 Closed。
@@ -334,7 +334,7 @@ result<DatagramRead> CoUDP::Receive(MutableBytes dst, const CallOptions& options
         return result<DatagramRead>::err(MakeError(ErrorCode::InvalidArgument,
             "Receive: null buffer with non-zero size"));
 
-    // §4.0.1.7（Issue #32）：Runtime 在途门禁先于在途计数——容量满即
+    // 在途账本契约：Runtime 在途门禁先于在途计数——容量满即
     // Overloaded、立即返回不挂起；名额计入 m_quota_held，op 结束归还 1，
     // Close/析构 DrainQuota 兜底归还。
     bool quota_admitted = false;
@@ -345,7 +345,7 @@ result<DatagramRead> CoUDP::Receive(MutableBytes dst, const CallOptions& options
         quota_admitted = true;
     }
 
-    // §6.4.3：在途计数先于等待登记，物理 close 在计数归零后才发生；
+    // 关闭协议契约：在途计数先于等待登记，物理 close 在计数归零后才发生；
     // 封口后入口立即拒绝（Closed），等待中封口则由 CloseWaiters 唤醒 Closed。
     {
         std::lock_guard<std::mutex> lock(m_mtx);
@@ -358,7 +358,7 @@ result<DatagramRead> CoUDP::Receive(MutableBytes dst, const CallOptions& options
         if (quota_admitted)
             ++m_quota_held;
     }
-    // §4.0.1.7 测试接缝：名额已登记，等待循环尚未进入。
+    // 在途配额测试接缝：名额已登记，等待循环尚未进入。
     if (m_wait_entry_gate_for_test)
         m_wait_entry_gate_for_test();
 
@@ -551,7 +551,7 @@ bool CoUDP::_SettleClosedLocked() noexcept {
     return true;
 }
 
-// §1（进程寿命运行时修订）：Close 幂等、任意线程可调用。序列：封口（拒绝新
+// 关闭契约（进程寿命运行时修订）：Close 幂等、任意线程可调用。序列：封口（拒绝新
 // 调用、归还已持有名额）→ 唤醒全部挂起等待者（CloseWaiters；封口后登记失败
 // 者自行 Notify）→ 等在途「fd 兴趣登记」排空（登记屏障，见 detail::CloseWaiters）
 // → 物理 close 并一次性跑 closed hook。不等待后端结果、不 flush。
@@ -564,7 +564,7 @@ void CoUDP::Close() noexcept {
         std::unique_lock<std::mutex> lock(m_mtx);
         if (!m_close_requested) {
             m_close_requested = true;
-            // §4.0.1.7：封口头归还本对象仍持有的全部名额；op 若仍返回，其
+            // 在途配额契约：封口头归还本对象仍持有的全部名额；op 若仍返回，其
             // 收尾见 m_quota_held==0 不再重复归还。
             while (m_quota_held > 0) {
                 --m_quota_held;

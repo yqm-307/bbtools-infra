@@ -36,7 +36,7 @@ public:
         std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>>& keep);
     static void SetCancelPostFailureOnce(Engine& engine);
     static void SetSealDelay(Engine& engine, std::chrono::milliseconds delay);
-    // F6：普通回调开始授权点前/后屏障（正常为空）。
+    // 普通回调开始授权点前/后屏障（正常为空）。
     static void SetAuthBarriers(Engine& engine, std::function<void()> pre_auth,
                                 std::function<void()> post_auth);
     static std::size_t ConnectionCount(Engine& engine);

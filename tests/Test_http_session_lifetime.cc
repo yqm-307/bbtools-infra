@@ -1,52 +1,52 @@
-// Issue #62 验收第 5 项回归探针：HttpSession lifetime/teardown 的
+// 验收第 5 项回归探针：HttpSession lifetime/teardown 的
 // 「m_sessions 反登记先于最后一次 shared_ptr 释放」顺序 + 活跃 keep-alive
 // 会话在另一线程 owner Close() 下的收口回归。
 //
 // 断言目标（可机器判定，不靠时序巧合）：
 //
-//   Case 1（受控交错 / 顺序本身）：
-//     K 条会话每条完成 1 次 keep-alive 请求后进入空闲（下一次 BeginRead 的
-//     deadline 看守与读就绪等待都已 armed，各自持有一份 self 强引用）。随后
-//     【测试线程先持有 io 域门】再调用 owner Close()：持门期间 io 域无法执行任何
-//     完成 handler，故三条 armed completion 路径（deadline / 读写就绪 / peer 观测）
-//     持有的 self 都不会被释放。前提：本用例每条连接都读到响应，handler 已退出，
-//     断言窗口内不存在可释放的协程侧 self。Close() 返回当刻断言：
-//       a) 登记会话数已为 0       —— 反登记在 Close 返回前完成；
-//       b) 会话析构数增量为 0     —— 最后一次 shared_ptr 尚未释放（防「Close 内
-//          提前释放最后一次强引用」这类回归；本用例的负向对照未触发该断言）；
-//       即「反登记严格先于最后一次强引用释放」，且 Close 不是被 5s drain 超时
-//       放行；listener 与全部会话 fd 已物理释放（新连接被拒 + socket fd 计数回落）。
-//     释放门后 io 域跑完中止的完成项：断言 K 条会话全部析构、
-//     destroyed_while_registered 恒为 0（无「仍登记即析构」的结构性缺陷）。
+// Case 1（受控交错 / 顺序本身）：
+// K 条会话每条完成 1 次 keep-alive 请求后进入空闲（下一次 BeginRead 的
+// deadline 看守与读就绪等待都已 armed，各自持有一份 self 强引用）。随后
+// 【测试线程先持有 io 域门】再调用 owner Close()：持门期间 io 域无法执行任何
+// 完成 handler，故三条 armed completion 路径（deadline / 读写就绪 / peer 观测）
+// 持有的 self 都不会被释放。前提：本用例每条连接都读到响应，handler 已退出，
+// 断言窗口内不存在可释放的协程侧 self。Close() 返回当刻断言：
+// a) 登记会话数已为 0 —— 反登记在 Close 返回前完成；
+// b) 会话析构数增量为 0 —— 最后一次 shared_ptr 尚未释放（防「Close 内
+// 提前释放最后一次强引用」这类回归；本用例的负向对照未触发该断言）；
+// 即「反登记严格先于最后一次强引用释放」，且 Close 不是被 5s drain 超时
+// 放行；listener 与全部会话 fd 已物理释放（新连接被拒 + socket fd 计数回落）。
+// 释放门后 io 域跑完中止的完成项：断言 K 条会话全部析构、
+// destroyed_while_registered 恒为 0（无「仍登记即析构」的结构性缺陷）。
 //
-//   Case 2a（空闲 keep-alive + 并发 Close）：
-//     N 条连接各完成 >=2 次 keep-alive 请求（强制 deadline timer cancel→re-arm），
-//     随后在客户端保持连接、服务端会话空闲时由另一线程调用 Close()。断言 Close
-//     返回当刻登记数已为 0、随后 N 条会话全部析构且无「仍登记即析构」。
+// Case 2a（空闲 keep-alive + 并发 Close）：
+// N 条连接各完成 >=2 次 keep-alive 请求（强制 deadline timer cancel→re-arm），
+// 随后在客户端保持连接、服务端会话空闲时由另一线程调用 Close()。断言 Close
+// 返回当刻登记数已为 0、随后 N 条会话全部析构且无「仍登记即析构」。
 //
-//   Case 2b（在途 handler + 并发 Close）：
-//     4 条 keep-alive 连接，其中 2 条的末次请求被受控 gated handler 挂起在途，
-//     另 2 条空闲；另一线程并发 Close()。断言 Close 返回当刻登记数已为 0
-//     （teardown 先于 drain 等待），handler 退出后全部会话析构且无「仍登记即析构」。
+// Case 2b（在途 handler + 并发 Close）：
+// 4 条 keep-alive 连接，其中 2 条的末次请求被受控 gated handler 挂起在途，
+// 另 2 条空闲；另一线程并发 Close()。断言 Close 返回当刻登记数已为 0
+// （teardown 先于 drain 等待），handler 退出后全部会话析构且无「仍登记即析构」。
 //
-// 两个验证面（PR #70 review 整改：debug 组件与数据独立、仅 debug 构建存在）：
-//   会话生命周期计数已迁入独立 debug 组件 src/debug/InfraDebug.hpp，仅在
-//   BBT_INFRA_STRINGENT_DEBUG 下存在。因此：
-//     Debug 面（宏 ON）  — 在上述生产可观测断言之外，追加计数断言（析构增量 /
-//                          「仍登记即析构」= 0），可机器判定「反登记严格先于最后
-//                          一次强引用释放」这一顺序本身；
-//     Release 面（宏 OFF）— 无 debug 计数：DEBUG 组件的计数与访问器在本构建里
-//                          根本不存在（不是返回常数 0 的假接口）。本探针退回全部
-//                          可生产观测的等价断言：Close 返回即反登记归零、物理 fd
-//                          回收且新连接被拒、未走 5s drain 超时、受控在途 handler
-//                          真退出、drain 归零。故关掉宏不会让本用例恒过。
+// 两个验证面（review 整改：debug 组件与数据独立、仅 debug 构建存在）：
+// 会话生命周期计数已迁入独立 debug 组件 src/debug/InfraDebug.hpp，仅在
+// BBT_INFRA_STRINGENT_DEBUG 下存在。因此：
+// Debug 面（宏 ON） — 在上述生产可观测断言之外，追加计数断言（析构增量 /
+// 「仍登记即析构」= 0），可机器判定「反登记严格先于最后
+// 一次强引用释放」这一顺序本身；
+// Release 面（宏 OFF）— 无 debug 计数：DEBUG 组件的计数与访问器在本构建里
+// 根本不存在（不是返回常数 0 的假接口）。本探针退回全部
+// 可生产观测的等价断言：Close 返回即反登记归零、物理 fd
+// 回收且新连接被拒、未走 5s drain 超时、受控在途 handler
+// 真退出、drain 归零。故关掉宏不会让本用例恒过。
 //
-// 反证（探针有效性）：把 CancelDeadlineWatch 的记账递减去掉（复现 #63 之前的
-//   inflight 多计），Case 1/2 的 (a) 断言即失败——两个验证面都能捕获该缺陷类
-//   （(a) 用的是生产状态 DebugSessionCount()，非 debug 计数）。
+// 反证（探针有效性）：把 CancelDeadlineWatch 的记账递减去掉（复现 之前的
+// inflight 多计），Case 1/2 的 (a) 断言即失败——两个验证面都能捕获该缺陷类
+// （(a) 用的是生产状态 DebugSessionCount()，非 debug 计数）。
 //
 // sanitizer 覆盖：本目标以 ASan/UBSan 构建运行；取消/反登记/析构交错期间出现
-//   悬垂访问由 sanitizer 直接报出（扫描 stderr 日志，不只看退出码）。
+// 悬垂访问由 sanitizer 直接报出（扫描 stderr 日志，不只看退出码）。
 //
 // 无第三方测试框架：失败打印 stderr 并以非零退出；等待全部有界（无 sleep 驱动
 // 时序，只用有预算的轮询），不会无限挂起。
@@ -98,7 +98,7 @@ void Check(bool cond, const char* expr, int line) {
     ++g_checks;
     if (!cond) {
         ++g_failures;
-        std::fprintf(stderr, "FAIL lifetime-probe line %d: %s\n", line, expr);
+        std::fprintf(stderr, "FAIL lifetime line %d: %s\n", line, expr);
     }
 }
 #define CHECK(cond) Check(static_cast<bool>(cond), #cond, __LINE__)
@@ -659,17 +659,17 @@ int main() {
     CHECK(sche->IsInitialized());
 
 #ifdef BBT_INFRA_STRINGENT_DEBUG
-    std::fprintf(stderr, "lifetime-probe: debug surface (counters enabled)\n");
+    std::fprintf(stderr, "lifetime: debug surface (counters enabled)\n");
 #else
     std::fprintf(stderr,
-                 "lifetime-probe: release surface (no debug counters)\n");
+                 "lifetime: release surface (no debug counters)\n");
 #endif
 
     RunCaseOrdering();
     RunCaseConcurrentIdle();
     RunCaseConcurrentInflight();
 
-    std::fprintf(stderr, "lifetime-probe: checks=%d failures=%d\n", g_checks,
+    std::fprintf(stderr, "lifetime: checks=%d failures=%d\n", g_checks,
                  g_failures);
     return g_failures == 0 ? 0 : 1;
 }

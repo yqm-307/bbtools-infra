@@ -416,7 +416,7 @@ void PhaseWire() {
     }
 }
 
-// P2-5 修复后契约断言（原复现探针已翻转）：调用方把 Error.request_phase
+// 修复后契约断言（原复现探针已翻转）：调用方把 Error.request_phase
 // 设为本地枚举范围之外的值时，Validate 与 Encode 都按 ProtocolError 拒绝，
 // 不再产出 present-UNSPECIFIED（接收端必拒）的 wire。
 void PhaseWireInvalidLocalProbe() {

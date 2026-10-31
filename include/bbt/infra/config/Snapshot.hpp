@@ -1,5 +1,5 @@
 #pragma once
-// config/v1：版本化不可变快照。契约来源：docs/decisions/0006（bbtools-infra#35）。
+// config/v1：版本化不可变快照。契约来源：docs/decisions/0006-infra-foundation-and-dynamic-config.md。
 
 #include <chrono>
 #include <cstdint>

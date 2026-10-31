@@ -1,10 +1,10 @@
 #pragma once
 
-// 公共 Engine（R2）：Engine::Run 占调用它的宿主 native 控制线程，自动绑定
+// 公共 Engine：Engine::Run 占调用它的宿主 native 控制线程，自动绑定
 // 已登记 Processer 槽，每个 Reactor 由对应 P 的 driver 推进自有 Asio context；
 // 不新建库内控制线程或网络 I/O 线程。
 //
-// 生命周期（详见 docs/architecture/gnet-network-execution.md §6）：
+// 生命周期（详见 docs/architecture/gnet-network-execution.md）：
 //   - Run 先校验宿主控制域：在协程上下文或已登记 Processer 上调用返回
 //     operation_not_permitted；runtime 未初始化返回 operation_not_supported；
 //     未声明 RuntimeProgress::Independent 返回 operation_not_permitted。
@@ -129,7 +129,7 @@ public:
     // 任务已释放（后者仍走 Connection::Released 与 Engine 最终收口）。
     bool AcceptingStopped() const noexcept;
 
-    // ---- Co 成员入口（终评 §2：协程消费面收口为成员，自由函数后续退役）----
+    // ---- Co 成员入口（docs/decisions/0012-icoconn-member-interface.md：协程消费面收口为成员，自由函数后续退役）----
     // 判定优先级与语义与旧 CoAccept/CoDial 自由函数完全等价（详见
     // CoConnection.hpp 注释）：执行域 gate 先于一切状态判定；终态（sealed/
     // Closing/Stopped → operation_canceled）先于 Idle/Starting 与

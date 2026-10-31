@@ -1,5 +1,5 @@
-// 由 Test_redis_net_contract.cc 在匿名 namespace 内包含；覆盖 COMMON §5 数据面契约。
-// 真实后端用例遵守 §3：BBT_REDIS_PORT 必须显式指向本验证自起的实例；缺失（回落
+// 由 Test_redis_net_contract.cc 在匿名 namespace 内包含；覆盖 COMMON 数据面契约。
+// 真实后端用例遵守：BBT_REDIS_PORT 必须显式指向本验证自起的实例；缺失（回落
 // 6379 共享实例）一律拒跑返回非零，不触碰共享服务，也不以 skip 冒充绿。
 // 鉴权覆盖复用同一 BBT_REDIS_PORT 无鉴权实例：管理连接现场创建本用例唯一 ACL
 // 用户（pid+随机、临时密码、仅 ~prefix* 键域与所需命令），RAII 清理 key 与
@@ -179,7 +179,7 @@ void KillOwnedConnections(AdminRedis& admin, const ScopedAclUser& acl) {
     CHECK(admin.ClientIdsByUser(acl.user()).empty());
 }
 
-// ── SET 选项（COMMON §5.1）────────────────────────────────────────────
+// ── SET 选项（COMMON）────────────────────────────────────────────
 void SetOptionsContract() {
     const int port = RequiredPort("BBT_REDIS_PORT");
     RealRedis backend;
@@ -252,7 +252,7 @@ void SetOptionsContract() {
                  "rejected_zero_accept=4 boundary_ok=1 same_stream_ping=1\n";
 }
 
-// ── Expire / Ttl 三态（COMMON §5.2）───────────────────────────────────
+// ── Expire / Ttl 三态（COMMON）───────────────────────────────────
 void ExpireTtlContract() {
     const int port = RequiredPort("BBT_REDIS_PORT");
     RealRedis backend;
@@ -290,7 +290,7 @@ void ExpireTtlContract() {
     std::cout << "expire_ttl three_states=3 pexpire_tf=2 remaining_in_range=1 invalid_rejected=4\n";
 }
 
-// ── INCR 族（COMMON §5.3）─────────────────────────────────────────────
+// ── INCR 族（COMMON）─────────────────────────────────────────────
 void IncrFamilyContract() {
     const int port = RequiredPort("BBT_REDIS_PORT");
     RealRedis backend;
@@ -333,7 +333,7 @@ void IncrFamilyContract() {
     std::cout << "incr_family values=5 nonint=RemoteError overflow=RemoteError stream_kept=3 empty_reject=1\n";
 }
 
-// ── Hash（COMMON §5.4）────────────────────────────────────────────────
+// ── Hash（COMMON）────────────────────────────────────────────────
 void HashContract() {
     const int port = RequiredPort("BBT_REDIS_PORT");
     RealRedis backend;
@@ -417,7 +417,7 @@ void HashContract() {
                  "wrongtype=RemoteError stream_kept=2 invalid_rejected=8\n";
 }
 
-// ── AUTH/SELECT 握手（COMMON §5.5）────────────────────────────────────
+// ── AUTH/SELECT 握手（COMMON）────────────────────────────────────
 // 复用 BBT_REDIS_PORT 无鉴权实例：管理连接现场创建本用例唯一 ACL 用户
 //（~prefix* 键域 + +@connection +get +set），真实验证双参 AUTH/SELECT/错误
 // 密码/定点 CLIENT KILL 后重建连接重握手。单参数 AUTH 编码由 Peer 静态断言；
@@ -435,7 +435,7 @@ void HandshakeAuthSelect() {
     std::random_device rnd;
 
     // 1) 单参数 AUTH 线上编码断言（受控 Peer，确定性）：user 空时编码为
-    //    {AUTH,password}，SELECT 在其后；两端 byte 序对拍真实客户端。
+    // {AUTH,password}，SELECT 在其后；两端 byte 序对拍真实客户端。
     for (const bool with_select : {false, true}) {
         const std::string pass = "static-pass-" + std::to_string(rnd());
         Peer peer([&](int fd) {
@@ -495,8 +495,8 @@ void HandshakeAuthSelect() {
         cli->Close(); cli.reset();
     }
     // 5) 非法库序号：Create 拒绝（Client 侧校验，不经网络）；服务端 databases
-    //    上限之外（默认 16，用回 DbCount 探测值）走服务端 ERR → RemoteError，
-    //    退役不泄漏密码。
+    // 上限之外（默认 16，用回 DbCount 探测值）走服务端 ERR → RemoteError，
+    // 退役不泄漏密码。
     {
         auto invalid = Client::Create(host_ready.engine, Loopback(port),
                                       {acl.user(), acl.password(), redis::kMaxDatabase + 1});
@@ -515,7 +515,7 @@ void HandshakeAuthSelect() {
         cli.reset();
     }
     // 6) CLIENT KILL 后显式 Connect 重新握手：只杀已确认归属本用例 ACL 用户的
-    //    连接 ID；死流→Connect→命令恢复且重连后 AUTH+SELECT 重放（仍落 db2）。
+    // 连接 ID；死流→Connect→命令恢复且重连后 AUTH+SELECT 重放（仍落 db2）。
     {
         auto cli = MakeHandshake(host_ready, Loopback(port), {acl.user(), acl.password(), 2});
         host_ready.Connect(cli);
@@ -539,7 +539,7 @@ void HandshakeAuthSelect() {
                  "db_range_rejected=2 client_kill_owned_ids=1 reconnect_handshake=1\n";
 }
 
-// ── 池层镜像（COMMON §5.7）：每条新命令经池借还执行。─────────────────────
+// ── 池层镜像（COMMON）：每条新命令经池借还执行。─────────────────────
 void PoolNewCommands() {
     const int port = RequiredPort("BBT_REDIS_PORT");
     RealRedis backend;
@@ -591,7 +591,7 @@ void PoolNewCommands() {
     std::cout << "pool_new_commands set_opts=2 expire_ttl=3 incr=2 hash=5 wrongtype=1 invalid=2\n";
 }
 
-// ── 池握手（COMMON §5.7）：PoolOptions.handshake 对每条池连接生效；失败归还预算。──
+// ── 池握手（COMMON）：PoolOptions.handshake 对每条池连接生效；失败归还预算。──
 // 与 HandshakeAuthSelect 共用同一 BBT_REDIS_PORT 实例和本用例唯一 ACL 用户；
 // CLIENT KILL 只针对已确认归属的 ID，范围 kill 禁用。
 void PoolHandshakeAuth() {
@@ -626,7 +626,7 @@ void PoolHandshakeAuth() {
         CHECK(in0->integer == 0);
     }
     // 2) 修复/重建的连接同样握手：CLIENT KILL 定点杀掉本用例 ACL 用户的池连接 →
-    //    命令发现死流 → 显式 Connect 修复（重建连接的 AUTH+SELECT 生效）。
+    // 命令发现死流 → 显式 Connect 修复（重建连接的 AUTH+SELECT 生效）。
     {
         auto pool = MakePoolWith(host, Loopback(port), 1, 2, {acl.user(), acl.password(), 2});
         CHECK(host.Call([&] { return bbt_co_await pool->Connect(Until()); }));
@@ -640,10 +640,10 @@ void PoolHandshakeAuth() {
         pool->Close(); pool.reset();
     }
     // 3) 池握手失败不泄漏预算：错误密码建池 → Connect 失败；资源计数与 host drain
-    //    收口证据（CountConnections==0、ConnectTableSize==0、Finish 全断）证明
-    //    无泄漏，不只凭「Ping 返回 not connected」。fd 总数收口由 Run() 末尾的
-    //    socket/fd baseline 断言统一给出——此前中途 SocketCount 断言因 fd 异步
-    //    回收时序竞争误报（WaitUntil 3s 内未归位），已移除；原因见 handoff。
+    // 收口证据（CountConnections==0、ConnectTableSize==0、Finish 全断）证明
+    // 无泄漏，不只凭「Ping 返回 not connected」。fd 总数收口由 Run() 末尾的
+    // socket/fd baseline 断言统一给出——此前中途 SocketCount 断言因 fd 异步
+    // 回收时序竞争误报（WaitUntil 3s 内未归位），已移除；原因见 handoff。
     {
         const std::string wrong_pass = "wrong-" + std::to_string(rnd());
         auto pool = MakePoolWith(host, Loopback(port), 2, 2, {acl.user(), wrong_pass, -1});
@@ -669,7 +669,7 @@ void PoolHandshakeAuth() {
                  "rollback_budget_returned=1 no_leak=1\n";
 }
 
-// ── 受控假服务端（COMMON §5.4）：分帧/嵌套数组/超限/退役语义。─────────────
+// ── 受控假服务端（COMMON）：分帧/嵌套数组/超限/退役语义。─────────────
 void HgetallProtocolFaults() {
     // 1) HGETALL 分帧跨段：回复被拆成多段发送，读回完整序列。
     {
@@ -770,7 +770,7 @@ void HgetallProtocolFaults() {
         host.Finish();
     }
     // 6) 奇数元素数组：field 无配对 value，fail-close 退役而不是静默丢尾。
-    //    区分回归：修复前返回 ok(empty)。
+    // 区分回归：修复前返回 ok(empty)。
     {
         Peer peer([](int fd) {
             CHECK(Peer::ReadCommand(fd)[0] == "HGETALL");
@@ -788,7 +788,7 @@ void HgetallProtocolFaults() {
         host.Finish();
     }
     // 7) 含 nil 元素的偶数数组：nil 不得折叠成空串 field/value，fail-close 退役。
-    //    区分回归：修复前返回 ok({f,""}) 且连接保留。
+    // 区分回归：修复前返回 ok({f,""}) 且连接保留。
     {
         Peer peer([](int fd) {
             CHECK(Peer::ReadCommand(fd)[0] == "HGETALL");
@@ -806,7 +806,7 @@ void HgetallProtocolFaults() {
         host.Finish();
     }
     // 8) 单元素超 kMaxArrayBytes：拒绝并退役；契约层面证明超字节回复零接纳
-    //    （修复前同样拒绝，但会先复制超限负载；本用例钉死对外契约）。
+    // （修复前同样拒绝，但会先复制超限负载；本用例钉死对外契约）。
     {
         const auto over = redis_detail::kMaxArrayBytes + 1;
         const std::string reply = "*2\r\n$" + std::to_string(over) + "\r\n" +
@@ -827,7 +827,7 @@ void HgetallProtocolFaults() {
         host.Finish();
     }
     // 9) 累计字节超限：第一元素恰为上限被接纳，第二元素把合计推出预算；
-    //    证明 checked-add 预算随元素递减而不是只在循环末尾比较。
+    // 证明 checked-add 预算随元素递减而不是只在循环末尾比较。
     {
         const auto first = redis_detail::kMaxArrayBytes;
         const std::string reply = "*2\r\n$" + std::to_string(first) + "\r\n" +
@@ -851,7 +851,7 @@ void HgetallProtocolFaults() {
     }
 }
 
-// ── 握手与 Close 竞争（COMMON §5.5/§5.6）：阶段证据为 AUTH 完整到达对端
+// ── 握手与 Close 竞争（COMMON /）：阶段证据为 AUTH 完整到达对端
 // （说明 Connect 已在握手 I/O 内挂起），此时 Close 胜出；Connect 不得返回成功，
 // 后续命令一律 Closed。修复前握手经共享成员 connection 收 +OK 后无复查，
 // Close 胜出时 Connect 仍可能 ok()。──

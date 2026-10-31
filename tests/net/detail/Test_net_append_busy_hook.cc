@@ -1,13 +1,13 @@
 // 接收路径确定性交错用例：验证「pending 未合入前，下一次 recv 的数据会插到它前面」。
 //
 // 与既有用例的关系：
-//   net.b4_raw_busy_deferred_onread 只验证 Busy→保留→补投 OnRead 的可见性，
-//   不涉及「pending 存在期间继续 recv」。本文件补的正是那条缺口。
+// net.b4_raw_busy_deferred_onread 只验证 Busy→保留→补投 OnRead 的可见性，
+// 不涉及「pending 存在期间继续 recv」。本文件补的正是那条缺口。
 //
 // 判据（块序与全字节分别断言，不只看块首字节）：
-//   out == A+B+C（逐字节 + 长度）→ 通过（修复后应如此）
-//   out == A+C+B（逐字节 + 长度）→ 违反 FIFO，必须失败并打印证据
-//   其他                          → 其他不一致，单独报错（不得归入上面两类）
+// out == A+B+C（逐字节 + 长度）→ 通过（修复后应如此）
+// out == A+C+B（逐字节 + 长度）→ 违反 FIFO，必须失败并打印证据
+// 其他 → 其他不一致，单独报错（不得归入上面两类）
 //
 // 线程约定：本文件不使用 std::this_thread::sleep_for —— 它在非协程上下文会
 // 进入 coroutine hook 的 UseSleep/Nanosleep 路径并触发断言。等待一律用
@@ -87,7 +87,7 @@ EngineConfig ServerConfig(const Address& listen) {
 }
 
 // 低压水线场景：把读方向总量界压到刚好容纳本例字节数。
-// ReadLowWater() = max_inbound_bytes / 2。选 49152*2 使低水位 = 49152，
+// ReadLowWater = max_inbound_bytes / 2。选 49152*2 使低水位 = 49152，
 // 与 A+B+C 总量相等 —— 这是「消费者读完仍不低于低水位」的最不利边界，
 // 用来验证 pending 导致的暂停能否真正解除（而不是永久卡住读泵）。
 EngineConfig TightServerConfig(const Address& listen) {
@@ -202,9 +202,9 @@ struct Gate {
 };
 
 // 接缝回调在 owner 线程执行：绝不抛异常（抛出会终止进程，破坏可判定性）。
-//   #1 = B 的 recv 之后（既有 read-append 接缝）：让 aux 取得真实数据锁并确认持有，
-//        这同时把 owner 挡在 append 之前，构成「此时才能发 C」的门。
-//   #2 = C 的 recv 之后：置位 c_recv_seen，让主线程知道 append 即将发生。
+// #1 = B 的 recv 之后（既有 read-append 接缝）：让 aux 取得真实数据锁并确认持有，
+// 这同时把 owner 挡在 append 之前，构成「此时才能发 C」的门。
+// docs/decisions/0002-co-network-contract.md = C 的 recv 之后：置位 c_recv_seen，让主线程知道 append 即将发生。
 std::function<void()> MakeReadAppendHook(const std::shared_ptr<Gate>& gate) {
     return [gate] {
         const int calls = gate->read_hook_calls.fetch_add(1);
@@ -363,7 +363,7 @@ Outcome RunInterleave(bool send_c, bool tight = false) {
     state = ConnectionTestAccess::StateOf(*conn);
     BOOST_REQUIRE(state != nullptr);
 
-    // 步骤 1：A 先入 ring（owner 已从内核取走 = ring.Size() 含 pending 达到 |A|）。
+    // 步骤 1：A 先入 ring（owner 已从内核取走 = ring.Size 含 pending 达到 |A|）。
     BOOST_REQUIRE(SendAll(client, a, 3000ms));
     BOOST_REQUIRE(WaitUntil([&] { return state->ring.Size() == a.size(); }, 5000ms));
 
@@ -375,7 +375,7 @@ Outcome RunInterleave(bool send_c, bool tight = false) {
     EngineTestAccess::SetAppendBusyHook(engine, MakeAppendBusyHook(gate));
     std::thread aux(AuxThread, gate);
 
-    // 步骤 3：此刻发 B → TryAppend 观测 Busy（aux 持真实数据锁）→ 接缝 #2 等待。
+    // 步骤 3：此刻发 B → TryAppend 观测 Busy（aux 持真实数据锁）→ 接缝 docs/decisions/0002-co-network-contract.md 等待。
     BOOST_REQUIRE(SendAll(client, b, 3000ms));
     BOOST_REQUIRE(WaitUntil([&] { return gate->lock_held.load() || gate->aux_error.load(); }, 6000ms));
     BOOST_TEST(!gate->aux_error.load());
@@ -391,8 +391,8 @@ Outcome RunInterleave(bool send_c, bool tight = false) {
     (void)WaitUntil([&] { return gate->pending_observed.load() != 0; }, 6000ms);
 
     // 步骤 5b：观测「缺陷窗口是否出现」，用于解释结果，不作为执行前提。
-    //   window_ok=1：C 在 pending 仍在时被 recv（旧行为下即 A+C+B 的成因）
-    //   window_ok=0：owner 在 pending 存在时停止了 recv（修复后的正确行为）
+    // window_ok=1：C 在 pending 仍在时被 recv（旧行为下即 A+C+B 的成因）
+    // window_ok=0：owner 在 pending 存在时停止了 recv（修复后的正确行为）
     // 把 window_ok 当前置条件会把「已修好」误判成「前提未成立」——这是判据错误。
     const bool window_ok = WaitUntil([&] {
         return gate->read_hook_calls.load() >= 2
@@ -455,8 +455,8 @@ BOOST_AUTO_TEST_CASE(pending_without_next_recv_is_ordered) {
     BOOST_CHECK(outcome.fifo_ok);
 }
 
-// 低水位边界：读方向总量界压到 49152（= A+B+C 总量），使 ReadLowWater() 恰为
-// 49152。消费者读完全部数据后 ring.Size() 才降到低水位，是「暂停能否解除」的
+// 低水位边界：读方向总量界压到 49152（= A+B+C 总量），使 ReadLowWater 恰为
+// 49152。消费者读完全部数据后 ring.Size 才降到低水位，是「暂停能否解除」的
 // 最不利情况。若该场景下仍能读全 A+B+C，说明 m_read_paused 恢复路径有效，
 // 不会因 pending 暂停而永久卡住读泵。
 BOOST_AUTO_TEST_CASE(pending_pause_recovers_at_low_water) {

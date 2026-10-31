@@ -20,7 +20,7 @@ std::error_code SysError() noexcept { return {errno, std::generic_category()}; }
 std::error_code Invalid() noexcept { return std::make_error_code(std::errc::invalid_argument); }
 std::error_code Unsupported() noexcept { return std::make_error_code(std::errc::operation_not_supported); }
 
-// R1 flags 契约：窄 primitive 只承诺保守子集；未列出位在任何系统调用前拒绝。
+// flags 契约：窄 primitive 只承诺保守子集；未列出位在任何系统调用前拒绝。
 constexpr int kSendAllow = MSG_DONTWAIT | MSG_NOSIGNAL;
 constexpr int kStreamRecvAllow = MSG_DONTWAIT | MSG_PEEK;
 constexpr int kDatagramRecvAllow = kStreamRecvAllow | MSG_TRUNC;

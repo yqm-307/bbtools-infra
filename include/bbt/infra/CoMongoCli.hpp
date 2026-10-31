@@ -1,5 +1,5 @@
 #pragma once
-// co-mongo/v1（bbtools-infra#7）：协程原生 MongoDB 客户端公共面。
+// co-mongo/v1：协程原生 MongoDB 客户端公共面。
 // mongocxx/bsoncxx 类型、驱动线程、连接池与阻塞调用全部隐藏于
 // src/mongo/ 实现，本头只出现 infra/标准库类型。
 
@@ -29,10 +29,10 @@ using mongo::kMongoLimitsMaxQueue;
 using mongo::kMongoLimitsMaxTimeout;
 using mongo::kMongoLimitsMaxWorkerThreads;
 
-// CoMongoCli 装配参数（Issue #7 旧契约，保留兼容）。本切片一个
+// CoMongoCli 装配参数（旧契约，保留兼容）。本切片一个
 // client 绑定一个 db.collection，内部由独占的 mongo owner
 // （src/mongo/MongoRuntime）承载 worker/队列/pool——资源归属与
-// Issue #40 的 bbt::infra::mongo::CoMongoDb 同构；需要多集合共享
+// mongo owner 契约的 bbt::infra::mongo::CoMongoDb 同构；需要多集合共享
 // 一组 worker 的新代码应直接用 mongo::CoMongoDb + 集合句柄。
 //   - worker_threads：执行阻塞 driver 调用的 worker 线程数上限
 //     （<=8；测试默认 <=2）；每项 operation 在同一 worker 上
@@ -95,7 +95,7 @@ inline result<void> ValidateMongoClientConfig(const MongoClientConfig& cfg) {
     return result<void>::ok();
 }
 
-// CoMongoCli：出站 MongoDB 组件（Issue #7 旧契约，兼容保留；新代码
+// CoMongoCli：出站 MongoDB 组件（旧契约兼容保留；新代码
 // 优先用 bbt::infra::mongo::CoMongoDb + CoMongoColl，见
 // include/bbt/infra/mongo/Client.hpp）。实现为「独占 mongo owner +
 // 单个集合句柄」：mongocxx 同步 driver + 有界 worker bridge，

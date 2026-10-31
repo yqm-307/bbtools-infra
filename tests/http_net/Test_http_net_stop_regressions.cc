@@ -1,4 +1,4 @@
-// F1 回归测试：Server::Submit 在与 Stop 同一 mutex 的任务登记预约处校验 stopping，
+// 回归测试：Server::Submit 在与 Stop 同一 mutex 的任务登记预约处校验 stopping，
 // 封口后不再预约/登记新任务，WaitStopped 后不再复活；TaskLease 未计数回退不下溢。
 // 覆盖已进入 Submit 的迟到 Start 被拒绝，以及停止后的重复公开 Start；不模拟 session Submit。
 //

@@ -1,5 +1,5 @@
 #pragma once
-// bbtools-infra 内部统一 debug 观测层（PR #70 review 整改）。
+// bbtools-infra 内部统一 debug 观测层。
 //
 // 定位（对齐 bbtools-coroutine 的 BBT_COROUTINE_STRINGENT_DEBUG + detail/debug/）：
 //   - 本文件整体只在 BBT_INFRA_STRINGENT_DEBUG 打开时展开（该宏由顶层 CMake 的
@@ -25,7 +25,7 @@
 
 namespace bbt::infra::debug {
 
-// ================= HTTP：会话生命周期观测（issue #62 验收第 5 项）=================
+// ================= HTTP：会话生命周期观测 =================
 // m_sessions 只保存裸指针：任何「析构时仍未反登记」都会给 Teardown 的裸指针
 // 遍历留下悬垂项（UAF）。正常路径下 MaybeRelease 已在 Close（io 域门内、inflight
 // 归零时）反登记，故 destroyed_while_registered 必须恒为 0。

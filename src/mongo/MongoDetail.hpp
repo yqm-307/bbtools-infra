@@ -84,7 +84,7 @@ Error ClassifyBsonError(const bsoncxx::v1::exception& e, const char* what);
 // connectTimeoutMS/socketTimeoutMS/waitQueueTimeoutMS/maxPoolSize；
 // 已在 URI 中显式给出的同名项（大小写不敏感）不覆盖。
 // 输入是 owner 级 MongoRuntimeConfig：pool 与 worker 预算归 owner
-// （Issue #40），database/collection 不再参与生效 URI。
+// （mongo owner 契约），database/collection 不再参与生效 URI。
 std::string EffectiveUri(const mongo::MongoRuntimeConfig& cfg);
 
 } // namespace bbt::infra::mongo_detail

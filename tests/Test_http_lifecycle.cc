@@ -1,37 +1,37 @@
-// N1b-2：HTTP 关闭与终态交付语义验收（进程寿命运行时修订，契约 §1/§2）。
+// HTTP 关闭与终态交付语义验收（进程寿命运行时修订，契约 /）。
 //
 // 旧口径已被删除，本件不保留任何旧断言：取消令牌（在途 token 寿命、
 // 取消源）、逻辑/物理清理分离下的 WaitClosed 等待、RequestClose/
 // CloseStatus、运行时代际都不再存在。改到新口径后逐条对应：
 //
-//   t_begin_start_runtime
-//       — 运行时只初始化一次（IsInitialized），无 Stop/代际。
-//   t_ctx_uses_listener_budget_only
-//       — ctx.deadline 只取 listener 本地预算；不信任自定义 deadline
-//         头；peer_principal 未认证为空；无 cancel 字段。
-//   t_unsent_request_never_reaches_wire
-//       — 未发送请求直接丢弃，不上网：本地期限已过期的请求、以及已
-//         Close 的 client 上的请求，都在建 socket 之前终止；对端在
-//         有界窗口内没有接到任何连接、任何字节。
-//   t_owner_close_returns_terminal_for_sent_request
-//       — owner 主动同步 Close()：已发送请求立即返回终态（Closed），
-//         且每个请求只交付一次终态。
-//   t_late_response_consumed_not_delivered
-//       — 终端先落定（本地期限），对端其后才写的合法响应不再产生
-//         第二次交付；首次终态不被覆盖。
-//   t_server_close_does_not_preempt_handler
-//       — server Close() 同步返回（有界等在途归零）；已接纳 handler
-//         不被抢占，其回复在已关闭的会话上只消费不交付。
-//   t_client_close_drains_inflight_read
-//       — client 在途 async_read 时 Close() 仍同步返回并物理收口。
-//   t_server_close_drains_idle_session
-//       — 无 handler 的空闲会话也计入物理收口：对端见到 FIN。
-//   t_timeout_caller_returns_cleanup_continues
-//       — 期限到点让调用方及时返回，底层清理继续（对端见 EOF）。
-//   t_runtime_close_converges_all_children
-//       — runtime Close() 收口全部子对象；落定后工厂与请求一律 Closed。
-//   t_end_physical_convergence
-//       — 收尾用显式 Close() + 物理收敛断言，不用 Scheduler::Stop()。
+// t_begin_start_runtime
+// — 运行时只初始化一次（IsInitialized），无 Stop/代际。
+// t_ctx_uses_listener_budget_only
+// — ctx.deadline 只取 listener 本地预算；不信任自定义 deadline
+// 头；peer_principal 未认证为空；无 cancel 字段。
+// t_unsent_request_never_reaches_wire
+// — 未发送请求直接丢弃，不上网：本地期限已过期的请求、以及已
+// Close 的 client 上的请求，都在建 socket 之前终止；对端在
+// 有界窗口内没有接到任何连接、任何字节。
+// t_owner_close_returns_terminal_for_sent_request
+// — owner 主动同步 Close()：已发送请求立即返回终态（Closed），
+// 且每个请求只交付一次终态。
+// t_late_response_consumed_not_delivered
+// — 终端先落定（本地期限），对端其后才写的合法响应不再产生
+// 第二次交付；首次终态不被覆盖。
+// t_server_close_does_not_preempt_handler
+// — server Close() 同步返回（有界等在途归零）；已接纳 handler
+// 不被抢占，其回复在已关闭的会话上只消费不交付。
+// t_client_close_drains_inflight_read
+// — client 在途 async_read 时 Close() 仍同步返回并物理收口。
+// t_server_close_drains_idle_session
+// — 无 handler 的空闲会话也计入物理收口：对端见到 FIN。
+// t_timeout_caller_returns_cleanup_continues
+// — 期限到点让调用方及时返回，底层清理继续（对端见 EOF）。
+// t_runtime_close_converges_all_children
+// — runtime Close() 收口全部子对象；落定后工厂与请求一律 Closed。
+// t_end_physical_convergence
+// — 收尾用显式 Close() + 物理收敛断言，不用 Scheduler::Stop()。
 //
 // 同步纪律：跨线程/跨协程一律用原子标志 + WaitUntil（带总预算）与
 // CountDownLatch 做屏障；handler 内的等待用 bbtco_sleep 轮询真实事件
@@ -245,7 +245,7 @@ result<HttpResponse> TestHandler(IncomingCallContext ctx, HttpRequest req) {
 }
 
 // 对端侧/owner 侧切断连接导致的本端终态分类。
-// #64：请求已完整写出（对端已读到请求、或本端写侧已完成）后失去可信回复
+// docs/decisions/0008-request-phase-outcome-unknown.md：请求已完整写出（对端已读到请求、或本端写侧已完成）后失去可信回复
 // 终态时是 OutcomeUnknown；未写出时的中止仍是确定失败。
 bool IsShutdownError(const Error& e) {
     return e.code == ErrorCode::TransportError ||
@@ -366,7 +366,7 @@ BOOST_AUTO_TEST_CASE(t_begin_start_runtime) {
     BOOST_REQUIRE_NE(g_port, 0);
 }
 
-// 回归（父探针 F1 同根）：Close() 返回即 listener 物理释放。此前实现把
+// 回归（父探针 同根）：Close() 返回即 listener 物理释放。此前实现把
 // teardown 投递到 strand 后只按逻辑计数判定 Closed——无在途连接时计数原为
 // 0，等待立即通过，Close 在 acceptor fd 仍存活时返回（实测其返回后 TCP
 // connect 仍成功，需额外 Tick 才拒绝）。本用例以真实 TCP connect 取证。
@@ -439,7 +439,7 @@ BOOST_AUTO_TEST_CASE(t_unsent_request_never_reaches_wire) {
     RawServer peer([](int) {}, /*accept_timeout_ms=*/600);
 
     // (a) 本地 deadline 在发起前就已过期：等待事件根本不登记、回调不
-    //     投递，请求从未被登记/发出 → 直接丢弃。
+    // 投递，请求从未被登记/发出 → 直接丢弃。
     CallOptions expired;
     expired.deadline = std::chrono::steady_clock::now() -
                        std::chrono::milliseconds(1);
@@ -449,7 +449,7 @@ BOOST_AUTO_TEST_CASE(t_unsent_request_never_reaches_wire) {
     BOOST_CHECK(res_expired.error().code == ErrorCode::TimedOut);
 
     // (b) 已 Close 的 client：Request 在建立 socket/resolver 之前就
-    //     返回 Closed（终态），同样不上网。
+    // 返回 Closed（终态），同样不上网。
     auto cl = g_runtime->CreateHttpClient();
     BOOST_REQUIRE(cl);
     auto closed_client = std::move(cl).value();
@@ -509,7 +509,7 @@ BOOST_AUTO_TEST_CASE(t_close_returns_terminal_for_sent_request) {
         WaitUntil([&] { return out_ready.load(std::memory_order_acquire); }));
     BOOST_REQUIRE(out.has_value());
     BOOST_REQUIRE(!out.value());
-    // #64：对端已读到请求（peer.bytes > 0）⇒ 请求已完整写出 ⇒ 回复丢失即未知。
+    // docs/decisions/0008-request-phase-outcome-unknown.md：对端已读到请求（peer.bytes > 0）⇒ 请求已完整写出 ⇒ 回复丢失即未知。
     BOOST_CHECK(out->error().code == ErrorCode::OutcomeUnknown);
     BOOST_REQUIRE(out->error().request_phase.has_value());
     BOOST_CHECK(*out->error().request_phase == RequestPhase::RequestCommitted);
@@ -568,7 +568,7 @@ BOOST_AUTO_TEST_CASE(t_late_response_consumed_not_delivered) {
         WaitUntil([&] { return out_ready.load(std::memory_order_acquire); }));
     BOOST_REQUIRE(out.has_value());
     BOOST_REQUIRE(!out.value());
-    // #64：请求已完整写出、对端迟到响应不构成可信终态 ⇒ 未知（不是超时）。
+    // docs/decisions/0008-request-phase-outcome-unknown.md：请求已完整写出、对端迟到响应不构成可信终态 ⇒ 未知（不是超时）。
     BOOST_CHECK(out->error().code == ErrorCode::OutcomeUnknown);
     BOOST_REQUIRE(out->error().request_phase.has_value());
     BOOST_CHECK(*out->error().request_phase == RequestPhase::RequestCommitted);
@@ -630,17 +630,17 @@ BOOST_AUTO_TEST_CASE(t_server_close_does_not_preempt_handler) {
     BOOST_CHECK(server->IsClosed());
 }
 
-// Finding B 回归（冻结契约 §6 同根）：handler 已产出响应（排队/正在发送）时
+// Finding B 回归（冻结契约 同根）：handler 已产出响应（排队/正在发送）时
 // owner Close()，返回当刻会话 socket 必须已物理关闭、未发送 payload 被丢弃。
 // 此前 owner teardown 经 Abort→Close 命中 reply_posted 的「写完再关」分支：
 // 只置 close_after_write 就返回，socket 仍存活且被后端继续写（会话仍在册还
 // 会让 Close 阻塞整个 5s drain 窗口）。
 // 差分取证用「不读」的对端 + 大于内核发送缓冲上界（tcp_wmem max 4MB）的响应体：
-//   - 旧语义：Close 阻塞 ~5s 后返回且会话仍开着，对端一开始读就把整个响应体
-//     读完（写路径把剩余字节继续推出），total == 响应体；
-//   - 新语义：Close 在域门内同步断开并丢弃未发送数据 → 立即返回且 IsClosed，
-//     对端读到的字节必然少于响应体（未发送部分不补发），随后 EOF，且 EOF 后
-//     不再有新字节（晚到完成不再写资源）。
+// - 旧语义：Close 阻塞 ~5s 后返回且会话仍开着，对端一开始读就把整个响应体
+// 读完（写路径把剩余字节继续推出），total == 响应体；
+// - 新语义：Close 在域门内同步断开并丢弃未发送数据 → 立即返回且 IsClosed，
+// 对端读到的字节必然少于响应体（未发送部分不补发），随后 EOF，且 EOF 后
+// 不再有新字节（晚到完成不再写资源）。
 BOOST_AUTO_TEST_CASE(t_server_owner_close_discards_queued_response) {
     constexpr std::size_t kBigBody = 8 * 1024 * 1024;
     NetworkLimits limits = MakeLimits(std::chrono::milliseconds{10000});
@@ -756,7 +756,7 @@ BOOST_AUTO_TEST_CASE(t_client_close_drains_inflight_read) {
         WaitUntil([&] { return out_ready.load(std::memory_order_acquire); }));
     BOOST_REQUIRE(out.has_value());
     BOOST_REQUIRE(!out.value());
-    // #64：对端已读到请求 ⇒ 已完整写出；owner Close 不改变「请求可能已生效」
+    // docs/decisions/0008-request-phase-outcome-unknown.md：对端已读到请求 ⇒ 已完整写出；owner Close 不改变「请求可能已生效」
     // 这一事实，故终态是未知而非 Closed。
     BOOST_CHECK(out->error().code == ErrorCode::OutcomeUnknown);
     BOOST_REQUIRE(out->error().request_phase.has_value());
@@ -855,7 +855,7 @@ BOOST_AUTO_TEST_CASE(t_timeout_caller_returns_cleanup_continues) {
     auto res = CallApi(std::move(req), opt);
     // 调用方按期限及时返回，不等待物理清理。
     BOOST_REQUIRE(!res);
-    // #64：对端已读到请求 ⇒ 请求已完整写出 ⇒ 期限先到也解释为未知
+    // docs/decisions/0008-request-phase-outcome-unknown.md：对端已读到请求 ⇒ 请求已完整写出 ⇒ 期限先到也解释为未知
     // （期限只证明本端放弃等待，不证明请求未生效）。
     BOOST_CHECK(res.error().code == ErrorCode::OutcomeUnknown);
     BOOST_REQUIRE(res.error().request_phase.has_value());

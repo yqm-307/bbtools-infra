@@ -15,7 +15,7 @@ foreach(_case connect_failure_owned seal_during_connect_start close_invalidates_
         handshake_auth_select pool_new_commands pool_handshake_auth hgetall_protocol_faults
         close_during_handshake)
     add_test(NAME redis.net.${_case} COMMAND Test_redis_net_contract ${_case})
-    set_tests_properties(redis.net.${_case} PROPERTIES TIMEOUT 30 LABELS "redis_net")
+    set_tests_properties(redis.net.${_case} PROPERTIES TIMEOUT 30 LABELS "unit")
 endforeach()
 
 file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/async-includes.txt"
@@ -25,4 +25,4 @@ add_test(NAME redis.net.async_compile COMMAND ${CMAKE_COMMAND}
     "-DINCLUDES=${CMAKE_CURRENT_BINARY_DIR}/async-includes.txt"
     "-DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/AsyncCompile.cc"
     -P "${CMAKE_CURRENT_SOURCE_DIR}/AsyncCompile.cmake")
-set_tests_properties(redis.net.async_compile PROPERTIES TIMEOUT 60 LABELS "redis_net")
+set_tests_properties(redis.net.async_compile PROPERTIES TIMEOUT 60 LABELS "integration")

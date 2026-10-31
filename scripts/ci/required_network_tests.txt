@@ -9,10 +9,10 @@ net.udp_high_level_compile_reject
 net.buffer_allocation
 net.reactor_driver_bind
 net.reactor_driver_failed
-net.r2_raw_roundtrip
-net.r2_co_accept_read_write
-net.r2_co_dial
-net.b4_co_pingpong_strict
-net.b4_request_close_write_error_intent
-net.b4_request_close_write_readiness
-net.b4_sealed_write_error_read_publication
+net.tcp_raw_roundtrip
+net.tcp_co_accept_read_write
+net.tcp_co_dial
+net.co_pingpong_strict
+net.request_close_write_error_intent
+net.request_close_write_readiness
+net.sealed_write_error_read_publication

@@ -1,17 +1,17 @@
-// R2 Processer driver 私有适配聚焦测试（批次 B1）。
+// Processer driver 私有适配聚焦测试（批次）。
 //
 // 覆盖：
-//   bind     —— 真实 driver 绑定已登记 P 槽；OnTick 在目标 worker（非测试线程）
-//               且 LastTickProcesserId 与绑定槽一致；owner context 的 Asio handler
-//               由 P 推进；绑定不新建线程；driver 与业务协程并存；同步解绑后停 tick。
-//   wake     —— 早到 latch 短路；外线程打断阻塞 Wait；并发/嵌套 Wake；
-//               唤醒计数与 latch 持久。
-//   budget   —— 单次 OnTick handler 数预算；AfterSchedule 不推进 context。
-//   time_budget —— 回调内部耗时计入时间预算，预算耗尽即停。
-//   rollback —— 槽不足整体回滚，且不扰动他人已有绑定；回滚后空槽仍可用。
-//   unbind   —— owner 线程内自解绑被拒（SelfDetach）、绑定保留；控制线程同步解绑；
-//               stale token 被拒；解绑后不再 tick。
-//   failed   —— 注入 OnTick 异常走 runtime 既有 Failed 出口并可查询。
+// bind —— 真实 driver 绑定已登记 P 槽；OnTick 在目标 worker（非测试线程）
+// 且 LastTickProcesserId 与绑定槽一致；owner context 的 Asio handler
+// 由 P 推进；绑定不新建线程；driver 与业务协程并存；同步解绑后停 tick。
+// wake —— 早到 latch 短路；外线程打断阻塞 Wait；并发/嵌套 Wake；
+// 唤醒计数与 latch 持久。
+// budget —— 单次 OnTick handler 数预算；AfterSchedule 不推进 context。
+// time_budget —— 回调内部耗时计入时间预算，预算耗尽即停。
+// rollback —— 槽不足整体回滚，且不扰动他人已有绑定；回滚后空槽仍可用。
+// unbind —— owner 线程内自解绑被拒（SelfDetach）、绑定保留；控制线程同步解绑；
+// stale token 被拒；解绑后不再 tick。
+// failed —— 注入 OnTick 异常走 runtime 既有 Failed 出口并可查询。
 //
 // 本测试使用动态端口以外的纯 driver 路径（不伪造 fd/TCP 能力）；raw/Conn/Co
 // 真实收发由后续批次补齐。
@@ -382,7 +382,7 @@ static void UnbindRefusalCase() {
     const auto token = slots[0].token;
 
     // 外部先行同代解绑（模拟竞争/已脱离）：该代归属已不存在，DriverBinder
-    // 依核心契约 §11.2/§11.4 把 StaleToken 视为安全移出，不伪报仍绑定；
+    // 依核心契约 / 把 StaleToken 视为安全移出，不伪报仍绑定；
     // 不存在的旧 token 不能解绑后续新代（另测）。
     CHECK(bbt::coroutine::detail::Scheduler::GetInstance()->UnregisterProcesserDriver(token)
         == bbt::coroutine::detail::ProcesserDriverStatus::Ok);

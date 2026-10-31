@@ -1,4 +1,4 @@
-// R2 协程网络最小示例（只消费公开 API：bbt::infra_net + bbtools-coroutine）。
+// 协程网络最小示例（只消费公开 API：bbt::infra_net + bbtools-coroutine）。
 //
 // 真实 TCP 回环：Engine server（main + 1 sub owner，各自绑定已登记 Processer
 // driver 槽，不新建网络线程）→ Engine::CoAccept 取连接 →

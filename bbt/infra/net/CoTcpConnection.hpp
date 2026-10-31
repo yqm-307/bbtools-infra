@@ -1,6 +1,6 @@
 #pragma once
 
-// TCP 连接的 ICoConnection 薄实现（终评 §2 / A1）：纯值包装，不复制状态。
+// TCP 连接的 ICoConnection 薄实现（docs/decisions/0012-icoconn-member-interface.md）：纯值包装，不复制状态。
 //
 // 本对象只持有一个 Connection 值句柄（内部是 shared_ptr<ConnectionState>），
 // 不复制 ring、不缓存状态投影、不建第二队列；所有 ICoConnection 成员直接

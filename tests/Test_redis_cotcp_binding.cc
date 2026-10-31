@@ -6,65 +6,65 @@
 //
 // 与当前 main 契约对齐（同步 Close、无 RequestClose/WaitClosed/CloseStatus、无取消
 // 令牌、无 CompletionSignal、无 Scheduler::Stop）：
-//   - 显式生命周期：Connect(options) 在协程内真实等待 TCP 建连完成；Disconnect()
-//     同步释放连接但不进终态、可再次 Connect；Close() 是 ICoCloseable 终态。
-//     ConnectStatus() 只读本地状态、不发网络探测。命令不得隐式建连（不做 Lazy）。
-//   - owner 主动 Close() 同步返回；封口 + 收口已登记 op + 物理关闭 CoTCP（fd）+
-//     释放 hiredis reader 都在 Close 的调用线程内完成。
-//   - Close 返回当刻：已建连的 CoTCP fd 已物理关闭（IsClosed + FdOpen==false）；
-//     hiredis reader 恰好释放（readers_created==readers_freed）。
-//   - 在途 DialTCP：Close/Disconnect 封口 owner 级 dial 等待登记打断 connect，候选 fd
-//     由 owner 关闭原语在封口后同步收口——返回当刻对象候选 fd 已释放（进程级 socket
-//     数至多因协程内部 dup 残留一个；该 dup 随等待在协程恢复时释放）。
-//   - IsClosed() 反映物理收口（封口 + 已登记 op 归零 + 连接物理收口），Close 返回
-//     当刻即成立（owner 批次退出不再是落定条件）。
-//   - reconnect_on_new_command=true 仅「故障（Failed）之后提交」的新命令可重建连接；
-//     故障前排队命令以 TransportError 落定、不迁移、不重发（见
-//     t_reconnect_only_for_new_commands_after_failure）。
+// - 显式生命周期：Connect(options) 在协程内真实等待 TCP 建连完成；Disconnect()
+// 同步释放连接但不进终态、可再次 Connect；Close() 是 ICoCloseable 终态。
+// ConnectStatus() 只读本地状态、不发网络探测。命令不得隐式建连（不做 Lazy）。
+// - owner 主动 Close() 同步返回；封口 + 收口已登记 op + 物理关闭 CoTCP（fd）+
+// 释放 hiredis reader 都在 Close 的调用线程内完成。
+// - Close 返回当刻：已建连的 CoTCP fd 已物理关闭（IsClosed + FdOpen==false）；
+// hiredis reader 恰好释放（readers_created==readers_freed）。
+// - 在途 DialTCP：Close/Disconnect 封口 owner 级 dial 等待登记打断 connect，候选 fd
+// 由 owner 关闭原语在封口后同步收口——返回当刻对象候选 fd 已释放（进程级 socket
+// 数至多因协程内部 dup 残留一个；该 dup 随等待在协程恢复时释放）。
+// - IsClosed() 反映物理收口（封口 + 已登记 op 归零 + 连接物理收口），Close 返回
+// 当刻即成立（owner 批次退出不再是落定条件）。
+// - reconnect_on_new_command=true 仅「故障（Failed）之后提交」的新命令可重建连接；
+// 故障前排队命令以 TransportError 落定、不迁移、不重发（见
+// t_reconnect_only_for_new_commands_after_failure）。
 //
 // 连接故障后新命令的口径由 RedisClientConfig::reconnect_on_new_command 决定（默认
 // false = sticky TransportError；true = 每条新命令允许一次新连接，已失败命令不重发）；
 // 该选项不绕过显式生命周期（首次未 Connect / 主动 Disconnect / Close 均不隐式建连）。
 //
 // 覆盖矩阵：
-//   t_resp2_roundtrip_live           真实 Redis loopback：Connect + PING/SET/GET/
-//                                    EXISTS/DEL、二进制值、nil、服务端错误、2 MiB
-//                                    大回复（无 Redis 时按退出码 77 表示环境不可用）
-//   t_no_connect_command_rejected    未 Connect 的命令拒绝且服务端零连接（无字节）
-//   t_explicit_connect_lifecycle     显式状态机：Connect 幂等 / ConnectStatus 只读无
-//                                    网络请求 / Disconnect 同步收口且可再 Connect /
-//                                    Close 拒绝 Connect；Ping 真实发送 PING 字节
-//   t_connect_failure_state          连不上/超时 → Failed；默认 sticky TransportError，
-//                                    显式重连每条新命令恰一次
-//   t_connect_while_connecting       Connecting 中重复 Connect → Overloaded
-//   t_disconnect_interrupts_inflight_dial Disconnect 打断在途 dial 并同步收口候选 fd
-//   t_disconnect_during_inflight_command  Disconnect 与在途命令竞争：命令 TransportError、
-//                                    同步收口、同实例可再 Connect
-//   t_raw_reply_types_and_errors      原始对端预置 RESP2 各类型 + 垃圾字节协议错误
-//   t_partial_write_then_full_delivery 小接收窗对端：写侧部分写/WouldBlock 后写满
-//   t_write_side_deadline            写侧阻塞 + deadline → TimedOut（不重发）
-//   t_eof_and_rst                    EOF（干净 FIN）与 RST 都映射为 TransportError
-//   t_read_side_deadline             读侧 deadline → TimedOut；TryReadSome 无进展探针
-//   t_owner_close_physical_collect   在途命令随 Close 落定 Closed；Close 返回当刻 fd
-//                                    物理关闭、reader 恰好释放；晚到终态不覆盖
-//   t_repeated_and_concurrent_close  重复/并发 Close：无 UAF/死锁，物理收口一次
-//   t_b1_close_during_inflight_dial  DialTCP 挂起期间 Close：打断在途 dial、收敛、
-//                                    不编码/不发送、无 socket 残留
-//   t_b1_close_after_dial_no_encode  dial 已成功、尚未编码时 Close（测试接缝落点）：
-//                                    不编码、不发送，Close 返回当刻 fd 物理关闭
-//   t_reconnect_new_command_true     显式开启重连：故障后新命令重建连接成功、已失败
-//                                    命令不重发（Accepted/dial_attempts/CommandsRead）
-//   t_reconnect_dial_failure_exposed 显式开启重连且目标不可达：对应 dial/命令恰尝试
-//                                    一次，失败直接暴露，无后台循环
-//   t_close_inflight_isolated_synchronous 在途命令下 Close 同步落定（Close 返回当刻
-//                                    IsClosed + fd 关闭 + registered 归零）
+// t_resp2_roundtrip_live 真实 Redis loopback：Connect + PING/SET/GET/
+// EXISTS/DEL、二进制值、nil、服务端错误、2 MiB
+// 大回复（无 Redis 时按退出码 77 表示环境不可用）
+// t_no_connect_command_rejected 未 Connect 的命令拒绝且服务端零连接（无字节）
+// t_explicit_connect_lifecycle 显式状态机：Connect 幂等 / ConnectStatus 只读无
+// 网络请求 / Disconnect 同步收口且可再 Connect /
+// Close 拒绝 Connect；Ping 真实发送 PING 字节
+// t_connect_failure_state 连不上/超时 → Failed；默认 sticky TransportError，
+// 显式重连每条新命令恰一次
+// t_connect_while_connecting Connecting 中重复 Connect → Overloaded
+// t_disconnect_interrupts_inflight_dial Disconnect 打断在途 dial 并同步收口候选 fd
+// t_disconnect_during_inflight_command Disconnect 与在途命令竞争：命令 TransportError、
+// 同步收口、同实例可再 Connect
+// t_raw_reply_types_and_errors 原始对端预置 RESP2 各类型 + 垃圾字节协议错误
+// t_partial_write_then_full_delivery 小接收窗对端：写侧部分写/WouldBlock 后写满
+// t_write_side_deadline 写侧阻塞 + deadline → TimedOut（不重发）
+// t_eof_and_rst EOF（干净 FIN）与 RST 都映射为 TransportError
+// t_read_side_deadline 读侧 deadline → TimedOut；TryReadSome 无进展探针
+// t_owner_close_physical_collect 在途命令随 Close 落定 Closed；Close 返回当刻 fd
+// 物理关闭、reader 恰好释放；晚到终态不覆盖
+// t_repeated_and_concurrent_close 重复/并发 Close：无 UAF/死锁，物理收口一次
+// t_b1_close_during_inflight_dial DialTCP 挂起期间 Close：打断在途 dial、收敛、
+// 不编码/不发送、无 socket 残留
+// t_b1_close_after_dial_no_encode dial 已成功、尚未编码时 Close（测试接缝落点）：
+// 不编码、不发送，Close 返回当刻 fd 物理关闭
+// t_reconnect_new_command_true 显式开启重连：故障后新命令重建连接成功、已失败
+// 命令不重发（Accepted/dial_attempts/CommandsRead）
+// t_reconnect_dial_failure_exposed 显式开启重连且目标不可达：对应 dial/命令恰尝试
+// 一次，失败直接暴露，无后台循环
+// t_close_inflight_isolated_synchronous 在途命令下 Close 同步落定（Close 返回当刻
+// IsClosed + fd 关闭 + registered 归零）
 //
-// 范围：候选为**单连接 / 单 owner**，本套件不构成多连接并发或完整 §10 B 级验收。
+// 范围：候选为**单连接 / 单 owner**，本套件不构成多连接并发或完整 B 级验收。
 //
 // 运行：BBT_TEST_REDIS_ADDR=127.0.0.1:16379 ./Test_redis_cotcp_binding
-//   - 真实 Redis 用例（t_resp2_roundtrip_live）单独成组（见 tests/CMakeLists.txt）：
-//     未显式给地址且默认 loopback 无服务时只以退出码 77 表示「环境不可用」，不使用
-//     会被 CTest 当作 skip 的正则（那会掩盖其他用例的真实失败）。
+// - 真实 Redis 用例（t_resp2_roundtrip_live）单独成组（见 tests/CMakeLists.txt）：
+// 未显式给地址且默认 loopback 无服务时只以退出码 77 表示「环境不可用」，不使用
+// 会被 CTest 当作 skip 的正则（那会掩盖其他用例的真实失败）。
 
 #define BOOST_TEST_DYN_LINK
 #define BOOST_TEST_MAIN
@@ -260,10 +260,10 @@ struct BlackholeDialError : std::runtime_error {
 };
 
 // 探测结论：
-//   Hangs      悬停（前提成立）——须内核态佐证 SYN_SENT
-//   Completed  真实完成（占住 accept 队列位）
-//   Unusable   不可用（错误/读不到状态，不得据此确认前提）
-//   InProgress 本 slice 无事件，继续有界等待
+// Hangs 悬停（前提成立）——须内核态佐证 SYN_SENT
+// Completed 真实完成（占住 accept 队列位）
+// Unusable 不可用（错误/读不到状态，不得据此确认前提）
+// InProgress 本 slice 无事件，继续有界等待
 enum class ProbeResult { Hangs, Completed, Unusable, InProgress };
 
 // 一次 poll 结果 + SO_ERROR → 结论（纯判据，便于正反例直接验证）。poll 失败不得判
@@ -942,7 +942,7 @@ BOOST_AUTO_TEST_CASE(t_explicit_connect_lifecycle) {
 #endif
 }
 
-// A1：探测判据正反例（含真实内核 RST）。任何错误事件都不得被当成「前提成立」。
+// 探测判据正反例（含真实内核 RST）。任何错误事件都不得被当成「前提成立」。
 BOOST_AUTO_TEST_CASE(t_blackhole_probe_classification) {
     // 纯判据
     BOOST_CHECK(ClassifyProbePoll(1, POLLOUT, 0) == ProbeResult::Completed);
@@ -1009,7 +1009,7 @@ BOOST_AUTO_TEST_CASE(t_blackhole_probe_classification) {
     ::close(lfd);
 }
 
-// A2：构造失败路径（含新增的前提不成立）必须真实回收 fd 回基线，不得泄漏。
+// 构造失败路径（含新增的前提不成立）必须真实回收 fd 回基线，不得泄漏。
 // 用有界 fd 软限额强制 BlackholeDial 内部 socket() 中途 EMFILE：FillBatch 已分配若干
 // filler 后，probe 也拿不到 fd ⇒ 前提无法确认 ⇒ 构造抛 BlackholeDialError。若 ctor 不
 // 回收，这些 fd 会残留在进程里。只降软限（硬限不变）并在构造后立即恢复。

@@ -326,7 +326,7 @@ void BadStreamRetire() {
     std::cout << "bad_stream_retire protocol_error=1 retired=1 redial=1\n";
 }
 
-// F1：省略最终 CallOptions 走真实成功请求（Deadline::max() 缺省），且显式
+// 省略最终 CallOptions 走真实成功请求（Deadline::max() 缺省），且显式
 // CallOptions{}（epoch 期限）在池/I/O 前拒绝、对端零请求。两种形态分别证明
 // 「省略参数」与「显式过期」是不同语义。
 void OmittedCallOptionsDeadline() {

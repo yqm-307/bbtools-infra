@@ -1,13 +1,13 @@
-// Issue #64：出站请求阶段与 OutcomeUnknown 分界的动态验收（S1–S7）。
+// docs/decisions/0008-request-phase-outcome-unknown.md：出站请求阶段与 OutcomeUnknown 分界的动态验收（S1–S7）。
 //
 // 验收口径（全部机器可判定，不用错误文本、errno、日志顺序或固定 sleep）：
-//   - 请求尚未完整写出（未连接/写中断）→ 原有确定错误，且 request_phase
-//     未达 RequestCommitted；
-//   - 请求已完整写出但没有可信回复终态（对端确认收全后断开、deadline、
-//     Close）→ ErrorCode::OutcomeUnknown 且 request_phase ==
-//     RequestCommitted；
-//   - 可信回复（200/404/500）保持既有成功/远端错误语义，不被升级为未知；
-//     对端字节已到达但 framing 不可用仍是对回复的确定判决（ProtocolError）。
+// - 请求尚未完整写出（未连接/写中断）→ 原有确定错误，且 request_phase
+// 未达 RequestCommitted；
+// - 请求已完整写出但没有可信回复终态（对端确认收全后断开、deadline、
+// Close）→ ErrorCode::OutcomeUnknown 且 request_phase ==
+// RequestCommitted；
+// - 可信回复（200/404/500）保持既有成功/远端错误语义，不被升级为未知；
+// 对端字节已到达但 framing 不可用仍是对回复的确定判决（ProtocolError）。
 //
 // 事件控制：对端的「已完整收到请求」由服务端自己读到请求结束符（marker）后才置位，
 // 客户端的阶段由 result 里的 request_phase 直接读出，两者交叉
@@ -16,17 +16,17 @@
 // 等待，不放宽断言。
 //
 // 独立审查 F-1/F-2/F-3 修复后的对应口径：
-//   - F-1（S8）：放弃路径与 io 域在同一 IoGate 内依次完成 Abort 与阶段读取，
-//     故「返回确定失败后不会再完整写出」；已完整写出仍是 OutcomeUnknown。用例用
-//     on_write_started 事件确认客户端已进入写出，再让 deadline 在「写侧必然停在
-//     未提交」的状态到点；断言放弃返回确定失败、阶段未提交、且放行对端后仍收不到
-//     完整请求。限制见 S8 处：本运行时放弃与「io 同步写出」不可能并发，故该用例
-//     不能动态区分未修复实现，F-1 的线性化由源码线性化点证明。
-//   - F-2：协程任务的完成态是堆上共享对象（CoRunState），调用方提前返回/
-//     断言失败离开作用域都不会让任务写入已析构的栈对象（不再有 &done/&out）。
-//   - F-3（S2/S5-b）：精确断言 Writing 之前先等客户端侧的因果事件
-//     on_write_started（同一 IoGate 内、进入写出阶段且尚未写出任何字节），
-//     不再用「服务端 accept 计数」猜 OnConnect 是否已发生。
+// - F-1（S8）：放弃路径与 io 域在同一 IoGate 内依次完成 Abort 与阶段读取，
+// 故「返回确定失败后不会再完整写出」；已完整写出仍是 OutcomeUnknown。用例用
+// on_write_started 事件确认客户端已进入写出，再让 deadline 在「写侧必然停在
+// 未提交」的状态到点；断言放弃返回确定失败、阶段未提交、且放行对端后仍收不到
+// 完整请求。限制见 S8 处：本运行时放弃与「io 同步写出」不可能并发，故该用例
+// 不能动态区分未修复实现，F-1 的线性化由源码线性化点证明。
+// - F-2：协程任务的完成态是堆上共享对象（CoRunState），调用方提前返回/
+// 断言失败离开作用域都不会让任务写入已析构的栈对象（不再有 &done/&out）。
+// - F-3（S2/S5-b）：精确断言 Writing 之前先等客户端侧的因果事件
+// on_write_started（同一 IoGate 内、进入写出阶段且尚未写出任何字节），
+// 不再用「服务端 accept 计数」猜 OnConnect 是否已发生。
 
 #define BOOST_TEST_DYN_LINK
 #define BOOST_TEST_MAIN
@@ -784,19 +784,19 @@ BOOST_AUTO_TEST_CASE(t_s6_operations_do_not_share_phase_state) {
 
 // S8（F-1）：放弃（deadline）在「请求尚未完整写出」时返回确定失败，且此后后端
 // 不可能再把请求完整写出。构造为状态门控、不靠墙钟竞态：
-//   - 持有型对端 accept 后不读，请求体 8MiB 远超内核缓冲 ⇒ 写侧必然停在
-//     Writing（未提交），且 io 域回到空闲等待（不像停放那样冻结事件循环）；
-//   - 用 on_write_started 事件确认客户端确已进入写出阶段，随后 deadline 到点，
-//     放弃在 Writing 落定 ⇒ 确定失败（TimedOut），绝不升级为 OutcomeUnknown；
-//   - 放弃返回后放行对端排空：对端仍收不到完整请求（Abort 已在返回前关 socket），
-//     也不出现第二条连接。
+// - 持有型对端 accept 后不读，请求体 8MiB 远超内核缓冲 ⇒ 写侧必然停在
+// Writing（未提交），且 io 域回到空闲等待（不像停放那样冻结事件循环）；
+// - 用 on_write_started 事件确认客户端确已进入写出阶段，随后 deadline 到点，
+// 放弃在 Writing 落定 ⇒ 确定失败（TimedOut），绝不升级为 OutcomeUnknown；
+// - 放弃返回后放行对端排空：对端仍收不到完整请求（Abort 已在返回前关 socket），
+// 也不出现第二条连接。
 //
 // 限制（不伪称覆盖）：本运行时 io handler 与 deadline 定时器同由单一 Scheduler
 // 事件循环线程（CoPoller::PollOnce，见 bbtools-coroutine Scheduler.cc）驱动，
 // 因此「放弃读阶段」与「io 正在同步写出」不可能并发——本用例验证的是放弃边界
 // 的可观察不变量，**不能**在动态上区分未修复实现。F-1 的「放弃决定与 io 域
 // 线性化」由源码线性化点证明：HttpClientImpl::Request 放弃路径在同一 IoGate 内
-// Abort → 读阶段 → SealError → Finish（见 src/http/HttpClientImpl.cc 与决策 0008 §4）。
+// Abort → 读阶段 → SealError → Finish（见 src/http/HttpClientImpl.cc 与决策 0008）。
 BOOST_AUTO_TEST_CASE(t_s8_abandon_pre_commit_is_determinate_no_late_write) {
     ReleaseGate drain_gate;   // 先声明：寿命长于对端线程
     auto got_full = std::make_shared<std::atomic_bool>(false);

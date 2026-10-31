@@ -3,20 +3,20 @@
 //
 // 每个 case 对应审查报告（final-review-report.md）一条缺陷的修复方向，
 // 断言以「修复后契约成立」为真：
-//   d1_read_post_pop_oom_no_loss         P1-1 段元数据在 pop 事务内完成，
-//        Read 不再做 post-pop 分配；注入任何序号都不会丢已提交字节。
-//   d2_grant_pop_append_oom_no_throw    P1-2 TryAppend 的 OOM 折成
-//        Error+not_enough_memory 返回而非抛出——SubmitReceivedOwner 的
-//        m_recv_hold 登记分支可达，owner recv 字节不丢。
-//   d3_sso_payload_not_copied           P2-1 pending/detached 保持可整体
-//        转移的堆 backing（SSO 内联缓冲在移交前已转出），段指针不落在
-//        目标 string 对象内联区间——移交不复制载荷。
-//   d4_copy_assign_deleted              P2-2a Buffer 拷贝构造/赋值已删除，
-//        OOM 悬空段形态不可达。
-//   d5_public_ctor_forge_denied         P2-2b backing+segments 构造已收回
-//        private——外部不可构造伪造 owning 不变量的 Buffer。
-//   d6_coaccept_reclaim_valid_ticket    P1-5 CoAccept 交付的 reclaim 与连接
-//        IsReleased 同一真源：成功时 reclaim 有效且未释放。
+// d1_read_post_pop_oom_no_loss 段元数据在 pop 事务内完成，
+// Read 不再做 post-pop 分配；注入任何序号都不会丢已提交字节。
+// d2_grant_pop_append_oom_no_throw TryAppend 的 OOM 折成
+// Error+not_enough_memory 返回而非抛出——SubmitReceivedOwner 的
+// m_recv_hold 登记分支可达，owner recv 字节不丢。
+// d3_sso_payload_not_copied pending/detached 保持可整体
+// 转移的堆 backing（SSO 内联缓冲在移交前已转出），段指针不落在
+// 目标 string 对象内联区间——移交不复制载荷。
+// d4_copy_assign_deleted 2a Buffer 拷贝构造/赋值已删除，
+// OOM 悬空段形态不可达。
+// d5_public_ctor_forge_denied 2b backing+segments 构造已收回
+// private——外部不可构造伪造 owning 不变量的 Buffer。
+// d6_coaccept_reclaim_valid_ticket CoAccept 交付的 reclaim 与连接
+// IsReleased 同一真源：成功时 reclaim 有效且未释放。
 //
 // 线程约定同 pop_all.cc：不用 sleep_for 依赖时序；等待一律有界轮询/yield。
 #define BOOST_TEST_NO_MAIN
@@ -137,7 +137,7 @@ std::future<void> Task(std::function<void()> callback) {
         } catch (...) {
             promise->set_exception(std::current_exception());
         }
-    }, "net.repro_oom");
+    }, "net.buffer_oom");
     return future;
 }
 
@@ -155,13 +155,13 @@ Buffer Convert(ReceiveRing::PopAllResult& popped) {
 
 }  // namespace
 
-BOOST_AUTO_TEST_SUITE(net_repro_buffer_oom)
+BOOST_AUTO_TEST_SUITE(net_buffer_oom)
 
-// ---- D1（修复后契约）：Read 不做 post-pop 分配 ----
+// ---- （修复后契约）：Read 不做 post-pop 分配 ----
 // 注入逐序号扫描：TryPopAll 内部的可失败步骤仍允许出现（它们先于首个变更
 // 步骤，失败零消费可重试），但 Read 侧不再有第 4 次分配——任何序号下
 // bad_alloc 都不会逃出 Read，已提交字节不会随异常丢失。
-BOOST_AUTO_TEST_CASE(d1_read_post_pop_oom_no_loss) {
+BOOST_AUTO_TEST_CASE(read_post_pop_oom_no_loss) {
     StartRuntime(1);
     // 修复后断言：任何注入序号下 Read 要么成功交付、要么 Error+not_enough_memory
     // 且零消费可重试；绝不抛出且绝不丢已提交字节。
@@ -230,11 +230,11 @@ BOOST_AUTO_TEST_CASE(d1_read_post_pop_oom_no_loss) {
     BOOST_CHECK(saw_error);
 }
 
-// ---- D2（修复后契约）：grant→pop→append OOM 返回错误而非抛出 ----
+// ---- （修复后契约）：grant→pop→append OOM 返回错误而非抛出 ----
 // TryAppend 在「grant 后 pop 移走 backing」交错下需要重新分配；分配失败
 // 折成 Error+not_enough_memory 返回值，SubmitReceivedOwner 的 m_recv_hold
 // 登记分支可达，owner 已 recv 字节不再随异常丢失。
-BOOST_AUTO_TEST_CASE(d2_grant_pop_append_oom_no_throw) {
+BOOST_AUTO_TEST_CASE(grant_pop_append_oom_no_throw) {
     ReceiveRing ring(256);
     BOOST_REQUIRE(ring.TryAppend("old").status == ReadStatus::Ok);
     const auto grant = ring.TryReserveForAppend(64);
@@ -274,10 +274,10 @@ BOOST_AUTO_TEST_CASE(d2_grant_pop_append_oom_no_throw) {
     BOOST_CHECK_EQUAL(ok_append.error.value(), 0);
 }
 
-// ---- D3（修复后契约）：pending/detached 移交不复制载荷 ----
+// ---- （修复后契约）：pending/detached 移交不复制载荷 ----
 // 短载荷仍可在移交后保持「段指针不落在 takeout string 对象内联区间」——
 // pending/detached 在移交前已确保持有堆 backing，move 即指针移交。
-BOOST_AUTO_TEST_CASE(d3_sso_payload_not_copied) {
+BOOST_AUTO_TEST_CASE(sso_payload_not_copied) {
     auto ring = std::make_unique<ReceiveRing>(256);
     BOOST_REQUIRE(ring->AppendDeferred("P"));
     auto popped = ring->TryPopAll();
@@ -327,8 +327,8 @@ BOOST_AUTO_TEST_CASE(d3_sso_payload_not_copied) {
     BOOST_CHECK(!big_inline);
 }
 
-// ---- D4（修复后契约）：Buffer 拷贝已删除，OOM 悬空段形态不可达 ----
-BOOST_AUTO_TEST_CASE(d4_copy_assign_deleted) {
+// ---- （修复后契约）：Buffer 拷贝已删除，OOM 悬空段形态不可达 ----
+BOOST_AUTO_TEST_CASE(copy_assign_deleted) {
     static_assert(!std::is_copy_constructible_v<Buffer>,
                   "修复后契约：Buffer 不可拷贝构造");
     static_assert(!std::is_copy_assignable_v<Buffer>,
@@ -354,8 +354,8 @@ BOOST_AUTO_TEST_CASE(d4_copy_assign_deleted) {
     BOOST_TEST_MESSAGE("d4 copy_deleted move_ok=1");
 }
 
-// ---- D5（修复后契约）：backing+segments 构造已收回 private ----
-BOOST_AUTO_TEST_CASE(d5_public_ctor_forge_denied) {
+// ---- （修复后契约）：backing+segments 构造已收回 private ----
+BOOST_AUTO_TEST_CASE(public_ctor_forge_denied) {
     static_assert(!std::is_constructible_v<Buffer, std::shared_ptr<void>,
                                          std::vector<BufferSegment>>,
                   "修复后契约：公共构造已收回，owning 不变量不可伪造");
@@ -372,8 +372,8 @@ BOOST_AUTO_TEST_CASE(d5_public_ctor_forge_denied) {
     BOOST_TEST_MESSAGE("d5 forge_denied=1 test_access_make_ok=1");
 }
 
-// ---- D6（修复后契约）：CoAccept reclaim 与连接同一事实源 ----
-BOOST_AUTO_TEST_CASE(d6_coaccept_reclaim_valid_ticket) {
+// ---- （修复后契约）：CoAccept reclaim 与连接同一事实源 ----
+BOOST_AUTO_TEST_CASE(coaccept_reclaim_valid_ticket) {
     struct NullHandler : RawHandler {};
     auto handler = std::make_shared<NullHandler>();
     Engine engine(handler);

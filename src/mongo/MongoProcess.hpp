@@ -1,5 +1,5 @@
 #pragma once
-// 进程级驱动运行域（Issue #7 裁决：一个进程级 mongocxx::pool）：
+// 进程级驱动运行域（裁决：一个进程级 mongocxx::pool）：
 // mongocxx::v1::instance 唯一实例 + 按生效 URI 划分的 pool 注册表
 // （上限 kMongoMaxPools）。client 经 MongoPoolLease 持有共享 pool；
 // lease 内 instance 成员先于 pool 声明，保证 pool 必然先于 instance

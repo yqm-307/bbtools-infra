@@ -73,7 +73,7 @@ SocketAddress LocalOf(const CoUDP::SPtr& sock) {  // 传 .value() 解包后的 S
 
 } // namespace
 
-// §5 真实双端 loopback：datagram 边界、peer 地址、回发、LocalAddress。
+// 真实双端 loopback：datagram 边界、peer 地址、回发、LocalAddress。
 BOOST_AUTO_TEST_CASE(t_udp_real_loopback) {
     EnsureRuntime();
 
@@ -140,7 +140,7 @@ BOOST_AUTO_TEST_CASE(t_udp_real_loopback) {
     BOOST_CHECK(sender.value()->IsClosed());
 }
 
-// §5 截断语义：大报文 + 小 buffer → bytes=容量、truncated=true；
+// 截断语义：大报文 + 小 buffer → bytes=容量、truncated=true；
 // 恰好等于容量 → truncated=false；size=0 buffer 读到报文 → truncated=true。
 BOOST_AUTO_TEST_CASE(t_udp_truncation) {
     EnsureRuntime();
@@ -247,7 +247,7 @@ BOOST_AUTO_TEST_CASE(t_udp_zero_length_datagram_and_timeout) {
     BOOST_CHECK(receiver.value()->IsClosed());
 }
 
-// §5 Try*：无数据 WouldBlock、有数据立即成功、TrySend 正常；Try* 不挂起。
+// Try*：无数据 WouldBlock、有数据立即成功、TrySend 正常；Try* 不挂起。
 BOOST_AUTO_TEST_CASE(t_udp_try_operations) {
     EnsureRuntime();
 
@@ -292,7 +292,7 @@ BOOST_AUTO_TEST_CASE(t_udp_try_operations) {
     BOOST_CHECK(receiver.value()->IsClosed());
 }
 
-// §1 关闭协议：跨线程 Close 先封口并唤醒在途 Receive（Closed）、Close 返回即
+// 关闭协议：跨线程 Close 先封口并唤醒在途 Receive（Closed）、Close 返回即
 // 物理收口（IsClosed）、封口后新调用立即 Closed、FD 数字复用后旧对象不再触达。
 BOOST_AUTO_TEST_CASE(t_udp_close_lifecycle) {
     EnsureRuntime();

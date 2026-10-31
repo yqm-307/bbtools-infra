@@ -1,6 +1,6 @@
 #pragma once
-// co-network/v1 N0：统一结果表面 result<T>/result<void>、ErrorCode 与 Error。
-// 契约来源：docs/decisions/0002-co-network-contract-v1.md（bbtools-infra#2）。
+// co-network/v1：统一结果表面 result<T>/result<void>、ErrorCode 与 Error。
+// 契约来源：docs/decisions/0002-co-network-contract.md。
 //
 // core 的 bbt::core::util::Result<T,E> 已评估：其 IsOk/Ok/Err 访问语义与本契约
 // 「value()/error() 访问错误分支抛 std::logic_error、&& 重载、void 特化」不一致，
@@ -33,11 +33,11 @@ inline constexpr std::size_t kMaxValueBytes   = 256;
 using ErrorDetails = std::vector<std::pair<std::string, std::string>>;
 
 // 稳定错误域：infra 自身错误的默认域。上层域（如 framework.actor）及其保留键
-// 语义归各自上层边界拥有（见 decisions/0002 第 76 行的分工说明），本头不再
+// 语义归各自上层边界拥有（分工说明见 docs/decisions/0002-co-network-contract.md），本头不再
 // 硬编码任何上层专属字段语义。
 inline constexpr std::string_view kErrorDomainInfra = "infra";
 
-// 出站请求阶段（Issue #64）：由 operation owner（HTTP/RPC adapter 的 op 状态）
+// 出站请求阶段（request_phase 契约）：由 operation owner（HTTP/RPC adapter 的 op 状态）
 // 维护并随终态错误对外发布。消费者据此机械判定「请求字节是否已完整写出」，
 // 不需要解析 message、errno、日志顺序或用固定等待猜测。
 //
@@ -56,7 +56,7 @@ enum class RequestPhase {
     ReplyTerminal,        // 已获得可信回复终态
 };
 
-// 「请求是否已完整写出」的稳定判定：消费者用它读 #64 的分界，
+// 「请求是否已完整写出」的稳定判定：消费者用它读 request_phase 契约的分界，
 // 不依赖枚举序号，也不接触 Beast/Asio/socket 类型。
 inline constexpr bool IsRequestCommitted(RequestPhase phase) noexcept {
     return phase == RequestPhase::RequestCommitted ||
@@ -209,7 +209,7 @@ inline result<void> ValidateErrorDetails(const Error& error) {
     }
     // 注意：上层域的保留键归属与格式（如 framework.actor 的
     // expected_sequence）由上层边界的 ErrorDomainRule 校验负责；
-    // infra 通用层只保证本函数之上的结构规则，见 decisions/0002。
+    // infra 通用层只保证本函数之上的结构规则，见 docs/decisions/0002-co-network-contract.md。
     return result<void>::ok();
 }
 

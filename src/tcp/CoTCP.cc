@@ -143,7 +143,7 @@ result<addrinfo*> _ResolveHost(const std::string& host, std::uint16_t port,
     return result<addrinfo*>::ok(state->results);
 }
 
-// co-io-adapter/v1 §4.0.1.3：数值地址直接进入非阻塞 connect，
+// co-io-adapter/v1 非阻塞 connect 契约：数值地址直接进入非阻塞 connect，
 // 不允许落到 getaddrinfo（DNS 属于 transport 接管的阻塞路径）。
 bool _TryNumericAddress(const std::string& host, sockaddr_storage& out,
                         socklen_t& out_len) {
@@ -531,7 +531,7 @@ result<std::size_t> CoTCP::_ReadSome(void* buffer, std::size_t size,
     auto entry = _CheckEntry(/*in_coroutine_only=*/true);
     if (!entry)
         return result<std::size_t>::err(std::move(entry).error());
-    // §4.0.1.7：Runtime 在途门禁——admit 先于 m_inflight 计数，拒绝即
+    // 在途配额契约：Runtime 在途门禁——admit 先于 m_inflight 计数，拒绝即
     // Overloaded 立即返回；名额登记在 m_quota_held（对象侧账本），
     // op 结束归还 1，Close/析构 DrainQuota 兜底。
     if (m_inflight_admit && !m_inflight_admit())
@@ -549,7 +549,7 @@ result<std::size_t> CoTCP::_ReadSome(void* buffer, std::size_t size,
         if (m_inflight_admit)
             ++m_quota_held;
     }
-    // §4.0.1.7 测试接缝：名额已登记（m_quota_held++），等待循环尚未进入。
+    // 在途配额测试接缝：名额已登记（m_quota_held++），等待循环尚未进入。
     // 测试据此断言「op 已占名额」而无需时间推断。
     if (m_wait_entry_gate_for_test)
         m_wait_entry_gate_for_test();
@@ -558,7 +558,7 @@ result<std::size_t> CoTCP::_ReadSome(void* buffer, std::size_t size,
       for (;;) {
         ssize_t n;
         {
-          // §1：最后一次封口检查 + 非阻塞 syscall 与物理 close 同锁配对。
+          // 关闭契约：最后一次封口检查 + 非阻塞 syscall 与物理 close 同锁配对。
           // _CloseFd 持同一把 m_mtx，封口置位后不可能再有 syscall 越过本锁。
           std::lock_guard<std::mutex> lock(m_mtx);
           if (m_closing || m_fd < 0)
@@ -576,7 +576,7 @@ result<std::size_t> CoTCP::_ReadSome(void* buffer, std::size_t size,
           if (m_closing || m_fd < 0)
             return result<std::size_t>::err(MakeError(ErrorCode::Closed, "TCP socket closed"));
         }
-        // F3：数据路径挂起落定回调——证明协程真实挂起在 fd 可读等待。
+        // 数据路径挂起落定回调——证明协程真实挂起在 fd 可读等待。
         auto wait = _WaitFd(fd, true, options, m_close_waiters.get(),
                             m_io_wait_registered_gate_for_test);
         if (!wait) return result<std::size_t>::err(std::move(wait).error());
@@ -616,7 +616,7 @@ result<std::size_t> CoTCP::_WriteSome(const void* buffer, std::size_t size,
       for (;;) {
         ssize_t n;
         {
-          // §1：最后一次封口检查 + 非阻塞 syscall 与物理 close 同锁配对。
+          // 关闭契约：最后一次封口检查 + 非阻塞 syscall 与物理 close 同锁配对。
           std::lock_guard<std::mutex> lock(m_mtx);
           if (m_closing || m_fd < 0)
             return result<std::size_t>::err(MakeError(ErrorCode::Closed, "TCP socket closed"));
@@ -632,7 +632,7 @@ result<std::size_t> CoTCP::_WriteSome(const void* buffer, std::size_t size,
           if (m_closing || m_fd < 0)
             return result<std::size_t>::err(MakeError(ErrorCode::Closed, "TCP socket closed"));
         }
-        // F3：数据路径挂起落定回调——证明协程真实挂起在 fd 可写等待。
+        // 数据路径挂起落定回调——证明协程真实挂起在 fd 可写等待。
         auto wait = _WaitFd(fd, false, options, m_close_waiters.get(),
                             m_io_wait_registered_gate_for_test);
         if (!wait) return result<std::size_t>::err(std::move(wait).error());
@@ -648,12 +648,12 @@ result<std::size_t> CoTCP::_WriteAll(const void* buffer, std::size_t size,
     if (size && !buffer)
         return result<std::size_t>::err(MakeError(ErrorCode::InvalidArgument,
             "null TCP write buffer"));
-    // §4.0.1.7：与 ReadSome/WriteSome 共用同一入口门禁（参数之外的协程上下文
+    // 在途配额契约：与 ReadSome/WriteSome 共用同一入口门禁（参数之外的协程上下文
     // 与运行时可用性检查），不再自带一份等价副本。
     auto entry = _CheckEntry(/*in_coroutine_only=*/true);
     if (!entry)
         return result<std::size_t>::err(std::move(entry).error());
-    // §4.0.1.7 在途粒度：WriteAll 是 _WriteSome 的重试循环，**不**在自身入口
+    // 在途粒度（在途配额契约）：WriteAll 是 _WriteSome 的重试循环，**不**在自身入口
     // 占名额——在途粒度是每一轮内部单次写尝试（每轮 admit/归还）。轮间名额可
     // 被其他 op 取走，故多轮 WriteAll 可能中途 Overloaded；已写字节数始终经
     // error.transferred_bytes 回报（见下方 !part 分支）。
@@ -695,7 +695,7 @@ void CoTCP::_EndIo() noexcept {
     {
         std::lock_guard<std::mutex> lock(m_mtx);
         --m_inflight;
-        // §4.0.1.7：op 落定归还本对象计入的一个在途名额；若对象已封口
+        // 在途配额契约：op 落定归还本对象计入的一个在途名额；若对象已封口
         // （Close 先行 DrainQuota），m_quota_held 已清零，此归还不会发生
         // ——两条归还路径互斥不重复。
         if (m_quota_held > 0) {
@@ -717,7 +717,7 @@ void CoTCP::Close() noexcept {
         std::unique_lock<std::mutex> lock(m_mtx);
         if (!m_closing.exchange(true)) {
             // 首次调用者执行完整收口：封口 → 唤醒挂起 op → 物理释放。
-            // §4.0.1.7：挂起 op 可能仍在等待段（未被唤醒或唤醒后尚未退出），
+            // 在途配额契约：挂起 op 可能仍在等待段（未被唤醒或唤醒后尚未退出），
             // 此处先归还全部未归还名额；op 若仍返回，其 _EndIo 见
             // m_quota_held==0 不再重复归还。
             _DrainQuotaLocked();
@@ -727,7 +727,7 @@ void CoTCP::Close() noexcept {
             // 登记中的 op 先完成登记（旧 fd 有效），物理 close 不会越过；已过最后
             // 检查但尚未 BeginRegister 的晚到 op 在此封口后得到明确 Closed，不在
             // 已关/复用 fd 上登记（修复 InitFdEvent EBADF/RuntimeUnavailable）。
-            // syscall 与物理 close 仍持同一把 m_mtx（§1），封口后无 syscall 越过。
+            // syscall 与物理 close 仍持同一把 m_mtx（关闭契约），封口后无 syscall 越过。
             m_close_waiters->SealWakeAndDrainRegistrations();
             lock.lock();
             settled_now = _SettleClosedLocked();
@@ -848,7 +848,7 @@ result<std::shared_ptr<CoTCP>> CoTCPListener::Accept(const CallOptions& options)
     auto entry = _CheckEntry();
     if (!entry)
         return result<std::shared_ptr<CoTCP>>::err(std::move(entry).error());
-    // §4.0.1.7：Runtime 在途门禁先于连接容量（m_accept_admit）。容量满
+    // 在途配额契约：Runtime 在途门禁先于连接容量（m_accept_admit）。容量满
     // 立即 Overloaded、不排队；名额计入 m_quota_held，op 结束经 _EndIo
     // 归还，Close/析构经 DrainQuota 兜底。
     bool quota_admitted = false;
@@ -859,7 +859,7 @@ result<std::shared_ptr<CoTCP>> CoTCPListener::Accept(const CallOptions& options)
         quota_admitted = true;
     }
     bool capacity_reserved = false;
-    // §4.0.1.7：接纳容量预留的出账凭据。正常终态（adopt 转移 / release 归还）
+    // 在途配额契约：接纳容量预留的出账凭据。正常终态（adopt 转移 / release 归还）
     // 由本 op 唯一返回路径出账（容量归还 + 本凭据消费计数）；封口唤醒使挂起
     // Accept 照常走该返回路径，故不再需要停机期兜底出账。
     struct ReservedLedger {
@@ -898,14 +898,14 @@ result<std::shared_ptr<CoTCP>> CoTCPListener::Accept(const CallOptions& options)
         if (quota_admitted)
             ++m_quota_held;
     }
-    // §4.0.1.7 测试接缝：名额登记完成、首次 accept4/等待前触发。
+    // 在途配额测试接缝：名额登记完成、首次 accept4/等待前触发。
     if (m_wait_entry_gate_for_test)
         m_wait_entry_gate_for_test();
     auto run = [&]() -> result<std::shared_ptr<CoTCP>> {
       for (;;) {
         int fd;
         {
-          // §1：最后一次封口检查 + 非阻塞 syscall 与物理 close 同锁配对。
+          // 关闭契约：最后一次封口检查 + 非阻塞 syscall 与物理 close 同锁配对。
           std::lock_guard<std::mutex> lock(m_mtx);
           if (m_closing || m_fd < 0)
             return result<std::shared_ptr<CoTCP>>::err(
@@ -1004,7 +1004,7 @@ void CoTCPListener::Close() noexcept {
         if (!m_closing.exchange(true)) {
             _DrainQuotaLocked();   // 封口头归还仍持有的在途名额
             lock.unlock();
-            // §1 + 关闭线性化：封口后无 accept4 可越过本锁；先唤醒在册等待者，
+            // 关闭契约 + 关闭线性化：封口后无 accept4 可越过本锁；先唤醒在册等待者，
             // 再等在途「fd 兴趣登记」排空才物理释放 fd——登记中的 op 先完成登记
             // （fd 有效），晚到 op 在 BeginRegister 处得到明确 Closed，不在已关/
             // 复用 fd 上登记。

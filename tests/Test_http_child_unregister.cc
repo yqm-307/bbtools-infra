@@ -1,33 +1,33 @@
-// Issue #38：HTTP 子对象物理关闭后从 NetworkRuntime 托管集合安全反登记。
+// HTTP 子对象物理关闭后从 NetworkRuntime 托管集合安全反登记。
 //
-// 关闭面按进程寿命运行时修订（契约 §1）：ICoCloseable 只有
+// 关闭面按进程寿命运行时修订（契约）：ICoCloseable 只有
 // Close()/IsClosed()。已删除语义不保留旧断言：RequestClose/WaitClosed、
 // CloseStatus、取消令牌、CompletionSignal 都不再使用；每个用例的 runtime
 // 在用例内显式 Close() 并断言物理收口（IsClosed + 托管集合/transport
 // 落定探针 + weak_ptr 失效），不用 Scheduler::Stop()。
 //
 // 验收映射（infra-review-issues-20260924/02-http-owner.md）：
-//   t_children_released_while_runtime_alive
-//       — Runtime 存活期间反复创建/关闭/释放有限数量 client 与 server；
-//         关闭回调排空且外部引用退出后 weak_ptr 失效，不等 Runtime 析构。
-//   t_close_midflight_unregisters_child
-//       — 在途请求 + owner 同步 Close()：已发送请求立即拿终态；物理关闭
-//         后从托管集合反登记（外部引用释放即 weak 失效）；已接纳 handler
-//         不被抢占，其回复只消费不交付。
-//   t_idle_client_released_still_managed
-//       — 空闲活跃对象（无在途 op、未 Close）释放唯一外部引用后仍由
-//         Runtime 强托管；隔离 ClientOp::owner 反向强引用，Runtime
-//         teardown 落定后 weak_ptr 失效（client 与 server 双侧）。
-//   t_runtime_close_with_early_released_children
-//       — 子对象先关、Runtime 后关、外部引用提前释放的组合路径：
-//         计数不丢、不双删、不 UAF。
-//   t_repeat_and_factory_race_close
-//       — 重复 Close、并发 Close、工厂与 Close 竞争：Close 幂等，
-//         关闭中/后的工厂调用一律拒绝，已登记对象必被收口。
-//   t_handler_captured_resource_released
-//       — server handler 捕获资源以析构计数证明可释放，不靠 RSS 判断。
-//   t_end_runtime_convergence
-//       — 收尾：Runtime 显式 Close() + 托管集合/transport 物理落定。
+// t_children_released_while_runtime_alive
+// — Runtime 存活期间反复创建/关闭/释放有限数量 client 与 server；
+// 关闭回调排空且外部引用退出后 weak_ptr 失效，不等 Runtime 析构。
+// t_close_midflight_unregisters_child
+// — 在途请求 + owner 同步 Close()：已发送请求立即拿终态；物理关闭
+// 后从托管集合反登记（外部引用释放即 weak 失效）；已接纳 handler
+// 不被抢占，其回复只消费不交付。
+// t_idle_client_released_still_managed
+// — 空闲活跃对象（无在途 op、未 Close）释放唯一外部引用后仍由
+// Runtime 强托管；隔离 ClientOp::owner 反向强引用，Runtime
+// teardown 落定后 weak_ptr 失效（client 与 server 双侧）。
+// t_runtime_close_with_early_released_children
+// — 子对象先关、Runtime 后关、外部引用提前释放的组合路径：
+// 计数不丢、不双删、不 UAF。
+// t_repeat_and_factory_race_close
+// — 重复 Close、并发 Close、工厂与 Close 竞争：Close 幂等，
+// 关闭中/后的工厂调用一律拒绝，已登记对象必被收口。
+// t_handler_captured_resource_released
+// — server handler 捕获资源以析构计数证明可释放，不靠 RSS 判断。
+// t_end_runtime_convergence
+// — 收尾：Runtime 显式 Close() + 托管集合/transport 物理落定。
 //
 // 同步纪律：跨线程/跨协程一律原子标志 + WaitUntil（有界预算）与
 // CountDownLatch；handler 内等待用 bbtco_sleep 轮询真实事件标志。
@@ -279,7 +279,7 @@ BOOST_AUTO_TEST_CASE(t_close_midflight_unregisters_child) {
         WaitUntil([&] { return out_ready.load(std::memory_order_acquire); }));
     BOOST_REQUIRE(out.has_value());
     BOOST_REQUIRE(!out.value());
-    // #64：服务端 handler 已进入 ⇒ 请求已完整写出 ⇒ owner Close 后是未知。
+    // docs/decisions/0008-request-phase-outcome-unknown.md：服务端 handler 已进入 ⇒ 请求已完整写出 ⇒ owner Close 后是未知。
     BOOST_CHECK(out->error().code == ErrorCode::OutcomeUnknown);
     BOOST_REQUIRE(out->error().request_phase.has_value());
     BOOST_CHECK(*out->error().request_phase == RequestPhase::RequestCommitted);
@@ -408,26 +408,26 @@ BOOST_AUTO_TEST_CASE(t_repeat_and_factory_race_close) {
     // 两侧胜出者都来自与 Close 同一并发窗口的竞态线程结果，
     // 不使用任何在屏障前预登记的对象充当成功样本。
     // 线性化点在 CheckAndAdoptLocked 的锁内复检（m_state/m_sealed/IsOpen）：
-    //   adopt 成功 ⇒ 对象登记早于 Close 的 m_state 提交点 ⇒
-    //     必在 teardown 快照中被收口：Close 后 IsClosed 成立、
-    //     外部引用释放后 weak 失效；
-    //   adopt 失败 ⇒ Closed 错误，不假成功、不产生孤儿。
+    // adopt 成功 ⇒ 对象登记早于 Close 的 m_state 提交点 ⇒
+    // 必在 teardown 快照中被收口：Close 后 IsClosed 成立、
+    // 外部引用释放后 weak 失效；
+    // adopt 失败 ⇒ Closed 错误，不假成功、不产生孤儿。
     int saw_adopted  = 0;
     int saw_rejected = 0;
 
     // 子段 A：adopt 胜出必须来自与 Close 的真实重叠调用窗口，
     // 不靠 sleep/时序推断。确定性构造（不碰运气）：
-    //   1) 经 impl 测试接缝 SetAdoptCommitGateForTest 把 factory 的
-    //      CreateHttpClient 停在「CheckAndAdoptLocked 复检已过、
-    //      登记提交未发生」的临界段内（此时仍持 m_lifecycle_mtx）；
-    //   2) 主线程观察到 factory 停在调用内部后，才发起
-    //      runtime2->Close()——factory 调用窗口 ⊃ Close
-    //      调用窗口，重叠是构造保证的，不是时序猜测；
-    //   3) 放行 gate：登记在 Close 已提交 BeginClose/
-    //      m_state、io 域/关闭线程正等 m_lifecycle_mtx 时提交——
-    //      sealed 尚未置位 ⇒ 登记先于 sealed ⇒ teardown 快照必含
-    //      此对象 ⇒ Close 后必 IsClosed、外部引用释放后 weak
-    //      失效。若实现丢这份通知，saw_adopted 断言失败。
+    // 1) 经 impl 测试接缝 SetAdoptCommitGateForTest 把 factory 的
+    // CreateHttpClient 停在「CheckAndAdoptLocked 复检已过、
+    // 登记提交未发生」的临界段内（此时仍持 m_lifecycle_mtx）；
+    // 2) 主线程观察到 factory 停在调用内部后，才发起
+    // runtime2->Close()——factory 调用窗口 ⊃ Close
+    // 调用窗口，重叠是构造保证的，不是时序猜测；
+    // 3) 放行 gate：登记在 Close 已提交 BeginClose/
+    // m_state、io 域/关闭线程正等 m_lifecycle_mtx 时提交——
+    // sealed 尚未置位 ⇒ 登记先于 sealed ⇒ teardown 快照必含
+    // 此对象 ⇒ Close 后必 IsClosed、外部引用释放后 weak
+    // 失效。若实现丢这份通知，saw_adopted 断言失败。
     {
         auto rt2 = NetworkRuntime::Create(MakeLimits());
         BOOST_REQUIRE(rt2);
@@ -463,7 +463,7 @@ BOOST_AUTO_TEST_CASE(t_repeat_and_factory_race_close) {
         // 发起时仍在飞，登记提交也必然晚于 Close 发起点：
         // 两次调用真实重叠，不依赖任何 sleep/时序推断。
         // （不先 join closer：Close 会阻塞在 factory 所持的
-        //   m_lifecycle_mtx 上，先 join 将死锁。）
+        // m_lifecycle_mtx 上，先 join 将死锁。）
         std::atomic<bool> close_entered{false};
         std::thread closer([&] {
             close_entered.store(true, std::memory_order_release);

@@ -1,8 +1,8 @@
 #pragma once
-// MongoRuntime：Issue #40 引入的 mongo 资源 owner（仍走 Issue #7 裁决的
+// MongoRuntime：mongo 资源 owner（docs/decisions/0007-mongo-owner-handles.md；仍走裁决的
 // mongocxx 同步 driver + 有界 worker bridge）。
 //
-// 归属变化（与 #7 每 client 一组 worker 的差异）：
+// 归属变化（与旧契约每 client 一组 worker 的差异）：
 //   - 连接配置、pool lease、worker 组、接纳队列、ops 注册表与关闭排空
 //     集中在 owner；集合句柄（MongoCollImpl）只携带 db/collection
 //     目标值与 owner 共享指针，不新建线程。
@@ -14,7 +14,7 @@
 //     终态，已进入 driver 的调用继续到 driver timeout，op、client lease
 //     与 payload 保活到物理收口。
 //
-// 请求完成（契约 §2）：一次业务调用内部走 CoWaiter::WaitWithCallback
+// 请求完成（请求完成契约）：一次业务调用内部走 CoWaiter::WaitWithCallback
 // 范式——登记等待事件 → 在 on_registered 内登记 CloseWaiters 并做一次
 // 入队投递 → 挂起；响应/结果放 op state，每个 op 只向业务交付一次终态
 // （CAS 落定）。pending（未派发）op 遇 Close 直接从队列摘出、不发送；
@@ -220,13 +220,13 @@ public:
         return n;
     }
     // 关闭链路观测（m_ops_mtx 保护）：确认启动失败/关闭收口后 io 域已
-    // 置死，后续提交一律按 Closed 拒绝（Issue #12 M1）。
+    // 置死，后续提交一律按 Closed 拒绝（回归接缝）。
     bool IoDeadForTest() const noexcept {
         std::lock_guard<std::mutex> lk(m_ops_mtx);
         return m_io_dead;
     }
 
-    // Issue #12 M1 回归接缝（生产路径不安装；默认 kSpawnFailNone 不改变
+    // 回归接缝（生产路径不安装；默认 kSpawnFailNone 不改变
     // 行为）：让下一次 Start 的 worker 组在指定点失败——kSpawnFailReserve
     // 在 reserve 前失败（等价 bad_alloc），其余值在第 N 个 worker 创建前
     // 失败（等价 std::thread 构造抛 system_error，此时已起 N 个 worker）。
@@ -278,7 +278,7 @@ private:
     mutable std::mutex                           m_ops_mtx;
     std::unordered_set<std::shared_ptr<MongoOp>> m_ops;
     bool m_io_dead{false};   // m_ops_mtx 保护：teardown 后置位
-    // Issue #12 M1 回归接缝状态；生产默认 kSpawnFailNone。
+    // 回归接缝状态；生产默认 kSpawnFailNone。
     std::atomic<std::size_t> m_spawn_fail_at{kSpawnFailNone};
     // Close 有界排空等待（m_ops_mtx + 谓词「op 清空且 worker 全退」）。
     std::condition_variable                      m_drain_cv;

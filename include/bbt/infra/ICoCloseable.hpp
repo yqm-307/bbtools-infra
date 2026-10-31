@@ -1,5 +1,5 @@
 #pragma once
-// co-network/v1 N0：关闭契约（进程寿命运行时修订）。
+// co-network/v1：关闭契约（进程寿命运行时修订）。
 //
 // 关闭时机由资源 owner/上层（framework manager）决定，不绑定 coroutine
 // runtime：Close() 同步完成物理释放并返回——返回即本对象拥有的物理资源

@@ -65,7 +65,7 @@ struct Watcher::Impl {
     // 落定；RequestClose 自身（含回调内自关闭）不提前 MarkClosed。
     detail::ManagedCloseState close;
 
-    // 回调起点与 close 的线性化门（P2-6）：Deliver 的「open 检查 + 进入
+    // 回调起点与 close 的线性化门：Deliver 的「open 检查 + 进入
     // callback」与 RequestClose 的「BeginClose + 唤醒」在同一把门下，使
     // RequestClose 返回时不可能再有新回调起点；已通过 open 检查获准的
     // 当前回调可以执行完成（回调不得阻塞是本契约前置，等待有界）。

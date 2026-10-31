@@ -50,7 +50,7 @@ HttpSession::HttpSession(std::shared_ptr<HttpServerImpl> srv,
 
 #ifdef BBT_INFRA_STRINGENT_DEBUG
 HttpSession::~HttpSession() {
-    // issue #62 验收第 5 项：析构即向独立观测组件 debug/InfraDebug.hpp 上报。
+    // 析构即向独立观测组件 debug/InfraDebug.hpp 上报。
     // m_sessions 只保存裸指针，正常路径下 MaybeRelease 已在 Close（io 域门内、
     // inflight 归零时）反登记，故 registered 必为 false。仅在
     // BBT_INFRA_STRINGENT_DEBUG 下存在：Release 无此析构、无计数写入、无符号。
@@ -245,7 +245,7 @@ void HttpSession::OnDeadline(boost::system::error_code ec,
     IoAsyncDone();
     if (ec || closed)
         return;
-    // 期限到点：关闭会话切断回复路径。已接纳 handler 不取消（契约 §N1：
+    // 期限到点：关闭会话切断回复路径。已接纳 handler 不取消（冻结契约：
     // StopAccepting/Close 都不抢占 handler），其持有的 InFlightRequest
     // 仍然有效，回复在写路径上按「只交付一次终态」收口。
     Close();
@@ -322,7 +322,7 @@ void HttpSession::Dispatch(bool keep_alive) {
     bool succ = false;
     // 业务 handler 移交受管协程执行；I/O 回调到此为止。
     // req_state 经捕获随 coroutine task 存活：期限信息覆盖 handler 全程，
-    // 不会被响应超时或连接断开提前释放（契约 §120）；handler 不被抢占。
+    // 不会被响应超时或连接断开提前释放（冻结契约）；handler 不被抢占。
     bbt::coroutine::detail::Scheduler::GetInstance()->RegistCoroutineTask(
         [self, req_state, req = std::move(req), ctx, keep_alive]() mutable {
             self->RunHandler(std::move(req), std::move(ctx), keep_alive);
@@ -383,7 +383,7 @@ void HttpSession::RunHandler(HttpRequest request, IncomingCallContext ctx,
         // payload 挂在会话持有的壳上、排队 lambda 只捕获壳：owner Close 在
         // 域门内清空壳即同步释放 body——不把 8MiB 留在排队回调里。
         pending_reply = reply;
-        // issue #19：先置 reply_posted 再投递——若 Close 的 Teardown
+        // 先置 reply_posted 再投递——若 Close 的 Teardown
         // 抢先进 io 队列并 Abort→Close，Close 见 reply_posted 会延迟到本
         // DeliverResult 写完才真关，不再丢弃已产出的响应。
         reply_posted.store(true, std::memory_order_release);
@@ -478,7 +478,7 @@ void HttpSession::PumpWrite() {
         }
     }
     // 本条回复已全部交给内核：本次请求的回复终结。
-    // issue #19：清 reply_posted 让随后 Close（含 close_after_write 延迟路径）
+    // 清 reply_posted 让随后 Close（含 close_after_write 延迟路径）
     // 真正关闭 socket。
     reply_posted.store(false, std::memory_order_release);
     if (close_after_write || !reply_keep_alive || !server->Accepting() ||
@@ -519,7 +519,7 @@ void HttpSession::ReplyStatusAndClose(unsigned status) {
 
 void HttpSession::Abort() noexcept {
     // owner close：断开会话；已接纳 handler 不取消，按只交付一次终态收口。
-    // 冻结契约 §6：owner 的 Close 直接丢弃未发送数据并同步释放 buffer，不做
+    // resource-close-boundary 冻结契约：owner 的 Close 直接丢弃未发送数据并同步释放 buffer，不做
     // flush。因此这里强制同步断开——置 discard_unsent 让 Close 跳过
     // close_after_write 延迟分支（该分支会在 Close 返回后继续写同一 socket）。
     discard_unsent.store(true, std::memory_order_release);
@@ -545,7 +545,7 @@ void HttpSession::MaybeRelease() {
 }
 
 void HttpSession::ReleaseBuffers() noexcept {
-    // 冻结契约 §6：Close 直接丢弃未发送数据并同步释放 buffer。
+    // resource-close-boundary 冻结契约：Close 直接丢弃未发送数据并同步释放 buffer。
     // 顺序：serializer（引用 message）→ message → parser → flat_buffer →
     // 排队中的 handler 结果载荷。以上都不被任何在途完成项引用（在途的只有
     // 「不借 payload 的就绪等待」），因此此处 reset 不会造成悬垂。
@@ -568,7 +568,7 @@ void HttpSession::Close() noexcept {
     // handler 已产出结果、DeliverResult 仍在 io 队列未写时，线级触发的关闭
     // （对端 FIN / 期限到点）标记 close_after_write，让响应经写路径写完后
     // 回到这里真正关闭。owner teardown 路径（Abort 置 discard_unsent）不走
-    // 这条延迟分支：冻结契约 §6 要求 Close 丢弃未发送数据并同步释放。
+    // 这条延迟分支：resource-close-boundary 冻结契约要求 Close 丢弃未发送数据并同步释放。
     if (!discard_unsent.load(std::memory_order_acquire) &&
         reply_posted.load(std::memory_order_acquire) && !close_after_write) {
         close_after_write = true;

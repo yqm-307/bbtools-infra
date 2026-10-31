@@ -6,7 +6,7 @@
 // 现有事件循环线程推进）；终态 handler 把 result<HttpResponse>
 // 写入堆上 operation state 后 Notify 等待者；调用协程经
 // CoWaiter::WaitWithCallback 先登记事件、再投递 Begin、随后挂起
-// （契约 §2 请求完成范式）。I/O 回调不触碰业务协程栈，不新造事件
+// （请求完成契约范式）。I/O 回调不触碰业务协程栈，不新造事件
 // 状态机，不依赖 Linux Hook。
 //
 // 关闭语义（进程寿命运行时修订）：Close() 幂等、任意线程可调用，
@@ -15,7 +15,7 @@
 // 且后端不会再访问已释放资源；无 RequestClose/WaitClosed、无取消令牌、无
 // CompletionSignal。
 //
-// 资源模型（与 server 同源，冻结契约 resource-close-boundary §6：Close 直接
+// 资源模型（与 server 同源，resource-close-boundary 冻结契约：Close 直接
 // 丢弃未发送数据并同步释放 buffer，不 flush）：
 //   - request/parser/flat_buffer 是 op 自身的 owner 资源，只在 io 域门内被
 //     访问；写/读走「非阻塞 send/receive + 序列化器/解析器泵」；
@@ -63,7 +63,7 @@ struct ClientOp : std::enable_shared_from_this<ClientOp> {
     // Finish 的 Notify 跨线程安全；早到（协程 park 前）唤醒走
     // CoPollEvent 的 PENDING 路径，不丢唤醒。
     bbt::coroutine::sync::CoWaiter::SPtr  waiter;
-    // resolver 是第三方 Asio 对象的 owner 载荷（#56 H1）。它的后台
+    // resolver 是第三方 Asio 对象的 owner 载荷（resolver 寿命契约）。它的后台
     // getaddrinfo 由 Asio 解析服务线程执行，cancel() 返回不等于该线程已
     // 停止，也无法同步 join——本适配器不新增阻塞 join 层。寿命保护靠
     // 「解析 handler 捕获 shared_from_this()」：只要完成项尚未投递，本 op
@@ -87,14 +87,14 @@ struct ClientOp : std::enable_shared_from_this<ClientOp> {
     // 首次发布即逻辑终态：Finish 经 CAS 保证只落定一次（io 域为主，
     // TryPost 失败/调用方提前返回的收口路径可能在其它线程触发）。
     std::atomic_bool                      finished{false};
-    // Issue #64：请求阶段事实。写侧只有 io 域（Begin/OnConnect/PumpWrite/
+    // request_phase 契约（docs/decisions/0008-request-phase-outcome-unknown.md）：请求阶段事实。写侧只有 io 域（Begin/OnConnect/PumpWrite/
     // PumpRead），严格单调前进；读侧是调用方线程（Wait 返回后决定终态）与
     // owner Close 线程（Finish 收口），故用 atomic。
     std::atomic<RequestPhase>             phase{RequestPhase::NotStarted};
 
     RequestPhase Phase() const noexcept { return phase.load(); }
 
-    // 终态错误合成（#64 的唯一分界点），就地改写传入的错误：
+    // 终态错误合成（request_phase 契约的唯一分界点），就地改写传入的错误：
     //   - 绑定本次落定的请求阶段；
     //   - 已完整写出（IsRequestCommitted）且失去可信回复终态时升级为
     //     OutcomeUnknown；
@@ -121,7 +121,7 @@ struct ClientOp : std::enable_shared_from_this<ClientOp> {
     // 另一侧看到已置零即认定自己是晚到空壳，不再触碰 socket/资源。
     bool                                  op_armed{false};
 
-    // #57 H2：多 endpoint 串行连接状态。不用 asio::async_connect 的 range
+    // 串行 connect 契约：多 endpoint 串行连接状态。不用 asio::async_connect 的 range
     // 组合操作——其内部对每个 endpoint 的 close/open 在 socket executor 上
     // 异步恢复，不经过任何本模块入口（不持 IoGate），会与跨线程 Abort/Close
     // 的 socket 触碰并发。改为在本门内逐条 close/open/发起单次
@@ -130,27 +130,27 @@ struct ClientOp : std::enable_shared_from_this<ClientOp> {
     // 语义与错误分类不变（见 OnConnect：非 operation_aborted 才回退下一条）。
     boost::asio::ip::tcp::resolver::results_type endpoints;
     std::size_t                           next_endpoint{0};
-    // #57 H2 证据计数：本 op 已发起的单次 connect 尝试数（仅 io 域写；测试
+    // 串行 connect 证据计数：本 op 已发起的单次 connect 尝试数（仅 io 域写；测试
     // 在 op->finished 置位后再读，happens-before 由 finished 的 exchange 建立）。
     int                                   connect_attempts{0};
 
-    // 测试 seam（#55 F2）：在「发起某个 async_* 之前、同一 try 块内」被调用，
+    // 测试 seam（失败收口契约）：在「发起某个 async_* 之前、同一 try 块内」被调用，
     // 供用例注入同步异常，确定性走到对应发起失败分支。实参为站点标识
     // （resolve/connect/write/armwait/io_pump）。生产路径恒为空。
     std::function<void(const char*)>      io_fault;
-    // 测试 seam（#56 H1）：解析完成项进入处理前（尚未取 IoGate）调用一次，
+    // 测试 seam（resolver 寿命契约）：解析完成项进入处理前（尚未取 IoGate）调用一次，
     // 供用例门控「查询完成处理」并与 Close 竞争。生产路径恒为空。
     std::function<void()>                 on_resolve;
-    // 测试 seam（#57 H2）：TryStartConnect 入口（同一 IoGate 内）调用一次，
+    // 测试 seam（串行 connect 契约）：TryStartConnect 入口（同一 IoGate 内）调用一次，
     // 供用例门控「连接内部步骤」并观察与 Close 的串行。生产路径恒为空。
     std::function<void()>                 on_connect_attempt;
-    // 测试 seam（#64 F-1/F-3）：OnConnect 内进入写出阶段（phase=Writing）、
+    // 测试 seam（request_phase 契约）：OnConnect 内进入写出阶段（phase=Writing）、
     // 尚未写出任何字节时，在同一 IoGate 内调用一次。用例据此获得「客户端已
     // 进入写出」的因果事件（不靠 accept 计数猜 Connecting/Writing），也可在
     // 同一门内停放 io 域以确定性构造放弃/Close 与写侧的先后。生产路径恒空。
     std::function<void()>                 on_write_started;
 
-    // 测试 seam（#57 H2）：注入解析结果并驱动首个 endpoint 尝试。生产路径
+    // 测试 seam（串行 connect 契约）：注入解析结果并驱动首个 endpoint 尝试。生产路径
     // 不经此——生产由 OnResolve 的真实解析结果驱动。
     void SetEndpointsForTest(boost::asio::ip::tcp::resolver::results_type eps) {
         endpoints = std::move(eps);
@@ -184,7 +184,7 @@ struct ClientOp : std::enable_shared_from_this<ClientOp> {
     // completion 落定路径上变化，两处都必须调用。
     void MaybeUnregister();
 
-    // Issue #37：物理收口归还钩子。op 离开 m_ops（= 后端不再访问
+    // HTTP 出站配额契约（docs/decisions/0002-co-network-contract.md）：物理收口归还钩子。op 离开 m_ops（= 后端不再访问
     // 本 op 资源）的瞬间由 UnregisterOp 调一次。TryAdmit 成功才
     // 登记该钩，所以严格配对、每条路径只归还一次。
     std::function<void()> on_unregister;
@@ -197,11 +197,11 @@ private:
     void OnResolve(boost::system::error_code ec,
                    boost::asio::ip::tcp::resolver::results_type results);
     void OnConnect(boost::system::error_code ec);
-    // #57 H2：门内推进到下一个 endpoint，关旧 socket、按新 endpoint 协议族
+    // 串行 connect 契约：门内推进到下一个 endpoint，关旧 socket、按新 endpoint 协议族
     // 打开并发起单次 async_connect；全部 socket 触碰在本门内与本门外的
     // Abort/Close 串行。
     void TryStartConnect();
-    // #55 F2 共同根因：失败路径在同一 IoGate 内先 Abort()（关 socket/resolver +
+    // 失败收口共同根因：失败路径在同一 IoGate 内先 Abort()（关 socket/resolver +
     // 释放 op 载荷）再 Finish()，保证 op 离开 owner m_ops 前资源已物理释放。
     void FailFinish(result<HttpResponse> r) noexcept;
 };
@@ -214,7 +214,7 @@ public:
         : m_engine(std::move(engine)),
           m_info(std::move(info)) {}
 
-    // Issue #37：配额钩子由 owner（NetworkRuntimeImpl）在创建时注入。
+    // HTTP 出站配额契约（docs/decisions/0002-co-network-contract.md）：配额钩子由 owner（NetworkRuntimeImpl）在创建时注入。
     // admit 在「登记 op / 发起 I/O 之前」原子预留名额；release 在 op
     // 物理收口（UnregisterOp）时被调一次。两者都允许为空（空 = 不
     // 计量），便于在不接 owner 预算的上下文构造 client。
@@ -255,7 +255,7 @@ public:
         m_read_armed_hook = std::move(hook);
     }
 
-    // 测试 seam（#64）：给后续新建的 op 注入「已进入写出阶段」通知（io 域内、
+    // 测试 seam（request_phase 契约）：给后续新建的 op 注入「已进入写出阶段」通知（io 域内、
     // 同一 IoGate、写出任何字节之前触发一次）。空 = 不通知。
     void SetWriteStartedHookForTest(std::function<void()> hook) {
         m_write_started_hook = std::move(hook);
@@ -274,7 +274,7 @@ public:
     }
     // op 在 finished 且 in-flight 归零后才调用本方法离开 m_ops：
     // m_ops 清空即「后端不再访问任何 op 资源」，Close 的在途等待据此返回。
-    // Issue #37：这里同时是出站配额的「物理收口」归还点——op 一旦
+    // HTTP 出站配额契约（docs/decisions/0002-co-network-contract.md）：这里同时是出站配额的「物理收口」归还点——op 一旦
     // 离开 m_ops，其占用的 max_connections/max_inflight 名额立即
     // 经 op->on_unregister 归还给 owner，晚于此才允许名额复用。
     // 原子一次性：erase 的返回值是本 op 是否「真正从集合移除」的判定。
@@ -312,7 +312,7 @@ private:
     bool                          m_io_dead{false};
     bool                          m_teardown_snapshotted{false};
 
-    // Issue #37：owner 注入的配额钩子；空表示不计量。
+    // HTTP 出站配额契约（docs/decisions/0002-co-network-contract.md）：owner 注入的配额钩子；空表示不计量。
     std::function<result<void>()> m_admit;
     std::function<void()>         m_release;
 
