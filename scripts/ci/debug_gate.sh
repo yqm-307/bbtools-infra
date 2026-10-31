@@ -26,8 +26,8 @@ cmake -S "$REPO_DIR" -B "$DEBUG_BUILD_DIR" -G Ninja \
     -DBBT_MONGOCXX_PREFIX="$DEPS_PREFIX/mongocxx" \
     -DBBT_MONGOC_PREFIX="$DEPS_PREFIX/mongoc"
 cmake --build "$DEBUG_BUILD_DIR" --parallel "$JOBS" --target \
-    Test_contract_basics Test_http_session_lifetime_probe \
-    Test_http_timer_rearm_probe Test_http_inflight_close_probe \
+    Test_contract_basics Test_http_session_lifetime \
+    Test_http_timer_rearm Test_http_inflight_close \
     Test_http_child_unregister Test_redis_unit Test_redis_cotcp_binding Test_mongo_unit \
     Test_rpc_payload
 
