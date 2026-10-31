@@ -1,6 +1,6 @@
 # 开发与验收指南
 
-本文承接根 [AGENTS.md](../AGENTS.md) 的操作规范。执行相应任务前阅读相关章节；不新增审批阶段、固定模板或每次必跑的全仓审查。模块交付状态见 [README](../README.md)，稳定取舍见 [decisions](decisions/)，CI 实际入口见 [CI 说明](ci/infra-ci-v1.md)与 [workflow](../.github/workflows/ci.yml)。
+本文承接根 [AGENTS.md](../../AGENTS.md) 的操作规范。执行相应任务前阅读相关章节；不新增审批阶段、固定模板或每次必跑的全仓审查。模块交付状态见 [README](../../README.md)，稳定取舍见 [decisions](../decisions/)，CI 实际入口见 [CI 说明](ci.md)与 [workflow](../../.github/workflows/ci.yml)。
 
 ## 开工与隔离
 
@@ -73,7 +73,7 @@ ctest --test-dir <private-build> -j1 -R '<affected-tests>' --output-on-failure -
 
 新增目标或测试须核对 **构建选项 → 实际构建目标 → CTest 注册集合 → 实跑结果 → CI 执行路径**。注册、执行和预期范围须一致，跳过或缺项按验收条件处理并明确列出。没有进入 workflow 的路径，即使已有 CI 全绿也仍是未覆盖；CI 接线变更另行确认，不在文档中宣称已完成。
 
-实际 runner、依赖准备、Redis/Mongo 临时容器及清理方式以现役 workflow/脚本和精确 run 为准，不根据旧镜像印象假定后端存在。通用 CI 方法见 [CI 说明](ci/infra-ci-v1.md)和[真实后端验收](redis-mongo-acceptance.md)，新 Redis 入口的覆盖边界见[验证边界](redis-net.md#验证边界)。监视客户端 EOF 或退出码不自动等于 job 失败，须回读 run/job 实际结论。
+实际 runner、依赖准备、Redis/Mongo 临时容器及清理方式以现役 workflow/脚本和精确 run 为准，不根据旧镜像印象假定后端存在。通用 CI 方法见 [CI 说明](ci.md)；Redis/Mongo 真实后端 live 编排的边界记录在对应 PR/Issue 验收评论（运行证据不入仓），新 Redis 入口的覆盖边界见[验证边界](redis-net.md#验证边界)。监视客户端 EOF 或退出码不自动等于 job 失败，须回读 run/job 实际结论。
 
 ## 审查与交付
 

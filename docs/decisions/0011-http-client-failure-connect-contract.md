@@ -6,8 +6,8 @@
 不表示兼容验收通过、也不授权合并。
 
 本文冻结 `HttpClientImpl` / `ClientOp` 在以下三点的内部契约，与
-[0005 §6.3/§6.4](0005-co-io-adapter-contract-v1.md)（跨线程同步 Close、返回即物理收口）
-和 [0002](0002-co-network-contract-v1.md)（网络关闭语义）一致，不改变公开 HTTP API、
+[0005 §6.3/§6.4](0005-co-io-adapter-contract.md)（跨线程同步 Close、返回即物理收口）
+和 [0002](0002-co-network-contract.md)（网络关闭语义）一致，不改变公开 HTTP API、
 错误分类或消息。对应 Issue #55（F2）、#56（H1）、#57（H2）。
 
 ## 1. 失败出口先物理释放再离开 owner 账本（#55 F2）

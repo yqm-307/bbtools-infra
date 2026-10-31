@@ -38,14 +38,14 @@
 
 - 公共头：`<bbt/infra/net/Engine.hpp>`（`Engine`/`EngineConfig`/`RuntimeProgress`/`EnginePhase`）、`RawHandler.hpp`、`Connection.hpp`、`ICoConnection.hpp`、`CoTcpConnection.hpp`、`ConnectionResult.hpp`、`Buffer.hpp`、`WriteOperation.hpp`、`CoConnection.hpp`（聚合注释头，原自由函数已删）、`Types.hpp`、`ReadAccess.hpp`、`Options.hpp`、`LoadBalancing.hpp`、`Address.hpp`、`NativeSocket.hpp`、`Error.hpp`、`ICoObject.hpp`/`CoObject.hpp`/`Annotations.hpp`；内部部件在 `detail/`（`ReactorDriver`、`DriverBinder`、`ReceiveRing`、`OutboundQueue`、`EventRingBuffer`、`WakeHub`、`ConnectionState`、`OptionsNormalize`、`TestAccess`、`EngineTestAccess`），不进公共自检。高层 UDP 只有 `<bbt/infra/net/Udp.hpp>` 的编译拒绝入口。
 - 目标：`bbt::infra_net`（STATIC），依赖 `bbt_coroutine` 与 Boost 头，不引入新第三方依赖。
-- 测试面：`tests/net/` 的 `net_foundation`/`net_primitives`/`net_allocation`/`reactor_driver`/`r2_tcp`/`b4_contract`/`freeze_contract`/`ico_write_close`/`net_accept_stop`/`reclaim_receipt`/`net_foundation_consumer` 与 `example_co_net_service_roundtrip`，由 `scripts/ci/check_network_tests.py` 强制「注册集 = 实跑集、零跳过」。
+- 测试面：`tests/net/` 的 `Test_net_foundation`/`Test_net_primitives`/`Test_net_allocation`/`Test_net_reactor_driver`/`Test_net_tcp`/`Test_net_contract_regressions`/`Test_net_freeze_contract`/`Test_net_ico_write_close`/`Test_net_accept_stop`/`Test_net_reclaim_receipt`/`net_foundation_consumer` 与 `example_co_net_service_roundtrip`，由 `scripts/ci/check_network_tests.py` 强制「注册集 = 实跑集、零跳过」。
 - 协程消费面收口为 `ICoConnection`/`CoTcpConnection` 成员接口（[PR #104](https://github.com/yqm-307/bbtools-infra/pull/104) 合入）：`Engine::CoAccept`/`Engine::CoDial` 返回 `ConnectionResult{error, connection, reclaim}`，`connection` 为 `CoTcpConnection`（实现 `ICoConnection`）；成员 `Read` 交付 owning `Buffer`（`ReadOutcome{state,data,error}`），`Write` 返回 `WriteReport{wait_error,outcome,operation}`，`AsyncWrite` 返回 `WriteOperation`（拒绝票内联 `Rejected/0/具体原因`），另有 `RequestClose`/`WaitClosed`/`Status`（`ConnectionStatus` 聚合）与非虚投影 `Valid`/`IsClosed`/`IsReleased`。`CoRead`/`CoWrite`/`CoAccept`/`CoDial` 自由函数与 `Engine::WaitConnect`/`WaitAccepted`/`AsyncConnectAwaitable` 公共入口已删除（两段式收为 `CoDial` 内部细节）。
 - 更早的 `Client`/`EventHandler`/`Action`/`Engine::Stop`/`CloseMode` 与旧 `CoTcpConnection`/`ICoConnection` 已删除，不保留兼容壳；生命周期入口只有 `Run` 与 `RequestClose`（其余是观测、建连与 Run 前配置入口）。
 - 未交付：HTTP/RPC/Redis/Mongo/config 消费者迁移、TLS、ReusePort 跨 loop 验收、非 Linux 平台、Release/sanitizer/长时压力、Engine 级 graceful drain。
 
 ## 冻结公共面与迁移（候选已由 PR #104 合入）
 
-> **状态：已合入主线**（PR #104）。本节原描述分支 `refactor/net-minimal-api-freeze`（基线 `c35a2a25a5a9a74634d04ab4fa02b2691d40c85c`）的收口清单，现已落地；落地时协程面进一步收口为 `ICoConnection` 成员接口——下表 `CoConnection.hpp` 一行的自由函数不再存在，等价入口是 `Engine::CoAccept`/`Engine::CoDial` + `ICoConnection::Read`/`Write`/`AsyncWrite`/`WaitClosed`/`Status`（终评见 [2026-10-29 终评](2026-10-29-icoconn-interface-final-review.md)）。其余符号面不变。
+> **状态：已合入主线**（PR #104）。本节原描述分支 `refactor/net-minimal-api-freeze`（基线 `c35a2a25a5a9a74634d04ab4fa02b2691d40c85c`）的收口清单，现已落地；落地时协程面进一步收口为 `ICoConnection` 成员接口——下表 `CoConnection.hpp` 一行的自由函数不再存在，等价入口是 `Engine::CoAccept`/`Engine::CoDial` + `ICoConnection::Read`/`Write`/`AsyncWrite`/`WaitClosed`/`Status`（接口取舍见 [0012](0012-icoconn-member-interface.md)）。其余符号面不变。
 
 冻结含义：只冻结下面列出的**源级公共符号及其行为**；不承诺稳定 ABI、内部布局、测试接缝、安装包或导出 CMake 包。允许以后兼容新增；不允许改已有方法含义、默认值、错误/副作用边界来冒充兼容。`Options` 继续是公开 aggregate，不引入 builder；推荐具名赋值，未来新增字段须评估位置初始化/structured binding 的源码兼容影响。
 
@@ -176,7 +176,7 @@ Send/Receive/Sendv/SendTo/ReceiveFrom 显式 DONTWAIT，send 加 NOSIGNAL；保�
 
 源码面：根 CMake 分流、`cmake/NetworkOnly.cmake`、`bbt/infra/net/`（公共头 + `detail/` 内部部件 + `Engine.cc` 等实现）、`tests/net/`、`examples/net_foundation_consumer/`、`examples/co_net_service/`。根分流跳过旧 `src/tests/examples`，故 network-only 不触碰旧模块 CMake。
 
-CI：`.github/workflows/ci.yml` 的 `network` job 已接入（不属于旧 Release/Debug job），复用同 run 的 prepared deps、核实际 coroutine SHA、独立目录 `-DBBT_INFRA_NETWORK_ONLY=ON` Debug 构建，然后 `ctest -j1 --no-tests=error` 跑全注册集并由 `scripts/ci/check_network_tests.py` 拒绝缺项/重复/失败/跳过，另对 `net.b4_co_pingpong_strict` 复跑 5 次。该 job 计入唯一结果汇聚。
+CI：`.github/workflows/ci.yml` 的 `build-and-gates` job 中 `network_gate.sh` step 已接入（不属于旧 Release/Debug job），复用同 run 的 prepared deps、核实际 coroutine SHA、独立目录 `-DBBT_INFRA_NETWORK_ONLY=ON` Debug 构建，然后 `ctest -j1 --no-tests=error` 跑全注册集并由 `scripts/ci/check_network_tests.py` 拒绝缺项/重复/失败/跳过，另对 `net.co_pingpong_strict` 复跑 5 次。该 job 计入唯一结果汇聚。
 
 NetworkOnly 对新建/复用两类 coroutine target 统一补 target 级公共头 include；复用分支解 alias、realpath 核真实 SOURCE_DIR，与固定源码路径不一致时 configure 明确失败。tests/net 提供真实 coroutine-first parent consumer（configure/build/run/DSO 来源核验）与 mismatch 负向 fixture。
 

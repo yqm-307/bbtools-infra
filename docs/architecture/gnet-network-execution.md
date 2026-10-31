@@ -136,9 +136,9 @@ Run 用有限间隔谓词等待，控制唤醒或到期后通过 QueryProcesserD
 
 已落地（PR #84 + PR #104，`bbt/infra/net/`）：`detail/ReactorDriver`（真实 Asio context 的 `OnTick/Wait/Wake`、预算、槽绑定/回滚/同代解绑、driver Failed 出口）、`detail/DriverBinder`、`detail/ReceiveRing`（共享并发 ring + 释放代次通知）、`detail/OutboundQueue`（逐操作记账）、`detail/WakeHub`、`Engine`（`Run`/`RequestClose`/`Phase`/`LastError`/`LastFailure`/`LocalAddresses`/`CountConnections`/`HandlerErrorCount`/`ReactorOwnerIds`/`AsyncConnect`/`EnableAcceptHandoff`/`RequestStopAccepting`/`AcceptingStopped`/`CoAccept`/`CoDial`）、`Connection`/`ReclaimReceipt`、`WriteOperation`/`WriteReport`、`RawHandler`、`ICoConnection`/`CoTcpConnection`/`ConnectionResult`/`Buffer`、独立公共 `ReadAccess` 与 `Types.hpp`、13 字段 `Options`。
 
-PR #104 把公共面收口落地：`Connection::State()`、两处内部构造、`AsyncConnectAwaitable`、公开 `WaitConnect`/`WaitAccepted`、公共 `NormalizeOptions` 与 12 个历史 Options 字段被删除或收回内部，测试接缝全部落在 `detail/`；协程消费面改为 `ICoConnection` 成员接口，`CoRead`/`CoWrite`/`CoAccept`/`CoDial` 自由函数删除（`CoConnection.hpp` 只剩聚合注释）。冻结符号清单、删除迁移表与逐条行为契约见 [决策 0010「冻结公共面与迁移」](../decisions/0010-gnet-network-foundation.md) 与 [2026-10-29 接口终评](../decisions/2026-10-29-icoconn-interface-final-review.md)。
+PR #104 把公共面收口落地：`Connection::State()`、两处内部构造、`AsyncConnectAwaitable`、公开 `WaitConnect`/`WaitAccepted`、公共 `NormalizeOptions` 与 12 个历史 Options 字段被删除或收回内部，测试接缝全部落在 `detail/`；协程消费面改为 `ICoConnection` 成员接口，`CoRead`/`CoWrite`/`CoAccept`/`CoDial` 自由函数删除（`CoConnection.hpp` 只剩聚合注释）。冻结符号清单、删除迁移表与逐条行为契约见 [决策 0010「冻结公共面与迁移」](../decisions/0010-gnet-network-foundation.md) 与 [决策 0012](../decisions/0012-icoconn-member-interface.md)。
 
-验证面：`tests/net/` 的 `net_foundation`、`net_primitives`、`net_allocation`、`net.reactor_driver_*`、`net.r2_*`、`net.b4_*`、`net.freeze_*`、`net.ico_*`、`net.stop_*`、`net.reclaim_*`、`net_foundation_consumer`、`example_co_net_service_roundtrip`，以及 `net.consumer_coroutine_first_{configure,build,run}` 与 `net.consumer_source_dir_mismatch` 负向配置；CI 的 network job 用 `scripts/ci/check_network_tests.py` 强制注册集与 JUnit 实跑集一致、零跳过。合入后主线 run `39305113509` 的该 job 为 success —— 该 success 属于 PR #84 的形态；PR #104 的 CI 结果以该 PR run 为准。
+验证面：`tests/net/` 的 `Test_net_foundation`、`Test_net_primitives`、`Test_net_allocation`、`net.reactor_driver_*`、`net.tcp_*`、`net.freeze_*`、`net.ico_*`、`net.stop_*`、`net.reclaim_*`、`net_foundation_consumer`、`example_co_net_service_roundtrip`、契约回归 `net.<case>`（`Test_net_contract_regressions` 分发），以及 `net.consumer_coroutine_first_{configure,build,run}` 与 `net.consumer_source_dir_mismatch` 负向配置；CI 的 `build-and-gates` job（`network_gate.sh` step）用 `scripts/ci/check_network_tests.py` 强制注册集与 JUnit 实跑集一致、零跳过。合入后主线 run `39305113509` 的该 job 为 success —— 该 success 属于 PR #84 的形态；PR #104 的 CI 结果以该 PR run 为准。
 
 未覆盖：Long-running/多连接压力与性能门槛、Release/ASAN/TSAN、非 Linux 平台、ReusePort 跨 loop 验收、TLS、高层 UDP（仅编译拒绝入口）、HTTP/RPC/Redis/Mongo/config 消费者迁移、Engine 级 graceful drain。文末旧用例与次数只绑定其当时版本，不能转记为当前通过证据。
 
@@ -150,11 +150,27 @@ coroutine 契约真源为其 [核心运行时契约 §11](https://github.com/yqm
 
 C++17、`bbt::infra::net`、Boost 优先及现有构建目标保持，不新增依赖或通用异步平台。其余模块的迁移是独立任务，不在新 net 范围内顺带进行。
 
-## 9. 测试进程退出约定与已知限制
+## 8.1 停止接纳与物理回收观察
+
+`Engine::RequestStopAccepting()` 把「停止接纳新业务」与「关闭整个 Engine」分开：任意线程、非阻塞、幂等，本代不重新开放接纳；已有业务连接仍可读写，`CoDial` 不因此被封口。`AcceptingStopped()` 初始为 false，只在本代 listener 真实关闭、handoff 封口、接纳等待者被通知后为真；停止请求本身不是物理停止凭据，真实停止由 owner 关闭 listener（或 driver Failed 后同代同步解绑、控制域关闭 listener）确认。它不证明已 accepted fd、外部连接引用或业务任务已释放；连接回收看 `Connection::Released()`，Engine 最终收口看 `Run` 返回。
+
+- Idle 停止后不允许本代再创建监听，server `Run` 返回 `operation_canceled`；client-only 布局不需监听，不因此禁止启动或拨号。Starting 期间在不能确认 owner 与安装责任收口前，观察面保持未完成；已确认停止后不得再建本代监听。
+- Running 停止不封整个 Engine：不关闭已交付连接、不解绑 driver，Engine 仍推进在途读写。停止封口与 `CoAccept`/handoff 授权共门：已授权的 raw `OnAccept` 允许完成，门后不授予新交付；停止后的 `CoAccept` 返回 `operation_canceled` 且 `connection` 无效；未交付队列与晚到交接请求回收。
+- 投递失败不等于 fd 已关：停止请求保持可达，由控制域有界节拍重交原 owner；driver Failed 的最终停止依据同步解绑后的显式关闭，不依赖清容器或异步捕获析构。`LocalAddresses` 是本代启动后的绑定快照，不是仍在监听的凭据。
+- 对应回归为 `net.stop_*`（真实地址拒连、停止后双向收发、启动前/重复/并发停止、启动竞态、driver Failed、未交付交接回收、停止唤醒 `CoAccept` 等待者）与 `net.reclaim_*` 用例。
+
+`CoDial`/`CoAccept` 的 `ConnectionResult::reclaim`（`net::ReclaimReceipt`，值语义、默认无效）与 `Connection::Released()` 让「一次提交的物理 socket 责任」可观察，替代以逻辑 `Closed()` 或进程计数近似记账的做法：
+
+- 无效句柄（默认构造）：`Valid()=false`、`Released()=true`，没有已提交责任。提交未接纳（执行域、Idle、容量、投递失败等）句柄保持无效。
+- 有效句柄 `Released()=false`：本次建连/物理 socket 责任仍存活（排队、建连中、已连接未交付、已交付未物理收口）；`Released()=true` 表示 fd 已真实关闭且 owner 资源责任清理完毕。
+- 提交接纳后，无论超时/取消/未交付/Close 竞态，句柄有效并描述本次真实责任；`error` 非空时 `connection` 无效但不遗留不可观察责任。句柄只观察：不等待、不取消、不收回；寿命不延长 socket/Engine，不与 Engine 成环。已交付连接的 `Released()` 与其 `reclaim` 同一记录、同终态。不关心回收的消费者可忽略该字段。
+- 内部责任流：共享释放记录（`detail/ReclaimRecord`）在提交前预分配、沿 owner 捕获链传递并随交付转入 `ConnectionState`；标记释放只发生在真实 close 点之后（fd 关闭、`ConnCore` backend close 及析构兜底）；fd 创建前失败即时收口，fd 转交成功仅转移记录不提前标记。控制域兜底：`Run` 收口（含 driver Failed）与 `~Engine` 在同代解绑/控制收口后才对未转移记录补标记——解绑和清空容器本身不证明异步捕获已析构，不能提前发布 Released。
+
+## 8.2 测试进程退出约定与已知限制
 
 当前 runtime 模型没有 Stop/重启/优雅停机：调度线程随进程存活，公共契约即「runtime 进程寿命」。由此有一个**未修复的已知退出限制**：启动 runtime 的测试进程从 main 正常 `return`（或 `exit`）进入静态析构后，runtime 线程仍可能 `PollOnce` 延迟销毁 Event → `CancelListen` → `DelEventCallback` → 对已析构的 `Event::m_callback_map` 执行 `erase`（是 erase 非 find）→ SIGSEGV（GDB27/exit-forensics-24 受控交错复现）。
 
-约定（`tests/net/ProcessRuntimeTestMain.hpp`，测试私有，不是产品 API）：已启动 runtime 的测试 main 与示例一律经 `bbt_net_test::RunTestProcessExit` 收口（`tests/net/r2_tcp.cc`、`b4_contract.cc`、`reactor_driver.cc`、`net_foundation.cc` 与 `examples/co_net_service/main.cc`）。推荐写法是一 case 一独立进程，顺序固定为：
+约定（`tests/net/ProcessRuntimeTestMain.hpp`，测试私有，不是产品 API）：已启动 runtime 的测试 main 与示例一律经 `bbt_net_test::RunTestProcessExit` 收口（`tests/net/Test_net_tcp.cc`、`Test_net_contract_regressions.cc`、`Test_net_reactor_driver.cc`、`Test_net_foundation.cc` 与 `examples/co_net_service/main.cc`）。推荐写法是一 case 一独立进程，顺序固定为：
 
 ```
 case 作用域 → 业务资源显式 close/join（socket/listener/owner loop、callback/ticket/snapshot 配对、FD/线程回 warm 基线）→ 断言 → 原退出码 → flush C++/C stdio → std::_Exit(code)
@@ -172,11 +188,11 @@ case 作用域 → 业务资源显式 close/join（socket/listener/owner loop、
 本地命令示例（独占构建目录，新 configure 必加 ccache）：
 
 ```sh
-cmake --build build-r2 --target Test_net_r2 --parallel 2
-ctest --test-dir build-r2 -R '^net\.r2_raw_roundtrip$' --output-on-failure
+cmake --build build-net --target Test_net_tcp --parallel 2
+ctest --test-dir build-net -R '^net\.tcp_raw_roundtrip$' --output-on-failure
 ```
 
-## 10. 验收场景索引（C1–C14）
+## 9. 验收场景索引（C1–C14）
 
 以下承接原迁移计划 §5 的编号、场景与证据要求，供逐项追溯，不是第二份施工进度或整体验收结论。原阶段编号仅作历史映射；当前已交付范围和未覆盖项以 §7、[决策 0010](../decisions/0010-gnet-network-foundation.md) 与对应 PR 验收为准。未执行、范围待裁决或已改用其他 API 的场景不能因计划删除而自动通过或取消。
 

@@ -2,11 +2,11 @@
 
 ## 状态与范围
 
-日期：2026-09-19。关联 Issue：#7（拆分 #3：CoMongoCli 协程客户端与有界 worker bridge）、父任务 #3、契约文档 `0002-co-network-contract-v1.md`。本决策记录当前 Mongo 最小切片，不限制后续主流 API 扩展。后续公共 API 应迁移到 `bbt::infra::mongo` 与 `include/bbt/infra/mongo/`；实现必须基于 bbtools-coroutine 现有等待/恢复模型，不使用 C++20 `co_await`/`Task<T>` 作为公共接口示例。配置读取、动态 watch 和分布式配置治理不属于本客户端决策，基础配置机制见 `0006-infra-foundation-and-dynamic-config.md`。
+日期：2026-09-19。关联 Issue：#7（拆分 #3：CoMongoCli 协程客户端与有界 worker bridge）、父任务 #3、契约文档 `0002-co-network-contract.md`。本决策记录当前 Mongo 最小切片，不限制后续主流 API 扩展。后续公共 API 应迁移到 `bbt::infra::mongo` 与 `include/bbt/infra/mongo/`；实现必须基于 bbtools-coroutine 现有等待/恢复模型，不使用 C++20 `co_await`/`Task<T>` 作为公共接口示例。配置读取、动态 watch 和分布式配置治理不属于本客户端决策，基础配置机制见 `0006-infra-foundation-and-dynamic-config.md`。
 
 ### 后续目标规格
 
-[0005：CoTCP/CoUDP 与第三方 Binding](0005-co-io-adapter-contract-v1.md) 将 worker bridge 作为显式兼容例外保留。本文“只能在专用 worker”是当前切片选型，不是 mongocxx 永远不能协程化的证明。是否能采用直接绑定或非阻塞 owner 驱动，由独立兼容调查裁决；PR 合并不代替真实后端、关闭及下游消费验收。
+[0005：CoTCP/CoUDP 与第三方 Binding](0005-co-io-adapter-contract.md) 将 worker bridge 作为显式兼容例外保留。本文“只能在专用 worker”是当前切片选型，不是 mongocxx 永远不能协程化的证明。是否能采用直接绑定或非阻塞 owner 驱动，由独立兼容调查裁决；PR 合并不代替真实后端、关闭及下游消费验收。
 
 ### 修订记录（2026-10-01：进程寿命运行时 + owner 同步 Close）
 
@@ -16,7 +16,7 @@
 `max_queue` 背压、URI 超时注入、错误映射与“同步 driver 调用不可强杀”；**取代**：完成回投不再
 用 `CompletionSignal`，改由 adapter 路径 `Notify`（可带载荷）唤醒 `CoWaiter`；关闭不再有
 `WaitClosed`——owner 同步 `Close()` 返回即表示在途 driver 调用与队列归零、worker 全退。
-superseded by [0002 修订记录](0002-co-network-contract-v1.md)。本契约（进程寿命运行时 + owner 同步
+superseded by [0002 修订记录](0002-co-network-contract.md)。本契约（进程寿命运行时 + owner 同步
 `Close()`）已合入 main（close/stop 迁移 `02567ed`），本记录只陈述契约与迁移状态，不代表已被完整验收。
 
 ## 固定依赖
