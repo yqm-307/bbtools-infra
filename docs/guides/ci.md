@@ -56,7 +56,10 @@ job）。分类规则由 `scripts/ci/changed_files.py` 承载，结果判定由
 
 ## 3. 结果汇聚（result job）
 
-`result.py` 把 needs.*.result 汇总为唯一 required check 判定：
+workflow 中 `result` job（`always()`，needs：`changes`、`docs-check`、
+`build-and-gates`、`live`）是唯一 required check，调用 `result.py`，其中
+`required = [changes, docs-check]`、`optional = [build-and-gates, live]`；
+分类为 `docs-only` 时才允许两个 optional job 为 skipped。`result.py` 的判定规则：
 
 - `required` 集合必须非空（空即拒绝，防「全跳过变绿」）；
 - 任一 required 为 `failure`/`cancelled`/缺失/`skipped` → verdict=failure；
@@ -99,11 +102,14 @@ job）。分类规则由 `scripts/ci/changed_files.py` 承载，结果判定由
 - **redis-net 判据**：`BBT_INFRA_REDIS_NET=ON` + `BBT_HIREDIS_PREFIX` 构建，
   临时容器（动态 project + 动态端口，`trap` 保证 `down -v` 清理本 project），
   `redis.net.*` 全注册集实跑零跳过，`redis_net_example` 冒烟。
-- **live 判据**：Release job 后段追加真实容器门禁（`tests/redis-live/run.sh` +
-  `tests/mongo-live/run.sh`，A/B/C 阶段：在线 → 停止态必须失败 → 重启恢复）；
-  缺 docker/compose/live 二进制一律非零失败，不得 skip 变绿；step 上限
-  （redis 19min / mongo 16min）大于脚本内界之和，避免共享外框硬杀导致 trap
-  不执行残留。
+- **live 判据**：独立 `live` job（`needs: build-and-gates`，与构建失败分离）。
+  解包同 run 的 deps bundle，校验 bundle sha256 与 coroutine pin 双钉后，只构建
+  `Test_redis_live`、`Test_redis_cotcp_binding`、`Test_mongo_live` 三个目标，
+  再依次运行 `live_redis_gate.sh`、`live_mongo_gate.sh`（内部调
+  `tests/redis-live/run.sh`、`tests/mongo-live/run.sh`，A/B/C 阶段：在线 →
+  停止态必须失败 → 重启恢复）；缺 docker/compose/live 二进制一律非零失败，
+  不得 skip 变绿。step 上限（redis 19min / mongo 16min）大于脚本内界之和，
+  避免外框硬杀导致 trap 不执行残留；Mongo live 失败时上传诊断产物。
 - **docs-check**：`check_docs.py --root <repo> --readme-max 200`；
   docs-only PR 只跑 docs-check。
 - **format-diff**：`check_format_diff.sh <base>` 只检查本 PR 改动行的
