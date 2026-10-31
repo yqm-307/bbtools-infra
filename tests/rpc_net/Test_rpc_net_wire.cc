@@ -283,7 +283,7 @@ void Malformed() {
     }
     {
         auto bad = made.value(); bad.headers.clear();
-        ExpectCode(rpc::ParseRpcWireHttpResponse(bad), ErrorCode::InvalidArgument);
+        ExpectCode(rpc::ParseRpcWireHttpResponse(bad), ErrorCode::ProtocolError);
     }
     {
         auto bad = made.value(); bad.body.clear();

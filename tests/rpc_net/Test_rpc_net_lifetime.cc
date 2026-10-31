@@ -148,6 +148,162 @@ void ReleasedClientHandle() {
                  "transport=closed budget=0\n";
 }
 
+void CompatFactory() {
+    // 源兼容工厂仍装配同一 HTTP adapter 栈：rpc::Server::Create(engine, handler)
+    // 与 rpc::Client::Create(http_client) 可链接、行为与 seam 路径等价
+    // （旧 include consumer 兼容窗口证据）。
+    std::atomic<unsigned> handled{0};
+    auto server_engine =
+        std::make_shared<net::Engine>(std::shared_ptr<net::RawHandler>{});
+    auto made_server = rpc::Server::Create(server_engine, EchoHandler(&handled));
+    CHECK(made_server);
+    auto server = std::move(made_server).value();
+    net::EngineConfig config;
+    config.runtime_progress = net::RuntimeProgress::Independent;
+    config.options.num_event_loop = 1;
+    std::error_code address_error;
+    config.listen_addresses = {net::Address::Ip("127.0.0.1", 0, address_error)};
+    CHECK(!address_error);
+    std::error_code run_error;
+    std::thread runner([&] { run_error = server_engine->Run(config); });
+    CHECK(WaitUntil([&] { return server_engine->Phase() == net::EnginePhase::Running; }));
+    CHECK(server->Start());
+    std::vector<net::Address> addresses;
+    CHECK(!server_engine->LocalAddresses(addresses) && addresses.size() == 1);
+    const std::string endpoint =
+        "127.0.0.1:" + std::to_string(addresses.front().Port());
+
+    Host host;
+    http::ClientOptions options;
+    options.base_url = "http://" + endpoint;
+    auto made_http = http::Client::Create(host.engine, options);
+    CHECK(made_http);
+    auto made_client = rpc::Client::Create(std::move(made_http).value());
+    CHECK(made_client);
+    auto client = std::move(made_client).value();
+    auto reply = host.Call([&] {
+        return bbt_co_await client->Call({"http", endpoint},
+            MakeEnvelope("echo", "Say", "cf-1", Pack("c", 7)), Until());
+    });
+    CHECK(reply && reply.value().request_id == "cf-1" && handled.load() == 1);
+    client->Close();
+    server->StopAccepting();
+    CHECK(server->Drain(std::chrono::steady_clock::now() + 3s));
+    server->Close();
+    CHECK(server->WaitStopped(std::chrono::steady_clock::now() + 3s));
+    server_engine->RequestClose();
+    runner.join();
+    CHECK(!run_error && server_engine->Phase() == net::EnginePhase::Stopped);
+    std::cout << "rpc compat factory engine/http_client overloads link+roundtrip=1\n";
+}
+
+void InboundCycleRelease() {
+    // B-1：HTTP inbound adapter 不得成环——rpc::Server Close + 释放全部外部
+    // 强引用后，weak<Engine> 必须 expired（对照组 adapter/Server 同理释放）。
+    // 引用环会让 http::Server 持有的 bridge lambda 反向持有 adapter State，
+    // Close 后 Engine 仍被 State 抓住无法过期。
+    std::weak_ptr<net::Engine> weak_engine;
+    std::weak_ptr<rpc::Server> weak_server;
+    {
+        auto engine =
+            std::make_shared<net::Engine>(std::shared_ptr<net::RawHandler>{});
+        weak_engine = engine;
+        auto inbound = rpc::HttpRpcInboundTransport::Create(engine, {});
+        CHECK(inbound);
+        auto made = rpc::Server::Create(
+            std::shared_ptr<rpc::IRpcInboundTransport>(
+                std::move(inbound).value()),
+            EchoHandler());
+        CHECK(made);
+        auto server = std::move(made).value();
+        weak_server = server;
+        // 未 Start：http::Server 已创建并挂 bridge lambda，Close 后释放。
+        server->Close();
+        server.reset();
+    }
+    CHECK(weak_server.expired());
+    CHECK(weak_engine.expired());   // 引用环已断开：Engine 随 Close 释放
+    std::cout << "rpc inbound cycle release engine expired="
+              << weak_engine.expired() << "\n";
+}
+
+void DestroyDuringInflight() {
+    // B-2：rpc::Server 析构不等待在途 handler——handler 必须靠共享计数
+    // 的 wire handler 保持引用稳定，不能借裸 State*。在途 handler 挂在
+    // gate 上、Server 析构后放行，回调必须安全完成（不悬空、不 UAF）。
+    auto gate = std::make_shared<Gate>();
+    std::atomic<unsigned> entered{0};
+    std::weak_ptr<net::Engine> weak_engine;
+    net::Address address;
+    {
+        auto engine =
+            std::make_shared<net::Engine>(std::shared_ptr<net::RawHandler>{});
+        weak_engine = engine;
+        auto inbound = rpc::HttpRpcInboundTransport::Create(engine, {});
+        CHECK(inbound);
+        auto made = rpc::Server::Create(
+            std::shared_ptr<rpc::IRpcInboundTransport>(
+                std::move(inbound).value()),
+            [&](IncomingCallContext, RpcEnvelope request)
+                -> result<RpcEnvelope> {
+                entered.fetch_add(1);
+                gate->Pause();   // 阻塞在 Server 析构之后
+                return result<RpcEnvelope>::ok(std::move(request));
+            });
+        CHECK(made);
+        auto server = std::move(made).value();
+        net::EngineConfig config;
+        config.runtime_progress = net::RuntimeProgress::Independent;
+        config.options.num_event_loop = 1;
+        std::error_code error;
+        config.listen_addresses = {net::Address::Ip("127.0.0.1", 0, error)};
+        CHECK(!error);
+        std::thread runner([&] { (void)engine->Run(config); });
+        CHECK(WaitUntil([&] {
+            return engine->Phase() == net::EnginePhase::Running; }));
+        CHECK(server->Start());
+        std::vector<net::Address> addresses;
+        CHECK(!engine->LocalAddresses(addresses) && !addresses.empty());
+        address = addresses[0];
+
+        Host host;
+        http::ClientOptions options;
+        options.base_url = "http://127.0.0.1:" + std::to_string(address.Port());
+        auto made_http = http::Client::Create(host.engine, options);
+        CHECK(made_http);
+        auto transport = rpc::HttpRpcTransport::Create(
+            std::move(made_http).value());
+        CHECK(transport);
+        auto made_client = rpc::Client::Create(
+            std::shared_ptr<rpc::IRpcTransport>(
+                std::move(transport).value()));
+        CHECK(made_client);
+        auto client = std::move(made_client).value();
+        auto inflight = host.Submit([&] {
+            return bbt_co_await client->Call(
+                {"http", "127.0.0.1:" + std::to_string(address.Port())},
+                MakeEnvelope("s", "m", "dd-0"), Until(5s));
+        });
+        CHECK(WaitUntil([&] { return entered.load() == 1; }));
+        // 在途 handler 已进 gate 时析构 rpc::Server：Close 封 listener/
+        // 连接，handler 本体经 wire 共享计数保活，不悬空。
+        server.reset();
+        gate->Release();
+        // 回复可能因 Close 被封口而不送达：只断言调用真实终态（非悬挂），
+        // handler 已安全返回。
+        const auto outcome = Get(inflight);
+        (void)outcome;
+        client->Close();
+        CHECK(server.use_count() == 0);
+        engine->RequestClose();
+        runner.join();
+        engine.reset();
+    }
+    CHECK(weak_engine.expired());
+    std::cout << "rpc destroy-during-inflight handler=safe engine expired="
+              << weak_engine.expired() << "\n";
+}
+
 } // namespace
 
 int RunCase(const std::string& mode) {
@@ -160,6 +316,9 @@ int RunCase(const std::string& mode) {
     else if (mode == "inflight_authorization") { InflightAuthorization(); }
     else if (mode == "close_drops_inflight") { CloseDropsInflightReply(); }
     else if (mode == "released_client_handle") { ReleasedClientHandle(); }
+    else if (mode == "compat_factory") { CompatFactory(); }
+    else if (mode == "inbound_cycle_release") { InboundCycleRelease(); }
+    else if (mode == "destroy_during_inflight") { DestroyDuringInflight(); }
     else { CHECK(false); }
     std::cout << "rpc lifetime " << mode << " PASS\n";
     return 0;

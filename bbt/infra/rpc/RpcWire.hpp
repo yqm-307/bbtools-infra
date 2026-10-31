@@ -1,14 +1,14 @@
 #pragma once
-// bbtools-infra：版本化 Protobuf RpcEnvelope wire profile（HTTP body 绑定，
-// 新 bbt::infra::http 栈）。
+// bbtools-infra：版本化 Protobuf RpcEnvelope wire profile（RPC core，
+// 不依赖任何物理 transport 栈）。
 //
 // wire 单一真源仍是 proto/bbt/infra/rpc/v1/rpc_envelope.proto；字节规则、
 // 值类型校验、错误域映射与 metadata 约束自旧 include/bbt/infra/rpc/RpcWire.hpp
-// 原样保留（复用，不改 profile）。本头随 RPC core 迁移到新 HTTP 栈：
-//   * HTTP body 绑定改为消费 bbt::infra::http 公开值类型
-//     （http::IncomingRequest / http::Response）；旧 bbt::infra::HttpRequest/
-//     HttpResponse 绑定随旧 RPC 兼容壳删除；
-//   * protobuf 生成物仍不出现在公共头（adapter 边界，AGENTS.md）；
+// 原样保留（复用，不改 profile）。随 transport seam 切分（architecture §5）：
+//   * 本头只承载值类型 + protobuf 编解码 + RpcEnvelope seam 互转，不含任何
+//     HTTP/net 类型；HTTP body 绑定助手迁入 HTTP adapter
+//     （bbt/infra/rpc/HttpTransport.hpp）；
+//   * protobuf 生成物仍不出现在公共头（adapter 边界，AGENTS.md §4）；
 //     实现经 PIMPL 隔在本模块 .cc 内。
 //
 // protoc/runtime 同源锁定见 cmake/RpcNet.cmake 的接入注释（BBT_INFRA_RPC_NET）。
@@ -21,7 +21,6 @@
 
 #include <bbt/infra/NetworkTypes.hpp>
 #include <bbt/infra/Result.hpp>
-#include <bbt/infra/http/Server.hpp>
 
 namespace bbt::infra::rpc {
 
@@ -99,22 +98,6 @@ result<RpcWireEnvelope> DecodeRpcWireEnvelope(
 // 同上，接受 string 视图以减少一次拷贝（HTTP body 已是 std::string）。
 result<RpcWireEnvelope> DecodeRpcWireEnvelope(
     const std::string& bytes, bool is_response);
-
-// --- HTTP body 绑定（bbt::infra::http 值类型） -------------------------------
-
-// 服务端 → 客户端：把 envelope 编码进 200 响应
-// （Content-Type: application/x-protobuf、body=wire bytes）。
-// 仅填标准传输字段；不设置任何 x-bbt-* 头。
-result<http::Response> MakeRpcWireHttpResponse(const RpcWireEnvelope& env);
-
-// 服务端入站解析：仅接受正式 POST + 精确 target /rpc（origin-form，无 query）
-// + Content-Type: application/x-protobuf + 非空 body；违规返回
-// InvalidArgument/ProtocolError；不读取任何 x-bbt-* 字段。
-result<RpcWireEnvelope> ParseRpcWireHttpRequest(const http::IncomingRequest& req);
-
-// 客户端回包解析：仅接受 HTTP 200 + Content-Type: application/x-protobuf +
-// 非空 body；违规返回 InvalidArgument/ProtocolError。
-result<RpcWireEnvelope> ParseRpcWireHttpResponse(const http::Response& resp);
 
 // --- 与既有 RpcEnvelope seam 的互转 -------------------------------------------
 

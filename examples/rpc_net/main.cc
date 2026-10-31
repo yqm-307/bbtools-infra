@@ -4,6 +4,7 @@
 // 本示例是公开调用方式/错误/关闭责任的消费确认入口，不是 mock 冒烟。
 
 #include <bbt/infra/rpc/Client.hpp>
+#include <bbt/infra/rpc/HttpTransport.hpp>
 #include <bbt/infra/rpc/RpcPayload.hpp>
 #include <bbt/infra/rpc/RpcWire.hpp>
 #include <bbt/infra/rpc/Server.hpp>
@@ -102,10 +103,15 @@ int Example() {
     g_bbt_coroutine_config->m_cfg_processer_auto_scale = false;
     g_scheduler->Start();
 
-    // 2) server：rpc::Server::Create（Engine Idle，只配置 handoff）→ Run → Start。
+    // 2) server：HttpRpcInboundTransport::Create（Engine Idle，只配置 handoff）
+    //    → rpc::Server::Create(inbound, handler) → Run → Start。
     auto server_engine =
         std::make_shared<net::Engine>(std::shared_ptr<net::RawHandler>{});
-    auto made_server = rpc::Server::Create(server_engine,
+    auto made_inbound = rpc::HttpRpcInboundTransport::Create(server_engine);
+    Check(static_cast<bool>(made_inbound), "rpc inbound transport Create");
+    auto made_server = rpc::Server::Create(
+        std::shared_ptr<rpc::IRpcInboundTransport>(
+            std::move(made_inbound).value()),
         [](IncomingCallContext, RpcEnvelope request) -> result<RpcEnvelope> {
             if (request.method == "Fail") {
                 return result<RpcEnvelope>::err(bbt::infra::MakeError(
@@ -131,7 +137,8 @@ int Example() {
     const std::string endpoint =
         "127.0.0.1:" + std::to_string(addresses.front().Port());
 
-    // 3) client：应用装配 http::Client（Engine + base_url），rpc::Client 只包装。
+    // 3) client：应用装配 http::Client（Engine + base_url），HttpRpcTransport
+    //    包装其池，rpc::Client 只持有 IRpcTransport seam。
     auto client_engine =
         std::make_shared<net::Engine>(std::shared_ptr<net::RawHandler>{});
     config.listen_addresses.clear();
@@ -141,7 +148,11 @@ int Example() {
     client_options.base_url = "http://" + endpoint;
     auto made_http = http::Client::Create(client_engine, client_options);
     Check(static_cast<bool>(made_http), "http Client Create");
-    auto made_client = rpc::Client::Create(std::move(made_http).value());
+    auto made_transport =
+        rpc::HttpRpcTransport::Create(std::move(made_http).value());
+    Check(static_cast<bool>(made_transport), "rpc transport Create");
+    auto made_client = rpc::Client::Create(
+        std::shared_ptr<rpc::IRpcTransport>(std::move(made_transport).value()));
     Check(static_cast<bool>(made_client), "rpc Client Create");
     auto client = std::move(made_client).value();
 

@@ -77,7 +77,10 @@ void TransportErrors() {
         options.base_url = "http://127.0.0.1:" + std::to_string(port);
         auto made = http::Client::Create(host.engine, options);
         CHECK(made);
-        auto client = rpc::Client::Create(std::move(made).value());
+        auto transport = rpc::HttpRpcTransport::Create(std::move(made).value());
+        CHECK(transport);
+        auto client = rpc::Client::Create(
+            std::shared_ptr<rpc::IRpcTransport>(std::move(transport).value()));
         CHECK(client);
         auto refused = host.Call([&] {
             return bbt_co_await client.value()->Call(
@@ -166,7 +169,10 @@ void UnknownOutcome() {
     options.base_url = "http://127.0.0.1:" + std::to_string(peer.port);
     auto made = http::Client::Create(host.engine, options);
     CHECK(made);
-    auto client = rpc::Client::Create(std::move(made).value());
+    auto transport = rpc::HttpRpcTransport::Create(std::move(made).value());
+    CHECK(transport);
+    auto client = rpc::Client::Create(
+        std::shared_ptr<rpc::IRpcTransport>(std::move(transport).value()));
     CHECK(client);
     auto unknown = host.Call([&] {
         return bbt_co_await client.value()->Call(
@@ -234,12 +240,13 @@ void MalformedReply() {
     ClientFixture client(server.Base());
     const RpcAddress endpoint = server.Endpoint();
 
-    {   // n==0：Content-Type 错（服务端剧本 body 是合法信封但类型头不对）。
+    {   // n==0：Content-Type 错（服务端剧本 body 是合法信封但类型头不对），
+        // 按 §5.2 malformed/mismatched content type → ProtocolError。
         auto bad = client.host.Call([&] {
             return bbt_co_await client.client->Call(endpoint,
                 MakeEnvelope("s", "m", "m-1"), Until());
         });
-        ExpectCode(bad, ErrorCode::InvalidArgument);
+        ExpectCode(bad, ErrorCode::ProtocolError);
     }
     {   // n==1：垃圾 body。
         auto bad = client.host.Call([&] {
