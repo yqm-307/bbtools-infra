@@ -4,7 +4,6 @@ import json
 import sys
 import xml.etree.ElementTree as ET
 
-
 REQUIRED = {
     'example_co_net_service_roundtrip', 'example_ico_connection_roundtrip',
     'net.consumer',
@@ -21,7 +20,7 @@ REQUIRED = {
 def check(registration, report):
     names = [test['name'] for test in registration['tests']]
     expected = set(names)
-    # R10 基线为 111 项；新增可自动纳入，删除须显式评审此覆盖下限。
+    # 基线 111 项；新增可自动纳入，删除须显式评审此覆盖下限。
     if len(names) < 111 or len(names) != len(expected) or not REQUIRED <= expected:
         raise ValueError('network-only 注册集缺项或重复（至少111项且关键入口齐全）')
     if any(not (name.startswith('net.') or name.startswith('example_'))
