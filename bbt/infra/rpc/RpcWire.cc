@@ -367,63 +367,6 @@ result<RpcWireEnvelope> FromProto(const pbv1::RpcEnvelopeMsg& in,
     return result<RpcWireEnvelope>::ok(std::move(env));
 }
 
-// --- HTTP 字段辅助（bbt::infra::http 值类型） ---------------------------------
-
-bool HasHeader(const std::vector<std::pair<std::string, std::string>>& hs,
-               const std::string& name, const std::string& expect) {
-    const auto equal_ascii_ci = [](const std::string& lhs,
-                                   const std::string& rhs) {
-        if (lhs.size() != rhs.size())
-            return false;
-        for (std::size_t i = 0; i < lhs.size(); ++i) {
-            const auto lower = [](unsigned char c) {
-                return static_cast<char>(c >= 'A' && c <= 'Z'
-                                             ? c + ('a' - 'A')
-                                             : c);
-            };
-            if (lower(static_cast<unsigned char>(lhs[i])) !=
-                lower(static_cast<unsigned char>(rhs[i])))
-                return false;
-        }
-        return true;
-    };
-    for (const auto& [k, v] : hs)
-        if (equal_ascii_ci(k, name) && v == expect)
-            return true;
-    return false;
-}
-
-// 新 http::Server 只交付 origin-form target（无 scheme/host）；RPC wire 固定
-// path，不接受 query/fragment 变体。
-result<void> CheckHttpRequestShape(const http::IncomingRequest& req) {
-    if (req.method != "POST")
-        return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "rpc wire requires POST"));
-    if (req.target != kRpcWireHttpPath)
-        return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "rpc wire path mismatch"));
-    if (!HasHeader(req.headers, kRpcWireContentTypeKey, kRpcWireContentType))
-        return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "rpc wire requires Content-Type: application/x-protobuf"));
-    if (req.body.empty())
-        return result<void>::err(MakeError(ErrorCode::ProtocolError,
-            "rpc wire empty body"));
-    return result<void>::ok();
-}
-
-result<void> CheckHttpResponseShape(const http::Response& resp) {
-    if (resp.status_code != 200)
-        return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "rpc wire response requires HTTP 200"));
-    if (!HasHeader(resp.headers, kRpcWireContentTypeKey, kRpcWireContentType))
-        return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "rpc wire response missing Content-Type"));
-    if (resp.body.empty())
-        return result<void>::err(MakeError(ErrorCode::ProtocolError,
-            "rpc wire response empty body"));
-    return result<void>::ok();
-}
-
 } // namespace
 
 // --- 公开实现 ---------------------------------------------------------------
@@ -469,32 +412,6 @@ result<RpcWireEnvelope> DecodeRpcWireEnvelope(
         return result<RpcWireEnvelope>::err(MakeError(
             ErrorCode::ProtocolError, "envelope parse failed"));
     return FromProto(p, is_response);
-}
-
-result<http::Response> MakeRpcWireHttpResponse(
-    const RpcWireEnvelope& env) {
-    auto body = EncodeRpcWireEnvelope(env, /*is_response=*/true);
-    if (!body)
-        return result<http::Response>::err(body.error());
-    http::Response resp;
-    resp.status_code = 200;
-    resp.headers.emplace_back(kRpcWireContentTypeKey, kRpcWireContentType);
-    resp.body.assign(reinterpret_cast<const char*>(body.value().data()),
-                     body.value().size());
-    return result<http::Response>::ok(std::move(resp));
-}
-
-result<RpcWireEnvelope> ParseRpcWireHttpRequest(
-    const http::IncomingRequest& req) {
-    if (auto r = CheckHttpRequestShape(req); !r)
-        return result<RpcWireEnvelope>::err(r.error());
-    return DecodeRpcWireEnvelope(req.body, /*is_response=*/false);
-}
-
-result<RpcWireEnvelope> ParseRpcWireHttpResponse(const http::Response& resp) {
-    if (auto r = CheckHttpResponseShape(resp); !r)
-        return result<RpcWireEnvelope>::err(r.error());
-    return DecodeRpcWireEnvelope(resp.body, /*is_response=*/true);
 }
 
 result<RpcWireEnvelope> ToWireEnvelope(const RpcEnvelope& env,

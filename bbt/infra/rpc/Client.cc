@@ -1,12 +1,9 @@
-// RPC core 出站客户端实现：组合公开 http::Client，不引用 HTTP 内部头。
-// wire/关联/预算语义见 bbt/infra/rpc/Client.hpp 与 RpcWire.hpp。
+// RPC core 出站客户端实现：组合 IRpcTransport seam，不引用任何物理栈头。
+// wire/关联/预算语义见 bbt/infra/rpc/Client.hpp 与 RpcWire.hpp；
+// HTTP 兼容工厂在 bbt/infra/rpc/HttpTransport.cc。
 
 #include <bbt/infra/rpc/Client.hpp>
 
-#include <algorithm>
-#include <cctype>
-#include <string>
-#include <string_view>
 #include <utility>
 
 #include <bbt/coroutine/coroutine.hpp>
@@ -20,30 +17,15 @@ Error Invalid(std::string message) {
                      "rpc client: " + std::move(message));
 }
 
-bool EqualsNoCase(std::string_view left, std::string_view right) {
-    if (left.size() != right.size()) { return false; }
-    for (std::size_t i = 0; i < left.size(); ++i) {
-        if (std::tolower(static_cast<unsigned char>(left[i])) !=
-            std::tolower(static_cast<unsigned char>(right[i]))) {
-            return false;
-        }
-    }
-    return true;
-}
-
-bool IsContentType(std::string_view name) {
-    return EqualsNoCase(name, kRpcWireContentTypeKey);
-}
-
 } // namespace
 
-Client::Client(std::shared_ptr<http::Client> transport) noexcept
+Client::Client(std::shared_ptr<IRpcTransport> transport) noexcept
     : m_transport(std::move(transport)) {}
 
 Client::~Client() noexcept { Close(); }
 
 result<std::shared_ptr<Client>> Client::Create(
-    std::shared_ptr<http::Client> transport) {
+    std::shared_ptr<IRpcTransport> transport) {
     if (!transport) {
         return result<std::shared_ptr<Client>>::err(
             Invalid("transport required (client 不自建执行底座)"));
@@ -55,7 +37,8 @@ result<std::shared_ptr<Client>> Client::Create(
 bbt_co_async(result<RpcEnvelope>) Client::Call(const RpcAddress& address,
                                                RpcEnvelope request,
                                                const CallOptions& options) {
-    // 局部安全引用：调用期间外部 RPC/HTTP 句柄可被释放，本协程仍持有 transport。
+    // 局部安全引用：调用期间外部 RPC/adapter 句柄可被释放，本协程仍持有
+    // transport。
     const auto transport = m_transport;
     if (!transport || transport->IsClosed()) {
         return result<RpcEnvelope>::err(
@@ -66,13 +49,12 @@ bbt_co_async(result<RpcEnvelope>) Client::Call(const RpcAddress& address,
             MakeError(ErrorCode::InvalidContext,
                       "rpc client: coroutine context required"));
     }
-    if (address.transport != "http" || address.endpoint.empty()) {
+    // transport 字段只作 adapter 路由标识（"http"/"tcp"），endpoint 的完整
+    // 合法性归 adapter（architecture §5.3）。
+    if ((address.transport != "http" && address.transport != "tcp") ||
+        address.endpoint.empty()) {
         return result<RpcEnvelope>::err(Invalid(
-            "address requires http transport and non-empty endpoint"));
-    }
-    if (!detail::IsRpcAuthority(address.endpoint)) {
-        return result<RpcEnvelope>::err(Invalid(
-            "endpoint must be an authority without scheme or path"));
+            "address requires http/tcp transport and non-empty endpoint"));
     }
     result<void> budget_status = result<void>::ok();
     const auto budget = detail::RemainingBudgetMs(options.deadline, budget_status);
@@ -89,45 +71,14 @@ bbt_co_async(result<RpcEnvelope>) Client::Call(const RpcAddress& address,
         return result<RpcEnvelope>::err(body.error());
     }
 
-    const std::string url =
-        "http://" + address.endpoint + kRpcWireHttpPath;
-
-    // 经公开 BuildRequest 完成 base_url/默认 headers/params/分档超时合并与解析，
-    // 再收敛到固定 wire profile：target 必须是精确 /rpc、Content-Type 只有一个
-    // application/x-protobuf。HTTP 的共享默认配置（授权头、查询参数、超时）仍
-    // 参与合并，只有会破坏 profile 的这两项被覆盖；Send 内仍执行
-    // ValidatePrepared，二者不一致会显式拒绝而不是发出坏请求。
-    auto prepared = transport->BuildRequest("POST", url, {});
-    if (!prepared) {
-        return result<RpcEnvelope>::err(prepared.error());
-    }
-    auto& outbound = prepared.value();
-    outbound.url = url;
-    outbound.target_for_wire = kRpcWireHttpPath;
-    outbound.headers.erase(
-        std::remove_if(outbound.headers.begin(), outbound.headers.end(),
-                       [](const http::Headers::value_type& header) {
-                           return IsContentType(header.first);
-                       }),
-        outbound.headers.end());
-    outbound.headers.emplace_back(kRpcWireContentTypeKey, kRpcWireContentType);
-    outbound.body.assign(reinterpret_cast<const char*>(body.value().data()),
-                         body.value().size());
-
     // 传输/排队/取消/未知结果错误原样透传（含 request_phase 事实）。
-    auto response = bbt_co_await transport->Send(outbound, options);
+    auto response = bbt_co_await transport->Exchange(
+        address, WireRequest{std::move(body).value()}, options);
     if (!response) {
         return result<RpcEnvelope>::err(response.error());
     }
-    if (response.value().status_code != 200) {
-        auto error = MakeError(
-            ErrorCode::Unavailable,
-            "rpc endpoint returned non-success HTTP status");
-        error.backend_category = "http";
-        error.backend_code = response.value().status_code;
-        return result<RpcEnvelope>::err(std::move(error));
-    }
-    auto decoded = ParseRpcWireHttpResponse(response.value());
+    auto decoded = DecodeRpcWireEnvelope(response.value().body,
+                                         /*is_response=*/true);
     if (!decoded) {
         return result<RpcEnvelope>::err(decoded.error());
     }

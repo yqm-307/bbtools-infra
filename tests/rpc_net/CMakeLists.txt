@@ -29,7 +29,8 @@ add_executable(Test_rpc_net_lifetime Test_rpc_net_lifetime.cc)
 target_link_libraries(Test_rpc_net_lifetime PRIVATE bbt::infra_rpc_net Boost::headers)
 target_compile_options(Test_rpc_net_lifetime PRIVATE -Wall -Wextra -Wpedantic)
 foreach(_case client_close server_lifecycle inflight_authorization
-        close_drops_inflight released_client_handle)
+        close_drops_inflight released_client_handle compat_factory
+        inbound_cycle_release destroy_during_inflight)
     add_test(NAME rpc.net.${_case} COMMAND Test_rpc_net_lifetime ${_case})
     set_tests_properties(rpc.net.${_case} PROPERTIES TIMEOUT 60 LABELS "unit")
 endforeach()

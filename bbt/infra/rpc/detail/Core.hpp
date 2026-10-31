@@ -6,7 +6,6 @@
 #include <chrono>
 #include <cstdint>
 #include <string>
-#include <string_view>
 #include <utility>
 
 #include <bbt/infra/NetworkTypes.hpp>
@@ -34,26 +33,6 @@ inline std::uint32_t RemainingBudgetMs(const bbt::coroutine::Deadline& deadline,
         remaining = static_cast<long long>(kMaxRemainingBudgetMs);
     status = result<void>::ok();
     return static_cast<std::uint32_t>(remaining);
-}
-
-// 只做 authority 的局部边界检查：RPC endpoint 必须是裸 authority（host[:port]），
-// 不得夹带 scheme/path/query/fragment/userinfo 或空白/控制字符。host/port 的
-// 完整合法性仍由公开 http::Client 自己的 URL 校验负责，这里不复制 HTTP parser。
-inline bool IsRpcAuthority(std::string_view endpoint) noexcept {
-    if (endpoint.empty())
-        return false;
-    if (endpoint.find("://") != std::string_view::npos)
-        return false; // scheme
-    for (const char ch : endpoint) {
-        const auto c = static_cast<unsigned char>(ch);
-        if (c <= 0x20 || c == 0x7f)
-            return false; // 空白/控制字符/DEL
-        if (ch == '/' || ch == '?' || ch == '#')
-            return false; // path/query/fragment
-        if (ch == '@')
-            return false; // userinfo
-    }
-    return true;
 }
 
 // 服务端错误回复信封：success=false + 调用方 error；关联字段缺失时用
