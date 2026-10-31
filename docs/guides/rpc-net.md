@@ -1,8 +1,8 @@
 # RPC core：新 HTTP 栈上的 Client/Server（`bbt::infra_rpc_net`）
 
-> 状态：**候选已完成本地实现、独立审查与现役 workflow 接线，待远端 CI 验证**。本切片在 HTTP PR 基线
+> 状态：**已合入 main（PR #103，提交 `9dd4313`）**，现役 workflow 已接线；远端 CI 结论以 PR 与 main 的 workflow run 为准。本切片在 HTTP PR 基线
 > （`feat/httpx-style-client` 2e92660）上把 RPC 运行时迁移到
-> `bbt::infra::http::Client/Server`，删除旧 `RpcClient`/`RpcServer` 兼容壳；远端 CI 尚未观察到本候选结果。
+> `bbt::infra::http::Client/Server`，删除旧 `RpcClient`/`RpcServer` 兼容壳。
 > 本文描述当前实现与边界，不是冻结契约；接口以
 > `bbt/infra/rpc/Client.hpp`、`Server.hpp`、`RpcWire.hpp` 为准。
 
@@ -75,7 +75,8 @@ Stats/LocalAddress。
   空 body、坏 protobuf 字节一律回 **200 + 错误信封**（解析失败时关联字段用
   `unparsed`/`unknown` 占位），不 crash、不断言成功；客户端对错误形状
   （非 200、错 Content-Type、空 body、坏字节）返回对应
-  `InvalidArgument`/`ProtocolError`。
+  `InvalidArgument`/`ProtocolError`，其中回复侧 Content-Type 缺失/不符按
+  malformed/mismatched content type 归 `ProtocolError`（§5.2）。
 - **deadline local-min**：服务端 handler 期限 =
   `min(本请求期限, now + remaining_budget_ms)`；handler 返回时预算已尽 →
   `TimedOut` 错误信封（不把超预算当成功）。
@@ -125,11 +126,13 @@ ctest --test-dir <build> -j1 -R '^rpc\.net\.' --output-on-failure
   服务端畸形请求错误信封（raw POSIX 对端）。
 - `Test_rpc_net_lifetime`：client Close 幂等/拒绝/共享 owner、server
   `StopAccepting→Drain→Close→WaitStopped` 收口凭据、停止授权下在途 handler
-  完成并真实送达、`Close` 丢弃在途回复（客户端非成功终态）、`IsClosed`。
+  完成并真实送达、`Close` 丢弃在途回复（客户端非成功终态）、`IsClosed`、
+  HTTP inbound 无引用环（Close+释放后 weak\<Engine\> expired）、在途
+  handler 期间析构 Server（wire handler 共享计数保活、不悬空）。
 
 ## 边界与未覆盖
 
-- RPC/HTTP 定向门禁已接入现役 workflow：Release/Debug 的独立新闭包构建并执行 `rpc.net.*` 与 `http.net.*`，注册集与 JUnit 实跑集必须一致且零跳过；HTTP-only 闭包继续验证不引入 protobuf，缺少锁定 protobuf 前缀时 RPC configure 必须拒绝。本地结构与集合检查已通过，远端 CI 尚未运行。
+- RPC/HTTP 定向门禁已接入现役 workflow：Release/Debug 的独立新闭包构建并执行 `rpc.net.*` 与 `http.net.*`，注册集与 JUnit 实跑集必须一致且零跳过；HTTP-only 闭包继续验证不引入 protobuf，缺少锁定 protobuf 前缀时 RPC configure 必须拒绝。远端 CI 结论以 main 的 workflow run 为准。
 - https/DNS/主机名、json/form、流式、重定向、HTTP/2、自动重试——均继承
   `bbt::infra::http` 的未实现边界，本模块不暗示。
 - 双进程（跨进程）round-trip、framework Service/Actor 耦合、跨机器与压力

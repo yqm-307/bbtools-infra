@@ -22,6 +22,10 @@ option(BBT_INFRA_NETWORK_ONLY "只构建新 gnet 网络基础及其实际依赖�
 option(BBT_INFRA_REDIS_NET "构建基于新 net 的 Redis 窄适配及其依赖闭包" OFF)
 option(BBT_INFRA_HTTP_NET "构建基于新 net 的 HTTP 客户端窄适配及其依赖闭包" OFF)
 option(BBT_INFRA_RPC_NET "构建消费新 HTTP 的 RPC core（wire + Client/Server）及其依赖闭包" OFF)
+option(BBT_INFRA_RPC_TCP "构建长度前缀 TCP 的 RPC adapter（bbt::infra_rpc_tcp）；依赖 net 基础，不需要第三方前缀" OFF)
+option(BBT_INFRA_MCP "构建 MCP server 核心与 stdio（bbt::infra_mcp_core / bbt::infra_mcp_stdio）；核心不需要第三方前缀" OFF)
+option(BBT_INFRA_MCP_HTTP "构建 MCP Streamable HTTP transport（bbt::infra_mcp_http）；需 BBT_INFRA_MCP 与 BBT_INFRA_HTTP_NET 同开" OFF)
+option(BBT_INFRA_MCP_SCHEMA "构建 MCP JSON Schema 校验器私有 adapter（需 BBT_JSONCONS_PREFIX 与 BBT_ICU_PREFIX）" OFF)
 
 # 旧栈/普通模式选择开关（P1-6）：声明并真实消费。OFF 的模块不接入 src/ 对应
 # 切片；默认 ON 保持既有「普通模式全量」语义。
@@ -52,6 +56,12 @@ if(BBT_INFRA_NETWORK_ONLY)
             endif()
         endif()
     endforeach()
+endif()
+
+# 新协议开关（RPC_TCP / MCP*）尚未接入 NetworkOnly 闭包：显式拒绝，不静默忽略。
+if(BBT_INFRA_NETWORK_ONLY AND (BBT_INFRA_RPC_TCP OR BBT_INFRA_MCP OR BBT_INFRA_MCP_HTTP OR BBT_INFRA_MCP_SCHEMA))
+    message(FATAL_ERROR
+        "BBT_INFRA_NETWORK_ONLY=ON 不接入 RPC TCP / MCP 开关（network-only 闭包只含已声明的 net 协议）；请关闭这些开关。")
 endif()
 
 option(BBT_INFRA_NET "${_bbt_doc_net}" ON)
@@ -171,7 +181,7 @@ add_subdirectory(src)
 # 先确定测试开关：模块内 tests/examples 子目录按 BUILD_TESTING 注册，
 # include(CTest) 必须先于模块接入（否则 BUILD_TESTING 未定义、测试被静默跳过）。
 include(CTest)
-if(BBT_INFRA_NET OR BBT_INFRA_REDIS_NET OR BBT_INFRA_HTTP_NET OR BBT_INFRA_RPC_NET)
+if(BBT_INFRA_NET OR BBT_INFRA_REDIS_NET OR BBT_INFRA_HTTP_NET OR BBT_INFRA_RPC_NET OR BBT_INFRA_RPC_TCP)
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/NetBase.cmake")
 endif()
 if(BBT_INFRA_REDIS_NET)
@@ -182,6 +192,23 @@ if(BBT_INFRA_HTTP_NET)
 endif()
 if(BBT_INFRA_RPC_NET)
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/RpcNet.cmake")
+endif()
+if(BBT_INFRA_RPC_TCP)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/RpcTcp.cmake")
+endif()
+# MCP schema 前缀门禁先于 MCP 核心接入（核心 add_subdirectory 时需已知 schema 开关）。
+if(BBT_INFRA_MCP_SCHEMA)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/McpSchema.cmake")
+endif()
+# MCP HTTP transport 开关校验：必须依赖 MCP + HTTP_NET 双开（fail-closed，
+# 双开缺一即 configure 失败，不静默跳过）。
+if(BBT_INFRA_MCP_HTTP AND NOT (BBT_INFRA_MCP AND BBT_INFRA_HTTP_NET))
+    message(FATAL_ERROR
+        "BBT_INFRA_MCP_HTTP=ON 需要同时开启 BBT_INFRA_MCP 与 BBT_INFRA_HTTP_NET；"
+        "开关 fail-closed，不静默跳过。")
+endif()
+if(BBT_INFRA_MCP)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/McpCore.cmake")
 endif()
 
 # Issue #27：最小真实消费示例（examples/）；不影响库目标与测试注册。

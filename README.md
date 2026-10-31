@@ -19,7 +19,8 @@
 | 基础动态配置 | `bbt::infra_config` | 最小切片已合入主线，独立消费已验证 | `bbt::infra::config`；版本化不可变快照 + 内存源 + 真实本地文件源 + watch。**未交付**：远程 provider 与真实重连、业务 schema 校验、客户端资源热切换。契约/命令/未覆盖矩阵见 [docs/guides/config-watch.md](docs/guides/config-watch.md) |
 | RPC core（新 HTTP 栈） | `bbt::infra_rpc_net` | 候选已实现，独立审查通过，待远端 CI 验证 | 消费新 `bbt::infra::http::Client/Server` 的 RPC core：版本化 Protobuf RpcEnvelope wire profile 与 RpcPayload 逐位复用；请求关联、deadline local-min、错误透传、畸形报文错误信封、`StopAccepting/Drain/Close/WaitStopped`+`IsClosed`。https/DNS/双进程/framework 消费切换未覆盖。契约、构建与验证命令见 [docs/guides/rpc-net.md](docs/guides/rpc-net.md)；旧 runtime 契约的历史记录见 [0009](docs/decisions/0009-rpc-runtime.md) |
 | R2 TCP 网络底座（Processer driver） | `bbt::infra_net` | 已合入主线 | 自有 main/sub Asio context 由已登记 Processer driver 推进，不建网络 I/O 线程；协程消费面为 `ICoConnection` 成员接口（`Engine::CoAccept`/`Engine::CoDial` → `ConnectionResult{error, connection, reclaim}`，`conn.Read`/`Write`/`AsyncWrite`/`RequestClose`/`WaitClosed`/`Status`）；旧 `CoRead/CoWrite/CoAccept/CoDial` 自由函数与 `Client/EventHandler/Action` 已删除。设计与契约真源见 [网络执行域设计](docs/architecture/gnet-network-execution.md) 与 [0010](docs/decisions/0010-gnet-network-foundation.md)、[0012](docs/decisions/0012-icoconn-member-interface.md) |
-| MCP server | — | 未交付（草稿候选） | C++17 server-only 的协议核心、tools/resources/prompts 与 stdio/Streamable HTTP 候选保存在草稿 PR #80，未合入 main；目标与验收由 Issue #85 维护 |
+| RPC over TCP | `bbt::infra_rpc_tcp` | 未交付（开关骨架已接线） | `BBT_INFRA_RPC_TCP`（默认 OFF）已接线；实现目录 `bbt/infra/rpc_tcp/` 尚未合入，开关 ON 时 configure fail-closed。长度前缀 TCP 不需要第三方前缀，不拉入 HTTP |
+| MCP server | — | 未交付（草稿候选） | C++17 server-only 的协议核心、tools/resources/prompts 与 stdio/Streamable HTTP 候选保存在 [草稿 PR #80](https://github.com/yqm-307/bbtools-infra/pull/80)，未合入 main，当前主线无可消费 target；`BBT_INFRA_MCP` / `BBT_INFRA_MCP_SCHEMA`（默认 OFF）开关已接线，`bbt/infra/mcp/` 尚未合入，开关 ON 时 configure fail-closed。目标、阻断与 R1–R11 / S1–S24 验收由 [Issue #85](https://github.com/yqm-307/bbtools-infra/issues/85) 维护；完整 client SDK 与 OAuth 不在首版范围。实时冲突和检查状态以该 PR 为准 |
 
 已实现能力的单测与示例均可独立构建运行，见下文「独立消费」与 [examples/README.md](examples/README.md)。
 
@@ -98,6 +99,9 @@ network-only 闭包（`-DBBT_INFRA_NETWORK_ONLY=ON`）在旧目标、数据库/p
 |------|----------------|------|
 | Redis | `BBT_HIREDIS_PREFIX` | hiredis 私有安装前缀；未设置时跳过 `bbt_infra_redis` |
 | Mongo | `BBT_MONGOCXX_PREFIX` + `BBT_MONGOC_PREFIX` | mongo-cxx-driver 与 mongo-c-driver 私有前缀；须成对设置 |
+| RPC over TCP | — | `BBT_INFRA_RPC_TCP=ON` 不需要前缀，依赖 net 基础；NETWORK_ONLY 下拒绝；实现目录未合入时 configure fail-closed |
+| MCP | — | `BBT_INFRA_MCP=ON` 核心不需要前缀；NETWORK_ONLY 下拒绝；实现目录未合入时 configure fail-closed |
+| MCP schema | `BBT_JSONCONS_PREFIX` + `BBT_ICU_PREFIX` | `BBT_INFRA_MCP_SCHEMA=ON` 须同时给两个前缀且依赖 `BBT_INFRA_MCP=ON`；缺前缀 fail-closed；validator 启用须先过 provenance 审批 |
 
 ### 示例
 
