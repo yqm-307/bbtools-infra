@@ -64,5 +64,5 @@ assert not skipped, f"意外 skipped: {skipped}"
 print(f"redis.net 注册集与实跑一致: {len(ran)} 项零跳过")
 PY
 
-ctest --test-dir "$BUILD_DIR" -j1 -R '^example_redis_net_consumer$' --no-tests=error \
+ctest --test-dir "$BUILD_DIR" -j1 -R '^redis\.net\.consumer$' --no-tests=error \
     --output-on-failure --timeout 60
