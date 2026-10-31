@@ -17,7 +17,10 @@ cmake -S "$REPO_DIR" -B "$BUILD_DIR" -G Ninja \
     -DBOOST_ROOT="$BOOST_PREFIX" -DCMAKE_PREFIX_PATH="$BOOST_PREFIX" \
     -DBBT_COROUTINE_SOURCE_DIR="$COROUTINE_DIR"
 # 子 consumer 由 CTest configure，不继承父 cache；显式传递同一锁定 Boost 前缀。
-printf 'CMAKE_PREFIX_PATH=%s\nBOOST_ROOT=%s\n' "$BOOST_PREFIX" "$BOOST_PREFIX" >> "${GITHUB_ENV:-/dev/stdout}"
+# 本脚本单 step 内 cmake+ctest 串行：export 才对本 step 后续子进程生效
+# （写 GITHUB_ENV 只作用于下一 step，无法送达本 step 内 ctest 的子 cmake）。
+export CMAKE_PREFIX_PATH="$BOOST_PREFIX"
+export BOOST_ROOT="$BOOST_PREFIX"
 cmake --build "$BUILD_DIR" --parallel "$JOBS" --target \
     bbt_infra_net_header_selfcheck Test_net_primitives Test_net_allocation \
     Test_net_foundation Test_net_reactor_driver Test_net_tcp Test_net_contract_regressions \
