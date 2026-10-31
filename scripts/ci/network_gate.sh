@@ -23,11 +23,11 @@ export CMAKE_PREFIX_PATH="$BOOST_PREFIX"
 export BOOST_ROOT="$BOOST_PREFIX"
 cmake --build "$BUILD_DIR" --parallel "$JOBS" --target \
     bbt_infra_net_header_selfcheck Test_net_primitives Test_net_allocation \
-    Test_net_foundation Test_net_reactor_driver Test_net_r2 Test_net_b4_contract \
-    Test_net_freeze Test_net_append_busy_hook \
+    Test_net_foundation Test_net_reactor_driver Test_net_tcp Test_net_contract_regressions \
+    Test_net_freeze_contract Test_net_append_busy_hook \
     net_foundation_consumer Example_co_net_service \
-    Test_net_reclaim_receipt Test_net_accept_stop net_accept_stop_fd \
-    Test_net_ico_write_close Test_net_popall Test_net_repro_buffer_oom \
+    Test_net_reclaim_receipt Test_net_accept_stop Test_net_accept_stop_fd \
+    Test_net_ico_write_close Test_net_pop_all Test_net_buffer_oom \
     Example_ico_connection
 
 ctest --test-dir "$BUILD_DIR" --show-only=json-v1 > "$BUILD_DIR/registered.json"
@@ -35,5 +35,5 @@ ctest --test-dir "$BUILD_DIR" -j1 --no-tests=error \
     --output-on-failure --timeout 120 --output-junit "$BUILD_DIR/network.xml"
 python3 "$SCRIPT_DIR/check_network_tests.py" \
     "$BUILD_DIR/registered.json" "$BUILD_DIR/network.xml"
-ctest --test-dir "$BUILD_DIR" -j1 -R '^net\.b4_co_pingpong_strict$' \
+ctest --test-dir "$BUILD_DIR" -j1 -R '^net\.co_pingpong_strict$' \
     --no-tests=error --repeat until-fail:5 --output-on-failure --timeout 60
