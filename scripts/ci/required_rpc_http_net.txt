@@ -50,3 +50,13 @@ http.net.server_start_capacity
 http.net.server_stop_authorization
 http.net.server_wire
 http.net.stop_regressions
+http.net.stream_wire
+http.net.stream_variant_buffered
+http.net.stream_disallowed
+http.net.stream_commit_boundary
+http.net.stream_peer_abort
+http.net.stream_slow_reader
+http.net.stream_lifecycle
+http.net.stream_lifetime
+http.net.stream_start_deadline
+http.net.stream_close_in_handler

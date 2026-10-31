@@ -146,14 +146,69 @@ result<std::string> SerializeResponse(Response response, bool head, bool keep_al
         message.content_length(response.body.size());
         if (!head) { message.body() = std::move(response.body); }
     }
+    {
+        std::string bytes;
+        detail::StringSink sink(bytes);
+        boost::system::error_code error;
+        wire::write(sink, message, error);
+        if (error) {
+            return result<std::string>::err(MakeError(ErrorCode::ProtocolError, error.message()));
+        }
+        return result<std::string>::ok(std::move(bytes));
+    }
+}
+
+result<std::string> SerializeResponseHead(int status_code, const Headers& headers, bool head,
+                                        bool chunked, bool keep_alive,
+                                        const ServerOptions& options) {
+    if (status_code < 200 || status_code > 599) {
+        return result<std::string>::err(MakeError(ErrorCode::InvalidArgument, "invalid server response"));
+    }
+    if (chunked && (head || status_code == 204 || status_code == 304)) {
+        return result<std::string>::err(MakeError(ErrorCode::InvalidArgument, "chunked reply disallowed"));
+    }
+    wire::response<wire::empty_body> message{static_cast<wire::status>(status_code), 11};
+    std::size_t header_bytes = 0;
+    for (const auto& field : headers) {
+        header_bytes += field.first.size() + field.second.size() + 4;
+        if (header_bytes > options.limits.max_header_bytes || !Token(field.first) || !FieldValue(field.second) ||
+            boost::beast::iequals(field.first, "Content-Length") ||
+            boost::beast::iequals(field.first, "Transfer-Encoding") ||
+            boost::beast::iequals(field.first, "Connection") ||
+            boost::beast::iequals(field.first, "Upgrade") || boost::beast::iequals(field.first, "Trailer")) {
+            return result<std::string>::err(MakeError(ErrorCode::InvalidArgument, "invalid server response header"));
+        }
+        message.insert(field.first, field.second);
+    }
+    message.keep_alive(keep_alive);
+    if (chunked) { message.chunked(true); }
+    else if (status_code != 204 && status_code != 304) { message.content_length(0); }
     std::string bytes;
     detail::StringSink sink(bytes);
+    wire::response_serializer<wire::empty_body> serializer{message};
     boost::system::error_code error;
-    wire::write(sink, message, error);
+    wire::write_header(sink, serializer, error);
     if (error) {
         return result<std::string>::err(MakeError(ErrorCode::ProtocolError, error.message()));
     }
     return result<std::string>::ok(std::move(bytes));
+}
+
+// chunked wire 块手工编码（十六进制长度 + CRLF + 数据 + CRLF）；Boost
+// write_chunk 需要 serializer 状态，手工编码同等正确且不持有 serializer。
+std::string EncodeChunk(std::string_view data) {
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    char head[24];
+    std::size_t size = data.size();
+    int digits = 0;
+    for (std::size_t v = size; v; v >>= 4) { ++digits; }
+    if (digits == 0) { digits = 1; }
+    for (int i = digits - 1; i >= 0; --i) { head[i] = kHex[size & 0xF]; size >>= 4; }
+    std::string out(head, head + digits);
+    out += "\r\n";
+    out += data;
+    out += "\r\n";
+    return out;
 }
 } // namespace
 
@@ -162,6 +217,8 @@ struct Server::State : std::enable_shared_from_this<Server::State> {
         net::Connection connection;
         bool authorized{false}; // 与 stopping 同 mutex 仲裁，包含回复发送责任
         bool task_done{false};
+        std::shared_ptr<ResponseBody> source; // 活动流源（关闭时 Cancel 一次）
+        bool source_cancelled{false};
     };
     // 最后一个 callback 捕获销毁时才减任务数；不是 handler 返回即算任务结束。
     struct TaskLease {
@@ -178,7 +235,9 @@ struct Server::State : std::enable_shared_from_this<Server::State> {
 
     std::shared_ptr<net::Engine> engine;
     ServerHandler handler;
+    StreamingServerHandler streaming_handler; // 非空即 streaming server（CreateStreaming）
     ServerOptions options;
+    StreamingOptions streaming{};
     mutable std::mutex mutex;
     std::condition_variable cv;
     bool started{false};
@@ -240,15 +299,22 @@ struct Server::State : std::enable_shared_from_this<Server::State> {
     }
 
     void Stop(bool force) {
+        std::vector<std::shared_ptr<ResponseBody>> sources;
         {
             std::lock_guard<std::mutex> lock(mutex);
             stopping = true;
             closing = closing || force;
             for (const auto& session : sessions) {
                 if (closing || !session->authorized) { session->connection.RequestClose(); }
+                if (closing && session->source && !session->source_cancelled) {
+                    session->source_cancelled = true;
+                    sources.push_back(session->source);
+                }
             }
             cv.notify_all();
         }
+        // Cancel 在锁外：实现可能挂起或回调，不能持锁调用未知代码。
+        for (const auto& source : sources) { source->Cancel(); }
         engine->RequestStopAccepting();
     }
 
@@ -291,8 +357,8 @@ struct Server::State : std::enable_shared_from_this<Server::State> {
     }
 
     bool Write(const std::shared_ptr<Session>& session, const std::string& bytes,
-               bbt::coroutine::Deadline deadline) {
-        deadline = std::min(deadline, Clock::now() + options.write_timeout);
+               bbt::coroutine::Deadline deadline, std::chrono::milliseconds per_write) {
+        deadline = std::min(deadline, Clock::now() + per_write);
         std::size_t offset = 0;
         std::size_t chunk = 16 * 1024;
         while (offset < bytes.size()) {
@@ -324,6 +390,8 @@ struct Server::State : std::enable_shared_from_this<Server::State> {
     void Serve(const std::shared_ptr<Session>& session) {
         std::string pending;
         for (;;) {
+            // session 状态机：ReadingRequest → Dispatching →（streaming server 时）
+            // WaitingStreamStart → WritingBuffered | Streaming → Closing → Released。
             const auto deadline = Clock::now() + options.limits.incoming_timeout;
             wire::request_parser<wire::string_body> parser;
             parser.header_limit(static_cast<std::uint32_t>(options.limits.max_header_bytes));
@@ -376,23 +444,46 @@ struct Server::State : std::enable_shared_from_this<Server::State> {
                 ++requests;
                 ++inflight;
             }
-            auto response = result<Response>::err(MakeError(ErrorCode::InternalError, "handler failed"));
-            try { response = handler({deadline, {}}, std::move(request)); }
-            catch (...) { /* 回调异常隔离为 500；授权责任继续包含回复发送。 */ }
-            if (!response) { response = result<Response>::ok(Response{500, {}, {}}); }
-            {
-                std::lock_guard<std::mutex> lock(mutex);
-                keep_alive = keep_alive && !stopping;
-            }
             bool sent = false;
-            if (!detail::CheckCall(deadline)) {
-                auto bytes = SerializeResponse(std::move(response).value(), head, keep_alive, options);
-                if (bytes) { sent = Write(session, bytes.value(), deadline); }
+            bool streaming_done = false;
+            if (streaming_handler) {
+                // Dispatching：handler 返回 Response 或 ResponseBody 拉取源。
+                auto reply = result<ServerReply>::err(MakeError(ErrorCode::InternalError, "handler failed"));
+                try { reply = streaming_handler({deadline, {}}, std::move(request)); }
+                catch (...) { /* 回调异常隔离为 500；授权责任继续包含回复发送。 */ }
+                if (!reply) { reply = result<ServerReply>::ok(ServerReply{Response{500, {}, {}}}); }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    keep_alive = keep_alive && !stopping;
+                }
+                if (detail::CheckCall(deadline)) { /* 超总期限：明确放弃。 */ }
+                else if (auto* buffered = std::get_if<Response>(&reply.value())) {
+                    auto bytes = SerializeResponse(std::move(*buffered), head, keep_alive, options);
+                    if (bytes) { sent = Write(session, bytes.value(), deadline, options.write_timeout); }
+                } else {
+                    auto source = std::get<std::shared_ptr<ResponseBody>>(std::move(reply.value()));
+                    sent = ServeStream(session, std::move(source), head, keep_alive, deadline);
+                    streaming_done = true;
+                }
+            } else {
+                auto response = result<Response>::err(MakeError(ErrorCode::InternalError, "handler failed"));
+                try { response = handler({deadline, {}}, std::move(request)); }
+                catch (...) { /* 回调异常隔离为 500；授权责任继续包含回复发送。 */ }
+                if (!response) { response = result<Response>::ok(Response{500, {}, {}}); }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    keep_alive = keep_alive && !stopping;
+                }
+                if (!detail::CheckCall(deadline)) {
+                    auto bytes = SerializeResponse(std::move(response).value(), head, keep_alive, options);
+                    if (bytes) { sent = Write(session, bytes.value(), deadline, options.write_timeout); }
+                }
             }
             if (!sent) { session->connection.RequestClose(); } // 明确放弃在计数结算前封写
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 session->authorized = false;
+                if (streaming_done) { session->source.reset(); }
                 --inflight;
                 cv.notify_all();
                 if (stopping) { keep_alive = false; }
@@ -400,6 +491,87 @@ struct Server::State : std::enable_shared_from_this<Server::State> {
             if (!sent || !keep_alive) { return; }
             bbtco_yield; // hot pipeline 每请求让出，不允许缓存命中无限占 worker
         }
+    }
+
+    // WaitingStreamStart → WritingBuffered | Streaming：Start 在总期限内提交；
+    // commit 后切到独立流期限 min(stream_start + max_stream_lifetime, 之后每次
+    // 写再取 stream_write_timeout 较早者)。commit 后源错误/超时/peer EOF 取消
+    // 源并关闭连接（不重发、不写 trailer），只留本地诊断责任。
+    bool ServeStream(const std::shared_ptr<Session>& session,
+                     std::shared_ptr<ResponseBody> source, bool head, bool keep_alive,
+                     bbt::coroutine::Deadline deadline) {
+        bool cancel_now = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            session->source = source;
+            // Close 可能已过 Stop() 的取消收集（注册前窗口）：补一次登记检查，
+            // 与 Stop() 的「source 非空则取消」合起来保证恰好一次。
+            if (closing && !session->source_cancelled) {
+                session->source_cancelled = true;
+                cancel_now = true;
+            }
+        }
+        if (cancel_now) { source->Cancel(); return false; }
+        auto started = result<StreamStart>::err(MakeError(ErrorCode::InternalError, "stream start failed"));
+        try { started = bbt_co_await source->Start({deadline}); }
+        catch (...) { }
+        if (!started) {
+            // 头提交前失败：经正常错误响应路径（500），不当作流错误。
+            auto bytes = SerializeResponse({500, {}, {}}, head, keep_alive, options);
+            return bytes && Write(session, bytes.value(), deadline, options.write_timeout);
+        }
+        StreamStart& start = started.value();
+        if (start.mode == StreamStart::Mode::Buffered) {
+            Response response{start.status_code, std::move(start.headers), std::move(start.body)};
+            auto bytes = SerializeResponse(std::move(response), head, keep_alive, options);
+            if (!bytes) { CancelSource(session, source); return false; }
+            if (!Write(session, bytes.value(), deadline, options.write_timeout)) {
+                CancelSource(session, source);
+                return false;
+            }
+            return true;
+        }
+        auto head_bytes = SerializeResponseHead(start.status_code, start.headers, head, true,
+                                                keep_alive, options);
+        if (!head_bytes) { CancelSource(session, source); return false; }
+        // commit：头发出后进入 Streaming；流期限从此时起算。
+        if (!Write(session, head_bytes.value(), deadline, options.write_timeout)) {
+            CancelSource(session, source);
+            return false;
+        }
+        const auto stream_deadline = std::min(Clock::now() + streaming.max_stream_lifetime, deadline);
+        auto write_chunk = [&](std::string_view data) {
+            if (data.empty()) { return true; }
+            if (data.size() > streaming.max_chunk_bytes) { return false; }
+            const auto wire = EncodeChunk(data);
+            return Write(session, wire, stream_deadline, streaming.stream_write_timeout);
+        };
+        if (!write_chunk(start.first_chunk)) { CancelSource(session, source); return false; }
+        for (;;) {
+            auto next = result<std::optional<std::string>>::err(
+                MakeError(ErrorCode::InternalError, "stream next failed"));
+            try { next = bbt_co_await source->Next({stream_deadline}); }
+            catch (...) { }
+            if (!next) { CancelSource(session, source); return false; } // commit 后源错误：取消源、关连接
+            if (!next.value()) { return FinishStream(session); }          // EOF：0-chunk 收尾
+            if (!write_chunk(next.value().value())) { CancelSource(session, source); return false; }
+        }
+    }
+
+    bool FinishStream(const std::shared_ptr<Session>& session) {
+        // 正常 EOF：写 0-chunk 终止流。
+        return Write(session, "0\r\n\r\n", Clock::now() + streaming.stream_write_timeout,
+                     streaming.stream_write_timeout);
+    }
+
+    void CancelSource(const std::shared_ptr<Session>& session,
+                      const std::shared_ptr<ResponseBody>& source) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (session->source_cancelled) { return; }
+            session->source_cancelled = true;
+        }
+        source->Cancel();
     }
 };
 
@@ -428,6 +600,38 @@ result<std::shared_ptr<Server>> Server::Create(std::shared_ptr<net::Engine> engi
     state->engine = std::move(engine);
     state->handler = std::move(handler);
     state->options = options;
+    state->sessions.reserve(options.limits.max_connections);
+    auto server = std::shared_ptr<Server>(new Server(state));
+    if (state->engine->EnableAcceptHandoff(options.handoff_capacity)) {
+        return R::err(MakeError(ErrorCode::InvalidContext, "accept handoff configuration failed"));
+    }
+    return R::ok(std::move(server));
+}
+
+result<std::shared_ptr<Server>> Server::CreateStreaming(
+    std::shared_ptr<net::Engine> engine, StreamingServerHandler handler,
+    ServerOptions options, StreamingOptions streaming) {
+    using R = result<std::shared_ptr<Server>>;
+    const auto valid = ValidateNetworkLimits(options.limits);
+    if (!engine || !handler || !valid || options.handoff_capacity == 0 ||
+        options.handoff_capacity > kNetworkLimitsMaxConnections || options.max_target_bytes == 0 ||
+        options.max_target_bytes > options.limits.max_header_bytes || options.write_timeout <= 0ms ||
+        options.write_timeout > kNetworkLimitsMaxIncomingTimeout ||
+        streaming.max_chunk_bytes == 0 || streaming.max_chunk_bytes > kNetworkLimitsMaxBodyBytes ||
+        streaming.max_stream_lifetime <= 0ms ||
+        streaming.max_stream_lifetime > kNetworkLimitsMaxIncomingTimeout ||
+        streaming.stream_write_timeout <= 0ms ||
+        streaming.stream_write_timeout > kNetworkLimitsMaxIncomingTimeout) {
+        return R::err(MakeError(ErrorCode::InvalidArgument, "invalid HTTP Server streaming options"));
+    }
+    if (engine->Phase() != net::EnginePhase::Idle) {
+        return R::err(MakeError(ErrorCode::InvalidContext, "Server::CreateStreaming requires Idle Engine"));
+    }
+    auto state = std::make_shared<State>();
+    state->engine = std::move(engine);
+    state->streaming_handler = std::move(handler);
+    state->options = options;
+    state->streaming = streaming;
     state->sessions.reserve(options.limits.max_connections);
     auto server = std::shared_ptr<Server>(new Server(state));
     if (state->engine->EnableAcceptHandoff(options.handoff_capacity)) {

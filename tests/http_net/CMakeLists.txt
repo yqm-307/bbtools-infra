@@ -28,6 +28,16 @@ foreach(_case server_wire server_stop_authorization server_reply_drain server_cl
     set_tests_properties(http.net.${_case} PROPERTIES TIMEOUT 30 LABELS "unit")
 endforeach()
 
+add_executable(Test_http_net_streaming Test_http_net_streaming.cc)
+target_link_libraries(Test_http_net_streaming PRIVATE bbt::infra_http_net)
+target_compile_options(Test_http_net_streaming PRIVATE -Wall -Wextra -Wpedantic)
+foreach(_case stream_wire stream_variant_buffered stream_disallowed stream_commit_boundary
+        stream_peer_abort stream_slow_reader stream_lifecycle stream_lifetime stream_start_deadline
+        stream_close_in_handler)
+    add_test(NAME http.net.${_case} COMMAND Test_http_net_streaming ${_case})
+    set_tests_properties(http.net.${_case} PROPERTIES TIMEOUT 30 LABELS "unit")
+endforeach()
+
 # 停止封口回归：Server::Submit 停止封口后不再预约新任务，TaskLease 未计数
 # 回退不下溢（--wrap=_Znwm）。
 # 独立 target，避免将 wrapped operator new 带入其它 http 测试进程。
