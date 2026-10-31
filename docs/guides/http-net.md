@@ -1,6 +1,6 @@
 # HTTP net 客户端与服务端（`bbt::infra_http_net`）
 
-> 状态：实验性候选，本地聚焦验证，待独立审查；不代表整个 HTTP 迁移已交付。本文描述当前实现，不是冻结契约；接口以 `bbt/infra/http/Client.hpp`、`Server.hpp` 为准。
+> 状态：已合入 main（PR #102，提交 `4b07517`）；远端 CI 结论以 PR 与 main 的 workflow run 为准。不代表整个 HTTP 迁移已交付。本文描述当前实现，不是冻结契约；接口以 `bbt/infra/http/Client.hpp`、`Server.hpp` 为准。
 
 ## 定位
 
@@ -14,13 +14,13 @@ cmake -S <infra 工作树> -B <私有 build 目录> \
     -DBBT_INFRA_HTTP_NET=ON \
     -DBBT_COROUTINE_SOURCE_DIR=<bbtools-coroutine 精确 pin 检出> \
     -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DBUILD_TESTING=ON
-cmake --build <私有 build 目录> --target bbt_infra_http_net_header_selfcheck http_net_example Test_http_net_contract Test_http_net_regressions Test_http_net_server --parallel 2
+cmake --build <私有 build 目录> --target bbt_infra_http_net_header_selfcheck http_net_example Test_http_net_contract Test_http_net_regressions Test_http_net_server Test_http_net_streaming --parallel 2
 ctest --test-dir <私有 build 目录> -j1 -R 'http\.net\.' --output-on-failure --no-tests=error
 ```
 
-- 目标：`bbt::infra_http_net`（alias）；示例 `http_net_example`（CTest 名 `example_http_net_consumer`）；契约测试 `Test_http_net_contract`/`Test_http_net_regressions`/`Test_http_net_server`/`Test_http_net_stop_regressions`（用例名分发，`http.net.*`，LABELS `unit`）。
+- 目标：`bbt::infra_http_net`（alias）；示例 `http_net_example`（CTest 名 `example_http_net_consumer`）；契约测试 `Test_http_net_contract`/`Test_http_net_regressions`/`Test_http_net_server`/`Test_http_net_stop_regressions`/`Test_http_net_streaming`（用例名分发，`http.net.*`，LABELS `unit`）。
 - 依赖：仅 `bbt::infra_net`（含 Boost::headers，Beast header-only），无新第三方依赖；coroutine 消费受 `cmake/coroutine.sha` pin 门禁约束。
-- CI：`BBT_INFRA_HTTP_NET` 已由 Release/Debug 门禁的新 RPC/HTTP 闭包覆盖（`scripts/ci/release_gate.sh`/`debug_gate.sh` → `run_ctest_label.sh --regex '^(rpc|http)\.net\.'`）；HTTP-only 闭包另验证不引入 protobuf。
+- CI：`BBT_INFRA_HTTP_NET` 已由 Release/Debug 门禁的新 RPC/HTTP 闭包覆盖（`scripts/ci/release_gate.sh`/`debug_gate.sh` → `run_ctest_label.sh --regex '^(rpc|http)\.net\.'`）；HTTP-only 闭包另验证不引入 protobuf。Server 端响应流（`http.net.stream_*`）已加入 release 门禁（`Test_http_net_streaming` 构建目标与 `required_rpc_http_net.txt` 清单）。
 
 ## 最小消费
 
@@ -105,7 +105,18 @@ auto stopped = server->WaitStopped(deadline);
 - HTTP/1.1 要求唯一合法 Host；当前 Host 接受 ASCII DNS 标签/数值 host（IPv6 必须方括号，可选十进制 port），拒绝 userinfo、空白、路径和畸形端口。target 校验 origin-form URI 字符及百分号转义。CONNECT、Upgrade、Expect 明确拒绝并关连接，Expect 在读完 header、等待 body 之前拒绝。
 - handler 异常或错误 result 隔离为 500；非法状态（仅接受 200–599）、CR/LF/控制字节头及用户 Content-Length/Transfer-Encoding/Connection/Upgrade/Trailer 明确断开。Beast 负责 framing；HEAD 保留表示长度但不发 body，204/304 不发 body。大响应以有界块 `conn.Write`，只有 Rejected + 无 operation 的零提交容量错误才减半重试，不重放已接纳写；每块复查期限与 Close 并让出。
 - 本地 `Test_http_net_server` 覆盖 wire（分片/chunked/pipeline/HEAD/204/304/FIN）、停止授权及 idle/半包、回复写屏障 Drain、Close 超时责任、入站期限晚返、安全、Start/登记失败、inflight 门禁及 owner 扣留物理回收额度。每例在进程退出前验证 HTTP 任务/连接、listener、Run/join 及 socket 基线归还。私有注入仅用于确定性阶段，不替代真实 TCP 字节。
-- TLS、HTTP/2、流式、代理、DNS 解析、路由框架、永久阻塞 handler 的抢占以及跨平台/sanitizer/压力验证不在本批。
+- TLS、HTTP/2、客户端流式、代理、DNS 解析、路由框架、永久阻塞 handler 的抢占以及跨平台/sanitizer/压力验证不在本批。
+
+## Server 端响应流（streaming）
+
+`Server::CreateStreaming(engine, StreamingServerHandler, ServerOptions, StreamingOptions)` 是独立于 `Create` 的工厂（不改动既有 `ServerHandler`/`Response` 签名与语义）。handler 返回 `ServerReply`（`std::variant<Response, std::shared_ptr<ResponseBody>>`）：`Response` 与 buffered 路径完全一致；`ResponseBody` 是**拉取源**——`Start(WaitOptions)` 在头提交前返回 `StreamStart` 选择 `Buffered`（等价完整回复）或 `Chunked`（可带 `first_chunk`），之后由 session 逐个 `Next(WaitOptions)` 取 chunk（`nullopt`=EOF 写 `0\r\n\r\n` 终止块）。`Cancel()` 幂等，由 session 在 source 注册后 `Close`、commit 前后写头/写块失败、commit 后 `Next` 错误/超时/peer EOF 时恰好调用一次（Start 自身失败除外——Start 未成功即视为未获源）。
+
+- **wire**：chunked 回复头由 Beast `write_header` 序列化（`Transfer-Encoding: chunked`，禁止业务 Content-Length/TE/Connection/Upgrade/Trailer 头，与 buffered 同一校验）；数据块手工按 `HEX\r\ndata\r\n` 编码，上限 `StreamingOptions.max_chunk_bytes`（超限取消源并断连）。HEAD/204/304 拒绝 chunked（`InvalidArgument`，commit 前断开）。
+- **状态机**：`ReadingRequest → Dispatching → WaitingStreamStart → WritingBuffered | Streaming → Closing → Released`；一连接一次一个活动请求，Streaming 期间不派发同连接 pipeline 请求；流 EOF 且 keep-alive 时连接可复用。
+- **commit 边界**：`Start` err 或异常在头提交前→普通 500 错误响应；commit 后 `Next` err/超时/取消/peer EOF→`Cancel()` 源一次 + 关闭连接，不重发、不补终止块。
+- **双 deadline**：头提交前受请求总期限（`limits.incoming_timeout`）约束；commit 后切到 `min(stream_start + max_stream_lifetime, 剩余总期限)`，每次写再取 `stream_write_timeout` 较早者。两档都必须有限正值且 ≤24h（`CreateStreaming` 校验）。期限已尽时连 500 也无法写出，按超限明确断开。
+- **背压**：拉取模型天然有界——session 一次只挂起一个 `Next`；写路径复用「Rejected + 无 operation = 零提交减半重试、已接纳不重放」规则；`Close`/`StopAccepting` 语义与 buffered 相同，`Drain` 计数覆盖到最终 chunk 写终态或明确放弃，`WaitStopped` 仍要求 listener 停止 + callback 销毁 + 连接 `Released()`。
+- 本地 `Test_http_net_streaming`（`http.net.stream_*`）覆盖：chunk wire 字节与复用、variant 三路、HEAD/204/304、commit 前后错误分界、peer RST、slow-reader 写超时（带 `elapsed ≥ stream_write_timeout` 阶段证据）、流总期限、Start 期限、Close-during-handler 源取消、StopAccepting/Drain/Close/WaitStopped 全收口。
 
 ## 契约要点
 
@@ -129,7 +140,7 @@ auto stopped = server->WaitStopped(deadline);
 
 实现范围（本地验收命令见上文，不代表全部 HTTPX 功能）：http scheme、数值 IPv4 host、GET/POST/扩展 token 方法 `Request`、raw body（含二进制）、base_url/默认 headers/params 合并（params client 在前、请求级追加、百分号编码）、分阶段超时、连接池复用/上限/排队/过载/退役/过期、关闭与取消竞争、坏流退役。
 
-未实现（接口不暗示）：https/TLS、主机名 DNS（host 名显式报 `InvalidArgument`，DNS 方案需单独决策）、json/form 编码、流式响应（`StreamResponse`）、重定向、代理、HTTP/2、请求自动重试、事件 hook。DNS/新依赖/native worker 属未授权决策点，不在本模块内悄悄实施。
+未实现（接口不暗示）：https/TLS、主机名 DNS（host 名显式报 `InvalidArgument`，DNS 方案需单独决策）、json/form 编码、客户端流式响应（`Client::Send` 仍是有界 buffered）、重定向、代理、HTTP/2、请求自动重试、事件 hook。DNS/新依赖/native worker 属未授权决策点，不在本模块内悄悄实施。
 
 ## 已知局限
 
