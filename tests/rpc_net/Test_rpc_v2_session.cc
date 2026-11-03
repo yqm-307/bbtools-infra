@@ -2314,6 +2314,12 @@ void HookStateContract() {
     CHECK(!HookState(hooks_a, HookPoint::BeforeWrite).armed);
     CHECK(!HookState(hooks_b, HookPoint::BeforeWrite).armed);
 
+    // 每个 server 型 Engine 占 2 个 driver 槽位，测试进程只有 4 个：建第三台
+    // Engine（closed-owner）前必须释放只用于隔离断言的 b，否则其 Run 以
+    // no_buffer_space 失败。hooks_b 的断言至此已全部完成。
+    hooks_b.reset();
+    b.reset();
+
     std::shared_ptr<rpc::SessionHooks> closed;
     {
         auto owner = std::make_unique<AppHost>("closed-owner");
