@@ -1845,14 +1845,16 @@ void SimultaneousDial() {
     // fencing 后唯一幸存 link 服务两个方向——两个方向的 Call 都需要各自
     // 对端 ProcessAdmitted 驱动回复；pump 不触碰调用 future（Get 消费
     // 后 wait_for 会抛 future_error），只驱动 admitted 处理若干轮。
-    auto pump = SubmitCo([&] {
-        for (unsigned i = 0; i != 800; ++i) {
+    // 预算按时间给足：link 退役/回复处理都要经 pump 推进，Debug 下 800 轮
+    // （~2.4s）会在收敛前耗尽，令 links 记录永远停在退役前。
+    auto pump_stop = std::make_shared<std::atomic<bool>>(false);
+    auto pump = SubmitCo([&, pump_stop] {
+        for (unsigned i = 0; i != 8000 && !pump_stop->load(); ++i) {
             a->ProcessAdmitted(Echo);
             b->ProcessAdmitted(Echo);
             bbtco_sleep(3);
         }
     });
-    (void)pump;
     auto r_ab = Get(call_ab);
     auto r_ba = Get(call_ba);
     // fencing 竞速语义：先到安装后被选举退役的已提交调用是合法的
@@ -1889,6 +1891,10 @@ void SimultaneousDial() {
     // 入站 link 曾被接受再 fencing 的证据：至少一端 accepted≥1。
     CHECK(b->server->Stats().accepted_connections +
           a->server->Stats().accepted_connections >= 1);
+    // pump 按引用持有 a/b：用例结束前必须等它真正退出，否则它在 AppHost
+    // 析构后再次唤醒会访问已释放内存（ASan heap-use-after-free）。
+    pump_stop->store(true);
+    (void)Get(pump);
     std::cout << "v2 simultaneous dial fenced to one link ok\n";
 }
 
