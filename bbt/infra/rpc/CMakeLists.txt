@@ -13,6 +13,8 @@
 # protobuf 生成物只进 bbt_infra_rpc_proto，不出现在本模块公开头。
 add_library(bbt_infra_rpc_core STATIC
     RpcWire.cc
+    Codec.cc
+    Session.cc
     Client.cc
     Server.cc)
 add_library(bbt::infra_rpc_core ALIAS bbt_infra_rpc_core)
@@ -21,7 +23,7 @@ target_include_directories(bbt_infra_rpc_core
            "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>")
 target_compile_features(bbt_infra_rpc_core PUBLIC cxx_std_17)
 target_link_libraries(bbt_infra_rpc_core
-    PUBLIC bbt::infra_common
+    PUBLIC bbt::infra_common bbt::infra_net
     PRIVATE bbt_infra_rpc_proto)
 target_compile_options(bbt_infra_rpc_core PRIVATE -Wall -Wextra -Wpedantic)
 
@@ -45,7 +47,8 @@ target_link_libraries(bbt_infra_rpc_net
 
 # 公开头自给编译自检：公开头各自单独成 TU（detail 内部头不列入）。
 # core 头不得拉入 HTTP/net 类型（IRpc* seam 是纯抽象），http adapter 头单独验。
-set(_rpc_core_headers RpcWire.hpp Transport.hpp Client.hpp Server.hpp)
+set(_rpc_core_headers RpcWire.hpp Transport.hpp Client.hpp Server.hpp
+    Request.hpp Response.hpp Options.hpp Stats.hpp Codec.hpp Admission.hpp)
 set(_rpc_net_selfcheck_srcs "")
 foreach(_hdr IN LISTS _rpc_core_headers)
     set(_tu "${CMAKE_CURRENT_BINARY_DIR}/header_selfcheck/${_hdr}.cc")
@@ -64,23 +67,26 @@ target_link_libraries(bbt_infra_rpc_http_header_selfcheck PRIVATE bbt::infra_rpc
 target_compile_options(bbt_infra_rpc_http_header_selfcheck PRIVATE -Wall -Wextra -Wpedantic)
 set_target_properties(bbt_infra_rpc_http_header_selfcheck PROPERTIES LINKER_LANGUAGE CXX)
 
-# 第三方类型泄漏负向检查：core 公开头不得 include HTTP/net/protobuf 物理栈
-# 头或暴露第三方实现类型（beast/asio/protobuf 生成物）。兼容工厂签名里的
-# http::Client/net::Engine/http::ServerOptions 仅经前向声明引用（不产生头
-# 依赖），属 architecture §10 的源兼容面，不算泄漏。
+# 第三方类型泄漏负向检查：core 公开头不得 include HTTP/net 物理栈或
+# protobuf/beast/asio 头。net/Address.hpp 是纯值类型（sockaddr 快照，无
+# 物理栈依赖），Options.hpp 的 ServerOptions::SetListenAddress 显式经
+# ADR §2.3 冻结签名消费——白名单仅此一个值头。
+# 兼容工厂签名里的 http::Client/net::Engine/http::ServerOptions 仅经前向
+# 声明引用（不产生头依赖），属 architecture §10 的源兼容面，不算泄漏。
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/header_selfcheck/_third_party_guard.cc"
     "// generated: rpc core public headers must not leak physical-stack types\n")
 set(_rpc_leak_check "${CMAKE_CURRENT_BINARY_DIR}/rpc_public_header_leak_check.cmake")
 file(WRITE "${_rpc_leak_check}"
-    "foreach(_hdr RpcWire.hpp Transport.hpp Client.hpp Server.hpp)\n"
+    "foreach(_hdr RpcWire.hpp Transport.hpp Client.hpp Server.hpp Request.hpp Response.hpp Options.hpp Stats.hpp Codec.hpp Admission.hpp)\n"
     "    file(READ \"${CMAKE_CURRENT_SOURCE_DIR}/\${_hdr}\" _content)\n"
-    "    if(_content MATCHES \"#include[^\n]*infra/http/|#include[^\n]*infra/net/|#include[^\n]*\\.pb\\.h|google::protobuf|boost::beast|boost::asio|beast::|asio::\")\n"
+    "    string(REGEX REPLACE \"#include[^\\n]*infra/net/Address\\.hpp\" \"\" _content \"\${_content}\")\n"
+    "    if(_content MATCHES \"#include[^\\n]*infra/http/|#include[^\\n]*infra/net/|#include[^\\n]*\\.pb\\.h|google::protobuf|boost::beast|boost::asio|beast::|asio::\")\n"
     "        message(FATAL_ERROR\n"
     "            \"rpc core public header \${_hdr} leaks HTTP/net/protobuf types\")\n"
     "    endif()\n"
     "endforeach()\n"
     "file(READ \"${CMAKE_CURRENT_SOURCE_DIR}/HttpTransport.hpp\" _http_hdr)\n"
-    "if(_http_hdr MATCHES \"#include[^\n]*\\.pb\\.h|google::protobuf\")\n"
+    "if(_http_hdr MATCHES \"#include[^\\n]*\\.pb\\.h|google::protobuf\")\n"
     "    message(FATAL_ERROR\n"
     "        \"rpc http adapter header leaks protobuf types\")\n"
     "endif()\n")

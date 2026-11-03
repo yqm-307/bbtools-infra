@@ -31,6 +31,7 @@
 #include <vector>
 
 #include <bbt/coroutine/sync/CoWaiter.hpp>
+#include <bbt/coroutine/object/CoObject.hpp>
 
 #include <bbt/infra/net/Address.hpp>
 #include <bbt/infra/net/Connection.hpp>
@@ -59,10 +60,26 @@ struct ReclaimRecord;  // detail：物理回收共享释放记录（带句柄 Co
 class EngineTestAccess;
 struct CoAccess;
 
-class Engine {
+class Engine : public bbt::coroutine::CoObject {
 public:
+    // 真实创建入口（P1-2）：生产路径统一经 coroutine `MakeCoObject` 的
+    // 唯一 creator——Engine 身份初始化 + created/destroyed 统计在工厂提交
+    // 后才记账。Engine 是 native 域对象（不继承 CoRuntimeOnly），原生
+    // 线程可直接调用，不要求协程上下文。构造/登记失败沿工厂既有异常
+    // 路径传播，不提交计数。
+    template <class... Args>
+    static std::shared_ptr<Engine> Create(Args&&... args) {
+        return bbt::coroutine::MakeCoObject<Engine>(
+            "infra.net.Engine", "", [&] {
+                return std::shared_ptr<Engine>(
+                    new Engine(std::forward<Args>(args)...));
+            });
+    }
+
     // handler 可为空：client-only 布局允许无 raw 接收者（Co 消费），
-    // 但 server 布局必须另有 handoff 接收者（见 Run）。
+    // 但 server 布局必须另有 handoff 接收者（见 Run）。直接构造仅作
+    // 兼容/测试路径——生产创建统一走 Create()（经 MakeCoObject 唯一
+    // creator），使身份初始化与创建/销毁统计进入统一观测。
     explicit Engine(std::shared_ptr<RawHandler> handler);
     ~Engine();
     Engine(const Engine&) = delete;

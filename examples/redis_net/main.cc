@@ -153,7 +153,7 @@ int Run() {
     g_bbt_coroutine_config->m_cfg_static_thread_num = 1;
     g_bbt_coroutine_config->m_cfg_stack_size = 128 * 1024;
     g_scheduler->Start(); // runtime 进程寿命：整个示例只 Start 一次。
-    auto engine = std::make_shared<net::Engine>(nullptr);
+    auto engine = net::Engine::Create(nullptr);
     net::EngineConfig config;
     config.runtime_progress = net::RuntimeProgress::Independent;
     std::error_code run_error;

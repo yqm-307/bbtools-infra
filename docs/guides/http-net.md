@@ -78,7 +78,7 @@ runner.join();
 
 ```cpp
 // 应用先启动至少 4 个固定 scheduler worker（server 2 driver 槽 + client 1 槽）。
-auto engine = std::make_shared<net::Engine>(std::shared_ptr<net::RawHandler>{});
+auto engine = net::Engine::Create(std::shared_ptr<net::RawHandler>{});
 auto made = http::Server::Create(engine,
     [](IncomingCallContext ctx, http::IncomingRequest request) -> result<http::Response> {
         // 在原生有栈协程中，可 bbt_co_await 其它库；ctx.deadline 为有限总绝对期限。

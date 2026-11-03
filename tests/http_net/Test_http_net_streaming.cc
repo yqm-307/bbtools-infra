@@ -18,7 +18,7 @@ namespace wire = boost::beast::http;
 namespace {
 
 struct ServerHost {
-    std::shared_ptr<net::Engine> engine{std::make_shared<net::Engine>(std::shared_ptr<net::RawHandler>{})};
+    std::shared_ptr<net::Engine> engine{net::Engine::Create(std::shared_ptr<net::RawHandler>{})};
     std::shared_ptr<http::Server> server;
     std::thread runner;
     std::error_code run_error;

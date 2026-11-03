@@ -8,11 +8,17 @@
 ## 固定上游 commit（本 pin）
 
 - 仓库：<https://github.com/yqm-307/bbtools-coroutine>
-- 固定 commit（消费标识）：`206772b821ce6bd5ffc3afe547e11d21f5794b5a`
-  （PR #414 merge commit：轻量 async/await 协程语法糖 `bbt_co_async`/
-  `bbt_co_await`，infra redis net 入口消费该语法糖）
+- 固定 commit（消费标识）：`b0ba3e0239c06bf91a874f988187c7e2f56bf13d`
+  （PR #425 head commit：在 `45c575b` 上落地 coroutine 上下文查询、
+  `CoRuntimeOnly`/`CoObject` 创建观测、`CoWaiter` 无断言 Notify；infra
+  RPC/net 经公开头消费 `MakeCoObject`/`CoObjectStats`/`CoRuntimeOnly`/
+  `IsInCoroutineContext`）
 - 语义：不可变 commit——整个消费序列只读消费此版本，不随 `main` 更新。
   任何「main 现在恰好是某 SHA」的浮动消费都违反本 pin 语义。
+  该 commit 是推送到 yqm-307/bbtools-coroutine 分支
+  `feat/runtime-context-cowaiter-notify-v2`（PR #425）的远端可达 git
+  对象（tree `15d76e32…`，parent `45c575b…`），消费落点是它的干净
+  检出；它与候选快照 `ece810d…` tree 完全相同，仅 author/message 正规化。
 
 ## 单一 pin 真源
 
@@ -69,6 +75,5 @@ hex 字符，不做规范化/截断）。下游消费点都从它读，不维护
 
 - `bbtools-coroutine-candidate.provenance.md` 固定的是 `8ae6a889…`（PR #392
   mergeCommit，候选期证明「可脱离未提交差异重建」）；该记录已随 PR #84 合入
-  main，是**历史出处**。本文件 `206772b8…`（PR #414 merge）是**当前 pin**，旧 pin `a4d52c23…`
-  是其祖先（redis net 入口消费 async 语法糖时前移），两者
+  main，是**历史出处**。本文件 `b0ba3e02…`（PR #425 head）是**当前 pin**，旧 pin `206772b8…`（PR #414 merge，轻量 async/await 语法糖）是其祖先，两者
   不互相替代、不混用证据。旧 DSO/旧 dirty 候选的实测与本 pin 无关。

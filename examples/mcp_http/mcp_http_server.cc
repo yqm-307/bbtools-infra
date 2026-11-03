@@ -138,7 +138,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    auto engine = std::make_shared<bbt::infra::net::Engine>(
+    auto engine = bbt::infra::net::Engine::Create(
         std::shared_ptr<bbt::infra::net::RawHandler>{});
     bbt::infra::mcp::McpHttpOptions http_options;
     // loopback-only：Host/Origin 白名单覆盖本机；非 loopback 部署经外层反代

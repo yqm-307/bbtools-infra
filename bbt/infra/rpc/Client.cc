@@ -8,6 +8,7 @@
 
 #include <bbt/coroutine/coroutine.hpp>
 #include <bbt/infra/rpc/detail/Core.hpp>
+#include <bbt/infra/rpc/detail/Session.hpp>
 
 namespace bbt::infra::rpc {
 namespace {
@@ -22,6 +23,9 @@ Error Invalid(std::string message) {
 Client::Client(std::shared_ptr<IRpcTransport> transport) noexcept
     : m_transport(std::move(transport)) {}
 
+Client::Client(std::shared_ptr<SessionOwnerState> owner) noexcept
+    : m_owner(std::move(owner)) {}
+
 Client::~Client() noexcept { Close(); }
 
 result<std::shared_ptr<Client>> Client::Create(
@@ -31,23 +35,25 @@ result<std::shared_ptr<Client>> Client::Create(
             Invalid("transport required (client 不自建执行底座)"));
     }
     return result<std::shared_ptr<Client>>::ok(
-        std::shared_ptr<Client>(new Client(std::move(transport))));
+        bbt::coroutine::MakeCoObject<Client>("infra.rpc.Client", "", [&] {
+            return std::shared_ptr<Client>(new Client(std::move(transport)));
+        }));
 }
 
 bbt_co_async(result<RpcEnvelope>) Client::Call(const RpcAddress& address,
                                                RpcEnvelope request,
                                                const CallOptions& options) {
+    if (!bbt::coroutine::IsInCoroutineContext()) {
+        return result<RpcEnvelope>::err(
+            MakeError(ErrorCode::InvalidContext,
+                      "rpc client: coroutine context required"));
+    }
     // 局部安全引用：调用期间外部 RPC/adapter 句柄可被释放，本协程仍持有
     // transport。
     const auto transport = m_transport;
     if (!transport || transport->IsClosed()) {
         return result<RpcEnvelope>::err(
             MakeError(ErrorCode::Closed, "rpc client: closed"));
-    }
-    if (bbt::coroutine::GetLocalCoroutineId() == 0) {
-        return result<RpcEnvelope>::err(
-            MakeError(ErrorCode::InvalidContext,
-                      "rpc client: coroutine context required"));
     }
     // transport 字段只作 adapter 路由标识（"http"/"tcp"），endpoint 的完整
     // 合法性归 adapter（architecture §5.3）。
@@ -100,9 +106,11 @@ bbt_co_async(result<RpcEnvelope>) Client::Call(const RpcAddress& address,
 
 void Client::Close() noexcept {
     if (m_transport) { m_transport->Close(); }
+    if (m_owner) { SessionOwnerSeal(m_owner); }
 }
 
 bool Client::IsClosed() const noexcept {
+    if (m_owner) { return SessionOwnerClosed(*m_owner); }
     return !m_transport || m_transport->IsClosed();
 }
 

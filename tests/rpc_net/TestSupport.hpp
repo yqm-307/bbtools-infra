@@ -118,7 +118,7 @@ class Host {
 public:
     std::shared_ptr<net::Engine> engine;
     std::error_code run_error;
-    Host() : engine(std::make_shared<net::Engine>(std::shared_ptr<net::RawHandler>{})) {
+    Host() : engine(net::Engine::Create(std::shared_ptr<net::RawHandler>{})) {
         net::EngineConfig config;
         config.runtime_progress = net::RuntimeProgress::Independent;
         config.options.num_event_loop = 1;
@@ -167,7 +167,7 @@ private:
 // 的 StopAccepting → Drain → Close → WaitStopped 序列。
 struct ServerHost {
     std::shared_ptr<net::Engine> engine{
-        std::make_shared<net::Engine>(std::shared_ptr<net::RawHandler>{})};
+        net::Engine::Create(std::shared_ptr<net::RawHandler>{})};
     std::shared_ptr<rpc::Server> server;
     std::thread runner;
     std::error_code run_error;
@@ -226,7 +226,7 @@ struct ServerHost {
 // 畸形回复用例注入任意 ServerHandler；收口责任与 ServerHost 相同。
 struct HttpServerHost {
     std::shared_ptr<net::Engine> engine{
-        std::make_shared<net::Engine>(std::shared_ptr<net::RawHandler>{})};
+        net::Engine::Create(std::shared_ptr<net::RawHandler>{})};
     std::shared_ptr<http::Server> server;
     std::thread runner;
     std::error_code run_error;
@@ -448,7 +448,7 @@ inline std::string TcpReplyFrame(const rpc::RpcWireEnvelope& env) {
 // 动态端口；TCP 路径没有 HTTP 兼容面，收口序列与 ServerHost 相同。
 struct TcpServerHost {
     std::shared_ptr<net::Engine> engine{
-        std::make_shared<net::Engine>(std::shared_ptr<net::RawHandler>{})};
+        net::Engine::Create(std::shared_ptr<net::RawHandler>{})};
     std::shared_ptr<rpc::Server> server;
     std::shared_ptr<rpc::TcpRpcInboundTransport> inbound;
     std::thread runner;

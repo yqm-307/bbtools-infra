@@ -43,7 +43,7 @@ int Example() {
     g_bbt_coroutine_config->m_cfg_stack_size = 128 * 1024;
     g_bbt_coroutine_config->m_cfg_processer_auto_scale = false;
     g_scheduler->Start();
-    auto server_engine = std::make_shared<net::Engine>(std::shared_ptr<net::RawHandler>{});
+    auto server_engine = net::Engine::Create(std::shared_ptr<net::RawHandler>{});
     std::atomic<unsigned> peer_requests{0};
     auto made = http::Server::Create(server_engine,
         [&peer_requests](bbt::infra::IncomingCallContext ctx, http::IncomingRequest request) {
@@ -73,7 +73,7 @@ int Example() {
     Check(static_cast<bool>(server->Start()), "Server Start");
     std::vector<net::Address> addresses;
     Check(!server_engine->LocalAddresses(addresses) && addresses.size() == 1, "bound address");
-    auto client_engine = std::make_shared<net::Engine>(std::shared_ptr<net::RawHandler>{});
+    auto client_engine = net::Engine::Create(std::shared_ptr<net::RawHandler>{});
     config.listen_addresses.clear();
     Runner client_run(client_engine, config);
     Running(client_engine);

@@ -23,19 +23,31 @@
 //   - HTTP adapter 另将非 200 映射为 Unavailable（backend_category=http）。
 
 #include <memory>
+#include <string_view>
 
 #include <bbt/coroutine/syntax/Async.hpp>
+#include <bbt/coroutine/object/CoObject.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
 #include <bbt/infra/Result.hpp>
+#include <bbt/infra/rpc/Request.hpp>
+#include <bbt/infra/rpc/Response.hpp>
+#include <bbt/infra/rpc/Stats.hpp>
 #include <bbt/infra/rpc/Transport.hpp>
 
 // 源兼容工厂（HTTP adapter 实现，见 HttpTransport.hpp）：完整声明需要
 // bbt::infra::http 类型，这里仅前向声明；定义与实现在 HTTP adapter TU。
 namespace bbt::infra::http { class Client; }
+// v2 会话 owner：只前向声明 net::Engine（不产生头依赖），options/值类型
+// 见 rpc/Options.hpp。
+namespace bbt::infra::net { class Engine; }
 
 namespace bbt::infra::rpc {
 
-class Client {
+class ClientOptions;
+class SendOptions;
+struct SessionOwnerState;  // detail：v2 会话 owner，仅 Session TU 有定义
+
+class Client : public bbt::coroutine::CoObject {
 public:
     // 只装配：校验并持有 transport，不联网。Engine/执行底座由应用装配并
     // 最终收口（与 adapter owner 同责）。
@@ -45,6 +57,37 @@ public:
     // （architecture §10）。定义在 HTTP adapter（bbt/infra/rpc/HttpTransport.cc）。
     static result<std::shared_ptr<Client>> Create(
         std::shared_ptr<http::Client> http_client);
+
+    // ---- v2 会话 owner（ADR §2.2/§3.1）----------------------------------
+    // 只装配：校验 options 并持有共享 Engine，不启动 Engine、不建线程、
+    // 不监听、不拨号。未显式 SetTrustedNetworkPlaintext(true) 且当前没有
+    // verifier API 时返回 UnsupportedRoute。
+    static result<std::shared_ptr<Client>> Create(
+        std::shared_ptr<net::Engine> engine, ClientOptions options);
+
+    // 仅在受管协程内调用（bbt_co_await 消费）。target 为 "tcp://host:port"
+    // （numeric-ip:port，无 DNS）。首次使用经 Hello/HelloAck 握手与 epoch
+    // 协商建立 provisional session，同 PeerKey 的并发 Call/Send 共用一条
+    // 双向 link（含本进程 Server 入站接纳的 link）。
+    // Call 要求 request.Reply()==Required、Traffic 为 Service/Actor；
+    // request_id 为空时由 session 生成唯一值。失败错误面：InvalidArgument/
+    // InvalidContext/TimedOut/Closed/Overloaded/UnsupportedRoute/
+    // OutcomeUnknown（committed 后无可信终态）。
+    bbt_co_async(result<Response>) Call(
+        std::string_view target, Request request,
+        const CallOptions& options);
+
+    // Send 要求 request.Reply()==None、Traffic 为 Service/Actor；
+    // message_id 为空时由 session 生成唯一值。RequireRemoteAcceptance
+    // 编码为 acceptance_requested presence；true 时等到远端 admission
+    // 成功（或拒绝）的 SendAccepted 才返回。false 在本地 lane 接纳后返回。
+    bbt_co_async(result<void>) Send(
+        std::string_view target, Request message,
+        const SendOptions& options);
+
+    // v2 owner 观测快照（owner 汇总；逐 peer/epoch/link 观测缺口见
+    // handoff——本切片不声称完整 AppSession 监控）。
+    ClientStats Stats() const noexcept;
     ~Client() noexcept;
     Client(const Client&) = delete;
     Client& operator=(const Client&) = delete;
@@ -64,7 +107,11 @@ public:
 
 private:
     explicit Client(std::shared_ptr<IRpcTransport> transport) noexcept;
-    std::shared_ptr<IRpcTransport> m_transport;
+    explicit Client(std::shared_ptr<SessionOwnerState> owner) noexcept;
+    friend class Server;  // Server::Create 注入 session_owner 取 m_owner
+    std::shared_ptr<IRpcTransport>     m_transport;
+    std::shared_ptr<SessionOwnerState> m_owner;  // v2 会话 owner（与
+                                                 // m_transport 互斥装配）
 };
 
 } // namespace bbt::infra::rpc

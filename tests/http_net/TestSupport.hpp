@@ -135,7 +135,7 @@ public:
     std::error_code run_error;
     std::atomic<bool> run_returned{false};
 
-    Host() : engine(std::make_shared<net::Engine>(std::shared_ptr<net::RawHandler>{})) {
+    Host() : engine(net::Engine::Create(std::shared_ptr<net::RawHandler>{})) {
         net::EngineConfig config;
         config.runtime_progress = net::RuntimeProgress::Independent;
         config.options.num_event_loop = 1;

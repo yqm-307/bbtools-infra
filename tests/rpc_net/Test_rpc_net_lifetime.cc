@@ -154,7 +154,7 @@ void CompatFactory() {
     // （旧 include consumer 兼容窗口证据）。
     std::atomic<unsigned> handled{0};
     auto server_engine =
-        std::make_shared<net::Engine>(std::shared_ptr<net::RawHandler>{});
+        net::Engine::Create(std::shared_ptr<net::RawHandler>{});
     auto made_server = rpc::Server::Create(server_engine, EchoHandler(&handled));
     CHECK(made_server);
     auto server = std::move(made_server).value();
@@ -206,7 +206,7 @@ void InboundCycleRelease() {
     std::weak_ptr<rpc::Server> weak_server;
     {
         auto engine =
-            std::make_shared<net::Engine>(std::shared_ptr<net::RawHandler>{});
+            net::Engine::Create(std::shared_ptr<net::RawHandler>{});
         weak_engine = engine;
         auto inbound = rpc::HttpRpcInboundTransport::Create(engine, {});
         CHECK(inbound);
@@ -237,7 +237,7 @@ void DestroyDuringInflight() {
     net::Address address;
     {
         auto engine =
-            std::make_shared<net::Engine>(std::shared_ptr<net::RawHandler>{});
+            net::Engine::Create(std::shared_ptr<net::RawHandler>{});
         weak_engine = engine;
         auto inbound = rpc::HttpRpcInboundTransport::Create(engine, {});
         CHECK(inbound);
