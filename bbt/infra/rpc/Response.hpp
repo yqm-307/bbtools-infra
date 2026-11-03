@@ -1,6 +1,6 @@
 #pragma once
 // bbtools-infra v2：RPC 值层 Response。
-// 契约来源：docs/decisions/0014-app-session-v2.md §2.1/§2.4。
+// 契约来源：docs/decisions/0014-app-session.md §2.1/§2.4。
 //
 // 业务用默认构造 + setter 生成回复；Response 构造不提供 socket/session/业务
 // 上下文。关联字段（request_id/service/method/request_schema/response_schema）

@@ -1,6 +1,6 @@
 #pragma once
 // bbtools-infra v2：RPC lane/owner 观测值类型。
-// 契约来源：docs/decisions/0014-app-session-v2.md §2.1/§2.3。
+// 契约来源：docs/decisions/0014-app-session.md §2.1/§2.3。
 //
 // 快照语义：Client::Stats()/Server::Stats() 按值返回；累计字段单调增加，
 // 当前字段是取样时 gauge。MonitorService 只能消费这些 infra 事实。

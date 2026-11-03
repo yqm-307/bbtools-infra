@@ -1,6 +1,6 @@
 // bbtools-infra：v2 AppSession SessionFrame wire profile 单一真源。
 //
-// 契约来源：docs/decisions/0014-app-session-v2.md §5.1 的字段号表；
+// 契约来源：docs/decisions/0014-app-session.md §5.1 的字段号表；
 // 字段号一经发布不得复用/改号/改变含义，废弃字段改为 reserved。
 // 本文件自包含（不 import v1）：v2 是独立 profile，不在 v1 字段上隐式复用。
 // protoc 与 C++ runtime 同源锁定 3.21.12（cmake/RpcNet.cmake）。

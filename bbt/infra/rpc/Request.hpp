@@ -1,6 +1,6 @@
 #pragma once
 // bbtools-infra v2：RPC 值层 Request 与关联值类型。
-// 契约来源：docs/decisions/0014-app-session-v2.md §2.1 稳定签名。
+// 契约来源：docs/decisions/0014-app-session.md §2.1 稳定签名。
 //
 // 本头只承载值类型：标准库 + bbt::infra::Result + bbt::coroutine::Deadline；
 // 不引用 framework、HTTP/net transport 或 protobuf 生成物（AGENTS.md §4）。

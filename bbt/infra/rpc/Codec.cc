@@ -2,7 +2,7 @@
 // 公开面见 bbt/infra/rpc/Codec.hpp；protobuf 生成物只在本文件与 protoc
 // 生成目录内出现，不向公共头泄漏。
 //
-// 校验矩阵来源：docs/decisions/0014-app-session-v2.md §5.1 字段约束表与
+// 校验矩阵来源：docs/decisions/0014-app-session.md §5.1 字段约束表与
 // §5.2 分帧上限。错误映射沿用 v1 RpcWire 约定：编码端 InvalidArgument
 // （值不可编码）/ProtocolError（本地非法枚举会产出接收端必拒 wire）；
 // 解码端字段级违规统一 ProtocolError，不产生部分解码。

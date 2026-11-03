@@ -1,6 +1,6 @@
 #pragma once
 // bbtools-infra v2：RPC 装配值层 Options（ClientOptions/SendOptions/
-// ServerOptions）。契约来源：docs/decisions/0014-app-session-v2.md §2.2/§2.3。
+// ServerOptions）。契约来源：docs/decisions/0014-app-session.md §2.2/§2.3。
 //
 // 纯值类型 + Validate()：setter 只存值，Validate 在 Create/Start 边界由
 // owner 调用；本头不联网、不创建线程。net::Address 是值类型（sockaddr 快照，

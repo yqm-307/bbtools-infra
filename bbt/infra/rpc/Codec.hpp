@@ -3,7 +3,7 @@
 // 不依赖任何物理 transport 栈）。
 //
 // wire 单一真源：proto/bbt/infra/rpc/v2/session_frame.proto（profile 2，
-// 字段号冻结见 docs/decisions/0014-app-session-v2.md §5.1）；protobuf 生成物
+// 字段号冻结见 docs/decisions/0014-app-session.md §5.1）；protobuf 生成物
 // 只出现在 Codec.cc，公共头无 pb 类型泄漏（adapter 边界，AGENTS.md §4）。
 //
 // SessionFrame 值类型按 ADR §5.1 字段表逐字段承载，含：

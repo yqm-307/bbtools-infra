@@ -1,7 +1,7 @@
 #pragma once
 // bbtools-infra v2：RPC 入站 admission 公共类型（ReplyCompletion /
 // AdmissionLease / AdmissionItem / AdmissionHandler / AdmissionQueue）。
-// 契约来源：docs/decisions/0014-app-session-v2.md §2.3/§4.2。
+// 契约来源：docs/decisions/0014-app-session.md §2.3/§4.2。
 //
 // 职责边界：AdmissionItem 是 Call 与 Send 共用的唯一按序接纳入口载荷；
 // framework 的 AdmissionHandler 只做同步校验和有界转移（不挂起、不调普通
