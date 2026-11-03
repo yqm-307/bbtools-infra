@@ -214,13 +214,16 @@ struct SessionCore final : std::enable_shared_from_this<SessionCore> {
     // 本 link 占用的 owner 会话额度与映射（幂等）。持 owner->mu 调用；
     // 返回是否有额外交付（notify 已由调用方统一做时不重复）。
     bool ReleasedLocked();
-    // P1-8：conn 物理 Released 晚于退出责任归零时，由 server/owner 收口
-    // 观察点重驱一次归还（幂等）。持 owner->mu 调用。
+    // conn 物理 Released 可能晚于退出责任归零，所以收口观察点会重驱一次
+    // 归还（幂等）。持 owner->mu 调用。
     bool DriveReleaseLocked() { return ReleasedLocked(); }
     result<void> Enqueue(OutItem item);
     // 单条 OutItem 唯一结算点：发布 settle 终态（若有凭据）+ 写责任计数
     // 归零观察；outcome 是该条目的真实终态。
     void NoteWriteSettled(OutItem& item, result<void> outcome);
+    // 把本条关联的 pending（calls/sends，按 key 唯一）结算成 error 并唤醒
+    // 等待方；key 为空或已结算时无副作用。写失败与写前钩子抛出共用。
+    void FailItemPending(const OutItem& item, const Error& error);
     void WriterLoop();
     void ReaderLoop();
     void FailPending(Error error, bool committed_only);
@@ -233,6 +236,10 @@ struct SessionCore final : std::enable_shared_from_this<SessionCore> {
 struct SessionOwnerState {
     std::shared_ptr<net::Engine> engine;
     ClientOptions                options;
+    // owner 级受控检查点（bbt/infra/rpc/Hooks.hpp）：同 owner 的 link 共用
+    // 一份，不建全局态。由库分配，对外只给 owning handle——handle 可以比
+    // owner 活得久，owner 收口后只读到 closed。
+    std::shared_ptr<SessionHooks> hooks{new SessionHooks()};
     mutable std::mutex           mu;
     bool                         closed{false};
     std::unordered_map<std::string, std::weak_ptr<SessionCore>>   by_endpoint;
@@ -258,6 +265,8 @@ struct SessionOwnerState {
     std::atomic<std::uint64_t>     sessions{0};
     std::atomic<std::uint64_t>     links{0};
     std::atomic<std::uint64_t>     acceptance_pending{0};
+
+    ~SessionOwnerState();
 };
 
 namespace {
@@ -272,21 +281,6 @@ std::uint64_t NextNonce(SessionOwnerState& owner) {
     std::uint64_t nonce = 0;
     do { nonce = owner.random(); } while (nonce == 0);
     return nonce;
-}
-
-// WriterLoop 私有 test 屏障（正常为空）：Dequeue 取出条目后、conn.Write
-// 之前调用，供测试确定性钉住「已排队/写入中」交错。同 DialGateForTest。
-std::function<void()>& WriterGateForTest() {
-    static std::function<void()> gate;
-    return gate;
-}
-
-// 握手阶段私有 test 屏障（正常为空）：EstablishOutbound/ServeInbound 在
-// conn 就绪、开始握手 I/O 之前调用——确定性钉住「建立中」交错（quota
-// 已占用、link 尚未发布）。同 WriterGateForTest。
-std::function<void()>& DialGateForTest() {
-    static std::function<void()> gate;
-    return gate;
 }
 
 } // namespace
@@ -431,6 +425,199 @@ struct ServerV2State final : std::enable_shared_from_this<ServerV2State> {
 
 namespace {
 
+// 库内部固定异常标签：ThrowOnce 只抛这个类型，不接受用户异常对象或消息。
+// 四个调用点都在本 TU，由 RunHookCheckpoint 就地转成可见错误。
+struct HookInjectedFailure final {};
+
+// 检查点退出谓词使用的借用视图：指针指向调用方当前持有的 shared 对象，
+// 只在本函数调用期间有效。
+struct HookGate {
+    const SessionOwnerState*    owner{nullptr};
+    const ServerV2State*        server{nullptr};
+    const SessionCore*          session{nullptr};
+    const net::CoTcpConnection* conn{nullptr};
+    bbt::coroutine::Deadline    deadline{bbt::coroutine::Deadline::max()};
+};
+
+} // namespace
+
+namespace detail {
+
+/**
+ * @brief 固定动作检查点的实现接缝（只在本 TU 定义，不提供给测试）。
+ *
+ * 只做三件事：未注册直接通过；Pause 在库自己的 CoWaiter 上分片等待；
+ * ThrowOnce 在锁内唯一认领并抛出内部标签。不执行用户代码，不持业务锁等待，
+ * 也不让异常穿过 writer/握手路径。
+ */
+class SessionHookAccess {
+public:
+    static result<void> Checkpoint(SessionHooks& hooks, HookPoint point,
+                                   const HookGate& gate) {
+        const auto index = SessionHooks::IndexOf(point);
+        if (index == SessionHooks::kHookPointCount) {
+            return ErrV(ErrorCode::InvalidArgument, "unknown hook point");
+        }
+        std::uint64_t generation = 0;
+        HookAction action = HookAction::Pause;
+        bbt::coroutine::Deadline expires = bbt::coroutine::Deadline::max();
+        {
+            std::lock_guard<std::mutex> lock(hooks.m_mu);
+            if (hooks.m_closed) {
+                return ErrV(ErrorCode::Closed, "hook owner closed");
+            }
+            auto& state = hooks.m_points[index];
+            if (state.armed && Clock::now() >= state.expires_at) {
+                state.armed = false;   // 过期未命中的注册（含 ThrowOnce）失效
+            }
+            if (!state.armed) { return result<void>::ok(); }
+            generation = state.generation;
+            action = state.action;
+            expires = state.expires_at;
+            ++state.entered;
+            ++state.in_flight;
+        }
+        // 所有出口（正常、超时、取消、封口、抛出）都归还 in_flight。
+        Flight flight{hooks, index};
+        if (action == HookAction::ThrowOnce) {
+            {
+                std::lock_guard<std::mutex> lock(hooks.m_mu);
+                auto& state = hooks.m_points[index];
+                if (!state.armed || state.generation != generation) {
+                    return result<void>::ok();   // 已被替换/注销：本次通过
+                }
+                state.armed = false;             // 锁内唯一认领并消费
+            }
+            throw HookInjectedFailure{};
+        }
+        return PauseUntil(hooks, index, generation, expires, gate);
+    }
+
+    /// @brief owner 封口/销毁：永久 closed 并解除全部注册，不等在途退出。
+    static void Close(SessionHooks& hooks) noexcept {
+        std::lock_guard<std::mutex> lock(hooks.m_mu);
+        hooks.m_closed = true;
+        for (auto& state : hooks.m_points) { state.armed = false; }
+    }
+
+private:
+    static void Leave(SessionHooks& hooks, std::size_t index) noexcept {
+        std::lock_guard<std::mutex> lock(hooks.m_mu);
+        auto& state = hooks.m_points[index];
+        if (state.in_flight != 0) { --state.in_flight; }
+    }
+
+    struct Flight {
+        SessionHooks& hooks;
+        std::size_t   index;
+        ~Flight() { Leave(hooks, index); }
+    };
+
+    // Pause 的等待循环：每片重新取 min(操作期限, 注册到期, now + 10ms)，
+    // 并在每片前后检查库对象终态。每片都不持 hook 锁。
+    static result<void> PauseUntil(SessionHooks& hooks, std::size_t index,
+                                   std::uint64_t generation,
+                                   bbt::coroutine::Deadline expires,
+                                   const HookGate& gate) {
+        // 库对象终态：任一所属边界关闭都直接退出，不等注册被 Clear。
+        const auto closed_reason = [&gate]() -> const char* {
+            if (gate.owner && SessionOwnerClosed(*gate.owner)) {
+                return "hook pause: owner closed";
+            }
+            if (gate.server && ServerV2Closed(*gate.server)) {
+                return "hook pause: server closed";
+            }
+            if (gate.session && gate.session->dead.load()) {
+                return "hook pause: session closed";
+            }
+            if (gate.conn && gate.conn->IsClosed()) {
+                return "hook pause: connection closed";
+            }
+            return nullptr;
+        };
+        auto waiter = CoWaiter::Create();
+        for (;;) {
+            if (const char* reason = closed_reason()) {
+                return ErrV(ErrorCode::Closed, reason);
+            }
+            bool paused = false;
+            {
+                std::lock_guard<std::mutex> lock(hooks.m_mu);
+                if (hooks.m_closed) {
+                    return ErrV(ErrorCode::Closed, "hook owner closed");
+                }
+                auto& state = hooks.m_points[index];
+                if (state.armed && Clock::now() >= state.expires_at) {
+                    state.armed = false;
+                }
+                paused = state.armed && state.generation == generation;
+            }
+            if (!paused) { break; }   // 注销/替换/到期：解除暂停
+            const auto now = Clock::now();
+            if (now >= gate.deadline) {
+                return ErrV(ErrorCode::TimedOut,
+                            "hook pause: operation deadline");
+            }
+            const auto slice = std::min(
+                {gate.deadline, expires, now + SessionHooks::kPauseSlice});
+            const auto status = waiter->Wait({slice});
+            switch (status) {
+                case WaitStatus::Completed:
+                case WaitStatus::TimedOut:
+                    break;   // 本片结束，下一片重新检查注册与终态
+                case WaitStatus::Cancelled:
+                    return ErrV(ErrorCode::Cancelled, "hook pause: cancelled");
+                case WaitStatus::InvalidContext:
+                    return ErrV(ErrorCode::InvalidContext,
+                                "hook pause requires coroutine context");
+                case WaitStatus::AlreadyWaiting:
+                case WaitStatus::RuntimeUnavailable:
+                    return ErrV(ErrorCode::RuntimeUnavailable,
+                                "hook pause: wait unavailable");
+            }
+        }
+        // 解除后再次检查关闭与操作期限，随后才允许提交 I/O 或发布 link。
+        if (const char* reason = closed_reason()) {
+            return ErrV(ErrorCode::Closed, reason);
+        }
+        if (Clock::now() >= gate.deadline) {
+            return ErrV(ErrorCode::TimedOut, "hook pause: operation deadline");
+        }
+        return result<void>::ok();
+    }
+};
+
+} // namespace detail
+
+namespace {
+
+const char* HookPointLabel(HookPoint point) noexcept {
+    switch (point) {
+        case HookPoint::BeforeWrite:             return "before_write";
+        case HookPoint::OutboundBeforeHandshake: return "outbound_handshake";
+        case HookPoint::InboundBeforeHandshake:  return "inbound_handshake";
+        case HookPoint::InboundBeforePublish:    return "inbound_publish";
+    }
+    return "unknown";
+}
+
+// 把库内部固定标签转成可见错误：四个调用点都只处理 result，各自完成
+// pending/记录/额度/连接的收尾，异常不越过各自的责任边界。
+result<void> RunHookCheckpoint(SessionHooks& hooks, HookPoint point,
+                               const HookGate& gate) {
+    try {
+        return detail::SessionHookAccess::Checkpoint(hooks, point, gate);
+    } catch (const HookInjectedFailure&) {
+        return ErrV(ErrorCode::InternalError,
+                    std::string("hook checkpoint injected failure: ") +
+                        HookPointLabel(point));
+    }
+}
+
+} // namespace
+
+namespace {
+
 // ============================================================================
 // Outbound lane helpers
 // ============================================================================
@@ -518,6 +705,29 @@ void SessionCore::NoteWriteSettled(OutItem& item, result<void> outcome) {
     }
 }
 
+// 把本条关联的 pending 结算成 error 并唤醒等待方。写失败与「写前钩子抛出」
+// 共用同一条责任路径：两者都发生在真实写终态之前，等待方必须拿到确定失败
+// 而不是等到自己的 deadline。
+void SessionCore::FailItemPending(const OutItem& item, const Error& error) {
+    if (item.key.empty()) { return; }
+    std::shared_ptr<CoWaiter> waiter;
+    {
+        std::lock_guard<std::mutex> lock(pending_mu);
+        if (auto it = calls.find(item.key); it != calls.end()) {
+            it->second->outcome = result<Response>::err(error);
+            it->second->done = true;
+            waiter = it->second->waiter;
+            calls.erase(it);
+        } else if (auto si = sends.find(item.key); si != sends.end()) {
+            si->second->outcome = result<void>::err(error);
+            si->second->done = true;
+            waiter = si->second->waiter;
+            sends.erase(si);
+        }
+    }
+    if (waiter) { waiter->Notify(); }
+}
+
 bool SessionCore::Dequeue(OutItem& out) {
     std::lock_guard<std::mutex> lock(out_mu);
     // 调度顺序：System 保留容量优先；Service/Actor 按权重轮询。
@@ -536,7 +746,7 @@ bool SessionCore::Dequeue(OutItem& out) {
     if (pop(0)) { return true; }
     const std::uint32_t weights[kLaneCount - 1] = {
         owner->options.ServiceWeight(), owner->options.ActorWeight()};
-    // P2-10 权重轮询：rr_credit[lane]=本轮剩余可出队次数，两侧都耗尽时按
+    // 权重轮询：rr_credit[lane]=本轮剩余可出队次数，两侧都耗尽时按
     // 权重整体重载。Service 连续取满自身份额后 credit=0，下一条落到还有
     // credit 的 Actor——Service 恒有流量也不会饿死 Actor。某 lane 队列空
     // 时 credit 保留但不消费；本条两侧都无有效 pop 走兜底任取。
@@ -572,58 +782,66 @@ void SessionCore::WriterLoop() {
         auto deadline = item.deadline == Clock::time_point::max()
             ? Clock::now() + 30s
             : item.deadline;
-        // 私有 test seam（正常为空）：取出条目后、真实写前由测试钉住交错。
-        if (auto& gate = WriterGateForTest()) { gate(); }
-        // P2-7：writer 已把本条从队列取出并即将交给 conn.Write——责任自此刻
-        // 由 writer 承担，不再属「排队中」。先把关联 pending 标 committed
-        // （承担发送责任，结果可能未知），随后挂起期间若 link 被 Kill，
-        // FailPending 的 committed_only 结算按「已承担」返回 OutcomeUnknown
-        // 而非「未提交」Closed。
-        if (!item.key.empty()) {
-            std::lock_guard<std::mutex> lock(pending_mu);
-            if (auto it = calls.find(item.key); it != calls.end()) {
-                it->second->committed = true;
-            } else if (auto si = sends.find(item.key);
-                       si != sends.end()) {
-                si->second->committed = true;
-            }
-        }
-        const auto report = conn.Write(std::move(item.bytes), {deadline});
-        const auto settled = detail::TcpSettleWrite(report, "frame write failed");
-        if (settled) {
-            // committed：写成功，关联 pending 保持 committed（上面已置位）。
-            NoteWriteSettled(item, result<void>::ok());
-            continue;
-        }
-        // 写失败：向等待本帧的回复凭据发布真实失败终态，把对应 pending
-        // 结算 OutcomeUnknown（已部分写出不可断定零提交），随后整 link
-        // 退役、其余 pending 同样结算；本条写责任唯一 -1 由
-        // NoteWriteSettled 完成，不得泄漏给收口观察。
-        auto error = settled.error();
-        if (!item.key.empty()) {
-            std::shared_ptr<CoWaiter> waiter;
-            {
-                std::lock_guard<std::mutex> lock(pending_mu);
-                if (auto it = calls.find(item.key); it != calls.end()) {
-                    it->second->outcome =
-                        result<Response>::err(error);
-                    it->second->done = true;
-                    waiter = it->second->waiter;
-                    calls.erase(it);
-                } else if (auto si = sends.find(item.key);
-                           si != sends.end()) {
-                    si->second->outcome =
-                        result<void>::err(error);
-                    si->second->done = true;
-                    waiter = si->second->waiter;
-                    sends.erase(si);
+        // 已出队项的写责任区间：检查点、committed 标记、conn.Write 与结果
+        // 映射同属一份责任。任何出口都先结算这一条（关联 pending + reply
+        // settle + writes_outstanding 恰好一次）；Kill 只清扫仍在队列里的
+        // 条目，替已出队项结不了账，漏掉这一笔会让 writes_outstanding 永不
+        // 归零，Drain/Close 只能等到超时。
+        std::optional<Error> failure;
+        bool write_attempted = false;
+        try {
+            // 固定动作检查点：未注册直接通过；Pause 在库内分片等待，不执行
+            // 任何用户代码。失败（期限/取消/封口/注入）都是提交前确定失败。
+            const auto gate = RunHookCheckpoint(
+                *owner->hooks, HookPoint::BeforeWrite,
+                HookGate{owner.get(), nullptr, this, &conn, deadline});
+            if (!gate) {
+                failure = gate.error();
+            } else {
+                // writer 已把本条从队列取出并即将交给 conn.Write——责任自
+                // 此刻由 writer 承担，不再属「排队中」。先把关联 pending 标
+                // committed（承担发送责任，结果可能未知），随后挂起期间若
+                // link 被 Kill，FailPending 的 committed_only 结算按「已承担」
+                // 返回 OutcomeUnknown 而非「未提交」Closed。
+                if (!item.key.empty()) {
+                    std::lock_guard<std::mutex> lock(pending_mu);
+                    if (auto it = calls.find(item.key); it != calls.end()) {
+                        it->second->committed = true;
+                    } else if (auto si = sends.find(item.key);
+                               si != sends.end()) {
+                        si->second->committed = true;
+                    }
                 }
+                write_attempted = true;
+                const auto report =
+                    conn.Write(std::move(item.bytes), {deadline});
+                const auto settled =
+                    detail::TcpSettleWrite(report, "frame write failed");
+                if (!settled) { failure = settled.error(); }
             }
-            if (waiter) { waiter->Notify(); }
+        } catch (...) {
+            // 提交前：确定失败。已承担 conn.Write：字节可能已发出，按既有
+            // RequestCommitted/OutcomeUnknown 语义结算，不假装零提交、不重试。
+            failure = write_attempted
+                ? ErrPhase(ErrorCode::OutcomeUnknown,
+                           "write path threw after commit",
+                           RequestPhase::RequestCommitted)
+                : Err(ErrorCode::InternalError,
+                      "write path threw before commit");
         }
-        NoteWriteSettled(item, result<void>::err(error));
-        Kill(std::make_error_code(std::errc::io_error));
-        return;
+        if (failure) {
+            // 写失败/提交前失败：向等待本帧的回复凭据发布真实失败终态，把
+            // 对应 pending 结算成同一错误，随后整 link 退役、其余 pending
+            // 同样结算；本条写责任唯一 -1 由 NoteWriteSettled 完成，不得
+            // 泄漏给收口观察。
+            FailItemPending(item, *failure);
+            NoteWriteSettled(item, result<void>::err(*failure));
+            Kill(std::make_error_code(std::errc::io_error));
+            return;
+        }
+        // committed：写成功，关联 pending 保持 committed（上面已置位）。
+        NoteWriteSettled(item, result<void>::ok());
+        continue;
     }
 }
 
@@ -734,7 +952,7 @@ bool SessionCore::ExitDone() {
 
 // Released 唯一归还点（持 owner->mu）：物理收口真实完成后才归还额度——
 // 退役未完成的 link 持续占用 MaxSessions，防止「逻辑死亡即释放额度」
-// 让新建立绕过上限。P1-8：物理 conn 未 Released 前不得归还——conn 仍
+// 让新建立绕过上限。物理 conn 未 Released 前不得归还——conn 仍
 // 承担在途读写/物理关闭责任时，session/link 计数与 by_identity 台账必须
 // 保留，否则失去物理 Released 凭据。返回是否有额外交付。
 bool SessionCore::ReleasedLocked() {
@@ -780,7 +998,7 @@ void SessionCore::PostSessionError(const Error& error) {
 }
 
 namespace {
-// P2-5：reader 上的 admission 拒绝路径不等写终态（定义在 TU 后部）。
+// reader 上的 admission 拒绝路径不等写终态（定义在 TU 后部）。
 void PostReplyErrorNoWait(const std::shared_ptr<SessionCore>& session,
                           const detail::ReplyCompletionImpl& impl,
                           Error error);
@@ -793,7 +1011,7 @@ void SessionCore::AdmitInbound(const SessionFrame& frame, Request request) {
     std::shared_ptr<AdmissionQueue> queue;
     if (server) {
         // queue 指针写入受 server->mu 保护（ServerV2Start）；观察面取同一
-        // 临界区快照，不与 Start/Close 的台账写并发裸读（P2-3 同口径）。
+        // 临界区快照，不与 Start/Close 的台账写并发裸读。
         std::lock_guard<std::mutex> lock(server->mu);
         queue = server->queue;
     }
@@ -811,7 +1029,7 @@ void SessionCore::AdmitInbound(const SessionFrame& frame, Request request) {
     auto lease_impl = std::make_shared<detail::AdmissionLeaseImpl>();
     lease_impl->server = server;
     lease_impl->lane = item.request.Traffic();
-    item.lease = std::make_shared<AdmissionLease>(lease_impl);
+    item.lease = detail::AdmissionAccess::MakeLease(lease_impl);
     if (frame.kind == FrameKind::Call ||
         (frame.kind == FrameKind::Send &&
          frame.acceptance_requested.has_value() &&
@@ -832,7 +1050,7 @@ void SessionCore::AdmitInbound(const SessionFrame& frame, Request request) {
             impl->kind = FrameKind::SendAccepted;
             impl->message_id = frame.message_id;
         }
-        item.reply = std::make_shared<ReplyCompletion>(impl);
+        item.reply = detail::AdmissionAccess::MakeReply(impl);
     }
     {
         std::lock_guard<std::mutex> lock(out_mu);
@@ -858,12 +1076,12 @@ void SessionCore::AdmitInbound(const SessionFrame& frame, Request request) {
             ++stats.dropped;
             --stats.inflight;
         }
-        // F3/P2-5：保留 reply 凭据发布唯一拒绝终态，连接仍可进展。本路径在
+        // 保留 reply 凭据发布唯一拒绝终态，连接仍可进展。本路径在
         // 唯一 reader 上——不能调用会挂起等写终态的 Fail（写背压会阻塞
         // reader，无法继续解后续帧）。标 terminal 后直接入队错误帧不等待；
         // 写责任仍由 WriterLoop/Kill 真实结算。
         if (item.reply) {
-            if (auto impl = item.reply->MarkTerminalForReject()) {
+            if (auto impl = detail::AdmissionAccess::ClaimTerminal(*item.reply)) {
                 auto session = impl->session.lock();
                 if (session) {
                     PostReplyErrorNoWait(session, *impl,
@@ -875,7 +1093,7 @@ void SessionCore::AdmitInbound(const SessionFrame& frame, Request request) {
         // 随 item 析构，不欠账。
         return;
     }
-    // F3：保留完成凭据/lease 的本地副本——Admit 按值转移 item，拒绝路径
+    // 保留完成凭据/lease 的本地副本——Admit 按值转移 item，拒绝路径
     // 仍需可用 reply/lease 结算唯一终态。
     auto reply = item.reply;
     auto lease = item.lease;
@@ -885,7 +1103,7 @@ void SessionCore::AdmitInbound(const SessionFrame& frame, Request request) {
         // Call → Response error；带确认 Send → SendAccepted error。本路径
         // 同在唯一 reader 上，不等写终态。
         if (reply) {
-            if (auto impl = reply->MarkTerminalForReject()) {
+            if (auto impl = detail::AdmissionAccess::ClaimTerminal(*reply)) {
                 auto session = impl->session.lock();
                 if (session) {
                     PostReplyErrorNoWait(session, *impl, admitted.error());
@@ -1024,7 +1242,7 @@ void SessionCore::DispatchInbound(const SessionFrame& frame) {
 void SessionCore::ReaderLoop() {
     for (;;) {
         if (dead.load()) { return; }
-        // 先耗 decoder 缓存（含握手移交的合包余帧），再阻塞 Read（F1）。
+        // 先耗 decoder 缓存（含握手移交的合包余帧），再阻塞 Read。
         for (;;) {
             auto next = decoder.Next();
             if (!next) {
@@ -1132,7 +1350,7 @@ void AdmissionWorker(std::shared_ptr<detail::AdmissionQueueImpl> impl) {
                 (void)reply->Fail(std::move(error));
             }
         }
-        // F4：lease 单次结算——Release 内部已完成 inflight-1 与 finished+1，
+        // lease 单次结算——Release 内部已完成 inflight-1 与 finished+1，
         // 这里不再重复 NoteInflight（下溢 UINT64_MAX 会让 Drain 假超时）。
         if (lease) { lease->Release(); }
         if (server) {
@@ -1168,8 +1386,37 @@ result<std::shared_ptr<AdmissionQueue>> AdmissionQueue::Create(
         return R::err(Err(ErrorCode::RuntimeUnavailable,
                           "admission worker registration failed"));
     }
-    return R::ok(std::shared_ptr<AdmissionQueue>(
-        new AdmissionQueue(std::move(impl))));
+    return R::ok(detail::AdmissionAccess::MakeQueue(std::move(impl)));
+}
+
+// --- detail::AdmissionAccess：不透明实现的唯一构造/收口入口 -------------------
+
+std::shared_ptr<AdmissionQueue> detail::AdmissionAccess::MakeQueue(
+    std::shared_ptr<detail::AdmissionQueueImpl> impl) {
+    return std::shared_ptr<AdmissionQueue>(new AdmissionQueue(std::move(impl)));
+}
+
+std::shared_ptr<ReplyCompletion> detail::AdmissionAccess::MakeReply(
+    std::shared_ptr<detail::ReplyCompletionImpl> impl) {
+    return std::shared_ptr<ReplyCompletion>(
+        new ReplyCompletion(std::move(impl)));
+}
+
+std::shared_ptr<AdmissionLease> detail::AdmissionAccess::MakeLease(
+    std::shared_ptr<detail::AdmissionLeaseImpl> impl) {
+    return std::shared_ptr<AdmissionLease>(new AdmissionLease(std::move(impl)));
+}
+
+std::shared_ptr<detail::ReplyCompletionImpl>
+detail::AdmissionAccess::ClaimTerminal(ReplyCompletion& reply) noexcept {
+    return reply.MarkTerminalForReject();
+}
+
+void detail::AdmissionAccess::AttachQueue(
+    const std::shared_ptr<AdmissionQueue>& queue,
+    const std::shared_ptr<ServerV2State>& server) {
+    if (!queue || !queue->m_impl) { return; }
+    queue->m_impl->server = server;
 }
 
 result<void> AdmissionQueue::Admit(AdmissionItem item) {
@@ -1441,7 +1688,7 @@ bbt_co_async(result<void>) ReplyCompletion::Fail(Error error) {
 
 namespace {
 
-// P2-5：reader 上的 admission 拒绝路径——唯一 reader 不能调用会挂起等写终态
+// reader 上的 admission 拒绝路径——唯一 reader 不能调用会挂起等写终态
 // 的 Complete/Fail（背压会阻塞 reader，无法继续解后续 Response/System 帧）。
 // 本函数直接构造错误终态帧入队，不等待写终态：写责任仍由 WriterLoop/Kill
 // 在真实终态唯一结算，reader 立即返回继续 Read。terminal 已在本路径
@@ -1527,7 +1774,7 @@ namespace {
 // Hello/HelloAck 帧上限 min(max_frame,64KiB) 由 codec 在 hello_phase
 // 前缀阶段强制。先耗 decoder 缓存再 Read；同批 Read 只消费到「下一个
 // 完整握手帧」为止，排在其后的字节经 HandshakeStash 移交调用方——调用
-// 方在验证握手边界的时刻切数据态后按数据限额补喂（F2：合法最终
+// 方在验证握手边界的时刻切数据态后按数据限额补喂（合法最终
 // HelloAck+大首数据帧合包不被握手 pending 界误拒；未验证前这些字节
 // 尚未进 decoder，大声明仍按握手限额拒绝）。
 
@@ -1546,7 +1793,7 @@ constexpr std::size_t kHandshakeFeedChunk = 32 * 1024;
 
 // 读一帧握手帧。同批 Read 只消费到「下一个完整握手帧」为止——解码成功
 // 的瞬间把 decoder 里尚未耗尽的同批余字节 TakePending 进 stash 返回，
-// 由调用方在握手边界验证完成后按数据态补喂（F2：合法最终 HelloAck+
+// 由调用方在握手边界验证完成后按数据态补喂（合法最终 HelloAck+
 // 大首数据帧合包不被握手 pending 界误拒；未验证前这些字节未进
 // decoder，大声明仍按握手限额拒绝）。stash 无跨批语义，每帧调用清零。
 result<SessionFrame> ReadHandshakeFrame(net::ICoConnection& conn,
@@ -1581,7 +1828,7 @@ result<SessionFrame> ReadHandshakeFrame(net::ICoConnection& conn,
             return result<SessionFrame>::err(
                 CallError(gate, "handshake timed out", false));
         }
-        // 先耗缓存：上次已移交的字节先解（F1）。一帧到手即返回。
+        // 先耗缓存：上次已移交的字节先解。一帧到手即返回。
         {
             auto cached = decoder.Next();
             if (!cached) {
@@ -1614,7 +1861,7 @@ result<SessionFrame> ReadHandshakeFrame(net::ICoConnection& conn,
         }
         const auto read = conn.Read({deadline});
         if (read.state == net::ReadState::Data) {
-            // F2：同一 Read 批不整批先按 hello_phase Feed——分段内按
+            // 同一 Read 批不整批先按 hello_phase Feed——分段内按
             // kHandshakeFeedChunk 块补喂，每块后尝试解帧；解出首个握手帧即
             // 停喂，本批未喂字节排在 decoder 余量之后移交 stash（由调用方
             // 在边界验证后按数据态补喂）。decoder 缓冲在两次 Next 之间只
@@ -1725,7 +1972,7 @@ SessionFrame MakeHelloAck(const ClientOptions& options, std::uint64_t epoch,
 // 出站方向（拨号侧）：写 Hello → 读 Hello → epoch owner 决定 epoch →
 // 写 HelloAck → 读 HelloAck echo。identity 较小一侧是 epoch owner。
 // 成功时 out_decoder 收编握手 decoder（含未耗尽的合包余帧），供 session
-// live reader 继续消费（F1 余帧移交）。
+// live reader 继续消费（余帧移交）。
 result<std::uint64_t> OutboundHandshake(
     net::ICoConnection& conn, const ClientOptions& options,
     std::uint64_t proposal, std::uint64_t nonce,
@@ -1784,7 +2031,7 @@ result<std::uint64_t> OutboundHandshake(
             return R::err(Err(ErrorCode::ProtocolError,
                               "HelloAck echo mismatch"));
         }
-        // 验证完成的边界：切数据态后 stash 余字节按数据限额补喂（F2）。
+        // 验证完成的边界：切数据态后 stash 余字节按数据限额补喂。
         if (auto committed = CommitStashAfterFinalAck(decoder, stash);
             !committed) {
             return R::err(committed.error());
@@ -1857,7 +2104,7 @@ result<std::uint64_t> InboundHandshake(
             return R::err(Err(ErrorCode::ProtocolError,
                               "HelloAck echo mismatch"));
         }
-        // 验证完成边界：切数据态，stash 余字节按数据限额补喂（F2）。
+        // 验证完成边界：切数据态，stash 余字节按数据限额补喂。
         if (auto committed = CommitStashAfterFinalAck(decoder, stash);
             !committed) {
             return R::err(committed.error());
@@ -2008,7 +2255,17 @@ result<std::shared_ptr<SessionCore>> EstablishOutbound(
             return R::err(Err(ErrorCode::Closed, "owner closed"));
         }
     }
-    if (auto& gate = DialGateForTest()) { gate(); }
+    // 固定动作检查点：拨号已成功、额度已占，link 还没发布。Pause 在库内
+    // 分片等待；失败/注入转成可见错误后，establishing 记录、额度与 conn 由
+    // GetSession 的共同收尾归还——异常不越过该收尾块，也不在这里另造一条
+    // 半截清理路径。
+    if (const auto gate = RunHookCheckpoint(
+            *owner->hooks, HookPoint::OutboundBeforeHandshake,
+            HookGate{owner.get(), nullptr, nullptr, &conn, deadline});
+        !gate) {
+        conn.RequestClose();
+        return R::err(gate.error());
+    }
     std::string peer_identity;
     const auto proposal = NextEpoch(*owner);
     const auto nonce = NextNonce(*owner);
@@ -2050,7 +2307,7 @@ result<std::shared_ptr<SessionCore>> GetSession(
         if (owner->closed) {
             return R::err(Err(ErrorCode::Closed, "owner closed"));
         }
-        // P1-8：每次取会话都在 owner->mu 下顺带重驱各 link 的物理 Released
+        // 每次取会话都在 owner->mu 下顺带重驱各 link 的物理 Released
         // 归还（幂等）——conn 物理 Released 晚于 ExitDone 归零时，新调用
         // 是天然的收口观察点，不必另起清扫线程。先收集再驱动：ReleasedLocked
         // 会从 by_identity 擦除条目，持锁遍历中不能边迭代边擦除。
@@ -2118,22 +2375,46 @@ result<std::shared_ptr<SessionCore>> GetSession(
         }
     }
     // 本协程执行拨号。
-    auto made = EstablishOutbound(owner, target, endpoint_key, mine,
-                                  deadline);
+    // 异常全路径归还：EstablishOutbound 内部已把检查点注入与失败转成可见
+    // 错误，这里再兜一层——任何逃出的异常都不能跳过下面的收尾块，否则
+    // establishing 记录、reserved 额度与 done 位会永久留下。异常转成
+    // InternalError 返回，收尾块照常执行。
+    result<std::shared_ptr<SessionCore>> made =
+        R::err(Err(ErrorCode::InternalError, "establish did not run"));
+    try {
+        made = EstablishOutbound(owner, target, endpoint_key, mine, deadline);
+    } catch (const std::exception& error) {
+        made = R::err(Err(ErrorCode::InternalError,
+                          std::string("session establish threw: ") +
+                              error.what()));
+    } catch (...) {
+        made = R::err(Err(ErrorCode::InternalError,
+                          "session establish threw"));
+    }
+    net::Connection abandoned;
     {
         std::lock_guard<std::mutex> lock(owner->mu);
         if (made) {
             mine->session = made.value();
         } else {
             mine->error = made.error();
+            // 失败/异常路径的物理关闭责任兜底：EstablishOutbound 的正常失败
+            // 分支已自行 RequestClose（幂等），这里覆盖「异常逃出、还没关」
+            // 的情况——建立中 conn 不能因为记录被擦除而失去关闭责任人。
+            abandoned = mine->conn;
         }
         // 归还顺序（建立中责任）：conn 句柄先从记录上移除，使本条
         // shared_ptr 在临界区外随擦除析构——物理释放在额度归还前
-        // 完成；reserved 占位随记录消亡，不是独立计数。
+        // 完成；reserved 占位随记录消亡，不是独立计数。擦除只匹配本次
+        // 建立记录，不误删同名键上后来的建立者。
         mine->conn = net::Connection{};
-        owner->establishing.erase(endpoint_key);
+        if (auto it = owner->establishing.find(endpoint_key);
+            it != owner->establishing.end() && it->second == mine) {
+            owner->establishing.erase(it);
+        }
         mine->done = true;
     }
+    if (abandoned.Valid()) { abandoned.RequestClose(); }
     return made;
 }
 
@@ -2147,13 +2428,24 @@ void ServeInbound(std::shared_ptr<ServerV2State> server,
     const auto deadline =
         Clock::now() + server->options.IncomingTimeout();
     auto owner = server->owner;
-    if (auto& gate = DialGateForTest()) { gate(); }
+    // 固定动作检查点：conn 已 accept、握手还没开始。失败时本条握手责任仍
+    // 在本协程——关闭 conn 并移除台账记录，不把退役留给更外层的兜底 catch。
+    if (const auto gate = RunHookCheckpoint(
+            *owner->hooks, HookPoint::InboundBeforeHandshake,
+            HookGate{owner.get(), server.get(), nullptr, &conn, deadline});
+        !gate) {
+        conn.RequestClose();
+        std::lock_guard<std::mutex> lock(server->mu);
+        server->handshakes.erase(conn_id);
+        server->cv.notify_all();
+        return;
+    }
     std::string peer_identity;
     const auto proposal = NextEpoch(*owner);
     const auto nonce = NextNonce(*owner);
     SessionFrameDecoder decoder(owner->options.MaxFrameBytes());
-    auto epoch = InboundHandshake(conn, owner->options, proposal, nonce,
-                                  peer_identity, decoder, deadline);
+    auto epoch = detail::InboundHandshakeOnConnection(
+        conn, owner->options, proposal, nonce, peer_identity, decoder, deadline);
     // 握手 conn 责任随本协程结束（任一路径）：台账唯一移除点。
     const auto finish = [&] {
         std::lock_guard<std::mutex> lock(server->mu);
@@ -2172,9 +2464,18 @@ void ServeInbound(std::shared_ptr<ServerV2State> server,
     session->peer_identity = std::move(peer_identity);
     session->outbound = false;
     session->epoch = epoch.value();
-    // 私有 test seam 第二挂点（正常为空）：握手完成、安装前钉住——可
-    // 确定性复现「封口与发布竞争」。
-    if (auto& gate = DialGateForTest()) { gate(); }
+    // 第二个挂点：握手完成、link 还没进台账——封口与发布在这里竞争。
+    // 失败时 conn 已在 session 上、台账记录仍在，两者都要退；这里就地收尾，
+    // 因为外层 catch 只持有原始的 conn 局部量，不能替已移交的 session 关闭。
+    if (const auto gate = RunHookCheckpoint(
+            *owner->hooks, HookPoint::InboundBeforePublish,
+            HookGate{owner.get(), server.get(), nullptr, &session->conn,
+                     deadline});
+        !gate) {
+        session->conn.RequestClose();
+        finish();
+        return;
+    }
     // 封口后不发布 link（物理关闭责任）：Close/Seal 与安装竞争时，本握手
     // 必须退役而不是溜进台账成为漏管连接。检查与 InstallSession 同一
     // owner->mu 事务之外不可行（InstallSession 内部已查 owner->closed）；
@@ -2236,7 +2537,7 @@ void AcceptLoop(std::shared_ptr<ServerV2State> server) {
             server->engine->CoAccept({Clock::now() + 50ms});
         if (accepted.error == std::errc::timed_out) { continue; }
         if (accepted.error) {
-            ServerV2Seal(server);
+            detail::ServerV2Seal(server);
             exit_loop();
             return;
         }
@@ -2291,7 +2592,7 @@ void AcceptLoop(std::shared_ptr<ServerV2State> server) {
 // detail/Session.hpp 测试接缝（非成员，转调匿名 InboundHandshake）
 // ============================================================================
 
-result<std::uint64_t> InboundHandshakeForTest(
+result<std::uint64_t> detail::InboundHandshakeOnConnection(
     net::ICoConnection& conn, const ClientOptions& options,
     std::uint64_t proposal, std::uint64_t nonce,
     std::string& out_peer_identity, SessionFrameDecoder& out_decoder,
@@ -2300,36 +2601,21 @@ result<std::uint64_t> InboundHandshakeForTest(
                             out_peer_identity, out_decoder, deadline);
 }
 
-std::uint64_t ServerV2WritesOutstanding(
-    const std::shared_ptr<ServerV2State>& v2) noexcept {
-    if (!v2) { return 0; }
-    std::uint64_t total = 0;
-    std::lock_guard<std::mutex> lock(v2->mu);
-    for (const auto& weak : v2->links) {
-        if (auto session = weak.lock()) {
-            total += session->writes_outstanding.load();
-        }
-    }
-    return total;
+std::shared_ptr<SessionHooks> Client::Hooks() const noexcept {
+    return m_owner ? m_owner->hooks : nullptr;
 }
 
-void SessionSetWriterGateForTest(std::function<void()> gate) {
-    WriterGateForTest() = std::move(gate);
-}
-
-void SessionSetDialGateForTest(std::function<void()> gate) {
-    DialGateForTest() = std::move(gate);
-}
-
-// v2 台账快照核心（ServerV2State 直参）：links 计未失效弱引用，
-// handshakes 为建立中握手 conn 台账大小。
-detail::ServerV2Ledger ServerV2LinkLedger(
+// v2 台账快照：links/handshakes/writes 三项在同一把 server 锁内取样。
+detail::ServerV2Ledger detail::ServerV2LedgerOf(
     const std::shared_ptr<ServerV2State>& v2) noexcept {
     detail::ServerV2Ledger out;
     if (!v2) { return out; }
     std::lock_guard<std::mutex> lock(v2->mu);
     for (const auto& weak : v2->links) {
-        if (!weak.expired()) { ++out.links; }
+        auto session = weak.lock();
+        if (!session) { continue; }
+        ++out.links;
+        out.writes_outstanding += session->writes_outstanding.load();
     }
     out.handshakes = v2->handshakes.size();
     return out;
@@ -2484,7 +2770,7 @@ bbt_co_async(result<Response>) Client::Call(
     }
     const auto request_id = request.RequestId();
     owner->acceptance_pending.fetch_add(1);
-    // P1-7：先通知后等待的丢唤醒窗口由持久 done 谓词 + 登记后复查关闭。
+    // 先通知后等待的丢唤醒窗口由持久 done 谓词 + 登记后复查关闭。
     // Dispatch/写终态在 pending_mu 下先写 done 再 Notify；on_registered 在
     // waiter 已挂起登记后于同一锁复查 done——done 已真即同步 Notify 走
     // PENDING 早到路径，不依赖那次 Notify 的时序，永不丢唤醒。
@@ -2648,7 +2934,7 @@ bbt_co_async(result<void>) Client::Send(
         ++session->out_lanes[lane_index].finished;
         return R::ok();
     }
-    // P1-7：同 Call——on_registered 在 waiter 登记后于 pending_mu 复查
+    // 同 Call——on_registered 在 waiter 登记后于 pending_mu 复查
     // 持久 done，关闭先通知后等待的丢唤醒窗口。
     const auto status = pending->waiter->WaitWithCallback(
         {options.Deadline()}, [&] {
@@ -2765,7 +3051,7 @@ result<std::shared_ptr<Server>> Server::Create(
         }));
 }
 
-result<void> ServerV2Start(const std::shared_ptr<ServerV2State>& v2) {
+result<void> detail::ServerV2Start(const std::shared_ptr<ServerV2State>& v2) {
     if (!NativeHost()) {
         return ErrV(ErrorCode::InvalidContext,
                     "Start requires native host context");
@@ -2788,7 +3074,7 @@ result<void> ServerV2Start(const std::shared_ptr<ServerV2State>& v2) {
     if (!queue) {
         return result<void>::err(queue.error());
     }
-    queue.value()->Impl()->server = v2;
+    detail::AdmissionAccess::AttachQueue(queue.value(), v2);
     v2->queue = std::move(queue.value());
     bool registered = false;
     g_scheduler->RegistCoroutineTask(128 * 1024,
@@ -2796,7 +3082,7 @@ result<void> ServerV2Start(const std::shared_ptr<ServerV2State>& v2) {
             // 裸协程任务：异常逃逸即 terminate——兜底封 server。
             try { AcceptLoop(v2); }
             catch (...) {
-                ServerV2Seal(v2);
+                detail::ServerV2Seal(v2);
                 std::lock_guard<std::mutex> lock(v2->mu);
                 v2->accept_loop_exited = true;
                 v2->cv.notify_all();
@@ -2811,7 +3097,8 @@ result<void> ServerV2Start(const std::shared_ptr<ServerV2State>& v2) {
     return result<void>::ok();
 }
 
-void ServerV2StopAccepting(const std::shared_ptr<ServerV2State>& v2) noexcept {
+void detail::ServerV2StopAccepting(
+    const std::shared_ptr<ServerV2State>& v2) noexcept {
     std::shared_ptr<AdmissionQueue> queue;
     {
         std::lock_guard<std::mutex> lock(v2->mu);
@@ -2823,13 +3110,13 @@ void ServerV2StopAccepting(const std::shared_ptr<ServerV2State>& v2) noexcept {
     if (queue) { queue->Close(); }
 }
 
-result<void> ServerV2Drain(const std::shared_ptr<ServerV2State>& v2,
-                           bbt::coroutine::Deadline deadline) {
+result<void> detail::ServerV2Drain(const std::shared_ptr<ServerV2State>& v2,
+                                   bbt::coroutine::Deadline deadline) {
     if (!NativeHost()) {
         return ErrV(ErrorCode::InvalidContext,
                     "Drain requires native host context");
     }
-    ServerV2StopAccepting(v2);
+    detail::ServerV2StopAccepting(v2);
     std::unique_lock<std::mutex> lock(v2->mu);
     const auto done = v2->cv.wait_until(lock, deadline, [&] {
         return v2->DrainedLocked();
@@ -2840,7 +3127,7 @@ result<void> ServerV2Drain(const std::shared_ptr<ServerV2State>& v2,
     return result<void>::ok();
 }
 
-void ServerV2Seal(const std::shared_ptr<ServerV2State>& v2) noexcept {
+void detail::ServerV2Seal(const std::shared_ptr<ServerV2State>& v2) noexcept {
     std::vector<std::shared_ptr<SessionCore>> links;
     std::vector<net::Connection> handshakes;
     std::shared_ptr<AdmissionQueue> queue;
@@ -2869,13 +3156,14 @@ void ServerV2Seal(const std::shared_ptr<ServerV2State>& v2) noexcept {
     }
 }
 
-result<void> ServerV2WaitStopped(const std::shared_ptr<ServerV2State>& v2,
-                                 bbt::coroutine::Deadline deadline) {
+result<void> detail::ServerV2WaitStopped(
+    const std::shared_ptr<ServerV2State>& v2,
+    bbt::coroutine::Deadline deadline) {
     if (!NativeHost()) {
         return ErrV(ErrorCode::InvalidContext,
                     "WaitStopped requires native host context");
     }
-    // P1-8：conn 物理 Released 可能晚于 link 退出责任归零——cv 每醒一次就
+    // conn 物理 Released 可能晚于 link 退出责任归零——cv 每醒一次就
     // 在 owner->mu 下重驱各 link 的 ReleasedLocked（幂等），让额度/台账
     // 在真实 Released 后归还，不依赖 ExitDone 的单一驱动点。
     const auto sweep_release = [&] {
@@ -2914,11 +3202,11 @@ result<void> Server::Close(bbt::coroutine::Deadline deadline) {
         return ErrV(ErrorCode::InvalidContext,
                     "Close(deadline) requires native host context");
     }
-    ServerV2Seal(m_v2);
-    return ServerV2WaitStopped(m_v2, deadline);
+    detail::ServerV2Seal(m_v2);
+    return detail::ServerV2WaitStopped(m_v2, deadline);
 }
 
-bool ServerV2Closed(const ServerV2State& v2) noexcept {
+bool detail::ServerV2Closed(const ServerV2State& v2) noexcept {
     std::lock_guard<std::mutex> lock(v2.mu);
     return v2.closed;
 }
@@ -2962,7 +3250,9 @@ ServerStats Server::Stats() const noexcept {
         v2.links.size() > active ? v2.links.size() - active : 0;
     out.callbacks = v2.callbacks;
     // queue 计数经 AdmissionQueue 同步观察面读（impl->mu 内取），不得在
-    // 只持 v2.mu 时直读 impl 字段——读/写同一互斥才是一致快照。
+    // 只持 v2.mu 时直读 impl 字段——避免跨锁直读未同步字段。注意 Queued(i)
+    // 与 BytesQueued(i) 是两次独立取锁：本快照只保证每个字段自身读数合法，
+    // 不构成同一时刻的一致视图（见 Stats.hpp 文件头「取样语义」）。
     auto queue = v2.queue;
     std::array<std::uint64_t, kLaneCount> queued_items{};
     std::array<std::uint64_t, kLaneCount> queued_bytes{};
@@ -2987,31 +3277,48 @@ ServerStats Server::Stats() const noexcept {
 // detail 挂钩实现
 // ============================================================================
 
-void SessionOwnerSeal(const std::shared_ptr<SessionOwnerState>& owner) noexcept {
+void detail::SessionOwnerSeal(
+    const std::shared_ptr<SessionOwnerState>& owner) noexcept {
     std::vector<std::shared_ptr<SessionCore>> sessions;
     std::vector<net::Connection> handshakes;
+    bool sealing = false;
     {
         std::lock_guard<std::mutex> lock(owner->mu);
-        if (owner->closed) { return; }
-        owner->closed = true;
-        for (auto& [id, session] : owner->by_identity) {
-            (void)id;
-            sessions.push_back(session);
-        }
-        // 建立中出站握手 conn 同受关闭责任：RequestClose 让握手尽快
-        // 失败退出，不等调用 deadline（物理关闭责任）。
-        for (auto& [key, est] : owner->establishing) {
-            (void)key;
-            if (est->conn.Valid()) { handshakes.push_back(est->conn); }
+        if (!owner->closed) {
+            sealing = true;
+            owner->closed = true;
+            for (auto& [id, session] : owner->by_identity) {
+                (void)id;
+                sessions.push_back(session);
+            }
+            // 建立中出站握手 conn 同受关闭责任：RequestClose 让握手尽快
+            // 失败退出，不等调用 deadline（物理关闭责任）。
+            for (auto& [key, est] : owner->establishing) {
+                (void)key;
+                if (est->conn.Valid()) { handshakes.push_back(est->conn); }
+            }
         }
     }
-    for (auto& session : sessions) { session->Kill({}); }
-    for (auto& conn : handshakes) {
-        conn.RequestClose(std::make_error_code(std::errc::connection_aborted));
+    if (sealing) {
+        for (auto& session : sessions) { session->Kill({}); }
+        for (auto& conn : handshakes) {
+            conn.RequestClose(
+                std::make_error_code(std::errc::connection_aborted));
+        }
     }
+    // 控制器永久 closed：无论本次是否首次封口都置位，保证 Close 返回后 Arm
+    // 一定看到 Closed；在途 Pause 由 runtime 的 owner.closed 检查退出。锁外
+    // 单独取 hook 锁，不与 owner.mu 形成嵌套锁序。
+    if (owner->hooks) { detail::SessionHookAccess::Close(*owner->hooks); }
 }
 
-bool SessionOwnerClosed(const SessionOwnerState& owner) noexcept {
+SessionOwnerState::~SessionOwnerState() {
+    // 兜底：owner 未经 Seal 直接销毁时同样封口控制器。handle 可能比 owner
+    // 活得久，但只保留有界控制状态，不再接受注册。
+    if (hooks) { detail::SessionHookAccess::Close(*hooks); }
+}
+
+bool detail::SessionOwnerClosed(const SessionOwnerState& owner) noexcept {
     std::lock_guard<std::mutex> lock(owner.mu);
     return owner.closed;
 }

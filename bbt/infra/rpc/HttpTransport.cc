@@ -142,7 +142,7 @@ result<std::shared_ptr<HttpRpcTransport>> HttpRpcTransport::Create(
     std::shared_ptr<http::Client> http_client) {
     if (!http_client) {
         return result<std::shared_ptr<HttpRpcTransport>>::err(
-            Invalid("http client required (adapter 不自建执行底座)"));
+            Invalid("http client required (adapter does not own an execution base)"));
     }
     return result<std::shared_ptr<HttpRpcTransport>>::ok(
         std::shared_ptr<HttpRpcTransport>(
@@ -245,7 +245,7 @@ HttpRpcInboundTransport::Create(std::shared_ptr<net::Engine> engine,
     if (!engine) {
         return result<std::shared_ptr<HttpRpcInboundTransport>>::err(MakeError(
             ErrorCode::InvalidArgument,
-            "rpc http inbound: engine required (adapter 不自建执行底座)"));
+            "rpc http inbound: engine required (adapter does not own an execution base)"));
     }
     // handler 在 Start 时经 Start(WireInboundHandler) 注入；先挂固定桥接 lambda。
     // 只弱捕获 State（http::Server 持有本 lambda，强捕获会让 State↔http::Server

@@ -32,7 +32,7 @@ result<std::shared_ptr<Client>> Client::Create(
     std::shared_ptr<IRpcTransport> transport) {
     if (!transport) {
         return result<std::shared_ptr<Client>>::err(
-            Invalid("transport required (client 不自建执行底座)"));
+            Invalid("transport required (client does not own an execution base)"));
     }
     return result<std::shared_ptr<Client>>::ok(
         bbt::coroutine::MakeCoObject<Client>("infra.rpc.Client", "", [&] {
@@ -106,11 +106,11 @@ bbt_co_async(result<RpcEnvelope>) Client::Call(const RpcAddress& address,
 
 void Client::Close() noexcept {
     if (m_transport) { m_transport->Close(); }
-    if (m_owner) { SessionOwnerSeal(m_owner); }
+    if (m_owner) { detail::SessionOwnerSeal(m_owner); }
 }
 
 bool Client::IsClosed() const noexcept {
-    if (m_owner) { return SessionOwnerClosed(*m_owner); }
+    if (m_owner) { return detail::SessionOwnerClosed(*m_owner); }
     return !m_transport || m_transport->IsClosed();
 }
 

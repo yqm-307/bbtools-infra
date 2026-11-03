@@ -325,9 +325,34 @@ Server 状态和调用上下文固定如下：
 - `Close(deadline)` 立即封 Server 的逻辑入口，继续等待 listener、callback、发送责任和物理连接在 deadline 内收口；它不强杀 handler，不关闭共享 Engine。超时返回 `TimedOut`，`IsClosed()` 仍为 true，但 owner 必须保留并继续驱动 Engine，之后可以再次以更晚 deadline 调用 `Close()` 观察最终收口。没有物理收口证据时不得析构 owner。
 - `Close(deadline)` 收敛原先 `Close() + WaitStopped()` 的两段等待接口；`Stats()` 中的 `retiring`、`inflight`、`callbacks` 和连接计数是后续继续收口的观察面。
 
-Stats 是按值返回的快照。累计字段单调增加，当前字段是取样时的 gauge；这些类型已在 §2.1 的稳定值类型代码中定义。
+Stats 是按值返回的汇总取样，不是同一时刻的一致快照：字段由多把锁/多个 atomic 分步读取（owner gauge、逐 session 的 out_mu、队列自己的 impl->mu），因此跨字段等式可能短暂不成立。lane 字段是当前 session 台账的汇总，session 退役后可能下降；当前字段是各自取样点的 gauge；判定泄漏或收口用 `Drain`/`Close`/`WaitStopped` 的返回值或 `detail::ServerV2Ledger`，不要用单次取样的跨字段不等式。这些类型已在 §2.1 的稳定值类型代码中定义。
 
 `queued/dequeued/inflight/finished` 的职责不能混用：`queued` 是有限队列尚未交付；`dequeued` 表示已经交给 framework dispatch 或 mailbox；Call 的 `inflight` 延续到业务处理和回复写入终态，Send 的投递责任在 framework mailbox 接纳和所需 `SendAccepted` 写终态后结束。`finished` 只在对应责任有终态后累计。`Drain` 必须同时看到业务 admission 队列为空、infra 仍持有的 `inflight == 0`、回复写责任已结算和 Server 自有 callback 已收口；只看 TCP 写完成或只看 `queued == 0` 都不足以完成 Drain。
+
+### 2.3.1 受控检查点（固定动作，不是用户回调）
+
+写路径与握手路径上有四个库内固定检查点，类型是公开的 `rpc::SessionHooks`（`bbt/infra/rpc/Hooks.hpp`），只经 `Client::Hooks()` 取得 owning handle。Server 不提供 `Hooks()`：Server 创建时已经注入同一个 Client owner，入站检查点与出站检查点共用这一份控制状态。
+
+| 检查点 | 位置 | 停在这里意味着 |
+|---|---|---|
+| `HookPoint::BeforeWrite` | writer 已出队、尚未标记提交、尚未 `conn.Write` | 本条已出队、写终态未发生：回复凭据不会提前成功，Drain/Close 也不会提前报收口 |
+| `HookPoint::OutboundBeforeHandshake` | 出站 conn 已拨号成功、握手 I/O 尚未开始 | 额度已占、link 未发布：封口与发布在这里竞争 |
+| `HookPoint::InboundBeforeHandshake` | 入站 conn 已 accept、握手 I/O 尚未开始 | 入站连接已在握手台账、尚未进入会话 |
+| `HookPoint::InboundBeforePublish` | 入站握手完成、link 尚未安装/发布 | 握手结果已在本端、封口与发布在这里竞争 |
+
+每个点只有两种由库实现的动作，`HookAction::Pause` 与 `HookAction::ThrowOnce`。公开面没有 `HookSlot`、`std::function`、回调对象、虚接口或异常对象输入；严格路径不执行任何用户代码。四个点都在现有受管协程内、相关锁已释放之后进入。
+
+使用方只做三件事：
+
+- `Arm(point, action, expires_at)` 返回该点的单调 generation。窗口必须落在 `(now, now + 10s]`；过去时间、`Deadline::max()`、超过上限、未知 point/action 返回 `InvalidArgument`，owner 封口后返回 `Closed`，generation 耗尽返回 `RuntimeUnavailable` 且不回绕。新注册解除旧 generation 的 Pause；旧在途命中只退出旧 generation，不追随新配置。
+- `Clear(point, generation)` 只解除与 token 匹配的那一次注册。重复、已过期或不属于当前配置的 token 是成功的 no-op，不会清掉后来的注册。Clear 只更新状态，不等待在途退出，也不做排空；需要排空证据的调用方在自己的 deadline 内轮询 `Snapshot` 的 `in_flight`。
+- `Snapshot(point)` 只返回固定值：`generation`、`action`、`armed`、`closed`、`entered`、`in_flight`。它是控制状态的小值快照，不是 RPC 全局一致快照，也不代表业务成功或物理释放。`entered` 统计当前 generation 的命中次数，`in_flight` 统计跨 generation 尚未退出的命中次数，所以 Clear 返回不等于 `in_flight` 为零。
+
+`Pause` 的挂起只发生在库自己的 `CoWaiter` 上：每个在途 Pause 独占一个等待者，按 `10ms` 分片检查注册状态、owner/server/link/conn 关闭、协程取消与原操作期限，每片重新计算 `min(操作期限, 注册到期, now + 10ms)`。这里只承诺库控制的等待，不声称 timeout 能中止任意 C++ 代码。解除后仍走原封口检查与安装/提交事务；Clear、替换和注册到期解除诊断暂停，但不重置业务期限。关闭、取消和操作期限按既有错误失败。Server Close 只影响对应入站连接和已关闭的 link，不封掉同一 owner 的 Client 能力。控制 handle 不反向拥有业务 owner 或 Engine：owner 收口后 handle 仍可查询，只是永久 `closed`。
+
+`ThrowOnce` 由库抛出固定内部标签，生产与测试走同一机制，不接受用户异常对象或消息。调用点把它转成可见错误并完成资源结算：`BeforeWrite` → 本条已出队写责任结算为 `InternalError`（回复凭据拿到失败终态、`writes_outstanding` 归零）并退役 link；`OutboundBeforeHandshake` → 本次建立返回 `InternalError`，establishing 记录、占位额度、`done` 与 conn 由建立路径统一归还；`InboundBeforeHandshake` 与 `InboundBeforePublish` → 该入站连接退役，不发布 link。异常不得越过各自的责任边界。提交之后的写失败仍按既有 `OutcomeUnknown` 结算，不把 `RequestClose` 写成物理 Released。
+
+配置挂在 owner 上，同一 owner 下的所有 link 共用一份，不同 owner 完全隔离；没有进程级全局检查点。真实 TCP 集成测试保留，检查点不替代真实验收。
 
 ### 2.4 Response 构造和业务异常
 

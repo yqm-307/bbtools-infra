@@ -130,7 +130,7 @@ result<std::shared_ptr<Server>> Server::Create(
 }
 
 result<void> Server::Start() {
-    if (m_v2) { return ServerV2Start(m_v2); }
+    if (m_v2) { return detail::ServerV2Start(m_v2); }
     auto state = m_state;
     if (state->closed.load()) {
         return result<void>::err(
@@ -153,39 +153,34 @@ result<void> Server::Start() {
 }
 
 void Server::StopAccepting() noexcept {
-    if (m_v2) { ServerV2StopAccepting(m_v2); return; }
+    if (m_v2) { detail::ServerV2StopAccepting(m_v2); return; }
     m_state->inbound->StopAccepting();
 }
 
 result<void> Server::Drain(bbt::coroutine::Deadline deadline) {
-    if (m_v2) { return ServerV2Drain(m_v2, deadline); }
+    if (m_v2) { return detail::ServerV2Drain(m_v2, deadline); }
     return m_state->inbound->Drain(deadline);
 }
 
 void Server::Close() noexcept {
-    if (m_v2) { ServerV2Seal(m_v2); return; }
+    if (m_v2) { detail::ServerV2Seal(m_v2); return; }
     if (!m_state) { return; }
     if (!m_state->closed.exchange(true)) m_state->inbound->Close();
 }
 
 result<void> Server::WaitStopped(bbt::coroutine::Deadline deadline) {
-    if (m_v2) { return ServerV2WaitStopped(m_v2, deadline); }
+    if (m_v2) { return detail::ServerV2WaitStopped(m_v2, deadline); }
     return m_state->inbound->WaitStopped(deadline);
 }
 
 bool Server::IsClosed() const noexcept {
-    if (m_v2) { return ServerV2Closed(*m_v2); }
+    if (m_v2) { return detail::ServerV2Closed(*m_v2); }
     return !m_state || m_state->closed.load();
 }
 
-std::uint64_t detail::ServerV2WritesOutstandingForTest(
+detail::ServerV2Ledger detail::ServerV2LedgerForTest(
     const Server& server) noexcept {
-    return server.m_v2 ? ServerV2WritesOutstanding(server.m_v2) : 0;
-}
-
-detail::ServerV2Ledger detail::ServerV2LinkLedgerForTest(
-    const Server& server) noexcept {
-    return ServerV2LinkLedger(server.m_v2);
+    return detail::ServerV2LedgerOf(server.m_v2);
 }
 
 } // namespace bbt::infra::rpc

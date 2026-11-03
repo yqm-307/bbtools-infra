@@ -188,7 +188,7 @@ result<std::shared_ptr<TcpRpcTransport>> TcpRpcTransport::Create(
     using R = result<std::shared_ptr<TcpRpcTransport>>;
     if (!engine) {
         return R::err(MakeError(ErrorCode::InvalidArgument,
-            "rpc tcp transport: engine required (adapter 不自建执行底座)"));
+            "rpc tcp transport: engine required (adapter does not own an execution base)"));
     }
     if (options.max_inflight == 0 ||
         options.max_inflight > kNetworkLimitsMaxInflight ||

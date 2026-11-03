@@ -892,7 +892,7 @@ void HandshakeCoalescedBigPinned() {
     rpc::SessionFrameDecoder decoder(8 * 1024 * 1024);
     auto future = SubmitCo([&]() -> bbt::infra::result<std::uint64_t> {
         std::string peer_identity;
-        return rpc::InboundHandshakeForTest(
+        return rpc::detail::InboundHandshakeOnConnection(
             conn, options, /*proposal=*/11, /*nonce=*/0x1234,
             peer_identity, decoder,
             Clock::now() + 10s);
@@ -1003,7 +1003,7 @@ void HandshakeStashTailPreserved() {
     rpc::SessionFrameDecoder decoder(8 * 1024 * 1024);
     auto future = SubmitCo([&]() -> bbt::infra::result<std::uint64_t> {
         std::string peer_identity;
-        return rpc::InboundHandshakeForTest(
+        return rpc::detail::InboundHandshakeOnConnection(
             conn, options, /*proposal=*/11, /*nonce=*/0x1234,
             peer_identity, decoder,
             Clock::now() + 10s);
@@ -1215,23 +1215,68 @@ void AdmissionSealed() {
 }
 
 // ---- 13-16. 回复写终态：确定性钉住「已排队/写入中」交错 --------------------
-// WriterGate 挂到 infra 私有 test seam（detail/Session.hpp）：WriterLoop
-// 取出 OutItem 后、conn.Write 前调用本闸门。armed 期间回复必然处于
-// 「已入队/在写未终态」——比 TCP 分段或随机 sleep 更确定。
-struct WriterGate {
-    std::atomic<bool> entered{false};
-    std::shared_ptr<bbt::coroutine::sync::CoWaiter> waiter{
-        bbt::coroutine::sync::CoWaiter::Create()};
-    void Release() { waiter->Notify(); }
+// 只经公开控制器暂停真实 writer/握手，不向严格路径安装测试回调。
+using rpc::HookAction;
+using rpc::HookPoint;
+
+rpc::HookSnapshot HookState(const std::shared_ptr<rpc::SessionHooks>& hooks,
+                            HookPoint point) {
+    const auto state = hooks->Snapshot(point);
+    CHECK(state);
+    return state.value();
+}
+
+struct HookPause {
+    std::shared_ptr<rpc::SessionHooks> hooks;
+    HookPoint point;
+    std::uint64_t generation;
 };
-// gate 由 shared_ptr 持有：armed lambda 与其同寿（用例进程内单 session
-// writer 调用，生命周期覆盖整个用例）。
-std::shared_ptr<WriterGate> MakeWriterGate() {
-    auto gate = std::make_shared<WriterGate>();
-    rpc::SessionSetWriterGateForTest([gate] {
-        gate->entered.store(true);
-        (void)gate->waiter->Wait({Clock::now() + 10s});
-    });
+
+struct HookGate {
+    std::vector<HookPause> pauses;
+
+    void Arm(AppHost& host, HookPoint point) {
+        auto hooks = host.client->Hooks();
+        CHECK(hooks);
+        const auto armed = hooks->Arm(point, HookAction::Pause, Clock::now() + 10s);
+        CHECK(armed);
+        pauses.push_back({std::move(hooks), point, armed.value()});
+    }
+    std::uint64_t Entered(HookPoint point) const {
+        std::uint64_t count = 0;
+        for (const auto& pause : pauses) {
+            if (pause.point != point) { continue; }
+            const auto state = HookState(pause.hooks, point);
+            CHECK(state.generation == pause.generation);
+            count += state.entered;
+        }
+        return count;
+    }
+    std::uint64_t InFlight() const {
+        std::uint64_t count = 0;
+        for (const auto& pause : pauses) {
+            count += HookState(pause.hooks, pause.point).in_flight;
+        }
+        return count;
+    }
+    void Release(HookPoint point) {
+        for (const auto& pause : pauses) {
+            if (pause.point == point) {
+                CHECK(pause.hooks->Clear(point, pause.generation));
+            }
+        }
+    }
+    void Release() {
+        for (const auto& pause : pauses) {
+            CHECK(pause.hooks->Clear(pause.point, pause.generation));
+        }
+    }
+};
+
+std::shared_ptr<HookGate> MakeWriterGate(AppHost& first, AppHost& second) {
+    auto gate = std::make_shared<HookGate>();
+    gate->Arm(first, HookPoint::BeforeWrite);
+    gate->Arm(second, HookPoint::BeforeWrite);
     return gate;
 }
 
@@ -1253,7 +1298,7 @@ void ReplyWriteDeferred() {
             MakeCall("held1", 2, "k"), UntilMs(5s));
     });
     CHECK(WaitUntil([&] { return b.calls.load() == 2; }));
-    auto gate1 = MakeWriterGate();
+    auto gate1 = MakeWriterGate(a, b);
     rpc::Request request;
     std::shared_ptr<rpc::ReplyCompletion> reply;
     {
@@ -1268,26 +1313,25 @@ void ReplyWriteDeferred() {
         return bbt_co_await reply->Complete(Echo(request));
     });
     // 已排队/写入中的直接证据：writer 取走条目停在闸门，计数 >0。
-    CHECK(WaitUntil([&] { return gate1->entered.load(); }, 3s));
-    CHECK(rpc::detail::ServerV2WritesOutstandingForTest(*b.server) >= 1);
+    CHECK(WaitUntil([&] { return gate1->Entered(HookPoint::BeforeWrite); }, 3s));
+    CHECK(rpc::detail::ServerV2LedgerForTest(*b.server).writes_outstanding >= 1);
     // Complete 不得入队即返成功。
     CHECK(done1.wait_for(200ms) != std::future_status::ready);
     gate1->Release();
     CHECK(Get(done1));                         // 真实写终态后 Complete 成功
     CHECK(Get(held1));                         // 调用方收到 Response
     CHECK(WaitUntil([&] {
-        return rpc::detail::ServerV2WritesOutstandingForTest(*b.server) == 0;
+        return rpc::detail::ServerV2LedgerForTest(*b.server).writes_outstanding == 0;
     }, 2s));
 
     // 阶段二：Drain 不早成功——Drain 自带 StopAccepting 副作用（accept 错误
     // 令 AcceptLoop 执行 Seal → link 退役），在写项的真实终态随后唯一结算。
-    rpc::SessionSetWriterGateForTest({});   // held2 的 Call 帧不得被闸门拦截
     auto held2 = SubmitCo([&] {
         return bbt_co_await a.client->Call(b.Target(),
             MakeCall("held2", 3, "k"), UntilMs(5s));
     });
     CHECK(WaitUntil([&] { return b.calls.load() == 3; }));
-    auto gate2 = MakeWriterGate();
+    auto gate2 = MakeWriterGate(a, b);
     {
         std::lock_guard<std::mutex> lock(b.mu);
         CHECK(!b.admitted.empty());
@@ -1299,21 +1343,20 @@ void ReplyWriteDeferred() {
     auto done2 = SubmitCo([&] {
         return bbt_co_await reply->Complete(Echo(request));
     });
-    CHECK(WaitUntil([&] { return gate2->entered.load(); }, 3s));
-    CHECK(rpc::detail::ServerV2WritesOutstandingForTest(*b.server) >= 1);
-    // inflight==0、queued==0，仅写责任未结——Drain 必须 TimedOut 而非早成功。
-    auto drain = b.server->Drain(Clock::now() + 300ms);
-    CHECK(!drain && drain.error().code == ErrorCode::TimedOut);
-    gate2->Release();
+    CHECK(WaitUntil([&] { return gate2->Entered(HookPoint::BeforeWrite); }, 3s));
+    CHECK(rpc::detail::ServerV2LedgerForTest(*b.server).writes_outstanding >= 1);
+    CHECK(done2.wait_for(0ms) != std::future_status::ready);
+    // Drain 封口会取消诊断 Pause；不再要求控制方手动放行。
+    CHECK(b.server->Drain(Clock::now() + 3s));
+    CHECK(WaitUntil([&] { return gate2->InFlight() == 0; }));
     // link 已被 Drain 的 Seal 副作用退役：写失败终态如实返回（不伪报 ok）。
     const auto done2_result = Get(done2);
     CHECK(!done2_result);
     CHECK(WaitUntil([&] {
-        return rpc::detail::ServerV2WritesOutstandingForTest(*b.server) == 0;
+        return rpc::detail::ServerV2LedgerForTest(*b.server).writes_outstanding == 0;
     }, 2s));
     const auto held2_result = Get(held2);
     CHECK(!held2_result);
-    rpc::SessionSetWriterGateForTest({});
     std::cout << "v2 reply write deferred: no early complete/drain ok\n";
 }
 
@@ -1334,7 +1377,7 @@ void ReplyWriteFailClose() {
             MakeCall("held", 2, "k"), UntilMs(5s));
     });
     CHECK(WaitUntil([&] { return b->calls.load() == 2; }));
-    auto gate = MakeWriterGate();
+    auto gate = MakeWriterGate(*a, *b);
 
     rpc::Request request;
     std::shared_ptr<rpc::ReplyCompletion> reply;
@@ -1349,23 +1392,22 @@ void ReplyWriteFailClose() {
     auto done = SubmitCo([&] {
         return bbt_co_await reply->Complete(Echo(request));
     });
-    CHECK(WaitUntil([&] { return gate->entered.load(); }, 3s));
-    CHECK(rpc::detail::ServerV2WritesOutstandingForTest(*b->server) >= 1);
+    CHECK(WaitUntil([&] { return gate->Entered(HookPoint::BeforeWrite); }, 3s));
+    CHECK(rpc::detail::ServerV2LedgerForTest(*b->server).writes_outstanding >= 1);
     // 在写未终态时 v2 立即封口：Kill 对在写项保留责任（不属排队丢弃），
     // 真实终态由 WriterLoop 的失败路径唯一结算。
     b->server->Close();
-    gate->Release();
+    CHECK(WaitUntil([&] { return gate->InFlight() == 0; }));
     const auto result = Get(done);
     CHECK(!result);                            // 不得伪报写成功
     CHECK(result.error().code != ErrorCode::TimedOut);
     // 写终态唯一结算：凭据发布后计数恰好归零（发布先于计数递减，须等待）。
     CHECK(WaitUntil([&] {
-        return rpc::detail::ServerV2WritesOutstandingForTest(*b->server) == 0;
+        return rpc::detail::ServerV2LedgerForTest(*b->server).writes_outstanding == 0;
     }, 2s));
     const auto held_result = Get(held);
     CHECK(!held_result);                       // link 退役：提交后失联
     CHECK(b->server->WaitStopped(Clock::now() + 3s));
-    rpc::SessionSetWriterGateForTest({});
     std::cout << "v2 reply write fail-close: real failure returned\n";
 }
 
@@ -1389,7 +1431,7 @@ void ReplyWriteBudget() {
             MakeCall("held", 2, "k"), UntilMs(5s));
     });
     CHECK(WaitUntil([&] { return b->calls.load() == 2; }));
-    auto gate = MakeWriterGate();
+    auto gate = MakeWriterGate(*a, *b);
 
     rpc::Request request;
     std::shared_ptr<rpc::ReplyCompletion> reply;
@@ -1404,22 +1446,20 @@ void ReplyWriteBudget() {
     auto done = SubmitCo([&] {
         return bbt_co_await reply->Complete(Echo(request));
     });
-    CHECK(WaitUntil([&] { return gate->entered.load(); }, 3s));
+    CHECK(WaitUntil([&] { return gate->Entered(HookPoint::BeforeWrite); }, 3s));
     // 请求预算 400ms（incoming_timeout 比 wire remaining 3s 更紧）：
     // Complete 应在预算内 TimedOut 而非等满 30s/5s。
     const auto result = Get(done);
     CHECK(!result);
     CHECK(result.error().code == ErrorCode::TimedOut);
-    gate->Release();
+    CHECK(WaitUntil([&] { return gate->InFlight() == 0; }));
     // 写责任在 writer 终态路径唯一结算（在写项 deadline 已过 → 写失败）。
     CHECK(WaitUntil([&] {
-        return rpc::detail::ServerV2WritesOutstandingForTest(*b->server) == 0;
+        return rpc::detail::ServerV2LedgerForTest(*b->server).writes_outstanding == 0;
     }, 3s));
-    // held 的两可终态不属本用例判定：预算过期后写可能失败（link 退役 →
-    // OutcomeUnknown）或抢在关闭前写出（晚到 Response）；唯一结算已由
-    // 上面的计数归零与 done 的 TimedOut 证明。
-    (void)Get(held);
-    rpc::SessionSetWriterGateForTest({});
+    const auto held_result = Get(held);
+    CHECK(!held_result);
+    CHECK(held_result.error().code == ErrorCode::OutcomeUnknown);
     std::cout << "v2 reply write budget: request budget not reset\n";
 }
 
@@ -1440,7 +1480,7 @@ void ReplyCorrelationMismatch() {
             MakeCall("held", 2, "k"), UntilMs(5s));
     });
     CHECK(WaitUntil([&] { return b.calls.load() == 2; }));
-    auto gate = MakeWriterGate();
+    auto gate = MakeWriterGate(a, b);
 
     rpc::Request request;
     std::shared_ptr<rpc::ReplyCompletion> reply;
@@ -1458,8 +1498,8 @@ void ReplyCorrelationMismatch() {
     auto done = SubmitCo([&] {
         return bbt_co_await reply->Complete(std::move(bad));
     });
-    CHECK(WaitUntil([&] { return gate->entered.load(); }, 3s));
-    CHECK(rpc::detail::ServerV2WritesOutstandingForTest(*b.server) >= 1);
+    CHECK(WaitUntil([&] { return gate->Entered(HookPoint::BeforeWrite); }, 3s));
+    CHECK(rpc::detail::ServerV2LedgerForTest(*b.server).writes_outstanding >= 1);
     CHECK(done.wait_for(200ms) != std::future_status::ready);  // 等写终态
     gate->Release();
     const auto result = Get(done);
@@ -1470,57 +1510,32 @@ void ReplyCorrelationMismatch() {
     CHECK(!held_result);
     CHECK(held_result.error().code == ErrorCode::ProtocolError);
     CHECK(WaitUntil([&] {
-        return rpc::detail::ServerV2WritesOutstandingForTest(*b.server) == 0;
+        return rpc::detail::ServerV2LedgerForTest(*b.server).writes_outstanding == 0;
     }, 2s));
     CHECK(b.server->Drain(Clock::now() + 2s));
-    rpc::SessionSetWriterGateForTest({});
     std::cout << "v2 reply correlation mismatch: ProtocolError + write accounted\n";
 }
 
 // ---- 14-19. 物理关闭责任与建立中额度 -----------------------------------------
-// DialGate：Outbound 拨号成功后/Inbound 握手 I/O 前、以及入站握手完成/
-// 安装前由 infra 私有 seam 调用——确定性钉住「建立中」交错。每个到达点
-// 使用独立 CoWaiter（协程数可>1，同 waiter 多等待者会 AlreadyWaiting
-// 放行失真）；Release 放行当前全部排队 waiter，后来到达的继续等下轮。
-struct DialGate {
-    std::atomic<unsigned> entered{0};
-    std::mutex mu;
-    // 已放行票号上界：ticket <= released_upto 的到达不等待——「放行后才
-    // 到达的协程」不会永远停在没有下一轮 Notify 的 waiter 上。
-    unsigned released_upto{0};
-    std::deque<std::pair<unsigned,
-        std::shared_ptr<bbt::coroutine::sync::CoWaiter>>> waiters;
-    std::shared_ptr<bbt::coroutine::sync::CoWaiter> Arrive(unsigned ticket) {
-        auto w = bbt::coroutine::sync::CoWaiter::Create();
-        std::lock_guard<std::mutex> lock(mu);
-        if (ticket <= released_upto) { w->Notify(); return w; }
-        waiters.emplace_back(ticket, w);
-        return w;
-    }
-    // 放行当前全部已到达票据（entered 为票据序）；晚到票据等下一轮。
-    void Release() {
-        std::deque<std::pair<unsigned,
-            std::shared_ptr<bbt::coroutine::sync::CoWaiter>>> pending;
-        {
-            std::lock_guard<std::mutex> lock(mu);
-            released_upto = entered.load();
-            pending.swap(waiters);
-        }
-        for (auto& [t, w] : pending) { (void)t; w->Notify(); }
-    }
-};
-std::shared_ptr<DialGate> MakeDialGate() {
-    auto gate = std::make_shared<DialGate>();
-    rpc::SessionSetDialGateForTest([gate] {
-        const auto ticket = gate->entered.fetch_add(1) + 1;
-        auto w = gate->Arrive(ticket);
-        (void)w->Wait({Clock::now() + 10s});
-    });
+// 三个握手点分别注册；放行握手起点不会顺带放行尚未命中的发布点。
+void ArmDialGate(AppHost& host, const std::shared_ptr<HookGate>& gate) {
+    gate->Arm(host, HookPoint::OutboundBeforeHandshake);
+    gate->Arm(host, HookPoint::InboundBeforeHandshake);
+    gate->Arm(host, HookPoint::InboundBeforePublish);
+}
+
+std::shared_ptr<HookGate> MakeDialGate(AppHost& host) {
+    auto gate = std::make_shared<HookGate>();
+    ArmDialGate(host, gate);
     return gate;
 }
 
-// 14. Close 不把 session.dead 当物理完成：writer 持责期间 Close 超时保留
-//     owner，责任真实退出 + conn Released 后重复 Close 才收口。
+void ReleaseHandshakeStart(const std::shared_ptr<HookGate>& gate) {
+    gate->Release(HookPoint::OutboundBeforeHandshake);
+    gate->Release(HookPoint::InboundBeforeHandshake);
+}
+
+// 14. RPC Pause 可取消；完成一次真实回复后 Close 冒烟收口。
 void CloseReleased() {
     auto b = std::make_unique<AppHost>("app-b");
     auto a = std::make_unique<AppHost>("app-a");
@@ -1537,7 +1552,7 @@ void CloseReleased() {
             MakeCall("held", 2, "k"), UntilMs(5s));
     });
     CHECK(WaitUntil([&] { return b->calls.load() == 2; }));
-    auto gate = MakeWriterGate();
+    auto gate = MakeWriterGate(*a, *b);
     rpc::Request request;
     std::shared_ptr<rpc::ReplyCompletion> reply;
     {
@@ -1550,47 +1565,41 @@ void CloseReleased() {
     auto done = SubmitCo([&] {
         return bbt_co_await reply->Complete(Echo(request));
     });
-    CHECK(WaitUntil([&] { return gate->entered.load(); }, 3s));
-    // writer 被钉在 conn.Write 前：link dead 可置位但 reader/writer/物理
-    // conn 责任未结——Close 必须先 TimedOut 且 IsClosed() 已真（owner
-    // 保留，不是「关闭失败」）。
-    auto first = b->server->Close(Clock::now() + 300ms);
-    CHECK(!first && first.error().code == ErrorCode::TimedOut);
-    CHECK(b->server->IsClosed());
+    CHECK(WaitUntil([&] { return gate->Entered(HookPoint::BeforeWrite); }, 3s));
     gate->Release();
-    // 责任真实推进后重复 Close 收口到 Released（不另开门/不吞前次责任）。
-    CHECK(b->server->Close(Clock::now() + 3s));
-    CHECK(WaitUntil([&] { return b->engine->CountConnections() == 0; }, 3s));
-    const auto done_result = Get(done);
-    CHECK(!done_result);
+    CHECK(WaitUntil([&] { return gate->InFlight() == 0; }));
+    CHECK(done.wait_for(5s) == std::future_status::ready);
+    (void)Get(done);
     (void)Get(held);
-    rpc::SessionSetWriterGateForTest({});
-    std::cout << "v2 close waits physical released + re-close ok\n";
+    CHECK(b->server->Close(Clock::now() + 3s));
+    CHECK(b->server->IsClosed());
+    CHECK(WaitUntil([&] { return b->engine->CountConnections() == 0; }, 3s));
+    CHECK(WaitUntil([&] {
+        return rpc::detail::ServerV2LedgerForTest(*b->server)
+                   .writes_outstanding == 0;
+    }, 2s));
+    std::cout << "v2 close reply + responsibility smoke ok\n";
 }
 
-// 15. 建立中握手 conn 是关闭责任：DialGate 钉住 inbound 握手，links 未
-//     发布期间 Close 超时；Seal RequestClose 建立中 conn，放行后收口。
+// 15. Server Close 自动取消入站 Pause，握手/conn 收口无需用户 Clear。
 void CloseHandshake() {
     auto b = std::make_unique<AppHost>("app-b");
-    auto gate = MakeDialGate();
+    auto gate = MakeDialGate(*b);
     RawTcpPeer peer(b->address);
-    CHECK(WaitUntil([&] { return gate->entered.load() >= 1; }, 3s));
-    CHECK(rpc::detail::ServerV2LinkLedgerForTest(*b->server).handshakes >= 1);
-    // 握手责任在册但 link 未发布：Close 不能伪报收口。
-    auto first = b->server->Close(Clock::now() + 300ms);
-    CHECK(!first && first.error().code == ErrorCode::TimedOut);
-    CHECK(b->server->IsClosed());
-    gate->Release();
-    // 建立中 conn 已被 Seal RequestClose：握手协程失败退出、台账移除、
-    // conn Released 后重复 Close 才完成。
+    CHECK(WaitUntil([&] { return gate->Entered(HookPoint::InboundBeforeHandshake) == 1; }, 3s));
+    CHECK(rpc::detail::ServerV2LedgerForTest(*b->server).handshakes >= 1);
+    CHECK(gate->InFlight() == 1);
     CHECK(b->server->Close(Clock::now() + 3s));
+    CHECK(b->server->IsClosed());
+    CHECK(WaitUntil([&] { return gate->InFlight() == 0; }));
+    CHECK(!HookState(b->client->Hooks(), HookPoint::InboundBeforeHandshake).closed);
     CHECK(WaitUntil([&] {
         const auto ledger =
-            rpc::detail::ServerV2LinkLedgerForTest(*b->server);
+            rpc::detail::ServerV2LedgerForTest(*b->server);
         return ledger.links == 0 && ledger.handshakes == 0;
     }, 3s));
     CHECK(WaitUntil([&] { return b->engine->CountConnections() == 0; }, 3s));
-    rpc::SessionSetDialGateForTest({});
+    CHECK(WaitUntil([&] { return peer.Eof(); }));
     std::cout << "v2 close handshake-conn responsibility + sealed kill ok\n";
 }
 
@@ -1598,10 +1607,9 @@ void CloseHandshake() {
 //     继续推进时必须退役——links 台账不新增、conn 物理释放。
 void CloseSealedNoPublish() {
     auto b = std::make_unique<AppHost>("app-b");
-    auto gate = MakeDialGate();
+    auto gate = std::make_shared<HookGate>();
+    gate->Arm(*b, HookPoint::InboundBeforePublish);
     RawTcpPeer peer(b->address);
-    CHECK(WaitUntil([&] { return gate->entered.load() >= 1; }, 3s));
-    gate->Release();                          // 放行第一挂点：让握手跑完
 
     // 完整握手（B 是 epoch owner："app-b" < "zz-peer"）。
     rpc::SessionFrame hello;
@@ -1641,17 +1649,18 @@ void CloseSealedNoPublish() {
                echo_bytes.value().size()});
 
     // 第二挂点：握手完成、安装前——此时 Close 封口。
-    CHECK(WaitUntil([&] { return gate->entered.load() >= 2; }, 3s));
+    CHECK(WaitUntil([&] { return gate->Entered(HookPoint::InboundBeforePublish) == 1; }, 3s));
     b->server->Close();                       // 立即封口（不等待）
-    gate->Release();                          // 推进到安装点：必须退役
+    CHECK(WaitUntil([&] { return gate->InFlight() == 0; }));
     CHECK(WaitUntil([&] {
         const auto ledger =
-            rpc::detail::ServerV2LinkLedgerForTest(*b->server);
+            rpc::detail::ServerV2LedgerForTest(*b->server);
         return ledger.links == 0 && ledger.handshakes == 0;
     }, 3s));
     CHECK(b->server->WaitStopped(Clock::now() + 3s));
     CHECK(b->server->Stats().accepted_connections == 0);
-    rpc::SessionSetDialGateForTest({});
+    CHECK(WaitUntil([&] { return b->engine->CountConnections() == 0; }));
+    CHECK(WaitUntil([&] { return peer.Eof(); }));
     std::cout << "v2 sealed post-close handshake not published ok\n";
 }
 
@@ -1745,7 +1754,7 @@ void QuotaPeers() {
 
     // 建立中额度真实占用（合法路径）：b 的 owner 已装 1 条 a→b link——
     // MaxSessions=2 下 b→裸 listen 的拨号前检查通过（1<2）并占住
-    // reserved=1；DialGate 钉在握手起点时，再来的 raw peer 入站
+    // reserved=1；OutboundBeforeHandshake Pause 钉在握手起点时，再来的 raw peer 入站
     // install 按「已装 1 + 建立中 1」= 2 ≥ 2 超额拒绝。第三阶段移到
     // b 的 owner 是因为 a 的 MaxSessions=1 在新前置检查下连合法的
     // 建立责任都创建不了——a 的「建立中占位」语义已由
@@ -1763,14 +1772,14 @@ void QuotaPeers() {
     CHECK(::getsockname(lfd, reinterpret_cast<sockaddr*>(&bind_addr),
                         &addr_len) == 0);
     const auto lport = ntohs(bind_addr.sin_port);
-    auto gate = MakeDialGate();
+    auto gate = MakeDialGate(*b);
     auto outbound = SubmitCo([&] {
         return bbt_co_await b->client->Call(
             "tcp://127.0.0.1:" + std::to_string(lport),
             MakeCall("blocked", 1, "k"), UntilMs(5s));
     });
     // 拨号完成、握手起点被钉住：b 的 establishing reserved 已占。
-    CHECK(WaitUntil([&] { return gate->entered.load() >= 1; }, 3s));
+    CHECK(WaitUntil([&] { return gate->Entered(HookPoint::OutboundBeforeHandshake) == 1; }, 3s));
     // 第二个 raw peer 的入站握手（打到 b）也被同一闸门钉在起点
     // （entered=2）——放行后它完整握手并停在「安装前」第三挂点
     // （entered=3）。此时 b→lfd 的建立中握手仍在 conn.Read 等待
@@ -1781,9 +1790,9 @@ void QuotaPeers() {
         try { rejected2 = raw_handshake("zz-quota2", b->address); }
         catch (...) { driver_error = std::current_exception(); }
     });
-    CHECK(WaitUntil([&] { return gate->entered.load() >= 2; }, 3s));
-    gate->Release();
-    CHECK(WaitUntil([&] { return gate->entered.load() >= 3; }, 3s));
+    CHECK(WaitUntil([&] { return gate->Entered(HookPoint::InboundBeforeHandshake) == 1; }, 3s));
+    ReleaseHandshakeStart(gate);
+    CHECK(WaitUntil([&] { return gate->Entered(HookPoint::InboundBeforePublish) == 1; }, 3s));
     gate->Release();
     // install 判定「已装 1 + 建立中 1」超额：conn 退役、无第二份 session。
     driver.join();
@@ -1799,37 +1808,39 @@ void QuotaPeers() {
     const auto outbound_result = Get(outbound);
     CHECK(!outbound_result);
     ::close(lfd);
-    rpc::SessionSetDialGateForTest({});
+    gate->Release();
     std::cout << "v2 quota max-sessions cross-peer + establishing ok\n";
 }
 
-// 18. ADR §3.3 实际同时拨号：DialGate 钉住双向握手起点，双侧并发到 4
+// 18. ADR §3.3 实际同时拨号：握手起点 Pause 钉住双向拨号，双侧并发到 4
 //     个建立中连接后才放行——identity 较小侧保留本地发起 link，最终
 //     links=1 是两个物理 TCP 经 fencing 收敛的结果而非串行假象。
 void SimultaneousDial() {
     auto a = std::make_unique<AppHost>("app-a");
     auto b = std::make_unique<AppHost>("app-b");
-    auto gate = MakeDialGate();
+    auto gate = MakeDialGate(*a);
+    ArmDialGate(*b, gate);
     auto call_ab = SubmitCo([&] {
         return bbt_co_await a->client->Call(b->Target(),
             MakeCall("a2b", 1, "k"), UntilMs(10s));
     });
     // 等 a 的出站握手被闸门钉住，再发 b→a：两侧同刻都有「拨号已发起、
     // 握手未推进」的连接——真实同时拨号。
-    CHECK(WaitUntil([&] { return gate->entered.load() >= 1; }, 3s));
+    CHECK(WaitUntil([&] { return gate->Entered(HookPoint::OutboundBeforeHandshake) == 1; }, 3s));
     auto call_ba = SubmitCo([&] {
         return bbt_co_await b->client->Call(a->Target(),
             MakeCall("b2a", 2, "k"), UntilMs(10s));
     });
     // 4 路到达：a-outbound + a-inbound + b-outbound + b-inbound。
-    CHECK(WaitUntil([&] { return gate->entered.load() >= 4; }, 5s));
+    CHECK(WaitUntil([&] { return gate->Entered(HookPoint::OutboundBeforeHandshake) == 2 &&
+               gate->Entered(HookPoint::InboundBeforeHandshake) == 2; }, 5s));
     // 全过程额度证据：此刻两端各有 ≥2 条物理连接在册（建立中也占）。
     CHECK(a->engine->CountConnections() >= 2);
     CHECK(b->engine->CountConnections() >= 2);
-    gate->Release();
+    ReleaseHandshakeStart(gate);
     // 两条入站连接还会停在「握手完成/安装前」第二挂点（entered 5/6），
     // 放行后才有 link 安装与 fencing。
-    CHECK(WaitUntil([&] { return gate->entered.load() >= 6; }, 5s));
+    CHECK(WaitUntil([&] { return gate->Entered(HookPoint::InboundBeforePublish) == 2; }, 5s));
     gate->Release();
     // fencing 后唯一幸存 link 服务两个方向——两个方向的 Call 都需要各自
     // 对端 ProcessAdmitted 驱动回复；pump 不触碰调用 future（Get 消费
@@ -1874,7 +1885,7 @@ void SimultaneousDial() {
     }, 5s));
     CHECK(a->client->Stats().links == 1);
     CHECK(b->client->Stats().links == 1);
-    rpc::SessionSetDialGateForTest({});
+    gate->Release();
     // 入站 link 曾被接受再 fencing 的证据：至少一端 accepted≥1。
     CHECK(b->server->Stats().accepted_connections +
           a->server->Stats().accepted_connections >= 1);
@@ -1966,7 +1977,7 @@ struct BareListen {
     }
 };
 
-// 20. 拨号前额度检查：MaxSessions=1 + 第一条建立中被 DialGate 钉住
+// 20. 拨号前额度检查：MaxSessions=1 + 第一条建立中被握手起点 Pause 钉住
 //     （其 reserved 占位在册、握手未推进）时，对「不同 endpoint」的第二
 //     GetSession 必须在 CoDial/新握手之前 Overloaded——对端裸 listen 的
 //     accept 观察证明没有第二条物理连接越过上限。
@@ -1976,7 +1987,7 @@ void QuotaEstablishDial() {
     auto a = std::make_unique<AppHost>("app-a", one);
     BareListen first;    // a 的第一条拨号目标（永不回应，握手悬挂）
     BareListen second;   // 第二条拨号目标：accept 计数即越限证据
-    auto gate = MakeDialGate();
+    auto gate = MakeDialGate(*a);
 
     // 第一条拨号：connect 完成、挂点在握手 I/O 前——reserved 已占。
     // 拨号本身也走 Call 的 deadline：3s 足够盖住区分窗口且放行后
@@ -1985,7 +1996,7 @@ void QuotaEstablishDial() {
         return bbt_co_await a->client->Call(
             first.Target(), MakeCall("p1", 1, "k"), UntilMs(3s));
     });
-    CHECK(WaitUntil([&] { return gate->entered.load() >= 1; }, 3s));
+    CHECK(WaitUntil([&] { return gate->Entered(HookPoint::OutboundBeforeHandshake) == 1; }, 3s));
     // 此刻第一条建立中责任真实存在（conn 在手、占位在册）。
     CHECK(WaitUntil([&] { return a->engine->CountConnections() >= 1; },
                     3s));
@@ -2010,7 +2021,6 @@ void QuotaEstablishDial() {
     // 其结果，只证明闸门解除、资源回收路径不挂。
     gate->Release();
     (void)Get(pending);
-    rpc::SessionSetDialGateForTest({});
     std::cout << "v2 quota pre-dial reject: overloaded before second conn\n";
 }
 
@@ -2028,7 +2038,7 @@ void QuotaReleaseRetry() {
     // 占位则第二条必然撞额（区分「不双占」）。dead 对端永不回应，
     // 两个调用最终同以 TimedOut/Unavailable 收场；不指定唯一错误码，
     // 只要求同一条建立责任下都真实失败而非 Overloaded/伪成功。
-    auto gate = MakeDialGate();
+    auto gate = MakeDialGate(*a);
     auto c1 = SubmitCo([&] {
         return bbt_co_await a->client->Call(
             dead.Target(), MakeCall("d1", 1, "k"), UntilMs(1500ms));
@@ -2037,16 +2047,15 @@ void QuotaReleaseRetry() {
         return bbt_co_await a->client->Call(
             dead.Target(), MakeCall("d2", 2, "k"), UntilMs(1500ms));
     });
-    CHECK(WaitUntil([&] { return gate->entered.load() >= 1; }, 3s));
+    CHECK(WaitUntil([&] { return gate->Entered(HookPoint::OutboundBeforeHandshake) == 1; }, 3s));
     // 两条调用共享一条建立中 conn：对端物理上只有一条连接。
     CHECK(a->engine->CountConnections() == 1);
     gate->Release();
     const auto r1 = Get(c1);
     const auto r2 = Get(c2);
     CHECK(!r1 && !r2);
-    CHECK(r1.error().code != ErrorCode::Overloaded &&
-          r2.error().code != ErrorCode::Overloaded);
-    rpc::SessionSetDialGateForTest({});
+    CHECK(r1.error().code != ErrorCode::Overloaded);
+    CHECK(r1.error().code == r2.error().code);
 
     // 责任归还后（conn 随建立记录消亡而物理关闭）额度空出：新目标可
     // 建立唯一 link——「真实释放后可接纳」而非永久占用。
@@ -2214,7 +2223,7 @@ void QueueFullDrainStatsConcurrent() {
         }
         const auto s = b.server->Stats();
         const auto writes =
-            rpc::detail::ServerV2WritesOutstandingForTest(*b.server);
+            rpc::detail::ServerV2LedgerForTest(*b.server).writes_outstanding;
         return s.service.inflight == 0 && s.service.queued == 0 &&
                s.service.bytes_queued == 0 && writes == 0;
     };
@@ -2250,17 +2259,244 @@ void QueueFullDrainStatsConcurrent() {
     // 最终责任统计：inflight/queue/写责任/link 台账全部归零。
     CHECK(WaitUntil([&] {
         const auto s = b.server->Stats();
-        const auto ledger = rpc::detail::ServerV2LinkLedgerForTest(*b.server);
+        const auto ledger = rpc::detail::ServerV2LedgerForTest(*b.server);
         return s.service.inflight == 0 && s.service.queued == 0 &&
                s.service.bytes_queued == 0 && s.active_connections == 0 &&
                ledger.links == 0 && ledger.handshakes == 0 &&
-               rpc::detail::ServerV2WritesOutstandingForTest(*b.server) == 0;
+               rpc::detail::ServerV2LedgerForTest(*b.server).writes_outstanding == 0;
     }, 5s));
     const auto final_stats = b.server->Stats();
     CHECK(final_stats.service.finished >= final_stats.service.dropped);
     std::cout << "v2 queue-full drain/stats concurrent no deadlock"
               << " ok=" << ok << " overloaded=" << overloaded
               << " finished=" << final_stats.service.finished << "\n";
+}
+
+// 20. SessionHooks 公共状态契约：owner 隔离、generation 代际、旧 token
+//     幂等清理，以及 owner 封口后的 handle 安全性。
+void HookStateContract() {
+    auto a = std::make_unique<AppHost>("app-a");
+    auto b = std::make_unique<AppHost>("app-b");
+    auto hooks_a = a->client->Hooks();
+    auto hooks_b = b->client->Hooks();
+    CHECK(hooks_a && hooks_b);
+    CHECK(hooks_a.get() != hooks_b.get());
+    CHECK(!HookState(hooks_a, HookPoint::BeforeWrite).armed);
+    CHECK(!HookState(hooks_b, HookPoint::BeforeWrite).armed);
+
+    const auto past = hooks_a->Arm(
+        HookPoint::BeforeWrite, HookAction::Pause, Clock::now() - 1ms);
+    CHECK(!past && past.error().code == ErrorCode::InvalidArgument);
+    const auto infinite = hooks_a->Arm(
+        HookPoint::BeforeWrite, HookAction::Pause,
+        bbt::coroutine::Deadline::max());
+    CHECK(!infinite && infinite.error().code == ErrorCode::InvalidArgument);
+    const auto too_far = hooks_a->Arm(
+        HookPoint::BeforeWrite, HookAction::Pause, Clock::now() + 11s);
+    CHECK(!too_far && too_far.error().code == ErrorCode::InvalidArgument);
+
+    const auto first = hooks_a->Arm(
+        HookPoint::BeforeWrite, HookAction::Pause, Clock::now() + 5s);
+    CHECK(first);
+    const auto g1 = first.value();
+    auto state = HookState(hooks_a, HookPoint::BeforeWrite);
+    CHECK(state.generation == g1 && state.armed &&
+          state.action == HookAction::Pause);
+    const auto second = hooks_a->Arm(
+        HookPoint::BeforeWrite, HookAction::ThrowOnce, Clock::now() + 5s);
+    CHECK(second && second.value() > g1);
+    CHECK(hooks_a->Clear(HookPoint::BeforeWrite, g1));
+    state = HookState(hooks_a, HookPoint::BeforeWrite);
+    CHECK(state.generation == second.value() && state.armed &&
+          state.action == HookAction::ThrowOnce);
+    CHECK(hooks_a->Clear(HookPoint::BeforeWrite, second.value()));
+    CHECK(hooks_a->Clear(HookPoint::BeforeWrite, second.value()));
+    CHECK(!HookState(hooks_a, HookPoint::BeforeWrite).armed);
+    CHECK(!HookState(hooks_b, HookPoint::BeforeWrite).armed);
+
+    std::shared_ptr<rpc::SessionHooks> closed;
+    {
+        auto owner = std::make_unique<AppHost>("closed-owner");
+        closed = owner->client->Hooks();
+        owner.reset();
+    }
+    CHECK(WaitUntil([&] {
+        return HookState(closed, HookPoint::BeforeWrite).closed;
+    }));
+    const auto after_close = closed->Arm(
+        HookPoint::BeforeWrite, HookAction::Pause, Clock::now() + 1s);
+    CHECK(!after_close && after_close.error().code == ErrorCode::Closed);
+    std::cout << "v2 hook state: owner isolation + generation + close contract ok\n";
+}
+
+// 21. OutboundBeforeHandshake 的 Pause 受真实 Call deadline 解除；业务期限
+//     不被注册窗口续租，in_flight 退出后再清理注册。
+void HookPauseDeadline() {
+    AppHost a("app-a"), b("app-b");
+    auto hooks = a.client->Hooks();
+    const auto armed = hooks->Arm(
+        HookPoint::OutboundBeforeHandshake, HookAction::Pause,
+        Clock::now() + 5s);
+    CHECK(armed);
+    auto pending = SubmitCo([&] {
+        return bbt_co_await a.client->Call(
+            b.Target(), MakeCall("pause-deadline", 1, "k"), UntilMs(250ms));
+    });
+    CHECK(WaitUntil([&] {
+        return HookState(hooks, HookPoint::OutboundBeforeHandshake).entered == 1 &&
+               HookState(hooks, HookPoint::OutboundBeforeHandshake).in_flight == 1;
+    }));
+    const auto result = Get(pending);
+    CHECK(!result && result.error().code == ErrorCode::TimedOut);
+    CHECK(WaitUntil([&] {
+        return HookState(hooks, HookPoint::OutboundBeforeHandshake).in_flight == 0;
+    }));
+    CHECK(hooks->Clear(HookPoint::OutboundBeforeHandshake, armed.value()));
+    std::cout << "v2 hook pause deadline: real outbound checkpoint timed out and settled\n";
+}
+
+// 22. 同一真实出站握手中分别覆盖协程取消与 owner Close，二者都取消 Pause
+//     并回收 in_flight；没有通过 sleep 或假函数推进阶段。
+void HookPauseCancelClose() {
+    {
+        AppHost a("cancel-a"), b("cancel-b");
+        auto hooks = a.client->Hooks();
+        const auto armed = hooks->Arm(
+            HookPoint::OutboundBeforeHandshake, HookAction::Pause,
+            Clock::now() + 5s);
+        CHECK(armed);
+        std::promise<bbt::coroutine::detail::Coroutine*> promise;
+        auto current = promise.get_future();
+        auto pending = SubmitCo([&] {
+            promise.set_value(g_bbt_tls_coroutine_co);
+            return bbt_co_await a.client->Call(
+                b.Target(), MakeCall("pause-cancel", 1, "k"), UntilMs(5s));
+        });
+        auto* coroutine = Get(current);
+        CHECK(coroutine != nullptr);
+        CHECK(WaitUntil([&] {
+            return HookState(hooks, HookPoint::OutboundBeforeHandshake).entered == 1 &&
+                   HookState(hooks, HookPoint::OutboundBeforeHandshake).in_flight == 1;
+        }));
+        coroutine->RequestCancel();
+        const auto result = Get(pending);
+        CHECK(!result && result.error().code == ErrorCode::Cancelled);
+        CHECK(WaitUntil([&] {
+            return HookState(hooks, HookPoint::OutboundBeforeHandshake).in_flight == 0;
+        }));
+        CHECK(hooks->Clear(HookPoint::OutboundBeforeHandshake, armed.value()));
+    }
+    {
+        auto a = std::make_unique<AppHost>("close-a");
+        auto b = std::make_unique<AppHost>("close-b");
+        auto hooks = a->client->Hooks();
+        const auto armed = hooks->Arm(
+            HookPoint::OutboundBeforeHandshake, HookAction::Pause,
+            Clock::now() + 5s);
+        CHECK(armed);
+        auto pending = SubmitCo([&] {
+            return bbt_co_await a->client->Call(
+                b->Target(), MakeCall("pause-close", 1, "k"), UntilMs(5s));
+        });
+        CHECK(WaitUntil([&] {
+            return HookState(hooks, HookPoint::OutboundBeforeHandshake).entered == 1 &&
+                   HookState(hooks, HookPoint::OutboundBeforeHandshake).in_flight == 1;
+        }));
+        a->client->Close();
+        const auto result = Get(pending);
+        CHECK(!result && result.error().code == ErrorCode::Closed);
+        CHECK(WaitUntil([&] {
+            return HookState(hooks, HookPoint::OutboundBeforeHandshake).in_flight == 0 &&
+                   HookState(hooks, HookPoint::OutboundBeforeHandshake).closed;
+        }));
+    }
+    std::cout << "v2 hook pause cancel/close: real outbound checkpoint settled\n";
+}
+
+// 23. 出站固定 ThrowOnce：establishing 记录、额度、done 与 conn 责任全归还，
+//     错误可见且与「等 deadline」可区分；随后同 target 真实重试成功。
+void HookOutboundThrow() {
+    rpc::ClientOptions one;
+    one.SetMaxSessions(1);
+    AppHost a("app-a", one), b("app-b");
+    auto hooks = a.client->Hooks();
+    const auto armed = hooks->Arm(
+        HookPoint::OutboundBeforeHandshake, HookAction::ThrowOnce,
+        Clock::now() + 5s);
+    CHECK(armed);
+    const auto failed = CallCo([&] {
+        return bbt_co_await a.client->Call(
+            b.Target(), MakeCall("boom", 1, "k"), UntilMs(5s));
+    });
+    CHECK(!failed && failed.error().code == ErrorCode::InternalError);
+    CHECK(failed.error().message.find("outbound_handshake") !=
+          std::string::npos);
+    const auto state = HookState(hooks, HookPoint::OutboundBeforeHandshake);
+    CHECK(state.entered == 1 && state.in_flight == 0 && !state.armed);
+    CHECK(a.client->Stats().sessions == 0);
+    CHECK(WaitUntil([&] { return a.engine->CountConnections() == 0; }, 3s));
+
+    auto retried = SubmitCo([&] {
+        return bbt_co_await a.client->Call(
+            b.Target(), MakeCall("retry", 2, "k"), UntilMs(5s));
+    });
+    CHECK(WaitUntil([&] { return b.calls.load() == 1; }, 3s));
+    b.ProcessAdmitted(Echo);
+    CHECK(Get(retried));
+    CHECK(a.client->Stats().sessions == 1);
+    std::cout << "v2 outbound ThrowOnce: visible failure + quota retry ok\n";
+}
+
+// 24. BeforeWrite 固定 ThrowOnce：真实 ReplyCompletion 进入已出队 writer，
+//     提交前失败不得伪报成功，writes_outstanding 恰好归零且调用方被唤醒。
+void HookWriteThrow() {
+    AppHost a("app-a"), b("app-b");
+    auto boot = SubmitCo([&] {
+        return bbt_co_await a.client->Call(
+            b.Target(), MakeCall("boot", 1, "k"), UntilMs());
+    });
+    CHECK(WaitUntil([&] { return b.calls.load() == 1; }));
+    b.ProcessAdmitted(Echo);
+    CHECK(Get(boot));
+
+    auto held = SubmitCo([&] {
+        return bbt_co_await a.client->Call(
+            b.Target(), MakeCall("held", 2, "k"), UntilMs(5s));
+    });
+    CHECK(WaitUntil([&] { return b.calls.load() == 2; }));
+    rpc::Request request;
+    std::shared_ptr<rpc::ReplyCompletion> reply;
+    {
+        std::lock_guard<std::mutex> lock(b.mu);
+        CHECK(!b.admitted.empty());
+        request = b.admitted.front().request;
+        reply = b.admitted.front().reply;
+        b.admitted.front().lease->Release();
+        b.admitted.pop_front();
+    }
+    auto hooks = b.client->Hooks();
+    const auto armed = hooks->Arm(
+        HookPoint::BeforeWrite, HookAction::ThrowOnce, Clock::now() + 5s);
+    CHECK(armed);
+    auto done = SubmitCo([&] {
+        return bbt_co_await reply->Complete(Echo(request));
+    });
+    const auto result = Get(done);
+    CHECK(!result && result.error().code == ErrorCode::InternalError);
+    CHECK(HookState(hooks, HookPoint::BeforeWrite).entered == 1);
+    CHECK(HookState(hooks, HookPoint::BeforeWrite).in_flight == 0);
+    CHECK(!HookState(hooks, HookPoint::BeforeWrite).armed);
+    CHECK(WaitUntil([&] {
+        return rpc::detail::ServerV2LedgerForTest(*b.server)
+                   .writes_outstanding == 0;
+    }, 2s));
+    const auto held_result = Get(held);
+    // held 的请求帧已在注入前真实送达并被接纳（calls==2）：提交后 link 退役，
+    // 调用方按 OutcomeUnknown 收场，不得伪报提交前错误。
+    CHECK(!held_result);
+    CHECK(held_result.error().code == ErrorCode::OutcomeUnknown);
+    CHECK(b.server->Drain(Clock::now() + 3s));
+    std::cout << "v2 BeforeWrite ThrowOnce: dequeued write settled once\n";
 }
 
 } // namespace
@@ -2311,6 +2547,11 @@ int RunCase(const std::string& mode) {
     else if (mode == "v2s_queue_full_drain_stats") {
         QueueFullDrainStatsConcurrent();
     }
+    else if (mode == "v2s_hook_state") { HookStateContract(); }
+    else if (mode == "v2s_hook_pause_deadline") { HookPauseDeadline(); }
+    else if (mode == "v2s_hook_pause_cancel_close") { HookPauseCancelClose(); }
+    else if (mode == "v2s_hook_outbound_throw") { HookOutboundThrow(); }
+    else if (mode == "v2s_hook_write_throw") { HookWriteThrow(); }
     else { CHECK(false); }
     std::cout << "rpc v2 session " << mode << " PASS\n";
     return 0;

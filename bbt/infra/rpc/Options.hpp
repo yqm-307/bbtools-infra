@@ -1,14 +1,18 @@
+/**
+ * @file Options.hpp
+ * @brief RPC 装配值层：ClientOptions / SendOptions / ServerOptions。
+ *
+ * 纯值类型 + Validate()：setter 只存值，Validate 在 Create/Start 边界由
+ * owner 调用；本头不联网、不创建线程。net::Address 是值类型（sockaddr 快照，
+ * 无物理栈泄漏，见 cmake 的 rpc_public_header_leak_check 白名单注释）。
+ *
+ * trusted-network 明文模式（ADR §3.2）：未显式 SetTrustedNetworkPlaintext(true)
+ * 且当前没有 verifier API 时，Client::Create/Server::Start 返回
+ * UnsupportedRoute；peer_principal 恒为空，identity 不用于授权。
+ *
+ * 契约来源：docs/decisions/0014-app-session.md §2.2/§2.3。
+ */
 #pragma once
-// bbtools-infra v2：RPC 装配值层 Options（ClientOptions/SendOptions/
-// ServerOptions）。契约来源：docs/decisions/0014-app-session.md §2.2/§2.3。
-//
-// 纯值类型 + Validate()：setter 只存值，Validate 在 Create/Start 边界由
-// owner 调用；本头不联网、不创建线程。net::Address 是值类型（sockaddr 快照，
-// 无物理栈泄漏，见 cmake 的 rpc_public_header_leak_check 白名单注释）。
-//
-// trusted-network 明文模式（ADR §3.2）：未显式 SetTrustedNetworkPlaintext(true)
-// 且当前没有 verifier API 时，Client::Create/Server::Start 返回
-// UnsupportedRoute；peer_principal 恒为空，identity 不用于授权。
 
 #include <chrono>
 #include <cstddef>
@@ -35,6 +39,14 @@ inline constexpr std::size_t kMaxQueueBytes         = 256 * 1024 * 1024;
 // Hello/HelloAck payload 上限（ADR §5.2）：握手阶段 min(max_frame,64KiB)。
 inline constexpr std::size_t kMaxHelloFrameBytes    = 64 * 1024;
 
+/**
+ * @brief Client 出站配置。
+ *
+ * setter 只存值，不校验；调用 Validate() 或通过 Client::Create 边界时统一校验。
+ * local_identity 须非空 UTF-8 且 ≤256 字节（wire peer_identity 约束）。
+ * SetTrustedNetworkPlaintext(true) 是启用明文模式的唯一入口；未设置时
+ * Client::Create 返回 UnsupportedRoute（ADR §3.2）。
+ */
 class ClientOptions {
 public:
     ClientOptions& SetLocalIdentity(std::string value) {
@@ -65,8 +77,11 @@ public:
     std::uint32_t ActorWeight() const noexcept       { return m_actor_weight; }
     bool          ControlDataSplit() const noexcept  { return m_control_data_split; }
 
-    // Create 边界校验：各项有限正数且不超上限；local_identity 非空、UTF-8、
-    // ≤256 字节（wire peer_identity 约束，Codec.hpp 同源）。违规 InvalidArgument。
+    /// @brief Create 边界校验。
+    ///
+    /// 各项须为有限正数且不超上限；local_identity 非空、UTF-8、≤256 字节
+    /// （wire peer_identity 约束，Codec.hpp 同源）。
+    /// @return 违规返回 InvalidArgument（message 指明首个越界字段）。
     result<void> Validate() const {
         if (m_local_identity.empty() || m_local_identity.size() > 256 ||
             !infra::detail::IsValidUtf8(m_local_identity))
@@ -106,6 +121,13 @@ private:
 // Send frame 的 acceptance_requested presence/value——false 显式不请求
 // 确认（wire 上 presence=false），true 等待一次 SendAccepted。
 // 注意：SendOptions 不再携带 traffic class（Request::Traffic() 唯一真源）。
+/**
+ * @brief Send 调用选项：deadline 与远端接纳确认。
+ *
+ * RequireRemoteAcceptance(true) 时等待一次远端 SendAccepted 才返回；
+ * false（默认）在本地 lane 接纳后立即返回。
+ * traffic class 不在本类型携带，唯一真源是 Request::Traffic()。
+ */
 class SendOptions {
 public:
     SendOptions& SetDeadline(bbt::coroutine::Deadline value) noexcept {
@@ -117,8 +139,10 @@ public:
     bbt::coroutine::Deadline Deadline() const noexcept { return m_deadline; }
     bool RequiresRemoteAcceptance() const noexcept { return m_require_remote_acceptance; }
 
-    // 与 CallOptions 同规则：必须有有限、未过期的 deadline（出站边界拒绝
-    // epoch/已过期/远期 max，不让调用进入无界等待）。
+    /// @brief 出站边界校验：deadline 必须有限且未过期。
+    ///
+    /// 拒绝 epoch/已过期/远期 max 的 deadline，不让调用进入无界等待。
+    /// @return 违规返回 InvalidArgument。
     result<void> Validate() const {
         if (m_deadline == bbt::coroutine::Deadline::max() ||
             m_deadline <= std::chrono::steady_clock::now())
@@ -132,6 +156,13 @@ private:
     bool                     m_require_remote_acceptance = false;
 };
 
+/**
+ * @brief Server 入站配置。
+ *
+ * setter 只存值，不校验；调用 Validate() 或通过 Server::Create 边界时统一校验。
+ * listen_address 须 Valid()，incoming_timeout 须有限且 ≤24h；其余字段须有限
+ * 正数且不超 NetworkLimits 硬上限。
+ */
 class ServerOptions {
 public:
     ServerOptions& SetListenAddress(bbt::infra::net::Address value) {
@@ -152,8 +183,11 @@ public:
     std::size_t               MaxHandlerBytes() const noexcept  { return m_max_handler_bytes; }
     std::chrono::milliseconds IncomingTimeout() const noexcept { return m_incoming_timeout; }
 
-    // Create 边界校验：各项有限正数且不超 NetworkLimits 硬上限；
-    // incoming_timeout 必须有限且 ≤24h；listen_address 必须 Valid()。
+    /// @brief Create/Start 边界校验。
+    ///
+    /// 各项须为有限正数且不超 NetworkLimits 硬上限；incoming_timeout 须有限
+    /// 且 ≤24h；listen_address 须 Valid()。
+    /// @return 违规返回 InvalidArgument（message 指明首个越界字段）。
     result<void> Validate() const {
         if (!m_listen_address.Valid())
             return result<void>::err(MakeError(ErrorCode::InvalidArgument,

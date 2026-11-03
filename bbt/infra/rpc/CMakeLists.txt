@@ -48,7 +48,8 @@ target_link_libraries(bbt_infra_rpc_net
 # 公开头自给编译自检：公开头各自单独成 TU（detail 内部头不列入）。
 # core 头不得拉入 HTTP/net 类型（IRpc* seam 是纯抽象），http adapter 头单独验。
 set(_rpc_core_headers RpcWire.hpp Transport.hpp Client.hpp Server.hpp
-    Request.hpp Response.hpp Options.hpp Stats.hpp Codec.hpp Admission.hpp)
+    Request.hpp Response.hpp Options.hpp Stats.hpp Codec.hpp Admission.hpp
+    Hooks.hpp)
 set(_rpc_net_selfcheck_srcs "")
 foreach(_hdr IN LISTS _rpc_core_headers)
     set(_tu "${CMAKE_CURRENT_BINARY_DIR}/header_selfcheck/${_hdr}.cc")
@@ -77,7 +78,7 @@ file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/header_selfcheck/_third_party_guard.cc"
     "// generated: rpc core public headers must not leak physical-stack types\n")
 set(_rpc_leak_check "${CMAKE_CURRENT_BINARY_DIR}/rpc_public_header_leak_check.cmake")
 file(WRITE "${_rpc_leak_check}"
-    "foreach(_hdr RpcWire.hpp Transport.hpp Client.hpp Server.hpp Request.hpp Response.hpp Options.hpp Stats.hpp Codec.hpp Admission.hpp)\n"
+    "foreach(_hdr RpcWire.hpp Transport.hpp Client.hpp Server.hpp Request.hpp Response.hpp Options.hpp Stats.hpp Codec.hpp Admission.hpp Hooks.hpp)\n"
     "    file(READ \"${CMAKE_CURRENT_SOURCE_DIR}/\${_hdr}\" _content)\n"
     "    string(REGEX REPLACE \"#include[^\\n]*infra/net/Address\\.hpp\" \"\" _content \"\${_content}\")\n"
     "    if(_content MATCHES \"#include[^\\n]*infra/http/|#include[^\\n]*infra/net/|#include[^\\n]*\\.pb\\.h|google::protobuf|boost::beast|boost::asio|beast::|asio::\")\n"

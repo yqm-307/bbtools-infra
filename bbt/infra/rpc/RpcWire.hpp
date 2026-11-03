@@ -1,17 +1,19 @@
+/**
+ * @file RpcWire.hpp
+ * @brief 版本化 Protobuf RpcEnvelope wire profile（RPC core，不依赖物理 transport 栈）。
+ *
+ * wire 单一真源仍是 proto/bbt/infra/rpc/v1/rpc_envelope.proto；字节规则、
+ * 值类型校验、错误域映射与 metadata 约束自旧 include/bbt/infra/rpc/RpcWire.hpp
+ * 原样保留（复用，不改 profile）。随 transport seam 切分（architecture §5）：
+ *   * 本头只承载值类型 + protobuf 编解码 + RpcEnvelope seam 互转，不含任何
+ *     HTTP/net 类型；HTTP body 绑定助手迁入 HTTP adapter
+ *     （bbt/infra/rpc/HttpTransport.hpp）；
+ *   * protobuf 生成物仍不出现在公共头（adapter 边界，AGENTS.md §4）；
+ *     实现经 PIMPL 隔在本模块 .cc 内。
+ *
+ * protoc/runtime 同源锁定见 cmake/RpcNet.cmake 的接入注释（BBT_INFRA_RPC_NET）。
+ */
 #pragma once
-// bbtools-infra：版本化 Protobuf RpcEnvelope wire profile（RPC core，
-// 不依赖任何物理 transport 栈）。
-//
-// wire 单一真源仍是 proto/bbt/infra/rpc/v1/rpc_envelope.proto；字节规则、
-// 值类型校验、错误域映射与 metadata 约束自旧 include/bbt/infra/rpc/RpcWire.hpp
-// 原样保留（复用，不改 profile）。随 transport seam 切分（architecture §5）：
-//   * 本头只承载值类型 + protobuf 编解码 + RpcEnvelope seam 互转，不含任何
-//     HTTP/net 类型；HTTP body 绑定助手迁入 HTTP adapter
-//     （bbt/infra/rpc/HttpTransport.hpp）；
-//   * protobuf 生成物仍不出现在公共头（adapter 边界，AGENTS.md §4）；
-//     实现经 PIMPL 隔在本模块 .cc 内。
-//
-// protoc/runtime 同源锁定见 cmake/RpcNet.cmake 的接入注释（BBT_INFRA_RPC_NET）。
 
 #include <cstddef>
 #include <cstdint>
@@ -53,60 +55,103 @@ inline constexpr std::uint32_t kMaxRemainingBudgetMs =
     static_cast<std::uint32_t>(
         std::chrono::milliseconds{kNetworkLimitsMaxIncomingTimeout}.count());
 
-// RpcWireEnvelope：wire profile 的值类型视图。
-// 与 NetworkTypes.hpp 中既有 RpcEnvelope（C++ 结构 seam）的关系：
-//   RpcEnvelope 是 framework 消费的公共数据形态；本结构是 wire profile 的
-//   显式版本化形态，多了 profile_version / remaining_budget_ms / outcome。
-//   两者经 ToWireEnvelope / FromWireEnvelope 显式互转。
+/**
+ * @brief wire profile 的值类型视图。
+ *
+ * 与 NetworkTypes.hpp 中既有 RpcEnvelope（C++ 结构 seam）的关系：
+ *   RpcEnvelope 是 framework 消费的公共数据形态；本结构是 wire profile 的
+ *   显式版本化形态，多了 profile_version / remaining_budget_ms / outcome。
+ *   两者经 ToWireEnvelope / FromWireEnvelope 显式互转。
+ */
 struct RpcWireEnvelope {
-    std::uint32_t profile_version = kRpcWireProfileVersion;
-    std::string   request_id;
-    std::string   service;
-    std::string   method;
-    std::uint32_t remaining_budget_ms = 0;
-    std::string   request_schema;
-    std::string   response_schema;
-    std::vector<std::uint8_t> payload;
-    // 顺序保留；编码/解码均不允许重复键。
+    std::uint32_t profile_version = kRpcWireProfileVersion;  ///< wire profile 版本，当前固定 1
+    std::string   request_id;    ///< 请求唯一标识，五字段关联校验之一
+    std::string   service;       ///< 目标服务名
+    std::string   method;        ///< 目标方法名
+    std::uint32_t remaining_budget_ms = 0;  ///< 剩余预算毫秒，合法范围 1..kMaxRemainingBudgetMs
+    std::string   request_schema;  ///< 请求 payload 的 schema 标识
+    std::string   response_schema;  ///< 响应 payload 的 schema 标识
+    std::vector<std::uint8_t> payload;  ///< 业务负载
+    /// metadata 键值对，顺序保留；编码/解码均不允许重复键。
     std::vector<std::pair<std::string, std::string>> metadata;
 
-    // 请求方向与成功响应：success=true, error 为空。
-    // 错误响应：success=false, error 填充完整字段。
+    /// 请求方向与成功响应：true 时 error 为空。错误响应：false 且 error 填充完整字段。
     bool  success = true;
     Error error;
 };
 
 // --- 值类型校验（不触碰 wire） ----------------------------------------------
 
-// 校验 envelope 的可编码前提：profile_version 支持、request_id/service/method
-// 非空 UTF-8、metadata 前缀/条数/键值长度/重复键、remaining_budget 上限、
-// 错误分支完整性；request 方向禁止携带 outcome（success=false 拒绝）。
-// 违规返回对应 Error，不产生部分编码。
+/**
+ * @brief 校验 envelope 的可编码前提。
+ *
+ * 检查 profile_version 支持、request_id/service/method 非空 UTF-8、
+ * metadata 前缀/条数/键值长度/重复键、remaining_budget 上限、错误分支
+ * 完整性；request 方向禁止携带 outcome（success=false 拒绝）。违规返回
+ * 对应 Error，不产生部分编码。
+ *
+ * @param env         待校验的 envelope。
+ * @param is_response true 表示按响应方向校验（允许 success=false）。
+ * @return 成功为 ok；违规返回 InvalidArgument 或 ProtocolError。
+ */
 result<void> ValidateRpcWireEnvelope(const RpcWireEnvelope& env,
                                      bool is_response);
 
 // --- 编解码（无 protobuf 类型出现在签名） ------------------------------------
 
-// 编码为 protobuf wire 字节。失败返回 Error（InvalidArgument/ProtocolError）。
+/**
+ * @brief 编码为 protobuf wire 字节。
+ *
+ * @param env         待编码的 envelope（须先通过 ValidateRpcWireEnvelope）。
+ * @param is_response true 表示按响应方向编码（允许 success=false）。
+ * @return 成功返回 wire 字节；失败返回 InvalidArgument 或 ProtocolError。
+ */
 result<std::vector<std::uint8_t>> EncodeRpcWireEnvelope(
     const RpcWireEnvelope& env, bool is_response);
 
-// 从 protobuf wire 字节解码。截断/非法字节返回 ProtocolError；
-// 未知字段按 proto3 忽略；字段级约束违规返回 InvalidArgument。
+/**
+ * @brief 从 protobuf wire 字节解码。
+ *
+ * 截断/非法字节返回 ProtocolError；未知字段按 proto3 忽略；字段级约束
+ * 违规返回 InvalidArgument。
+ *
+ * @param bytes       wire 字节。
+ * @param is_response true 表示按响应方向解码。
+ * @return 成功返回 RpcWireEnvelope；失败返回 ProtocolError 或 InvalidArgument。
+ */
 result<RpcWireEnvelope> DecodeRpcWireEnvelope(
     const std::vector<std::uint8_t>& bytes, bool is_response);
-// 同上，接受 string 视图以减少一次拷贝（HTTP body 已是 std::string）。
+
+/**
+ * @brief 同 DecodeRpcWireEnvelope(vector)，接受 string 视图以减少一次拷贝。
+ *
+ * HTTP body 已是 std::string，直接传入避免额外的 vector 构造。
+ */
 result<RpcWireEnvelope> DecodeRpcWireEnvelope(
     const std::string& bytes, bool is_response);
 
 // --- 与既有 RpcEnvelope seam 的互转 -------------------------------------------
 
-// 公共数据形态（framework 消费面）→ wire profile。
-// 不填 outcome；success 由调用方按响应方向另行设置。
+/**
+ * @brief 公共数据形态（framework 消费面）→ wire profile。
+ *
+ * 不填 outcome；success 由调用方按响应方向另行设置。
+ *
+ * @param env                 源 RpcEnvelope。
+ * @param remaining_budget_ms  剩余预算毫秒，写入 wire 字段。
+ * @return 成功返回 RpcWireEnvelope；失败返回 InvalidArgument。
+ */
 result<RpcWireEnvelope> ToWireEnvelope(const RpcEnvelope& env,
                                        std::uint32_t remaining_budget_ms);
-// wire profile → 公共数据形态。丢弃 outcome 分支与 profile_version；
-// 上层经其他路径获知成功/失败。
+
+/**
+ * @brief wire profile → 公共数据形态。
+ *
+ * 丢弃 outcome 分支与 profile_version；上层经其他路径获知成功/失败。
+ *
+ * @param env  源 RpcWireEnvelope。
+ * @return 成功返回 RpcEnvelope；失败返回 InvalidArgument 或 ProtocolError。
+ */
 result<RpcEnvelope> FromWireEnvelope(const RpcWireEnvelope& env);
 
 } // namespace bbt::infra::rpc

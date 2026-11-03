@@ -1,25 +1,28 @@
 #pragma once
 // bbtools-infra v2：RPC 入站 admission 公共类型（ReplyCompletion /
 // AdmissionLease / AdmissionItem / AdmissionHandler / AdmissionQueue）。
+//
+// 一次入站帧的生命周期，谁在什么时候负责什么：
+//
+//   reader（每 session 一个）
+//     └─ AdmissionQueue::Admit(item)          满 → Overloaded，立即返回
+//          └─ FIFO worker（Create 时登记）
+//               └─ AdmissionHandler(item)     同步校验 + 有界转移，不挂起
+//                    ├─ 成功：item 归 framework
+//                    │    ├─ Call：业务协程 Complete/Fail → 真实写终态 → lease->Release()
+//                    │    └─ Send：infra 写一次 SendAccepted（若要求），lease 由 infra 收口
+//                    └─ 失败：infra 发布一次错误终态（Call 错误 / SendAccepted 错误）
+//
+// 两条硬约束：
+//   * reader 只有一个，它绝不挂起等写终态——写背压会把后续 Response/System
+//     帧一起堵住，所以拒绝路径只把错误帧入队，不等它写完。
+//   * 一个 item 的终态只发布一次。reply 的 terminal 位与 lease 的 released 位
+//     各自保证这一点，重复调用返回错误而不是重发。
+//
+// 域：Complete/Fail 是 bbt_co_async，只能在受管协程内 bbt_co_await；Release
+// 任意域可用。Admit 与 AdmissionHandler 都不可挂起。
+//
 // 契约来源：docs/decisions/0014-app-session.md §2.3/§4.2。
-//
-// 职责边界：AdmissionItem 是 Call 与 Send 共用的唯一按序接纳入口载荷；
-// framework 的 AdmissionHandler 只做同步校验和有界转移（不挂起、不调普通
-// 业务 handler）。infra 为每项创建 ReplyCompletion/AdmissionLease——业务
-// 不能构造这两个类型（实现类型是不透明 detail，仅 infra TU 有定义）。
-//
-// 责任终态（ADR §2.3/§4.2）：
-//   - Call：framework 业务协程完成后 bbt_co_await reply->Complete/Fail
-//     （异步回复写入终态），随后 lease->Release()；两终态各只发布一次。
-//   - Send：mailbox/admission 接纳成功后 infra 自行结束投递责任并释放
-//     lease；RequireRemoteAcceptance 时 SendAccepted 由 infra 在接纳边界
-//     写一次。
-//   - 关联字段（request_id/service/method/request_schema/response_schema）
-//     由 infra 在 Complete 边界校验，不一致返回 ProtocolError 并把回复
-//     结算为 ProtocolError 终态（不让 handler 改写另一个请求的回复）。
-//
-// 域约束：Complete/Fail 是 bbt_co_async——只能在受管协程内 bbt_co_await；
-// Release 任意域可用、仅第一次成功。AdmissionQueue::Admit 不可挂起。
 
 #include <cstddef>
 #include <cstdint>
@@ -34,104 +37,155 @@
 namespace bbt::infra::rpc {
 
 namespace detail {
-// 不透明实现类型：仅 infra Session TU 提供定义，业务无法构造。
+// 不透明实现：只有 infra 的 Session TU 有定义，业务拿不到有效对象。
 struct ReplyCompletionImpl;
 struct AdmissionLeaseImpl;
 struct AdmissionQueueImpl;
+class AdmissionAccess;   // 内部接缝的唯一入口，见 detail/Session.hpp
 } // namespace detail
 
-// Call/带确认 Send 的异步完成凭据。Complete 按 kind 生成 RESPONSE 或
-// SEND_ACCEPTED 终态；Fail 生成错误终态。IsTerminal 观测是否已发布终态。
-// 对无效（空）对象调用返回 InvalidArgument，IsTerminal()=true。
+/**
+ * @brief Call 与带确认 Send 的异步完成凭据。
+ *
+ * `Complete` 按 kind 生成 RESPONSE 或 SEND_ACCEPTED 终态，`Fail` 生成错误
+ * 终态；两者都要等到 socket 真实写终态才返回，因此「Complete 成功」等价于
+ * 「对端可能已经收到」。`IsTerminal()` 只观测是否已发布终态，不是成功凭据。
+ */
 class ReplyCompletion {
 public:
     ReplyCompletion() = default;
-    // 实现类型不透明：公共构造入口存在但业务无法构造有效 impl（仅 infra
-    // TU 有 detail::ReplyCompletionImpl 定义）。
+
+    /// @brief 发布成功终态（按 kind 生成 RESPONSE / SEND_ACCEPTED）。
+    ///
+    /// 等到 socket 真实写终态才返回：成功等价于「对端可能已经收到」。
+    /// 仅受管协程内可调用；非首次调用或无效凭据返回 InvalidArgument。
+    bbt_co_async(result<void>) Complete(Response response);
+    /// @brief 发布错误终态（Call 错误 Response / SendAccepted 错误）。
+    ///
+    /// 与 Complete 同域、同等待语义；同样只有第一次调用生效。
+    bbt_co_async(result<void>) Fail(Error error);
+    /// @brief 是否已发布过终态（观测事实，不是成功凭据）。
+    bool IsTerminal() const noexcept;
+
+    /// @brief 本凭据是 Send 的远端接纳确认（而非 Call 回复）。
+    ///
+    /// true 时 admission 成功后由 infra worker 写一次 SendAccepted；false 时
+    /// 回复归 framework 发布。业务不需要消费本判别。
+    bool ForSendAcceptance() const noexcept;
+
+private:
+    friend class detail::AdmissionAccess;
+
     explicit ReplyCompletion(std::shared_ptr<detail::ReplyCompletionImpl> impl)
         : m_impl(std::move(impl)) {}
 
-    bbt_co_async(result<void>) Complete(Response response);
-    bbt_co_async(result<void>) Fail(Error error);
-    bool IsTerminal() const noexcept;
-    // infra 内部判别：本 completion 是否为 Send 的远端接纳确认（true →
-    // admission 成功后由 infra worker 写一次 SendAccepted；false →
-    // Call 回复，归 framework 发布）。业务不消费本判别。
-    bool ForSendAcceptance() const noexcept;
-
-    // infra 内部接缝（P2-5）：reader 上的 admission 拒绝路径不能挂起等
-    // 写终态。把 reply 标记为 terminal（唯一一次成功）并返回 impl 供
-    // infra 构造错误终态帧直接入队——写责任仍由 infra 在真实终态结算，
-    // 业务不应消费本接缝。非首次/无效 impl 返回 nullptr。
+    /// @brief 供 detail::AdmissionAccess 使用：标记 terminal 并交出 impl。
+    ///
+    /// 语义就是「唯一一次成功」——非首次或无效 impl 返回 nullptr。放在私有
+    /// 段是为了让公共面只有 Complete/Fail 两个终态入口。
     std::shared_ptr<detail::ReplyCompletionImpl> MarkTerminalForReject() noexcept;
 
-private:
     std::shared_ptr<detail::ReplyCompletionImpl> m_impl;
 };
 
-// 入站责任 lease：framework 在 reply 终态后 Release。仅第一次调用成功。
-// infra 在 Send 接纳+确认写终态后自行收口本 lease（不经业务）。
+/**
+ * @brief 入站责任 lease：一个 item 从「已接纳」到「责任结清」的凭据。
+ *
+ * Call 在 reply 终态后由 framework Release；Send 由 infra 在接纳并写完所需
+ * 确认后自行收口。只有第一次 Release 成功，重复调用返回 false。
+ */
 class AdmissionLease {
 public:
     AdmissionLease() = default;
-    explicit AdmissionLease(std::shared_ptr<detail::AdmissionLeaseImpl> impl)
-        : m_impl(std::move(impl)) {}
 
-    bool Release() noexcept;              // 仅第一次调用成功
+    /// @brief 结清本 item 的入站责任；只有第一次返回 true。
+    ///
+    /// 任意域可用（不要求协程）。重复调用返回 false，不重复扣减。
+    bool Release() noexcept;
+    /// @brief 是否已结清（观测事实）。
     bool IsReleased() const noexcept;
 
 private:
+    friend class detail::AdmissionAccess;
+
+    explicit AdmissionLease(std::shared_ptr<detail::AdmissionLeaseImpl> impl)
+        : m_impl(std::move(impl)) {}
+
     std::shared_ptr<detail::AdmissionLeaseImpl> m_impl;
 };
 
-// 唯一按序接纳入口载荷：Request 为 owning（Context 已由 infra 在交付
-// admission 前填充：deadline local-min / peer_identity / peer_principal），
-// reply/lease 由 session 为每项创建，业务不能构造。
+/**
+ * @brief 唯一按序接纳入口的载荷。
+ *
+ * `request` 是 owning 的，Context（deadline local-min / peer_identity /
+ * peer_principal）已由 infra 在交付前填好。`reply`/`lease` 由 session 为每项
+ * 创建，业务不能自己造。
+ */
 struct AdmissionItem {
     Request                          request;
     std::shared_ptr<ReplyCompletion> reply;
     std::shared_ptr<AdmissionLease>  lease;
 };
 
-// 只做同步校验和有界转移；不得挂起或调用普通业务 handler。返回成功前必须
-// 完成 owning item 的框架队列转移；返回错误表示未接纳，由 infra 依
-// ReplyMode/acceptance_requested 生成 Call 错误或一次性 SendAccepted 错误。
+/**
+ * @brief framework 侧接纳回调：只做同步校验和有界转移。
+ *
+ * 返回成功之前必须已经把 owning item 转进自己的队列；返回错误表示未接纳，
+ * 由 infra 依 ReplyMode / acceptance_requested 生成一次 Call 错误或一次
+ * SendAccepted 错误。实现不得挂起、不得调用普通业务 handler。
+ */
 using AdmissionHandler = std::function<result<void>(AdmissionItem&&)>;
 
-// 单 FIFO admission 队列：唯一按序接纳入口。Admit 不可挂起——队列满立即
-// Overloaded。一个内部 FIFO worker 按序调用 AdmissionHandler 并把 item
-// 转移给 framework；worker 在受管协程内运行（Create 时登记）。
+/**
+ * @brief 单 FIFO admission 队列：Call 与 Send 共用的唯一按序接纳入口。
+ *
+ * `Admit` 不挂起：队列满立即 `Overloaded`，封口后 `Closed`。内部一个 FIFO
+ * worker 在受管协程里按序调用 `AdmissionHandler`，把 item 交给 framework。
+ * 队列长度与字节数都按 `item.request.Traffic()` 分 lane 记账，方便按业务
+ * 通道观察；总量上限才是接纳判据。
+ */
 class AdmissionQueue {
 public:
-    // max_items/max_bytes > 0 才有界；handler 必须非空。worker 登记失败
-    // 返回 RuntimeUnavailable。
+    /**
+     * @brief 建立队列并登记其 FIFO worker。
+     *
+     * @param max_items 条目上限，必须 > 0。
+     * @param max_bytes 字节上限，必须 > 0。
+     * @param handler   接纳回调，必须非空。
+     * @return 队列；参数非法为 InvalidArgument，worker 登记失败为
+     *         RuntimeUnavailable（此时没有留下常驻任务）。
+     */
     static result<std::shared_ptr<AdmissionQueue>> Create(
         std::size_t max_items, std::size_t max_bytes,
         AdmissionHandler handler);
 
-    // 不可挂起；按 item.request.Traffic() 记账（System 由 infra 内部使用，
-    // 业务 Call/Send 为 Service/Actor）。满 → Overloaded；Close 后 → Closed。
+    /// @brief 不可挂起；满 → Overloaded，封口后 → Closed。
     result<void> Admit(AdmissionItem item);
+    /// @brief 封口：拒绝后续 Admit，worker 退出；已接纳的 item 不受影响。
     void Close() noexcept;
+    /// @brief 是否已封口（观测事实）。
     bool IsClosed() const noexcept;
 
-    // infra 内部接缝：queue impl 仅 infra TU 有定义（ServerV2State 快照用）。
-    const std::shared_ptr<detail::AdmissionQueueImpl>& Impl() const noexcept {
-        return m_impl;
-    }
-
-    // 观察快照（gauge）。唯一同步观察面：计数读全部在 impl->mu 下完成，
-    // ServerV2Stats/Drain 只能经 Queued/BytesQueued 拿同步快照，不得直读
-    // impl 字段（queue 计数与 server 台账锁序解耦）。per-lane 重载供
-    // ServerV2Stats 分 lane 快照；lane 越界按 0 计。
+    // 观察面：计数读都在队列自己的锁内完成。ServerV2Stats/Drain 只经这里拿
+    // 快照，不直读 impl 字段——server 台账锁与队列锁因此保持单向顺序。
+    // per-lane 重载供分 lane 快照使用，lane 越界按 0 计。
+    /// @brief 当前队列条目总数（gauge，单次取锁）。
     std::size_t Queued() const noexcept;
+    /// @brief 当前队列字节总数（gauge，单次取锁）。
     std::size_t BytesQueued() const noexcept;
+    /// @brief 指定 lane 的当前排队条目数（gauge；越界 lane 按 0 计）。
     std::uint64_t Queued(std::size_t lane) const noexcept;
+    /// @brief 指定 lane 的当前排队字节数（gauge；越界 lane 按 0 计）。
+    ///
+    /// 与 Queued(lane) 是两次独立取锁：两者不构成同一时刻的一致视图。
     std::uint64_t BytesQueued(std::size_t lane) const noexcept;
 
 private:
+    friend class detail::AdmissionAccess;
+
     explicit AdmissionQueue(std::shared_ptr<detail::AdmissionQueueImpl> impl)
         : m_impl(std::move(impl)) {}
+
     std::shared_ptr<detail::AdmissionQueueImpl> m_impl;
 };
 

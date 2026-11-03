@@ -36,7 +36,10 @@ foreach(_case v2s_roundtrip v2s_bidirectional v2s_send_acceptance
         v2s_close_released v2s_close_handshake v2s_close_no_publish
         v2s_quota_peers v2s_simultaneous_dial v2s_epoch_reconnect
         v2s_quota_establish_dial v2s_quota_release_retry
-        v2s_never_started_drain_close v2s_queue_full_drain_stats)
+        v2s_never_started_drain_close v2s_queue_full_drain_stats
+        v2s_hook_state v2s_hook_pause_deadline
+        v2s_hook_pause_cancel_close
+        v2s_hook_outbound_throw v2s_hook_write_throw)
     add_test(NAME rpc.net.${_case} COMMAND Test_rpc_v2_session ${_case})
     set_tests_properties(rpc.net.${_case} PROPERTIES TIMEOUT 60 LABELS "rpc_net")
 endforeach()

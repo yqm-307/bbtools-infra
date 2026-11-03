@@ -1,26 +1,27 @@
+/**
+ * @file Client.hpp
+ * @brief RPC core 出站客户端（只依赖 IRpcTransport seam，不依赖任何物理栈）。
+ *
+ * 职责边界：Client 只做 envelope wire 编解码、address 边界检查、请求/回复
+ * 五字段关联校验与剩余预算换算；网络、连接池、阶段超时与错误分类全部归
+ * IRpcTransport 实现（architecture §5.2/§5.3）。wire profile 语义沿用
+ * bbt/infra/rpc/RpcWire.hpp。HTTP adapter 见 bbt/infra/rpc/HttpTransport.hpp。
+ *
+ * 生命周期（Open → Closing → Closed，无重开）：Close() 立即逻辑封口（幂等，
+ * 委托给 adapter；未提交调用 Closed，已提交无回复 OutcomeUnknown）；
+ * IsClosed() 查询当前状态。析构=Close。不新增第二种关闭入口，也不承诺物理
+ * 排空（退役连接由 adapter/Engine owner 收口）。
+ *
+ * 错误面（透传优先，RPC 不重新覆盖物理错误）：
+ *   - Closed：本 Client/adapter 已 Close 后调用；
+ *   - InvalidArgument：address transport/endpoint 非法、envelope 不可编码；
+ *   - TimedOut：调用方 deadline 已过期（确定失败，不发请求）；
+ *   - ProtocolError：回复五字段关联不匹配或 wire 解析失败；
+ *   - 传输/取消/未知结果原样透传 adapter 错误（含 OutcomeUnknown 与
+ *     request_phase 事实），RPC 不把提交后错误改写成其他终态；
+ *   - HTTP adapter 另将非 200 映射为 Unavailable（backend_category=http）。
+ */
 #pragma once
-
-// RPC core 出站客户端（bbt::infra::rpc，只依赖 IRpcTransport seam，不依赖
-// 任何物理栈；HTTP adapter 见 bbt/infra/rpc/HttpTransport.hpp）。
-//
-// 职责边界：Client 只做 envelope wire 编解码、address 边界检查、请求/回复
-// 五字段关联校验与剩余预算换算；网络、连接池、阶段超时与错误分类全部归
-// IRpcTransport 实现（architecture §5.2/§5.3）。wire profile 语义沿用
-// bbt/infra/rpc/RpcWire.hpp。
-//
-// 生命周期（Open → Closing → Closed，无重开）：Close() 立即逻辑封口（幂等，
-// 委托给 adapter；未提交调用 Closed，已提交无回复 OutcomeUnknown）；
-// IsClosed() 查询当前状态。析构=Close。不新增第二种关闭入口，也不承诺物理
-// 排空（退役连接由 adapter/Engine owner 收口）。
-//
-// 错误面（透传优先，RPC 不重新覆盖物理错误）：
-//   - Closed：本 Client/adapter 已 Close 后调用；
-//   - InvalidArgument：address transport/endpoint 非法、envelope 不可编码；
-//   - TimedOut：调用方 deadline 已过期（确定失败，不发请求）；
-//   - ProtocolError：回复五字段关联不匹配或 wire 解析失败；
-//   - 传输/取消/未知结果原样透传 adapter 错误（含 OutcomeUnknown 与
-//     request_phase 事实），RPC 不把提交后错误改写成其他终态；
-//   - HTTP adapter 另将非 200 映射为 Unavailable（backend_category=http）。
 
 #include <memory>
 #include <string_view>
@@ -33,6 +34,7 @@
 #include <bbt/infra/rpc/Response.hpp>
 #include <bbt/infra/rpc/Stats.hpp>
 #include <bbt/infra/rpc/Transport.hpp>
+#include <bbt/infra/rpc/Hooks.hpp>
 
 // 源兼容工厂（HTTP adapter 实现，见 HttpTransport.hpp）：完整声明需要
 // bbt::infra::http 类型，这里仅前向声明；定义与实现在 HTTP adapter TU。
@@ -47,68 +49,112 @@ class ClientOptions;
 class SendOptions;
 struct SessionOwnerState;  // detail：v2 会话 owner，仅 Session TU 有定义
 
+namespace detail {
+struct SessionOwnerAccess;
+} // namespace detail
+
+/**
+ * @brief RPC core 出站客户端。
+ *
+ * 只装配：校验并持有 transport，不联网。Engine/执行底座由应用装配并
+ * 最终收口（与 adapter owner 同责）。
+ */
 class Client : public bbt::coroutine::CoObject {
 public:
-    // 只装配：校验并持有 transport，不联网。Engine/执行底座由应用装配并
-    // 最终收口（与 adapter owner 同责）。
+    /// @brief 装配 IRpcTransport 的通用工厂：校验并持有 transport，不联网。
     static result<std::shared_ptr<Client>> Create(
         std::shared_ptr<IRpcTransport> transport);
-    // 源兼容转接：包装 HttpRpcTransport；下一迁移窗口结束前保留
-    // （architecture §10）。定义在 HTTP adapter（bbt/infra/rpc/HttpTransport.cc）。
+
+    /**
+     * @brief 源兼容工厂：包装 HttpRpcTransport（architecture §10）。
+     *
+     * 定义在 HTTP adapter（bbt/infra/rpc/HttpTransport.cc）。
+     */
     static result<std::shared_ptr<Client>> Create(
         std::shared_ptr<http::Client> http_client);
 
     // ---- v2 会话 owner（ADR §2.2/§3.1）----------------------------------
-    // 只装配：校验 options 并持有共享 Engine，不启动 Engine、不建线程、
-    // 不监听、不拨号。未显式 SetTrustedNetworkPlaintext(true) 且当前没有
-    // verifier API 时返回 UnsupportedRoute。
+    /**
+     * @brief v2 会话 owner 装配：校验 options 并持有共享 Engine。
+     *
+     * 只装配：不启动 Engine、不建线程、不监听、不拨号。未显式
+     * SetTrustedNetworkPlaintext(true) 且当前没有 verifier API 时返回
+     * UnsupportedRoute。
+     */
     static result<std::shared_ptr<Client>> Create(
         std::shared_ptr<net::Engine> engine, ClientOptions options);
 
-    // 仅在受管协程内调用（bbt_co_await 消费）。target 为 "tcp://host:port"
-    // （numeric-ip:port，无 DNS）。首次使用经 Hello/HelloAck 握手与 epoch
-    // 协商建立 provisional session，同 PeerKey 的并发 Call/Send 共用一条
-    // 双向 link（含本进程 Server 入站接纳的 link）。
-    // Call 要求 request.Reply()==Required、Traffic 为 Service/Actor；
-    // request_id 为空时由 session 生成唯一值。失败错误面：InvalidArgument/
-    // InvalidContext/TimedOut/Closed/Overloaded/UnsupportedRoute/
-    // OutcomeUnknown（committed 后无可信终态）。
+    /**
+     * @brief v2 会话出站 RPC 调用（仅受管协程内调用，bbt_co_await 消费）。
+     *
+     * target 为 "tcp://host:port"（numeric-ip:port，无 DNS）。首次使用经
+     * Hello/HelloAck 握手与 epoch 协商建立 provisional session，同 PeerKey
+     * 的并发 Call/Send 共用一条双向 link（含本进程 Server 入站接纳的 link）。
+     * Call 要求 request.Reply()==Required、Traffic 为 Service/Actor；
+     * request_id 为空时由 session 生成唯一值。
+     *
+     * @return 失败错误面：InvalidArgument/InvalidContext/TimedOut/Closed/
+     *         Overloaded/UnsupportedRoute/OutcomeUnknown（committed 后无可信终态）。
+     */
     bbt_co_async(result<Response>) Call(
         std::string_view target, Request request,
         const CallOptions& options);
 
-    // Send 要求 request.Reply()==None、Traffic 为 Service/Actor；
-    // message_id 为空时由 session 生成唯一值。RequireRemoteAcceptance
-    // 编码为 acceptance_requested presence；true 时等到远端 admission
-    // 成功（或拒绝）的 SendAccepted 才返回。false 在本地 lane 接纳后返回。
+    /**
+     * @brief v2 会话出站单向发送（仅受管协程内调用）。
+     *
+     * Send 要求 request.Reply()==None、Traffic 为 Service/Actor；
+     * message_id 为空时由 session 生成唯一值。RequireRemoteAcceptance
+     * 编码为 acceptance_requested presence；true 时等到远端 admission
+     * 成功（或拒绝）的 SendAccepted 才返回。false 在本地 lane 接纳后返回。
+     */
     bbt_co_async(result<void>) Send(
         std::string_view target, Request message,
         const SendOptions& options);
 
-    // v2 owner 观测快照（owner 汇总；逐 peer/epoch/link 观测缺口见
-    // handoff——本切片不声称完整 AppSession 监控）。
+    /**
+     * @brief 本 owner 实例的受控检查点控制器。
+     *
+     * v2 装配返回同一 owner 的共享 handle；v1 装配返回空 handle。handle 只
+     * 持有有界的控制状态，不延长 owner、Engine、连接或业务对象的寿命。
+     * 注册、注销、快照与故障动作的语义见 bbt/infra/rpc/Hooks.hpp。
+     */
+    std::shared_ptr<SessionHooks> Hooks() const noexcept;
+
+    /**
+     * @brief v2 owner 观测快照（owner 汇总）。
+     *
+     * 逐 peer/epoch/link 观测缺口见 docs/decisions/0014-app-session.md；
+     * 本结构不声称完整 AppSession 监控。
+     */
     ClientStats Stats() const noexcept;
     ~Client() noexcept;
     Client(const Client&) = delete;
     Client& operator=(const Client&) = delete;
 
-    // 仅在受管协程内调用（bbt_co_await 消费）；期限由 options.deadline 表达，
-    // 必须是未来时刻（epoch/已过期确定 TimedOut）。地址 transport 只接受
-    // "http"/"tcp"，endpoint 合法性归 adapter；请求经 wire profile 编码后交
-    // adapter Exchange。回复按五字段关联校验（request_id/service/method/
-    // request_schema/response_schema），不一致报 ProtocolError。
+    /**
+     * @brief v1 envelope 级 RPC 调用（仅受管协程内调用，bbt_co_await 消费）。
+     *
+     * 期限由 options.deadline 表达，必须是未来时刻（epoch/已过期确定
+     * TimedOut）。地址 transport 只接受 "http"/"tcp"，endpoint 合法性归
+     * adapter；请求经 wire profile 编码后交 adapter Exchange。回复按五字段
+     * 关联校验（request_id/service/method/request_schema/response_schema），
+     * 不一致报 ProtocolError。
+     */
     bbt_co_async(result<RpcEnvelope>) Call(const RpcAddress& address,
                                            RpcEnvelope request,
                                            const CallOptions& options);
 
-    // 立即逻辑封口：转发给 adapter（幂等、不可重开）。
+    /// @brief 立即逻辑封口：转发给 adapter（幂等、不可重开）。
     void Close() noexcept;
+    /// @brief 查询当前是否已 Close。
     bool IsClosed() const noexcept;
 
 private:
     explicit Client(std::shared_ptr<IRpcTransport> transport) noexcept;
     explicit Client(std::shared_ptr<SessionOwnerState> owner) noexcept;
     friend class Server;  // Server::Create 注入 session_owner 取 m_owner
+    friend struct detail::SessionOwnerAccess;
     std::shared_ptr<IRpcTransport>     m_transport;
     std::shared_ptr<SessionOwnerState> m_owner;  // v2 会话 owner（与
                                                  // m_transport 互斥装配）
