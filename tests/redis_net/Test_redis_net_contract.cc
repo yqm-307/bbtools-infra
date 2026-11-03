@@ -245,7 +245,7 @@ void ConnectFailureOwned() {
     CHECK(Access::ConnectTableSize(*raw_host.engine) == 0);
     raw_cli.reset();
     raw_host.Finish();
-    auto idle = std::make_shared<net::Engine>(nullptr);
+    auto idle = net::Engine::Create(nullptr);
     auto idle_cli = Client::Create(idle, Loopback());
     CHECK(idle_cli);
     ExpectCode(raw_host.Call([&] { return bbt_co_await idle_cli.value()->Connect(Until()); }), ErrorCode::RuntimeUnavailable);

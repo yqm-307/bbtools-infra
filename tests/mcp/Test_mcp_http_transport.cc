@@ -93,7 +93,7 @@ bool WaitUntil(const std::function<bool()>& pred, std::chrono::milliseconds time
 
 struct McpHost {
     std::shared_ptr<net::Engine> engine{
-        std::make_shared<net::Engine>(std::shared_ptr<net::RawHandler>{})};
+        net::Engine::Create(std::shared_ptr<net::RawHandler>{})};
     std::shared_ptr<mcp::McpServer> server;
     std::shared_ptr<mcp::McpHttpTransport> transport;
     std::thread runner;

@@ -104,7 +104,7 @@ int Example() {
     //    accept-handoff）→ rpc::Server::Create(inbound, handler) → Run →
     //    Start。Engine 监听地址由应用提供。
     auto server_engine =
-        std::make_shared<net::Engine>(std::shared_ptr<net::RawHandler>{});
+        net::Engine::Create(std::shared_ptr<net::RawHandler>{});
     rpc::TcpRpcServerOptions server_options;
     auto made_inbound =
         rpc::TcpRpcInboundTransport::Create(server_engine, server_options);
@@ -140,7 +140,7 @@ int Example() {
     // 3) client：应用装配 client-only Engine，TcpRpcTransport 借用其共享
     //    引用（不 Run/RequestClose），rpc::Client 只持 IRpcTransport seam。
     auto client_engine =
-        std::make_shared<net::Engine>(std::shared_ptr<net::RawHandler>{});
+        net::Engine::Create(std::shared_ptr<net::RawHandler>{});
     config.listen_addresses.clear();
     Runner client_run(client_engine, config);
     Running(client_engine);

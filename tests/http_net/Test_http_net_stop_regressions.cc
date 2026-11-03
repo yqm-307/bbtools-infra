@@ -54,7 +54,7 @@ int main() {
     g_bbt_coroutine_config->m_cfg_processer_auto_scale = false;
     g_scheduler->Start();
 
-    auto engine = std::make_shared<net::Engine>(std::shared_ptr<net::RawHandler>{});
+    auto engine = net::Engine::Create(std::shared_ptr<net::RawHandler>{});
     auto made = http::Server::Create(engine, [](bbt::infra::IncomingCallContext, http::IncomingRequest) {
         return bbt::infra::result<http::Response>::ok({200, {}, "ok"});
     });

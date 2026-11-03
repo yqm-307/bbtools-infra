@@ -153,7 +153,7 @@ public:
     std::atomic<bool> run_returned{false};
 
     explicit Host(std::shared_ptr<net::RawHandler> handler = {}, net::Options options = {})
-        : engine(std::make_shared<net::Engine>(std::move(handler))) {
+        : engine(net::Engine::Create(std::move(handler))) {
         net::EngineConfig config;
         config.runtime_progress = net::RuntimeProgress::Independent;
         config.options = options;

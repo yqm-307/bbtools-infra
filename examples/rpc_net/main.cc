@@ -106,7 +106,7 @@ int Example() {
     // 2) server：HttpRpcInboundTransport::Create（Engine Idle，只配置 handoff）
     //    → rpc::Server::Create(inbound, handler) → Run → Start。
     auto server_engine =
-        std::make_shared<net::Engine>(std::shared_ptr<net::RawHandler>{});
+        net::Engine::Create(std::shared_ptr<net::RawHandler>{});
     auto made_inbound = rpc::HttpRpcInboundTransport::Create(server_engine);
     Check(static_cast<bool>(made_inbound), "rpc inbound transport Create");
     auto made_server = rpc::Server::Create(
@@ -140,7 +140,7 @@ int Example() {
     // 3) client：应用装配 http::Client（Engine + base_url），HttpRpcTransport
     //    包装其池，rpc::Client 只持有 IRpcTransport seam。
     auto client_engine =
-        std::make_shared<net::Engine>(std::shared_ptr<net::RawHandler>{});
+        net::Engine::Create(std::shared_ptr<net::RawHandler>{});
     config.listen_addresses.clear();
     Runner client_run(client_engine, config);
     Running(client_engine);

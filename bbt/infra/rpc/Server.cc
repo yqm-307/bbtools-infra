@@ -11,6 +11,7 @@
 
 #include <bbt/infra/rpc/RpcWire.hpp>
 #include <bbt/infra/rpc/detail/Core.hpp>
+#include <bbt/infra/rpc/detail/Session.hpp>
 
 namespace bbt::infra::rpc {
 namespace {
@@ -103,6 +104,9 @@ struct Server::State {
 Server::Server(std::shared_ptr<State> state) noexcept
     : m_state(std::move(state)) {}
 
+Server::Server(std::shared_ptr<ServerV2State> v2) noexcept
+    : m_v2(std::move(v2)) {}
+
 Server::~Server() noexcept { Close(); }
 
 result<std::shared_ptr<Server>> Server::Create(
@@ -120,10 +124,13 @@ result<std::shared_ptr<Server>> Server::Create(
     state->inbound = std::move(inbound);
     state->handler = std::move(handler);
     return result<std::shared_ptr<Server>>::ok(
-        std::shared_ptr<Server>(new Server(std::move(state))));
+        bbt::coroutine::MakeCoObject<Server>("infra.rpc.Server", "", [&] {
+            return std::shared_ptr<Server>(new Server(std::move(state)));
+        }));
 }
 
 result<void> Server::Start() {
+    if (m_v2) { return detail::ServerV2Start(m_v2); }
     auto state = m_state;
     if (state->closed.load()) {
         return result<void>::err(
@@ -145,24 +152,35 @@ result<void> Server::Start() {
     return state->inbound->Start(*state->wire);
 }
 
-void Server::StopAccepting() noexcept { m_state->inbound->StopAccepting(); }
+void Server::StopAccepting() noexcept {
+    if (m_v2) { detail::ServerV2StopAccepting(m_v2); return; }
+    m_state->inbound->StopAccepting();
+}
 
 result<void> Server::Drain(bbt::coroutine::Deadline deadline) {
+    if (m_v2) { return detail::ServerV2Drain(m_v2, deadline); }
     return m_state->inbound->Drain(deadline);
 }
 
 void Server::Close() noexcept {
+    if (m_v2) { detail::ServerV2Seal(m_v2); return; }
     if (!m_state) { return; }
-    m_state->closed.store(true);
-    m_state->inbound->Close();
+    if (!m_state->closed.exchange(true)) m_state->inbound->Close();
 }
 
 result<void> Server::WaitStopped(bbt::coroutine::Deadline deadline) {
+    if (m_v2) { return detail::ServerV2WaitStopped(m_v2, deadline); }
     return m_state->inbound->WaitStopped(deadline);
 }
 
 bool Server::IsClosed() const noexcept {
+    if (m_v2) { return detail::ServerV2Closed(*m_v2); }
     return !m_state || m_state->closed.load();
+}
+
+detail::ServerV2Ledger detail::ServerV2LedgerForTest(
+    const Server& server) noexcept {
+    return detail::ServerV2LedgerOf(server.m_v2);
 }
 
 } // namespace bbt::infra::rpc

@@ -59,7 +59,7 @@ std::function<void()>& DialBarrierForTest()
 std::error_code RequireCoroutineContext()
 {
     // 与 ICoObject::RequireCoroutine 同源判定：不构造 CoObject、不缓存 TLS。
-    return bbt::coroutine::GetLocalCoroutineId() != 0 ? std::error_code{} : InvalidContext();
+    return bbt::coroutine::IsInCoroutineContext() ? std::error_code{} : InvalidContext();
 }
 
 std::error_code WaitStatusError(bbt::coroutine::WaitStatus status)

@@ -1,0 +1,134 @@
+// bbtools-infra：v2 AppSession SessionFrame wire profile 单一真源。
+//
+// 契约来源：docs/decisions/0014-app-session.md §5.1 的字段号表；
+// 字段号一经发布不得复用/改号/改变含义，废弃字段改为 reserved。
+// 本文件自包含（不 import v1）：v2 是独立 profile，不在 v1 字段上隐式复用。
+// protoc 与 C++ runtime 同源锁定 3.21.12（cmake/RpcNet.cmake）。
+
+syntax = "proto3";
+
+package bbt.infra.rpc.v2;
+
+option cc_enable_arenas = true;
+
+// ---------------------------------------------------------------------------
+// 错误分支（字段号与 v1 RpcError 固定一致：code=1 … request_phase=9）
+// ---------------------------------------------------------------------------
+
+// 与 include/bbt/infra/Result.hpp 的 bbt::infra::ErrorCode 一一对应，
+// 序号固定，新增成员只能追加，不得插入/改序/复用。
+enum RpcErrorCode {
+    RPC_ERROR_CODE_UNSPECIFIED      = 0;  // 解码端视为 ProtocolError
+    RPC_ERROR_CODE_INVALID_ARGUMENT = 1;
+    RPC_ERROR_CODE_INVALID_CONTEXT  = 2;
+    RPC_ERROR_CODE_RUNTIME_UNAVAILABLE = 3;
+    RPC_ERROR_CODE_CLOSED           = 4;
+    RPC_ERROR_CODE_CANCELLED        = 5;
+    RPC_ERROR_CODE_TIMED_OUT        = 6;
+    RPC_ERROR_CODE_OVERLOADED       = 7;
+    RPC_ERROR_CODE_UNAVAILABLE      = 8;
+    RPC_ERROR_CODE_TRANSPORT_ERROR  = 9;
+    RPC_ERROR_CODE_PROTOCOL_ERROR   = 10;
+    RPC_ERROR_CODE_NOT_FOUND        = 11;
+    RPC_ERROR_CODE_TYPE_MISMATCH    = 12;
+    RPC_ERROR_CODE_UNSUPPORTED_ROUTE = 13;
+    RPC_ERROR_CODE_OUTCOME_UNKNOWN  = 14;
+    RPC_ERROR_CODE_REMOTE_ERROR     = 15;
+    RPC_ERROR_CODE_INTERNAL_ERROR   = 16;
+}
+
+// 与 Result.hpp 的 RequestPhase 一一对应，序号固定；UNSPECIFIED=0 为非法值，
+// 解码端视为 ProtocolError。
+enum RpcRequestPhase {
+    RPC_REQUEST_PHASE_UNSPECIFIED        = 0;
+    RPC_REQUEST_PHASE_NOT_STARTED        = 1;
+    RPC_REQUEST_PHASE_CONNECTING         = 2;
+    RPC_REQUEST_PHASE_WRITING            = 3;
+    RPC_REQUEST_PHASE_REQUEST_COMMITTED  = 4;
+    RPC_REQUEST_PHASE_REPLY_TERMINAL     = 5;
+}
+
+message RpcError {
+    RpcErrorCode code            = 1;
+    string       domain          = 2;
+    string       domain_code     = 3;
+    string       message         = 4;
+    string       backend_category = 5;
+    int32        backend_code    = 6;
+    uint64       transferred_bytes = 7;
+    // 最多 16 项，键 ≤64 UTF-8 字节，值 ≤256 UTF-8 字节，不允许重复键。
+    repeated MetadataEntry details = 8;
+    // optional 保留存在位：缺字段解码为 nullopt，绝不补成未提交；
+    // UNSPECIFIED 与未识别枚举值按 ProtocolError 拒绝。
+    optional RpcRequestPhase request_phase = 9;
+}
+
+// ---------------------------------------------------------------------------
+// 枚举与受限 metadata
+// ---------------------------------------------------------------------------
+
+enum FrameKind {
+    FRAME_KIND_UNSPECIFIED = 0;
+    HELLO          = 1;
+    HELLO_ACK      = 2;
+    CALL           = 3;
+    RESPONSE       = 4;
+    SEND           = 5;
+    SEND_ACCEPTED  = 6;
+    SESSION_ERROR  = 7;
+    CLOSE          = 8;
+}
+
+enum TrafficClass {
+    TRAFFIC_SYSTEM  = 0;
+    TRAFFIC_SERVICE = 1;
+    TRAFFIC_ACTOR   = 2;
+}
+
+enum ReplyMode {
+    REPLY_NONE     = 0;
+    REPLY_REQUIRED = 1;
+}
+
+// 受限 metadata：仅 fw.* / route.* / trace.* 注册前缀；最多 32 项，
+// 键 ≤64 UTF-8 字节，值 ≤256 UTF-8 字节，无重复键。
+message MetadataEntry {
+    string key   = 1;
+    string value = 2;
+}
+
+// ---------------------------------------------------------------------------
+// SessionFrame（profile 2；u32be 前缀分帧，见 ADR §5.2）
+// ---------------------------------------------------------------------------
+
+message SessionFrame {
+    uint32       profile_version  = 1;   // 固定 2；其他版本 ProtocolError
+    FrameKind    frame_kind       = 2;
+    TrafficClass traffic_class    = 3;
+    string       peer_identity    = 4;   // 仅 Hello/HelloAck；非认证凭据
+    uint64       session_epoch    = 5;   // Hello/HelloAck 和所有数据帧非零
+    string       message_id       = 6;   // Send/SendAccepted 必填，≤128 字节
+    string       request_id       = 7;   // Call/Response 必填（Response 原样回显）
+    string       service          = 8;
+    string       method           = 9;
+    ReplyMode    reply_mode       = 10;
+    uint64       sequence         = 11;  // 0 表示未启用顺序检查
+    bytes        ordering_key     = 12;  // 启用顺序时非空、≤256 字节
+    uint32       remaining_budget_ms = 13;
+    string       request_schema   = 14;  // Call/Response 必填
+    string       response_schema  = 15;  // Call/Response 必填且响应与请求相同
+    bytes        payload          = 16;
+    repeated MetadataEntry metadata = 17;
+    oneof outcome {
+        bool     success          = 18;  // Response/SendAccepted/SessionError 二选一
+        RpcError error            = 19;
+    }
+    uint64       connection_nonce = 20;  // 仅 Hello/HelloAck，非零；非认证随机数
+    // 仅 Send；false 不生成成功确认，true 在入队成功或拒绝后只生成一次
+    // SendAccepted。presence 保留「显式 false ≠ 缺省」语义。
+    optional bool acceptance_requested = 21;
+
+    // 保留区间：未来 streaming/cancellation 扩展；当前版本禁止出现。
+    reserved 100 to 199;
+    reserved "extensions";
+}

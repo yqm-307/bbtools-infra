@@ -393,3 +393,10 @@ if(BBT_INFRA_PERF_BENCH)
             LABELS "perf")
     endforeach()
 endif()
+
+# Co 门禁、native 观察和关闭快路径（Boost.Test）。
+add_executable(Test_net_co_lifecycle Test_net_co_lifecycle.cc)
+target_link_libraries(Test_net_co_lifecycle PRIVATE bbt::infra_net Boost::headers)
+target_compile_options(Test_net_co_lifecycle PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME net.co_lifecycle COMMAND Test_net_co_lifecycle)
+set_tests_properties(net.co_lifecycle PROPERTIES TIMEOUT 30 LABELS "unit")

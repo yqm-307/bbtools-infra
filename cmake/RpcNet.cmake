@@ -170,22 +170,27 @@ message(STATUS
 
 # 从 proto 真源生成 C++；生成物落在 build 目录，不进仓库、不污染源码树。
 set(BBT_RPC_PROTO "${PROJECT_SOURCE_DIR}/proto/bbt/infra/rpc/v1/rpc_envelope.proto")
+set(BBT_RPC_PROTO_V2 "${PROJECT_SOURCE_DIR}/proto/bbt/infra/rpc/v2/session_frame.proto")
 set(BBT_RPC_GEN_DIR "${CMAKE_BINARY_DIR}/generated/rpc_net")
 file(MAKE_DIRECTORY "${BBT_RPC_GEN_DIR}")
 add_custom_command(
     OUTPUT "${BBT_RPC_GEN_DIR}/bbt/infra/rpc/v1/rpc_envelope.pb.cc"
            "${BBT_RPC_GEN_DIR}/bbt/infra/rpc/v1/rpc_envelope.pb.h"
+           "${BBT_RPC_GEN_DIR}/bbt/infra/rpc/v2/session_frame.pb.cc"
+           "${BBT_RPC_GEN_DIR}/bbt/infra/rpc/v2/session_frame.pb.h"
     COMMAND "${CMAKE_COMMAND}" -E env
             "LD_LIBRARY_PATH=${BBT_PROTOBUF_LIB_DIR}"
             "${BBT_PROTOC_EXECUTABLE}"
             --proto_path "${PROJECT_SOURCE_DIR}/proto"
             --cpp_out "${BBT_RPC_GEN_DIR}"
             "${BBT_RPC_PROTO}"
-    DEPENDS "${BBT_RPC_PROTO}" "${BBT_PROTOC_EXECUTABLE}"
-    COMMENT "protoc generate rpc_envelope.pb.{h,cc} (v${BBT_PROTOC_VERSION})"
+            "${BBT_RPC_PROTO_V2}"
+    DEPENDS "${BBT_RPC_PROTO}" "${BBT_RPC_PROTO_V2}" "${BBT_PROTOC_EXECUTABLE}"
+    COMMENT "protoc generate rpc v1/v2 .pb.{h,cc} (v${BBT_PROTOC_VERSION})"
     VERBATIM)
 add_library(bbt_infra_rpc_proto STATIC
-    "${BBT_RPC_GEN_DIR}/bbt/infra/rpc/v1/rpc_envelope.pb.cc")
+    "${BBT_RPC_GEN_DIR}/bbt/infra/rpc/v1/rpc_envelope.pb.cc"
+    "${BBT_RPC_GEN_DIR}/bbt/infra/rpc/v2/session_frame.pb.cc")
 target_include_directories(bbt_infra_rpc_proto PUBLIC
     "${BBT_RPC_GEN_DIR}" "${BBT_PROTOBUF_INCLUDE_DIR}")
 target_link_libraries(bbt_infra_rpc_proto PUBLIC "${BBT_PROTOBUF_LIBRARY}")

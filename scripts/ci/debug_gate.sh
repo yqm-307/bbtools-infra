@@ -62,7 +62,7 @@ cmake -S "$REPO_DIR" -B "$RPC_BUILD_DIR" -G Ninja \
     -DBBT_COROUTINE_SOURCE_DIR="$COROUTINE_DIR" -DBBT_PROTOBUF_PREFIX="$PROTOBUF_PREFIX"
 cmake --build "$RPC_BUILD_DIR" --parallel "$JOBS" --target \
     bbt_infra_rpc_net_header_selfcheck bbt_infra_http_net_header_selfcheck \
-    Test_rpc_net_wire Test_rpc_net_roundtrip Test_rpc_net_faults Test_rpc_net_lifetime rpc_net_example \
+    Test_rpc_net_wire Test_rpc_v2_wire Test_rpc_v2_session Test_rpc_co_lifecycle Test_rpc_net_roundtrip Test_rpc_net_faults Test_rpc_net_lifetime rpc_net_example rpc_v2_session_example \
     Test_http_net_contract Test_http_net_regressions Test_http_net_streaming Test_http_net_server Test_http_net_stop_regressions http_net_example
 bash "$SCRIPT_DIR/run_ctest_label.sh" \
     --build-dir "$RPC_BUILD_DIR" \
