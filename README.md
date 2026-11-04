@@ -69,7 +69,7 @@ coroutine 运行时按**进程寿命**存在、不参与业务资源收口（不
 
 ## 独立消费
 
-本仓当前**不提供安装包或导出 CMake 包**。消费方式为**源码树内 add_subdirectory** 或**直接在本仓构建后链接静态库**。
+本仓当前**不提供安装包或导出 CMake 包**。消费方式为**源码树内 add_subdirectory**、**直接在本仓构建后链接静态库**，或**用 `scripts/install/install.sh` 把头和库装到用户前缀（默认 `~/.local`，`BBT_INSTALL_PREFIX` 可覆盖）后按 `-I`/`-L` 链接**。
 
 ### 源码接入（推荐）
 
