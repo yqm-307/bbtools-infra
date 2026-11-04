@@ -1,0 +1,16 @@
+# smoke profile 必选注册清单：PR CI（release_gate.sh RELEASE_GATE_MODE=smoke）
+# 经 run_test_profile.sh --require-file 钉死。每模块/每覆盖轴至少 1 项
+# 秒级代表用例；label 调整时同步更新本清单，缺项直接 FATAL。
+contract.basics
+config.unit
+iowait.combined_wait
+rpc.payload
+tcp.loopback
+udp.loopback
+transport.runtime
+transport.acceptance
+http.loopback
+http.session_lifetime
+http.outbound_quota
+http.child_unregister
+redis.unit

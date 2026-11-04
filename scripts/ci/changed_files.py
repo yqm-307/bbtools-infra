@@ -13,6 +13,8 @@
 - `CMakeLists.txt`、`.github/workflows/**`、`*.cmake`、`*.py` 一律判 code
   （`CMakeLists.txt` 虽是 `.txt` 后缀，属构建入口；workflows 与 CI 脚本改动可能
   改变构建/测试行为，绝不允许被 markdown 后缀或目录形状带成 docs-only）；
+- `scripts/ci/**` 整目录判 code：required_*.txt 等清单是门禁输入（改动会
+  改变 smoke/focused 选集），绝不能按 `.txt` 后缀落入 docs-only；
 - `docs/` 前缀路径、`.md`/图片/`.txt` 等文档后缀、`LICENSE` 等根目录文书判 doc；
 - 混合变更集（任一 code 路径）判 code；
 - 变更集为空或 `classifier_status != ok` 判 unknown，保守执行全部。
@@ -27,7 +29,12 @@
   （classification=unknown→执行全部），**不裁剪成假子集**。
 
 输出（写入 `$GITHUB_OUTPUT`，未设置时写 stdout，便于离线冒烟）：
-  changed_files_json, classifier_status, classification, event_json
+  changed_files_json, classifier_status, classification, event_json, focused
+
+focused（必要 focused 测试名正则）：把变更路径经 `FOCUS_MAP` 前缀→测试名正则
+映射表归并为 `<a>|<b>|...`（`-R` 语义下前缀匹配即等价按名选择）；无匹配或
+分类器非 ok 输出空串。映射表覆盖本仓源码模块（src/include/bbt/proto/tests/
+cmake/构建入口），只作代码路径的 focused 补充选择，不改变 docs-only 分类语义。
 
 环境输入（由 workflow 注入；离线冒烟可用同名 env 覆盖）：
   EVENT_NAME, BASE_REF, SHA, BEFORE, REF_NAME, GITHUB_OUTPUT
@@ -52,7 +59,9 @@ DOC_BASENAMES = {"LICENSE", "NOTICE", "COPYING", "CODEOWNERS", "AUTHORS"}
 # 被打成 docs-only 放行）。
 CODE_BASENAMES = {"CMakeLists.txt"}
 CODE_SUFFIXES = (".cmake", ".py")
-CODE_PREFIXES = (".github/workflows/",)
+# scripts/ci/ 整目录判 code：required_*.txt 是 smoke/focused 门禁输入清单，
+# 改动必须触发构建与测试，不得被 .txt 后缀判成 doc（F-02）。
+CODE_PREFIXES = (".github/workflows/", "scripts/ci/")
 
 
 def classify_path(path: str) -> str:
@@ -72,6 +81,67 @@ def classify_path(path: str) -> str:
     if base in DOC_BASENAMES:
         return "doc"
     return "code"
+
+
+# ---- 必要 focused 映射（仓内维护：路径前缀 → ctest 测试名正则）----
+# 每条 (prefix, regex)：变更路径以 prefix 开头即并入 regex。regex 为 `|` 分隔的
+# 测试名前缀（ctest -R 子串语义下等价按名选择），与 tests/CMakeLists.txt 及
+# tests/{net,http_net,rpc_net,redis_net,mcp} 注册的 `<module>.<行为>` 命名轴对齐。
+# 无匹配 → focused 输出空串，workflow 不追加 focused 实跑。
+FOCUS_MAP = (
+    ("src/http/", "^http\\."),
+    ("include/bbt/infra/HttpClient.hpp", "^http\\."),
+    ("include/bbt/infra/HttpServer.hpp", "^http\\."),
+    ("include/bbt/infra/NetworkRuntime.hpp", "^http\\.|^transport\\."),
+    ("include/bbt/infra/TransportRuntime.hpp", "^transport\\."),
+    ("src/tcp/", "^tcp\\.|^transport\\."),
+    ("include/bbt/infra/CoTCP.hpp", "^tcp\\.|^transport\\."),
+    ("src/udp/", "^udp\\.|^transport\\."),
+    ("include/bbt/infra/CoUDP.hpp", "^udp\\.|^transport\\."),
+    ("src/transport/", "^transport\\."),
+    ("src/config/", "^config\\."),
+    ("include/bbt/infra/config/", "^config\\."),
+    ("src/redis/", "^redis\\."),
+    ("include/bbt/infra/CoRedisCli.hpp", "^redis\\."),
+    ("bbt/infra/redis/", "^redis\\.net\\.|^redis\\."),
+    ("src/mongo/", "^mongo\\."),
+    ("include/bbt/infra/CoMongoCli.hpp", "^mongo\\."),
+    ("include/bbt/infra/mongo/", "^mongo\\."),
+    ("bbt/infra/net/", "^net\\."),
+    ("bbt/infra/http/", "^http\\.net\\."),
+    ("bbt/infra/rpc_tcp/", "^rpc\\.tcp\\."),
+    ("bbt/infra/rpc/", "^rpc\\."),
+    ("bbt/infra/mcp/", "^mcp\\."),
+    ("include/bbt/infra/rpc/", "^rpc\\."),
+    ("proto/", "^rpc\\."),
+    ("src/detail/", "^iowait\\.|^transport\\."),
+    ("src/debug/", "^contract\\."),
+    ("src/", "^contract\\."),
+    ("include/bbt/infra/", "^contract\\."),
+    ("include/", "^contract\\."),
+    ("tests/net/", "^net\\."),
+    ("tests/http_net/", "^http\\.net\\."),
+    ("tests/rpc_net/", "^rpc\\.net\\."),
+    ("tests/redis_net/", "^redis\\.net\\."),
+    ("tests/mcp/", "^mcp\\."),
+    ("tests/", "^contract\\."),
+    ("cmake/", "^contract\\."),
+    ("CMakeLists.txt", "^contract\\."),
+    ("examples/", "^example_|^net\\.consumer|^mongo\\.client\\.consumer"),
+)
+
+
+def focused_regex(changed_files, status: str) -> str:
+    """变更集 → focused 测试名正则（`|` 归并、去重、保序）；无匹配返回空串。"""
+    if status != "ok" or not changed_files:
+        return ""
+    parts: list[str] = []
+    for path in changed_files:
+        for prefix, regex in FOCUS_MAP:
+            if path.startswith(prefix):
+                parts.extend(regex.split("|"))
+                break  # 首个命中前缀即停（FOCUS_MAP 已按最具体到最泛排序）
+    return "|".join(dict.fromkeys(parts))
 
 
 def classify_changes(changed_files) -> str:
@@ -160,6 +230,7 @@ def main() -> int:
     emit("classifier_status", status if status == "ok" else "unknown")
     emit("classification", classification)
     emit("event_json", json.dumps(bounded_event(), ensure_ascii=False))
+    emit("focused", focused_regex(files, status))
     return 0
 
 

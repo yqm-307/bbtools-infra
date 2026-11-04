@@ -65,6 +65,20 @@ class ClassifyPathTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(changed_files.classify_path(path), "code")
 
+    def test_ci_gate_inputs_are_code_not_doc(self):
+        # scripts/ci/ 下的 .txt 门禁清单是测试选集输入，绝不允许落入 docs-only。
+        for path in ("scripts/ci/required_smoke.txt",
+                     "scripts/ci/required_rpc_http_net.txt",
+                     "scripts/ci/required_debug_legacy.txt",
+                     "scripts/ci/required_network_tests.txt",
+                     "scripts/ci/notes.txt"):
+            with self.subTest(path=path):
+                self.assertEqual(changed_files.classify_path(path), "code")
+        # 仅改 required_smoke.txt 的变更集必须是 code，不是 docs-only。
+        self.assertEqual(
+            changed_files.classify_changes(["scripts/ci/required_smoke.txt"]),
+            "code")
+
 
 class ClassifyChangesTests(unittest.TestCase):
     """变更集分类：docs-only | code | unknown。"""
@@ -184,6 +198,61 @@ class ChangedFilesRoutingTests(unittest.TestCase):
             self.assertEqual(values["classification"], "unknown")
 
 
+class FocusedRegexTests(unittest.TestCase):
+    """FOCUS_MAP：变更路径前缀 → ctest 测试名正则。"""
+
+    def test_module_paths_map_to_test_prefixes(self):
+        cases = {
+            "src/http/ClientImpl.cc": "^http\\.",
+            "src/tcp/CoTCPImpl.cc": "^tcp\\.|^transport\\.",
+            "src/udp/CoUDPImpl.cc": "^udp\\.|^transport\\.",
+            "src/transport/TransportRuntime.cc": "^transport\\.",
+            "src/config/Value.cc": "^config\\.",
+            "src/redis/Cli.cc": "^redis\\.",
+            "src/mongo/ClientImpl.cc": "^mongo\\.",
+            "bbt/infra/net/Engine.cc": "^net\\.",
+            "bbt/infra/http/Client.cc": "^http\\.net\\.",
+            "bbt/infra/rpc/Client.cc": "^rpc\\.",
+            "bbt/infra/rpc_tcp/Server.cc": "^rpc\\.tcp\\.",
+            "bbt/infra/redis/Cli.cc": "^redis\\.net\\.|^redis\\.",
+            "bbt/infra/mcp/Server.cc": "^mcp\\.",
+            "include/bbt/infra/config/Value.hpp": "^config\\.",
+            "include/bbt/infra/rpc/RpcPayload.hpp": "^rpc\\.",
+            "proto/bbt/infra/rpc/v1/x.proto": "^rpc\\.",
+            "tests/net/CMakeLists.txt": "^net\\.",
+            "tests/http_net/Test_x.cc": "^http\\.net\\.",
+            "tests/rpc_net/Test_x.cc": "^rpc\\.net\\.",
+            "tests/redis_net/Test_x.cc": "^redis\\.net\\.",
+            "tests/mcp/Test_x.cc": "^mcp\\.",
+            "tests/Test_http_loopback.cc": "^contract\\.",
+            "cmake/RpcNet.cmake": "^contract\\.",
+            "CMakeLists.txt": "^contract\\.",
+        }
+        for path, expected in cases.items():
+            with self.subTest(path=path):
+                self.assertEqual(
+                    changed_files.focused_regex([path], "ok"), expected)
+
+    def test_unmatched_and_non_ok_status_yield_empty(self):
+        self.assertEqual(changed_files.focused_regex(["docs/a.md"], "ok"), "")
+        self.assertEqual(changed_files.focused_regex(["README.md"], "ok"), "")
+        self.assertEqual(changed_files.focused_regex([], "ok"), "")
+        self.assertEqual(
+            changed_files.focused_regex(["src/http/x.cc"], "over-budget"), "")
+        self.assertEqual(
+            changed_files.focused_regex(["src/http/x.cc"], "unknown"), "")
+
+    def test_union_dedup_preserves_order(self):
+        out = changed_files.focused_regex(
+            ["src/tcp/a.cc", "src/udp/b.cc", "src/tcp/c.cc"], "ok")
+        parts = out.split("|")
+        self.assertEqual(len(parts), len(set(parts)))
+        self.assertIn("^tcp\\.", out)
+        self.assertIn("^udp\\.", out)
+        self.assertIn("^transport\\.", out)
+        self.assertLess(out.index("^tcp\\."), out.index("^udp\\."))
+
+
 class ResultContractTests(unittest.TestCase):
     """result.py：必跑集失败闭合、docs-only 放行 optional 跳过、防全跳过变绿。"""
 
@@ -201,6 +270,24 @@ class ResultContractTests(unittest.TestCase):
                          ["changes"], ["build", "test"], "docs-only")
         self.assertEqual(out["verdict"], "success")
         self.assertEqual(sorted(out["skipped"]), ["build", "test"])
+
+    def test_expected_skip_missing_result_key_is_failure(self):
+        # expected_skips 只放行显式 skipped；结果键缺失必须判失败。
+        out = result_mod.evaluate(
+            {"changes": "success", "docs-check": "success",
+             "build-and-gates": "success"},
+            ["changes", "docs-check"], ["build-and-gates", "live"],
+            "code", ["live"])
+        self.assertEqual(out["verdict"], "failure")
+        self.assertEqual(out["failed"], ["live"])
+        self.assertEqual(out["skipped"], [])
+
+    def test_docs_only_missing_result_key_is_failure(self):
+        # docs-only 同样不放行缺失键：optional skipped 显式才放行。
+        out = result_mod.evaluate(
+            {"changes": "success"}, ["changes"], ["build"], "docs-only")
+        self.assertEqual(out["verdict"], "failure")
+        self.assertEqual(out["failed"], ["build"])
 
     def test_code_optional_skipped_is_failure(self):
         out = self._eval({"changes": "success", "build": "skipped", "test": "success"},

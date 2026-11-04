@@ -8,13 +8,18 @@
 - `required` 集合必须非空（空即拒绝，防「全跳过变绿」）；
 - 任一 required 为 failure / cancelled / 空值 / skipped → verdict=failure；
 - results 出现 required∪optional 之外的 job 或非法状态值 → 拒绝；
-- optional 非 success 时：skipped/缺失仅当 allow_skip（docs-only）放行；
+- optional 非 success 时：显式 skipped 仅当 allow_skip（docs-only）或
+  列入 expected_skips 放行；结果键缺失一律判失败；
 - 无任何真实 success 不得判绿。
 
 输入（JSON，stdin 或 --file）：
   {"results": {"<job>": "success|failure|cancelled|skipped", ...},
    "required": ["<job>", ...],
    "optional": ["<job>", ...],           # 可省，默认 []
+   "expected_skips": ["<job>", ...],     # 可省，默认 []；optional 子集，
+                                        # 这些 job 的显式 skipped 属计划内放行
+                                        #（如普通 PR 不跑 live/extended 深度门禁）；
+                                        # 结果键缺失一律判失败，不放行
    "classification": "docs-only|code|unknown"}   # 可省，默认 "unknown"
 
 输出（stdout 一行 JSON；并写 $GITHUB_OUTPUT，若在环境提供）：
@@ -52,7 +57,8 @@ def _load(stream):
     return payload
 
 
-def evaluate(results, required, optional, classification) -> dict:
+def evaluate(results, required, optional, classification,
+             expected_skips=None) -> dict:
     """返回 {verdict, failed, ran, skipped}；任何必跑非 success 即 failure。"""
     if not isinstance(results, dict) or not results:
         raise ContractError("E_RESULT_EMPTY")
@@ -64,6 +70,9 @@ def evaluate(results, required, optional, classification) -> dict:
         raise ContractError("E_INPUT_TYPE")
     if set(required) & set(optional):
         raise ContractError("E_CHECK_OVERLAP")
+    expected = set(expected_skips or [])
+    if not expected <= set(optional):
+        raise ContractError("E_INPUT_TYPE")
 
     allowed = set(required) | set(optional)
     unknown = set(results) - allowed
@@ -79,15 +88,17 @@ def evaluate(results, required, optional, classification) -> dict:
         if results.get(job, "") != "success":
             failed.append(job)
     for job in optional:
-        status = results.get(job, "")
-        if status == "success":
-            continue
-        if status in ("skipped", ""):
-            if allow_skip:
-                continue
+        if job not in results:
+            # 缺失键一律失败：expected_skips/docs-only 只放行显式 skipped，
+            # 「没观察到结果」不得按计划跳过放行（缺失默认失败）。
             failed.append(job)
             continue
-        failed.append(job)  # failure / cancelled
+        status = results[job]
+        if status == "success":
+            continue
+        if status == "skipped" and (allow_skip or job in expected):
+            continue
+        failed.append(job)  # skipped（非计划）/ failure / cancelled
 
     # 防御性不变量：无任何真实 success 不得判绿（即使调用方构造空 required 计划）。
     if not failed and not any(results.get(j, "") == "success" for j in allowed):
@@ -97,7 +108,7 @@ def evaluate(results, required, optional, classification) -> dict:
         "verdict": "success" if not failed else "failure",
         "failed": failed,
         "ran": [j for j in allowed if results.get(j, "") in ("success", "failure")],
-        "skipped": [j for j in allowed if results.get(j, "") in ("skipped", "")],
+        "skipped": [j for j in allowed if results.get(j) == "skipped"],
     }
 
 
@@ -122,6 +133,7 @@ def main(argv=None) -> int:
             payload["required"],
             payload.get("optional", []),
             payload.get("classification", "unknown"),
+            payload.get("expected_skips", []),
         )
     except ContractError as err:
         print(json.dumps({"ok": False, "code": err.code}, ensure_ascii=False,

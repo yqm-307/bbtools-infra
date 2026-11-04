@@ -40,7 +40,7 @@ MONGO_LIVE = os.path.join(WORKTREE, "tests", "mongo-live", "run.sh")
 
 GATE_SCRIPTS = [
     "verify_coroutine_pin.sh", "prepare_deps.sh", "resolve_ccache.sh",
-    "run_ctest_label.sh", "release_gate.sh", "debug_gate.sh",
+    "run_ctest_label.sh", "run_test_profile.sh", "release_gate.sh", "debug_gate.sh",
     "live_redis_gate.sh", "live_mongo_gate.sh", "network_gate.sh",
     "redis_net_gate.sh",
 ]
@@ -235,6 +235,32 @@ class ChangedFilesRoutingTests(unittest.TestCase):
             self.assertEqual(values["classifier_status"], "unknown")
             self.assertEqual(values["classification"], "unknown")
 
+    def test_push_src_change_emits_focused_regex(self):
+        with tempfile.TemporaryDirectory() as repo:
+            _init_repo(repo)
+            first = _commit(repo, "src/http/ClientImpl.cc", "x", "base")
+            head = _commit(repo, "src/http/Session.cc", "y", "feat")
+            proc, values = _changed_files(
+                repo,
+                {"EVENT_NAME": "push", "BEFORE": first, "SHA": head},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(values["classification"], "code")
+            self.assertEqual(values["focused"], "^http\\.")
+
+    def test_docs_only_change_emits_empty_focused(self):
+        with tempfile.TemporaryDirectory() as repo:
+            _init_repo(repo)
+            first = _commit(repo, "src/x.cc", "x", "base")
+            head = _commit(repo, "docs/a.md", "d", "docs")
+            proc, values = _changed_files(
+                repo,
+                {"EVENT_NAME": "push", "BEFORE": first, "SHA": head},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(values["classification"], "docs-only")
+            self.assertEqual(values["focused"], "")
+
     def test_oversized_change_set_falls_back_to_empty(self):
         with tempfile.TemporaryDirectory() as repo:
             _init_repo(repo)
@@ -293,6 +319,50 @@ class ResultContractTests(unittest.TestCase):
         proc = self._ok({"changes": "success", "build": "skipped"},
                         ["changes"], ["build"], "code")
         self.assertEqual(proc.returncode, 1)
+
+    def test_expected_skips_allows_optional_skip(self):
+        proc = self._cli({
+            "results": {"changes": "success", "docs-check": "success",
+                        "build-and-gates": "success", "live": "skipped"},
+            "required": ["changes", "docs-check"],
+            "optional": ["build-and-gates", "live"],
+            "expected_skips": ["live"],
+            "classification": "code",
+        })
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_expected_skip_missing_result_key_fails(self):
+        # expected_skips 只放行显式 skipped：live 结果键整体缺失时，
+        # 「计划跳过」不得把未观察到的结果判成 success（fail-closed）。
+        proc = self._cli({
+            "results": {"changes": "success", "docs-check": "success",
+                        "build-and-gates": "success"},
+            "required": ["changes", "docs-check"],
+            "optional": ["build-and-gates", "live"],
+            "expected_skips": ["live"],
+            "classification": "code",
+        })
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["verdict"], "failure")
+        self.assertEqual(out["failed"], ["live"])
+
+    def test_expected_skips_rejects_non_optional_members(self):
+        proc = self._cli({
+            "results": {"changes": "success", "live": "skipped"},
+            "required": ["changes"], "optional": ["build"],
+            "expected_skips": ["live"], "classification": "code",
+        })
+        self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
+
+    def test_expected_skips_does_not_forgive_unlisted_optional(self):
+        proc = self._cli({
+            "results": {"changes": "success", "build": "skipped", "live": "skipped"},
+            "required": ["changes"], "optional": ["build", "live"],
+            "expected_skips": ["live"], "classification": "code",
+        })
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertEqual(json.loads(proc.stdout)["failed"], ["build"])
 
     def test_required_failure_is_failure(self):
         proc = self._ok({"changes": "failure", "build": "success"},
@@ -442,6 +512,115 @@ class NetworkReportTests(unittest.TestCase):
             ET.SubElement(report[0], tag)
             with self.assertRaises(ValueError):
                 self.check(self.registration, report)
+
+
+# --------------------------------------------------------------------------- #
+# smoke profile 选集钉定：required_smoke.txt 必须与 tests/CMakeLists.txt 中
+# LABELS 含 smoke 的 add_test 注册集完全一致（label 改动须同步清单，否则
+# release_gate.sh smoke 模式的 --require-file 选集校验会 FATAL）。
+# --------------------------------------------------------------------------- #
+class SmokeSelectionTests(unittest.TestCase):
+    REQUIRED_SMOKE = os.path.join(CI_DIR, "required_smoke.txt")
+    TESTS_CMAKE = os.path.join(WORKTREE, "tests", "CMakeLists.txt")
+
+    def _smoke_labeled(self):
+        text = raw(self.TESTS_CMAKE)
+        labeled = set()
+        for match in re.finditer(
+            r'add_test\(NAME\s+(\S+).*?set_tests_properties\(\1[^)]*'
+            r'LABELS\s+"([^"]*)"', text, re.S,
+        ):
+            name, labels = match.groups()
+            if "smoke" in labels.split(";"):
+                labeled.add(name)
+        return labeled
+
+    def _required(self):
+        return {line.strip() for line in raw(self.REQUIRED_SMOKE).splitlines()
+                if line.strip() and not line.lstrip().startswith("#")}
+
+    def test_required_smoke_matches_cmake_labels(self):
+        labeled = self._smoke_labeled()
+        required = self._required()
+        self.assertTrue(required, "required_smoke.txt 为空")
+        self.assertEqual(labeled, required,
+                         f"smoke label 集与必选清单不一致: {sorted(labeled ^ required)}")
+
+    def test_required_smoke_subset_of_unit_labels(self):
+        # smoke 是 unit 的选集子集（每项 smoke 必须同为 unit），防止打错 label 轴。
+        text = raw(self.TESTS_CMAKE)
+        for name in self._required():
+            match = re.search(
+                r'set_tests_properties\(' + re.escape(name) +
+                r'[^)]*LABELS\s+"([^"]*)"', text, re.S)
+            self.assertIsNotNone(match, f"{name} 未注册")
+            labels = match.group(1) if match else ""
+            self.assertIn("unit", labels.split(";"),
+                          f"{name} 缺 unit label")
+
+
+# --------------------------------------------------------------------------- #
+# workflow 编排契约：ci.yml 的 PR 路径不跑深度门禁/live，调度入口由
+# test-depth 显式打开（防止把深度门禁塞回默认路径的回归）。
+# --------------------------------------------------------------------------- #
+class WorkflowOrchestrationTests(unittest.TestCase):
+    WORKFLOW = os.path.join(WORKTREE, ".github", "workflows", "ci.yml")
+
+    def test_pr_path_runs_smoke_release_gate(self):
+        text = raw(self.WORKFLOW)
+        # PR 默认路径经 release_gate.sh 的 smoke 模式承载（run_test_profile.sh
+        # 由脚本内部调用，不直接出现在 workflow）。
+        self.assertIn("RELEASE_GATE_MODE", text)
+        self.assertIn("release_gate.sh", text)
+        self.assertIn("'smoke'", text)
+
+    def test_live_gated_to_dispatch_depth(self):
+        text = raw(self.WORKFLOW)
+        self.assertIn("test-depth", text)
+        self.assertIn("expected_skips", text)
+        # live job 必须带深度条件，PR 默认路径不跑（job if 不支持 env
+        # context，直接钉 inputs.test-depth 表达式）
+        self.assertRegex(
+            text,
+            r"(?s)live:\s*\n\s*needs:.*?github\.event_name == 'workflow_dispatch'"
+            r".*?inputs\.test-depth == 'full'")
+
+    def test_deep_gates_gated_to_extended_full(self):
+        text = raw(self.WORKFLOW)
+        for gate in ("debug_gate.sh", "network_gate.sh", "redis_net_gate.sh"):
+            self.assertIn(gate, text)
+        # 深度 step 的 if 条件必须指向 extended|full
+        self.assertIn("TEST_DEPTH == 'extended'", text)
+
+    def test_pr_path_appends_focused_run_when_mapped(self):
+        # 必要 focused 入口：changes 输出 focused 正则，build-and-gates 在同一
+        # 构建树按非空条件追加 run_test_profile.sh --profile focused。
+        text = raw(self.WORKFLOW)
+        self.assertIn("focused: ${{ steps.diff.outputs.focused }}", text)
+        self.assertIn("needs.changes.outputs.focused != ''", text)
+        self.assertIn("--profile focused", text)
+        self.assertIn("junit-focused.xml", text)
+
+    def test_required_gate_inputs_classified_code(self):
+        # F-02：仅改 scripts/ci/required_*.txt 不得落入 docs-only。
+        import changed_files
+        for name in ("required_smoke.txt", "required_rpc_http_net.txt",
+                     "required_debug_legacy.txt", "required_network_tests.txt"):
+            self.assertEqual(
+                changed_files.classify_path(f"scripts/ci/{name}"), "code")
+
+
+# --------------------------------------------------------------------------- #
+# run_test_profile.sh 契约：复用 test_test_profile.py 的假 ctest 桩测试类，
+# 保证 `python3 scripts/ci/tests/run_tests.py` 单入口覆盖 profile 选集、
+# 注册集=实跑集、零跳过判定。
+# --------------------------------------------------------------------------- #
+sys.path.insert(0, CI_DIR)
+import test_test_profile as _ttp  # noqa: E402
+
+TestProfileArgContractTests = _ttp.ArgContractTests
+TestProfileSelectionContractTests = _ttp.SelectionContractTests
+TestProfileContractEnforcementTests = _ttp.ContractEnforcementTests
 
 
 if __name__ == "__main__":
