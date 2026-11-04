@@ -84,13 +84,19 @@ cmake/                 CMake 模块
 
   | label | 用途 |
   |---|---|
-  | `smoke` | 构建后快速确认基本可用性的冒烟用例 |
+  | `smoke` | 构建后快速确认基本可用性的冒烟用例（PR 默认路径；每模块/每覆盖轴至少 1 项秒级代表用例，重项归 full） |
   | `unit` | 模块内单元行为与边界 |
   | `integration` | 多模块或真实组件协作，但不依赖线上外部服务 |
   | `live` | 需要外部服务/环境的真实集成用例 |
   | `perf` | 基准、性能回归或疲劳性能用例 |
 
-- 新测试须在对应 `CMakeLists.txt` 添加 target 并用 `add_test()` 注册到 CTest；核对构建开关、注册集合及 CI 执行路径。测试覆盖正常路径、竞争/并发、超时、重入、状态清理与错误边界等相关情形。
+  `unit`/`integration` 表达测试性质，`smoke`/`focused`/`full` profile 表达执行
+  策略，两层不混用：smoke 项必须同时带性质 label（本仓 smoke ⊆ unit）。
+  执行策略与 profile 触发矩阵见 `docs/guides/testing.md`。
+- 新测试须在对应 `CMakeLists.txt` 添加 target 并用 `add_test()` 注册到 CTest；
+  核对构建开关、注册集合、smoke 必选清单（`scripts/ci/required_smoke.txt`，
+  契约测试比对一致性）及 CI 执行路径。测试覆盖正常路径、竞争/并发、超时、
+  重入、状态清理与错误边界等相关情形。
 - 并发/生命周期用例先证明已进入目标阶段再制造故障或关闭，检查结果和资源收口；用同步原语（如 coroutine 的 `CountDownLatch`）建立时序，固定 `sleep`、用例名或通过数量不能替代阶段证据。fixture 只补时序控制，不能替代真实后端集成。RPC 会话的时序故障只经 `rpc::SessionHooks` 的固定动作制造：`Arm`/`Clear`/`Snapshot` 选择 `Pause` 或 `ThrowOnce`，严格路径不执行用户回调；不把 `HookSlot`、`std::function` 或 `before_*` 槽位当作公开契约。
 - 新增行为要有可运行验证；CI 全绿只证明实际执行范围，不能替代新路径验收。权限、环境或依赖不足时明确标为 `BLOCKED`，不以 stub、跳过断言或放宽检查伪装完成。三仓统一本地边界见 `agents-common.md`：冒烟、本次功能与直接耦合测试，本地不跑全量。
 - 测试优先使用自有进程与动态端口；共享服务须说明复用/互斥及清理边界，不终止他人进程、不覆盖共享前缀。无法隔离时先报告阻塞。
@@ -127,8 +133,16 @@ cmake/                 CMake 模块
 ## 10. CI 骨架
 
 - `changes` 在本仓 workflow 内完成路径分类；不引入共享 classify/result callee 链。
-- `build-test` 在 `ubuntu-24.04` 上执行 Release 构建及 `ctest -L "smoke|unit"`。
-- 仓库专属 job：coroutine 的 perf；infra 的 live（Redis/Mongo 分开成 job）；framework 的 consume 验证。
+- 普通 PR/push 收敛为一次 Release 构建 + `run_test_profile.sh --profile smoke`
+  全量 smoke 标签集（infra 经 `release_gate.sh RELEASE_GATE_MODE=smoke` 承载）
+  + 必要 focused：`changed_files.py` 把变更路径经仓内 `FOCUS_MAP`
+  （路径前缀 → 测试名正则）归并输出，非空时同一构建树追加一次
+  `--profile focused --regex <focused>`，无命中不追加；
+  全量 unit/integration/live/perf 移入手动/定时/发布深度入口
+  （infra 为 `workflow_dispatch test-depth`），PR 默认不跑且跳过在 result
+  `expected_skips` 显式声明（只放行显式 `skipped`，结果键缺失判失败）。
+- `build-test` 在 `ubuntu-24.04` 上执行 Release 构建及 smoke profile 选集。
+- 仓库专属 job：coroutine 的 perf；infra 的 live（Redis/Mongo，深度入口触发）；framework 的 consume 验证。
 - `result` 汇总并作为唯一 required check。docs-only PR 只运行 `docs-check`。
 - 普通 CI 固定使用 `ubuntu-24.04`，不使用浮动 `ubuntu-latest`；ARC 仅用于 perf 和 memcheck。
 - Workflow 只编排，执行逻辑放 `scripts/ci/`；单个 workflow 文件不超过 300 行。

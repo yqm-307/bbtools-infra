@@ -3,6 +3,15 @@
 # 等价现役 ci.yml release job 的各 step；假定 prepared deps 已解包、
 # 资源前缀 A/B 已由调用方跑过、ccache 开关已由 resolve_ccache.sh 解析。
 #
+# 模式（env RELEASE_GATE_MODE，默认 full）：
+#   full  —— 原有深度：全量 ctest + RPC/HTTP 契约 + HTTP-only + 符号 + ldd，
+#            供 workflow_dispatch build-mode=extended|full 与发布路径使用。
+#   smoke —— 同样的干净性预检 + Release 全量构建 + 注册断言，但 ctest 只跑
+#            `run_test_profile.sh --profile smoke`（-L smoke 选集，必选清单
+#            required_smoke.txt 钉死，注册≠实跑/skipped 一律 FATAL）；
+#            RPC/HTTP 契约、HTTP-only、符号断言、ldd 段整体跳过，归
+#            extended/full 入口。普通 PR 只走本模式。
+#
 # 输入（env）：
 #   REPO_DIR        infra 检出根（含 scripts/、tests/）
 #   WORKSPACE       工作区根（含 deps-bundle 解包产物 coroutine/ deps-prefix/ 等）
@@ -14,6 +23,7 @@
 #   CORE_DIR        bbtools-core 源码树
 #   JOBS            构建并行度
 #   LAUNCHER        ccache launcher（由 resolve_ccache.sh 解析后传入；空=不启用）
+#   RELEASE_GATE_MODE  smoke | full（默认 full）
 set -euo pipefail
 
 : "${REPO_DIR:?need REPO_DIR}" "${WORKSPACE:?need WORKSPACE}" \
@@ -22,6 +32,9 @@ set -euo pipefail
   "${COROUTINE_DIR:?need COROUTINE_DIR}" "${CORE_DIR:?need CORE_DIR}" \
   "${JOBS:?need JOBS}"
 LAUNCHER="${LAUNCHER:-}"
+RELEASE_GATE_MODE="${RELEASE_GATE_MODE:-full}"
+[ "$RELEASE_GATE_MODE" = "smoke" ] || [ "$RELEASE_GATE_MODE" = "full" ] \
+    || { echo "FAIL: 未知 RELEASE_GATE_MODE '$RELEASE_GATE_MODE'（smoke|full）" >&2; exit 2; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---- 干净性预检 ----
@@ -63,6 +76,19 @@ for t in redis.unit mongo.unit rpc.payload; do
         exit 1
     fi
 done
+# smoke 模式：注册断言通过后只跑 -L smoke 选集（必选清单钉死注册集，
+# 注册集=实跑集、skipped/failure/error 一律 FATAL），深度段归 extended/full。
+if [ "$RELEASE_GATE_MODE" = "smoke" ]; then
+    bash "$SCRIPT_DIR/run_test_profile.sh" \
+        --build-dir "$BUILD_DIR" \
+        --profile smoke \
+        --timeout 180 \
+        --junit "$BUILD_DIR/junit-smoke.xml" \
+        --require-file "$SCRIPT_DIR/required_smoke.txt"
+    echo "[release-gate] smoke 模式完成：RPC/HTTP 契约/HTTP-only/符号/ldd 段归 extended|full 入口"
+    exit 0
+fi
+
 # --timeout 只作用于无 TIMEOUT 属性的测试；http.loopback/http.lifecycle 的
 # TIMEOUT 60/120 测试属性优先级更高。保持 180：contract.basics 无实测耗时证据
 # 就收紧会造成门禁 flake。

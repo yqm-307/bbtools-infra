@@ -1,19 +1,23 @@
-# bbtools-infra 正式普通 CI（唯一权威普通入口）。骨架（方案 §2.7）：
-# changes → docs-check → build-and-gates（deps 前缀 + Release + debug/network/
-# redis-net 串行）→ live → result（唯一 required check）。分类与结果本仓内联
-# （changed_files.py/result.py），callee 链已删（D3）；编排归本文件、逻辑归
-# scripts/ci/，门禁逐项承载见 gate-inventory 不得放宽。required context
-# 为 `result`，保护切换见 out/in-p3b/protection-checklist.md。
+# bbtools-infra 正式普通 CI（唯一权威普通入口）。测试分层规范见
+# docs/guides/testing.md：普通 PR/push 恒走 smoke 深度 —— changes →
+# docs-check → build-and-gates（deps 前缀 + Release 构建 + smoke 选集
+# + focused 映射非空时追加一次 focused 实跑）→ result（唯一 required
+# check）。workflow_dispatch test-depth 打开深度入口（extended=Release
+# full + debug/network/redis-net；full=extended + live；live=仅 live）。
 name: CI
-
 on:
   pull_request: {branches: [main]}
   push: {branches: [main]}
   workflow_dispatch:
     inputs:
-      # 仅手动触发可切换；PR/push 忽略 inputs，恒走 clean 全量门禁路径。
+      # 仅手动触发可切换；PR/push 忽略 inputs，恒走 smoke 门禁路径。
+      test-depth:
+        description: "smoke（同 PR）/ extended（深度门禁无 live）/ full（+live）/ live（仅真实服务）"
+        type: choice
+        default: smoke
+        options: [smoke, extended, full, live]
       build-mode:
-        description: "构建模式（全部运行 ctest；不影响 required 门禁语义）"
+        description: "构建模式（不影响 required 门禁语义）"
         type: choice
         default: clean
         options: [clean, cache-bypass]
@@ -21,15 +25,12 @@ on:
         description: "启用本次 run 内 ccache（跨 run 缓存已阻塞）"
         type: boolean
         default: true
-
 # 顶层最小权限：仅 checkout 的 job 授予 contents: read；无写权限、无 secret、无 OIDC。
 permissions: {}
-
 concurrency:
-  # PR：github.ref → 只取消同一 PR 旧 run；main/手动：含 run_id → 逐提交独立。
+  # PR：github.ref → 只取消同 PR 旧 run；main/手动：含 run_id → 逐提交独立。
   group: CI-${{ github.event_name == 'pull_request' && github.ref || format('run-{0}', github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 env:
   BUILD_DIR: ${{ github.workspace }}/build
   COROUTINE_DIR: ${{ github.workspace }}/coroutine
@@ -37,23 +38,22 @@ env:
   DEPS_PREFIX: ${{ github.workspace }}/deps-prefix
   BOOST_PREFIX: ${{ github.workspace }}/boost-prefix
   PROTOBUF_PREFIX: ${{ github.workspace }}/protobuf-prefix
-  # 锁定 protobuf 3.21.12 配方：framework 固定 40hex SHA 脚本 + Git 对象实算 sha256。
+  # 锁定 protobuf 3.21.12：固定 40hex SHA 配方 + Git 对象实算 sha256。
   PROTOBUF_RECIPE_URL: https://raw.githubusercontent.com/yqm-307/bbt-framework/bd9c490541ccad10cf32e15b91bb40104aa86118/scripts/prepare_protobuf.sh
   PROTOBUF_RECIPE_SHA256: d10f129761576cce19283f05c8bd0ef9001cb79a1a83d57f02f00955fb6666af
   DEPS_BUNDLE_TAR: ${{ github.workspace }}/deps-bundle.tar
   DEPS_BUNDLE_META: ${{ github.workspace }}/deps-bundle.meta
   JOBS: 3  # hosted 4 vCPU：固定 3，与三仓统一并发口径一致，不按 nproc 抢占。
   CACHE_ENABLED: ${{ github.event_name == 'workflow_dispatch' && inputs.cache-enabled == false && 'false' || inputs.build-mode == 'cache-bypass' && 'false' || 'true' }}
-
+  TEST_DEPTH: ${{ github.event_name == 'workflow_dispatch' && inputs.test-depth || 'smoke' }}  # 非 dispatch 恒 smoke
 jobs:
-  # 变更集 + 分类；无法确定保守回退 unknown（执行全部）。
   changes:
-    name: "变更类型检测"
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {contents: read}
     outputs:
       classification: ${{ steps.diff.outputs.classification }}
+      focused: ${{ steps.diff.outputs.focused }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with: {fetch-depth: 0, persist-credentials: false}
@@ -75,7 +75,6 @@ jobs:
             || command -v clang-format-diff.py >/dev/null 2>&1 \
             || { echo "::warning::clang-format 工具不在 PATH，跳过"; exit 0; }
           bash scripts/ci/check_format_diff.sh "origin/${{ github.base_ref }}"
-
   # docs-check：链接/文件名/README 行数；恒跑。
   docs-check:
     runs-on: ubuntu-24.04
@@ -85,11 +84,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with: {fetch-depth: 1, persist-credentials: false}
       - run: python3 -I scripts/ci/check_docs.py --root . --readme-max 200
-
-  # 依赖准备 + Release + debug/network/redis-net 窄入口合并为一个 job（in-p3b
-  # repair：PR 可见 check 收敛到 ≤5）。deps 段产出 bundle 供本 job 与 live 双
-  # 锚定；gate 段顺序为 release → debug → network → redis-net（gate-inventory
-  # 逐项承载不变，串行执行不放宽任何门禁）。
+  # deps 前缀 + Release 构建 + 按 TEST_DEPTH 分层的测试门禁；深度矩阵见 ci.md §5。
   build-and-gates:
     needs: [changes]
     if: ${{ needs.changes.outputs.classification != 'docs-only' }}
@@ -104,7 +99,6 @@ jobs:
       REPO_DIR: ${{ github.workspace }}/infra
       WORKSPACE: ${{ github.workspace }}
     steps:
-      # ---- deps 段（原 deps job，job 内步骤直接产出无需下载） ----
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with: {path: infra, fetch-depth: 1, persist-credentials: false}
       - name: "读取 coroutine pin（cmake/coroutine.sha，fail-closed）"
@@ -148,7 +142,6 @@ jobs:
             ${{ env.DEPS_BUNDLE_META }}
           if-no-files-found: error
           retention-days: 1
-      # ---- Release 门禁（原 build-test job；bundle 已在 workspace 直接复用） ----
       - name: "资源前缀拒绝路径回归（A/B，早停）"
         run: bash infra/tests/resource-prefix/run.sh
       - name: "解析本次 run 内 ccache（跨 run 缓存已阻塞）"
@@ -158,26 +151,47 @@ jobs:
           HEAD_REPO: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || '' }}
           REPO: ${{ github.repository }}
         run: bash infra/scripts/ci/resolve_ccache.sh
-      - name: "Release 全量门禁（构建 + ctest + RPC/HTTP + 符号 + ldd）"
+      - name: "Release 构建 + smoke profile 选集实跑（注册集=实跑集零跳过）"
         timeout-minutes: 25
         env:
           LAUNCHER: ${{ steps.cache-meta.outputs.enabled == 'true' && '-DCMAKE_CXX_COMPILER_LAUNCHER=ccache' || '' }}
+          RELEASE_GATE_MODE: ${{ (env.TEST_DEPTH == 'extended' || env.TEST_DEPTH == 'full') && 'full' || 'smoke' }}
         run: bash infra/scripts/ci/release_gate.sh
-      # ---- 窄入口门禁（原 gates matrix 三项，改为本 job 串行 step，不展开 check） ----
+      - name: "必要 focused 实跑（映射命中时；同一构建树）"
+        if: ${{ needs.changes.outputs.focused != '' }}
+        timeout-minutes: 10
+        run: >
+          bash infra/scripts/ci/run_test_profile.sh --build-dir "$BUILD_DIR"
+          --profile focused --timeout 180 --junit "$BUILD_DIR/junit-focused.xml"
+          --regex "${{ needs.changes.outputs.focused }}"
+      - name: "smoke/focused junit artifact 恒上传（仅 smoke 深度）"
+        if: ${{ always() && env.TEST_DEPTH == 'smoke' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: smoke-test-results
+          path: |
+            ${{ github.workspace }}/build/junit-smoke.xml
+            ${{ github.workspace }}/build/junit-focused.xml
+            ${{ github.workspace }}/build/Testing/Temporary/LastTest.log
+          if-no-files-found: warn
+          retention-days: 7
+      # ---- 深度门禁（debug/network/redis-net）：仅 extended|full 深度执行 ----
       - name: "debug_gate 门禁（构建 + 注册集实跑零跳过）"
+        if: ${{ env.TEST_DEPTH == 'extended' || env.TEST_DEPTH == 'full' }}
         timeout-minutes: 25
         env:
           BUILD_DIR: ${{ github.workspace }}/build-debug_gate
           LAUNCHER: ${{ steps.cache-meta.outputs.enabled == 'true' && '-DCMAKE_CXX_COMPILER_LAUNCHER=ccache' || '' }}
         run: bash infra/scripts/ci/debug_gate.sh
       - name: "network_gate 门禁（构建 + 注册集实跑零跳过）"
+        if: ${{ env.TEST_DEPTH == 'extended' || env.TEST_DEPTH == 'full' }}
         timeout-minutes: 25
         env:
           BUILD_DIR: ${{ github.workspace }}/build-network_gate
           LAUNCHER: ${{ steps.cache-meta.outputs.enabled == 'true' && '-DCMAKE_CXX_COMPILER_LAUNCHER=ccache' || '' }}
         run: bash infra/scripts/ci/network_gate.sh
-      - name: "network-test-results artifact 恒上传"
-        if: ${{ always() }}
+      - name: "network-test-results artifact 恒上传（仅 extended|full）"
+        if: ${{ always() && (env.TEST_DEPTH == 'extended' || env.TEST_DEPTH == 'full') }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: network-test-results
@@ -188,13 +202,14 @@ jobs:
           if-no-files-found: error
           retention-days: 7
       - name: "redis_net_gate 门禁（构建 + 注册集实跑零跳过）"
+        if: ${{ env.TEST_DEPTH == 'extended' || env.TEST_DEPTH == 'full' }}
         timeout-minutes: 25
         env:
           BUILD_DIR: ${{ github.workspace }}/build-redis_net_gate
           LAUNCHER: ${{ steps.cache-meta.outputs.enabled == 'true' && '-DCMAKE_CXX_COMPILER_LAUNCHER=ccache' || '' }}
         run: bash infra/scripts/ci/redis_net_gate.sh
-      - name: "redis-net-test-results artifact 恒上传"
-        if: ${{ always() }}
+      - name: "redis-net-test-results artifact 恒上传（仅 extended|full）"
+        if: ${{ always() && (env.TEST_DEPTH == 'extended' || env.TEST_DEPTH == 'full') }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: redis-net-test-results
@@ -205,11 +220,13 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # 真实 Redis/Mongo live 门禁（独立 job：live 与构建失败分离；复用同 run
-  # prepared deps 只构建 live 三 target；step 上界 redis 19/mongo 16 > 脚本内界）。
-  # needs build-and-gates（上游 deps 段同一 job 产出 bundle 与 pin 三输出）。
+  # 真实 Redis/Mongo live 门禁（独立 job，复用同 run deps bundle）：仅 dispatch
+  # test-depth=full|live；PR/push 恒 skipped 并在 expected_skips 声明。
   live:
     needs: [changes, build-and-gates]
+    if: ${{ needs.changes.outputs.classification != 'docs-only' &&
+            github.event_name == 'workflow_dispatch' &&
+            (inputs.test-depth == 'full' || inputs.test-depth == 'live') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     permissions: {contents: read}
@@ -260,7 +277,6 @@ jobs:
           path: ${{ github.workspace }}/mongo-live-diagnostics
           if-no-files-found: warn
           retention-days: 7
-
   result:  # 唯一 required check：always 汇聚 needs.*.result → result.py
     needs: [changes, docs-check, build-and-gates, live]
     if: ${{ always() }}
@@ -271,11 +287,14 @@ jobs:
       RESULTS_JSON: ${{ format('{{"changes":"{0}","docs-check":"{1}","build-and-gates":"{2}","live":"{3}"}}', needs.changes.result, needs.docs-check.result, needs.build-and-gates.result, needs.live.result) }}
       # changes 失败时 outputs 为空，回退 unknown → 按「执行全部」判。
       CLASSIFICATION: ${{ needs.changes.outputs.classification || 'unknown' }}
+      # 计划内跳过：非 dispatch 与 smoke/extended 深度不跑 live（job 级 env
+      # 不支持 env context，直接引 inputs）；result.py 只放行显式 skipped。
+      EXPECTED_SKIPS_JSON: ${{ (github.event_name == 'workflow_dispatch' && (inputs.test-depth == 'full' || inputs.test-depth == 'live')) && '[]' || '["live"]' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with: {fetch-depth: 1, persist-credentials: false}
       - name: "汇聚 needs.*.result → verdict（fail-closed，非零即红）"
         run: |
           set -euo pipefail
-          printf '{"results":%s,"required":["changes","docs-check"],"optional":["build-and-gates","live"],"classification":"%s"}' \
-            "$RESULTS_JSON" "$CLASSIFICATION" | python3 scripts/ci/result.py --file -
+          printf '{"results":%s,"required":["changes","docs-check"],"optional":["build-and-gates","live"],"expected_skips":%s,"classification":"%s"}' \
+            "$RESULTS_JSON" "$EXPECTED_SKIPS_JSON" "$CLASSIFICATION" | python3 scripts/ci/result.py --file -

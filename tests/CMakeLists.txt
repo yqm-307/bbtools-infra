@@ -5,6 +5,11 @@
 #   label  smoke（快速冒烟）/ unit（模块内行为与边界）/
 #          integration（真实组件协作，无外部服务）/ live（外部服务）/ perf
 #
+# smoke 分配口径：每模块/每覆盖轴至少 1 项秒级-亚秒级代表用例（实测见
+# build-baseline CTestCostData；mongo.unit 129s、config.watch 等重项刻意
+# 不打 smoke，归 full/extended 路径）。PR CI 只跑 -L smoke 选集，缺 smoke
+# 的模块在 PR 层无保护，新增测试须同步决定 label。
+#
 # 非 Boost.Test 的 case-dispatch 形态（自建 main + RunTestProcessExit）与
 # tests/net 的 RunCases 约定一致，见 tests/README.md。
 
@@ -24,7 +29,7 @@ target_link_libraries(Test_tcp_loopback
     PRIVATE bbt::infra_tcp)
 target_compile_options(Test_tcp_loopback PRIVATE -Wall -Wextra)
 add_test(NAME tcp.loopback COMMAND Test_tcp_loopback)
-set_tests_properties(tcp.loopback PROPERTIES TIMEOUT 30 LABELS "unit")
+set_tests_properties(tcp.loopback PROPERTIES TIMEOUT 30 LABELS "smoke;unit")
 
 # CoTCP Runtime 托管工厂（co-io-adapter/v1 §4.0.1）：需要 bbt_infra_http
 # （NetworkRuntime 实现在 HTTP 切片内）。覆盖未 Start 拒绝、容量门禁
@@ -46,7 +51,7 @@ add_executable(Test_udp_loopback Test_udp_loopback.cc)
 target_link_libraries(Test_udp_loopback PRIVATE bbt::infra_udp)
 target_compile_options(Test_udp_loopback PRIVATE -Wall -Wextra)
 add_test(NAME udp.loopback COMMAND Test_udp_loopback)
-set_tests_properties(udp.loopback PROPERTIES TIMEOUT 30 LABELS "unit")
+set_tests_properties(udp.loopback PROPERTIES TIMEOUT 30 LABELS "smoke;unit")
 
 # --- P2 transport owner：transport-only 消费者（无 HTTP 依赖）----------------
 # 本目标只链接 bbt::infra_transport，源文件不包含任何 HTTP 头：它是「受管
@@ -62,7 +67,7 @@ target_link_libraries(Test_transport_runtime
     PRIVATE bbt::infra_transport Boost::boost Threads::Threads)
 target_compile_options(Test_transport_runtime PRIVATE -Wall -Wextra)
 add_test(NAME transport.runtime COMMAND Test_transport_runtime)
-set_tests_properties(transport.runtime PROPERTIES TIMEOUT 60 LABELS "unit")
+set_tests_properties(transport.runtime PROPERTIES TIMEOUT 60 LABELS "smoke;unit")
 
 # P2 依赖门禁：transport-only 消费者的接口闭包不得含 HTTP target。
 get_target_property(_bbt_tr_links Test_transport_runtime LINK_LIBRARIES)
@@ -85,7 +90,7 @@ if(BBT_INFRA_LEGACY_STACK AND (NOT BBT_INFRA_HTTP_NET OR BBT_INFRA_RPC_NET))
     target_link_libraries(Test_rpc_payload PRIVATE bbt::infra_common)
     target_compile_options(Test_rpc_payload PRIVATE -Wall -Wextra)
     add_test(NAME rpc.payload COMMAND Test_rpc_payload)
-    set_tests_properties(rpc.payload PROPERTIES TIMEOUT 60 LABELS "unit")
+    set_tests_properties(rpc.payload PROPERTIES TIMEOUT 60 LABELS "smoke;unit")
 endif()
 
 # 实测 detail::CoPollEvent 单事件上 FD readable + custom wakeup + timeout
@@ -95,7 +100,7 @@ add_executable(Test_iowait_combined_wait Test_iowait_combined_wait.cc)
 target_link_libraries(Test_iowait_combined_wait PRIVATE bbt::infra_common)
 target_compile_options(Test_iowait_combined_wait PRIVATE -Wall -Wextra)
 add_test(NAME iowait.combined_wait COMMAND Test_iowait_combined_wait)
-set_tests_properties(iowait.combined_wait PROPERTIES TIMEOUT 60 LABELS "unit")
+set_tests_properties(iowait.combined_wait PROPERTIES TIMEOUT 60 LABELS "smoke;unit")
 
 # --- Config 基础配置模块测试（Issue #35）--------------------------------------
 # unit：Value 类型化读取/指纹、内存源版本、文件源读取/更新/格式错误（无需调度器）。
@@ -127,7 +132,7 @@ target_link_libraries(Test_http_loopback
     PRIVATE bbt::infra_http Boost::boost Threads::Threads)
 target_compile_options(Test_http_loopback PRIVATE -Wall -Wextra)
 add_test(NAME http.loopback COMMAND Test_http_loopback)
-set_tests_properties(http.loopback PROPERTIES TIMEOUT 60 LABELS "unit")
+set_tests_properties(http.loopback PROPERTIES TIMEOUT 60 LABELS "smoke;unit")
 
 # N1b-2：关闭与终态交付语义（owner 主动同步 Close()；未发送请求丢弃；
 # 已发送请求在 Close 后立即终态；迟到响应只消费不再交付；每请求只交付一次
@@ -181,7 +186,7 @@ target_link_libraries(Test_http_session_lifetime
     PRIVATE bbt::infra_http Boost::boost Threads::Threads)
 target_compile_options(Test_http_session_lifetime PRIVATE -Wall -Wextra)
 add_test(NAME http.session_lifetime COMMAND Test_http_session_lifetime)
-set_tests_properties(http.session_lifetime PROPERTIES TIMEOUT 180 LABELS "unit")
+set_tests_properties(http.session_lifetime PROPERTIES TIMEOUT 180 LABELS "smoke;unit")
 
 # Issue #37：HTTP 出站连接/在途配额的原子接纳与物理归还。
 # 与 transport #32 不同入口：覆盖 HttpClientImpl::Request 的 owner
@@ -196,7 +201,7 @@ target_link_libraries(Test_http_outbound_quota
     PRIVATE bbt::infra_http Boost::boost Threads::Threads)
 target_compile_options(Test_http_outbound_quota PRIVATE -Wall -Wextra)
 add_test(NAME http.outbound_quota COMMAND Test_http_outbound_quota)
-set_tests_properties(http.outbound_quota PROPERTIES TIMEOUT 120 LABELS "unit")
+set_tests_properties(http.outbound_quota PROPERTIES TIMEOUT 120 LABELS "smoke;unit")
 
 # Issue #64：出站请求阶段与 OutcomeUnknown 分界的动态验收（S1–S8）。
 # 服务端「完整收到请求」标记 + 客户端 request_phase 交叉断言；未连接/写中断
@@ -222,7 +227,7 @@ target_link_libraries(Test_http_child_unregister
     PRIVATE bbt::infra_http Boost::boost Threads::Threads)
 target_compile_options(Test_http_child_unregister PRIVATE -Wall -Wextra)
 add_test(NAME http.child_unregister COMMAND Test_http_child_unregister)
-set_tests_properties(http.child_unregister PROPERTIES TIMEOUT 120 LABELS "unit")
+set_tests_properties(http.child_unregister PROPERTIES TIMEOUT 120 LABELS "smoke;unit")
 
 # Issue #55/#56/#57：失败路径物理收口、resolver 寿命边界、composed connect
 # 串行化。直接驱动 impl 层 ClientOp（注入配额钩子、io_fault/on_resolve/
@@ -247,7 +252,7 @@ if(TARGET bbt_infra_redis)
         bbt_infra_redis bbt::infra_common Boost::boost Threads::Threads)
     target_compile_options(Test_redis_unit PRIVATE -Wall -Wextra)
     add_test(NAME redis.unit COMMAND Test_redis_unit)
-    set_tests_properties(redis.unit PROPERTIES TIMEOUT 120 LABELS "unit")
+    set_tests_properties(redis.unit PROPERTIES TIMEOUT 120 LABELS "smoke;unit")
 
     # B 级 owner binding 候选隔离验收：直接驱动 src/redis 候选实现与
     # detail::TransportWiring 装配面探针（fd 读/原生 fd），故需要 src 内部头。
@@ -382,7 +387,7 @@ target_link_libraries(Test_transport_acceptance
             Boost::boost Threads::Threads)
 target_compile_options(Test_transport_acceptance PRIVATE -Wall -Wextra)
 add_test(NAME transport.acceptance COMMAND Test_transport_acceptance)
-set_tests_properties(transport.acceptance PROPERTIES TIMEOUT 120 LABELS "unit")
+set_tests_properties(transport.acceptance PROPERTIES TIMEOUT 120 LABELS "smoke;unit")
 
 # --- R1：NO_LOOP 自驱动边界 —— Close 唤醒在途受管 DialTCP 后，工厂必须在
 # 不依赖 Close 调用方继续驱动 poller 的情况下自行走到 EndFactory。本目标刻意
