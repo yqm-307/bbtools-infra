@@ -29,8 +29,22 @@ option(BBT_INFRA_HTTP_NET "构建基于 net 的 HTTP 客户端与服务端" ${_b
 option(BBT_INFRA_RPC_NET "构建消费新 HTTP 的 RPC core（wire + Client/Server）及其依赖闭包" OFF)
 option(BBT_INFRA_RPC_TCP "构建长度前缀 TCP 的 RPC adapter（bbt::infra_rpc_tcp）；依赖 net 基础，不需要第三方前缀" OFF)
 option(BBT_INFRA_MCP "构建 MCP server 核心与 stdio（bbt::infra_mcp_core / bbt::infra_mcp_stdio）；核心不需要第三方前缀" OFF)
+option(BBT_INFRA_CONSUL "构建 Consul agent HTTP adapter（bbt::infra_consul）；需 BBT_INFRA_HTTP_NET 同开" OFF)
 option(BBT_INFRA_MCP_HTTP "构建 MCP Streamable HTTP transport（bbt::infra_mcp_http）；需 BBT_INFRA_MCP 与 BBT_INFRA_HTTP_NET 同开" OFF)
 option(BBT_INFRA_MCP_SCHEMA "构建 MCP JSON Schema 校验器私有 adapter（需 BBT_JSONCONS_PREFIX 与 BBT_ICU_PREFIX）" OFF)
+
+# Consul adapter 开关门禁（fail-closed）：它消费新 HTTP Client，缺 HTTP 闭包时
+# 不能静默跳过；同时它的 Client.cc 以 boost/json/src.hpp 源码内联 Boost.JSON，
+# 与 MCP 的 JsonValue.cc 同开会重复定义，故两者同开直接拒绝，由消费者择一。
+if(BBT_INFRA_CONSUL AND NOT BBT_INFRA_HTTP_NET)
+    message(FATAL_ERROR
+        "BBT_INFRA_CONSUL=ON 需要 BBT_INFRA_HTTP_NET=ON；开关 fail-closed，不静默跳过。")
+endif()
+if(BBT_INFRA_CONSUL AND BBT_INFRA_MCP)
+    message(FATAL_ERROR
+        "BBT_INFRA_CONSUL 与 BBT_INFRA_MCP 同开会重复内联 Boost.JSON"
+        "（两个 TU 都包含 boost/json/src.hpp）；同一构建内请只开其一。")
+endif()
 
 option(BBT_INFRA_NET "构建 net 网络基础" ON)
 if(BBT_INFRA_NETWORK_ONLY)
@@ -157,6 +171,9 @@ if(BBT_INFRA_HTTP_NET)
 endif()
 if(BBT_INFRA_RPC_NET)
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/RpcNet.cmake")
+endif()
+if(BBT_INFRA_CONSUL)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/Consul.cmake")
 endif()
 if(BBT_INFRA_RPC_TCP)
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/RpcTcp.cmake")

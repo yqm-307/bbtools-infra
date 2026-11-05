@@ -10,6 +10,7 @@ C++17 基础接入层：TCP 网络执行域、HTTP、Redis、RPC、Mongo 与基�
 | HTTP Client / Server | `bbt::infra_http_net` | 唯一现役 HTTP 实现；连接池、HTTP/1.1、流式响应及服务端停止/排空；见 [HTTP 指南](docs/guides/http-net.md) |
 | Redis | `bbt::infra_redis_net` | 单连接与有界池，RESP2、KV/Hash、AUTH/SELECT；见 [Redis 指南](docs/guides/redis-net.md) |
 | RPC | `bbt::infra_rpc_net` | 消费 HTTP 与锁定 protobuf 3.21.12；见 [RPC 指南](docs/guides/rpc-net.md) |
+| Consul 注册发现 adapter | `bbt::infra_consul` | Consul agent HTTP API 的最小注册、注销与健康发现；复用 `bbt::infra_http_net`，无 Consul SDK；契约与真后端验证见 [Consul 指南](docs/guides/consul-registry.md) |
 | Mongo | `bbt::infra_mongo` | 保留 bounded worker bridge、BSON 与 owner/句柄；不依赖 TCP/HTTP adapter |
 | 动态配置 | `bbt::infra_config` | 内存源、本地文件源、watch；私有关闭支撑；见 [config 指南](docs/guides/config-watch.md) |
 | RPC over TCP / MCP | 按模块开关导出 | 可选模块，不属于默认构建；接口和依赖以各模块 CMake 为准 |
@@ -37,5 +38,6 @@ ctest --test-dir <build> -j1 -R '^example_http_net_consumer$' --output-on-failur
 - [测试策略](docs/guides/testing.md)与 [CI](docs/guides/ci.md)：PR smoke + 直接耦合 focused；真实 Redis/Mongo 由独占 live 环境执行，不以 skip 冒充通过。
 - [开发规范](docs/guides/development.md)、[代码约定](docs/conventions.md)、[Agent 规范](AGENTS.md)。
 - [网络执行域契约](docs/architecture/gnet-network-execution.md)与 [历史决策](docs/decisions/)；ADR 正文保留原决策，不代表旧 API 仍可消费。
+- [Consul 指南](docs/guides/consul-registry.md)：agent HTTP adapter 的契约、错误映射、关闭语义与真后端验证。
 
 本地使用 `flock /tmp/bbt-build.lock` 串行重任务、ccache、`--parallel 2`、`ctest -j1`；只跑冒烟、本次功能及直接耦合测试，完整回归由 CI 执行。跨仓消费者切换和独立审查须另有实测，不由本仓构建通过替代。
