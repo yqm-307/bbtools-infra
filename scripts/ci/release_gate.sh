@@ -53,7 +53,8 @@ rm -rf "$BUILD_DIR" && mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 cmake "$REPO_DIR" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
-    -DBUILD_TESTING=ON \
+    -DBUILD_TESTING=ON -DBBT_INFRA_HTTP_NET=ON -DBBT_INFRA_REDIS_NET=ON -DBBT_INFRA_RPC_NET=ON \
+    -DBBT_PROTOBUF_PREFIX="$PROTOBUF_PREFIX" \
     -DBOOST_ROOT="$BOOST_PREFIX" \
     -DCMAKE_PREFIX_PATH="$BOOST_PREFIX" \
     $LAUNCHER \
@@ -69,8 +70,8 @@ if [ -n "$LAUNCHER" ] && command -v ccache >/dev/null 2>&1; then
 fi
 
 # 单测注册断言：若模块 target 缺失（前缀未传递或 find_package 失败）导致
-# redis.unit/mongo.unit/rpc.payload 没注册，这里直接非零失败，不进入 ctest 漏判。
-for t in redis.unit mongo.unit rpc.payload; do
+# redis.net.fragmented_reply/mongo.unit/rpc.payload 没注册，这里直接非零失败，不进入 ctest 漏判。
+for t in redis.net.fragmented_reply mongo.unit rpc.payload; do
     if ! ctest -N -R "^${t}$" | grep -q "Test.*: ${t}$"; then
         echo "FAIL: '${t}' 未注册（依赖前缀/模块 target 缺失）"
         exit 1
@@ -92,7 +93,8 @@ fi
 # --timeout 只作用于无 TIMEOUT 属性的测试；http.loopback/http.lifecycle 的
 # TIMEOUT 60/120 测试属性优先级更高。保持 180：contract.basics 无实测耗时证据
 # 就收紧会造成门禁 flake。
-ctest -j1 --output-on-failure --timeout 180
+bash "$SCRIPT_DIR/run_test_profile.sh" --build-dir "$BUILD_DIR" --profile full --timeout 180
+bash "$REPO_DIR/tests/redis-live/run.sh" "$BUILD_DIR"
 
 # ---- 新 RPC/HTTP Release 编译与完整契约门禁 ----
 RPC_BUILD_DIR="${BUILD_DIR}-rpc-release"
@@ -155,8 +157,10 @@ grep -q '需要显式 BBT_PROTOBUF_PREFIX' "$REJECT_DIR/rejection.log"
 python3 - "$BUILD_DIR" <<'PY'
 import pathlib, subprocess, sys
 build = sys.argv[1]
-for module in ('http', 'redis', 'mongo'):
-    archive = pathlib.Path(build) / 'src' / f'libbbt_infra_{module}.a'
+for relative in ('bbt_infra_http_net/libbbt_infra_http_net.a',
+                 'bbt_infra_redis_net/libbbt_infra_redis_net.a',
+                 'bbt/infra/libbbt_infra_mongo.a'):
+    archive = pathlib.Path(build) / relative
     if not archive.exists():
         raise SystemExit(f'FAIL: 缺 Release 归档 {archive}')
     symbols = subprocess.check_output(['nm', '-C', str(archive)], text=True)
@@ -176,8 +180,8 @@ if [ -z "$(find . -name 'libbbt_core.so*' -print -quit)" ]; then
     echo "WARN: 未见 libbbt_core.so（coroutine 自闭环预期内）"
 fi
 echo "=== test 二进制 ldd（关键依赖）==="
-for bin in tests/Test_contract_basics tests/Test_http_loopback tests/Test_http_lifecycle \
-           tests/Test_redis_unit tests/Test_mongo_unit; do
+for bin in tests/Test_contract_basics bbt_infra_http_net/http_net_tests/Test_http_net_contract bbt_infra_http_net/http_net_tests/Test_http_net_server \
+           bbt_infra_redis_net/redis_net_tests/Test_redis_net_contract tests/Test_mongo_unit; do
     [ -x "$bin" ] || continue
     echo "--- $bin ---"
     ldd "$bin" | grep -E 'bbt|boost|libevent|hiredis|mongo|bson' || echo "(静态/无外部依赖)"

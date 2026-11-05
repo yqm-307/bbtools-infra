@@ -15,8 +15,7 @@
 // - 底层 datagram 原语不在暂缓范围，保持现状可用：NativeSocket 的 SocketType::Datagram、
 //   SendTo/ReceiveFrom、零长与 truncation，及其既有消费者（tests/net/net_foundation.cc、
 //   tests/net/net_stream.cc、examples/net_foundation_consumer）。
-//   「高层无 UDP 入口」不等于「UDP 整体未实现」：旧模块 bbt::infra_udp 的 CoUDP
-//   （include/bbt/infra/CoUDP.hpp）是独立已交付实现，不属本头范围。
+//   高层 UDP 尚未交付；底层 datagram 原语不构成高层连接 API。
 // - 将来实现高层 UDP 时：删除本拒绝，按 docs/decisions/0010-gnet-network-foundation.md
 //   的目标语义（报文边界、截断、零长、完成项与错误传递、Wake 与事件位、预算与背压、
 //   家族门）新增真实入口。

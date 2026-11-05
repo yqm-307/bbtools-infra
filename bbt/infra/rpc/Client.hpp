@@ -24,6 +24,8 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string_view>
 
 #include <bbt/coroutine/syntax/Async.hpp>
@@ -145,10 +147,21 @@ public:
                                            RpcEnvelope request,
                                            const CallOptions& options);
 
-    /// @brief 立即逻辑封口：转发给 adapter（幂等、不可重开）。
-    void Close() noexcept;
+    /// @brief 立即逻辑封口：发布首个关闭原因并转发 adapter/会话 owner
+    ///        （幂等、不可重开）。
+    void Close(Error reason = MakeError(
+                   ErrorCode::Closed, "rpc client: closed by owner")) noexcept;
     /// @brief 查询当前是否已 Close。
     bool IsClosed() const noexcept;
+    /// @brief Close 发布的原因；仅 Shutdown 封口时为空。
+    std::optional<Error> CloseReason() const noexcept;
+    /// @brief 封口并等待已接纳调用真实归还责任。
+    ///
+    /// v1 转 transport（HTTP adapter 排空底层池；未提供排空谓词的 adapter
+    /// 如实返回 UnsupportedRoute）；v2 会话 owner 用自身接纳/操作计数，不
+    /// 依赖连接物理 Released。有限期限超时 TimedOut 且保持封口；等待期间
+    /// 被 Close 打断返回其关闭原因。native 宿主专用。
+    result<void> Shutdown(bbt::coroutine::Deadline deadline);
 
 private:
     explicit Client(std::shared_ptr<IRpcTransport> transport) noexcept;
@@ -158,6 +171,8 @@ private:
     std::shared_ptr<IRpcTransport>     m_transport;
     std::shared_ptr<SessionOwnerState> m_owner;  // v2 会话 owner（与
                                                  // m_transport 互斥装配）
+    mutable std::mutex                 m_reason_mtx;
+    std::optional<Error>               m_close_reason;
 };
 
 } // namespace bbt::infra::rpc

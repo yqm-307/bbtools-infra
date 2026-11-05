@@ -10,7 +10,7 @@ target_compile_features(bbt_infra_net PUBLIC cxx_std_17)
 target_link_libraries(bbt_infra_net PUBLIC bbt_coroutine PRIVATE Boost::headers)
 target_compile_options(bbt_infra_net PRIVATE -Wall -Wextra -Wpedantic)
 
-# 白名单单头 C++17 自检；不引用旧 include/bbt/infra/。
+# 白名单单头 C++17 自检；只覆盖 net 公共头。
 # Options/LB 是值层公开头；Types/ReadAccess/Connection/RawHandler/CoConnection/
 # Error 是 R2 值类型、读取守卫、原始与 Co 薄封装公共头。detail/* 是内部部件
 # （含 NormalizeOptions、TestAccess、EngineTestAccess），不得仅因自检变成公开 API。

@@ -8,8 +8,8 @@
 
 | 目录 | 模块 | 构建开关 |
 |---|---|---|
-| `tests/` 平铺 `Test_*.cc` | 旧栈（http/tcp/udp/transport）+ config + redis/mongo 客户端 + rpc payload codec + 通用契约 | `BBT_INFRA_LEGACY_STACK` / `BBT_INFRA_CONFIG` / 模块 target 存在 |
-| `tests/net/` | 新 gnet 网络面 | `BBT_INFRA_NET`（`BBT_INFRA_NETWORK_ONLY` 时唯一注册集） |
+| `tests/` 平铺 `Test_*.cc` | config + Mongo 客户端 + rpc payload codec + 通用契约 | `BBT_INFRA_CONFIG` / Mongo 模块 target 存在 |
+| `tests/net/` | 新 gnet 网络面 | `BBT_INFRA_NET`（默认与严格闭包共用） |
 | `tests/http_net/` | 新 HTTP 协议面 | `BBT_INFRA_HTTP_NET` |
 | `tests/rpc_net/` | 新 RPC 协议面 | `BBT_INFRA_RPC_NET` |
 | `tests/redis_net/` | 新 Redis 协议面 | `BBT_INFRA_REDIS_NET` |

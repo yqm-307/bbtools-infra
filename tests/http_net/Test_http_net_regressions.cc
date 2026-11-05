@@ -2,6 +2,7 @@
 #include "TestSupport.hpp"
 #include "../net/ProcessRuntimeTestMain.hpp"
 #include <bbt/coroutine/detail/Coroutine.hpp>
+#include <limits>
 
 using namespace http_net_test;
 namespace http = bbt::infra::http;
@@ -156,6 +157,57 @@ void InputBoundary() {
     CHECK(f.GetPath());
     CHECK(f.client->Stats().active == 0 && f.client->Stats().idle == 1);
     CHECK(f.peer.accept_total() == 1 && f.peer.requests_total() == 2);
+    f.Finish();
+}
+
+void Quotas() {
+    Fixture f;
+    http::ClientOptions options;
+    options.base_url = f.peer.base_url();
+    options.max_request_body_bytes = 3;
+    auto bounded = http::Client::Create(f.host.engine, options);
+    CHECK(bounded);
+    auto prepared = bounded.value()->BuildRequest("POST", "/quota", {});
+    CHECK(prepared);
+    prepared.value().body = "1234";
+    auto rejected = f.host.Call([&] {
+        return bbt_co_await bounded.value()->Send(prepared.value(), Until());
+    });
+    ExpectCode(rejected, ErrorCode::InvalidArgument);
+    CHECK(f.peer.accept_total() == 0);
+    CHECK(bounded.value()->Stats().budget == 0);
+
+    options.max_request_body_bytes.reset();
+    options.max_header_bytes = 64;
+    auto header_bounded = http::Client::Create(f.host.engine, options);
+    CHECK(header_bounded);
+    f.peer.set_canned([](const HttpPeer::Recorded&) {
+        return std::string("HTTP/1.1 200 OK\r\nX-Large: ") + std::string(80, 'x') +
+               "\r\nContent-Length: 2\r\n\r\nok";
+    });
+    auto header_rejected = f.host.Call([&] {
+        return bbt_co_await header_bounded.value()->Get("/header-quota", {}, Until());
+    });
+    ExpectCode(header_rejected, ErrorCode::ProtocolError);
+    f.peer.set_canned([](const HttpPeer::Recorded&) {
+        return HttpPeer::HttpResponse(200, "OK", "ok");
+    });
+    auto healthy = f.host.Call([&] {
+        return bbt_co_await header_bounded.value()->Get("/after-header-quota", {}, Until());
+    });
+    CHECK(healthy && healthy.value().body == "ok");
+    CHECK(header_bounded.value()->Stats().active == 0);
+
+    http::ClientOptions invalid;
+    invalid.max_request_body_bytes = 0;
+    CHECK(!http::Client::Create(f.host.engine, invalid));
+    invalid.max_request_body_bytes.reset();
+    invalid.max_header_bytes = 0;
+    CHECK(!http::Client::Create(f.host.engine, invalid));
+    invalid.max_header_bytes = std::numeric_limits<std::uint64_t>::max();
+    CHECK(!http::Client::Create(f.host.engine, invalid));
+    bounded.value()->Close();
+    header_bounded.value()->Close();
     f.Finish();
 }
 
@@ -355,6 +407,7 @@ int Run(int argc, char** argv) {
         const std::string mode = argv[1];
         if (mode == "fragment_header" || mode == "fragment_body" || mode == "chunked" ||
             mode == "head_interim" || mode == "eof_truncated" || mode == "body_limit") { Protocol(mode); }
+        else if (mode == "quotas") { Quotas(); }
         else if (mode == "input_boundary") { InputBoundary(); }
         else if (mode == "preexpired_cancelled") { PreexpiredCancelled(); }
         else if (mode == "phase_timeouts") { PhaseTimeouts(); }

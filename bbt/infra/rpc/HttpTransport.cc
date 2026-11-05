@@ -218,6 +218,18 @@ void HttpRpcTransport::Close() noexcept {
     if (m_http) { m_http->Close(); }
 }
 
+void HttpRpcTransport::Close(Error reason) noexcept {
+    if (m_http) { m_http->Close(std::move(reason)); }
+}
+
+result<void> HttpRpcTransport::Shutdown(bbt::coroutine::Deadline deadline) {
+    if (!m_http) {
+        return result<void>::err(
+            MakeError(ErrorCode::Closed, "rpc http transport: closed"));
+    }
+    return m_http->Shutdown(deadline);
+}
+
 bool HttpRpcTransport::IsClosed() const noexcept {
     return !m_http || m_http->IsClosed();
 }
@@ -333,6 +345,21 @@ void HttpRpcInboundTransport::Close() noexcept {
     if (!m_state) { return; }
     m_state->closed.store(true);
     m_state->http->Close();
+}
+
+void HttpRpcInboundTransport::Close(Error reason) noexcept {
+    if (!m_state) { return; }
+    m_state->closed.store(true);
+    m_state->http->Close(std::move(reason));
+}
+
+result<void> HttpRpcInboundTransport::Shutdown(
+    bbt::coroutine::Deadline deadline) {
+    if (!m_state) {
+        return result<void>::err(
+            MakeError(ErrorCode::Closed, "rpc http inbound: closed"));
+    }
+    return m_state->http->Shutdown(deadline);
 }
 
 result<void> HttpRpcInboundTransport::WaitStopped(

@@ -8,17 +8,20 @@
  * 实现（architecture §5.2/§5.3）。RpcHandler 由上层提供，在受管协程中调用，
  * 生命周期由本 Server 强持有。HTTP adapter 见 bbt/infra/rpc/HttpTransport.hpp。
  *
- * 生命周期（v2 收敛为简单 Close）：Close(deadline) 立即逻辑封口（幂等、
- * 不可重开）并在 deadline 内等物理收口；IsClosed() 观测本 Server 已封口。
- * StopAccepting/Drain/WaitStopped 是可选的用户排序工具——由调用方按自己
- * 的顺序与预算调用，不是 infra 强制的多阶段协议；Close(deadline) 单次
- * 调用即完成 Seal+收口等待，业务任务的停止/等待由用户控制，infra 不新增
- * drain/receipt/多阶段关闭协议。
+ * 生命周期（v2 收敛为两个动作）：Close(reason) 立即逻辑封口（幂等、不可
+ * 重开）并发布关闭原因；Shutdown(deadline) 封口并等已接纳调用真实归还
+ * 责任，超时/等待中被 Close 且有在途如实返回，重复调用仍 Draining 且有
+ * 在途返回 Overloaded（Busy）。IsClosed() 观测本 Server 是否已
+ * Close（v2 路径仅反映 Close）。StopAccepting/Drain/WaitStopped 是可选的
+ * 用户排序工具——由调用方
+ * 按自己的顺序与预算调用，不是 infra 强制的多阶段协议；业务任务的停止/等待
+ * 由用户控制，infra 不新增 drain/receipt/多阶段关闭协议。
  */
 #pragma once
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 
 #include <bbt/coroutine/syntax/Async.hpp>
 #include <bbt/coroutine/object/CoObject.hpp>
@@ -93,18 +96,30 @@ public:
         ServerOptions options);
 
     /**
-     * @brief v2 收敛关闭（ADR §2.3）。
+     * @brief 立即逻辑封口并发布关闭原因（ADR §2.3）。
      *
-     * 立即逻辑封口（StopAccepting + admission 封口 + 入站 link RequestClose），
-     * 再在 deadline 内等待 listener、单 FIFO admission worker、已授权
-     * reply/lease 与物理连接收口。超时返回 TimedOut——IsClosed() 仍为 true，
-     * owner/Engine 责任保留，可用更晚 deadline 再次调用观察最终收口。
-     * 不强杀 handler，不关闭共享 Engine。
+     * 只封口：StopAccepting + admission 封口 + 入站 link RequestClose，
+     * 不等待任何 handler/reply/连接收口，不强杀 handler，不关闭共享
+     * Engine。首个原因固定，幂等不可重开。
+     */
+    void Close(Error reason = MakeError(
+                   ErrorCode::Closed, "rpc server: closed by owner")) noexcept;
+
+    /**
+     * @brief 封口并等待本 Server 承诺范围内的真实排空。
+     *
+     * 拒新后等 admission 队列、已授权 reply/lease 与写责任归零（v1 转
+     * inbound transport；v2 用同一排空谓词）。不等连接物理 Released。
+     * 有限期限超时返回 TimedOut 且保持封口；等待期间被 Close 打断返回其
+     * 关闭原因；先排空后 Close 返回 ok。
      *
      * @par 执行域约束
      * 由非协程宿主上下文调用；受管协程/Processer 域返回 InvalidContext。
      */
-    result<void> Close(bbt::coroutine::Deadline deadline);
+    result<void> Shutdown(bbt::coroutine::Deadline deadline);
+
+    /// @brief Close 发布的原因；仅 Shutdown 封口时为空。
+    std::optional<Error> CloseReason() const noexcept;
 
     /**
      * @brief v2 实际绑定地址（仅 v2 Start() 成功后有效）。
@@ -129,8 +144,6 @@ public:
     void StopAccepting() noexcept;
     /// @brief 等待 in-flight 请求排空（可选排序工具）。
     result<void> Drain(bbt::coroutine::Deadline deadline);
-    /// @brief 立即逻辑封口（v1 路径）：幂等、不可重开。
-    void Close() noexcept;
     /// @brief 等待 Server 完全收口（可选排序工具）。
     result<void> WaitStopped(bbt::coroutine::Deadline deadline);
     /// @brief 查询本 Server 是否已封口。

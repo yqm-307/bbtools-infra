@@ -238,15 +238,15 @@ class ChangedFilesRoutingTests(unittest.TestCase):
     def test_push_src_change_emits_focused_regex(self):
         with tempfile.TemporaryDirectory() as repo:
             _init_repo(repo)
-            first = _commit(repo, "src/http/ClientImpl.cc", "x", "base")
-            head = _commit(repo, "src/http/Session.cc", "y", "feat")
+            first = _commit(repo, "bbt/infra/http/Client.cc", "x", "base")
+            head = _commit(repo, "bbt/infra/http/Server.cc", "y", "feat")
             proc, values = _changed_files(
                 repo,
                 {"EVENT_NAME": "push", "BEFORE": first, "SHA": head},
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertEqual(values["classification"], "code")
-            self.assertEqual(values["focused"], "^http\\.")
+            self.assertEqual(values["focused"], "^http\\.net\\.|^rpc\\.net\\.|^mcp\\.http")
 
     def test_docs_only_change_emits_empty_focused(self):
         with tempfile.TemporaryDirectory() as repo:
@@ -523,17 +523,28 @@ class SmokeSelectionTests(unittest.TestCase):
     REQUIRED_SMOKE = os.path.join(CI_DIR, "required_smoke.txt")
     TESTS_CMAKE = os.path.join(WORKTREE, "tests", "CMakeLists.txt")
 
+    def _labels(self):
+        labels = {}
+        for module in ("", "net", "http_net", "redis_net"):
+            text = raw(os.path.join(WORKTREE, "tests", module, "CMakeLists.txt"))
+            # Expand the actual flat foreach case lists before parsing properties.
+            def expand(match):
+                variable, values, body = match.groups()
+                return "\n".join(body.replace("${" + variable + "}", value)
+                                 for value in values.split())
+            text = re.sub(r'foreach\((\w+)\s+([^)]*)\)(.*?)endforeach\(\)',
+                          expand, text, flags=re.S)
+            for match in re.finditer(
+                    r'set_tests_properties\((.*?)\s+PROPERTIES\s+([^)]*)\)', text, re.S):
+                names, properties = match.groups()
+                value = re.search(r'LABELS\s+"([^"]*)"', properties)
+                if value:
+                    for name in names.split():
+                        labels[name] = set(value.group(1).split(";"))
+        return labels
+
     def _smoke_labeled(self):
-        text = raw(self.TESTS_CMAKE)
-        labeled = set()
-        for match in re.finditer(
-            r'add_test\(NAME\s+(\S+).*?set_tests_properties\(\1[^)]*'
-            r'LABELS\s+"([^"]*)"', text, re.S,
-        ):
-            name, labels = match.groups()
-            if "smoke" in labels.split(";"):
-                labeled.add(name)
-        return labeled
+        return {name for name, labels in self._labels().items() if "smoke" in labels}
 
     def _required(self):
         return {line.strip() for line in raw(self.REQUIRED_SMOKE).splitlines()
@@ -548,15 +559,11 @@ class SmokeSelectionTests(unittest.TestCase):
 
     def test_required_smoke_subset_of_unit_labels(self):
         # smoke 是 unit 的选集子集（每项 smoke 必须同为 unit），防止打错 label 轴。
-        text = raw(self.TESTS_CMAKE)
+        labels = self._labels()
         for name in self._required():
-            match = re.search(
-                r'set_tests_properties\(' + re.escape(name) +
-                r'[^)]*LABELS\s+"([^"]*)"', text, re.S)
-            self.assertIsNotNone(match, f"{name} 未注册")
-            labels = match.group(1) if match else ""
-            self.assertIn("unit", labels.split(";"),
-                          f"{name} 缺 unit label")
+            self.assertIn(name, labels, f"{name} 未注册")
+            self.assertIn("unit", labels[name], f"{name} 缺 unit label")
+
 
 
 # --------------------------------------------------------------------------- #

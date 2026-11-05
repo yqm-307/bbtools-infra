@@ -20,8 +20,7 @@ add_library(bbt_infra_redis_net STATIC
 add_library(bbt::infra_redis_net ALIAS bbt_infra_redis_net)
 target_include_directories(bbt_infra_redis_net
     PUBLIC "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>"
-           # 公开头仍引用旧公开头树的 NetworkTypes/Result（include/bbt/infra/）。
-           "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
+
     PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_features(bbt_infra_redis_net PUBLIC cxx_std_17)
 # hiredis 是实现细节，不经公开头/安装接口传播。

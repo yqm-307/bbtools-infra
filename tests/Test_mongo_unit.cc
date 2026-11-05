@@ -32,7 +32,7 @@
 // 返回、IsClosed() 在 driver 返回后才成立。用例统一经 CloseClientDrained()
 // 在有界窗口内确认真实收口。
 //
-// 两个验证面（观测数据已迁入 src/debug/InfraDebug.hpp）：
+// 两个验证面（观测数据已迁入 bbt/infra/debug/InfraDebug.hpp）：
 // Debug 面（BBT_INFRA_STRINGENT_DEBUG=ON）— 追加 debug 观测断言：运行中
 // driver 调用计数/峰值（并发上限）、执行域取证（同一次调用
 // acquire/use/release 同 worker）、以及「逻辑返回≠物理收口」的在途计数；
@@ -72,13 +72,13 @@
 // impl 观测钩子分两类：
 // - 真实生产状态（Release 下同样可用）：LiveWorkersForTest /
 // QueuedOpsForTest（读 m_live_workers / m_queue）；
-// - debug 观测层（src/debug/InfraDebug.hpp，仅 BBT_INFRA_STRINGENT_DEBUG
+// - debug 观测层（bbt/infra/debug/InfraDebug.hpp，仅 BBT_INFRA_STRINGENT_DEBUG
 // 下存在）：RunningDriverCallsForTest / PeakDriverCallsForTest /
 // LastDriverThreadEvidenceForTest。
 // 各用例按「Debug 面（宏 ON，追加观测断言）/ Release 面（宏 OFF，退回真实
 // 状态与结果断言，不得恒过）」两面组织，见用例内 #ifdef。MongoRuntime 是
 // docs/decisions/0007-mongo-owner-handles.md 的资源 owner。
-#include "mongo/MongoRuntime.hpp"
+#include "bbt/infra/mongo/detail/MongoRuntime.hpp"
 
 // M4：直接经真实 driver 构造非法 URI，核对 ClassifyDriverError
 // 的输入错误分类（URI 解析离线完成，不需要服务端）。
@@ -1988,7 +1988,7 @@ BOOST_AUTO_TEST_CASE(t_pool_acquire_failure_gates_start) {
 BOOST_AUTO_TEST_SUITE_END()
 
 // ===================== mongo_bson：BSON 公共入口 =====================
-// 只经公开面（include/bbt/infra/mongo/Bson.hpp）验证构造/读取语义，不引入
+// 只经公开面（bbt/infra/mongo/Bson.hpp）验证构造/读取语义，不引入
 // bsoncxx 类型断言；JSON 形态断言用 canonical/relaxed 输出里的 Extended JSON
 // 标记（$numberInt/$numberLong/$numberDouble），不绑定空格排版。
 BOOST_AUTO_TEST_SUITE(mongo_bson)

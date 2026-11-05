@@ -3,7 +3,7 @@
  * @brief 版本化 Protobuf RpcEnvelope wire profile（RPC core，不依赖物理 transport 栈）。
  *
  * wire 单一真源仍是 proto/bbt/infra/rpc/v1/rpc_envelope.proto；字节规则、
- * 值类型校验、错误域映射与 metadata 约束自旧 include/bbt/infra/rpc/RpcWire.hpp
+ * 值类型校验、错误域映射与 metadata 约束自旧 bbt/infra/rpc/RpcWire.hpp
  * 原样保留（复用，不改 profile）。随 transport seam 切分（architecture §5）：
  *   * 本头只承载值类型 + protobuf 编解码 + RpcEnvelope seam 互转，不含任何
  *     HTTP/net 类型；HTTP body 绑定助手迁入 HTTP adapter

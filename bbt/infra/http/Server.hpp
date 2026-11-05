@@ -99,10 +99,20 @@ public:
     result<void> Start();
     // 同门封新 handler；已授权 handler 及回复可继续。idle/半包会话被关闭。
     void StopAccepting() noexcept;
+    // 单入口封口 + 排空：持久拒绝新任务，等已授权 handler 及其回复写终态。
+    // native 宿主专用；协程/Processer 域返回 InvalidContext。有限期限超时
+    // 返回 TimedOut 且保持封口；等待期间被 Close 打断返回其关闭原因；先排空
+    // 后 Close 返回 ok（成功不被追改）。
+    result<void> Shutdown(bbt::coroutine::Deadline deadline);
     // native 宿主专用：必须先 StopAccepting；协程/Processer 域返回 InvalidContext。
+    // 被 Close 唤醒时立即返回关闭原因，不再无限等 inflight。
     result<void> Drain(bbt::coroutine::Deadline deadline);
-    // 幂等强制逻辑封口自身连接，不关 Engine，不强杀 handler。
-    void Close() noexcept;
+    // 立即逻辑封口：强封自身连接、取消活动流源（恰好一次）、发布关闭原因；
+    // 不等待 handler、不关 Engine。首个原因固定，幂等不可重开。
+    void Close(Error reason = MakeError(
+                   ErrorCode::Closed, "http server: closed by owner")) noexcept;
+    // Close 发布的原因；仅 Shutdown 封口时为空。
+    std::optional<Error> CloseReason() const noexcept;
     // native 宿主专用：listener 停止、全部本 Server callback 已销毁、连接 Released。
     // 超时保留任务/共享状态责任，宿主必须继续驱动 runtime 和 Engine。
     result<void> WaitStopped(bbt::coroutine::Deadline deadline);

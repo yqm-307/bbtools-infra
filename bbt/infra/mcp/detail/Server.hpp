@@ -1,9 +1,9 @@
 #pragma once
 // MCP transport-independent 核心：生命周期 / 有界准入 / 注册快照 / 业务方法分派
-// （**内部实现面**，不导出给公共消费者；公共契约只有 include/bbt/infra/mcp/）。
+// （**内部实现面**，不导出给公共消费者；公共契约只有 bbt/infra/mcp/）。
 //
 // 组织（2-4 切片）：
-//   - 公共 `McpServer`（include/bbt/infra/mcp/McpServer.hpp）只持有 `Impl`；
+//   - 公共 `McpServer`（bbt/infra/mcp/McpServer.hpp）只持有 `Impl`；
 //     真正的生命周期/注册表/分派都在本头的 `McpServer::Impl` 里，避免公共头泄漏
 //     内部类型，也避免再造一层重复 core+wrapper。
 //   - `McpSession`：每 channel/stream 独立会话（legacy 握手状态 + 客户端 capabilities）。

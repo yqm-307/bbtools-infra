@@ -15,81 +15,48 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # 新模块开关不再是互斥分流：公共依赖（bbt_infra_common / bbt_infra_internal_debug /
 # coroutine 源码接入 + pin / AsyncMisuse / Threads）在 cmake/Common.cmake 统一定义，
 # 普通模式与 NETWORK_ONLY 共用同一套 target 与同一棵 pin 过的 coroutine 树。
-# 新协议模块公开头仍引用旧公开头树的 NetworkTypes/Result 等值层类型，common
+# 新协议模块共用 NetworkTypes/Result 等公共值类型，common
 # 属于公共面而非旧栈——因此「新 HTTP + common + config」可在同一
 # add_subdirectory 消费里链接，不再被开关互斥断开。
 option(BBT_INFRA_NETWORK_ONLY "只构建新 gnet 网络基础及其实际依赖闭包" OFF)
 option(BBT_INFRA_REDIS_NET "构建基于新 net 的 Redis 窄适配及其依赖闭包" OFF)
-option(BBT_INFRA_HTTP_NET "构建基于新 net 的 HTTP 客户端窄适配及其依赖闭包" OFF)
+if(BBT_INFRA_NETWORK_ONLY)
+    set(_bbt_http_default OFF)
+else()
+    set(_bbt_http_default ON)
+endif()
+option(BBT_INFRA_HTTP_NET "构建基于 net 的 HTTP 客户端与服务端" ${_bbt_http_default})
 option(BBT_INFRA_RPC_NET "构建消费新 HTTP 的 RPC core（wire + Client/Server）及其依赖闭包" OFF)
 option(BBT_INFRA_RPC_TCP "构建长度前缀 TCP 的 RPC adapter（bbt::infra_rpc_tcp）；依赖 net 基础，不需要第三方前缀" OFF)
 option(BBT_INFRA_MCP "构建 MCP server 核心与 stdio（bbt::infra_mcp_core / bbt::infra_mcp_stdio）；核心不需要第三方前缀" OFF)
 option(BBT_INFRA_MCP_HTTP "构建 MCP Streamable HTTP transport（bbt::infra_mcp_http）；需 BBT_INFRA_MCP 与 BBT_INFRA_HTTP_NET 同开" OFF)
 option(BBT_INFRA_MCP_SCHEMA "构建 MCP JSON Schema 校验器私有 adapter（需 BBT_JSONCONS_PREFIX 与 BBT_ICU_PREFIX）" OFF)
 
-# 旧栈/普通模式选择开关（P1-6）：声明并真实消费。OFF 的模块不接入 src/ 对应
-# 切片；默认 ON 保持既有「普通模式全量」语义。
-#
-# NETWORK_ONLY 冲突判定（P1-6）：先判「显式 -D 传入」再声明 option——
-# option() 之后开关一定已在 cache，「用户 -D=ON」与「option 默认 ON」在
-# 取值上不可区分。判据：cache 条目的 HELPSTRING 不等于本 option 的文档串
-# 即为外部显式设置（-D 不给条目写文档串；option() 会写入下方一致的串）。
-set(_bbt_doc_net          "构建新 gnet 网络基础（普通模式与 NETWORK_ONLY 共用真源）")
-set(_bbt_doc_config       "构建 config 动态配置模块（src/config）")
-set(_bbt_doc_mongo        "构建 Mongo 模块（需 BBT_MONGOCXX_PREFIX/BBT_MONGOC_PREFIX）")
-set(_bbt_doc_legacy       "构建旧 HTTP/TCP/UDP/transport 栈（src/{http,tcp,udp,transport}）")
+option(BBT_INFRA_NET "构建 net 网络基础" ON)
 if(BBT_INFRA_NETWORK_ONLY)
-    # BBT_INFRA_NET 不是冲突项：network-only 闭包本身就构建 net——
-    # 它属于「开启的正是本闭包内容」而非旧栈选择。
-    foreach(_pair IN ITEMS "BBT_INFRA_CONFIG|${_bbt_doc_config}"
-                           "BBT_INFRA_MONGO|${_bbt_doc_mongo}"
-                           "BBT_INFRA_LEGACY_STACK|${_bbt_doc_legacy}")
-        string(REGEX MATCH "^[^|]+" _conflicting "${_pair}")
-        string(REGEX MATCH "[^|]+$" _doc "${_pair}")
-        if(DEFINED CACHE{${_conflicting}} AND ${_conflicting})
-            get_property(_help CACHE ${_conflicting} PROPERTY HELPSTRING)
-            if(NOT _help STREQUAL _doc)
-                message(FATAL_ERROR
-                    "BBT_INFRA_NETWORK_ONLY=ON 与 ${_conflicting}=ON 冲突："
-                    "network-only 闭包不接入旧栈/旧模块。请显式 "
-                    "-D${_conflicting}=OFF 或移除该开关。")
-            endif()
-        endif()
-    endforeach()
+    set(_bbt_module_default OFF)
+else()
+    set(_bbt_module_default ON)
 endif()
-
-# 新协议开关（RPC_TCP / MCP*）尚未接入 NetworkOnly 闭包：显式拒绝，不静默忽略。
+option(BBT_INFRA_CONFIG "构建 config 动态配置模块" ${_bbt_module_default})
+option(BBT_INFRA_MONGO "构建 Mongo 模块（需显式 driver 前缀）" ${_bbt_module_default})
+if(BBT_INFRA_NETWORK_ONLY AND (BBT_INFRA_CONFIG OR BBT_INFRA_MONGO))
+    message(FATAL_ERROR "NETWORK_ONLY 与 CONFIG/MONGO=ON 冲突；请关闭非网络模块")
+endif()
 if(BBT_INFRA_NETWORK_ONLY AND (BBT_INFRA_RPC_TCP OR BBT_INFRA_MCP OR BBT_INFRA_MCP_HTTP OR BBT_INFRA_MCP_SCHEMA))
-    message(FATAL_ERROR
-        "BBT_INFRA_NETWORK_ONLY=ON 不接入 RPC TCP / MCP 开关（network-only 闭包只含已声明的 net 协议）；请关闭这些开关。")
+    message(FATAL_ERROR "NETWORK_ONLY 不接入 RPC TCP / MCP，请关闭这些开关")
 endif()
-
-option(BBT_INFRA_NET "${_bbt_doc_net}" ON)
-option(BBT_INFRA_CONFIG "${_bbt_doc_config}" ON)
-option(BBT_INFRA_MONGO "${_bbt_doc_mongo}" ON)
-option(BBT_INFRA_LEGACY_STACK "${_bbt_doc_legacy}" ON)
-
 include(cmake/Common.cmake)
 
-# NETWORK_ONLY=ON 走严格闭包：net + 显式打开的新协议模块，不接入旧 src/ 栈、
-# 不探测旧模块前缀（BBT_INFRA_REDIS_NET 等是「额外接入新协议」而非旧 Redis）。OFF
-# 时继续普通模式：旧栈全量 + 新协议开关按需叠加（各 *_NET 开关语义不变）。
+# 严格闭包仅接入 net 与显式选择的协议，不探测 config/Mongo。
 if(BBT_INFRA_NETWORK_ONLY)
     include(cmake/NetworkOnly.cmake)
     return()
 endif()
 
-# --- hiredis 依赖接入（Issue #6，Redis 模块）---------------------------------
-# 与 coroutine 同规约：仅允许经显式前缀接入，禁止把本机私有绝对路径
-# 写进默认值或任何提交内容。src/CMakeLists.txt 内 find_package 限定
-# NO_DEFAULT_PATH，杜绝误链系统位置 hiredis；未设置时跳过 Redis 模块。
-set(BBT_HIREDIS_PREFIX "" CACHE PATH
-    "hiredis 安装前缀（含 include/hiredis 与 lib/cmake/hiredis）")
-
-
 # --- mongo-cxx-driver 依赖接入（Issue #7，Mongo 模块）-----------------------
 # 与 coroutine 同规约：仅允许经显式前缀接入，禁止把本机私有绝对路径
-# 写进默认值或任何提交内容。src/CMakeLists.txt 内 find_package 限定
+# 写进默认值或任何提交内容。bbt/infra/CMakeLists.txt 内 find_package 限定
 # NO_DEFAULT_PATH，杜绝误链系统位置 mongocxx/libmongoc；mongocxx 的
 # package config 依赖 mongoc/bsoncxx 包，C driver 前缀经独立变量限定。
 # 未设置时跳过 Mongo 模块。
@@ -99,7 +66,7 @@ set(BBT_MONGOC_PREFIX "" CACHE PATH
     "mongo-c-driver 安装前缀（含 include/mongoc 与 lib/cmake/mongoc）；mongocxxConfig.cmake 内 find_dependency(mongoc) 需要")
 
 # find_package 放在顶层作用域：包导出的 mongo::mongocxx_shared 等
-# IMPORTED target 只有目录级可见性，src/ 与 tests/ 都需要引用。
+# IMPORTED target 只有目录级可见性，bbt/infra/ 与 tests/ 都需要引用。
 # mongocxxConfig.cmake 内 find_dependency(mongoc/bsoncxx) 的嵌套
 # find_package 经 <pkg>_DIR 钉到私有前缀唯一版本目录（NO_DEFAULT_PATH
 # 会传播给嵌套调用使 CMAKE_PREFIX_PATH 失效，故不用 CMAKE_PREFIX_PATH）。
@@ -172,17 +139,15 @@ if(BBT_INFRA_MONGO AND BBT_MONGOCXX_PREFIX)
         PATHS "${BBT_MONGOCXX_PREFIX}" NO_DEFAULT_PATH)
 endif()
 
-add_subdirectory(src)
+add_subdirectory(bbt/infra)
 
-# 新协议模块按开关叠加接入：BBT_INFRA_*_NET 不再触发互斥分流，普通模式下与
-# 旧栈/common/config 同图共存（各模块 cmake/*.cmake 只做模块接入与其私有
-# 前缀门禁，不重复公共依赖）。模块目录经 PROJECT_SOURCE_DIR 绝对路径接入。
-# BBT_INFRA_NET=ON 也要求 net 基础 target（P1-6：开关须真实消费）。
-# 先确定测试开关：模块内 tests/examples 子目录按 BUILD_TESTING 注册，
-# include(CTest) 必须先于模块接入（否则 BUILD_TESTING 未定义、测试被静默跳过）。
+# CTest 必须先于模块，保证模块测试实际注册。
 include(CTest)
 if(BBT_INFRA_NET OR BBT_INFRA_REDIS_NET OR BBT_INFRA_HTTP_NET OR BBT_INFRA_RPC_NET OR BBT_INFRA_RPC_TCP)
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/NetBase.cmake")
+    if(BUILD_TESTING)
+        add_subdirectory(tests/net)
+    endif()
 endif()
 if(BBT_INFRA_REDIS_NET)
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/RedisNet.cmake")
@@ -223,16 +188,9 @@ set(BBT_INFRA_PUBLIC_HEADERS
     ICoCloseable.hpp
     NetworkTypes.hpp
     Codec.hpp
-    HttpClient.hpp
-    HttpServer.hpp
-    NetworkRuntime.hpp
-    TransportRuntime.hpp
-    CoRedisCli.hpp
     CoMongoCli.hpp
     mongo/Bson.hpp
     mongo/Client.hpp
-    CoTCP.hpp
-    CoUDP.hpp
     config/Value.hpp
     config/Snapshot.hpp
     config/Source.hpp
@@ -252,7 +210,7 @@ foreach(_hdr IN LISTS BBT_INFRA_PUBLIC_HEADERS)
 endforeach()
 add_library(bbt_infra_header_selfcheck STATIC ${_selfcheck_srcs})
 target_link_libraries(bbt_infra_header_selfcheck PRIVATE bbt::infra_common)
-# A5 接缝头 NetError.hpp 跨 include/ 值层与 bbt/infra/net/ 原始错误码：
+# A5 接缝头 NetError.hpp 跨公共值层与 bbt/infra/net/ 原始错误码：
 # 自检只补编译期可见性（项目根 include 路径），不引入链接依赖。
 target_include_directories(bbt_infra_header_selfcheck PRIVATE
     "${PROJECT_SOURCE_DIR}")

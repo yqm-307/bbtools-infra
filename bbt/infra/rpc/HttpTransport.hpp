@@ -71,6 +71,10 @@ public:
                                              const CallOptions& options) override;
     // 立即逻辑封口：转发 http::Client（幂等、不可重开）。
     void Close() noexcept override;
+    // 关闭原因版本：原因发布到底座 HTTP 池。
+    void Close(Error reason) noexcept override;
+    // 封口 + 等底层池排空（native 宿主域；协程域由底座返回 InvalidContext）。
+    result<void> Shutdown(bbt::coroutine::Deadline deadline) override;
     bool IsClosed() const noexcept override;
 
 private:
@@ -96,6 +100,10 @@ public:
     void StopAccepting() noexcept override;
     result<void> Drain(bbt::coroutine::Deadline deadline) override;
     void Close() noexcept override;
+    // 关闭原因版本：原因发布到底座 http::Server。
+    void Close(Error reason) noexcept override;
+    // 单入口封口 + 排空，语义即 http::Server::Shutdown（native 宿主域）。
+    result<void> Shutdown(bbt::coroutine::Deadline deadline) override;
     result<void> WaitStopped(bbt::coroutine::Deadline deadline) override;
     bool IsClosed() const noexcept override;
 

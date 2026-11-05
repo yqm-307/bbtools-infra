@@ -243,6 +243,10 @@ struct Server::State : std::enable_shared_from_this<Server::State> {
     bool started{false};
     bool stopping{false};
     bool closing{false};
+    // Open → Draining → Closed：draining 只由 Shutdown 置位（StopAccepting
+    // 不算重复 Shutdown），Close 经 closing 表达；两位不共用。
+    bool draining{false};
+    std::optional<Error> close_reason;  // Close 发布；首个原因固定
     bool fail_next_task{false}; // 窄私有故障注入，不扩大公开 API
     std::size_t accepted{0}, requests{0}, inflight{0}, tasks{0};
     std::vector<std::shared_ptr<Session>> sessions;
@@ -298,12 +302,13 @@ struct Server::State : std::enable_shared_from_this<Server::State> {
         return registered;
     }
 
-    void Stop(bool force) {
+    void Stop(bool force, const Error* reason = nullptr) {
         std::vector<std::shared_ptr<ResponseBody>> sources;
         {
             std::lock_guard<std::mutex> lock(mutex);
             stopping = true;
             closing = closing || force;
+            if (reason && !close_reason) { close_reason = *reason; }
             for (const auto& session : sessions) {
                 if (closing || !session->authorized) { session->connection.RequestClose(); }
                 if (closing && session->source && !session->source_cancelled) {
@@ -660,17 +665,61 @@ result<void> Server::Start() {
 }
 
 void Server::StopAccepting() noexcept { m_state->Stop(false); }
-void Server::Close() noexcept { m_state->Stop(true); }
+void Server::Close(Error reason) noexcept {
+    auto state = m_state;
+    try {
+        state->Stop(true, &reason);
+    } catch (...) {
+        // noexcept 契约：closing/close_reason 已在 Stop 的锁内先行写定，
+        // 取消源时的分配失败不放大为 terminate。
+    }
+}
+
+std::optional<Error> Server::CloseReason() const noexcept {
+    auto state = m_state;
+    std::lock_guard<std::mutex> lock(state->mutex);
+    return state->close_reason;
+}
+
+result<void> Server::Shutdown(bbt::coroutine::Deadline deadline) {
+    if (!NativeHost()) { return Failure(ErrorCode::InvalidContext, "Shutdown requires native host"); }
+    auto state = m_state;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->close_reason) {
+            return result<void>::err(*state->close_reason);   // 已 Closed
+        }
+        if (state->draining) {
+            // 重复调用（已 Draining）：已排空按 ok，否则 Busy。
+            if (state->inflight == 0) { return result<void>::ok(); }
+            return Failure(ErrorCode::Overloaded, "shutdown already in progress");
+        }
+        state->draining = true;
+    }
+    state->Stop(false);   // 持久封口：拒新 + 停接纳；不发布关闭原因
+    std::unique_lock<std::mutex> lock(state->mutex);
+    const auto done = state->cv.wait_until(lock, deadline, [&] {
+        return state->inflight == 0 || state->close_reason.has_value();
+    });
+    // 先完成者胜：已排空即 ok（不被随后 Close 追改）；否则如实返回关闭原因。
+    if (state->inflight == 0) { return result<void>::ok(); }
+    if (state->close_reason) { return result<void>::err(*state->close_reason); }
+    (void)done;
+    return Failure(ErrorCode::TimedOut, "Shutdown deadline expired; server remains sealed");
+}
 
 result<void> Server::Drain(bbt::coroutine::Deadline deadline) {
     if (!NativeHost()) { return Failure(ErrorCode::InvalidContext, "Drain requires native host"); }
     auto state = m_state;
     std::unique_lock<std::mutex> lock(state->mutex);
     if (!state->stopping) { return Failure(ErrorCode::InvalidArgument, "StopAccepting before Drain"); }
-    if (!state->cv.wait_until(lock, deadline, [&] { return state->inflight == 0; })) {
-        return Failure(ErrorCode::TimedOut, "Drain deadline expired; handler/reply responsibility retained");
-    }
-    return result<void>::ok();
+    const auto done = state->cv.wait_until(lock, deadline, [&] {
+        return state->inflight == 0 || state->close_reason.has_value();
+    });
+    if (state->inflight == 0) { return result<void>::ok(); }
+    if (state->close_reason) { return result<void>::err(*state->close_reason); }
+    (void)done;
+    return Failure(ErrorCode::TimedOut, "Drain deadline expired; handler/reply responsibility retained");
 }
 
 result<void> Server::WaitStopped(bbt::coroutine::Deadline deadline) {

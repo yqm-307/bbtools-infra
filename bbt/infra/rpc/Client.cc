@@ -104,14 +104,40 @@ bbt_co_async(result<RpcEnvelope>) Client::Call(const RpcAddress& address,
     return FromWireEnvelope(reply);
 }
 
-void Client::Close() noexcept {
-    if (m_transport) { m_transport->Close(); }
-    if (m_owner) { detail::SessionOwnerSeal(m_owner); }
+void Client::Close(Error reason) noexcept {
+    try {
+        {
+            std::lock_guard<std::mutex> lock(m_reason_mtx);
+            if (!m_close_reason) { m_close_reason = reason; }
+        }
+        if (m_transport) { m_transport->Close(std::move(reason)); }
+        if (m_owner) { detail::SessionOwnerSeal(m_owner, std::move(reason)); }
+    } catch (...) {
+        // noexcept 契约：封口状态已在上面写定，原因复制失败不放大。
+    }
 }
 
 bool Client::IsClosed() const noexcept {
     if (m_owner) { return detail::SessionOwnerClosed(*m_owner); }
     return !m_transport || m_transport->IsClosed();
+}
+
+std::optional<Error> Client::CloseReason() const noexcept {
+    {
+        std::lock_guard<std::mutex> lock(m_reason_mtx);
+        if (m_close_reason) { return m_close_reason; }
+    }
+    if (m_owner) { return detail::SessionOwnerCloseReason(*m_owner); }
+    return std::nullopt;
+}
+
+result<void> Client::Shutdown(bbt::coroutine::Deadline deadline) {
+    if (m_owner) { return detail::SessionOwnerShutdown(m_owner, deadline); }
+    if (!m_transport) {
+        return result<void>::err(
+            MakeError(ErrorCode::Closed, "rpc client: closed"));
+    }
+    return m_transport->Shutdown(deadline);
 }
 
 } // namespace bbt::infra::rpc

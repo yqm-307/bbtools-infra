@@ -131,6 +131,7 @@ result<Http11Connection::ExchangeResult> Http11Connection::ReadResponse(
     for (unsigned interim = 0; interim <= 16; ++interim) {
         boost::beast::http::response_parser<boost::beast::http::string_body> parser;
         parser.body_limit(m_max_body_bytes);
+        if (m_max_header_bytes) { parser.header_limit(*m_max_header_bytes); }
         parser.eager(true);
         parser.skip(request.method == "HEAD");
         while (!parser.is_done()) {

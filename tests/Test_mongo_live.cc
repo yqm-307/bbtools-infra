@@ -67,9 +67,9 @@
 #include <bbt/infra/mongo/Client.hpp>
 
 // 用例需要真实生产状态观测（runtime 的 worker/执行槽计数、
-// MongoCollImpl::Runtime）——读取 src/mongo/ 内部头（仅本测试目标引入内部
+// MongoCollImpl::Runtime）——读取 bbt/infra/mongo/detail/ 内部头（仅本测试目标引入内部
 // include，不新增生产接缝，也不进入被测公共面）。
-#include "mongo/MongoRuntime.hpp"
+#include "bbt/infra/mongo/detail/MongoRuntime.hpp"
 
 using namespace bbt::infra;
 using bbt::coroutine::SCHE_START_OPT_SCHE_THREAD;
@@ -865,7 +865,7 @@ BOOST_AUTO_TEST_CASE(t_owner_multi_collection_live) {
 // 类型化 getter + ToJson（canonical）→ DeleteOne → 读回未命中。只用公开头
 // （<bbt/infra/mongo/Bson.hpp> / <bbt/infra/mongo/Client.hpp>）与公开 target，
 // 不引入 bsoncxx 类型；「只含公开头」的隔离编译证据由 mongo_client_example
-// 提供，本 TU 仍包含 src/mongo 内部头供其它用例使用。
+// 提供，本 TU 仍包含 bbt/infra/mongo/detail 内部头供其它用例使用。
 BOOST_AUTO_TEST_CASE(t_public_bson_api_live) {
     if (!LiveEnabled() || !PhaseIs('A')) {
         BOOST_TEST_MESSAGE("skip: 需要 BBT_TEST_MONGO_URI 且 PHASE=A");

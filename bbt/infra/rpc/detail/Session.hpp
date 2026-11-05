@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include <bbt/coroutine/sync/WaitTypes.hpp>
@@ -92,28 +93,56 @@ result<std::uint64_t> InboundHandshakeOnConnection(
     bbt::coroutine::Deadline deadline);
 
 /**
- * @brief v2 owner 逻辑封口：幂等、不可重开。
+ * @brief v2 owner 逻辑封口：幂等、不可重开，发布首个关闭原因。
  *
- * 立即拒绝新 Call/Send，对在途 link RequestClose，已提交但无可信终态的调用
- * 结算为 OutcomeUnknown。封口就是「在途任务不再可用」的边界：等待顺序与业务
- * 任务停止由用户控制，infra 不引入 drain/receipt/多阶段协议。
+ * 立即拒绝新 Call/Send，对在途 link RequestClose 并结算全部未终结调用
+ * （「失败在途」恰好一次，Draining 下同样执行，与 Shutdown 不共用位）；
+ * 已提交但无可信终态的调用结算为 OutcomeUnknown。不等待在途调用：
+ * 等待顺序与业务任务停止由用户控制。关闭原因不在内部出口附加，统一由
+ * Call/Send 的调用方可见返回点读取 owner 原因后附加到 Error.details。
  */
-void SessionOwnerSeal(const std::shared_ptr<SessionOwnerState>& owner) noexcept;
+void SessionOwnerSeal(const std::shared_ptr<SessionOwnerState>& owner,
+                      Error reason) noexcept;
 bool SessionOwnerClosed(const SessionOwnerState& owner) noexcept;
+std::optional<Error> SessionOwnerCloseReason(const SessionOwnerState& owner);
+
+/**
+ * @brief v2 owner 置 Draining（拒新）+ 等 active_ops 归零。
+ *
+ * 先与 Call/Send 的接纳同门拒新（置 draining、不占用 closed 位、不发布
+ * 关闭原因），再等已接纳调用全部归还责任；不要求连接物理 Released。
+ * 有限期限超时 TimedOut 且保持拒新；等待期间被 Close 且仍有在途返回其
+ * 关闭原因，已排空先胜返回 ok；重复调用仍 Draining 且有在途返回
+ * Overloaded（Busy）；已 Closed 返回首个关闭原因。
+ */
+result<void> SessionOwnerShutdown(
+    const std::shared_ptr<SessionOwnerState>& owner,
+    bbt::coroutine::Deadline deadline);
+
+// Call/Send 的接纳责任：与 Closed/Draining 同门（owner->mu）拒绝或计数；
+// 每个成功接纳必须恰好一次 EndOperation 归还。EndOperation 唤醒 Shutdown
+// 等待者。
+bool SessionOwnerBeginOperation(const std::shared_ptr<SessionOwnerState>& owner,
+                                Error& closed_error);
+void SessionOwnerEndOperation(
+    const std::shared_ptr<SessionOwnerState>& owner) noexcept;
 
 /**
  * @brief v2 Server 生命周期入口（实现唯一在 Session.cc）。
  *
- * Seal 是立即逻辑封口，不等待。Drain 等待 `DrainedLocked()` 的逻辑排空：
- * admission、队列和已登记 link 的写责任归零；WaitStopped 等待
- * `StoppedLocked()` 的物理收口：listener/accept task、握手、session 责任和
- * connection Released，并同时满足逻辑排空。两者不是同一收口谓词，Drain 成功
- * 不代表所有连接已经物理 Released。
+ * Seal 是立即逻辑封口并发布原因，不等待。Shutdown 封口后等
+ * `DrainedLocked()` 的逻辑排空：admission、队列和已登记 link 的写责任归零；
+ * WaitStopped 等待 `StoppedLocked()` 的物理收口：listener/accept task、握手、
+ * session 责任和 connection Released，并同时满足逻辑排空。两者不是同一收口
+ * 谓词，Shutdown 成功不代表所有连接已经物理 Released。
  */
-void ServerV2Seal(const std::shared_ptr<ServerV2State>& v2) noexcept;
+void ServerV2Seal(const std::shared_ptr<ServerV2State>& v2, Error reason) noexcept;
 bool ServerV2Closed(const ServerV2State& v2) noexcept;
+std::optional<Error> ServerV2CloseReason(const ServerV2State& v2);
 void ServerV2StopAccepting(const std::shared_ptr<ServerV2State>& v2) noexcept;
 result<void> ServerV2Start(const std::shared_ptr<ServerV2State>& v2);
+result<void> ServerV2Shutdown(const std::shared_ptr<ServerV2State>& v2,
+                              bbt::coroutine::Deadline deadline);
 result<void> ServerV2Drain(const std::shared_ptr<ServerV2State>& v2,
                            bbt::coroutine::Deadline deadline);
 result<void> ServerV2WaitStopped(const std::shared_ptr<ServerV2State>& v2,

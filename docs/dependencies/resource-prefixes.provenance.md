@@ -76,7 +76,7 @@ actions/cache 未命中 -> 运行 scripts/prepare_resource_deps.sh <prefix-root>
 
 ## 消费契约
 
-与 infra 根 `CMakeLists.txt`、`src/CMakeLists.txt` 一致，只允许经显式前缀接入：
+与 infra 根 `CMakeLists.txt`、`bbt/infra/CMakeLists.txt` 一致，只允许经显式前缀接入：
 
 ```text
 -DBBT_HIREDIS_PREFIX=<prefix-root>/hiredis

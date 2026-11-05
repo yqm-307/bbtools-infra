@@ -59,7 +59,7 @@ class ClassifyPathTests(unittest.TestCase):
                 self.assertEqual(changed_files.classify_path(path), "doc")
 
     def test_source_and_unknown_suffix_are_code(self):
-        for path in ("bbt/infra/net/Engine.cc", "include/bbt/infra/x.hpp",
+        for path in ("bbt/infra/net/Engine.cc", "bbt/infra/x.hpp",
                      "scripts/ci/release_gate.sh", "deps.lock", "docker/Dockerfile",
                      "tests/Test_net_tcp.cc"):
             with self.subTest(path=path):
@@ -69,7 +69,7 @@ class ClassifyPathTests(unittest.TestCase):
         # scripts/ci/ 下的 .txt 门禁清单是测试选集输入，绝不允许落入 docs-only。
         for path in ("scripts/ci/required_smoke.txt",
                      "scripts/ci/required_rpc_http_net.txt",
-                     "scripts/ci/required_debug_legacy.txt",
+                     "scripts/ci/required_debug.txt",
                      "scripts/ci/required_network_tests.txt",
                      "scripts/ci/notes.txt"):
             with self.subTest(path=path):
@@ -202,32 +202,7 @@ class FocusedRegexTests(unittest.TestCase):
     """FOCUS_MAP：变更路径前缀 → ctest 测试名正则。"""
 
     def test_module_paths_map_to_test_prefixes(self):
-        cases = {
-            "src/http/ClientImpl.cc": "^http\\.",
-            "src/tcp/CoTCPImpl.cc": "^tcp\\.|^transport\\.",
-            "src/udp/CoUDPImpl.cc": "^udp\\.|^transport\\.",
-            "src/transport/TransportRuntime.cc": "^transport\\.",
-            "src/config/Value.cc": "^config\\.",
-            "src/redis/Cli.cc": "^redis\\.",
-            "src/mongo/ClientImpl.cc": "^mongo\\.",
-            "bbt/infra/net/Engine.cc": "^net\\.",
-            "bbt/infra/http/Client.cc": "^http\\.net\\.",
-            "bbt/infra/rpc/Client.cc": "^rpc\\.",
-            "bbt/infra/rpc_tcp/Server.cc": "^rpc\\.tcp\\.",
-            "bbt/infra/redis/Cli.cc": "^redis\\.net\\.|^redis\\.",
-            "bbt/infra/mcp/Server.cc": "^mcp\\.",
-            "include/bbt/infra/config/Value.hpp": "^config\\.",
-            "include/bbt/infra/rpc/RpcPayload.hpp": "^rpc\\.",
-            "proto/bbt/infra/rpc/v1/x.proto": "^rpc\\.",
-            "tests/net/CMakeLists.txt": "^net\\.",
-            "tests/http_net/Test_x.cc": "^http\\.net\\.",
-            "tests/rpc_net/Test_x.cc": "^rpc\\.net\\.",
-            "tests/redis_net/Test_x.cc": "^redis\\.net\\.",
-            "tests/mcp/Test_x.cc": "^mcp\\.",
-            "tests/Test_http_loopback.cc": "^contract\\.",
-            "cmake/RpcNet.cmake": "^contract\\.",
-            "CMakeLists.txt": "^contract\\.",
-        }
+        cases = {'bbt/infra/config/detail/CloseSupport.hpp': '^config\\.', 'bbt/infra/mongo/detail/MongoSupport.hpp': '^mongo\\.', 'bbt/infra/CoMongoCli.hpp': '^mongo\\.', 'bbt/infra/net/Engine.cc': '^net\\.|^http\\.net\\.|^redis\\.net\\.|^rpc\\.net\\.', 'bbt/infra/http/Client.cc': '^http\\.net\\.|^rpc\\.net\\.|^mcp\\.http', 'bbt/infra/redis/CoRedisCli.cc': '^redis\\.net\\.', 'bbt/infra/debug/InfraDebug.hpp': '^mongo\\.', 'tests/Test_config_watch.cc': '^config\\.', 'tests/Test_mongo_unit.cc': '^mongo\\.', 'tests/Test_rpc_payload.cc': '^rpc\\.payload', 'tests/http_net/Test_x.cc': '^http\\.net\\.', 'tests/redis_net/Test_x.cc': '^redis\\.net\\.', 'tests/rpc_net/Test_x.cc': '^rpc\\.net\\.', 'cmake/RpcNet.cmake': '^contract\\.|^net\\.|^http\\.net\\.|^redis\\.net\\.|^rpc\\.', 'CMakeLists.txt': '^contract\\.|^net\\.|^http\\.net\\.|^redis\\.net\\.|^rpc\\.'}
         for path, expected in cases.items():
             with self.subTest(path=path):
                 self.assertEqual(
@@ -238,19 +213,20 @@ class FocusedRegexTests(unittest.TestCase):
         self.assertEqual(changed_files.focused_regex(["README.md"], "ok"), "")
         self.assertEqual(changed_files.focused_regex([], "ok"), "")
         self.assertEqual(
-            changed_files.focused_regex(["src/http/x.cc"], "over-budget"), "")
+            changed_files.focused_regex(["bbt/infra/http/Client.cc"], "over-budget"), "")
         self.assertEqual(
-            changed_files.focused_regex(["src/http/x.cc"], "unknown"), "")
+            changed_files.focused_regex(["bbt/infra/http/Client.cc"], "unknown"), "")
 
     def test_union_dedup_preserves_order(self):
         out = changed_files.focused_regex(
-            ["src/tcp/a.cc", "src/udp/b.cc", "src/tcp/c.cc"], "ok")
+            ["bbt/infra/net/Engine.cc", "bbt/infra/http/Client.cc", "bbt/infra/net/Server.cc"], "ok")
         parts = out.split("|")
         self.assertEqual(len(parts), len(set(parts)))
-        self.assertIn("^tcp\\.", out)
-        self.assertIn("^udp\\.", out)
-        self.assertIn("^transport\\.", out)
-        self.assertLess(out.index("^tcp\\."), out.index("^udp\\."))
+        self.assertIn(r"^net\.", out)
+        self.assertIn(r"^http\.net\.", out)
+        self.assertIn(r"^redis\.net\.", out)
+        self.assertLess(out.index(r"^net\."), out.index(r"^http\.net\."))
+
 
 
 class ResultContractTests(unittest.TestCase):

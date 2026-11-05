@@ -34,7 +34,7 @@
 - `bbt_core` 依赖已冻结不再新增（`BBT_CORE_SOURCE_DIR` 仅为过渡兼容开关）；细则见 `docs/conventions.md` 第三节。新增 Redis/Mongo 公共 API 固定 `bbt::infra::redis`、`bbt::infra::mongo`，配置为 `bbt::infra::config`。
 - adapter 边界：第三方类型、异常、线程模型不进入公共 API；adapter 负责 I/O、取消/关闭、错误映射与资源寿命，coroutine 只负责运行时等待/唤醒。等待结束、逻辑关闭与物理回收按各模块契约区分。
 - coroutine 消费 pin 在 `cmake/coroutine.sha`，由 `bbt_coroutine_pin_verify()` 核验；新协议闭包构建开关 `BBT_INFRA_HTTP_NET` / `BBT_INFRA_REDIS_NET` / `BBT_INFRA_RPC_NET`。
-- 公开头一般在 `include/`；新 net/Redis 模块例外，公开头与实现并置于 `bbt/infra/net/`、`bbt/infra/redis/`，由公开 target 导出仓根 include 路径。
+- 源码统一在 `bbt/infra/`；公共头与实现按模块并置，私有实现放模块 `detail/`，公开 target 导出仓根 include 路径。
 - 并发/生命周期测试先证明进入目标阶段，再触发故障/关闭并检查结果与资源收口；fixture 不替代真实后端集成。Redis/Mongo live 容器编排归 Release job，普通 PR 不跑。
 - 用户可直接与本仓 Agent 确认任务；跨仓契约与相关拥有者协调，不能代改其他仓。framework 外程序可直接消费本仓；经 framework 使用不得绕过其生命周期、配置或安全约束。
 - 旧仓（bbtools-http/rpc/network/conet）只作历史素材；归档、只读、删除、重命名或消费者切换须先确认，规则详见 development.md「旧仓迁移与支撑缺口」。

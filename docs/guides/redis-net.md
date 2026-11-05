@@ -1,10 +1,10 @@
 # Redis 的 net 窄入口（已合入，默认关闭）
 
-公共头 `<bbt/infra/redis/CoRedisCli.hpp>` 与 `<bbt/infra/redis/CoRedisPool.hpp>`，类型 `bbt::infra::redis::CoRedisCli` / `CoRedisPool`，CMake 目标 `bbt::infra_redis_net`。公共头与实现同目录置于 `bbt/infra/redis/`（对齐 `bbt/infra/net` 布局；include 路径与 namespace 不变），hiredis 编解码共享层在 `bbt/infra/redis/detail/`（新旧 Redis 实现共用，不公开）。等待入口用上游 PR #414 的 `bbt_co_async(result<...>)` 标记，调用方经 `bbt_co_await` 消费；await helper 的协程域前置检查先于函数体，非协程直调抛 `std::logic_error`。固定大小连接池 `CoRedisPool` 的语义见[池](#池-coredispool)一节。该独立入口经审查后由 [PR #95](https://github.com/yqm-307/bbtools-infra/pull/95) 合入，合并提交 `7401099b16741d67f88a64807dd086a3ea0996ae`；旧 `bbt::infra::CoRedisCli` / `bbt::infra_redis` 保留原契约。默认构建不启用新入口，framework 消费者尚未切换。
+公共头 `<bbt/infra/redis/CoRedisCli.hpp>` 与 `<bbt/infra/redis/CoRedisPool.hpp>`，类型 `bbt::infra::redis::CoRedisCli` / `CoRedisPool`，CMake 目标 `bbt::infra_redis_net`。公共头与实现同目录置于 `bbt/infra/redis/`（对齐 `bbt/infra/net` 布局；include 路径与 namespace 不变），hiredis 编解码共享层在 `bbt/infra/redis/detail/`（模块私有，不公开）。等待入口用上游 PR #414 的 `bbt_co_async(result<...>)` 标记，调用方经 `bbt_co_await` 消费；await helper 的协程域前置检查先于函数体，非协程直调抛 `std::logic_error`。固定大小连接池 `CoRedisPool` 的语义见[池](#池-coredispool)一节。该独立入口经审查后由 [PR #95](https://github.com/yqm-307/bbtools-infra/pull/95) 合入，合并提交 `7401099b16741d67f88a64807dd086a3ea0996ae`；旧 `bbt::infra::CoRedisCli` / `bbt::infra_redis` 保留原契约。默认构建不启用新入口，framework 消费者尚未切换。
 
 ## 构建和消费
 
-只需既有 Boost 1.90、固定 coroutine 源码和决策 0003 对应的 hiredis 私有前缀。`BBT_INFRA_REDIS_NET=ON` 选择新 net 与 Redis 的依赖闭包，不构建旧 HTTP/RPC/CoTCP。未提供 hiredis 前缀时明确配置失败，默认不开启这个目标。
+只需既有 Boost 1.90、固定 coroutine 源码和决策 0003 对应的 hiredis 私有前缀。`BBT_INFRA_REDIS_NET=ON` 选择新 net 与 Redis 的依赖闭包，不接入其它协议依赖；默认 HTTP 可经 `BBT_INFRA_HTTP_NET=OFF` 关闭。未提供 hiredis 前缀时明确配置失败，默认不开启这个目标。
 
 ```bash
 cmake -S . -B <private-build> \
@@ -23,7 +23,7 @@ ctest --test-dir <private-build> -j1 -R '^redis\.net\.' --output-on-failure
 target_link_libraries(my_app PRIVATE bbt::infra_redis_net)
 ```
 
-hiredis 仅用于实现的 RESP2 编码/reader 和共享的 `bbt/infra/redis/detail/RedisDetail`；公共头不含 hiredis 类型，亦不链接旧 CoTCP。实现放在编译单元中以隔离连接、锁和解析状态。
+hiredis 仅用于实现的 RESP2 编码/reader 和共享的 `bbt/infra/redis/detail/RedisDetail`；公共头不含 hiredis 类型。实现放在编译单元中以隔离连接、锁和解析状态。
 
 可运行示例是 [examples/redis_net/main.cc](../../examples/redis_net/main.cc)，执行 `ctest --test-dir <private-build> -R '^example_redis_net_consumer$' --output-on-failure`。运行前须提供允许写入测试 key 的自有 loopback Redis，通过 `BBT_REDIS_PORT` 注入端口（未设置默认 6379；设置值须为 1–65535 的十进制整数）；示例只写入强唯一 key，删除并用 EXISTS 读回确认。数据面新增的契约用例同样只认显式注入的 `BBT_REDIS_PORT`，缺失即拒跑（不回落 6379、不 skip），见[验证边界](#验证边界)。运行时只有一个 worker；Engine 的 Run 在自有 native 控制线程推进。
 

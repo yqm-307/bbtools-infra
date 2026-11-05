@@ -4,9 +4,11 @@
 #include <cctype>
 #include <charconv>
 #include <exception>
+#include <limits>
 #include <utility>
 
 #include <bbt/coroutine/coroutine.hpp>
+#include <bbt/coroutine/detail/Processer.hpp>
 
 #include <bbt/infra/http/detail/Http11.hpp>
 #include <bbt/infra/http/detail/Pool.hpp>
@@ -22,6 +24,13 @@ Error InvalidArgument(std::string message) {
 
 Error Unsupported(std::string message) {
     return MakeError(ErrorCode::UnsupportedRoute, "http client: " + std::move(message));
+}
+
+// 排空只能在 native 宿主域等待：受管协程/Processer 域挂起会占住调度资源
+// （与 Server::Drain 同口径）。
+bool NativeHost() {
+    return bbt::coroutine::GetLocalCoroutineId() == 0 &&
+           bbt::coroutine::detail::Processer::TryGetLocalProcesser() == nullptr;
 }
 
 bool EqualsNoCase(std::string_view left, std::string_view right) {
@@ -237,7 +246,7 @@ PhaseTimeout ResolvePhase(const PhaseTimeout& request_phase, const PhaseTimeout&
 struct Client::State {
     State(std::shared_ptr<net::Engine> engine_arg, ClientOptions options_arg)
         : engine(std::move(engine_arg)), options(std::move(options_arg)),
-          pool(engine, options.limits, options.max_body_bytes) {}
+          pool(engine, options.limits, options.max_body_bytes, options.max_header_bytes) {}
 
     const std::shared_ptr<net::Engine> engine;
     const ClientOptions options;
@@ -257,6 +266,19 @@ result<std::shared_ptr<Client>> Client::Create(std::shared_ptr<net::Engine> engi
     if (options.max_body_bytes == 0) {
         return result<std::shared_ptr<Client>>::err(
             InvalidArgument("max_body_bytes must be greater than zero"));
+    }
+    if (options.max_request_body_bytes && *options.max_request_body_bytes == 0) {
+        return result<std::shared_ptr<Client>>::err(
+            InvalidArgument("max_request_body_bytes must be greater than zero"));
+    }
+    if (options.max_header_bytes && *options.max_header_bytes == 0) {
+        return result<std::shared_ptr<Client>>::err(
+            InvalidArgument("max_header_bytes must be greater than zero"));
+    }
+    if (options.max_header_bytes &&
+        *options.max_header_bytes > std::numeric_limits<std::uint32_t>::max()) {
+        return result<std::shared_ptr<Client>>::err(
+            InvalidArgument("max_header_bytes exceeds HTTP parser limit"));
     }
     if (auto headers = ValidateHeaders(options.headers); !headers) {
         return result<std::shared_ptr<Client>>::err(std::move(headers.error()));
@@ -411,8 +433,23 @@ bbt_co_async(result<Response>) Client::Send(const PreparedRequest& request, cons
             MakeError(ErrorCode::InvalidContext, "http client: coroutine context required"));
     }
     if (state->pool.IsClosed()) {
+        if (const auto reason = state->pool.CloseReason()) {
+            return result<Response>::err(*reason);
+        }
         return result<Response>::err(MakeError(ErrorCode::Closed, "http client: closed"));
     }
+    // 封口引起的失败以关闭原因对外；已提交（请求可能已生效）的 OutcomeUnknown
+    // 事实不追改，只附加关闭原因供排障。
+    const auto fail = [&state](Error error) {
+        const auto reason = state->pool.CloseReason();
+        if (!reason) { return result<Response>::err(std::move(error)); }
+        if (error.request_phase &&
+            *error.request_phase == RequestPhase::RequestCommitted) {
+            error.details.emplace_back("close_reason", reason->message);
+            return result<Response>::err(std::move(error));
+        }
+        return result<Response>::err(*reason);
+    };
     try {
         auto valid = ValidatePrepared(request);
         if (!valid) { return result<Response>::err(std::move(valid.error())); }
@@ -423,10 +460,15 @@ bbt_co_async(result<Response>) Client::Send(const PreparedRequest& request, cons
         }
         auto serialized = detail::SerializeRequest(request);
         if (!serialized) { return result<Response>::err(std::move(serialized.error())); }
+        if (state->options.max_request_body_bytes &&
+            request.body.size() > *state->options.max_request_body_bytes) {
+            return result<Response>::err(InvalidArgument(
+                "request body exceeds max_request_body_bytes"));
+        }
         const auto deadlines = detail::ResolveDeadlines(request.timeout, call.deadline,
                                                         std::chrono::steady_clock::now());
         auto leased = bbt_co_await state->pool.Acquire(valid.value().origin, request.address, deadlines);
-        if (!leased) { return result<Response>::err(std::move(leased.error())); }
+        if (!leased) { return fail(std::move(leased.error())); }
         struct LeaseGuard {
             detail::ConnectionPool& pool;
             detail::ConnectionPool::Lease& lease;
@@ -434,7 +476,7 @@ bbt_co_async(result<Response>) Client::Send(const PreparedRequest& request, cons
             ~LeaseGuard() { if (!returned) { pool.Retire(lease); } }
         } guard{state->pool, leased.value()};
         auto exchanged = bbt_co_await leased.value().connection->Exchange(request, serialized.value(), deadlines);
-        if (!exchanged) { return result<Response>::err(std::move(exchanged.error())); }
+        if (!exchanged) { return fail(std::move(exchanged.error())); }
         state->pool.Release(leased.value(), exchanged.value().keep_alive);
         guard.returned = true;
         return result<Response>::ok(std::move(exchanged.value().response));
@@ -444,14 +486,36 @@ bbt_co_async(result<Response>) Client::Send(const PreparedRequest& request, cons
     }
 }
 
-void Client::Close() noexcept {
+void Client::Close(Error reason) noexcept {
     const auto state = m_state;
-    if (state) { state->pool.Close(); }
+    if (!state) { return; }
+    try {
+        state->pool.Close(std::move(reason));
+    } catch (...) {
+        // noexcept 契约：封口本身已生效（布尔位先写），原因复制失败不放大。
+    }
 }
 
 bool Client::IsClosed() const noexcept {
     const auto state = m_state;
     return state && state->pool.IsClosed();
+}
+
+std::optional<Error> Client::CloseReason() const noexcept {
+    const auto state = m_state;
+    return state ? state->pool.CloseReason() : std::nullopt;
+}
+
+result<void> Client::Shutdown(bbt::coroutine::Deadline deadline) {
+    if (!NativeHost()) {
+        return result<void>::err(MakeError(
+            ErrorCode::InvalidContext, "http client: Shutdown requires native host"));
+    }
+    const auto state = m_state;
+    if (!state) {
+        return result<void>::err(MakeError(ErrorCode::Closed, "http client: closed"));
+    }
+    return state->pool.Shutdown(deadline);
 }
 
 PoolStats Client::Stats() const noexcept {

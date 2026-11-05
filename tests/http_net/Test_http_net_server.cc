@@ -42,9 +42,12 @@ struct ServerHost {
     }
     std::string Url() const { return "http://127.0.0.1:" + std::to_string(address.Port()); }
     void Finish() {
-        server->StopAccepting();
-        CHECK(server->Drain(std::chrono::steady_clock::now() + 3s));
-        server->Close();
+        // 已 Close 时 Drain 会如实返回关闭原因，不能再当收口前奏；直接用
+        // Shutdown（未 Close 时）→ Close → WaitStopped 的收口序列。
+        if (!server->CloseReason().has_value()) {
+            CHECK(server->Shutdown(std::chrono::steady_clock::now() + 3s));
+            server->Close();
+        }
         CHECK(server->WaitStopped(std::chrono::steady_clock::now() + 3s));
         auto stats = server->Stats();
         CHECK(stats.tasks == 0 && stats.sessions == 0 && stats.inflight == 0);
@@ -234,10 +237,97 @@ void CloseTimeout() {
     CHECK(WaitUntil([&] { return gate.entered.load(); }));
     host.server->Close();
     host.server->Close();
-    ExpectCode(host.server->Drain(std::chrono::steady_clock::now() + 20ms), ErrorCode::TimedOut);
+    // Close 唤醒已登记的 Drain 等待：立即返回关闭原因，不再按 inflight 无限等。
+    auto drained = host.server->Drain(std::chrono::steady_clock::now() + 20ms);
+    CHECK(!drained && drained.error().code == ErrorCode::Closed);
+    auto reason = host.server->CloseReason();
+    CHECK(reason.has_value() && reason->code == ErrorCode::Closed);
     ExpectCode(host.server->WaitStopped(std::chrono::steady_clock::now() + 20ms), ErrorCode::TimedOut);
     CHECK(host.server->Stats().inflight == 1 && host.server->Stats().tasks >= 1);
     CHECK(peer.Eof());
+    gate.Release();
+    host.Finish();
+}
+
+// Shutdown：封口 + 等已授权 handler/reply 真实排空。有限预算内 inflight>0
+// 诚实 TimedOut 且保持封口（不隐式转 Close、不发布关闭原因）；handler 放行后
+// 再等待即成功。
+void ShutdownDrain() {
+    Gate gate;
+    ServerHost host([&](IncomingCallContext, http::IncomingRequest) {
+        gate.Pause();
+        return result<http::Response>::ok({200, {}, "drained"});
+    });
+    Peer peer(host.address);
+    peer.Send("GET /drain HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    CHECK(WaitUntil([&] { return gate.entered.load(); }));
+    CHECK(host.server->Stats().inflight == 1);
+
+    ExpectCode(host.server->Shutdown(std::chrono::steady_clock::now() + 50ms), ErrorCode::TimedOut);
+    CHECK(!host.server->CloseReason().has_value());
+
+    gate.Release();
+    CHECK(peer.Read().body == "drained");
+    CHECK(peer.Eof());
+    CHECK(host.server->Shutdown(std::chrono::steady_clock::now() + 2s));
+    host.server->Close(MakeError(ErrorCode::Unavailable, "owner shutdown complete"));
+    auto reason = host.server->CloseReason();
+    CHECK(reason.has_value() && reason->code == ErrorCode::Unavailable);
+    host.Finish();
+}
+
+// Shutdown 超时后仍拒新：同连接后续请求不再授权，且服务保持封口直到显式 Close。
+void ShutdownTimeout() {
+    Gate gate;
+    std::atomic<unsigned> calls{0};
+    ServerHost host([&](IncomingCallContext, http::IncomingRequest) {
+        ++calls;
+        gate.Pause();
+        return result<http::Response>::ok({200, {}, "late"});
+    });
+    Peer peer(host.address);
+    peer.Send("GET /first HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    CHECK(WaitUntil([&] { return gate.entered.load(); }));
+    ExpectCode(host.server->Shutdown(std::chrono::steady_clock::now() + 50ms), ErrorCode::TimedOut);
+    CHECK(!host.server->CloseReason().has_value());
+    CHECK(calls == 1);
+    gate.Release();
+    CHECK(peer.Read().body == "late");
+    CHECK(peer.Eof());   // 封口后回复 keep_alive=false
+    host.Finish();
+}
+
+// Close 打断正在等待的 Shutdown：以「Shutdown 返回时 handler 仍在 inflight」
+// 证明等待被打断，并返回真实（自定义）关闭原因。
+void ShutdownInterruptedByClose() {
+    Gate gate;
+    ServerHost host([&](IncomingCallContext, http::IncomingRequest) {
+        gate.Pause();
+        return result<http::Response>::ok({200, {}, "must-not-write"});
+    });
+    Peer peer(host.address);
+    peer.Send("GET /hold HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    CHECK(WaitUntil([&] { return gate.entered.load(); }));
+
+    std::optional<result<void>> shutdown_result;
+    std::thread waiter([&] {
+        shutdown_result.emplace(host.server->Shutdown(bbt::coroutine::Deadline::max()));
+    });
+    // 屏障：Shutdown 已封口（Drain 的不再是「未 StopAccepting」InvalidArgument）。
+    CHECK(WaitUntil([&] {
+        auto r = host.server->Drain(std::chrono::steady_clock::now());
+        return !r && r.error().code != ErrorCode::InvalidArgument;
+    }));
+    host.server->Close(MakeError(ErrorCode::Unavailable, "owner abort"));
+    waiter.join();
+
+    CHECK(shutdown_result.has_value());
+    CHECK(!*shutdown_result);
+    if (shutdown_result && !*shutdown_result) {
+        CHECK(shutdown_result->error().code == ErrorCode::Unavailable);
+        CHECK(shutdown_result->error().message == "owner abort");
+    }
+    CHECK(host.server->Stats().inflight == 1);   // handler 仍阻塞：确为 Close 打断
     gate.Release();
     host.Finish();
 }
@@ -440,6 +530,9 @@ int Run(int argc, char** argv) {
         else if (name == "server_stop_authorization") { StopAuthorization(); }
         else if (name == "server_reply_drain") { ReplyDrain(); }
         else if (name == "server_close_timeout") { CloseTimeout(); }
+        else if (name == "server_shutdown_drain") { ShutdownDrain(); }
+        else if (name == "server_shutdown_timeout") { ShutdownTimeout(); }
+        else if (name == "server_shutdown_interrupted_by_close") { ShutdownInterruptedByClose(); }
         else if (name == "server_security") { Security(); }
         else if (name == "server_incoming_deadline") { IncomingDeadline(); }
         else if (name == "server_start_capacity") { StartAndCapacity(); }

@@ -2,7 +2,7 @@
 #
 # 布局对齐 bbt/infra/http、bbt/infra/rpc：公开头与实现同目录，include 路径是
 # <bbt/infra/mcp/...>，以 PROJECT_SOURCE_DIR 为 include root；公开头仍引用
-# include/bbt/infra/ 的 Result 值层（经 bbt::infra_common 的接口传播可见）。
+# bbt/infra/ 的 Result 值层（经 bbt::infra_common 的接口传播可见）。
 # detail/ 与 schema/ 是内部部件，不导出给公共消费者（测试经模块根 include 路径
 # 消费，见 tests/mcp/CMakeLists.txt）。
 #
@@ -27,7 +27,6 @@ add_library(bbt_infra_mcp_core STATIC
 add_library(bbt::infra_mcp_core ALIAS bbt_infra_mcp_core)
 target_include_directories(bbt_infra_mcp_core
     PUBLIC  "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>"
-            "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
     # 内部实现面（detail/）：实现 TU 以 "mcp/detail/..." 形式包含，仅本 target 可见。
     PRIVATE "${PROJECT_SOURCE_DIR}/bbt/infra")
 target_compile_features(bbt_infra_mcp_core PUBLIC cxx_std_17)
@@ -41,7 +40,6 @@ add_library(bbt_infra_mcp_stdio STATIC
 add_library(bbt::infra_mcp_stdio ALIAS bbt_infra_mcp_stdio)
 target_include_directories(bbt_infra_mcp_stdio
     PUBLIC  "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>"
-            "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
     PRIVATE "${PROJECT_SOURCE_DIR}/bbt/infra")
 target_compile_features(bbt_infra_mcp_stdio PUBLIC cxx_std_17)
 target_link_libraries(bbt_infra_mcp_stdio
@@ -60,7 +58,6 @@ if(BBT_INFRA_MCP_HTTP)
     add_library(bbt::infra_mcp_http ALIAS bbt_infra_mcp_http)
     target_include_directories(bbt_infra_mcp_http
         PUBLIC  "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>"
-                "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
         PRIVATE "${PROJECT_SOURCE_DIR}/bbt/infra")
     target_compile_features(bbt_infra_mcp_http PUBLIC cxx_std_17)
     target_link_libraries(bbt_infra_mcp_http

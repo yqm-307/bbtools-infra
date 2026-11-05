@@ -1,6 +1,6 @@
 # config watch v1：版本化快照、本地配置源与 watch 公开契约
 
-范围：`bbtools-infra#35` 首切片（`include/bbt/infra/config/`、`src/config/`、`bbt::infra_config`）。
+范围：`bbtools-infra#35` 首切片（`bbt/infra/config/` 公共头与实现、`bbt::infra_config`）。
 状态：**已并入 main**——`029dc2a4fe113499cfa43feab69e25d2d55d7345`（`feat(config): 实现版本化快照与本地配置源 watch (#35)`），
 随后 `02567ed8017fd2afef21ffc32d18d9f85c2d0b93`（`refactor(infra): migrate close stop lifecycle semantics`）
 按进程寿命运行时迁移为同步 `Close()`。**验收基线** `e0478cb541e55350da5259bcc18f0029852add11`。
@@ -26,14 +26,14 @@ owner 主动调用的同步 `Close()`**。本文原「§事件、错误与关闭
 - 请求等待用 `CoWaiter::WaitWithCallback`（登记 → 一次投递回调 → 挂起），adapter/轮询路径 `Notify`
   唤醒；结果（事件、错误）放 operation state。
 
-说明：`include/bbt/infra/config/Watch.hpp` 与 `src/config/` 的迁移（`RequestClose`/`WaitClosed` → `Close()`）
+说明：`bbt/infra/config/Watch.hpp` 与 `bbt/infra/config/` 的迁移（`RequestClose`/`WaitClosed` → `Close()`）
 已随 `02567ed` 并入 main，本记录与下方改写描述的是**当前已实现并复验的契约**（复验命令与结果见
 「§有界命令与实测结果」）。
 
 ## 模块与公共面
 
-- 公共头：`include/bbt/infra/config/{Value,Snapshot,Source,MemorySource,FileSource,Watch}.hpp`，
-  命名空间固定 `bbt::infra::config`（三层）；实现 `src/config/{Value 为 header-only,MemorySource,FileSource,Watch}`。
+- 公共头：`bbt/infra/config/{Value,Snapshot,Source,MemorySource,FileSource,Watch}.hpp`，
+  命名空间固定 `bbt::infra::config`（三层）；实现 `bbt/infra/config/{Value 为 header-only,MemorySource,FileSource,Watch}`。
 - 模块 target `bbt::infra_config`（STATIC），`PUBLIC` 只依赖 `bbt::infra_common`（即 bbtools-coroutine），
   无第三方新依赖、无隐藏 I/O 线程；公共头不出现 framework 类型或第三方类型。
 - 固定依赖 SHA：`bbtools-coroutine` = `7bcda3b078f975ff2978424be7f6ba38e04fb7f6`（main HEAD，

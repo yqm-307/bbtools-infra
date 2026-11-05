@@ -25,7 +25,7 @@ cmake/                 CMake 模块
 ```
 
 - 根目录保留各仓入口文件（如 `AGENTS.md`、`README.md`、`CMakeLists.txt`、`.clang-format`、`.editorconfig`、`.gitignore`）。新目录按上表归类，不另建工具工作流或任务状态目录。
-- 现有目录在本轮按已定迁移边界处理：coroutine 的 `unit_test/`、`example/`、`benchmark_test/` 迁至 `tests/`、`examples/`、`benchmarks/`；framework 的 `framework/` 与 infra 的 `include/`、`src/` 暂不改名。不要把目标布局解释为要求一次性移动所有旧文件。
+- infra 代码统一位于 `bbt/infra/`，公共头与实现按模块并置，私有头放模块 `detail/`；已退役网络实现不保留兼容副本。coroutine 使用 `bbt/coroutine/`；framework 的 `framework/` 布局保持不变。
 - 每个公开类原则上由独立 `.hpp` 声明；有非内联实现时配对 `.cc`。接口抽象放 `interface/` 子目录，纯虚基类使用 `I` 前缀；头文件用 `#pragma once`。目录层级与命名空间保持一致。
 - include 顺序遵循仓库现有约定：对应/本文件所需头文件、标准库、项目公共头（如 `bbt/xxx`）、子模块头；避免无关 include。
 
