@@ -1,0 +1,46 @@
+# 公开头文件 API 文档。入口：scripts/docs/build_docs.sh（从仓库根运行）。
+# 一次解析同时产出 HTML（给人看）与 XML（export_ai_docs.py 转成给 AI 看的分层 Markdown）。
+# 路径均相对仓库根；输出目录、版本、主题由 build_docs.sh 通过环境变量传入。
+
+PROJECT_NAME           = "$(DOCS_PROJECT)"
+PROJECT_NUMBER         = "$(DOCS_VERSION)"
+OUTPUT_DIRECTORY       = $(DOCS_OUT)
+
+# 只导出公开头文件；detail/ 与 debug 是实现细节，不进文档。
+INPUT                  = bbt/infra
+STRIP_FROM_PATH        = .
+FILE_PATTERNS          = *.hpp *.h
+RECURSIVE              = YES
+# Udp.hpp 是显式 #include 即 #error 的编译期拒绝入口，不声明任何 API，不能被文档当作接口。
+EXCLUDE_PATTERNS       = */detail/* */debug/* */net/Udp.hpp
+
+EXTRACT_ALL            = NO
+EXTRACT_PRIVATE        = NO
+EXTRACT_STATIC         = NO
+ENABLE_PREPROCESSING   = YES
+# 协程语法宏来自上游 bbtools-coroutine，不在本仓输入面内，Doxygen 无法自行解析；
+# 按真实定义预定义（bbt/coroutine/syntax/Async.hpp）：只展开这两个宏，其余保持原文。
+# bbt_co_async 必须展开成真实返回类型包装，不能简化成 x，否则成员签名/参数解析失真。
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = YES
+PREDEFINED             = "bbt_co_async(...)=::bbt::coroutine::detail::AsyncReturn<__VA_ARGS__>" \
+                         "bbt_co_await="
+
+GENERATE_XML           = YES
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+
+HAVE_DOT               = YES
+UML_LOOK               = YES
+CALL_GRAPH             = NO
+
+# 主题（Doxygen Awesome）由 build_docs.sh 传入；未提供时回落到 Doxygen 默认样式。
+HTML_EXTRA_STYLESHEET  = $(DOXYGEN_AWESOME_CSS)
+GENERATE_TREEVIEW      = YES
+HTML_COLORSTYLE        = LIGHT
+
+# 缺注释只告警；是否阻断由 build_docs.sh 的 DOCS_WERROR 决定。
+WARN_IF_UNDOCUMENTED   = YES
+WARN_IF_DOC_ERROR      = YES
+WARN_LOGFILE           = $(DOCS_OUT)/warnings.log
+QUIET                  = YES

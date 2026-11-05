@@ -2,13 +2,13 @@
  * @file RpcWire.hpp
  * @brief 版本化 Protobuf RpcEnvelope wire profile（RPC core，不依赖物理 transport 栈）。
  *
- * wire 单一真源仍是 proto/bbt/infra/rpc/v1/rpc_envelope.proto；字节规则、
- * 值类型校验、错误域映射与 metadata 约束自旧 bbt/infra/rpc/RpcWire.hpp
- * 原样保留（复用，不改 profile）。随 transport seam 切分（architecture §5）：
+ * wire 单一真源是 proto/bbt/infra/rpc/v1/rpc_envelope.proto；字节规则、值类型校验、
+ * 错误域映射与 metadata 约束以该 proto 为准，transport seam 切分不改变 wire profile。
+ * 与 transport seam 的分工：
  *   * 本头只承载值类型 + protobuf 编解码 + RpcEnvelope seam 互转，不含任何
- *     HTTP/net 类型；HTTP body 绑定助手迁入 HTTP adapter
+ *     HTTP/net 类型；HTTP body 绑定助手位于 HTTP adapter
  *     （bbt/infra/rpc/HttpTransport.hpp）；
- *   * protobuf 生成物仍不出现在公共头（adapter 边界，AGENTS.md §4）；
+ *   * protobuf 生成物不出现在公共头（adapter 边界）；
  *     实现经 PIMPL 隔在本模块 .cc 内。
  *
  * protoc/runtime 同源锁定见 cmake/RpcNet.cmake 的接入注释（BBT_INFRA_RPC_NET）。
@@ -26,34 +26,41 @@
 
 namespace bbt::infra::rpc {
 
-// wire profile 版本；与 proto 中 profile_version 对应，当前固定为 1。
-// proto package 保留 bbt.infra.rpc.v1 表达 wire 版本；公共 C++ 命名空间
-// 收敛到 bbt::infra::rpc（AGENTS.md「namespace 不超过三层」）。
+/// wire profile 版本；与 proto 中 profile_version 对应，当前固定为 1。
+/// proto package 保留 bbt.infra.rpc.v1 表达 wire 版本；公共 C++ 命名空间
+/// 收敛到 bbt::infra::rpc（AGENTS.md「namespace 不超过三层」）。
 inline constexpr std::uint32_t kRpcWireProfileVersion = 1;
 
-// HTTP 绑定：固定 POST path 与 Content-Type。headers 只承担标准传输语义，
-// 禁止 x-bbt-* 成为协议字段（wire Profile 约束，见 docs/decisions/0009-rpc-runtime.md）。
-inline constexpr char kRpcWireHttpPath[]        = "/rpc";
-inline constexpr char kRpcWireContentType[]     = "application/x-protobuf";
-inline constexpr char kRpcWireContentTypeKey[]  = "Content-Type";
+/**
+ * @brief HTTP 绑定的固定 path 与 Content-Type。
+ *
+ * headers 只承担标准传输语义，禁止 x-bbt-* 成为协议字段（wire profile 约束，
+ * 见 docs/decisions/0009-rpc-runtime.md）。
+ */
+inline constexpr char kRpcWireHttpPath[] = "/rpc";                      ///< 固定 POST target
+inline constexpr char kRpcWireContentType[] = "application/x-protobuf"; ///< 唯一允许的 body Content-Type
+inline constexpr char kRpcWireContentTypeKey[] = "Content-Type";        ///< 承载上述 Content-Type 的头名
 
-// metadata 前缀白名单（docs/decisions/0002-co-network-contract.md 契约）：仅这三组注册前缀可出现在 envelope.metadata。
-inline constexpr char kMetaPrefixFw[]    = "fw.";
-inline constexpr char kMetaPrefixRoute[] = "route.";
-inline constexpr char kMetaPrefixTrace[] = "trace.";
-// 每项上限与条数上限沿用该契约：最多 32 项，键 ≤64 UTF-8 字节，值 ≤256 UTF-8 字节。
-inline constexpr std::size_t kMaxMetadataItems = 32;
-inline constexpr std::size_t kMaxMetadataKeyBytes   = 64;
-inline constexpr std::size_t kMaxMetadataValueBytes = 256;
+/**
+ * @brief metadata 前缀白名单（docs/decisions/0002-co-network-contract.md 契约）：
+ *        仅这三组注册前缀可出现在 envelope.metadata。
+ */
+inline constexpr char kMetaPrefixFw[] = "fw.";       ///< framework 注册前缀
+inline constexpr char kMetaPrefixRoute[] = "route."; ///< 路由注册前缀
+inline constexpr char kMetaPrefixTrace[] = "trace."; ///< 链路追踪注册前缀
+/// 每项上限与条数上限沿用该契约：最多 32 项，键 ≤64 UTF-8 字节，值 ≤256 UTF-8 字节。
+inline constexpr std::size_t kMaxMetadataItems = 32;       ///< metadata 条目上限
+inline constexpr std::size_t kMaxMetadataKeyBytes = 64;    ///< 键 UTF-8 字节上限
+inline constexpr std::size_t kMaxMetadataValueBytes = 256; ///< 值 UTF-8 字节上限
 
-// remaining_budget_ms：有上限的无符号毫秒，wire 上合法范围
-// 1..kMaxRemainingBudgetMs。0 明确拒绝（wire 契约），越界同样拒绝；
-// 发送端由本地 deadline 换算、至少 1ms；接收端按本地 handler 预算取 min，
-// clamp 发生在上层（rpc::Server），本层只钉死 wire 合法范围。
-// 上限沿用 NetworkLimits::incoming_timeout 的语义边界（不超过 24h）。
+/// remaining_budget_ms 的 wire 合法上限：合法范围 1..kMaxRemainingBudgetMs，
+/// 0 与越界同样拒绝。
+///
+/// 发送端由本地 deadline 换算、至少 1ms；接收端按本地 handler 预算取 min，
+/// clamp 发生在上层（rpc::Server），本层只钉死 wire 合法范围。上限沿用
+/// NetworkLimits::incoming_timeout 的语义边界（不超过 24h）。
 inline constexpr std::uint32_t kMaxRemainingBudgetMs =
-    static_cast<std::uint32_t>(
-        std::chrono::milliseconds{kNetworkLimitsMaxIncomingTimeout}.count());
+    static_cast<std::uint32_t>(std::chrono::milliseconds{kNetworkLimitsMaxIncomingTimeout}.count());
 
 /**
  * @brief wire profile 的值类型视图。
@@ -64,20 +71,20 @@ inline constexpr std::uint32_t kMaxRemainingBudgetMs =
  *   两者经 ToWireEnvelope / FromWireEnvelope 显式互转。
  */
 struct RpcWireEnvelope {
-    std::uint32_t profile_version = kRpcWireProfileVersion;  ///< wire profile 版本，当前固定 1
-    std::string   request_id;    ///< 请求唯一标识，五字段关联校验之一
-    std::string   service;       ///< 目标服务名
-    std::string   method;        ///< 目标方法名
-    std::uint32_t remaining_budget_ms = 0;  ///< 剩余预算毫秒，合法范围 1..kMaxRemainingBudgetMs
-    std::string   request_schema;  ///< 请求 payload 的 schema 标识
-    std::string   response_schema;  ///< 响应 payload 的 schema 标识
-    std::vector<std::uint8_t> payload;  ///< 业务负载
+    std::uint32_t profile_version = kRpcWireProfileVersion; ///< wire profile 版本，当前固定 1
+    std::string request_id;                                 ///< 请求唯一标识，五字段关联校验之一
+    std::string service;                                    ///< 目标服务名
+    std::string method;                                     ///< 目标方法名
+    std::uint32_t remaining_budget_ms = 0;                  ///< 剩余预算毫秒，合法范围 1..kMaxRemainingBudgetMs
+    std::string request_schema;                             ///< 请求 payload 的 schema 标识
+    std::string response_schema;                            ///< 响应 payload 的 schema 标识
+    std::vector<std::uint8_t> payload;                      ///< 业务负载
     /// metadata 键值对，顺序保留；编码/解码均不允许重复键。
     std::vector<std::pair<std::string, std::string>> metadata;
 
     /// 请求方向与成功响应：true 时 error 为空。错误响应：false 且 error 填充完整字段。
-    bool  success = true;
-    Error error;
+    bool success = true;
+    Error error; ///< 失败分支的完整错误（success=false 时填充）
 };
 
 // --- 值类型校验（不触碰 wire） ----------------------------------------------
@@ -94,8 +101,7 @@ struct RpcWireEnvelope {
  * @param is_response true 表示按响应方向校验（允许 success=false）。
  * @return 成功为 ok；违规返回 InvalidArgument 或 ProtocolError。
  */
-result<void> ValidateRpcWireEnvelope(const RpcWireEnvelope& env,
-                                     bool is_response);
+result<void> ValidateRpcWireEnvelope(const RpcWireEnvelope& env, bool is_response);
 
 // --- 编解码（无 protobuf 类型出现在签名） ------------------------------------
 
@@ -106,8 +112,7 @@ result<void> ValidateRpcWireEnvelope(const RpcWireEnvelope& env,
  * @param is_response true 表示按响应方向编码（允许 success=false）。
  * @return 成功返回 wire 字节；失败返回 InvalidArgument 或 ProtocolError。
  */
-result<std::vector<std::uint8_t>> EncodeRpcWireEnvelope(
-    const RpcWireEnvelope& env, bool is_response);
+result<std::vector<std::uint8_t>> EncodeRpcWireEnvelope(const RpcWireEnvelope& env, bool is_response);
 
 /**
  * @brief 从 protobuf wire 字节解码。
@@ -119,16 +124,14 @@ result<std::vector<std::uint8_t>> EncodeRpcWireEnvelope(
  * @param is_response true 表示按响应方向解码。
  * @return 成功返回 RpcWireEnvelope；失败返回 ProtocolError 或 InvalidArgument。
  */
-result<RpcWireEnvelope> DecodeRpcWireEnvelope(
-    const std::vector<std::uint8_t>& bytes, bool is_response);
+result<RpcWireEnvelope> DecodeRpcWireEnvelope(const std::vector<std::uint8_t>& bytes, bool is_response);
 
 /**
  * @brief 同 DecodeRpcWireEnvelope(vector)，接受 string 视图以减少一次拷贝。
  *
  * HTTP body 已是 std::string，直接传入避免额外的 vector 构造。
  */
-result<RpcWireEnvelope> DecodeRpcWireEnvelope(
-    const std::string& bytes, bool is_response);
+result<RpcWireEnvelope> DecodeRpcWireEnvelope(const std::string& bytes, bool is_response);
 
 // --- 与既有 RpcEnvelope seam 的互转 -------------------------------------------
 
@@ -141,8 +144,7 @@ result<RpcWireEnvelope> DecodeRpcWireEnvelope(
  * @param remaining_budget_ms  剩余预算毫秒，写入 wire 字段。
  * @return 成功返回 RpcWireEnvelope；失败返回 InvalidArgument。
  */
-result<RpcWireEnvelope> ToWireEnvelope(const RpcEnvelope& env,
-                                       std::uint32_t remaining_budget_ms);
+result<RpcWireEnvelope> ToWireEnvelope(const RpcEnvelope& env, std::uint32_t remaining_budget_ms);
 
 /**
  * @brief wire profile → 公共数据形态。

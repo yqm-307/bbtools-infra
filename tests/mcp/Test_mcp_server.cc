@@ -31,7 +31,8 @@ namespace {
 int g_checks = 0;
 int g_failures = 0;
 
-void Check(bool ok, const char* expr, int line) {
+void Check(bool ok, const char* expr, int line)
+{
     ++g_checks;
     if (!ok) {
         ++g_failures;
@@ -52,13 +53,16 @@ using bbt::infra::mcp::ServerOptions;
 
 // --- 小工具（读响应 JSON）-----------------------------------------------------
 
-std::optional<JsonValue> Find(const JsonValue& value, const std::string& key) {
+std::optional<JsonValue> Find(const JsonValue& value, const std::string& key)
+{
     auto found = value.Find(key);
-    if (!found) return std::nullopt;
+    if (!found)
+        return std::nullopt;
     return std::move(found).value();
 }
 
-JsonValue ParseOk(const std::string& text) {
+JsonValue ParseOk(const std::string& text)
+{
     auto parsed = JsonValue::Parse(text, 1U << 20, 32);
     if (!parsed) {
         ++g_checks;
@@ -69,30 +73,40 @@ JsonValue ParseOk(const std::string& text) {
     return std::move(parsed).value();
 }
 
-std::string Str(const std::optional<JsonValue>& value) {
-    if (!value) return "<missing>";
+std::string Str(const std::optional<JsonValue>& value)
+{
+    if (!value)
+        return "<missing>";
     auto text = value->AsString();
-    if (!text) return "<not-string>";
+    if (!text)
+        return "<not-string>";
     return std::move(text).value();
 }
 
 // result<JsonValue> 重载：JsonValue::At 返回 result 而非 optional。
-std::string Str(const result<JsonValue>& value) {
-    if (!value) return "<missing>";
+std::string Str(const result<JsonValue>& value)
+{
+    if (!value)
+        return "<missing>";
     auto text = value.value().AsString();
-    if (!text) return "<not-string>";
+    if (!text)
+        return "<not-string>";
     return std::move(text).value();
 }
 
-std::int64_t Int(const std::optional<JsonValue>& value) {
-    if (!value) return -999999;
+std::int64_t Int(const std::optional<JsonValue>& value)
+{
+    if (!value)
+        return -999999;
     auto number = value->AsInt64();
-    if (!number) return -999999;
+    if (!number)
+        return -999999;
     return number.value();
 }
 
 // 解析一次 HandleFrame 的响应；断言必须回包。
-JsonValue Respond(McpSession& session, const std::string& frame, int line) {
+JsonValue Respond(McpSession& session, const std::string& frame, int line)
+{
     auto outcome = session.HandleFrame(frame);
     ++g_checks;
     if (!outcome) {
@@ -102,15 +116,15 @@ JsonValue Respond(McpSession& session, const std::string& frame, int line) {
     }
     if (!outcome.value().has_response) {
         ++g_failures;
-        std::fprintf(stderr, "FAIL %s:%d  expected a response, got notification outcome\n", __FILE__,
-                     line);
+        std::fprintf(stderr, "FAIL %s:%d  expected a response, got notification outcome\n", __FILE__, line);
         return JsonValue();
     }
     return ParseOk(outcome.value().response);
 }
 
 // 断言一次 HandleFrame 不产生响应（合法通知）。
-void ExpectNoResponse(McpSession& session, const std::string& frame, int line) {
+void ExpectNoResponse(McpSession& session, const std::string& frame, int line)
+{
     auto outcome = session.HandleFrame(frame);
     ++g_checks;
     if (!outcome) {
@@ -126,9 +140,11 @@ void ExpectNoResponse(McpSession& session, const std::string& frame, int line) {
 }
 
 // wire 错误码（-32700/-32600/-32602/-32601/-32022）。
-std::int64_t ErrorCodeOf(const JsonValue& response) {
+std::int64_t ErrorCodeOf(const JsonValue& response)
+{
     auto error = Find(response, "error");
-    if (!error) return 0;
+    if (!error)
+        return 0;
     return Int(Find(*error, "code"));
 }
 
@@ -146,18 +162,22 @@ const std::string kModernDiscover =
 const std::string kLegacyInit =
     R"({"jsonrpc":"2.0","id":2,"method":"initialize","params":{"capabilities":{},"clientInfo":{"name":"cli","version":"1"},"protocolVersion":"2025-11-25"}})";
 
-result<std::shared_ptr<McpServer>> StartedServer(ServerOptions options = ServerOptions{}) {
+result<std::shared_ptr<McpServer>> StartedServer(ServerOptions options = ServerOptions{})
+{
     auto created = McpServer::Create(std::move(options));
-    if (!created) return created;
+    if (!created)
+        return created;
     std::shared_ptr<McpServer> server = std::move(created).value();
     auto started = server->Start();
-    if (!started) return result<std::shared_ptr<McpServer>>::err(started.error());
+    if (!started)
+        return result<std::shared_ptr<McpServer>>::err(started.error());
     return result<std::shared_ptr<McpServer>>::ok(std::move(server));
 }
 
 // --- 1. 生命周期 / 配置校验 / 准入 -------------------------------------------
 
-void TestLifecycleAndOptions() {
+void TestLifecycleAndOptions()
+{
     ServerOptions bad;
     bad.max_inflight_requests = 0;
     CHECK(!McpServer::Create(bad));
@@ -174,10 +194,10 @@ void TestLifecycleAndOptions() {
     bad.server_version.clear();
     CHECK(!McpServer::Create(bad));
     bad = ServerOptions{};
-    bad.server_name = std::string("\xFF\xFE", 2);  // 非法 UTF-8
+    bad.server_name = std::string("\xFF\xFE", 2); // 非法 UTF-8
     CHECK(!McpServer::Create(bad));
     bad = ServerOptions{};
-    bad.instructions = std::string("\xC3\x28", 2);  // 非法 UTF-8 续字节
+    bad.instructions = std::string("\xC3\x28", 2); // 非法 UTF-8 续字节
     CHECK(!McpServer::Create(bad));
 
     auto created = McpServer::Create(ServerOptions{});
@@ -185,7 +205,7 @@ void TestLifecycleAndOptions() {
     auto server = std::move(created).value();
     CHECK(!server->IsStarted());
     CHECK(!server->IsClosed());
-    CHECK(server->AdvertisedVersions().size() == 2);  // 2025-06-18 已移除
+    CHECK(server->AdvertisedVersions().size() == 2); // 2025-06-18 已移除
 
     auto session = CreateSession(server);
     CHECK(session != nullptr);
@@ -203,9 +223,9 @@ void TestLifecycleAndOptions() {
 
     server->Close();
     CHECK(server->IsClosed());
-    server->Close();  // 幂等
+    server->Close(); // 幂等
     CHECK(server->IsClosed());
-    auto reopen = server->Start();  // 不重开
+    auto reopen = server->Start(); // 不重开
     CHECK(!reopen);
     CHECK(reopen.error().code == ErrorCode::Closed);
     auto after = session->HandleFrame(kModernDiscover);
@@ -215,7 +235,8 @@ void TestLifecycleAndOptions() {
 
 // --- 2. modern discover ------------------------------------------------------
 
-void TestModernDiscover() {
+void TestModernDiscover()
+{
     auto started = StartedServer();
     CHECK(started);
     auto server = std::move(started).value();
@@ -261,7 +282,8 @@ void TestModernDiscover() {
     CHECK(!session->NegotiatedVersion().has_value());
 }
 
-void TestModernMetaRejections() {
+void TestModernMetaRejections()
+{
     auto started = StartedServer();
     auto server = std::move(started).value();
     auto session = CreateSession(server);
@@ -312,15 +334,15 @@ void TestModernMetaRejections() {
 
     // 无 `_meta` 的 server/discover 在本切片路由为 legacy（无 transport 头判 era）
     // → legacy 表无该方法 → -32601。这是本切片的诚实边界（HTTP 头判 era 属 3-2）。
-    const std::string no_meta =
-        R"({"jsonrpc":"2.0","id":12,"method":"server/discover"})";
+    const std::string no_meta = R"({"jsonrpc":"2.0","id":12,"method":"server/discover"})";
     JsonValue no_meta_response = Respond(*session, no_meta, __LINE__);
     CHECK(ErrorCodeOf(no_meta_response) == -32601);
 }
 
 // --- 3. 两 era 方法表隔离 -----------------------------------------------------
 
-void TestMethodTableIsolation() {
+void TestMethodTableIsolation()
+{
     auto started = StartedServer();
     auto server = std::move(started).value();
     auto session = CreateSession(server);
@@ -330,7 +352,7 @@ void TestMethodTableIsolation() {
         R"({"jsonrpc":"2.0","id":21,"method":"initialize","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}},"capabilities":{},"clientInfo":{"name":"c","version":"1"},"protocolVersion":"2026-07-28"}})";
     JsonValue modern_init_response = Respond(*session, modern_init, __LINE__);
     CHECK(ErrorCodeOf(modern_init_response) == -32601);
-    CHECK(!session->InitializeAccepted());  // 隔离：modern 帧不推进 legacy 状态
+    CHECK(!session->InitializeAccepted()); // 隔离：modern 帧不推进 legacy 状态
 
     // modern 表没有 ping。
     const std::string modern_ping =
@@ -338,8 +360,8 @@ void TestMethodTableIsolation() {
     CHECK(ErrorCodeOf(Respond(*session, modern_ping, __LINE__)) == -32601);
 
     // legacy 表没有 server/discover（无 `_meta` → 路由 legacy）。
-    CHECK(ErrorCodeOf(Respond(*session, R"({"jsonrpc":"2.0","id":23,"method":"server/discover"})",
-                              __LINE__)) == -32601);
+    CHECK(ErrorCodeOf(Respond(*session, R"({"jsonrpc":"2.0","id":23,"method":"server/discover"})", __LINE__))
+          == -32601);
 
     // modern 信封的 notifications/initialized：不回包，且不推进 legacy 状态。
     const std::string modern_initialized =
@@ -350,7 +372,8 @@ void TestMethodTableIsolation() {
 
 // --- 4. legacy initialize / initialized / ping -------------------------------
 
-void TestLegacyLifecycle() {
+void TestLegacyLifecycle()
+{
     auto started = StartedServer();
     auto server = std::move(started).value();
     auto session = CreateSession(server);
@@ -367,8 +390,8 @@ void TestLegacyLifecycle() {
     {
         auto fresh = CreateSession(server);
         const std::string frame =
-            std::string(R"({"jsonrpc":"2.0","id":31,"method":"initialize","params":{)") +
-            R"("capabilities":{},"clientInfo":{"name":"c","version":"1"},"protocolVersion":"2025-11-25"}})";
+            std::string(R"({"jsonrpc":"2.0","id":31,"method":"initialize","params":{)")
+            + R"("capabilities":{},"clientInfo":{"name":"c","version":"1"},"protocolVersion":"2025-11-25"}})";
         JsonValue response = Respond(*fresh, frame, __LINE__);
         auto result_value = Find(response, "result");
         CHECK(result_value.has_value());
@@ -382,9 +405,8 @@ void TestLegacyLifecycle() {
         auto server_info = Find(*result_value, "serverInfo");
         CHECK(server_info.has_value() && Str(Find(*server_info, "name")) == "bbt-infra-mcp");
         CHECK(fresh->InitializeAccepted());
-        CHECK(fresh->NegotiatedVersion().has_value() &&
-              fresh->NegotiatedVersion().value() == "2025-11-25");
-        CHECK(!fresh->Initialized());  // 握手未完成（还没发 initialized 通知）
+        CHECK(fresh->NegotiatedVersion().has_value() && fresh->NegotiatedVersion().value() == "2025-11-25");
+        CHECK(!fresh->Initialized()); // 握手未完成（还没发 initialized 通知）
     }
 
     // 未服务的版本 → 反提议最新 legacy（2025-11-25），不宣称支持该版本。
@@ -392,10 +414,9 @@ void TestLegacyLifecycle() {
     // 不再被采纳，与未知版本同走反提议路径。
     for (const char* requested : {"1999-01-01", "2025-03-26", "2025-06-18", "2026-07-28"}) {
         auto fresh = CreateSession(server);
-        const std::string frame =
-            std::string(R"({"jsonrpc":"2.0","id":32,"method":"initialize","params":{)") +
-            R"("capabilities":{},"clientInfo":{"name":"c","version":"1"},"protocolVersion":")" +
-            requested + R"("}})";
+        const std::string frame = std::string(R"({"jsonrpc":"2.0","id":32,"method":"initialize","params":{)")
+                                  + R"("capabilities":{},"clientInfo":{"name":"c","version":"1"},"protocolVersion":")"
+                                  + requested + R"("}})";
         JsonValue response = Respond(*fresh, frame, __LINE__);
         auto result_value = Find(response, "result");
         CHECK(result_value.has_value());
@@ -420,24 +441,22 @@ void TestLegacyLifecycle() {
 
 // F6：legacy initialize 的 capabilities 按本次 negotiated/反提议 revision 校验；
 // 非法 initialize 不推进/覆盖 accepted/version/caps，错误 id 原值保真。
-void TestLegacyInitializeCapabilitiesRevision() {
+void TestLegacyInitializeCapabilitiesRevision()
+{
     auto started = StartedServer();
     auto server = std::move(started).value();
 
     auto init_frame = [](const char* id, const char* version, const char* caps) {
-        return std::string(R"({"jsonrpc":"2.0","id":)") + id +
-               R"(,"method":"initialize","params":{"capabilities":)" + caps +
-               R"(,"clientInfo":{"name":"c","version":"1"},"protocolVersion":")" + version +
-               R"("}})";
+        return std::string(R"({"jsonrpc":"2.0","id":)") + id + R"(,"method":"initialize","params":{"capabilities":)"
+               + caps + R"(,"clientInfo":{"name":"c","version":"1"},"protocolVersion":")" + version + R"("}})";
     };
 
     // 2025-11-25 profile：sampling.context 须 object → -32602，状态不推进。
     //（2025-06-18 宽松 profile 已随该版本从服务矩阵移除——不再有「子字段自由」
     // 的第二套 shape。）
     auto nov = CreateSession(server);
-    JsonValue nov_bad = Respond(
-        *nov, init_frame("\"nov-bad\"", "2025-11-25", R"({"sampling":{"context":"bad"}})"),
-        __LINE__);
+    JsonValue nov_bad =
+        Respond(*nov, init_frame("\"nov-bad\"", "2025-11-25", R"({"sampling":{"context":"bad"}})"), __LINE__);
     CHECK(ErrorCodeOf(nov_bad) == -32602);
     CHECK(Str(Find(nov_bad, "id")) == "nov-bad");
     CHECK(!nov->InitializeAccepted());
@@ -446,30 +465,28 @@ void TestLegacyInitializeCapabilitiesRevision() {
 
     // 不支持版本 → 反提议 2025-11-25 并按该 profile 校验：tasks.list 非 object → 拒。
     auto counter = CreateSession(server);
-    JsonValue counter_bad = Respond(
-        *counter, init_frame("\"c1\"", "2025-03-26", R"({"tasks":{"list":"bad"}})"), __LINE__);
+    JsonValue counter_bad =
+        Respond(*counter, init_frame("\"c1\"", "2025-03-26", R"({"tasks":{"list":"bad"}})"), __LINE__);
     CHECK(ErrorCodeOf(counter_bad) == -32602);
     CHECK(!counter->InitializeAccepted());
     CHECK(!counter->NegotiatedVersion().has_value());
 
     // 同一不支持版本 + 合法 11 月 caps → 反提议成功。
     auto counter_ok = CreateSession(server);
-    JsonValue counter_good = Respond(
-        *counter_ok, init_frame("\"c2\"", "2025-03-26", R"({"tasks":{"list":{}}})"), __LINE__);
+    JsonValue counter_good =
+        Respond(*counter_ok, init_frame("\"c2\"", "2025-03-26", R"({"tasks":{"list":{}}})"), __LINE__);
     CHECK(Find(counter_good, "result").has_value());
     CHECK(counter_ok->NegotiatedVersion().value() == "2025-11-25");
 
     // 已握手会话收到非法 initialize：-32602 且不覆盖既有 accepted/version/caps。
     auto existing = CreateSession(server);
-    CHECK(Find(Respond(*existing, init_frame("\"e1\"", "2025-11-25", "{}"), __LINE__), "result")
-              .has_value());
+    CHECK(Find(Respond(*existing, init_frame("\"e1\"", "2025-11-25", "{}"), __LINE__), "result").has_value());
     const std::string before = existing->ClientCapabilities().Serialize();
-    JsonValue overwrite = Respond(
-        *existing, init_frame("\"e2\"", "2025-11-25", R"({"sampling":{"context":"bad"}})"), __LINE__);
+    JsonValue overwrite =
+        Respond(*existing, init_frame("\"e2\"", "2025-11-25", R"({"sampling":{"context":"bad"}})"), __LINE__);
     CHECK(ErrorCodeOf(overwrite) == -32602);
-    CHECK(existing->InitializeAccepted());  // 非法 initialize 不撤销既有握手
-    CHECK(existing->NegotiatedVersion().has_value() &&
-          existing->NegotiatedVersion().value() == "2025-11-25");
+    CHECK(existing->InitializeAccepted()); // 非法 initialize 不撤销既有握手
+    CHECK(existing->NegotiatedVersion().has_value() && existing->NegotiatedVersion().value() == "2025-11-25");
     CHECK(existing->ClientCapabilities().Serialize() == before);
 
     // 拒绝后会话仍可用（ping 豁免；无注册 → 业务方法走 -32601 门禁）。
@@ -477,7 +494,8 @@ void TestLegacyInitializeCapabilitiesRevision() {
     CHECK(ErrorCodeOf(ping) == 0);
 }
 
-void TestLegacyInitializeRejections() {
+void TestLegacyInitializeRejections()
+{
     auto started = StartedServer();
     auto server = std::move(started).value();
     auto session = CreateSession(server);
@@ -488,7 +506,7 @@ void TestLegacyInitializeRejections() {
     JsonValue response = Respond(*session, no_client_info, __LINE__);
     CHECK(ErrorCodeOf(response) == -32602);
     CHECK(Int(Find(response, "id")) == 40);
-    CHECK(!session->InitializeAccepted());  // 失败不推进状态
+    CHECK(!session->InitializeAccepted()); // 失败不推进状态
 
     // 缺 capabilities。
     const std::string no_caps =
@@ -506,8 +524,7 @@ void TestLegacyInitializeRejections() {
     CHECK(ErrorCodeOf(Respond(*session, bad_version, __LINE__)) == -32602);
 
     // params 形状错（标量）→ -32602，id 保留。
-    const std::string scalar_params =
-        R"({"jsonrpc":"2.0","id":44,"method":"initialize","params":3})";
+    const std::string scalar_params = R"({"jsonrpc":"2.0","id":44,"method":"initialize","params":3})";
     JsonValue scalar_response = Respond(*session, scalar_params, __LINE__);
     CHECK(ErrorCodeOf(scalar_response) == -32602);
     CHECK(Int(Find(scalar_response, "id")) == 44);
@@ -545,7 +562,7 @@ void TestLegacyInitializeRejections() {
     const std::string info_version_type =
         R"({"jsonrpc":"2.0","id":49,"method":"initialize","params":{"capabilities":{},"clientInfo":{"name":"c","version":3},"protocolVersion":"2025-11-25"}})";
     CHECK(ErrorCodeOf(Respond(*session, info_version_type, __LINE__)) == -32602);
-    CHECK(!session->InitializeAccepted());  // 全部失败后仍未推进
+    CHECK(!session->InitializeAccepted()); // 全部失败后仍未推进
 
     // 空字符串是合法 string（schema 未要求非空）→ 接受并推进状态（不擅自加 nonempty）。
     auto empty_strings = CreateSession(server);
@@ -567,13 +584,13 @@ void TestLegacyInitializeRejections() {
     // 原状态未被清空、未被改成失败帧提议的版本（clientInfo 缺 version 在
     // params 校验即拒，先于版本协商——版本提议本身不再可达）。
     CHECK(negotiated->InitializeAccepted());
-    CHECK(negotiated->NegotiatedVersion().has_value() &&
-          negotiated->NegotiatedVersion().value() == "2025-11-25");
+    CHECK(negotiated->NegotiatedVersion().has_value() && negotiated->NegotiatedVersion().value() == "2025-11-25");
 }
 
 // --- 5. 错误 id / 通知 / 帧拒绝 ----------------------------------------------
 
-void TestErrorAndNotificationHandling() {
+void TestErrorAndNotificationHandling()
+{
     auto started = StartedServer();
     auto server = std::move(started).value();
     auto session = CreateSession(server);
@@ -591,8 +608,7 @@ void TestErrorAndNotificationHandling() {
     CHECK(ErrorCodeOf(Respond(*session, R"({"id":50,"method":"ping"})", __LINE__)) == -32600);
 
     // id 已确定 + params 形状错 → -32602 且 id 原值回包（关联在途请求）。
-    const std::string known_id_bad_params =
-        R"({"jsonrpc":"2.0","id":77,"method":"ping","params":3})";
+    const std::string known_id_bad_params = R"({"jsonrpc":"2.0","id":77,"method":"ping","params":3})";
     JsonValue known_response = Respond(*session, known_id_bad_params, __LINE__);
     CHECK(ErrorCodeOf(known_response) == -32602);
     CHECK(Int(Find(known_response, "id")) == 77);
@@ -603,8 +619,7 @@ void TestErrorAndNotificationHandling() {
     CHECK(Str(Find(string_response, "id")) == "req-77");
 
     // 超过 2^53 的整数 id 原值保留。
-    const std::string big_id =
-        R"({"jsonrpc":"2.0","id":9007199254740993,"method":"ping"})";
+    const std::string big_id = R"({"jsonrpc":"2.0","id":9007199254740993,"method":"ping"})";
     JsonValue big_response = Respond(*session, big_id, __LINE__);
     CHECK(Int(Find(big_response, "id")) == 9007199254740993LL);
 
@@ -619,17 +634,18 @@ void TestErrorAndNotificationHandling() {
     ExpectNoResponse(*session, R"({"jsonrpc":"2.0","method":"notifications/cancelled"})", __LINE__);
 
     // 无 id 的 initialize（被当作通知）→ 不回包；但仍是「合法通知」，不产生响应。
-    ExpectNoResponse(*session,
-                     R"({"jsonrpc":"2.0","method":"initialize","params":{"capabilities":{},"clientInfo":{},"protocolVersion":"2025-11-25"}})",
-                     __LINE__);
+    ExpectNoResponse(
+        *session,
+        R"({"jsonrpc":"2.0","method":"initialize","params":{"capabilities":{},"clientInfo":{},"protocolVersion":"2025-11-25"}})",
+        __LINE__);
 
     // 超大帧 → -32700（mcp.json.max_bytes）。
     ServerOptions tiny;
     tiny.max_message_bytes = 64;
     auto small_server = StartedServer(tiny).value();
     auto small_session = CreateSession(small_server);
-    const std::string huge = std::string(R"({"jsonrpc":"2.0","id":70,"method":"ping","pad":")") +
-                             std::string(200, 'x') + R"("})";
+    const std::string huge =
+        std::string(R"({"jsonrpc":"2.0","id":70,"method":"ping","pad":")") + std::string(200, 'x') + R"("})";
     CHECK(ErrorCodeOf(Respond(*small_session, huge, __LINE__)) == -32700);
 
     // 超深帧 → -32700（mcp.json.max_depth）。
@@ -637,14 +653,14 @@ void TestErrorAndNotificationHandling() {
     shallow.max_depth = 4;
     auto shallow_server = StartedServer(shallow).value();
     auto shallow_session = CreateSession(shallow_server);
-    const std::string deep =
-        R"({"jsonrpc":"2.0","id":71,"method":"ping","params":[[[[[[[[1]]]]]]]]})";
+    const std::string deep = R"({"jsonrpc":"2.0","id":71,"method":"ping","params":[[[[[[[[1]]]]]]]]})";
     CHECK(ErrorCodeOf(Respond(*shallow_session, deep, __LINE__)) == -32700);
 }
 
 // --- 5b. 通知 params 非法：静默丢弃（JSON-RPC 2.0 §4.1 通知不回包）-------------
 
-void TestNotificationParamsDropped() {
+void TestNotificationParamsDropped()
+{
     auto started = StartedServer();
     auto server = std::move(started).value();
     auto session = CreateSession(server);
@@ -652,30 +668,21 @@ void TestNotificationParamsDropped() {
     // F2：无 id 且 params 形状非法（数字/字符串/null）→ 不回包（合法通知不回包），
     // 且不得推进任何会话状态——尤其 notifications/initialized 带坏 params 时
     // Initialized() 必须保持 false（非法 params 不是可执行通知）。
-    ExpectNoResponse(*session,
-                     R"({"jsonrpc":"2.0","method":"notifications/initialized","params":3})",
-                     __LINE__);
+    ExpectNoResponse(*session, R"({"jsonrpc":"2.0","method":"notifications/initialized","params":3})", __LINE__);
     CHECK(!session->Initialized());
-    ExpectNoResponse(*session,
-                     R"({"jsonrpc":"2.0","method":"notifications/initialized","params":"x"})",
-                     __LINE__);
+    ExpectNoResponse(*session, R"({"jsonrpc":"2.0","method":"notifications/initialized","params":"x"})", __LINE__);
     CHECK(!session->Initialized());
-    ExpectNoResponse(*session,
-                     R"({"jsonrpc":"2.0","method":"notifications/initialized","params":null})",
-                     __LINE__);
+    ExpectNoResponse(*session, R"({"jsonrpc":"2.0","method":"notifications/initialized","params":null})", __LINE__);
     CHECK(!session->Initialized());
-    ExpectNoResponse(*session, R"({"jsonrpc":"2.0","method":"notifications/cancelled","params":3})",
-                     __LINE__);
+    ExpectNoResponse(*session, R"({"jsonrpc":"2.0","method":"notifications/cancelled","params":3})", __LINE__);
     CHECK(!session->InitializeAccepted());
 
     // 对照：params 合法（缺省/object）的同一通知 → 仍不回包且推进状态。
-    ExpectNoResponse(*session, R"({"jsonrpc":"2.0","method":"notifications/initialized"})",
-                     __LINE__);
+    ExpectNoResponse(*session, R"({"jsonrpc":"2.0","method":"notifications/initialized"})", __LINE__);
     CHECK(session->Initialized());
 
     // 有 id 的同一帧仍是请求：params 形状非法 → -32602 且 id 原值回包。
-    JsonValue with_id =
-        Respond(*session, R"({"jsonrpc":"2.0","id":77,"method":"ping","params":3})", __LINE__);
+    JsonValue with_id = Respond(*session, R"({"jsonrpc":"2.0","id":77,"method":"ping","params":3})", __LINE__);
     CHECK(ErrorCodeOf(with_id) == -32602);
     CHECK(Int(Find(with_id, "id")) == 77);
 
@@ -692,34 +699,31 @@ void TestNotificationParamsDropped() {
     CHECK(parse_id.has_value() && parse_id->IsNull());
 
     // 无 id 且 result 混入（response 伪装成 request）→ -32600，id null（不分类为通知）。
-    JsonValue with_result = Respond(
-        *session, R"({"jsonrpc":"2.0","method":"m","params":3,"result":{}})", __LINE__);
+    JsonValue with_result = Respond(*session, R"({"jsonrpc":"2.0","method":"m","params":3,"result":{}})", __LINE__);
     CHECK(ErrorCodeOf(with_result) == -32600);
 
     // 连续调用：通知分类与 id 不跨帧泄漏（golden regression）。
     auto fresh = CreateSession(server);
-    ExpectNoResponse(*fresh,
-                     R"({"jsonrpc":"2.0","method":"notifications/initialized","params":3})",
-                     __LINE__);
-    CHECK(!fresh->Initialized());  // (1) 坏 params 未推进状态
-    JsonValue e1 = Respond(*fresh, "{", __LINE__);  // (2) 分类不得泄漏：parse 坏仍回 -32700
+    ExpectNoResponse(*fresh, R"({"jsonrpc":"2.0","method":"notifications/initialized","params":3})", __LINE__);
+    CHECK(!fresh->Initialized());                  // (1) 坏 params 未推进状态
+    JsonValue e1 = Respond(*fresh, "{", __LINE__); // (2) 分类不得泄漏：parse 坏仍回 -32700
     CHECK(ErrorCodeOf(e1) == -32700);
     auto e1_id = Find(e1, "id");
     CHECK(e1_id.has_value() && e1_id->IsNull());
-    JsonValue r1 =
-        Respond(*fresh, R"({"jsonrpc":"2.0","id":91,"method":"ping","params":3})", __LINE__);
-    CHECK(ErrorCodeOf(r1) == -32602);  // (3) 有 id 仍原值回包
+    JsonValue r1 = Respond(*fresh, R"({"jsonrpc":"2.0","id":91,"method":"ping","params":3})", __LINE__);
+    CHECK(ErrorCodeOf(r1) == -32602); // (3) 有 id 仍原值回包
     CHECK(Int(Find(r1, "id")) == 91);
     ExpectNoResponse(*fresh, R"({"jsonrpc":"2.0","method":"notifications/cancelled","params":null})",
-                     __LINE__);  // (4) id 已清，仍丢弃
+                     __LINE__); // (4) id 已清，仍丢弃
     JsonValue r2 = Respond(*fresh, R"({"jsonrpc":"2.0","id":92,"method":"ping"})", __LINE__);
-    CHECK(Int(Find(r2, "id")) == 92);  // (5) 后续合法请求正常回包
+    CHECK(Int(Find(r2, "id")) == 92); // (5) 后续合法请求正常回包
     CHECK(Find(r2, "result").has_value());
 }
 
 // --- 6. 会话按 channel 隔离 ---------------------------------------------------
 
-void TestSessionIsolation() {
+void TestSessionIsolation()
+{
     auto started = StartedServer();
     auto server = std::move(started).value();
     auto alpha = CreateSession(server);
@@ -741,7 +745,7 @@ void TestSessionIsolation() {
         R"({"jsonrpc":"2.0","id":80,"method":"initialize","params":{"capabilities":{},"clientInfo":{"name":"beta","version":"1"},"protocolVersion":"2025-06-18"}})";
     CHECK(Find(Respond(*beta, beta_init, __LINE__), "result").has_value());
     CHECK(beta->NegotiatedVersion().value() == "2025-11-25");
-    CHECK(alpha->NegotiatedVersion().value() == "2025-11-25");  // alpha 不受影响
+    CHECK(alpha->NegotiatedVersion().value() == "2025-11-25"); // alpha 不受影响
 
     // 另一 server 实例也完全独立。
     auto other = StartedServer().value();
@@ -760,7 +764,8 @@ struct AdmitCounts {
     int wrong = 0;
 };
 
-AdmitCounts RunConcurrent(const std::shared_ptr<McpServer>& server, int threads, int per_thread) {
+AdmitCounts RunConcurrent(const std::shared_ptr<McpServer>& server, int threads, int per_thread)
+{
     std::vector<std::thread> workers;
     std::vector<AdmitCounts> counts(static_cast<std::size_t>(threads));
     for (int t = 0; t < threads; ++t) {
@@ -782,15 +787,16 @@ AdmitCounts RunConcurrent(const std::shared_ptr<McpServer>& server, int threads,
                 }
                 JsonValue response = ParseOk(outcome.value().response);
                 auto result_value = Find(response, "result");
-                if (Int(Find(response, "id")) != 1 || !result_value ||
-                    Str(Find(*result_value, "resultType")) != "complete")
+                if (Int(Find(response, "id")) != 1 || !result_value
+                    || Str(Find(*result_value, "resultType")) != "complete")
                     ++counts[t].wrong;
                 else
                     ++counts[t].ok;
             }
         });
     }
-    for (auto& worker : workers) worker.join();
+    for (auto& worker : workers)
+        worker.join();
     AdmitCounts total;
     for (int t = 0; t < threads; ++t) {
         CHECK(counts[t].wrong == 0);
@@ -802,15 +808,16 @@ AdmitCounts RunConcurrent(const std::shared_ptr<McpServer>& server, int threads,
     return total;
 }
 
-void TestConcurrentAdmission() {
+void TestConcurrentAdmission()
+{
     // 阶段 A：上界 = 1。并发调用必然出现「成功或 Overloaded」二择一，绝不允许
     // 第三种结果（无泄漏、无串味、无半份响应）。这同时真实触发 Overloaded 路径。
     ServerOptions tight;
     tight.max_inflight_requests = 1;
     auto tight_server = StartedServer(tight).value();
     AdmitCounts tight_counts = RunConcurrent(tight_server, 4, 50);
-    std::printf("mcp.server: admission(max_inflight=1): ok=%d overloaded=%d wrong=%d\n",
-                tight_counts.ok, tight_counts.overloaded, tight_counts.wrong);
+    std::printf("mcp.server: admission(max_inflight=1): ok=%d overloaded=%d wrong=%d\n", tight_counts.ok,
+                tight_counts.overloaded, tight_counts.wrong);
     CHECK(tight_counts.wrong == 0);
     // 并发后准入名额已归还：同一 server 仍能正常接纳。
     auto session = CreateSession(tight_server);
@@ -824,8 +831,8 @@ void TestConcurrentAdmission() {
     roomy.max_inflight_requests = 64;
     auto roomy_server = StartedServer(roomy).value();
     AdmitCounts roomy_counts = RunConcurrent(roomy_server, 4, 50);
-    std::printf("mcp.server: admission(max_inflight=64): ok=%d overloaded=%d wrong=%d\n",
-                roomy_counts.ok, roomy_counts.overloaded, roomy_counts.wrong);
+    std::printf("mcp.server: admission(max_inflight=64): ok=%d overloaded=%d wrong=%d\n", roomy_counts.ok,
+                roomy_counts.overloaded, roomy_counts.wrong);
     CHECK(roomy_counts.ok == 200);
     CHECK(roomy_counts.overloaded == 0);
     CHECK(roomy_counts.wrong == 0);
@@ -833,7 +840,8 @@ void TestConcurrentAdmission() {
 
 // --- 7b. 同一 session 并发驱动：状态一致（F3 同步回归）------------------------
 
-void TestSameSessionConcurrentState() {
+void TestSameSessionConcurrentState()
+{
     auto started = StartedServer();
     auto server = std::move(started).value();
 
@@ -848,7 +856,8 @@ void TestSameSessionConcurrentState() {
         std::atomic<int> ready{0};
         auto barrier = [&ready]() {
             ready.fetch_add(1, std::memory_order_acq_rel);
-            while (ready.load(std::memory_order_acquire) < 2) std::this_thread::yield();
+            while (ready.load(std::memory_order_acquire) < 2)
+                std::this_thread::yield();
         };
         const std::string init_a =
             R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{},"clientInfo":{"name":"a","version":"1"},"protocolVersion":"2025-11-25"}})";
@@ -871,13 +880,15 @@ void TestSameSessionConcurrentState() {
         CHECK(shared->InitializeAccepted());
         std::optional<std::string> version = shared->NegotiatedVersion();
         CHECK(version.has_value());
-        if (version) CHECK(*version == "2025-11-25");
+        if (version)
+            CHECK(*version == "2025-11-25");
     }
 }
 
 } // namespace
 
-int main() {
+int main()
+{
     TestLifecycleAndOptions();
     TestModernDiscover();
     TestModernMetaRejections();

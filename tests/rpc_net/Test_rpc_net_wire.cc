@@ -8,7 +8,8 @@ namespace {
 
 using rpc::RpcWireEnvelope;
 
-RpcWireEnvelope ValidRequest() {
+RpcWireEnvelope ValidRequest()
+{
     RpcWireEnvelope env;
     env.request_id = "req-1";
     env.service = "echo";
@@ -21,7 +22,8 @@ RpcWireEnvelope ValidRequest() {
     return env;
 }
 
-void Roundtrip() {
+void Roundtrip()
+{
     // 请求方向：值类型 → 字节 → 值类型逐字段一致。
     const auto request = ValidRequest();
     auto bytes = rpc::EncodeRpcWireEnvelope(request, /*is_response=*/false);
@@ -36,9 +38,8 @@ void Roundtrip() {
     CHECK(decoded.value().request_schema == std::string(rpc::kRpcPositionalSchema));
     CHECK(decoded.value().response_schema == std::string(rpc::kRpcPositionalSchema));
     CHECK(decoded.value().payload == request.payload);
-    CHECK(decoded.value().metadata.size() == 1 &&
-          decoded.value().metadata.front().first == "trace.id" &&
-          decoded.value().metadata.front().second == "t-1");
+    CHECK(decoded.value().metadata.size() == 1 && decoded.value().metadata.front().first == "trace.id"
+          && decoded.value().metadata.front().second == "t-1");
     CHECK(decoded.value().success);
     // string 视图入口与 vector 入口等价。
     const std::string text(bytes.value().begin(), bytes.value().end());
@@ -74,8 +75,7 @@ void Roundtrip() {
     CHECK(err.domain_code == "svc.missing");
     CHECK(err.backend_category == "echo" && err.backend_code == 7);
     CHECK(err.transferred_bytes == 12);
-    CHECK(err.details.size() == 1 && err.details.front().first == "route.key" &&
-          err.details.front().second == "a/b");
+    CHECK(err.details.size() == 1 && err.details.front().first == "route.key" && err.details.front().second == "a/b");
 
     // seam 互转：RpcEnvelope → wire → RpcEnvelope 保留五关联字段/payload/metadata。
     auto seam = MakeEnvelope("echo", "Say", "seam-1", Pack("x", 1));
@@ -84,13 +84,13 @@ void Roundtrip() {
     CHECK(wire_env && wire_env.value().remaining_budget_ms == 2000 && wire_env.value().success);
     auto back = rpc::FromWireEnvelope(wire_env.value());
     CHECK(back);
-    CHECK(back.value().service == "echo" && back.value().method == "Say" &&
-          back.value().request_id == "seam-1");
+    CHECK(back.value().service == "echo" && back.value().method == "Say" && back.value().request_id == "seam-1");
     CHECK(back.value().request_schema == std::string(rpc::kRpcPositionalSchema));
     CHECK(back.value().payload == seam.payload && back.value().metadata.size() == 1);
 }
 
-void Reject() {
+void Reject()
+{
     const auto valid = ValidRequest();
     // remaining_budget_ms：0 与越界都拒绝。
     {
@@ -109,20 +109,17 @@ void Reject() {
         auto env = valid;
         env.success = false;
         env.error = MakeError(ErrorCode::InternalError, "nope");
-        ExpectCode(rpc::EncodeRpcWireEnvelope(env, /*is_response=*/false),
-                   ErrorCode::InvalidArgument);
+        ExpectCode(rpc::EncodeRpcWireEnvelope(env, /*is_response=*/false), ErrorCode::InvalidArgument);
         // 解码路径同样钉死：按 response 编码的信封再按 request 解码必须拒绝。
         auto as_response = rpc::EncodeRpcWireEnvelope(env, /*is_response=*/true);
         CHECK(as_response);
-        ExpectCode(rpc::DecodeRpcWireEnvelope(as_response.value(), false),
-                   ErrorCode::ProtocolError);
+        ExpectCode(rpc::DecodeRpcWireEnvelope(as_response.value(), false), ErrorCode::ProtocolError);
     }
     // 响应缺失 outcome：请求编码（无 outcome 字段）按 response 解码拒绝。
     {
         auto request_bytes = rpc::EncodeRpcWireEnvelope(valid, false);
         CHECK(request_bytes);
-        ExpectCode(rpc::DecodeRpcWireEnvelope(request_bytes.value(), true),
-                   ErrorCode::ProtocolError);
+        ExpectCode(rpc::DecodeRpcWireEnvelope(request_bytes.value(), true), ErrorCode::ProtocolError);
     }
     // 空关联字段与非法 profile_version。
     {
@@ -219,17 +216,16 @@ void Reject() {
     {
         auto bytes = rpc::EncodeRpcWireEnvelope(valid, true);
         CHECK(bytes);
-        bytes.value().push_back(0x28);  // field 5 (remaining_budget_ms), varint
-        bytes.value().push_back(0x00);  // value 0
-        ExpectCode(rpc::DecodeRpcWireEnvelope(bytes.value(), true),
-                   ErrorCode::InvalidArgument);
+        bytes.value().push_back(0x28); // field 5 (remaining_budget_ms), varint
+        bytes.value().push_back(0x00); // value 0
+        ExpectCode(rpc::DecodeRpcWireEnvelope(bytes.value(), true), ErrorCode::InvalidArgument);
     }
 }
 
-void Malformed() {
+void Malformed()
+{
     // 空字节与垃圾字节：ProtocolError，不产生部分解码。
-    ExpectCode(rpc::DecodeRpcWireEnvelope(std::vector<std::uint8_t>{}, false),
-               ErrorCode::ProtocolError);
+    ExpectCode(rpc::DecodeRpcWireEnvelope(std::vector<std::uint8_t>{}, false), ErrorCode::ProtocolError);
     {
         std::vector<std::uint8_t> garbage{0xff, 0xff, 0xff, 0xff, 0x0a};
         ExpectCode(rpc::DecodeRpcWireEnvelope(garbage, false), ErrorCode::ProtocolError);
@@ -242,7 +238,7 @@ void Malformed() {
         bytes.value().pop_back();
         bytes.value().pop_back();
         auto decoded = rpc::DecodeRpcWireEnvelope(bytes.value(), false);
-        CHECK(!decoded);  // method/request_id 等必填字段缺失或解析失败
+        CHECK(!decoded); // method/request_id 等必填字段缺失或解析失败
     }
 
     // HTTP 绑定形状：POST /rpc + application/x-protobuf + 非空 body。
@@ -254,11 +250,13 @@ void Malformed() {
     auto parsed = rpc::ParseRpcWireHttpRequest(good);
     CHECK(parsed && parsed.value().request_id == "req-1");
     {
-        auto bad = good; bad.method = "GET";
+        auto bad = good;
+        bad.method = "GET";
         ExpectCode(rpc::ParseRpcWireHttpRequest(bad), ErrorCode::InvalidArgument);
     }
     {
-        auto bad = good; bad.target = "/rpc/extra";
+        auto bad = good;
+        bad.target = "/rpc/extra";
         ExpectCode(rpc::ParseRpcWireHttpRequest(bad), ErrorCode::InvalidArgument);
     }
     {
@@ -267,7 +265,8 @@ void Malformed() {
         ExpectCode(rpc::ParseRpcWireHttpRequest(bad), ErrorCode::InvalidArgument);
     }
     {
-        auto bad = good; bad.body.clear();
+        auto bad = good;
+        bad.body.clear();
         ExpectCode(rpc::ParseRpcWireHttpRequest(bad), ErrorCode::ProtocolError);
     }
 
@@ -278,15 +277,18 @@ void Malformed() {
     auto parsed_reply = rpc::ParseRpcWireHttpResponse(made.value());
     CHECK(parsed_reply && parsed_reply.value().service == "echo");
     {
-        auto bad = made.value(); bad.status_code = 500;
+        auto bad = made.value();
+        bad.status_code = 500;
         ExpectCode(rpc::ParseRpcWireHttpResponse(bad), ErrorCode::InvalidArgument);
     }
     {
-        auto bad = made.value(); bad.headers.clear();
+        auto bad = made.value();
+        bad.headers.clear();
         ExpectCode(rpc::ParseRpcWireHttpResponse(bad), ErrorCode::ProtocolError);
     }
     {
-        auto bad = made.value(); bad.body.clear();
+        auto bad = made.value();
+        bad.body.clear();
         ExpectCode(rpc::ParseRpcWireHttpResponse(bad), ErrorCode::ProtocolError);
     }
 
@@ -304,8 +306,7 @@ void Malformed() {
             }
         }
         CHECK(patched);
-        ExpectCode(rpc::DecodeRpcWireEnvelope(bytes.value(), true),
-                   ErrorCode::ProtocolError);
+        ExpectCode(rpc::DecodeRpcWireEnvelope(bytes.value(), true), ErrorCode::ProtocolError);
     }
     // 未知字段忽略：末尾追加 field 200（varint tag 0xA0 0x0C + value 0x01）后
     // 解码仍成功，关联字段保持。
@@ -316,12 +317,12 @@ void Malformed() {
         bytes.value().push_back(0x0C);
         bytes.value().push_back(0x01);
         auto decoded = rpc::DecodeRpcWireEnvelope(bytes.value(), false);
-        CHECK(decoded && decoded.value().request_id == "req-1" &&
-              decoded.value().service == "echo");
+        CHECK(decoded && decoded.value().request_id == "req-1" && decoded.value().service == "echo");
     }
 }
 
-void PhaseWire() {
+void PhaseWire()
+{
     // Error.request_phase 带过 wire（decisions/0008 的升级路径）：optional
     // 字段保留存在位——缺席 → nullopt，绝不补成 NotStarted；UNSPECIFIED 与
     // 未识别值按 ProtocolError 拒绝；远端 Error 阶段只作远端事实透传，本地
@@ -335,14 +336,12 @@ void PhaseWire() {
     // wire 存在性用确定性 diff 证明：带阶段的编码 = 缺字段编码在 error
     // 子消息尾部追加 {0x48, wire_value}（field 9 varint），且 error LEN
     // 前缀恰大 2——不靠字节扫描（payload 内容可能撞 tag 值）。
-    const RequestPhase phases[] = {
-        RequestPhase::NotStarted, RequestPhase::Connecting,
-        RequestPhase::Writing, RequestPhase::RequestCommitted,
-        RequestPhase::ReplyTerminal};
+    const RequestPhase phases[] = {RequestPhase::NotStarted, RequestPhase::Connecting, RequestPhase::Writing,
+                                   RequestPhase::RequestCommitted, RequestPhase::ReplyTerminal};
     for (const auto phase : phases) {
         auto with = failing;
         with.error.request_phase = phase;
-        auto without = failing;  // request_phase 缺席
+        auto without = failing; // request_phase 缺席
         auto with_bytes = rpc::EncodeRpcWireEnvelope(with, /*is_response=*/true);
         auto without_bytes = rpc::EncodeRpcWireEnvelope(without, true);
         CHECK(with_bytes && without_bytes);
@@ -352,21 +351,22 @@ void PhaseWire() {
         CHECK(a.size() == b.size() + 2);
         CHECK(a[a.size() - 2] == 0x48 && a.back() == wire_value);
         std::size_t i = 0;
-        while (i < b.size() && a[i] == b[i]) { ++i; }  // error LEN 前缀处
+        while (i < b.size() && a[i] == b[i]) {
+            ++i;
+        } // error LEN 前缀处
         CHECK(i < b.size() && a[i] == b[i] + 2);
         CHECK(std::equal(b.begin() + i + 1, b.end(), a.begin() + i + 1));
         auto back = rpc::DecodeRpcWireEnvelope(a, /*is_response=*/true);
         CHECK(back && !back.value().success);
         CHECK(back.value().error.request_phase.has_value());
         CHECK(*back.value().error.request_phase == phase);
-        CHECK(IsRequestCommitted(*back.value().error.request_phase) ==
-              IsRequestCommitted(phase));
+        CHECK(IsRequestCommitted(*back.value().error.request_phase) == IsRequestCommitted(phase));
     }
 
     // nullopt 与旧 peer（缺字段）：编码端不落 field 9，解码端回 nullopt——
     // 不补 NotStarted、不推断未提交。
     {
-        auto env = failing;  // request_phase 默认 nullopt
+        auto env = failing; // request_phase 默认 nullopt
         auto bytes = rpc::EncodeRpcWireEnvelope(env, /*is_response=*/true);
         CHECK(bytes);
         auto back = rpc::DecodeRpcWireEnvelope(bytes.value(), true);
@@ -400,11 +400,10 @@ void PhaseWire() {
         bytes.push_back(0x5A);
         bytes.push_back(0x04);
         bytes.push_back(0x08);
-        bytes.push_back(0x0B);   // code=NOT_FOUND，合法
+        bytes.push_back(0x0B); // code=NOT_FOUND，合法
         bytes.push_back(0x48);
-        bytes.push_back(bad);    // request_phase 非法
-        ExpectCode(rpc::DecodeRpcWireEnvelope(bytes, /*is_response=*/true),
-                   ErrorCode::ProtocolError);
+        bytes.push_back(bad); // request_phase 非法
+        ExpectCode(rpc::DecodeRpcWireEnvelope(bytes, /*is_response=*/true), ErrorCode::ProtocolError);
     }
 
     // 成功响应不产生 error 分支，也无 request_phase 可丢。
@@ -419,25 +418,22 @@ void PhaseWire() {
 // 修复后契约断言（原复现探针已翻转）：调用方把 Error.request_phase
 // 设为本地枚举范围之外的值时，Validate 与 Encode 都按 ProtocolError 拒绝，
 // 不再产出 present-UNSPECIFIED（接收端必拒）的 wire。
-void PhaseWireInvalidLocalProbe() {
+void PhaseWireInvalidLocalProbe()
+{
     auto env = ValidRequest();
     env.success = false;
     env.error = MakeError(ErrorCode::OutcomeUnknown, "reply lost after commit");
 
-    const RequestPhase invalids[] = {
-        static_cast<RequestPhase>(-1),
-        static_cast<RequestPhase>(5),   // 合法序 0..4 之外
-        static_cast<RequestPhase>(99)};
+    const RequestPhase invalids[] = {static_cast<RequestPhase>(-1),
+                                     static_cast<RequestPhase>(5), // 合法序 0..4 之外
+                                     static_cast<RequestPhase>(99)};
     for (const auto bad : invalids) {
         env.error.request_phase = bad;
         const int v = static_cast<int>(bad);
 
         auto validated = rpc::ValidateRpcWireEnvelope(env, /*is_response=*/true);
-        std::cout << "invalid_local_phase value=" << v
-                  << " validate_ok=" << (validated ? 1 : 0)
-                  << " validate_error="
-                  << (validated ? -1 : static_cast<int>(validated.error().code))
-                  << '\n';
+        std::cout << "invalid_local_phase value=" << v << " validate_ok=" << (validated ? 1 : 0)
+                  << " validate_error=" << (validated ? -1 : static_cast<int>(validated.error().code)) << '\n';
         // 修复后契约：Validate 必须先拒非法本地阶段。
         CHECK(!validated);
         if (!validated) {
@@ -445,11 +441,8 @@ void PhaseWireInvalidLocalProbe() {
         }
 
         auto bytes = rpc::EncodeRpcWireEnvelope(env, /*is_response=*/true);
-        std::cout << "invalid_local_phase value=" << v
-                  << " encode_ok=" << (bytes ? 1 : 0)
-                  << " encode_error="
-                  << (bytes ? -1 : static_cast<int>(bytes.error().code))
-                  << '\n';
+        std::cout << "invalid_local_phase value=" << v << " encode_ok=" << (bytes ? 1 : 0)
+                  << " encode_error=" << (bytes ? -1 : static_cast<int>(bytes.error().code)) << '\n';
         // 修复后契约：Encode 同样拒绝，不再产出接收端必拒的 wire。
         CHECK(!bytes);
         if (!bytes) {
@@ -463,20 +456,28 @@ void PhaseWireInvalidLocalProbe() {
     auto back = rpc::DecodeRpcWireEnvelope(good.value(), /*is_response=*/true);
     CHECK(back);
     if (back) {
-        CHECK(back.value().error.request_phase.has_value() &&
-              *back.value().error.request_phase == RequestPhase::RequestCommitted);
+        CHECK(back.value().error.request_phase.has_value()
+              && *back.value().error.request_phase == RequestPhase::RequestCommitted);
     }
 }
 
 } // namespace
 
-int RunCase(const std::string& mode) {
-    if (mode == "wire_roundtrip") { Roundtrip(); }
-    else if (mode == "wire_reject") { Reject(); }
-    else if (mode == "wire_malformed") { Malformed(); }
-    else if (mode == "wire_request_phase") { PhaseWire(); }
-    else if (mode == "wire_phase_invalid_local_probe") { PhaseWireInvalidLocalProbe(); }
-    else { CHECK(false); }
+int RunCase(const std::string& mode)
+{
+    if (mode == "wire_roundtrip") {
+        Roundtrip();
+    } else if (mode == "wire_reject") {
+        Reject();
+    } else if (mode == "wire_malformed") {
+        Malformed();
+    } else if (mode == "wire_request_phase") {
+        PhaseWire();
+    } else if (mode == "wire_phase_invalid_local_probe") {
+        PhaseWireInvalidLocalProbe();
+    } else {
+        CHECK(false);
+    }
     std::cout << "rpc wire " << mode << " PASS\n";
     return 0;
 }
@@ -485,7 +486,8 @@ int RunCase(const std::string& mode) {
 
 #include "../net/ProcessRuntimeTestMain.hpp"
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv)
+{
     return bbt_net_test::RunTestProcessExit([&] {
         rpc_net_test::Watchdog watchdog;
         try {

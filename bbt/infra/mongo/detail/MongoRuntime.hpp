@@ -1,8 +1,8 @@
 #pragma once
-// MongoRuntime：mongo 资源 owner（docs/decisions/0007-mongo-owner-handles.md；仍走裁决的
-// mongocxx 同步 driver + 有界 worker bridge）。
+// MongoRuntime：mongo 资源 owner（契约见 docs/decisions/0007-mongo-owner-handles.md；
+// 底层为 mongocxx 同步 driver 加有界 worker bridge）。
 //
-// 归属变化（与旧契约每 client 一组 worker 的差异）：
+// 资源归属：每个 owner 拥有一组 worker，不再是每个 client 各自一组：
 //   - 连接配置、pool lease、worker 组、接纳队列、ops 注册表与关闭排空
 //     集中在 owner；集合句柄（MongoCollImpl）只携带 db/collection
 //     目标值与 owner 共享指针，不新建线程。
@@ -62,41 +62,49 @@ class MongoCollImpl;
 // 协议结果与终态一律落在本对象，等待者恢复后自己读 outcome。
 struct MongoOp : std::enable_shared_from_this<MongoOp> {
     enum class Kind {
-        InsertOne, FindOne, UpdateOne, DeleteOne,
-        InsertMany, Find, UpdateMany, DeleteMany, CountDocuments,
+        InsertOne,
+        FindOne,
+        UpdateOne,
+        DeleteOne,
+        InsertMany,
+        Find,
+        UpdateMany,
+        DeleteMany,
+        CountDocuments,
     };
     // kQueued 在 runtime 队列等 worker（含已登记未派发）；kRunning 已被
     // 取出、driver 调用进行中；kDone 后端不再访问（未派发摘出 / driver 已返回）。
     enum class Phase : int { kQueued = 0, kRunning = 1, kDone = 2 };
 
-    std::shared_ptr<MongoRuntime>        runtime;
-    std::shared_ptr<MongoCollImpl>       handle;
-    Kind                                 kind;
-    MongoDocument                        doc;     // insert 文档 / 谓词
-    MongoDocument                        update;  // UpdateOne/UpdateMany
-    std::vector<MongoDocument>           docs;    // 仅 InsertMany
-    std::size_t                          find_limit = 0;  // 仅 Find（必填）
-    std::size_t                          find_skip = 0;   // 仅 Find
-    MongoDocument                        find_sort;       // 仅 Find
-    MongoDocument                        find_projection; // 仅 Find
+    std::shared_ptr<MongoRuntime> runtime;
+    std::shared_ptr<MongoCollImpl> handle;
+    Kind kind;
+    MongoDocument doc;               // insert 文档 / 谓词
+    MongoDocument update;            // UpdateOne/UpdateMany
+    std::vector<MongoDocument> docs; // 仅 InsertMany
+    std::size_t find_limit = 0;      // 仅 Find（必填）
+    std::size_t find_skip = 0;       // 仅 Find
+    MongoDocument find_sort;         // 仅 Find
+    MongoDocument find_projection;   // 仅 Find
     bbt::coroutine::sync::CoWaiter::SPtr sig;
     std::optional<result<MongoOpOutcome>> outcome;
     // 首次发布即逻辑终态：Finish 经 CAS 保证只落定一次（worker 完成
     // 回投为主，调用方超时与 close 收口路径可能在其它线程触发）。
-    std::atomic_bool                     finished{false};
-    std::atomic<Phase>                   phase{Phase::kQueued};
+    std::atomic_bool finished{false};
+    std::atomic<Phase> phase{Phase::kQueued};
 
-    MongoOp(std::shared_ptr<MongoRuntime>  rt,
-            std::shared_ptr<MongoCollImpl> h, Kind k, MongoDocument d,
+    MongoOp(std::shared_ptr<MongoRuntime> rt, std::shared_ptr<MongoCollImpl> h, Kind k, MongoDocument d,
             MongoDocument u)
-        : runtime(std::move(rt)), handle(std::move(h)), kind(k),
-          doc(std::move(d)), update(std::move(u)) {}
+        : runtime(std::move(rt)), handle(std::move(h)), kind(k), doc(std::move(d)), update(std::move(u))
+    {
+    }
 
     // 可在任意线程调用：首次落定者独占 outcome 写入并唤醒等待者；
     // 完成/deadline/owner close 竞争时先到者的逻辑终态不被覆盖。
     // 早退分支也做 MaybeUnregister：phase=kDone 可能由另一收口路径在
     // finished 置位之后才落定，两条路径都要汇到反登记检查。
-    void Finish(result<MongoOpOutcome> r) noexcept {
+    void Finish(result<MongoOpOutcome> r) noexcept
+    {
         if (finished.exchange(true)) {
             MaybeUnregister();
             return;
@@ -116,9 +124,10 @@ struct MongoOp : std::enable_shared_from_this<MongoOp> {
 // 持有；op 也保活 runtime，最后一个引用释放后才析构。
 class MongoRuntime : public std::enable_shared_from_this<MongoRuntime> {
 public:
-    MongoRuntime(mongo::MongoRuntimeConfig    config,
-                 bbt::coroutine::CoObjectInfo info)
-        : m_config(std::move(config)), m_info(std::move(info)) {}
+    MongoRuntime(mongo::MongoRuntimeConfig config, bbt::coroutine::CoObjectInfo info)
+        : m_config(std::move(config)), m_info(std::move(info))
+    {
+    }
     // op 经 shared_ptr 保活 runtime；句柄不持 worker。析构前完成收口
     // 并 join 全部 worker——driver 调用有超时上界，join 必然收敛。
     ~MongoRuntime();
@@ -130,14 +139,10 @@ public:
     // handle 为目标集合来源；调用方须保证其处于接纳态（MongoCollImpl 已校验）。
     // docs/find_limit/find_skip/find_sort/find_projection 为可选扩展载荷：
     // docs 仅 InsertMany 携带，find_* 仅 Find 携带；其余 kind 保持默认。
-    result<MongoOpOutcome> Submit(std::shared_ptr<MongoCollImpl> handle,
-                                  MongoOp::Kind kind, MongoDocument doc,
-                                  MongoDocument      update,
-                                  const CallOptions& options,
-                                  std::vector<MongoDocument> docs = {},
-                                  std::size_t find_limit = 0,
-                                  std::size_t find_skip = 0,
-                                  MongoDocument find_sort = {},
+    result<MongoOpOutcome> Submit(std::shared_ptr<MongoCollImpl> handle, MongoOp::Kind kind, MongoDocument doc,
+                                  MongoDocument update, const CallOptions& options,
+                                  std::vector<MongoDocument> docs = {}, std::size_t find_limit = 0,
+                                  std::size_t find_skip = 0, MongoDocument find_sort = {},
                                   MongoDocument find_projection = {});
 
     // 同步关闭（幂等、任意线程可调用）：取得关闭权者封口 → 唤醒全部挂起
@@ -147,24 +152,38 @@ public:
     // 不提前 Closed。返回即 op/worker 已收口，且 runtime 不再接纳新命令；
     // driver 自身超时是在途调用返回上界。
     void Close() noexcept;
-    bool IsClosed() const noexcept { return m_close.IsClosed(); }
+    bool IsClosed() const noexcept
+    {
+        return m_close.IsClosed();
+    }
     // owner 是否处于 Running（Start 成功且未进入关闭）。Collection()
     // 用它落实公共契约「owner 必须 Running 才能创建句柄」。
-    bool IsRunning() const noexcept { return m_state.load() == kRunning; }
-    bbt::coroutine::CoObjectInfo GetObjectInfo() const { return m_info; }
-    const mongo::MongoRuntimeConfig& Config() const { return m_config; }
+    bool IsRunning() const noexcept
+    {
+        return m_state.load() == kRunning;
+    }
+    bbt::coroutine::CoObjectInfo GetObjectInfo() const
+    {
+        return m_info;
+    }
+    const mongo::MongoRuntimeConfig& Config() const
+    {
+        return m_config;
+    }
 
     // ---- op 生命周期（m_ops_mtx 保护，跨线程可触达）----
     // 返回 false 表示 teardown 已快照，调用方按 Closed 拒绝——保证
     // 「已登记必被终态收口」，等待者不会因 close 竞态挂住。
-    bool RegisterOp(const std::shared_ptr<MongoOp>& op) {
+    bool RegisterOp(const std::shared_ptr<MongoOp>& op)
+    {
         std::lock_guard<std::mutex> lk(m_ops_mtx);
         if (m_io_dead)
             return false;
         m_ops.insert(op);
         return true;
     }
-    void UnregisterOp(const std::shared_ptr<MongoOp>& op) {
+    void UnregisterOp(const std::shared_ptr<MongoOp>& op)
+    {
         bool drained = false;
         {
             std::lock_guard<std::mutex> lk(m_ops_mtx);
@@ -179,28 +198,32 @@ public:
 
     // 真实生产状态观测：worker 数（m_live_workers 参与 drain 谓词）。
     // 保留、不门控——Release 下同样可用。同一 owner 多句柄共享同一组 worker。
-    std::size_t LiveWorkersForTest() const noexcept {
+    std::size_t LiveWorkersForTest() const noexcept
+    {
         return static_cast<std::size_t>(m_live_workers.load());
     }
 #ifdef BBT_INFRA_STRINGENT_DEBUG
     // debug 观测（仅观测数据，整体在宏内）：运行中 driver 调用计数与
     // 峰值由 debug/InfraDebug.hpp 的 MongoRuntimeObservation 维护，
     // 取证存储/锁也随其移出生产对象。Release 下这些访问器不存在。
-    std::size_t RunningDriverCallsForTest() const noexcept {
+    std::size_t RunningDriverCallsForTest() const noexcept
+    {
         return m_obs.running_calls.load();
     }
-    std::size_t PeakDriverCallsForTest() const noexcept {
+    std::size_t PeakDriverCallsForTest() const noexcept
+    {
         return m_obs.peak_calls.load();
     }
-    std::optional<bbt::infra::debug::MongoThreadEvidence>
-    LastDriverThreadEvidenceForTest() const {
+    std::optional<bbt::infra::debug::MongoThreadEvidence> LastDriverThreadEvidenceForTest() const
+    {
         return m_obs.LastEvidence();
     }
 #endif
     // 队列深度观测（m_queue_mtx 保护）：跨集合共享背压用例用它确定
     // 「前一个 op 已占住队列容量」，再提交下一个断言 Overloaded。
     // 读的是真实生产队列 m_queue，Release 下同样可用。
-    std::size_t QueuedOpsForTest() const noexcept {
+    std::size_t QueuedOpsForTest() const noexcept
+    {
         std::lock_guard<std::mutex> lk(m_queue_mtx);
         return m_queue.size();
     }
@@ -211,7 +234,8 @@ public:
     // 故它证明「op 已离开队列并被 worker 占用执行槽」，不等同于「已进入 native
     // driver 调用」——native 入口之后的证据仍由既有 debug 观测（RunningGuard）
     // 提供，本访问器不冒充后者。
-    std::size_t DriverCallsInFlightForTest() const noexcept {
+    std::size_t DriverCallsInFlightForTest() const noexcept
+    {
         std::lock_guard<std::mutex> lk(m_ops_mtx);
         std::size_t n = 0;
         for (const auto& op : m_ops)
@@ -219,22 +243,22 @@ public:
                 ++n;
         return n;
     }
-    // 关闭链路观测（m_ops_mtx 保护）：确认启动失败/关闭收口后 io 域已
-    // 置死，后续提交一律按 Closed 拒绝（回归接缝）。
-    bool IoDeadForTest() const noexcept {
+    // 关闭链路观测（m_ops_mtx 保护）：启动失败或关闭收口后 io 域已置死，
+    // 后续提交一律按 Closed 拒绝。
+    bool IoDeadForTest() const noexcept
+    {
         std::lock_guard<std::mutex> lk(m_ops_mtx);
         return m_io_dead;
     }
 
-    // 回归接缝（生产路径不安装；默认 kSpawnFailNone 不改变
-    // 行为）：让下一次 Start 的 worker 组在指定点失败——kSpawnFailReserve
-    // 在 reserve 前失败（等价 bad_alloc），其余值在第 N 个 worker 创建前
-    // 失败（等价 std::thread 构造抛 system_error，此时已起 N 个 worker）。
-    static constexpr std::size_t kSpawnFailNone =
-        static_cast<std::size_t>(-1);
-    static constexpr std::size_t kSpawnFailReserve =
-        static_cast<std::size_t>(-2);
-    void SetWorkerSpawnFailForTest(std::size_t at) noexcept {
+    // 测试注入点：让下一次 Start 的 worker 组在指定位置失败。生产路径不安装，
+    // 默认 kSpawnFailNone 不改变行为。kSpawnFailReserve 在 reserve 前失败，
+    // 等价 bad_alloc；其余值在第 N 个 worker 创建前失败，等价 std::thread 构造抛
+    // system_error，此时已启动 N 个 worker。
+    static constexpr std::size_t kSpawnFailNone = static_cast<std::size_t>(-1);
+    static constexpr std::size_t kSpawnFailReserve = static_cast<std::size_t>(-2);
+    void SetWorkerSpawnFailForTest(std::size_t at) noexcept
+    {
         m_spawn_fail_at.store(at, std::memory_order_relaxed);
     }
 
@@ -243,13 +267,12 @@ private:
     result<void> PreCheck() const;
 
     // ---- worker 线程域 ----
-    void                  WorkerLoop() noexcept;
+    void WorkerLoop() noexcept;
     // 在同一 worker 上 acquire/use/release client 并执行阻塞调用；
     // 全部 driver/bson 异常分类为契约 Error，不向 worker 抛出。
     result<MongoOpOutcome> RunDriverCall(const MongoOp& op) noexcept;
     // 完成回投共享 executor 后落定；执行域不可达时 worker 直接落定。
-    void Publish(const std::shared_ptr<MongoOp>& op,
-                 result<MongoOpOutcome>          r);
+    void Publish(const std::shared_ptr<MongoOp>& op, result<MongoOpOutcome> r);
 
     // ---- 关闭链路（Close/finalizer 线程直接执行）----
     void Teardown() noexcept;
@@ -264,47 +287,47 @@ private:
     void Finalize() noexcept;
     void FinalizeOnce() noexcept;
 
-    mongo::MongoRuntimeConfig    m_config;
+    mongo::MongoRuntimeConfig m_config;
     bbt::coroutine::CoObjectInfo m_info;
-    ManagedCloseState            m_close;
-    MongoIoEngine                m_engine;   // 完成回投域
-    std::atomic<int>             m_state{kCreated};
+    ManagedCloseState m_close;
+    MongoIoEngine m_engine; // 完成回投域
+    std::atomic<int> m_state{kCreated};
     // 生命周期迁移（Start 发布 pool/取运行态、Close 取关闭权）与 finalizer
     // 归还 lease 互斥：同一 m_pool shared_ptr 对象不再被并发赋值/reset
     // （shared_ptr 引用计数的线程安全不覆盖同一对象的并发修改）。
-    std::mutex                   m_lifecycle_mtx;
-    std::shared_ptr<MongoPoolLease> m_pool;  // Start 建立
+    std::mutex m_lifecycle_mtx;
+    std::shared_ptr<MongoPoolLease> m_pool; // Start 建立
 
-    mutable std::mutex                           m_ops_mtx;
+    mutable std::mutex m_ops_mtx;
     std::unordered_set<std::shared_ptr<MongoOp>> m_ops;
-    bool m_io_dead{false};   // m_ops_mtx 保护：teardown 后置位
-    // 回归接缝状态；生产默认 kSpawnFailNone。
+    bool m_io_dead{false}; // m_ops_mtx 保护：teardown 后置位
+    // 测试注入点的当前状态；生产默认 kSpawnFailNone。
     std::atomic<std::size_t> m_spawn_fail_at{kSpawnFailNone};
     // Close 有界排空等待（m_ops_mtx + 谓词「op 清空且 worker 全退」）。
-    std::condition_variable                      m_drain_cv;
+    std::condition_variable m_drain_cv;
 
     // 挂起业务等待者登记：Close 在此唤醒全部在册等待者（跨线程安全）。
-    CloseWaiters                                 m_waiters;
+    CloseWaiters m_waiters;
 
-    mutable std::mutex                  m_queue_mtx;
-    std::condition_variable               m_queue_cv;
-    std::deque<std::shared_ptr<MongoOp>>  m_queue;          // m_queue_mtx 保护
-    bool                                  m_queue_stopping{false};
+    mutable std::mutex m_queue_mtx;
+    std::condition_variable m_queue_cv;
+    std::deque<std::shared_ptr<MongoOp>> m_queue; // m_queue_mtx 保护
+    bool m_queue_stopping{false};
 
-    std::vector<std::thread>   m_workers;
+    std::vector<std::thread> m_workers;
     // worker 在 loop 顶自增、退出前自减；DrainNotify 据此唤醒 finalizer
     // 的排空等待（不在此发布终态）。
-    std::atomic<int>           m_live_workers{0};
+    std::atomic<int> m_live_workers{0};
     // worker 起跑闩与 join 串行：m_started_workers（m_workers_mtx 保护）只增
     // 不减，Start 等其等于配置数（Close 抢跑时以 state 逃逸，不依赖
     // live_workers==配置数、不会自锁）；m_join_mtx 使并发 Close 的 join
     // 串行，后来者观察到同一 join 事实。
-    std::mutex                 m_workers_mtx;
-    std::condition_variable    m_workers_cv;
-    int                        m_started_workers{0};
-    std::mutex                 m_join_mtx;
+    std::mutex m_workers_mtx;
+    std::condition_variable m_workers_cv;
+    int m_started_workers{0};
+    std::mutex m_join_mtx;
     // 唯一配对 finalizer 的 once 闩：并发/重复 Close 与析构等待同一事实。
-    std::once_flag             m_finalize_once;
+    std::once_flag m_finalize_once;
 #ifdef BBT_INFRA_STRINGENT_DEBUG
     // 仅观测：运行中 driver 调用计数/峰值 + 执行域取证存储与锁，整体收进
     // debug 层组件（Release 下生产对象无这些原子/锁/存储，也无相关符号）。
@@ -317,93 +340,97 @@ private:
 // MongoCollImpl：集合句柄——携带 db/collection 目标值与 owner 共享
 // 指针，不持有 worker/队列/pool。句柄关闭只影响自身接纳与新命令
 // 前置校验；owner 的物理收口与在途 op 保活由 runtime 负责。
-class MongoCollImpl : public mongo::CoMongoColl,
-                      public std::enable_shared_from_this<MongoCollImpl> {
+class MongoCollImpl : public mongo::CoMongoColl, public std::enable_shared_from_this<MongoCollImpl> {
 public:
-    MongoCollImpl(std::shared_ptr<MongoRuntime> runtime,
-                  mongo::MongoTarget            target,
-                  bbt::coroutine::CoObjectInfo  info)
-        : m_runtime(std::move(runtime)),
-          m_target(std::move(target)),
-          m_info(std::move(info)) {}
+    MongoCollImpl(std::shared_ptr<MongoRuntime> runtime, mongo::MongoTarget target, bbt::coroutine::CoObjectInfo info)
+        : m_runtime(std::move(runtime)), m_target(std::move(target)), m_info(std::move(info))
+    {
+    }
     // 不拥有 worker/ops；析构前只做句柄级接纳封口（幂等）。
-    ~MongoCollImpl() override { Close(); }
+    ~MongoCollImpl() override
+    {
+        Close();
+    }
 
-    bbt_co_async(result<void>) InsertOne(const MongoDocument& doc,
-                                         const CallOptions&   options) override;
-    bbt_co_async(result<std::optional<MongoDocument>>) FindOne(
-        const MongoDocument& filter, const CallOptions& options) override;
-    bbt_co_async(result<MongoUpdateResult>) UpdateOne(
-        const MongoDocument& filter, const MongoDocument& update,
-        const CallOptions&   options) override;
-    bbt_co_async(result<std::uint64_t>) DeleteOne(
-        const MongoDocument& filter, const CallOptions& options) override;
+    bbt_co_async(result<void>) InsertOne(const MongoDocument& doc, const CallOptions& options) override;
+    bbt_co_async(result<std::optional<MongoDocument>>)
+        FindOne(const MongoDocument& filter, const CallOptions& options) override;
+    bbt_co_async(result<MongoUpdateResult>)
+        UpdateOne(const MongoDocument& filter, const MongoDocument& update, const CallOptions& options) override;
+    bbt_co_async(result<std::uint64_t>) DeleteOne(const MongoDocument& filter, const CallOptions& options) override;
 
-    bbt_co_async(result<mongo::MongoInsertManyResult>) InsertMany(
-        const std::vector<MongoDocument>& docs,
-        const CallOptions&                options) override;
-    bbt_co_async(result<std::vector<MongoDocument>>) Find(
-        const MongoDocument& filter, const mongo::FindOptions& find_options,
-        const CallOptions&   options) override;
-    bbt_co_async(result<MongoUpdateResult>) UpdateMany(
-        const MongoDocument& filter, const MongoDocument& update,
-        const CallOptions&   options) override;
-    bbt_co_async(result<std::uint64_t>) DeleteMany(
-        const MongoDocument& filter, const CallOptions& options) override;
-    bbt_co_async(result<std::uint64_t>) CountDocuments(
-        const MongoDocument& filter, const CallOptions& options) override;
+    bbt_co_async(result<mongo::MongoInsertManyResult>)
+        InsertMany(const std::vector<MongoDocument>& docs, const CallOptions& options) override;
+    bbt_co_async(result<std::vector<MongoDocument>>)
+        Find(const MongoDocument& filter, const mongo::FindOptions& find_options, const CallOptions& options) override;
+    bbt_co_async(result<MongoUpdateResult>)
+        UpdateMany(const MongoDocument& filter, const MongoDocument& update, const CallOptions& options) override;
+    bbt_co_async(result<std::uint64_t>) DeleteMany(const MongoDocument& filter, const CallOptions& options) override;
+    bbt_co_async(result<std::uint64_t>)
+        CountDocuments(const MongoDocument& filter, const CallOptions& options) override;
 
     // 句柄关闭只做接纳门禁：封口后新命令前置校验返回 Closed；已提交的
     // 在途 op 由 op->handle 保活，物理收口归 runtime，句柄不等 owner drain。
-    void Close() noexcept override {
+    void Close() noexcept override
+    {
         m_close.BeginClose();
         m_close.MarkClosed();
     }
-    bool IsClosed() const noexcept override { return m_close.IsClosed(); }
-    bbt::coroutine::CoObjectInfo GetObjectInfo() const override {
+    bool IsClosed() const noexcept override
+    {
+        return m_close.IsClosed();
+    }
+    bbt::coroutine::CoObjectInfo GetObjectInfo() const override
+    {
         return m_info;
     }
 
-    bool                          Accepting() const noexcept {
+    bool Accepting() const noexcept
+    {
         return m_close.IsOpen();
     }
-    const mongo::MongoTarget&     Target() const { return m_target; }
-    std::shared_ptr<MongoRuntime> Runtime() const { return m_runtime; }
+    const mongo::MongoTarget& Target() const
+    {
+        return m_target;
+    }
+    std::shared_ptr<MongoRuntime> Runtime() const
+    {
+        return m_runtime;
+    }
 
 private:
     std::shared_ptr<MongoRuntime> m_runtime;
-    mongo::MongoTarget            m_target;
-    bbt::coroutine::CoObjectInfo  m_info;
-    ManagedCloseState             m_close;
+    mongo::MongoTarget m_target;
+    bbt::coroutine::CoObjectInfo m_info;
+    ManagedCloseState m_close;
 };
 
-inline void MongoOp::MaybeUnregister() {
+inline void MongoOp::MaybeUnregister()
+{
     if (finished && phase.load() == Phase::kDone)
         runtime->UnregisterOp(shared_from_this());
 }
 
-// CoMongoCliImpl：旧契约 client——内部持有一个独占 runtime + 一个
-// 集合句柄；保留既有公开 API 行为，不新增公共能力。worker/队列/pool
-// 资源归属已上移到 MongoRuntime，本类只剩状态转发。
-class CoMongoCliImpl : public CoMongoCli,
-                       public std::enable_shared_from_this<CoMongoCliImpl> {
+// CoMongoCliImpl：单集合 client 的实现，内部持有一个独占 runtime 与一个
+// 集合句柄。worker、队列与 pool 资源归属在 MongoRuntime，本类只做状态转发。
+class CoMongoCliImpl : public CoMongoCli, public std::enable_shared_from_this<CoMongoCliImpl> {
 public:
-    CoMongoCliImpl(MongoClientConfig             config,
-                   bbt::coroutine::CoObjectInfo  info)
-        : m_config(std::move(config)), m_info(std::move(info)) {}
-    ~CoMongoCliImpl() override { Close(); }
+    CoMongoCliImpl(MongoClientConfig config, bbt::coroutine::CoObjectInfo info)
+        : m_config(std::move(config)), m_info(std::move(info))
+    {
+    }
+    ~CoMongoCliImpl() override
+    {
+        Close();
+    }
 
     result<void> Start() override;
 
-    result<void> InsertOne(const MongoDocument& doc,
-                           const CallOptions&   options) override;
-    result<std::optional<MongoDocument>> FindOne(
-        const MongoDocument& filter, const CallOptions& options) override;
-    result<MongoUpdateResult> UpdateOne(const MongoDocument& filter,
-                                        const MongoDocument& update,
-                                        const CallOptions&   options) override;
-    result<std::uint64_t> DeleteOne(const MongoDocument& filter,
-                                    const CallOptions&   options) override;
+    result<void> InsertOne(const MongoDocument& doc, const CallOptions& options) override;
+    result<std::optional<MongoDocument>> FindOne(const MongoDocument& filter, const CallOptions& options) override;
+    result<MongoUpdateResult> UpdateOne(const MongoDocument& filter, const MongoDocument& update,
+                                        const CallOptions& options) override;
+    result<std::uint64_t> DeleteOne(const MongoDocument& filter, const CallOptions& options) override;
 
     // client 关闭 = 句柄接纳封口 + 独占 runtime 同步收口：返回即 worker
     // 全退、ops 清空（未 Start 时无 runtime，本对象信号即刻落定）。
@@ -413,40 +440,47 @@ public:
     void Close() noexcept override;
     // 语义：runtime 物理收口（ops 清空 + worker 全退）才视为 Closed；
     // 未 Start（m_runtime 为空）时看本对象 close 信号。
-    bool IsClosed() const noexcept override {
+    bool IsClosed() const noexcept override
+    {
         const auto rt = RuntimeSnapshot();
         return rt ? rt->IsClosed() : m_close.IsClosed();
     }
-    bbt::coroutine::CoObjectInfo GetObjectInfo() const override {
+    bbt::coroutine::CoObjectInfo GetObjectInfo() const override
+    {
         return m_info;
     }
 
     // 真实生产状态观测：委托 runtime 的存活 worker 数（Release 下同样可用；
     // Start 未成功建立 runtime 时为 0）。
-    std::size_t LiveWorkersForTest() const noexcept {
+    std::size_t LiveWorkersForTest() const noexcept
+    {
         const auto rt = RuntimeSnapshot();
         return rt ? rt->LiveWorkersForTest() : 0;
     }
     // 真实生产状态：委托 runtime 的接纳队列深度（读 m_queue，Release 下
     // 同样可用；Start 未建立 runtime 时为 0）。测试用它做确定性同步。
-    std::size_t QueuedOpsForTest() const noexcept {
+    std::size_t QueuedOpsForTest() const noexcept
+    {
         const auto rt = RuntimeSnapshot();
         return rt ? rt->QueuedOpsForTest() : 0;
     }
     // 真实生产状态：委托 runtime 的执行槽占用数（读 m_ops + phase==kRunning，
     // Release 下同样可用；Start 未建立 runtime 时为 0）。
-    std::size_t DriverCallsInFlightForTest() const noexcept {
+    std::size_t DriverCallsInFlightForTest() const noexcept
+    {
         const auto rt = RuntimeSnapshot();
         return rt ? rt->DriverCallsInFlightForTest() : 0;
     }
 #ifdef BBT_INFRA_STRINGENT_DEBUG
     // 兼容 debug 观测钩子（委托 runtime；Start 未建立 runtime 时为 0）。
     // Release 下不存在。
-    std::size_t RunningDriverCallsForTest() const noexcept {
+    std::size_t RunningDriverCallsForTest() const noexcept
+    {
         const auto rt = RuntimeSnapshot();
         return rt ? rt->RunningDriverCallsForTest() : 0;
     }
-    std::size_t PeakDriverCallsForTest() const noexcept {
+    std::size_t PeakDriverCallsForTest() const noexcept
+    {
         const auto rt = RuntimeSnapshot();
         return rt ? rt->PeakDriverCallsForTest() : 0;
     }
@@ -456,17 +490,20 @@ private:
     // 稳定快照：m_coll/m_runtime 由 Start 在 m_lifecycle_mtx 内发布、由
     // Close 在同一锁内取走并收口。所有直接消费者先取快照再使用，绝不
     // 持锁跨协程 Submit／回调，避免与 Close 配对制造死锁。
-    std::shared_ptr<MongoCollImpl> CollSnapshot() const noexcept {
+    std::shared_ptr<MongoCollImpl> CollSnapshot() const noexcept
+    {
         std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
         return m_coll;
     }
-    std::shared_ptr<MongoRuntime> RuntimeSnapshot() const noexcept {
+    std::shared_ptr<MongoRuntime> RuntimeSnapshot() const noexcept
+    {
         std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
         return m_runtime;
     }
     // 「Start 在途」标志的收尾：必须在资源自清完成后才清标志并唤醒
     // Close，保证 Close 返回当刻资源已收口。
-    void FinishStarting() noexcept {
+    void FinishStarting() noexcept
+    {
         {
             std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
             m_starting = false;
@@ -476,20 +513,25 @@ private:
     // Start 全部出口（成功/失败/被 Close 抢先封口）的作用域收尾。
     struct StartingScope {
         CoMongoCliImpl* cli;
-        explicit StartingScope(CoMongoCliImpl* c) noexcept : cli(c) {}
-        StartingScope(const StartingScope&)            = delete;
+        explicit StartingScope(CoMongoCliImpl* c) noexcept : cli(c)
+        {
+        }
+        StartingScope(const StartingScope&) = delete;
         StartingScope& operator=(const StartingScope&) = delete;
-        ~StartingScope() noexcept { cli->FinishStarting(); }
+        ~StartingScope() noexcept
+        {
+            cli->FinishStarting();
+        }
     };
 
-    MongoClientConfig                 m_config;
-    bbt::coroutine::CoObjectInfo      m_info;
-    ManagedCloseState                 m_close;
-    mutable std::mutex                m_lifecycle_mtx;  // 发布/封口配对
-    std::condition_variable           m_lifecycle_cv;   // Start 完成唤醒 Close
-    bool                              m_starting = false;  // Start 在途
-    std::shared_ptr<MongoRuntime>     m_runtime;  // Start 成功才建立
-    std::shared_ptr<MongoCollImpl>    m_coll;     // 与 runtime 同建
+    MongoClientConfig m_config;
+    bbt::coroutine::CoObjectInfo m_info;
+    ManagedCloseState m_close;
+    mutable std::mutex m_lifecycle_mtx;      // 发布/封口配对
+    std::condition_variable m_lifecycle_cv;  // Start 完成唤醒 Close
+    bool m_starting = false;                 // Start 在途
+    std::shared_ptr<MongoRuntime> m_runtime; // Start 成功才建立
+    std::shared_ptr<MongoCollImpl> m_coll;   // 与 runtime 同建
 };
 
 } // namespace bbt::infra::mongo_detail

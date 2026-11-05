@@ -36,7 +36,7 @@ public:
     static std::error_code BindSlots(std::size_t count, std::vector<DriverSlot>& out,
                                      std::vector<DriverSlot>* residual = nullptr);
 
-    // 同代同步解绑：成功项原地移出（无分配、无临时容器）；解绑被拒项保留在
+    // 同代同步解绑：成功项原地移出（不分配额外容器）；解绑被拒项保留在
     // slots 中由调用者继续持有。返回首个失败映射。
     static std::error_code UnbindSlots(std::vector<DriverSlot>& slots);
 

@@ -37,8 +37,7 @@ public:
     OutboundQueue(std::size_t ring_bytes, std::size_t max_total_bytes, std::size_t max_segments)
         : max_total_bytes_(max_total_bytes), max_segments_(max_segments)
     {
-        if (ring_bytes != 0 && max_total_bytes != 0 && max_segments != 0
-            && ring_bytes <= max_total_bytes) {
+        if (ring_bytes != 0 && max_total_bytes != 0 && max_segments != 0 && ring_bytes <= max_total_bytes) {
             geometry_valid_ = true;
             ring_.resize(ring_bytes);
         }
@@ -53,8 +52,7 @@ public:
     // 初始化成功前不触碰源；之后 swap/exchange 不分配、不抛。
     // 构造失败无目标对象，源字节/几何完整保持原样。
     OutboundQueue(OutboundQueue&& other)
-        : max_total_bytes_(other.max_total_bytes_),
-          max_segments_(other.max_segments_),
+        : max_total_bytes_(other.max_total_bytes_), max_segments_(other.max_segments_),
           geometry_valid_(other.geometry_valid_)
     {
         ring_.swap(other.ring_);
@@ -78,14 +76,32 @@ public:
         return *this;
     }
 
-    std::size_t RingCapacity() const noexcept { return ring_.size(); }
-    std::size_t MaxTotalBytes() const noexcept { return max_total_bytes_; }
+    std::size_t RingCapacity() const noexcept
+    {
+        return ring_.size();
+    }
+    std::size_t MaxTotalBytes() const noexcept
+    {
+        return max_total_bytes_;
+    }
     // 段语义：MaxSegments 是溢出 list 的段数上限；SegmentCount 是逻辑
     // 总段数（ring 非空计 1 段 + 溢出段数），可达 MaxSegments()+1。
-    std::size_t MaxSegments() const noexcept { return max_segments_; }
-    std::size_t TotalBytes() const noexcept { return ring_size_ + list_bytes_; }
-    std::size_t SegmentCount() const noexcept { return (ring_size_ != 0 ? 1 : 0) + spill_.size(); }
-    bool Empty() const noexcept { return TotalBytes() == 0; }
+    std::size_t MaxSegments() const noexcept
+    {
+        return max_segments_;
+    }
+    std::size_t TotalBytes() const noexcept
+    {
+        return ring_size_ + list_bytes_;
+    }
+    std::size_t SegmentCount() const noexcept
+    {
+        return (ring_size_ != 0 ? 1 : 0) + spill_.size();
+    }
+    bool Empty() const noexcept
+    {
+        return TotalBytes() == 0;
+    }
 
     // 拷贝追加。空数据合法且不产生任何段。无效几何、超总量界，或溢出
     // 部分既不能合并进尾段又已达到段数界时，在修改前拒绝
@@ -109,12 +125,11 @@ public:
         if (data.size() > max_total_bytes_ - TotalBytes()) {
             return std::make_error_code(std::errc::no_buffer_space);
         }
-        const std::size_t ring_space =
-            spill_.empty() ? ring_.size() - ring_size_ : 0;
+        const std::size_t ring_space = spill_.empty() ? ring_.size() - ring_size_ : 0;
         const std::size_t to_ring = data.size() < ring_space ? data.size() : ring_space;
         const std::string_view spill_part = data.substr(to_ring);
         const bool can_merge = !spill_part.empty() && !spill_.empty()
-            && spill_.back().size() + spill_part.size() <= kMaxMergedSegmentBytes;
+                               && spill_.back().size() + spill_part.size() <= kMaxMergedSegmentBytes;
         if (!spill_part.empty() && !can_merge && spill_.size() >= max_segments_) {
             return std::make_error_code(std::errc::no_buffer_space);
         }
@@ -150,11 +165,10 @@ public:
         if (ring_size_ != 0 && filled < max_views) {
             const std::size_t contiguous =
                 ring_size_ < ring_.size() - ring_head_ ? ring_size_ : ring_.size() - ring_head_;
-            views[filled++] = std::string_view(
-                reinterpret_cast<const char*>(ring_.data() + ring_head_), contiguous);
+            views[filled++] = std::string_view(reinterpret_cast<const char*>(ring_.data() + ring_head_), contiguous);
             if (ring_size_ > contiguous && filled < max_views) {
-                views[filled++] = std::string_view(
-                    reinterpret_cast<const char*>(ring_.data()), ring_size_ - contiguous);
+                views[filled++] =
+                    std::string_view(reinterpret_cast<const char*>(ring_.data()), ring_size_ - contiguous);
             }
         }
         for (const auto& segment : spill_) {
@@ -208,11 +222,11 @@ private:
     std::vector<unsigned char> ring_;
     std::size_t ring_head_{0};
     std::size_t ring_size_{0};
-    std::deque<std::string> spill_;     // 溢出段，按发送顺序
+    std::deque<std::string> spill_; // 溢出段，按发送顺序
     std::size_t list_bytes_{0};
     std::size_t max_total_bytes_;
     std::size_t max_segments_;
-    bool geometry_valid_{false};        // 构造时几何校验结果
+    bool geometry_valid_{false}; // 构造时几何校验结果
 };
 
 } // namespace bbt::infra::net

@@ -1,17 +1,14 @@
+/** @file ICoObject.hpp
+ * @brief 协程受管对象的身份与等待参数：聚合 coroutine 的公开头，不复制上游类型定义。
+ *
+ * 上游 coroutine 已收敛到进程寿命运行时，本头只做聚合：
+ *   - bbt::coroutine::ICoObject、CoObjectInfo、CoObjectId：对象身份不再携带运行时代际；
+ *   - bbt::coroutine::Deadline、WaitStatus、WaitOptions，以及 bbt::coroutine::sync::CoWaiter、
+ *     CombinedWaitOptions、CoEventValue：请求等待与带载荷唤醒。
+ * 上游不再提供 CompletionSignal、CancellationToken/CancellationSource 与 RuntimeGeneration 系列类型，
+ * infra 也不引用它们。公共签名统一写 bbt::coroutine:: 限定名，infra 不提供同名别名。
+ */
 #pragma once
-// co-network/v1：协程受管对象的身份与等待参数。
-//
-// 上游 coroutine 已按进程寿命运行时收敛（候选 HEAD 03430a5），本头聚合其
-// 公开头，不复制上游类型定义：
-//   - bbt::coroutine::ICoObject / CoObjectInfo / CoObjectId（对象身份不再
-//     携带运行时代际）
-//   - bbt::coroutine::Deadline / WaitStatus / WaitOptions，以及
-//     bbt::coroutine::sync::CoWaiter / CombinedWaitOptions / CoEventValue
-//     （请求等待与带载荷唤醒）
-// 已删除的上游类型不再被 infra 引用：CompletionSignal、CancellationToken /
-// CancellationSource、RuntimeGeneration / CurrentRuntimeGeneration。
-// 契约公共签名一律写 bbt::coroutine:: 限定名，infra 不保留同名别名
-// （见 docs/decisions/0002-co-network-contract.md）。
 
 #include <bbt/coroutine/object/interface/ICoObject.hpp>
 #include <bbt/coroutine/sync/WaitTypes.hpp>

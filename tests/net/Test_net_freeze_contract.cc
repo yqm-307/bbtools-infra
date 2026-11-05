@@ -71,7 +71,8 @@ namespace {
 thread_local bool g_fail_alloc = false;
 }
 
-void* operator new(std::size_t size) {
+void* operator new(std::size_t size)
+{
     if (g_fail_alloc) {
         throw std::bad_alloc();
     }
@@ -81,24 +82,42 @@ void* operator new(std::size_t size) {
     }
     return memory;
 }
-void* operator new[](std::size_t size) { return ::operator new(size); }
-void operator delete(void* memory) noexcept { std::free(memory); }
-void operator delete[](void* memory) noexcept { std::free(memory); }
-void operator delete(void* memory, std::size_t) noexcept { std::free(memory); }
-void operator delete[](void* memory, std::size_t) noexcept { std::free(memory); }
+void* operator new[](std::size_t size)
+{
+    return ::operator new(size);
+}
+void operator delete(void* memory) noexcept
+{
+    std::free(memory);
+}
+void operator delete[](void* memory) noexcept
+{
+    std::free(memory);
+}
+void operator delete(void* memory, std::size_t) noexcept
+{
+    std::free(memory);
+}
+void operator delete[](void* memory, std::size_t) noexcept
+{
+    std::free(memory);
+}
 
-static void Check(bool value, const char* expression, int line) {
+static void Check(bool value, const char* expression, int line)
+{
     if (!value) {
         throw std::runtime_error("line " + std::to_string(line) + ": " + expression);
     }
 }
 #define CHECK(expression) Check(static_cast<bool>(expression), #expression, __LINE__)
 
-static bbt::coroutine::WaitOptions Until(std::chrono::milliseconds duration) {
+static bbt::coroutine::WaitOptions Until(std::chrono::milliseconds duration)
+{
     return {std::chrono::steady_clock::now() + duration};
 }
 
-static bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds timeout) {
+static bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds timeout)
+{
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
         if (predicate()) {
@@ -109,42 +128,49 @@ static bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milli
     return predicate();
 }
 
-static void StartRuntime(std::size_t workers) {
+static void StartRuntime(std::size_t workers)
+{
     g_bbt_coroutine_config->m_cfg_static_thread_num = workers;
     g_bbt_coroutine_config->m_cfg_stack_size = 65536;
     g_scheduler->Start();
 }
 
-static std::future<void> Task(std::function<void()> callback) {
+static std::future<void> Task(std::function<void()> callback)
+{
     auto promise = std::make_shared<std::promise<void>>();
     auto future = promise->get_future();
-    g_scheduler->RegistCoroutineTask(65536, [promise, callback] {
-        try {
-            callback();
-            promise->set_value();
-        } catch (...) {
-            promise->set_exception(std::current_exception());
-        }
-    }, "net.freeze");
+    g_scheduler->RegistCoroutineTask(
+        65536,
+        [promise, callback] {
+            try {
+                callback();
+                promise->set_value();
+            } catch (...) {
+                promise->set_exception(std::current_exception());
+            }
+        },
+        "net.freeze");
     return future;
 }
 
-static void Get(std::future<void>& future) {
+static void Get(std::future<void>& future)
+{
     CHECK(future.wait_for(5s) == std::future_status::ready);
     future.get();
 }
 
-static Address Loopback(int port) {
+static Address Loopback(int port)
+{
     std::error_code error;
     Address address = Address::Ip("127.0.0.1", port, error);
     CHECK(!error);
     return address;
 }
 
-static std::size_t CountFds() {
-    return static_cast<std::size_t>(std::distance(
-        std::filesystem::directory_iterator("/proc/self/fd"),
-        std::filesystem::directory_iterator{}));
+static std::size_t CountFds()
+{
+    return static_cast<std::size_t>(
+        std::distance(std::filesystem::directory_iterator("/proc/self/fd"), std::filesystem::directory_iterator{}));
 }
 
 struct EngineRunner {
@@ -152,22 +178,29 @@ struct EngineRunner {
     std::error_code error;
     std::thread thread;
 
-    EngineRunner(Engine& target, EngineConfig config) : engine(target) {
+    EngineRunner(Engine& target, EngineConfig config) : engine(target)
+    {
         thread = std::thread([this, config]() mutable { error = engine.Run(config); });
     }
-    bool WaitForReturn(std::chrono::milliseconds timeout) {
+    bool WaitForReturn(std::chrono::milliseconds timeout)
+    {
         return WaitUntil([&] { return engine.Phase() == EnginePhase::Stopped; }, timeout);
     }
-    void CloseAndJoin() {
+    void CloseAndJoin()
+    {
         engine.RequestClose();
         if (thread.joinable()) {
             thread.join();
         }
     }
-    ~EngineRunner() { CloseAndJoin(); }
+    ~EngineRunner()
+    {
+        CloseAndJoin();
+    }
 };
 
-static EngineConfig ServerConfig(const Address& listen, std::size_t subs = 1) {
+static EngineConfig ServerConfig(const Address& listen, std::size_t subs = 1)
+{
     EngineConfig config;
     config.listen_addresses = {listen};
     config.runtime_progress = RuntimeProgress::Independent;
@@ -175,14 +208,16 @@ static EngineConfig ServerConfig(const Address& listen, std::size_t subs = 1) {
     return config;
 }
 
-static EngineConfig ClientConfig() {
+static EngineConfig ClientConfig()
+{
     EngineConfig config;
     config.runtime_progress = RuntimeProgress::Independent;
     config.options.num_event_loop = 1;
     return config;
 }
 
-static NativeSocket MakeListener(Address& address) {
+static NativeSocket MakeListener(Address& address)
+{
     std::error_code error;
     NativeSocket listener = NativeSocket::Open(AddressFamily::IPv4, SocketType::Stream, error);
     CHECK(!error);
@@ -193,13 +228,13 @@ static NativeSocket MakeListener(Address& address) {
     return listener;
 }
 
-static NativeSocket ConnectClient(const Address& address) {
+static NativeSocket ConnectClient(const Address& address)
+{
     std::error_code error;
     NativeSocket client = NativeSocket::Open(AddressFamily::IPv4, SocketType::Stream, error);
     CHECK(!error);
     const auto connect_error = client.Connect(address);
-    CHECK(!connect_error || connect_error.value() == EINPROGRESS
-          || connect_error.value() == EWOULDBLOCK);
+    CHECK(!connect_error || connect_error.value() == EINPROGRESS || connect_error.value() == EWOULDBLOCK);
     pollfd descriptor{client.Fd(), POLLOUT, 0};
     CHECK(::poll(&descriptor, 1, 3000) > 0);
     CHECK(!client.PendingError());
@@ -211,7 +246,8 @@ struct NullHandler : RawHandler {};
 //
 // guard_lifetime
 //
-static void GuardLifetime() {
+static void GuardLifetime()
+{
     // 1) 保活：只在内部 state 上建立守卫，随后销毁唯一 Connection，守卫仍可读。
     auto state = std::make_shared<ConnectionState>(1, 4096, 1024, 4, nullptr);
     CHECK(state->ring.TryAppend("abcdef").status == ReadStatus::Ok);
@@ -219,11 +255,11 @@ static void GuardLifetime() {
     auto guard = connection.TryAccess();
     CHECK(bool(guard));
     CHECK(guard.Size() == 6);
-    connection = Connection();          // 释放唯一句柄：守卫必须保活数据
-    CHECK(state.use_count() == 2);      // 局部 state + 守卫（唯一业务引用已释放）
+    connection = Connection();     // 释放唯一句柄：守卫必须保活数据
+    CHECK(state.use_count() == 2); // 局部 state + 守卫（唯一业务引用已释放）
     CHECK(guard.Peek() == "abcdef");
     std::string copied;
-    CHECK(!guard.CopyAll(copied));      // 不消费
+    CHECK(!guard.CopyAll(copied)); // 不消费
     CHECK(copied == "abcdef");
     CHECK(guard.Size() == 6);
     CHECK(!guard.Consume(6));
@@ -231,7 +267,7 @@ static void GuardLifetime() {
 
     // 2) 关闭后尾部仍可读：先入队尾部（需先释放上段保护），再发布 MarkClosed，
     // 然后由新守卫消费；空守卫在已关闭连接上应报 Eof 而不是 WouldBlock。
-    ConnectionTestAccess::Reset(guard);   // 释放上段保护，否则 TryAppend 会 Busy
+    ConnectionTestAccess::Reset(guard); // 释放上段保护，否则 TryAppend 会 Busy
     CHECK(state->ring.TryAppend("tail").status == ReadStatus::Ok);
     state->MarkClosed(std::make_error_code(std::errc::operation_canceled));
     {
@@ -270,16 +306,16 @@ static void GuardLifetime() {
         CHECK(bool(source));
         const auto before = move_state->ring.AccessGeneration();
         ReadAccess moved(std::move(source));
-        CHECK(!source);                       // 源不再持锁/不再有通知责任
+        CHECK(!source); // 源不再持锁/不再有通知责任
         CHECK(source.Size() == 0);
         CHECK(bool(moved) && moved.Size() == 2);
-        CHECK(move_state->ring.AccessGeneration() == before);  // 移动不释放保护
+        CHECK(move_state->ring.AccessGeneration() == before); // 移动不释放保护
         ReadAccess sink;
-        sink = std::move(moved);              // 移动赋值：先释放旧（空）守卫
+        sink = std::move(moved); // 移动赋值：先释放旧（空）守卫
         CHECK(!moved);
         CHECK(bool(sink) && sink.Size() == 2);
         CHECK(move_state->ring.AccessGeneration() == before);
-        ConnectionTestAccess::Reset(sink);    // 唯一一次真实释放
+        ConnectionTestAccess::Reset(sink); // 唯一一次真实释放
         CHECK(move_state->ring.AccessGeneration() == before + 1);
     }
 
@@ -292,9 +328,9 @@ static void GuardLifetime() {
         auto held = ConnectionTestAccess::HoldForTest(first_state);
         CHECK(bool(held));
         const auto first_before = first_state->ring.AccessGeneration();
-        held = ConnectionTestAccess::HoldForTest(second_state);  // 释放旧守卫 → 接管新
+        held = ConnectionTestAccess::HoldForTest(second_state); // 释放旧守卫 → 接管新
         CHECK(first_state->ring.AccessGeneration() == first_before + 1);
-        CHECK(first_state.use_count() == 1);   // 旧 state 引用已归还
+        CHECK(first_state.use_count() == 1); // 旧 state 引用已归还
         CHECK(bool(held) && held.Size() == 2 && held.Peek() == "bb");
         ConnectionTestAccess::Reset(held);
     }
@@ -334,7 +370,8 @@ struct GateProbe {
 // 在给定调用域内跑四个 Co 入口；调用者预先放好"快路径"条件（有数据/零长写/
 // 已就绪 handoff 队列），从而证明拒绝发生在消费/提交/出队之前。
 GateProbe RunAllCoEntries(Connection& connection, Engine& accept_engine, Engine& dial_engine,
-                          const Address& dial_address) {
+                          const Address& dial_address)
+{
     GateProbe probe;
     CoTcpConnection co_conn{connection};
     auto [read_data, read_error] = co_conn.Read(Until(50ms));
@@ -353,7 +390,8 @@ GateProbe RunAllCoEntries(Connection& connection, Engine& accept_engine, Engine&
     return probe;
 }
 
-void CheckGateProbe(const GateProbe& probe, const char* domain) {
+void CheckGateProbe(const GateProbe& probe, const char* domain)
+{
     const auto not_permitted = std::make_error_code(std::errc::operation_not_permitted);
     CHECK(probe.read_error == not_permitted);
     CHECK(probe.write_error == not_permitted);
@@ -363,14 +401,15 @@ void CheckGateProbe(const GateProbe& probe, const char* domain) {
     CHECK(probe.outcome.sent == 0);
     CHECK(probe.outcome.error == not_permitted);
     CHECK(!probe.operation_valid);
-    CHECK(probe.read_out.empty());      // CoRead 失败不改 out
+    CHECK(probe.read_out.empty()); // CoRead 失败不改 out
     std::cout << "co_context_gate domain=" << domain << " all=operation_not_permitted\n";
 }
 
-}  // namespace
+} // namespace
 
-static void CoContextGate() {
-    StartRuntime(4);   // server 占 main+1 sub，host 另占 1 sub
+static void CoContextGate()
+{
+    StartRuntime(4); // server 占 main+1 sub，host 另占 1 sub
     // 服务端：handler + handoff，用来观察"已就绪 accept 是否被出队"。
     auto handler = std::make_shared<NullHandler>();
     Engine server(handler);
@@ -420,7 +459,9 @@ static void CoContextGate() {
         }
     });
     idle_thread.join();
-    if (idle_thread_error) { std::rethrow_exception(idle_thread_error); }
+    if (idle_thread_error) {
+        std::rethrow_exception(idle_thread_error);
+    }
 
     // 域 3：raw owner 回调同域（非业务协程）。**这是模拟**：raw 回调在 owner 的
     // 非协程边界执行，这里用一个不持协程上下文的普通线程复现同一判定，避免向
@@ -436,7 +477,9 @@ static void CoContextGate() {
         }
     });
     owner_like.join();
-    if (owner_like_error) { std::rethrow_exception(owner_like_error); }
+    if (owner_like_error) {
+        std::rethrow_exception(owner_like_error);
+    }
 
     // 零副作用：数据未消费、无新活动写、handoff 队列未被弹走、零新建连。
     CHECK(state->ring.Size() == ring_before);
@@ -444,7 +487,7 @@ static void CoContextGate() {
     CHECK(state->ring.AccessGeneration() == queue_before);
     CHECK(EngineTestAccess::ConnectTableSize(host) == connect_table_before);
     CHECK(host.CountConnections() == 0);
-    CHECK(server.CountConnections() >= 1);  // 队列里的连接仍在
+    CHECK(server.CountConnections() >= 1); // 队列里的连接仍在
 
     // 已就绪 handoff 仍可被合法域（协程）取走：证明拒绝路径零出队。
     std::atomic<int> accepted{-1};
@@ -478,11 +521,9 @@ static void CoContextGate() {
         const auto write_error = report.wait_error;
         const auto outcome = report.outcome;
         const auto operation = report.operation;
-        const bool accepted_in_flight =
-            write_error == std::make_error_code(std::errc::timed_out)
-            && outcome.phase == WritePhase::InFlight && operation.Valid();
-        const bool done_locally =
-            !write_error && outcome.phase == WritePhase::Done && operation.Valid();
+        const bool accepted_in_flight = write_error == std::make_error_code(std::errc::timed_out)
+                                        && outcome.phase == WritePhase::InFlight && operation.Valid();
+        const bool done_locally = !write_error && outcome.phase == WritePhase::Done && operation.Valid();
         if (!accepted_in_flight && !done_locally) {
             return;
         }
@@ -505,7 +546,8 @@ static void CoContextGate() {
 //
 // options_contract（编译期删除项在 net.freeze_public_surface 负向 TU）
 //
-static void OptionsContract() {
+static void OptionsContract()
+{
     // 默认：loop=1（不做 CPU 推导）、总量界 1MiB、pending 1024、keepalive 关闭。
     NormalizedOptions defaults;
     CHECK(!NormalizeOptions(Options{}, defaults));
@@ -547,18 +589,15 @@ static void OptionsContract() {
     // 32 位目标：int64 正值不能全部用 size_t 表示，server 还要额外 +1 main 槽，
     // 所以归一化必须拒绝，且失败路径不改 out。
     {
-        const std::int64_t unusable[] = {
-            static_cast<std::int64_t>(std::numeric_limits<std::size_t>::max()),
-            std::int64_t{1} << 62,
-            std::numeric_limits<std::int64_t>::max()};
+        const std::int64_t unusable[] = {static_cast<std::int64_t>(std::numeric_limits<std::size_t>::max()),
+                                         std::int64_t{1} << 62, std::numeric_limits<std::int64_t>::max()};
         for (const auto loops_value : unusable) {
             Options options;
             options.num_event_loop = loops_value;
             NormalizedOptions out;
             out.num_event_loop = 777;
             out.max_pending_events = 4321;
-            CHECK(NormalizeOptions(options, out)
-                  == std::make_error_code(std::errc::result_out_of_range));
+            CHECK(NormalizeOptions(options, out) == std::make_error_code(std::errc::result_out_of_range));
             CHECK(out.num_event_loop == 777);
             CHECK(out.max_pending_events == 4321);
         }
@@ -570,8 +609,7 @@ static void OptionsContract() {
         options.num_event_loop = std::numeric_limits<std::int64_t>::max();
         NormalizedOptions out;
         CHECK(!NormalizeOptions(options, out));
-        CHECK(out.num_event_loop
-              == static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()));
+        CHECK(out.num_event_loop == static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()));
     }
 #endif
 
@@ -584,15 +622,13 @@ static void OptionsContract() {
         NormalizedOptions out;
         return std::make_pair(NormalizeOptions(options, out), out);
     };
-    CHECK(bounds(0, 1024, 1024).first
-          == std::make_error_code(std::errc::invalid_argument));
+    CHECK(bounds(0, 1024, 1024).first == std::make_error_code(std::errc::invalid_argument));
     CHECK(bounds(1, 1, 1).first == std::error_code{});
     CHECK(bounds(1, 1, 1).second.max_inbound_bytes == 1);
     CHECK(bounds(1, 1, 1).second.max_outbound_bytes == 1);
     CHECK(bounds(1, 1, 1).second.max_pending_events == 1);
     CHECK(bounds(4096, 4096, 1).second.max_inbound_bytes == 4096);
-    CHECK(bounds(-1, 1024, 1024).first
-          == std::make_error_code(std::errc::invalid_argument));
+    CHECK(bounds(-1, 1024, 1024).first == std::make_error_code(std::errc::invalid_argument));
     {
         Options options;
         options.max_pending_events = std::numeric_limits<std::int64_t>::max();
@@ -600,8 +636,7 @@ static void OptionsContract() {
         // 64 位平台上 int64 max 恰好落在 size_t 范围内：合法且不截断。
         const auto error = NormalizeOptions(options, out);
         CHECK(!error);
-        CHECK(out.max_pending_events
-              == static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()));
+        CHECK(out.max_pending_events == static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()));
     }
 
     // keepalive：默认 interval=idle/5、count=5、最小 1s；非法值逐项拒绝。
@@ -660,8 +695,7 @@ static void OptionsContract() {
         return config;
     };
     const auto loop_space_exhausted = std::make_error_code(std::errc::no_buffer_space);
-    const std::int64_t extreme_loops[] = {
-        std::int64_t{1} << 62, std::numeric_limits<std::int64_t>::max()};
+    const std::int64_t extreme_loops[] = {std::int64_t{1} << 62, std::numeric_limits<std::int64_t>::max()};
     for (const auto loops_value : extreme_loops) {
         {
             Engine client{std::shared_ptr<RawHandler>()};
@@ -707,7 +741,8 @@ static void OptionsContract() {
 //
 // write_output_reuse
 //
-static void WriteOutputReuse() {
+static void WriteOutputReuse()
+{
     StartRuntime(1);
     auto state = std::make_shared<ConnectionState>(1, 4096, 256, 4, nullptr);
     Connection connection = ConnectionTestAccess::Make(state);
@@ -716,18 +751,17 @@ static void WriteOutputReuse() {
     };
     // 1) 先取得一次真实成功的结果，把它留在 outcome/operation 里（复用变量的起点）。
     std::shared_ptr<WriteOpRecord> done_record;
-    CHECK(!state->AcceptWrite("hello", done_record));   // 真实接纳路径
+    CHECK(!state->AcceptWrite("hello", done_record)); // 真实接纳路径
     state->PumpWrites(8, 4096, sink);
     CHECK(ConnectionTestAccess::MakeWrite(done_record).Query().phase == WritePhase::Done);
 
     std::atomic<int> result{-1};
-    std::atomic<int> progress{0};   // 失败时定位到具体步骤
+    std::atomic<int> progress{0}; // 失败时定位到具体步骤
     auto task = Task([&] {
         WriteOutcome outcome = ConnectionTestAccess::MakeWrite(done_record).Query();
         WriteOperation operation = ConnectionTestAccess::MakeWrite(done_record);
-        if (outcome.phase != WritePhase::Done || outcome.sent != 5 || !operation.Valid()
-            || outcome.error) {
-            return;   // 起点不成立，后面的"覆盖"就没有判别力
+        if (outcome.phase != WritePhase::Done || outcome.sent != 5 || !operation.Valid() || outcome.error) {
+            return; // 起点不成立，后面的"覆盖"就没有判别力
         }
         const auto first_id = operation.Id();
         progress.store(2);
@@ -738,8 +772,8 @@ static void WriteOutputReuse() {
         const auto invalid_error = invalid_report.wait_error;
         outcome = invalid_report.outcome;
         operation = invalid_report.operation;
-        if (invalid_error != make_error_code(NetErrc::Closed)
-            || outcome.phase != WritePhase::Rejected || operation.Valid()) {
+        if (invalid_error != make_error_code(NetErrc::Closed) || outcome.phase != WritePhase::Rejected
+            || operation.Valid()) {
             return;
         }
 
@@ -750,8 +784,8 @@ static void WriteOutputReuse() {
         const auto oversized_error = oversized_report.wait_error;
         outcome = oversized_report.outcome;
         operation = oversized_report.operation;
-        if (oversized_error != std::make_error_code(std::errc::no_buffer_space)
-            || outcome.phase != WritePhase::Rejected || operation.Valid()) {
+        if (oversized_error != std::make_error_code(std::errc::no_buffer_space) || outcome.phase != WritePhase::Rejected
+            || operation.Valid()) {
             return;
         }
 
@@ -763,8 +797,8 @@ static void WriteOutputReuse() {
         const auto closed_error = closed_report.wait_error;
         outcome = closed_report.outcome;
         operation = closed_report.operation;
-        if (closed_error != make_error_code(NetErrc::Closed)
-            || outcome.phase != WritePhase::Rejected || operation.Valid()) {
+        if (closed_error != make_error_code(NetErrc::Closed) || outcome.phase != WritePhase::Rejected
+            || operation.Valid()) {
             return;
         }
         (void)first_id;
@@ -773,8 +807,7 @@ static void WriteOutputReuse() {
     });
     Get(task);
     if (result.load() != 0) {
-        throw std::runtime_error("write_output_reuse failed at step "
-                                 + std::to_string(progress.load()));
+        throw std::runtime_error("write_output_reuse failed at step " + std::to_string(progress.load()));
     }
     CHECK(result.load() == 0);
 
@@ -788,8 +821,8 @@ static void WriteOutputReuse() {
             const auto error = report.wait_error;
             const auto outcome = report.outcome;
             const auto operation = report.operation;
-            if (error == std::make_error_code(std::errc::timed_out)
-                && outcome.phase == WritePhase::InFlight && operation.Valid()) {
+            if (error == std::make_error_code(std::errc::timed_out) && outcome.phase == WritePhase::InFlight
+                && operation.Valid()) {
                 inflight_result.store(0);
             }
         });
@@ -809,9 +842,8 @@ static void WriteOutputReuse() {
             const auto error = report.wait_error;
             const auto outcome = report.outcome;
             const auto operation = report.operation;
-            if (error == std::make_error_code(std::errc::not_enough_memory)
-                && outcome.phase == WritePhase::Rejected && outcome.sent == 0
-                && outcome.error == std::make_error_code(std::errc::not_enough_memory)
+            if (error == std::make_error_code(std::errc::not_enough_memory) && outcome.phase == WritePhase::Rejected
+                && outcome.sent == 0 && outcome.error == std::make_error_code(std::errc::not_enough_memory)
                 && !operation.Valid() && alloc_state->ActiveOpCount() == 0) {
                 alloc_result.store(0);
             }
@@ -825,7 +857,7 @@ static void WriteOutputReuse() {
         auto full_state = std::make_shared<ConnectionState>(4, 4096, 4, 4, nullptr);
         Connection full_conn = ConnectionTestAccess::Make(full_state);
         std::shared_ptr<WriteOpRecord> warm_record;
-        CHECK(!full_state->AcceptWrite("warm", warm_record));   // 占满 outbound=8
+        CHECK(!full_state->AcceptWrite("warm", warm_record)); // 占满 outbound=8
         std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>> keep;
         for (std::size_t i = 0; i < WakeHub::kMaxWaiters; ++i) {
             auto waiter = full_state->CreateWriteWaiter();
@@ -838,14 +870,14 @@ static void WriteOutputReuse() {
             const auto error = report.wait_error;
             const auto outcome = report.outcome;
             const auto operation = report.operation;
-            if (error == std::make_error_code(std::errc::no_buffer_space)
-                && outcome.phase == WritePhase::Rejected && !operation.Valid()) {
+            if (error == std::make_error_code(std::errc::no_buffer_space) && outcome.phase == WritePhase::Rejected
+                && !operation.Valid()) {
                 full_result.store(0);
             }
         });
         Get(full_task);
         CHECK(full_result.load() == 0);
-        CHECK(full_state->ActiveOpCount() == 1);   // 只有 warm 被接纳
+        CHECK(full_state->ActiveOpCount() == 1); // 只有 warm 被接纳
     }
 
     // 8) Done + error（失败结算）与等待错误分开：等待返回空表示本地终态，
@@ -857,11 +889,10 @@ static void WriteOutputReuse() {
         auto failed_task = Task([&] {
             std::thread pump([&] {
                 std::this_thread::sleep_for(20ms);
-                failed_state->PumpWrites(4, 4096,
-                    [](const std::string_view*, std::size_t, std::size_t) -> ssize_t {
-                        errno = EPIPE;
-                        return -1;
-                    });
+                failed_state->PumpWrites(4, 4096, [](const std::string_view*, std::size_t, std::size_t) -> ssize_t {
+                    errno = EPIPE;
+                    return -1;
+                });
             });
             const auto report = CoTcpConnection{failed_conn}.Write("boom", Until(2000ms));
             pump.join();
@@ -870,8 +901,7 @@ static void WriteOutputReuse() {
             const auto operation = report.operation;
             // 本地完成路径：等待正常结束（wait_error 为空），发送错误落在
             // outcome.error（EPIPE）；这与"等待超时但仍在途"是不同的两个结果。
-            if (!wait_error && outcome.phase == WritePhase::Done
-                && outcome.error.value() == EPIPE && outcome.sent == 0
+            if (!wait_error && outcome.phase == WritePhase::Done && outcome.error.value() == EPIPE && outcome.sent == 0
                 && operation.Valid()) {
                 failed_result.store(0);
             }
@@ -886,7 +916,8 @@ static void WriteOutputReuse() {
 //
 // output_preservation
 //
-static void OutputPreservation() {
+static void OutputPreservation()
+{
     StartRuntime(2);
     // 1) CoRead 超时不消费、不改非空 out。
     {
@@ -899,8 +930,7 @@ static void OutputPreservation() {
             if (!read_error) {
                 read_data.AppendTo(out);
             }
-            if (bool(read_error)
-                && read_error == std::make_error_code(std::errc::timed_out) && out == "keep") {
+            if (bool(read_error) && read_error == std::make_error_code(std::errc::timed_out) && out == "keep") {
                 result.store(0);
             }
         });
@@ -926,7 +956,7 @@ static void OutputPreservation() {
                     read_data.AppendTo(*out);
                 }
             } catch (const std::bad_alloc&) {
-                g_fail_alloc = false;  // 分配失败未交付任何数据，等价 Error 路径
+                g_fail_alloc = false; // 分配失败未交付任何数据，等价 Error 路径
             }
         });
         Get(task);
@@ -947,10 +977,8 @@ static void OutputPreservation() {
         auto task = Task([&] {
             auto res = engine.CoAccept(Until(100ms));
             std::string tail;
-            if (res.error == std::make_error_code(std::errc::operation_not_permitted)
-                && !res.connection.Valid()
-                && original.Valid()
-                && original.TryRead(tail).status == ReadStatus::Ok && tail == "original") {
+            if (res.error == std::make_error_code(std::errc::operation_not_permitted) && !res.connection.Valid()
+                && original.Valid() && original.TryRead(tail).status == ReadStatus::Ok && tail == "original") {
                 result.store(0);
             }
         });
@@ -965,7 +993,7 @@ static void OutputPreservation() {
         CHECK(WaitUntil([&] { return host.Phase() == EnginePhase::Running; }, 3000ms));
         Address dead;
         auto dead_listener = MakeListener(dead);
-        CHECK(!dead_listener.Close());      // 已关闭的监听地址：连接必然失败
+        CHECK(!dead_listener.Close()); // 已关闭的监听地址：连接必然失败
 
         auto original_state = std::make_shared<ConnectionState>(10, 1024, 1024, 4, nullptr);
         CHECK(original_state->ring.TryAppend("kept").status == ReadStatus::Ok);
@@ -974,8 +1002,7 @@ static void OutputPreservation() {
         auto task = Task([&] {
             auto res = host.CoDial(dead, Until(500ms));
             std::string tail;
-            if (res.error && !res.connection.Valid()
-                && original.Valid()
+            if (res.error && !res.connection.Valid() && original.Valid()
                 && original.TryRead(tail).status == ReadStatus::Ok && tail == "kept") {
                 result.store(0);
             }
@@ -991,7 +1018,8 @@ static void OutputPreservation() {
 //
 // connect_delivery
 //
-static void ConnectDelivery() {
+static void ConnectDelivery()
+{
     StartRuntime(2);
     Address address;
     auto listener = MakeListener(address);
@@ -1007,8 +1035,8 @@ static void ConnectDelivery() {
         std::mutex mutex;
         std::set<std::uint64_t> operations;
 
-        void OnConnect(Connection connection, std::error_code error,
-                       std::uint64_t operation) override {
+        void OnConnect(Connection connection, std::error_code error, std::uint64_t operation) override
+        {
             if (!submit_returned.load()) {
                 callback_before_return.store(true);
             }
@@ -1041,7 +1069,7 @@ static void ConnectDelivery() {
         CHECK(id != 0);
         handler->submit_returned.store(true);
         CHECK(WaitUntil([&] { return handler->calls.load() == 1; }, 3000ms));
-        CHECK(handler->last_operation.load() == id);   // 以回调自带 operation 关联
+        CHECK(handler->last_operation.load() == id); // 以回调自带 operation 关联
         CHECK(handler->success.load() == 1);
         CHECK(handler->operations.size() == 1);
         CHECK(WaitUntil([&] { return EngineTestAccess::ConnectTableSize(client) == 0; }, 2000ms));
@@ -1049,8 +1077,7 @@ static void ConnectDelivery() {
         runner.CloseAndJoin();
         CHECK(!runner.error);
         std::cout << "connect_delivery raw id=" << id
-                  << " callback_before_return=" << (handler->callback_before_return.load() ? 1 : 0)
-                  << '\n';
+                  << " callback_before_return=" << (handler->callback_before_return.load() ? 1 : 0) << '\n';
     }
 
     // 1b) 早到交付交错（确定性）：提交已成功 TryPost 但尚未写 out_id 时，用内部
@@ -1072,14 +1099,14 @@ static void ConnectDelivery() {
         const std::uint64_t sentinel = 0x5a5a;
         std::uint64_t id = sentinel;
         CHECK(!client.AsyncConnect(address, id));
-        CHECK(barrier_entered.load());                 // 屏障真的被调用（否则本用例无判别力）
-        CHECK(callback_inside_barrier.load());         // 回调确实先于提交返回
+        CHECK(barrier_entered.load());         // 屏障真的被调用（否则本用例无判别力）
+        CHECK(callback_inside_barrier.load()); // 回调确实先于提交返回
         CHECK(handler->callback_before_return.load());
-        CHECK(id != 0);                                // 返回时 out_id 已写入
+        CHECK(id != 0); // 返回时 out_id 已写入
         CHECK(id != sentinel);
         CHECK(WaitUntil([&] { return handler->calls.load() == 1; }, 3000ms));
-        CHECK(handler->calls.load() == 1);             // 恰一次（屏障内没有重复派发）
-        CHECK(handler->last_operation.load() == id);   // operation == 最终 out_id
+        CHECK(handler->calls.load() == 1);           // 恰一次（屏障内没有重复派发）
+        CHECK(handler->last_operation.load() == id); // operation == 最终 out_id
         CHECK(handler->success.load() == 1);
         std::lock_guard<std::mutex> lock(handler->mutex);
         CHECK(handler->operations.size() == 1);
@@ -1100,7 +1127,7 @@ static void ConnectDelivery() {
         CHECK(!client.AsyncConnect(address, id));
         CHECK(id != 0);
         handler->submit_returned.store(true);
-        CHECK(!handler->callback_before_return.load());   // 负对照：未武装时不会早到
+        CHECK(!handler->callback_before_return.load()); // 负对照：未武装时不会早到
         CHECK(WaitUntil([&] { return handler->calls.load() == 1; }, 3000ms));
         CHECK(handler->last_operation.load() == id);
     }
@@ -1115,16 +1142,15 @@ static void ConnectDelivery() {
         EngineTestAccess::SetConnectPostFailureOnce(client);
         const std::uint64_t sentinel = 0x2b2b;
         std::uint64_t id = sentinel;
-        CHECK(client.AsyncConnect(address, id)
-              == std::make_error_code(std::errc::operation_canceled));
-        CHECK(id == sentinel);                                  // 拒绝不改 out_id
+        CHECK(client.AsyncConnect(address, id) == std::make_error_code(std::errc::operation_canceled));
+        CHECK(id == sentinel); // 拒绝不改 out_id
         CHECK(EngineTestAccess::ConnectTableSize(client) == 0);
-        CHECK(handler->calls.load() == 0);                      // 零回调
+        CHECK(handler->calls.load() == 0); // 零回调
         CHECK(client.CountConnections() == 0);
         EngineTestAccess::ClearConnectInjection(client);
         std::uint64_t recovered = 0;
         CHECK(!client.AsyncConnect(address, recovered));
-        CHECK(recovered != 0);                                  // 名额/op 槽未被消耗
+        CHECK(recovered != 0); // 名额/op 槽未被消耗
         CHECK(WaitUntil([&] { return handler->calls.load() == 1; }, 3000ms));
         CHECK(handler->last_operation.load() == recovered);
         CHECK(handler->success.load() == 1);
@@ -1141,8 +1167,7 @@ static void ConnectDelivery() {
         CHECK(client.Phase() == EnginePhase::Idle);
         const std::uint64_t sentinel = 0x3c3c;
         std::uint64_t id = sentinel;
-        CHECK(client.AsyncConnect(address, id)
-              == std::make_error_code(std::errc::operation_canceled));
+        CHECK(client.AsyncConnect(address, id) == std::make_error_code(std::errc::operation_canceled));
         CHECK(id == sentinel);
         CHECK(EngineTestAccess::ConnectTableSize(client) == 0);
         CHECK(handler->calls.load() == 0);
@@ -1176,7 +1201,7 @@ static void ConnectDelivery() {
         // owner 先派发回调、再 ResolveConnect 擦表项：等表项回收即可确定回调动
         // 作已完成，无需"睡一段再看"这种不受控等待。
         CHECK(WaitUntil([&] { return EngineTestAccess::ConnectTableSize(client) == 0; }, 3000ms));
-        CHECK(handler->calls.load() == 1);          // 恰一次（无重复派发）
+        CHECK(handler->calls.load() == 1); // 恰一次（无重复派发）
         CHECK(handler->failures.load() == 1);
         CHECK(handler->success.load() == 0);
         CHECK(handler->last_operation.load() == id);
@@ -1199,8 +1224,7 @@ static void ConnectDelivery() {
         Engine co_only{std::shared_ptr<RawHandler>()};
         EngineRunner co_runner(co_only, ClientConfig());
         CHECK(WaitUntil([&] { return co_only.Phase() == EnginePhase::Running; }, 3000ms));
-        CHECK(co_only.AsyncConnect(address, id)
-              == std::make_error_code(std::errc::operation_not_supported));
+        CHECK(co_only.AsyncConnect(address, id) == std::make_error_code(std::errc::operation_not_supported));
         CHECK(id == sentinel);
         CHECK(EngineTestAccess::ConnectTableSize(co_only) == 0);
         CHECK(handler->calls.load() == 0);
@@ -1218,12 +1242,11 @@ static void ConnectDelivery() {
         EngineRunner runner(client, ClientConfig());
         CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
         client.RequestClose();
-        CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Closing
-                                   || client.Phase() == EnginePhase::Stopped; }, 3000ms));
+        CHECK(WaitUntil(
+            [&] { return client.Phase() == EnginePhase::Closing || client.Phase() == EnginePhase::Stopped; }, 3000ms));
         const std::uint64_t sentinel = 0x77;
         std::uint64_t id = sentinel;
-        CHECK(client.AsyncConnect(address, id)
-              == std::make_error_code(std::errc::operation_canceled));
+        CHECK(client.AsyncConnect(address, id) == std::make_error_code(std::errc::operation_canceled));
         CHECK(id == sentinel);
         CHECK(handler->calls.load() == 0);
         runner.CloseAndJoin();
@@ -1242,8 +1265,7 @@ static void ConnectDelivery() {
         CHECK(first != 0);
         const std::uint64_t sentinel = 0x99;
         std::uint64_t second = sentinel;
-        CHECK(client.AsyncConnect(address, second)
-              == std::make_error_code(std::errc::no_buffer_space));
+        CHECK(client.AsyncConnect(address, second) == std::make_error_code(std::errc::no_buffer_space));
         CHECK(second == sentinel);
         CHECK(WaitUntil([&] { return handler->calls.load() == 1; }, 3000ms));
         CHECK(handler->last_operation.load() == first);
@@ -1294,28 +1316,29 @@ static void ConnectDelivery() {
         std::atomic<int> rejected{-1};
         auto reject_task = Task([&] {
             auto res = raw_client.CoDial(address, Until(1000ms));
-            if (res.error == std::make_error_code(std::errc::operation_not_supported)
-                && !res.connection.Valid()) {
+            if (res.error == std::make_error_code(std::errc::operation_not_supported) && !res.connection.Valid()) {
                 rejected.store(0);
             }
         });
         Get(reject_task);
         CHECK(rejected.load() == 0);
-        CHECK(EngineTestAccess::ConnectTableSize(raw_client) == 0);  // 零提交
+        CHECK(EngineTestAccess::ConnectTableSize(raw_client) == 0); // 零提交
         CHECK(raw_handler->calls.load() == 0);
         raw_runner.CloseAndJoin();
     }
 
     Address peer;
     std::error_code ignored;
-    while (listener.Accept(peer, ignored).Fd() >= 0) {}
+    while (listener.Accept(peer, ignored).Fd() >= 0) {
+    }
     std::cout << "connect_delivery raw/nohandler/sealed/cap/codial_matrix=ok\n";
 }
 
 //
 // connect_failure_cleanup
 //
-static void ConnectFailureCleanup() {
+static void ConnectFailureCleanup()
+{
     StartRuntime(2);
     Address address;
     auto listener = MakeListener(address);
@@ -1330,18 +1353,16 @@ static void ConnectFailureCleanup() {
         auto fail_cycle = [&] {
             EngineTestAccess::FailNextConnectWaiterCreateOnce(client);
             std::atomic<int> value{-2};
-            auto task = Task([&] {
-                value.store(client.CoDial(address, Until(1000ms)).error.value());
-            });
+            auto task = Task([&] { value.store(client.CoDial(address, Until(1000ms)).error.value()); });
             Get(task);
             CHECK(value.load() == std::make_error_code(std::errc::not_enough_memory).value());
             // 未交付路径必须归还 claim/连接责任：表项回收、连接回收。
             CHECK(WaitUntil([&] { return EngineTestAccess::ConnectTableSize(client) == 0; }, 3000ms));
             CHECK(WaitUntil([&] { return EngineTestAccess::ConnectionCount(client) == 0; }, 3000ms));
         };
-        fail_cycle();                                   // 首轮：含上下文惰性 fd
+        fail_cycle(); // 首轮：含上下文惰性 fd
         const auto fds_after_first = CountFds();
-        fail_cycle();                                   // 次轮：fd 不得增长
+        fail_cycle(); // 次轮：fd 不得增长
         CHECK(WaitUntil([&] { return CountFds() <= fds_after_first; }, 3000ms));
         std::atomic<int> recovered{-2};
         auto recovered_task = Task([&] {
@@ -1390,9 +1411,7 @@ static void ConnectFailureCleanup() {
         CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
         EngineTestAccess::SetConnectDeliveryDelay(client, std::chrono::milliseconds(200));
         std::atomic<int> timed_out{-2};
-        auto timeout_task = Task([&] {
-            timed_out.store(client.CoDial(address, Until(30ms)).error.value());
-        });
+        auto timeout_task = Task([&] { timed_out.store(client.CoDial(address, Until(30ms)).error.value()); });
         Get(timeout_task);
         CHECK(timed_out.load() == std::make_error_code(std::errc::timed_out).value());
         CHECK(WaitUntil([&] { return EngineTestAccess::ConnectTableSize(client) == 0; }, 3000ms));
@@ -1421,9 +1440,7 @@ static void ConnectFailureCleanup() {
         EngineTestAccess::SetConnectStartDelay(client, std::chrono::milliseconds(5000));
         EngineTestAccess::SetCancelPostFailureOnce(client);
         std::atomic<int> result{-2};
-        auto task = Task([&] {
-            result.store(client.CoDial(address, Until(30ms)).error.value());
-        });
+        auto task = Task([&] { result.store(client.CoDial(address, Until(30ms)).error.value()); });
         Get(task);
         CHECK(result.load() == std::make_error_code(std::errc::timed_out).value());
         CHECK(WaitUntil([&] { return EngineTestAccess::ConnectTableSize(client) == 0; }, 3000ms));
@@ -1439,8 +1456,8 @@ static void ConnectFailureCleanup() {
             std::atomic<int> closes{0};
             std::mutex mutex;
             std::shared_ptr<Connection> stored;
-            void OnConnect(Connection connection, std::error_code error,
-                           std::uint64_t) override {
+            void OnConnect(Connection connection, std::error_code error, std::uint64_t) override
+            {
                 if (error || !connection.Valid()) {
                     return;
                 }
@@ -1448,7 +1465,10 @@ static void ConnectFailureCleanup() {
                 std::lock_guard<std::mutex> lock(mutex);
                 stored = std::make_shared<Connection>(connection);
             }
-            void OnClose(Connection, std::error_code) override { closes.fetch_add(1); }
+            void OnClose(Connection, std::error_code) override
+            {
+                closes.fetch_add(1);
+            }
         };
         auto handler = std::make_shared<RawDelivery>();
         Engine client(handler);
@@ -1497,12 +1517,10 @@ static void ConnectFailureCleanup() {
             const char* label;
         };
         const Injected cases[] = {
-            {WaitStatus::InvalidContext,
-             std::make_error_code(std::errc::operation_not_permitted), "invalid_context"},
-            {WaitStatus::RuntimeUnavailable,
-             std::make_error_code(std::errc::operation_not_supported), "runtime_unavailable"},
-            {WaitStatus::AlreadyWaiting,
-             std::make_error_code(std::errc::device_or_resource_busy), "already_waiting"},
+            {WaitStatus::InvalidContext, std::make_error_code(std::errc::operation_not_permitted), "invalid_context"},
+            {WaitStatus::RuntimeUnavailable, std::make_error_code(std::errc::operation_not_supported),
+             "runtime_unavailable"},
+            {WaitStatus::AlreadyWaiting, std::make_error_code(std::errc::device_or_resource_busy), "already_waiting"},
         };
         for (const auto& item : cases) {
             // 本段的 listener 只是"有对端可连"：每轮先取走 backlog，避免多轮内核
@@ -1510,7 +1528,8 @@ static void ConnectFailureCleanup() {
             auto drain_listener = [&listener] {
                 Address peer;
                 std::error_code ignored;
-                while (listener.Accept(peer, ignored).Fd() >= 0) {}
+                while (listener.Accept(peer, ignored).Fd() >= 0) {
+                }
                 (void)peer;
             };
             drain_listener();
@@ -1531,8 +1550,7 @@ static void ConnectFailureCleanup() {
                 });
                 Get(warm);
                 CHECK(baseline.load() == 0);
-                CHECK(WaitUntil([&] { return EngineTestAccess::ConnectTableSize(client) == 0; },
-                                3000ms));
+                CHECK(WaitUntil([&] { return EngineTestAccess::ConnectTableSize(client) == 0; }, 3000ms));
             }
             const auto fds_baseline = CountFds();
 
@@ -1541,8 +1559,7 @@ static void ConnectFailureCleanup() {
             std::uint64_t id = 0;
             CHECK(!CoAccess::SubmitConnect(client, address, id));
             CHECK(id != 0);
-            CHECK(WaitUntil([&] { return EngineTestAccess::PendingConnectCount(client) == 1; },
-                            3000ms));
+            CHECK(WaitUntil([&] { return EngineTestAccess::PendingConnectCount(client) == 1; }, 3000ms));
             EngineTestAccess::SetConnectWaitStatusOnce(client, static_cast<int>(item.status));
 
             auto original_state = std::make_shared<ConnectionState>(97, 1024, 1024, 4, nullptr);
@@ -1555,19 +1572,19 @@ static void ConnectFailureCleanup() {
                 const auto error = CoAccess::WaitConnect(client, id, out, Until(3000ms));
                 observed.store(error.value());
                 std::string tail;
-                if (out.Valid() && out.Id() == original.Id()
-                    && out.TryRead(tail).status == ReadStatus::Ok && tail == "held") {
+                if (out.Valid() && out.Id() == original.Id() && out.TryRead(tail).status == ReadStatus::Ok
+                    && tail == "held") {
                     out_kept.store(0);
                 }
             });
             Get(task);
-            CHECK(observed.load() == item.expected.value());   // 实际返回的 errc
-            CHECK(out_kept.load() == 0);                       // 未交付失败不覆盖 out
+            CHECK(observed.load() == item.expected.value()); // 实际返回的 errc
+            CHECK(out_kept.load() == 0);                     // 未交付失败不覆盖 out
             // 责任回收：claim 已归还、op 表项清空、无遗留 pending、无连接进入 Engine。
             CHECK(WaitUntil([&] { return EngineTestAccess::ConnectTableSize(client) == 0; }, 4000ms));
             CHECK(EngineTestAccess::PendingConnectCount(client) == 0);
             CHECK(WaitUntil([&] { return client.CountConnections() == 0; }, 3000ms));
-            CHECK(WaitUntil([&] { return CountFds() <= fds_baseline; }, 3000ms));  // 无 fd 泄漏/误关
+            CHECK(WaitUntil([&] { return CountFds() <= fds_baseline; }, 3000ms)); // 无 fd 泄漏/误关
             CHECK(client.Phase() == EnginePhase::Running);
 
             // 同一状态再经公开 CoDial 走一遍：这是"实际 CoDial 返回 errc"的证据，
@@ -1584,17 +1601,16 @@ static void ConnectFailureCleanup() {
                 dial_errc.store(res.error.value());
                 std::string tail;
                 if (!res.connection.Valid() && dial_original.Valid()
-                    && dial_original.TryRead(tail).status == ReadStatus::Ok
-                    && tail == "held-dial") {
+                    && dial_original.TryRead(tail).status == ReadStatus::Ok && tail == "held-dial") {
                     dial_out_kept.store(0);
                 }
             });
             Get(dial_task);
-            CHECK(dial_errc.load() == item.expected.value());   // CoDial 实际 errc
-            CHECK(dial_out_kept.load() == 0);                   // CoDial 也保留原 out
+            CHECK(dial_errc.load() == item.expected.value()); // CoDial 实际 errc
+            CHECK(dial_out_kept.load() == 0);                 // CoDial 也保留原 out
             CHECK(WaitUntil([&] { return EngineTestAccess::ConnectTableSize(client) == 0; }, 4000ms));
             CHECK(EngineTestAccess::PendingConnectCount(client) == 0);
-            CHECK(client.CountConnections() == 0);              // 未交付 fd 被回收，无误留
+            CHECK(client.CountConnections() == 0); // 未交付 fd 被回收，无误留
             CHECK(WaitUntil([&] { return CountFds() <= fds_baseline; }, 3000ms));
 
             // 同一 Engine 解除注入后正常 CoDial：名额/fd/连接都回到可用基线。
@@ -1615,9 +1631,8 @@ static void ConnectFailureCleanup() {
             CHECK(WaitUntil([&] { return CountFds() <= fds_baseline + 1; }, 3000ms));
             runner.CloseAndJoin();
             CHECK(!runner.error);
-            std::cout << "connect_failure_cleanup wait_status_injected=" << item.label
-                      << " errc=" << observed.load() << " codial_errc=" << dial_errc.load()
-                      << " out_kept=1 recovered=1" << std::endl;
+            std::cout << "connect_failure_cleanup wait_status_injected=" << item.label << " errc=" << observed.load()
+                      << " codial_errc=" << dial_errc.load() << " out_kept=1 recovered=1" << std::endl;
         }
     }
 
@@ -1637,28 +1652,29 @@ static void ConnectFailureCleanup() {
             {WaitStatus::Cancelled, std::make_error_code(std::errc::operation_canceled)},
             {WaitStatus::InvalidContext, std::make_error_code(std::errc::operation_not_permitted)},
             {WaitStatus::AlreadyWaiting, std::make_error_code(std::errc::device_or_resource_busy)},
-            {WaitStatus::RuntimeUnavailable,
-             std::make_error_code(std::errc::operation_not_supported)},
+            {WaitStatus::RuntimeUnavailable, std::make_error_code(std::errc::operation_not_supported)},
         };
         for (const auto& item : mappings) {
             const auto mapped = WaitStatusError(item.status);
             CHECK(mapped == item.expected);
             CHECK(mapped != std::make_error_code(std::errc::io_error));
         }
-        std::cout << "connect_failure_cleanup wait_status_mapping entries="
-                  << (sizeof(mappings) / sizeof(mappings[0])) << "\n";
+        std::cout << "connect_failure_cleanup wait_status_mapping entries=" << (sizeof(mappings) / sizeof(mappings[0]))
+                  << "\n";
     }
 
     Address peer;
     std::error_code ignored;
-    while (listener.Accept(peer, ignored).Fd() >= 0) {}
+    while (listener.Accept(peer, ignored).Fd() >= 0) {
+    }
     std::cout << "connect_failure_cleanup create/hub/timeout/cancel/raw_intact=ok\n";
 }
 
 //
 // accept_configuration
 //
-static void AcceptConfiguration() {
+static void AcceptConfiguration()
+{
     StartRuntime(3);
 
     // 1) server 布局 + 无 handler + 未启用 handoff：Run 在绑定前拒绝。
@@ -1670,18 +1686,16 @@ static void AcceptConfiguration() {
         CHECK(error == std::make_error_code(std::errc::operation_not_permitted));
         CHECK(engine.Phase() == EnginePhase::Stopped);
         std::vector<Address> addresses;
-        CHECK(engine.LocalAddresses(addresses)
-              == std::make_error_code(std::errc::operation_not_permitted));
-        CHECK(CountFds() == fds_before);      // 零 socket 副作用
+        CHECK(engine.LocalAddresses(addresses) == std::make_error_code(std::errc::operation_not_permitted));
+        CHECK(CountFds() == fds_before); // 零 socket 副作用
     }
 
     // 2) CoAccept 阶段/配置精确 errc 矩阵。每条都断言：精确 errc、快速拒绝（不占满
     // deadline）、失败不覆盖调用者原有 out（原连接仍可读自己的字节）。
     // 3) 与 4/4b) 的具体阶段见各段注释。
-    auto expect_accept_rejection = [](Engine& engine, std::error_code expected,
-                                      const char* label, std::uint64_t state_id) {
-        auto original_state =
-            std::make_shared<ConnectionState>(state_id, 1024, 1024, 4, nullptr);
+    auto expect_accept_rejection = [](Engine& engine, std::error_code expected, const char* label,
+                                      std::uint64_t state_id) {
+        auto original_state = std::make_shared<ConnectionState>(state_id, 1024, 1024, 4, nullptr);
         CHECK(original_state->ring.TryAppend("accept-kept").status == ReadStatus::Ok);
         Connection original = ConnectionTestAccess::Make(original_state);
         const auto begin = std::chrono::steady_clock::now();
@@ -1691,19 +1705,19 @@ static void AcceptConfiguration() {
             auto res = engine.CoAccept(Until(3000ms));
             errc.store(res.error.value());
             std::string tail;
-            if (!res.connection.Valid() && original.Valid()
-                && original.TryRead(tail).status == ReadStatus::Ok && tail == "accept-kept") {
+            if (!res.connection.Valid() && original.Valid() && original.TryRead(tail).status == ReadStatus::Ok
+                && tail == "accept-kept") {
                 kept.store(0);
             }
         });
         Get(task);
-        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - begin).count();
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count();
         CHECK(errc.load() == expected.value());
-        CHECK(kept.load() == 0);          // 原 out 保留且原连接未受影响
-        CHECK(elapsed < 1000);            // 快速拒绝，不占满 deadline
-        std::cout << "accept_configuration reject=" << label
-                  << " errc=" << errc.load() << " fast=1 out_kept=1" << std::endl;
+        CHECK(kept.load() == 0); // 原 out 保留且原连接未受影响
+        CHECK(elapsed < 1000);   // 快速拒绝，不占满 deadline
+        std::cout << "accept_configuration reject=" << label << " errc=" << errc.load() << " fast=1 out_kept=1"
+                  << std::endl;
     };
 
     // 2a) Idle（从未 Run）：尚未建立 accept 生产者 → not_permitted。
@@ -1711,8 +1725,7 @@ static void AcceptConfiguration() {
         Engine engine{std::shared_ptr<RawHandler>()};
         CHECK(!engine.EnableAcceptHandoff(2));
         CHECK(engine.Phase() == EnginePhase::Idle);
-        expect_accept_rejection(engine, std::make_error_code(std::errc::operation_not_permitted),
-                                "idle", 101);
+        expect_accept_rejection(engine, std::make_error_code(std::errc::operation_not_permitted), "idle", 101);
     }
 
     // 2b) Starting（Run 已发布 Starting、owner 尚未安装完）：not_permitted；
@@ -1725,8 +1738,7 @@ static void AcceptConfiguration() {
         EngineTestAccess::SetInstallDelay(engine, std::chrono::milliseconds(800));
         EngineRunner runner(engine, ServerConfig(Loopback(0), 1));
         CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Starting; }, 3000ms));
-        expect_accept_rejection(engine, std::make_error_code(std::errc::operation_not_permitted),
-                                "starting", 102);
+        expect_accept_rejection(engine, std::make_error_code(std::errc::operation_not_permitted), "starting", 102);
         CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
         runner.CloseAndJoin();
     }
@@ -1748,8 +1760,7 @@ static void AcceptConfiguration() {
         CHECK(!engine.EnableAcceptHandoff(2));
         EngineRunner runner(engine, ClientConfig());
         CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
-        expect_accept_rejection(engine, std::make_error_code(std::errc::operation_not_supported),
-                                "client_only", 104);
+        expect_accept_rejection(engine, std::make_error_code(std::errc::operation_not_supported), "client_only", 104);
         runner.CloseAndJoin();
     }
 
@@ -1764,8 +1775,7 @@ static void AcceptConfiguration() {
         EngineTestAccess::SetSealDelay(engine, std::chrono::milliseconds(400));
         engine.RequestClose();
         CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Closing; }, 3000ms));
-        expect_accept_rejection(engine, std::make_error_code(std::errc::operation_canceled),
-                                "closing", 105);
+        expect_accept_rejection(engine, std::make_error_code(std::errc::operation_canceled), "closing", 105);
         runner.CloseAndJoin();
     }
 
@@ -1779,8 +1789,7 @@ static void AcceptConfiguration() {
         CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
         engine.RequestClose();
         CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Stopped; }, 3000ms));
-        expect_accept_rejection(engine, std::make_error_code(std::errc::operation_canceled),
-                                "stopped", 106);
+        expect_accept_rejection(engine, std::make_error_code(std::errc::operation_canceled), "stopped", 106);
         runner.CloseAndJoin();
     }
 
@@ -1790,7 +1799,8 @@ static void AcceptConfiguration() {
             std::atomic<int> accepted{0};
             std::mutex mutex;
             std::vector<std::uint64_t> ids;
-            void OnAccept(Connection connection) override {
+            void OnAccept(Connection connection) override
+            {
                 accepted.fetch_add(1);
                 std::lock_guard<std::mutex> lock(mutex);
                 ids.push_back(connection.Id());
@@ -1824,7 +1834,7 @@ static void AcceptConfiguration() {
             raw_id = handler->ids.front();
         }
         CHECK(raw_id != 0);
-        CHECK(handoff_id.load() == raw_id);    // 同一连接、两个交付者
+        CHECK(handoff_id.load() == raw_id); // 同一连接、两个交付者
         (void)client.Close();
         runner.CloseAndJoin();
         CHECK(!runner.error);
@@ -1897,7 +1907,8 @@ static void AcceptConfiguration() {
 
 #include "ProcessRuntimeTestMain.hpp"
 
-static void DumpBacktrace(int signal_number) {
+static void DumpBacktrace(int signal_number)
+{
     void* frames[64];
     const int count = backtrace(frames, 64);
     std::cerr << "caught signal " << signal_number << '\n';
@@ -1905,19 +1916,30 @@ static void DumpBacktrace(int signal_number) {
     std::_Exit(139);
 }
 
-static int RunCases(int argc, char** argv) {
+static int RunCases(int argc, char** argv)
+{
     try {
         CHECK(argc == 2);
         const std::string test = argv[1];
-        if (test == "guard_lifetime") { GuardLifetime(); }
-        else if (test == "co_context_gate") { CoContextGate(); }
-        else if (test == "options_contract") { OptionsContract(); }
-        else if (test == "write_output_reuse") { WriteOutputReuse(); }
-        else if (test == "output_preservation") { OutputPreservation(); }
-        else if (test == "connect_delivery") { ConnectDelivery(); }
-        else if (test == "connect_failure_cleanup") { ConnectFailureCleanup(); }
-        else if (test == "accept_configuration") { AcceptConfiguration(); }
-        else { throw std::runtime_error("unknown test: " + test); }
+        if (test == "guard_lifetime") {
+            GuardLifetime();
+        } else if (test == "co_context_gate") {
+            CoContextGate();
+        } else if (test == "options_contract") {
+            OptionsContract();
+        } else if (test == "write_output_reuse") {
+            WriteOutputReuse();
+        } else if (test == "output_preservation") {
+            OutputPreservation();
+        } else if (test == "connect_delivery") {
+            ConnectDelivery();
+        } else if (test == "connect_failure_cleanup") {
+            ConnectFailureCleanup();
+        } else if (test == "accept_configuration") {
+            AcceptConfiguration();
+        } else {
+            throw std::runtime_error("unknown test: " + test);
+        }
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
@@ -1925,7 +1947,8 @@ static int RunCases(int argc, char** argv) {
     }
 }
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv)
+{
     signal(SIGSEGV, DumpBacktrace);
     signal(SIGABRT, DumpBacktrace);
     return bbt_net_test::RunTestProcessExit([&] { return RunCases(argc, argv); });

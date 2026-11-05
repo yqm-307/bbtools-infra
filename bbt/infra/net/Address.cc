@@ -18,20 +18,35 @@ namespace {
 // 因此 scope 在进入 Boost 前自行严格校验：只支持完整十进制数字（C++17 from_chars，
 // u32 范围），拒绝负号、空、尾随垃圾、溢出、重复 '%' 与 IPv4/主机名带 scope；
 // 不支持接口名（无 if_nametoindex/atoi 回退）。返回 false 表示已置 error。
-bool SplitV6Scope(const std::string& host, std::string* body, std::uint32_t* scope, std::error_code& error) {
+bool SplitV6Scope(const std::string& host, std::string* body, std::uint32_t* scope, std::error_code& error)
+{
     const auto percent = host.find('%');
-    if (percent == std::string::npos) { return true; }
+    if (percent == std::string::npos) {
+        return true;
+    }
     const auto invalid = std::make_error_code(std::errc::invalid_argument);
-    if (host.find('%', percent + 1) != std::string::npos) { error = invalid; return false; } // 重复 %
+    if (host.find('%', percent + 1) != std::string::npos) {
+        error = invalid;
+        return false;
+    } // 重复 %
     *body = host.substr(0, percent);
-    if (body->find(':') == std::string::npos) { error = invalid; return false; }             // IPv4/主机名不支持 scope
+    if (body->find(':') == std::string::npos) {
+        error = invalid;
+        return false;
+    } // IPv4/主机名不支持 scope
     const std::string suffix = host.substr(percent + 1);
-    if (suffix.empty()) { error = invalid; return false; }
+    if (suffix.empty()) {
+        error = invalid;
+        return false;
+    }
     const char* first = suffix.data();
     const char* last = first + suffix.size();
     std::uint32_t value = 0;
     const auto parsed = std::from_chars(first, last, value, 10);
-    if (parsed.ec != std::errc{} || parsed.ptr != last) { error = invalid; return false; }   // 非数字/垃圾/溢出
+    if (parsed.ec != std::errc{} || parsed.ptr != last) {
+        error = invalid;
+        return false;
+    } // 非数字/垃圾/溢出
     *scope = value;
     return true;
 }
@@ -39,7 +54,8 @@ bool SplitV6Scope(const std::string& host, std::string* body, std::uint32_t* sco
 
 namespace bbt::infra::net {
 
-Address Address::Ip(const std::string& host, int port, std::error_code& error) {
+Address Address::Ip(const std::string& host, int port, std::error_code& error)
+{
     error.clear();
     Address result;
     if (host.empty() || host.find('\0') != std::string::npos || port < 0 || port > 65535) {
@@ -48,7 +64,9 @@ Address Address::Ip(const std::string& host, int port, std::error_code& error) {
     }
     std::string body = host;
     std::uint32_t scope = 0;
-    if (!SplitV6Scope(host, &body, &scope, error)) { return result; }
+    if (!SplitV6Scope(host, &body, &scope, error)) {
+        return result;
+    }
     boost::system::error_code parsed_error;
     const auto parsed = boost::asio::ip::make_address(body, parsed_error);
     if (parsed_error) {
@@ -77,7 +95,8 @@ Address Address::Ip(const std::string& host, int port, std::error_code& error) {
     return result;
 }
 
-Address Address::Unix(const std::string& path, std::error_code& error, bool abstract) {
+Address Address::Unix(const std::string& path, std::error_code& error, bool abstract)
+{
     error.clear();
     Address result;
     sockaddr_un addr{};
@@ -93,16 +112,22 @@ Address Address::Unix(const std::string& path, std::error_code& error, bool abst
     return result;
 }
 
-AddressFamily Address::Family() const noexcept {
+AddressFamily Address::Family() const noexcept
+{
     switch (m_storage.ss_family) {
-    case AF_INET: return AddressFamily::IPv4;
-    case AF_INET6: return AddressFamily::IPv6;
-    case AF_UNIX: return AddressFamily::Unix;
-    default: return AddressFamily::Unspecified;
+    case AF_INET:
+        return AddressFamily::IPv4;
+    case AF_INET6:
+        return AddressFamily::IPv6;
+    case AF_UNIX:
+        return AddressFamily::Unix;
+    default:
+        return AddressFamily::Unspecified;
     }
 }
 
-std::uint16_t Address::Port() const noexcept {
+std::uint16_t Address::Port() const noexcept
+{
     if (Family() == AddressFamily::IPv4) {
         sockaddr_in addr{};
         std::memcpy(&addr, &m_storage, sizeof(addr));
@@ -116,18 +141,23 @@ std::uint16_t Address::Port() const noexcept {
     return 0;
 }
 
-std::string Address::ToString() const {
+std::string Address::ToString() const
+{
     char text[INET6_ADDRSTRLEN]{};
     if (Family() == AddressFamily::IPv4) {
         sockaddr_in addr{};
         std::memcpy(&addr, &m_storage, sizeof(addr));
-        if (!inet_ntop(AF_INET, &addr.sin_addr, text, sizeof(text))) { return {}; }
+        if (!inet_ntop(AF_INET, &addr.sin_addr, text, sizeof(text))) {
+            return {};
+        }
         return std::string(text) + ':' + std::to_string(Port());
     }
     if (Family() == AddressFamily::IPv6) {
         sockaddr_in6 addr{};
         std::memcpy(&addr, &m_storage, sizeof(addr));
-        if (!inet_ntop(AF_INET6, &addr.sin6_addr, text, sizeof(text))) { return {}; }
+        if (!inet_ntop(AF_INET6, &addr.sin6_addr, text, sizeof(text))) {
+            return {};
+        }
         const std::string scope = addr.sin6_scope_id ? '%' + std::to_string(addr.sin6_scope_id) : "";
         return '[' + std::string(text) + scope + "]:" + std::to_string(Port());
     }
@@ -135,16 +165,21 @@ std::string Address::ToString() const {
         sockaddr_un addr{};
         std::memcpy(&addr, &m_storage, sizeof(addr));
         const auto size = m_size > offsetof(sockaddr_un, sun_path) ? m_size - offsetof(sockaddr_un, sun_path) : 0;
-        if (!size) { return {}; }
-        if (!addr.sun_path[0]) { return '@' + std::string(addr.sun_path + 1, size - 1); }
+        if (!size) {
+            return {};
+        }
+        if (!addr.sun_path[0]) {
+            return '@' + std::string(addr.sun_path + 1, size - 1);
+        }
         return std::string(addr.sun_path, strnlen(addr.sun_path, size));
     }
     return {};
 }
 
-
-bool Address::IsLoopback() const noexcept {
-    if (Family() == AddressFamily::Unix) return true;
+bool Address::IsLoopback() const noexcept
+{
+    if (Family() == AddressFamily::Unix)
+        return true;
     if (Family() == AddressFamily::IPv4) {
         sockaddr_in addr{};
         std::memcpy(&addr, &m_storage, sizeof(addr));
@@ -155,13 +190,15 @@ bool Address::IsLoopback() const noexcept {
         std::memcpy(&addr, &m_storage, sizeof(addr));
         const auto& bytes = addr.sin6_addr.s6_addr;
         for (int i = 0; i < 15; ++i)
-            if (bytes[i] != 0) return false;
+            if (bytes[i] != 0)
+                return false;
         return bytes[15] == 1;
     }
     return false;
 }
 
-Address Address::FromNative(const sockaddr* addr, socklen_t length) {
+Address Address::FromNative(const sockaddr* addr, socklen_t length)
+{
     Address out;
     if (addr == nullptr || length == 0 || static_cast<std::size_t>(length) > sizeof(sockaddr_storage)) {
         return out;

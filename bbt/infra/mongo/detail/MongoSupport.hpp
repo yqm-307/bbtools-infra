@@ -50,21 +50,21 @@ public:
     // 控制线程调用，幂等且至多生效一次：经 bbt::coroutine::io::GetExecutor()
     // 取得共享 executor 并建立 strand。executor 不可得/无效时返回
     // RuntimeUnavailable——infra 不接触原始 io_context，无法自治兜底。
-    result<void> Start() {
+    result<void> Start()
+    {
         boost::asio::any_io_executor ex;
         try {
             ex = bbt::coroutine::io::GetExecutor();
         } catch (...) {
-            return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable,
-                "coroutine shared io executor unavailable"));
+            return result<void>::err(
+                MakeError(ErrorCode::RuntimeUnavailable, "coroutine shared io executor unavailable"));
         }
         if (!ex)
-            return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable,
-                "coroutine shared io executor is empty"));
+            return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable, "coroutine shared io executor is empty"));
 
         std::lock_guard<std::mutex> lk(m_post_mtx);
         if (m_io)
-            return result<void>::ok();   // 幂等：并发 Start 只建立一次
+            return result<void>::ok(); // 幂等：并发 Start 只建立一次
         m_io.emplace(ex);
         return result<void>::ok();
     }
@@ -73,8 +73,8 @@ public:
     // 已封，或 post 自身分配失败——调用方按「执行域不可达」处理。
     // noexcept 调用方依赖本方法不向调用方抛：post 可能抛 bad_alloc，
     // 统一吞为 false。
-    template <class F>
-    bool TryPost(F&& f) {
+    template <class F> bool TryPost(F&& f)
+    {
         std::lock_guard<std::mutex> lk(m_post_mtx);
         if (m_stopped || !m_io)
             return false;
@@ -88,24 +88,27 @@ public:
 
     // 关闭链路调用：封死 TryPost，此后新投递一律拒绝。
     // 不承诺任何已受理 handler 已落定——落定判据是 owner 的在途计数。
-    void Seal() noexcept {
+    void Seal() noexcept
+    {
         std::lock_guard<std::mutex> lk(m_post_mtx);
         m_stopped = true;
     }
 
-    bool Started() const noexcept {
+    bool Started() const noexcept
+    {
         std::lock_guard<std::mutex> lk(m_post_mtx);
         return m_io.has_value();
     }
 
 private:
     std::optional<IoStrand> m_io;
-    mutable std::mutex      m_post_mtx;
-    bool                    m_stopped{false};   // m_post_mtx 保护
+    mutable std::mutex m_post_mtx;
+    bool m_stopped{false}; // m_post_mtx 保护
 };
 
 // WaitStatus → 请求侧 Error 的固定映射（Completed 不出现）。
-inline Error WaitStatusToError(bbt::coroutine::WaitStatus status) {
+inline Error WaitStatusToError(bbt::coroutine::WaitStatus status)
+{
     using bbt::coroutine::WaitStatus;
     switch (status) {
     case WaitStatus::TimedOut:
@@ -113,14 +116,11 @@ inline Error WaitStatusToError(bbt::coroutine::WaitStatus status) {
     case WaitStatus::Cancelled:
         return MakeError(ErrorCode::Cancelled, "request cancelled");
     case WaitStatus::InvalidContext:
-        return MakeError(ErrorCode::InvalidContext,
-            "request must run in coroutine context");
+        return MakeError(ErrorCode::InvalidContext, "request must run in coroutine context");
     case WaitStatus::AlreadyWaiting:
-        return MakeError(ErrorCode::InternalError,
-            "internal: duplicate waiter on request signal");
+        return MakeError(ErrorCode::InternalError, "internal: duplicate waiter on request signal");
     case WaitStatus::RuntimeUnavailable:
-        return MakeError(ErrorCode::RuntimeUnavailable,
-            "coroutine runtime unavailable for request wait");
+        return MakeError(ErrorCode::RuntimeUnavailable, "coroutine runtime unavailable for request wait");
     case WaitStatus::Completed:
         break;
     }
@@ -143,7 +143,8 @@ inline constexpr std::chrono::milliseconds kCloseDrainTimeout{5000};
 //  - 本类型只负责「登记 + 唤醒」；物理排空判据仍是各对象自己的在途计数。
 class CloseWaiters {
 public:
-    bool Add(const bbt::coroutine::sync::CoWaiter::SPtr& waiter) {
+    bool Add(const bbt::coroutine::sync::CoWaiter::SPtr& waiter)
+    {
         std::lock_guard<std::mutex> lk(m_mtx);
         if (m_closed)
             return false;
@@ -151,7 +152,8 @@ public:
         return true;
     }
 
-    void Remove(const bbt::coroutine::sync::CoWaiter* waiter) noexcept {
+    void Remove(const bbt::coroutine::sync::CoWaiter* waiter) noexcept
+    {
         std::lock_guard<std::mutex> lk(m_mtx);
         for (auto it = m_waiters.begin(); it != m_waiters.end(); ++it) {
             if (it->get() == waiter) {
@@ -161,7 +163,8 @@ public:
         }
     }
 
-    void CloseAndWakeAll() noexcept {
+    void CloseAndWakeAll() noexcept
+    {
         std::vector<bbt::coroutine::sync::CoWaiter::SPtr> wake;
         {
             std::lock_guard<std::mutex> lk(m_mtx);
@@ -172,14 +175,15 @@ public:
             waiter->Notify();
     }
 
-    bool Closed() const noexcept {
+    bool Closed() const noexcept
+    {
         std::lock_guard<std::mutex> lk(m_mtx);
         return m_closed;
     }
 
 private:
-    mutable std::mutex                                m_mtx;
-    bool                                              m_closed{false};
+    mutable std::mutex m_mtx;
+    bool m_closed{false};
     std::vector<bbt::coroutine::sync::CoWaiter::SPtr> m_waiters;
 };
 
@@ -193,40 +197,48 @@ public:
     ManagedCloseState() = default;
 
     // Open→Closing；仅首次返回 true，调用方据此执行一次性 teardown。
-    bool BeginClose() noexcept {
+    bool BeginClose() noexcept
+    {
         int expected = kOpen;
         return m_phase.compare_exchange_strong(expected, kClosing);
     }
     // 物理清理落定：幂等（仅首次落实者跑回调）。
     // 「Closed = 后端不会再访问本组件拥有的操作资源」，而非仅收到关闭意图。
-    void MarkClosed() noexcept {
+    void MarkClosed() noexcept
+    {
         if (m_phase.exchange(kClosed) == kClosed)
             return;
         if (m_hook)
             m_hook();
     }
     // 发布前一次性注册：对象逃逸到其他线程之前由工厂设置。
-    void SetClosedHook(std::function<void()> hook) noexcept {
+    void SetClosedHook(std::function<void()> hook) noexcept
+    {
         m_hook = std::move(hook);
     }
-    bool IsClosed() const noexcept { return m_phase.load() == kClosed; }
-    bool IsOpen()    const noexcept { return m_phase.load() == kOpen; }
+    bool IsClosed() const noexcept
+    {
+        return m_phase.load() == kClosed;
+    }
+    bool IsOpen() const noexcept
+    {
+        return m_phase.load() == kOpen;
+    }
 
 private:
-    std::atomic<int>      m_phase{kOpen};
-    std::function<void()> m_hook;   // 仅发布前写一次，此后只读
+    std::atomic<int> m_phase{kOpen};
+    std::function<void()> m_hook; // 仅发布前写一次，此后只读
 };
 
 // CreateObjectInfo 的前置条件是「运行时已初始化」（不再有运行时代际）；
 // 抛出的 logic_error 统一映射为 RuntimeUnavailable。
-inline result<bbt::coroutine::CoObjectInfo> NewObjectInfo(std::string kind) {
+inline result<bbt::coroutine::CoObjectInfo> NewObjectInfo(std::string kind)
+{
     try {
-        return result<bbt::coroutine::CoObjectInfo>::ok(
-            bbt::coroutine::CreateObjectInfo(std::move(kind), ""));
+        return result<bbt::coroutine::CoObjectInfo>::ok(bbt::coroutine::CreateObjectInfo(std::move(kind), ""));
     } catch (const std::logic_error&) {
-        return result<bbt::coroutine::CoObjectInfo>::err(MakeError(
-            ErrorCode::RuntimeUnavailable,
-            "coroutine runtime not initialized"));
+        return result<bbt::coroutine::CoObjectInfo>::err(
+            MakeError(ErrorCode::RuntimeUnavailable, "coroutine runtime not initialized"));
     }
 }
 

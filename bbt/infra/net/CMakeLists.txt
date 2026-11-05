@@ -12,9 +12,9 @@ target_compile_options(bbt_infra_net PRIVATE -Wall -Wextra -Wpedantic)
 
 # 白名单单头 C++17 自检；只覆盖 net 公共头。
 # Options/LB 是值层公开头；Types/ReadAccess/Connection/RawHandler/CoConnection/
-# Error 是 R2 值类型、读取守卫、原始与 Co 薄封装公共头。detail/* 是内部部件
+# Error 是值类型，ReadAccess、Connection、RawHandler、CoConnection 是读取守卫、原始与 Co 薄封装公共头。detail/* 是内部部件
 # （含 NormalizeOptions、TestAccess、EngineTestAccess），不得仅因自检变成公开 API。
-# Udp.hpp 是高层 UDP 的编译拒绝入口（用户 2026-10-17 裁定本轮不做高层 UDP），
+# Udp.hpp 是高层 UDP 的编译拒绝入口（当前不提供高层 UDP 连接 API），
 # 其全部内容就是 #error，故**故意不列入** _headers；由
 # net.udp_high_level_compile_reject 做正/负编译对照验证。
 set(_headers Annotations.hpp ICoObject.hpp CoObject.hpp Address.hpp NativeSocket.hpp

@@ -1,0 +1,19 @@
+{
+  "project": "bbtools-infra",
+  "modules": {
+    "infra": "根部公共头：公共值契约（Result、NetworkTypes、NetError、Codec）、基础接口（ICoObject、ICoNetwork、ICoCloseable），以及保留的 CoMongoCli 入口",
+    "net": "TCP 网络执行域：Engine、ICoConnection、Connection、Options、Buffer 与 Co 消费面",
+    "http": "HTTP Client / Server（唯一现役 HTTP 实现）",
+    "redis": "Redis 协程客户端 CoRedisCli 与有界连接池 CoRedisPool",
+    "rpc": "RPC core：Client / Server、Transport seam（HTTP、TCP）、Options、Codec、Hooks",
+    "mcp": "MCP：McpServer、McpTypes、JsonValue、stdio / HTTP 传输与 schema 校验",
+    "mongo": "MongoDB 协程客户端 Client 与 BSON 类型",
+    "config": "动态配置：Source、Value、Snapshot、Watch、内存与文件源",
+    "consul": "Consul agent HTTP API 的注册、注销与健康发现 adapter"
+  },
+  "start_here": [
+    ["net", "TCP 网络执行域入口：Engine 与 ICoConnection"],
+    ["http", "HTTP Client / Server 的连接池、流式响应与服务端停止语义"],
+    ["rpc", "RPC core 与 transport seam"]
+  ]
+}

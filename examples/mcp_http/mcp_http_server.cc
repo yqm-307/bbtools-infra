@@ -47,12 +47,15 @@
 namespace {
 
 volatile std::sig_atomic_t g_stop = 0;
-void OnStopSignal(int) { g_stop = 1; }
+void OnStopSignal(int)
+{
+    g_stop = 1;
+}
 
-bbt::infra::result<bbt::infra::mcp::ResourceResult> EchoResource(
-    const bbt::infra::mcp::RequestContext&, const std::string& uri) {
-    auto content =
-        bbt::infra::mcp::ResourceContents::Text(uri, "text/plain", "echo:" + uri);
+bbt::infra::result<bbt::infra::mcp::ResourceResult> EchoResource(const bbt::infra::mcp::RequestContext&,
+                                                                 const std::string& uri)
+{
+    auto content = bbt::infra::mcp::ResourceContents::Text(uri, "text/plain", "echo:" + uri);
     if (!content)
         return bbt::infra::result<bbt::infra::mcp::ResourceResult>::err(content.error());
     bbt::infra::mcp::ResourceResult out;
@@ -60,14 +63,16 @@ bbt::infra::result<bbt::infra::mcp::ResourceResult> EchoResource(
     return bbt::infra::result<bbt::infra::mcp::ResourceResult>::ok(std::move(out));
 }
 
-bbt::infra::result<bbt::infra::mcp::PromptResult> EchoPrompt(
-    const bbt::infra::mcp::RequestContext&, const bbt::infra::mcp::JsonValue& arguments) {
+bbt::infra::result<bbt::infra::mcp::PromptResult> EchoPrompt(const bbt::infra::mcp::RequestContext&,
+                                                             const bbt::infra::mcp::JsonValue& arguments)
+{
     std::string text = "你好";
     if (arguments.IsObject()) {
         auto found = arguments.Find("text");
         if (found && found.value().IsString()) {
             auto s = found.value().AsString();
-            if (s) text = s.value();
+            if (s)
+                text = s.value();
         }
     }
     bbt::infra::mcp::PromptResult out;
@@ -79,20 +84,22 @@ bbt::infra::result<bbt::infra::mcp::PromptResult> EchoPrompt(
     return bbt::infra::result<bbt::infra::mcp::PromptResult>::ok(std::move(out));
 }
 
-void PrintUsage(std::FILE* out) {
+void PrintUsage(std::FILE* out)
+{
     std::fprintf(out, "用法：Example_mcp_http_server --http\n"
                       "  --http  POST /mcp Streamable HTTP（127.0.0.1 随机端口）\n");
 }
 
 } // namespace
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv)
+{
     if (argc != 2 || std::strcmp(argv[1], "--http") != 0) {
         PrintUsage(stderr);
         return 2;
     }
 
-    struct sigaction action {};
+    struct sigaction action{};
     action.sa_handler = OnStopSignal;
     ::sigemptyset(&action.sa_mask);
     ::sigaction(SIGINT, &action, nullptr);
@@ -104,8 +111,7 @@ int main(int argc, char** argv) {
     g_scheduler->Start();
 
     bbt::infra::mcp::ServerOptions server_options;
-    server_options.instructions =
-        "bbtools-infra MCP HTTP 示例：echo 资源与提示词";
+    server_options.instructions = "bbtools-infra MCP HTTP 示例：echo 资源与提示词";
     auto made_server = bbt::infra::mcp::McpServer::Create(std::move(server_options));
     if (!made_server) {
         std::fprintf(stderr, "mcp-example: McpServer::Create 失败\n");
@@ -138,14 +144,12 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    auto engine = bbt::infra::net::Engine::Create(
-        std::shared_ptr<bbt::infra::net::RawHandler>{});
+    auto engine = bbt::infra::net::Engine::Create(std::shared_ptr<bbt::infra::net::RawHandler>{});
     bbt::infra::mcp::McpHttpOptions http_options;
     // loopback-only：Host/Origin 白名单覆盖本机；非 loopback 部署经外层反代
     // 改 allowed_hosts（鉴权在 infra 之上）。
     http_options.allowed_hosts = {"127.0.0.1", "localhost"};
-    auto made_transport = bbt::infra::mcp::McpHttpTransport::Create(
-        server, engine, std::move(http_options));
+    auto made_transport = bbt::infra::mcp::McpHttpTransport::Create(server, engine, std::move(http_options));
     if (!made_transport) {
         std::fprintf(stderr, "mcp-example: McpHttpTransport::Create 失败\n");
         return 1;
@@ -164,8 +168,7 @@ int main(int argc, char** argv) {
     std::thread runner([&] { error = engine->Run(config); });
     {
         const auto end = std::chrono::steady_clock::now() + std::chrono::seconds{3};
-        while (engine->Phase() != bbt::infra::net::EnginePhase::Running &&
-               std::chrono::steady_clock::now() < end)
+        while (engine->Phase() != bbt::infra::net::EnginePhase::Running && std::chrono::steady_clock::now() < end)
             std::this_thread::sleep_for(std::chrono::milliseconds{1});
     }
     if (engine->Phase() != bbt::infra::net::EnginePhase::Running) {
@@ -181,8 +184,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "mcp-example: transport Start 失败\n");
         return 1;
     }
-    std::fprintf(stderr, "mcp-example: listening http://127.0.0.1:%u/mcp\n",
-                 addresses.front().Port());
+    std::fprintf(stderr, "mcp-example: listening http://127.0.0.1:%u/mcp\n", addresses.front().Port());
 
     // 演示发布入口：每 2s 发一次 mem://echo 的资源变更，给 SSE 订阅流一个真实
     // 事件源（PublishResourceChanged 是公共面显式发布入口）。
@@ -190,11 +192,13 @@ int main(int argc, char** argv) {
     std::thread publisher([&] {
         while (publish_run.load()) {
             std::this_thread::sleep_for(std::chrono::seconds{2});
-            if (publish_run.load()) server->PublishResourceChanged("memo://echo");
+            if (publish_run.load())
+                server->PublishResourceChanged("memo://echo");
         }
     });
 
-    while (g_stop == 0) std::this_thread::sleep_for(std::chrono::milliseconds{20});
+    while (g_stop == 0)
+        std::this_thread::sleep_for(std::chrono::milliseconds{20});
 
     publish_run.store(false);
     publisher.join();
@@ -203,8 +207,8 @@ int main(int argc, char** argv) {
     const auto drained = transport->Drain(std::chrono::steady_clock::now() + std::chrono::seconds{3});
     transport->Close();
     const auto stopped = transport->WaitStopped(std::chrono::steady_clock::now() + std::chrono::seconds{3});
-    std::fprintf(stderr, "mcp-example: http stopped drain=%d stopped=%d\n",
-                 static_cast<bool>(drained), static_cast<bool>(stopped));
+    std::fprintf(stderr, "mcp-example: http stopped drain=%d stopped=%d\n", static_cast<bool>(drained),
+                 static_cast<bool>(stopped));
     server->Close();
     engine->RequestClose();
     runner.join();

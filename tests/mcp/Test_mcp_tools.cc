@@ -37,7 +37,8 @@ namespace {
 int g_checks = 0;
 int g_failures = 0;
 
-void Check(bool ok, const char* expr, int line) {
+void Check(bool ok, const char* expr, int line)
+{
     ++g_checks;
     if (!ok) {
         ++g_failures;
@@ -64,40 +65,51 @@ using bbt::infra::mcp::ToolDefinition;
 using bbt::infra::mcp::ToolHandler;
 using bbt::infra::mcp::ToolResult;
 
-std::optional<JsonValue> Find(const JsonValue& value, const std::string& key) {
+std::optional<JsonValue> Find(const JsonValue& value, const std::string& key)
+{
     auto found = value.Find(key);
-    if (!found) return std::nullopt;
+    if (!found)
+        return std::nullopt;
     return std::move(found).value();
 }
 
-std::optional<JsonValue> Pick(bbt::infra::result<JsonValue>&& r) {
-    if (!r) return std::nullopt;
+std::optional<JsonValue> Pick(bbt::infra::result<JsonValue>&& r)
+{
+    if (!r)
+        return std::nullopt;
     return std::move(r).value();
 }
 
-std::optional<JsonValue> Respond(McpSession& session, const std::string& frame) {
+std::optional<JsonValue> Respond(McpSession& session, const std::string& frame)
+{
     auto outcome = session.HandleFrame(frame);
-    if (!outcome || !outcome.value().has_response) return std::nullopt;
+    if (!outcome || !outcome.value().has_response)
+        return std::nullopt;
     auto parsed = JsonValue::Parse(outcome.value().response, 1U << 20, 32);
-    if (!parsed) return std::nullopt;
+    if (!parsed)
+        return std::nullopt;
     return std::move(parsed).value();
 }
 
-std::optional<std::int64_t> ErrorCodeOf(const JsonValue& response) {
+std::optional<std::int64_t> ErrorCodeOf(const JsonValue& response)
+{
     auto error = Find(response, "error");
-    if (!error) return std::nullopt;
+    if (!error)
+        return std::nullopt;
     auto code = Find(*error, "code");
-    if (!code) return std::nullopt;
+    if (!code)
+        return std::nullopt;
     auto number = code->AsInt64();
-    if (!number) return std::nullopt;
+    if (!number)
+        return std::nullopt;
     return number.value();
 }
 
-JsonValue ModernMeta(const std::string& capabilities_json = "{}") {
+JsonValue ModernMeta(const std::string& capabilities_json = "{}")
+{
     JsonValue meta = JsonValue::Object();
     meta.Set("io.modelcontextprotocol/protocolVersion", JsonValue(std::string("2026-07-28")));
-    meta.Set("io.modelcontextprotocol/clientCapabilities",
-             JsonValue::Parse(capabilities_json, 1U << 20, 32).value());
+    meta.Set("io.modelcontextprotocol/clientCapabilities", JsonValue::Parse(capabilities_json, 1U << 20, 32).value());
     JsonValue params = JsonValue::Object();
     params.Set("_meta", std::move(meta));
     return params;
@@ -105,42 +117,43 @@ JsonValue ModernMeta(const std::string& capabilities_json = "{}") {
 
 // 带 sampling 能力的 modern tools/call 帧（params._meta 两键 + name[/arguments/extra]）。
 std::string ModernCall(int id, const std::string& name, const std::string& arguments_json,
-                       const std::string& caps = "{\"sampling\":{}}",
-                       const std::string& extra_params = "") {
+                       const std::string& caps = "{\"sampling\":{}}", const std::string& extra_params = "")
+{
     std::string params = ModernMeta(caps).Serialize();
-    params.insert(params.size() - 1,
-                  ",\"name\":\"" + name + "\"" +
-                      (arguments_json.empty() ? "" : ",\"arguments\":" + arguments_json) +
-                      extra_params);
-    return "{\"jsonrpc\":\"2.0\",\"id\":" + std::to_string(id) +
-           ",\"method\":\"tools/call\",\"params\":" + params + "}";
+    params.insert(params.size() - 1, ",\"name\":\"" + name + "\""
+                                         + (arguments_json.empty() ? "" : ",\"arguments\":" + arguments_json)
+                                         + extra_params);
+    return "{\"jsonrpc\":\"2.0\",\"id\":" + std::to_string(id) + ",\"method\":\"tools/call\",\"params\":" + params
+           + "}";
 }
 
-std::string ModernList(int id, const std::string& cursor_json = "") {
+std::string ModernList(int id, const std::string& cursor_json = "")
+{
     std::string params = ModernMeta().Serialize();
     params.insert(params.size() - 1, cursor_json);
-    return "{\"jsonrpc\":\"2.0\",\"id\":" + std::to_string(id) +
-           ",\"method\":\"tools/list\",\"params\":" + params + "}";
+    return "{\"jsonrpc\":\"2.0\",\"id\":" + std::to_string(id) + ",\"method\":\"tools/list\",\"params\":" + params
+           + "}";
 }
 
-std::string LegacyCall(int id, const std::string& name, const std::string& arguments_json) {
+std::string LegacyCall(int id, const std::string& name, const std::string& arguments_json)
+{
     std::string args = arguments_json.empty() ? "" : ",\"arguments\":" + arguments_json;
-    return "{\"jsonrpc\":\"2.0\",\"id\":" + std::to_string(id) +
-           ",\"method\":\"tools/call\",\"params\":{\"name\":\"" + name + "\"" + args + "}}";
+    return "{\"jsonrpc\":\"2.0\",\"id\":" + std::to_string(id) + ",\"method\":\"tools/call\",\"params\":{\"name\":\""
+           + name + "\"" + args + "}}";
 }
 
 // echo 工具：原样回显 message（真实 handler，全流程实调）。
-ToolHandler EchoHandler(int* counter) {
-    return [counter](const RequestContext&, JsonValue arguments)
-               -> result<HandlerResult<ToolResult>> {
+ToolHandler EchoHandler(int* counter)
+{
+    return [counter](const RequestContext&, JsonValue arguments) -> result<HandlerResult<ToolResult>> {
         ++*counter;
         std::string text;
         if (auto message = arguments.Find("message"))
-            if (auto parsed = message.value().AsString()) text = std::string(parsed.value());
+            if (auto parsed = message.value().AsString())
+                text = std::string(parsed.value());
         ToolResult produced;
         produced.content.push_back(Content::Text(std::move(text)));
-        return result<HandlerResult<ToolResult>>::ok(
-            HandlerResult<ToolResult>::Completed(std::move(produced)));
+        return result<HandlerResult<ToolResult>>::ok(HandlerResult<ToolResult>::Completed(std::move(produced)));
     };
 }
 
@@ -152,12 +165,12 @@ const char* kRootEmptySchema = R"({})";
 const char* kRootStringSchema = R"({"type":"string"})";
 const char* kRootMissingTypeSchema = R"({"properties":{"message":{"type":"string"}}})";
 const char* kRootArrayTypeSchema = R"({"type":["object","null"]})";
-const char* kExternalRefSchema =
-    R"({"type":"object","properties":{"x":{"$ref":"https://example.invalid/schema"}}})";
+const char* kExternalRefSchema = R"({"type":"object","properties":{"x":{"$ref":"https://example.invalid/schema"}}})";
 
-}  // namespace
+} // namespace
 
-int main() {
+int main()
+{
     // ---- 1. 未接通 Schema：AddTool fail-closed --------------------------------
     {
         auto server = McpServer::Create(ServerOptions{}).value();
@@ -166,14 +179,14 @@ int main() {
         def.input_schema = JsonValue::Parse(kEchoInputSchema, 1U << 20, 32).value();
         int count = 0;
         auto refused = server->AddTool(std::move(def), EchoHandler(&count));
-        CHECK(!refused);  // fail-closed：不注册未校验工具
+        CHECK(!refused); // fail-closed：不注册未校验工具
     }
 
     // ---- 2. 接通 + 注册 + tools/list + echo 调用 + 输入校验 --------------------
     {
         auto server = McpServer::Create(ServerOptions{}).value();
         CHECK(EnableToolsSchemaValidation(*server));
-        CHECK(!EnableToolsSchemaValidation(*server));  // 重复接通拒绝
+        CHECK(!EnableToolsSchemaValidation(*server)); // 重复接通拒绝
 
         ToolDefinition echo;
         echo.name = "echo";
@@ -195,8 +208,8 @@ int main() {
         // R5：input_schema 根 type 必须是 string "object"——{}、缺 type、type:string、
         // type:array 一律 InvalidArgument 拒绝；拒绝先于任何 mutation，不消耗
         // 名字/容量，随后同名合法注册仍成功（事务性）。
-        const char* rejected_root_schemas[] = {kRootEmptySchema, kRootStringSchema,
-                                               kRootMissingTypeSchema, kRootArrayTypeSchema};
+        const char* rejected_root_schemas[] = {kRootEmptySchema, kRootStringSchema, kRootMissingTypeSchema,
+                                               kRootArrayTypeSchema};
         for (const char* schema_json : rejected_root_schemas) {
             ToolDefinition rejected_root;
             rejected_root.name = "rootcheck";
@@ -246,7 +259,8 @@ int main() {
         auto session = CreateSession(server);
 
         // capabilities：有 tool 注册 → 宣告 tools（真实注册事实）。
-        auto discover = Respond(*session,
+        auto discover = Respond(
+            *session,
             R"({"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}})");
         CHECK(discover);
         auto caps = Find(Find(*discover, "result").value(), "capabilities");
@@ -282,7 +296,7 @@ int main() {
         CHECK(block0);
         auto text0 = Find(*block0, "text");
         CHECK(text0 && text0->AsString() && text0->AsString().value() == "hello");
-        CHECK(!Find(*ok_result, "isError"));  // false 不写
+        CHECK(!Find(*ok_result, "isError")); // false 不写
         CHECK(count == 1);
 
         // 缺 required → -32602、handler 0 次（S9）。
@@ -314,29 +328,30 @@ int main() {
         ToolDefinition def;
         def.name = "calc";
         def.input_schema = JsonValue::Parse(R"({"type":"object"})", 1U << 20, 32).value();
-        def.output_schema = JsonValue::Parse(
-            R"({"type":"object","properties":{"n":{"type":"integer"}},"required":["n"]})", 1U << 20, 32).value();
+        def.output_schema =
+            JsonValue::Parse(R"({"type":"object","properties":{"n":{"type":"integer"}},"required":["n"]})", 1U << 20,
+                             32)
+                .value();
         int count = 0;
-        ToolHandler calc = [&count](const RequestContext&, JsonValue arguments)
-                                  -> result<HandlerResult<ToolResult>> {
+        ToolHandler calc = [&count](const RequestContext&, JsonValue arguments) -> result<HandlerResult<ToolResult>> {
             ++count;
             std::string operation = "ok";
             if (auto op = arguments.Find("op"))
-                if (auto parsed = op.value().AsString()) operation = std::string(parsed.value());
+                if (auto parsed = op.value().AsString())
+                    operation = std::string(parsed.value());
             ToolResult produced;
-            if (operation == "boom") throw std::runtime_error("secret boom");
+            if (operation == "boom")
+                throw std::runtime_error("secret boom");
             if (operation == "badoutput") {
                 produced.structured_content = JsonValue::Parse(R"({"n":"not-an-integer"})", 1U << 20, 32).value();
-                return result<HandlerResult<ToolResult>>::ok(
-                    HandlerResult<ToolResult>::Completed(std::move(produced)));
+                return result<HandlerResult<ToolResult>>::ok(HandlerResult<ToolResult>::Completed(std::move(produced)));
             }
             produced.structured_content = JsonValue::Parse(R"({"n":7})", 1U << 20, 32).value();
             if (operation == "iserror") {
                 produced.is_error = true;
                 produced.content.push_back(Content::Text("business failure"));
             }
-            return result<HandlerResult<ToolResult>>::ok(
-                HandlerResult<ToolResult>::Completed(std::move(produced)));
+            return result<HandlerResult<ToolResult>>::ok(HandlerResult<ToolResult>::Completed(std::move(produced)));
         };
         CHECK(server->AddTool(std::move(def), std::move(calc)));
         CHECK(server->Start());
@@ -367,7 +382,7 @@ int main() {
         CHECK(boom);
         CHECK(ErrorCodeOf(*boom) == -32603);
         CHECK(boom->Serialize().find("secret boom") == std::string::npos);
-        CHECK(count == 4);  // good/badoutput/iserror/boom 全部进入 handler（输出校验在出口）
+        CHECK(count == 4); // good/badoutput/iserror/boom 全部进入 handler（输出校验在出口）
     }
 
     // ---- 4. 业务 MRTR：Deferred(InputRequired) ---------------------------------
@@ -378,20 +393,17 @@ int main() {
         def.name = "confirm";
         def.input_schema = JsonValue::Parse(R"({"type":"object"})", 1U << 20, 32).value();
         int count = 0;
-        ToolHandler confirm = [&count](const RequestContext& context,
-                                       JsonValue) -> result<HandlerResult<ToolResult>> {
+        ToolHandler confirm = [&count](const RequestContext& context, JsonValue) -> result<HandlerResult<ToolResult>> {
             ++count;
             // 重试请求（第二轮）：库把 owned inputResponses/requestState 放进上下文。
             if (!context.InputResponses().empty()) {
                 CHECK(context.RequestState().has_value());
                 ToolResult produced;
                 produced.content.push_back(Content::Text("resumed"));
-                return result<HandlerResult<ToolResult>>::ok(
-                    HandlerResult<ToolResult>::Completed(std::move(produced)));
+                return result<HandlerResult<ToolResult>>::ok(HandlerResult<ToolResult>::Completed(std::move(produced)));
             }
             std::map<std::string, ClientInputRequest> requests;
-            requests.emplace("srv1",
-                             ClientInputRequest{"sampling/createMessage", JsonValue::Object()});
+            requests.emplace("srv1", ClientInputRequest{"sampling/createMessage", JsonValue::Object()});
             auto required = InputRequired::Create(std::move(requests), std::string("state-1"));
             return result<HandlerResult<ToolResult>>::ok(
                 HandlerResult<ToolResult>::Deferred(std::move(required).value()));
@@ -417,8 +429,7 @@ int main() {
         CHECK(!ErrorCodeOf(*deferred));
         auto result_value = Find(*deferred, "result");
         auto result_type = Find(*result_value, "resultType");
-        CHECK(result_type && result_type->AsString() &&
-              result_type->AsString().value() == "input_required");
+        CHECK(result_type && result_type->AsString() && result_type->AsString().value() == "input_required");
         auto input_requests = Find(*result_value, "inputRequests");
         CHECK(input_requests);
         auto srv1 = Find(*input_requests, "srv1");
@@ -430,10 +441,8 @@ int main() {
         CHECK(count == 2);
 
         // MRTR 重试：inputResponses + requestState → handler 观察到 owned 输入（新 id）。
-        std::string retry_extra =
-            ",\"inputResponses\":{\"srv1\":{\"text\":\"yes\"}},\"requestState\":\"state-1\"";
-        auto retry = Respond(*session,
-                             ModernCall(22, "confirm", "{}", "{\"sampling\":{}}", retry_extra));
+        std::string retry_extra = ",\"inputResponses\":{\"srv1\":{\"text\":\"yes\"}},\"requestState\":\"state-1\"";
+        auto retry = Respond(*session, ModernCall(22, "confirm", "{}", "{\"sampling\":{}}", retry_extra));
         CHECK(retry);
         CHECK(!ErrorCodeOf(*retry));
         auto retry_content = Find(Find(*retry, "result").value(), "content");
@@ -449,12 +458,11 @@ int main() {
         legacy_def.name = "confirm";
         legacy_def.input_schema = JsonValue::Parse(R"({"type":"object"})", 1U << 20, 32).value();
         int legacy_count = 0;
-        ToolHandler legacy_handler = [&legacy_count](const RequestContext&, JsonValue)
-                                            -> result<HandlerResult<ToolResult>> {
+        ToolHandler legacy_handler = [&legacy_count](const RequestContext&,
+                                                     JsonValue) -> result<HandlerResult<ToolResult>> {
             ++legacy_count;
             std::map<std::string, ClientInputRequest> requests;
-            requests.emplace("srv1",
-                             ClientInputRequest{"sampling/createMessage", JsonValue::Object()});
+            requests.emplace("srv1", ClientInputRequest{"sampling/createMessage", JsonValue::Object()});
             auto required = InputRequired::Create(std::move(requests), std::string("s"));
             return result<HandlerResult<ToolResult>>::ok(
                 HandlerResult<ToolResult>::Deferred(std::move(required).value()));
@@ -462,7 +470,8 @@ int main() {
         CHECK(legacy_server->AddTool(std::move(legacy_def), std::move(legacy_handler)));
         CHECK(legacy_server->Start());
         auto legacy_session = CreateSession(legacy_server);
-        CHECK(Respond(*legacy_session,
+        CHECK(Respond(
+            *legacy_session,
             R"({"jsonrpc":"2.0","id":30,"method":"initialize","params":{"capabilities":{},"clientInfo":{"name":"cli","version":"1"},"protocolVersion":"2025-11-25"}})"));
         auto legacy_deferred = Respond(*legacy_session, LegacyCall(31, "confirm", "{}"));
         CHECK(legacy_deferred);
@@ -495,13 +504,12 @@ int main() {
         CHECK(item0 && item0->IsObject());
         auto next = Find(*r1, "nextCursor");
         CHECK(next);
-        auto page2 = Respond(*session, ModernList(
-                                          41, ",\"cursor\":\"" + std::string(next->AsString().value()) + "\""));
+        auto page2 = Respond(*session, ModernList(41, ",\"cursor\":\"" + std::string(next->AsString().value()) + "\""));
         CHECK(page2);
         auto r2 = Find(*page2, "result");
         auto t2 = Find(*r2, "tools");
         CHECK(t2);
-        CHECK(!Find(*r2, "nextCursor"));  // 末页无 nextCursor
+        CHECK(!Find(*r2, "nextCursor")); // 末页无 nextCursor
         // 非法 cursor → -32602。
         auto bad_cursor = Respond(*session, ModernList(42, ",\"cursor\":\"zz\""));
         CHECK(bad_cursor);
@@ -512,7 +520,8 @@ int main() {
         auto server = McpServer::Create(ServerOptions{}).value();
         CHECK(server->Start());
         auto session = CreateSession(server);
-        auto discover = Respond(*session,
+        auto discover = Respond(
+            *session,
             R"({"jsonrpc":"2.0","id":50,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}})");
         CHECK(discover);
         auto caps = Find(Find(*discover, "result").value(), "capabilities");

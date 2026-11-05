@@ -8,14 +8,16 @@
 namespace bbt::infra::config_detail {
 class CloseWaiters {
 public:
-    bool Add(const bbt::coroutine::sync::CoWaiter::SPtr& waiter) {
+    bool Add(const bbt::coroutine::sync::CoWaiter::SPtr& waiter)
+    {
         std::lock_guard<std::mutex> lock(m_mtx);
         if (m_closed)
             return false;
         m_waiters.push_back(waiter);
         return true;
     }
-    void Remove(const bbt::coroutine::sync::CoWaiter* waiter) noexcept {
+    void Remove(const bbt::coroutine::sync::CoWaiter* waiter) noexcept
+    {
         std::lock_guard<std::mutex> lock(m_mtx);
         for (auto it = m_waiters.begin(); it != m_waiters.end(); ++it) {
             if (it->get() == waiter) {
@@ -24,7 +26,8 @@ public:
             }
         }
     }
-    void CloseAndWakeAll() noexcept {
+    void CloseAndWakeAll() noexcept
+    {
         std::vector<bbt::coroutine::sync::CoWaiter::SPtr> wake;
         {
             std::lock_guard<std::mutex> lock(m_mtx);
@@ -34,6 +37,7 @@ public:
         for (auto& waiter : wake)
             waiter->Notify();
     }
+
 private:
     std::mutex m_mtx;
     bool m_closed{false};
@@ -42,12 +46,19 @@ private:
 
 class ManagedCloseState {
 public:
-    bool BeginClose() noexcept {
+    bool BeginClose() noexcept
+    {
         int expected = kOpen;
         return m_phase.compare_exchange_strong(expected, kClosing);
     }
-    void MarkClosed() noexcept { m_phase.store(kClosed); }
-    bool IsOpen() const noexcept { return m_phase.load() == kOpen; }
+    void MarkClosed() noexcept
+    {
+        m_phase.store(kClosed);
+    }
+    bool IsOpen() const noexcept
+    {
+        return m_phase.load() == kOpen;
+    }
 
 private:
     enum Phase : int { kOpen, kClosing, kClosed };

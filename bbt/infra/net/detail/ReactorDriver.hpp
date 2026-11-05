@@ -50,47 +50,68 @@ public:
     ReactorDriver(const ReactorDriver&) = delete;
     ReactorDriver& operator=(const ReactorDriver&) = delete;
 
-    bbt::coroutine::detail::ProcesserDriverResult OnTick(
-        bbt::coroutine::detail::ProcesserDriverPhase phase) override;
+    bbt::coroutine::detail::ProcesserDriverResult OnTick(bbt::coroutine::detail::ProcesserDriverPhase phase) override;
     bbt::coroutine::detail::ProcesserDriverResult Wait(std::chrono::microseconds timeout) override;
     void Wake() noexcept override;
 
     // 只许绑定的 owner 线程登记/取消 Asio 资源；不得跨线程保存使用。
-    boost::asio::io_context& Context() noexcept { return m_context; }
+    boost::asio::io_context& Context() noexcept
+    {
+        return m_context;
+    }
 
     // 每轮调度前（BeforeSchedule）在 owner 线程调用的推进钩子（写泵/读恢复）。
     // 必须在绑定后、首次 Tick 前设置；设置后不再变更。
-    void SetTickHook(std::function<void()> hook) { m_tick_hook = std::move(hook); }
+    void SetTickHook(std::function<void()> hook)
+    {
+        m_tick_hook = std::move(hook);
+    }
 
     // ---- 观察/测试口（detail，不是公共契约） ----
-    std::size_t TickCount() const noexcept { return m_ticks.load(std::memory_order_relaxed); }
-    std::size_t WaitCount() const noexcept { return m_waits.load(std::memory_order_relaxed); }
-    std::size_t WakeCount() const noexcept { return m_wakes.load(std::memory_order_relaxed); }
-    std::size_t LastTickHandlers() const noexcept {
+    std::size_t TickCount() const noexcept
+    {
+        return m_ticks.load(std::memory_order_relaxed);
+    }
+    std::size_t WaitCount() const noexcept
+    {
+        return m_waits.load(std::memory_order_relaxed);
+    }
+    std::size_t WakeCount() const noexcept
+    {
+        return m_wakes.load(std::memory_order_relaxed);
+    }
+    std::size_t LastTickHandlers() const noexcept
+    {
         return m_last_tick_handlers.load(std::memory_order_relaxed);
     }
-    std::size_t UnhandledFailureCount() const noexcept {
+    std::size_t UnhandledFailureCount() const noexcept
+    {
         return m_unhandled_failures.load(std::memory_order_relaxed);
     }
-    std::exception_ptr LastFailure() const {
+    std::exception_ptr LastFailure() const
+    {
         std::lock_guard<std::mutex> lock(m_observe_mutex);
         return m_last_failure;
     }
-    std::thread::id LastTickThread() const {
+    std::thread::id LastTickThread() const
+    {
         std::lock_guard<std::mutex> lock(m_observe_mutex);
         return m_last_tick_thread;
     }
     // OnTick 执行时当前 worker 的 ProcesserId；未命中的登记槽为 0。
-    std::uint64_t LastTickProcesserId() const noexcept {
+    std::uint64_t LastTickProcesserId() const noexcept
+    {
         return m_last_tick_processer_id.load(std::memory_order_relaxed);
     }
     // 当前是否正由绑定的 owner 执行 OnTick/Wait（用于避免自身 Wake 造成的
     // stop/restart churn）。
-    bool InOwnerCall() const noexcept {
+    bool InOwnerCall() const noexcept
+    {
         return m_owner_call_depth.load(std::memory_order_acquire) != 0;
     }
     // 下一次 OnTick 抛异常，验证 runtime 既有 Failed 出口；一次性。
-    void InjectTickFailureOnce() noexcept {
+    void InjectTickFailureOnce() noexcept
+    {
         m_inject_tick_failure.store(true, std::memory_order_release);
     }
 

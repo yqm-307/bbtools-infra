@@ -33,8 +33,8 @@ struct MongoThreadEvidence {
     std::thread::id acquire_thread;
     std::thread::id use_thread;
     std::thread::id release_thread;
-    std::string     database;
-    std::string     collection;
+    std::string database;
+    std::string collection;
 };
 
 // 每个 MongoRuntime 一个实例：运行中 driver 调用计数与峰值 + 取证存储/锁。
@@ -42,14 +42,16 @@ struct MongoThreadEvidence {
 struct MongoRuntimeObservation {
     std::atomic<std::size_t> running_calls{0};
     std::atomic<std::size_t> peak_calls{0};
-    mutable std::mutex       evidence_mtx;
+    mutable std::mutex evidence_mtx;
     std::optional<MongoThreadEvidence> last_evidence;
 
-    void Record(MongoThreadEvidence evidence) {
+    void Record(MongoThreadEvidence evidence)
+    {
         std::lock_guard<std::mutex> lk(evidence_mtx);
         last_evidence = std::move(evidence);
     }
-    std::optional<MongoThreadEvidence> LastEvidence() const {
+    std::optional<MongoThreadEvidence> LastEvidence() const
+    {
         std::lock_guard<std::mutex> lk(evidence_mtx);
         return last_evidence;
     }

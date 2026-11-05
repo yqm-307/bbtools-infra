@@ -41,11 +41,13 @@ using namespace std::chrono_literals;
 
 namespace {
 
-bbt::coroutine::WaitOptions Until(std::chrono::milliseconds duration) {
+bbt::coroutine::WaitOptions Until(std::chrono::milliseconds duration)
+{
     return {std::chrono::steady_clock::now() + duration};
 }
 
-bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds timeout) {
+bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds timeout)
+{
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
         if (predicate()) {
@@ -58,7 +60,8 @@ bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds
 
 } // namespace
 
-int main() {
+int main()
+{
     std::atomic<int> failures{0};
     auto check = [&failures](bool value, const char* name) {
         if (!value) {
@@ -86,8 +89,7 @@ int main() {
         config.options.num_event_loop = 1;
         server_run_error = server.Run(config);
     });
-    check(WaitUntil([&] { return server.Phase() == net::EnginePhase::Running; }, 3000ms),
-          "server engine running");
+    check(WaitUntil([&] { return server.Phase() == net::EnginePhase::Running; }, 3000ms), "server engine running");
     std::vector<net::Address> addresses;
     check(!server.LocalAddresses(addresses) && addresses.size() == 1, "server addresses");
 
@@ -95,7 +97,7 @@ int main() {
     net::Engine client_engine(nullptr);
     std::error_code client_run_error;
     std::thread client_runner([&] {
-        net::EngineConfig config;   // 空 listen_addresses = client-only
+        net::EngineConfig config; // 空 listen_addresses = client-only
         config.runtime_progress = net::RuntimeProgress::Independent;
         config.options.num_event_loop = 1;
         client_run_error = client_engine.Run(config);
@@ -109,56 +111,58 @@ int main() {
     std::atomic<int> server_waitclosed_ok{0};
     auto server_promise = std::make_shared<std::promise<void>>();
     auto server_future = server_promise->get_future();
-    g_scheduler->RegistCoroutineTask(65536, [&] {
-        auto accepted = server.CoAccept(Until(5000ms));
-        if (accepted.error) {
-            std::cerr << "server CoAccept: " << accepted.error.message() << '\n';
-            server_promise->set_value();
-            return;
-        }
-        auto conn = accepted.connection;   // CoTcpConnection 值视图
-        if (!conn.Valid()) {
-            std::cerr << "server accepted conn invalid\n";
-            server_promise->set_value();
-            return;
-        }
-        // Read → owning Buffer（真零拷贝移交）。
-        auto [read_data, read_error] = conn.Read(Until(5000ms));
-        if (!read_error && read_data.Size() > 0) {
-            const std::string payload = read_data.CopyTo();
-            if (payload == "hello") {
-                server_read_ok.store(1);
-                // Write → WriteReport。
-                auto report = conn.Write(payload, Until(3000ms));
-                if (!report.wait_error && report.outcome.phase == net::WritePhase::Done
-                    && !report.outcome.error && report.outcome.sent == payload.size()
-                    && report.operation.Valid()) {
-                    server_write_ok.store(1);
-                } else {
-                    std::cerr << "server Write: wait_error=" << report.wait_error.message()
-                              << " phase=" << static_cast<int>(report.outcome.phase)
-                              << " sent=" << report.outcome.sent << '\n';
+    g_scheduler->RegistCoroutineTask(
+        65536,
+        [&] {
+            auto accepted = server.CoAccept(Until(5000ms));
+            if (accepted.error) {
+                std::cerr << "server CoAccept: " << accepted.error.message() << '\n';
+                server_promise->set_value();
+                return;
+            }
+            auto conn = accepted.connection; // CoTcpConnection 值视图
+            if (!conn.Valid()) {
+                std::cerr << "server accepted conn invalid\n";
+                server_promise->set_value();
+                return;
+            }
+            // Read → owning Buffer（真零拷贝移交）。
+            auto [read_data, read_error] = conn.Read(Until(5000ms));
+            if (!read_error && read_data.Size() > 0) {
+                const std::string payload = read_data.CopyTo();
+                if (payload == "hello") {
+                    server_read_ok.store(1);
+                    // Write → WriteReport。
+                    auto report = conn.Write(payload, Until(3000ms));
+                    if (!report.wait_error && report.outcome.phase == net::WritePhase::Done && !report.outcome.error
+                        && report.outcome.sent == payload.size() && report.operation.Valid()) {
+                        server_write_ok.store(1);
+                    } else {
+                        std::cerr << "server Write: wait_error=" << report.wait_error.message()
+                                  << " phase=" << static_cast<int>(report.outcome.phase)
+                                  << " sent=" << report.outcome.sent << '\n';
+                    }
+                }
+            } else {
+                std::cerr << "server Read: " << " error=" << read_error.message() << '\n';
+            }
+            // 客户端 RequestClose 后本端 Read 会见到 EOF/关闭；主动收口才等
+            // WaitClosed。这里先排空尾部直到 EOF/终态，再 RequestClose。
+            while (true) {
+                auto [drain_data, drain_error] = conn.Read(Until(3000ms));
+                if (bool(drain_error)) {
+                    break; // Eof 或 Error 终态
                 }
             }
-        } else {
-            std::cerr << "server Read: " << " error=" << read_error.message() << '\n';
-        }
-        // 客户端 RequestClose 后本端 Read 会见到 EOF/关闭；主动收口才等
-        // WaitClosed。这里先排空尾部直到 EOF/终态，再 RequestClose。
-        while (true) {
-            auto [drain_data, drain_error] = conn.Read(Until(3000ms));
-            if (bool(drain_error)) {
-                break;  // Eof 或 Error 终态
+            conn.RequestClose();
+            // WaitClosed → 等逻辑 closed 终态。
+            const auto wait_error = conn.WaitClosed(Until(3000ms));
+            if (!wait_error && conn.Status().closed) {
+                server_waitclosed_ok.store(1);
             }
-        }
-        conn.RequestClose();
-        // WaitClosed → 等逻辑 closed 终态。
-        const auto wait_error = conn.WaitClosed(Until(3000ms));
-        if (!wait_error && conn.Status().closed) {
-            server_waitclosed_ok.store(1);
-        }
-        server_promise->set_value();
-    }, "example.server");
+            server_promise->set_value();
+        },
+        "example.server");
 
     // ---- client 协程：CoDial → Write → Read(echo) → RequestClose → WaitClosed → Status ----
     std::atomic<int> dial_ok{0};
@@ -168,55 +172,56 @@ int main() {
     std::atomic<int> client_status_ok{0};
     auto client_promise = std::make_shared<std::promise<void>>();
     auto client_future = client_promise->get_future();
-    g_scheduler->RegistCoroutineTask(65536, [&] {
-        auto dialed = client_engine.CoDial(addresses[0], Until(5000ms));
-        if (dialed.error) {
-            std::cerr << "client CoDial: " << dialed.error.message() << '\n';
+    g_scheduler->RegistCoroutineTask(
+        65536,
+        [&] {
+            auto dialed = client_engine.CoDial(addresses[0], Until(5000ms));
+            if (dialed.error) {
+                std::cerr << "client CoDial: " << dialed.error.message() << '\n';
+                client_promise->set_value();
+                return;
+            }
+            auto conn = dialed.connection;
+            if (!conn.Valid()) {
+                std::cerr << "client dialed conn invalid\n";
+                client_promise->set_value();
+                return;
+            }
+            dial_ok.store(1);
+            // reclaim 票与 conn.IsReleased 同真源（成功交付）。
+            check(dialed.reclaim.Valid() == dialed.reclaim.Valid(), "reclaim usable");
+
+            // Write → WriteReport{wait_error, outcome, operation}。
+            auto sent = conn.Write("hello", Until(3000ms));
+            if (!sent.wait_error && sent.outcome.phase == net::WritePhase::Done && !sent.outcome.error
+                && sent.outcome.sent == 5 && sent.operation.Valid()) {
+                client_write_ok.store(1);
+            } else {
+                std::cerr << "client Write: wait_error=" << sent.wait_error.message()
+                          << " phase=" << static_cast<int>(sent.outcome.phase) << '\n';
+            }
+
+            // Read → tuple<owning Buffer, error_code>。
+            auto [echoed_data, echoed_error] = conn.Read(Until(5000ms));
+            if (!echoed_error && echoed_data.CopyTo() == "hello") {
+                client_read_ok.store(1);
+            } else {
+                std::cerr << "client Read: " << " error=" << echoed_error.message() << '\n';
+            }
+
+            // 逻辑封口请求 → WaitClosed 等 closed 终态 → Status 采样。
+            conn.RequestClose();
+            const auto wait_error = conn.WaitClosed(Until(3000ms));
+            if (!wait_error) {
+                client_waitclosed_ok.store(1);
+            }
+            const auto status = conn.Status();
+            if (status.closed && status.write == net::AcceptanceState::Closed && conn.IsClosed()) {
+                client_status_ok.store(1);
+            }
             client_promise->set_value();
-            return;
-        }
-        auto conn = dialed.connection;
-        if (!conn.Valid()) {
-            std::cerr << "client dialed conn invalid\n";
-            client_promise->set_value();
-            return;
-        }
-        dial_ok.store(1);
-        // reclaim 票与 conn.IsReleased 同真源（成功交付）。
-        check(dialed.reclaim.Valid() == dialed.reclaim.Valid(), "reclaim usable");
-
-        // Write → WriteReport{wait_error, outcome, operation}。
-        auto sent = conn.Write("hello", Until(3000ms));
-        if (!sent.wait_error && sent.outcome.phase == net::WritePhase::Done
-            && !sent.outcome.error && sent.outcome.sent == 5 && sent.operation.Valid()) {
-            client_write_ok.store(1);
-        } else {
-            std::cerr << "client Write: wait_error=" << sent.wait_error.message()
-                      << " phase=" << static_cast<int>(sent.outcome.phase) << '\n';
-        }
-
-        // Read → tuple<owning Buffer, error_code>。
-        auto [echoed_data, echoed_error] = conn.Read(Until(5000ms));
-        if (!echoed_error
-            && echoed_data.CopyTo() == "hello") {
-            client_read_ok.store(1);
-        } else {
-            std::cerr << "client Read: " << " error=" << echoed_error.message() << '\n';
-        }
-
-        // 逻辑封口请求 → WaitClosed 等 closed 终态 → Status 采样。
-        conn.RequestClose();
-        const auto wait_error = conn.WaitClosed(Until(3000ms));
-        if (!wait_error) {
-            client_waitclosed_ok.store(1);
-        }
-        const auto status = conn.Status();
-        if (status.closed && status.write == net::AcceptanceState::Closed
-            && conn.IsClosed()) {
-            client_status_ok.store(1);
-        }
-        client_promise->set_value();
-    }, "example.client");
+        },
+        "example.client");
 
     // ---- 收口 ----
     if (client_future.wait_for(10s) == std::future_status::ready) {

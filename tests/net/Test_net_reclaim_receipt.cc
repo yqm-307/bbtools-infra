@@ -54,18 +54,21 @@ using namespace std::chrono_literals;
 
 namespace {
 
-void Check(bool value, const char* expression, int line) {
+void Check(bool value, const char* expression, int line)
+{
     if (!value) {
         throw std::runtime_error("line " + std::to_string(line) + ": " + expression);
     }
 }
 #define CHECK(expression) Check(static_cast<bool>(expression), #expression, __LINE__)
 
-bbt::coroutine::WaitOptions Until(std::chrono::milliseconds duration) {
+bbt::coroutine::WaitOptions Until(std::chrono::milliseconds duration)
+{
     return {std::chrono::steady_clock::now() + duration};
 }
 
-bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds timeout) {
+bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds timeout)
+{
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
         if (predicate()) {
@@ -76,32 +79,39 @@ bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds
     return predicate();
 }
 
-void StartRuntime(std::size_t workers) {
+void StartRuntime(std::size_t workers)
+{
     g_bbt_coroutine_config->m_cfg_static_thread_num = workers;
     g_bbt_coroutine_config->m_cfg_stack_size = 65536;
     g_scheduler->Start();
 }
 
-std::future<void> Task(std::function<void()> callback) {
+std::future<void> Task(std::function<void()> callback)
+{
     auto promise = std::make_shared<std::promise<void>>();
     auto future = promise->get_future();
-    g_scheduler->RegistCoroutineTask(65536, [promise, callback] {
-        try {
-            callback();
-            promise->set_value();
-        } catch (...) {
-            promise->set_exception(std::current_exception());
-        }
-    }, "net.reclaim");
+    g_scheduler->RegistCoroutineTask(
+        65536,
+        [promise, callback] {
+            try {
+                callback();
+                promise->set_value();
+            } catch (...) {
+                promise->set_exception(std::current_exception());
+            }
+        },
+        "net.reclaim");
     return future;
 }
 
-void Get(std::future<void>& future) {
+void Get(std::future<void>& future)
+{
     CHECK(future.wait_for(5s) == std::future_status::ready);
     future.get();
 }
 
-Address Loopback(int port) {
+Address Loopback(int port)
+{
     std::error_code error;
     Address address = Address::Ip("127.0.0.1", port, error);
     CHECK(!error);
@@ -113,19 +123,25 @@ struct EngineRunner {
     std::error_code error;
     std::thread thread;
 
-    EngineRunner(Engine& target, EngineConfig config) : engine(target) {
+    EngineRunner(Engine& target, EngineConfig config) : engine(target)
+    {
         thread = std::thread([this, config]() mutable { error = engine.Run(config); });
     }
-    void CloseAndJoin() {
+    void CloseAndJoin()
+    {
         engine.RequestClose();
         if (thread.joinable()) {
             thread.join();
         }
     }
-    ~EngineRunner() { CloseAndJoin(); }
+    ~EngineRunner()
+    {
+        CloseAndJoin();
+    }
 };
 
-NativeSocket MakeListener(Address& address) {
+NativeSocket MakeListener(Address& address)
+{
     std::error_code error;
     NativeSocket listener = NativeSocket::Open(AddressFamily::IPv4, SocketType::Stream, error);
     CHECK(!error);
@@ -136,32 +152,35 @@ NativeSocket MakeListener(Address& address) {
     return listener;
 }
 
-EngineConfig ClientConfig() {
+EngineConfig ClientConfig()
+{
     EngineConfig config;
     config.runtime_progress = RuntimeProgress::Independent;
     config.options.num_event_loop = 1;
     return config;
 }
 
-std::size_t CountFds() {
-    return static_cast<std::size_t>(std::distance(
-        std::filesystem::directory_iterator("/proc/self/fd"),
-        std::filesystem::directory_iterator{}));
+std::size_t CountFds()
+{
+    return static_cast<std::size_t>(
+        std::distance(std::filesystem::directory_iterator("/proc/self/fd"), std::filesystem::directory_iterator{}));
 }
 
 // ---------------- cases ----------------
 
-void ReceiptInvalidDefault() {
+void ReceiptInvalidDefault()
+{
     ReclaimReceipt receipt;
     CHECK(!receipt.Valid());
-    CHECK(receipt.Released());  // 无效句柄=没有已提交资源责任
+    CHECK(receipt.Released()); // 无效句柄=没有已提交资源责任
     Connection connection;
     CHECK(!connection.Valid());
     CHECK(connection.Released());
     std::cout << "receipt_invalid_default invalid_released=ok\n";
 }
 
-void CoDialSuccessCloseReleased() {
+void CoDialSuccessCloseReleased()
+{
     StartRuntime(2);
     Address address;
     auto listener = MakeListener(address);
@@ -217,7 +236,8 @@ void CoDialSuccessCloseReleased() {
     std::cout << "codial_success_close_released same_record=ok redial=ok\n";
 }
 
-void CoDialTimeoutUndelivered() {
+void CoDialTimeoutUndelivered()
+{
     StartRuntime(2);
     Address address;
     auto listener = MakeListener(address);
@@ -227,7 +247,7 @@ void CoDialTimeoutUndelivered() {
     // 交付延迟拉长 owner 交付：连接已真实完成（内核 backlog/已建立），尚未交付。
     EngineTestAccess::SetConnectDeliveryDelay(client, std::chrono::milliseconds(800));
     std::atomic<int> result{-2};
-    auto receipt = std::make_shared<ReclaimReceipt>();  // 跨协程存活，主线程可观察
+    auto receipt = std::make_shared<ReclaimReceipt>(); // 跨协程存活，主线程可观察
     auto task = Task([&] {
         auto res = client.CoDial(address, Until(40ms));
         *receipt = res.reclaim;
@@ -270,7 +290,8 @@ void CoDialTimeoutUndelivered() {
     std::cout << "codial_timeout_undelivered established=ok reclaimed=ok\n";
 }
 
-void DialRefusedReleased() {
+void DialRefusedReleased()
+{
     StartRuntime(2);
     // 制造真实拒连端口：先绑定取得端口，再关闭 listener。
     Address refused;
@@ -282,15 +303,15 @@ void DialRefusedReleased() {
     EngineRunner runner(client, ClientConfig());
     CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
     std::atomic<int> result{-2};
-    auto receipt = std::make_shared<ReclaimReceipt>();  // 跨协程存活，主线程可观察
+    auto receipt = std::make_shared<ReclaimReceipt>(); // 跨协程存活，主线程可观察
     auto task = Task([&] {
         auto res = client.CoDial(refused, Until(2000ms));
         *receipt = res.reclaim;
         result.store(res.error.value());
-        CHECK(!res.connection.Valid());  // 失败时 connection 无效（不覆盖调用者原值）
+        CHECK(!res.connection.Valid()); // 失败时 connection 无效（不覆盖调用者原值）
     });
     Get(task);
-    CHECK(result.load() != 0);  // 真实拒连错误（ECONNREFUSED），不是等待超时
+    CHECK(result.load() != 0); // 真实拒连错误（ECONNREFUSED），不是等待超时
     CHECK(receipt->Valid());
     // fd 建立后在 SO_ERROR 真实关闭并收口：owner notify 先于领取返回，已可观察。
     CHECK(receipt->Released());
@@ -301,7 +322,8 @@ void DialRefusedReleased() {
     std::cout << "dial_refused_released refused_closed=ok receipt_settled=ok\n";
 }
 
-void DialPreSubmitRejections() {
+void DialPreSubmitRejections()
+{
     // 1) 执行域非法：gate 先于一切状态/责任，句柄保持无效。
     {
         Engine idle{std::shared_ptr<RawHandler>()};
@@ -346,7 +368,7 @@ void DialPreSubmitRejections() {
     auto second_task = Task([&] {
         auto res = client.CoDial(address, Until(200ms));
         second_result.store(res.error.value());
-        CHECK(!res.reclaim.Valid());  // 提交前容量拒绝：无本次责任
+        CHECK(!res.reclaim.Valid()); // 提交前容量拒绝：无本次责任
         CHECK(res.reclaim.Released());
         CHECK(!res.connection.Valid());
     });
@@ -364,7 +386,8 @@ void DialPreSubmitRejections() {
     std::cout << "dial_pre_submit_rejections gate=ok post_fail=ok cap=ok\n";
 }
 
-void ReleasedNotBeforePhysicalClose() {
+void ReleasedNotBeforePhysicalClose()
+{
     StartRuntime(2);
     Address address;
     auto listener = MakeListener(address);
@@ -412,7 +435,8 @@ void ReleasedNotBeforePhysicalClose() {
     std::cout << "released_not_before_physical_close fd_open_unreleased=ok\n";
 }
 
-void EngineStopReleases() {
+void EngineStopReleases()
+{
     StartRuntime(2);
     Address address;
     auto listener = MakeListener(address);
@@ -451,10 +475,11 @@ void EngineStopReleases() {
     CHECK(pending_result.load() == std::make_error_code(std::errc::operation_canceled).value());
     // Engine 收尾后主线程统一观察：已交付连接与未交付占位都可达释放。
     CHECK(pending_receipt->Valid());
-    CHECK(WaitUntil([&] {
-        return delivered_receipt->Released() && delivered_connection->Released()
-            && pending_receipt->Released();
-    }, 3000ms));
+    CHECK(WaitUntil(
+        [&] {
+            return delivered_receipt->Released() && delivered_connection->Released() && pending_receipt->Released();
+        },
+        3000ms));
     CHECK(client.Phase() == EnginePhase::Stopped);
     CHECK(client.CountConnections() == 0);
     CHECK(EngineTestAccess::FirstConnectionFd(client) == -1);
@@ -463,7 +488,8 @@ void EngineStopReleases() {
     std::cout << "engine_stop_releases delivered=ok pending=ok\n";
 }
 
-void DriverFailedReleases() {
+void DriverFailedReleases()
+{
     StartRuntime(2);
     Address address;
     auto listener = MakeListener(address);
@@ -483,27 +509,31 @@ void DriverFailedReleases() {
     CHECK(!EngineTestAccess::InjectDriverFailure(client));
     runner.CloseAndJoin();
     Get(task);
-    CHECK(result.load() != 0);  // 中止路径按取消终结，不伪报成功
+    CHECK(result.load() != 0); // 中止路径按取消终结，不伪报成功
     CHECK(client.Phase() == EnginePhase::Stopped);
     CHECK(EngineTestAccess::ConnectTableSize(client) == 0);
     EngineTestAccess::ClearConnectInjection(client);
-    CHECK(runner.error);  // Run 经真实错误出口返回
+    CHECK(runner.error); // Run 经真实错误出口返回
     std::cout << "driver_failed_releases aborted_pending_settled=ok\n";
 }
 
 // 最后一次独立审查的真实 fd 反例：按远端端口锁定 fd，再用 inode 排除复用。
-int FindConnectedFd(std::uint16_t port) {
+int FindConnectedFd(std::uint16_t port)
+{
     for (const auto& item : std::filesystem::directory_iterator("/proc/self/fd")) {
         const int fd = std::stoi(item.path().filename().string());
         sockaddr_in peer{};
         socklen_t size = sizeof(peer);
-        if (::getpeername(fd, reinterpret_cast<sockaddr*>(&peer), &size) == 0 &&
-            peer.sin_family == AF_INET && ntohs(peer.sin_port) == port) { return fd; }
+        if (::getpeername(fd, reinterpret_cast<sockaddr*>(&peer), &size) == 0 && peer.sin_family == AF_INET
+            && ntohs(peer.sin_port) == port) {
+            return fd;
+        }
     }
     return -1;
 }
 
-void DriverFailedWithLiveFd() {
+void DriverFailedWithLiveFd()
+{
     StartRuntime(2);
     unsigned violations = 0;
     for (unsigned round = 0; round != 32; ++round) {
@@ -546,33 +576,46 @@ void DriverFailedWithLiveFd() {
         observer.join();
         CHECK(marked && runner.error && client.Phase() == EnginePhase::Stopped);
         CHECK(client.CountConnections() == 0 && EngineTestAccess::ConnectTableSize(client) == 0);
-        if (premature) { ++violations; }
-        std::cout << "driver_fd round=" << round
-                  << " fd_open_at_first_released=" << premature.load() << '\n';
+        if (premature) {
+            ++violations;
+        }
+        std::cout << "driver_fd round=" << round << " fd_open_at_first_released=" << premature.load() << '\n';
         CHECK(!accepted.Close() && !listener.Close());
-        CHECK(WaitUntil([&] {
-            struct stat after{};
-            return ::fstat(fd, &after) != 0 || after.st_ino != before.st_ino;
-        }, 3000ms));
+        CHECK(WaitUntil(
+            [&] {
+                struct stat after{};
+                return ::fstat(fd, &after) != 0 || after.st_ino != before.st_ino;
+            },
+            3000ms));
     }
     std::cout << "driver_fd premature_released_total=" << violations << "/32\n";
     CHECK(violations == 0);
 }
 
-int RunCases(int argc, char** argv) {
+int RunCases(int argc, char** argv)
+{
     try {
         CHECK(argc == 2);
         const std::string test = argv[1];
-        if (test == "receipt_invalid_default") { ReceiptInvalidDefault(); }
-        else if (test == "codial_success_close_released") { CoDialSuccessCloseReleased(); }
-        else if (test == "codial_timeout_undelivered") { CoDialTimeoutUndelivered(); }
-        else if (test == "dial_refused_released") { DialRefusedReleased(); }
-        else if (test == "dial_pre_submit_rejections") { DialPreSubmitRejections(); }
-        else if (test == "released_not_before_physical_close") { ReleasedNotBeforePhysicalClose(); }
-        else if (test == "engine_stop_releases") { EngineStopReleases(); }
-        else if (test == "driver_failed_releases") { DriverFailedReleases(); }
-        else if (test == "driver_failed_live_fd") { DriverFailedWithLiveFd(); }
-        else {
+        if (test == "receipt_invalid_default") {
+            ReceiptInvalidDefault();
+        } else if (test == "codial_success_close_released") {
+            CoDialSuccessCloseReleased();
+        } else if (test == "codial_timeout_undelivered") {
+            CoDialTimeoutUndelivered();
+        } else if (test == "dial_refused_released") {
+            DialRefusedReleased();
+        } else if (test == "dial_pre_submit_rejections") {
+            DialPreSubmitRejections();
+        } else if (test == "released_not_before_physical_close") {
+            ReleasedNotBeforePhysicalClose();
+        } else if (test == "engine_stop_releases") {
+            EngineStopReleases();
+        } else if (test == "driver_failed_releases") {
+            DriverFailedReleases();
+        } else if (test == "driver_failed_live_fd") {
+            DriverFailedWithLiveFd();
+        } else {
             std::cerr << "unknown case: " << test << "\n";
             return 2;
         }
@@ -585,7 +628,8 @@ int RunCases(int argc, char** argv) {
 
 } // namespace
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv)
+{
     std::signal(SIGSEGV, [](int) { std::_Exit(139); });
     std::signal(SIGABRT, [](int) { std::_Exit(134); });
     return bbt_net_test::RunTestProcessExit([&] { return RunCases(argc, argv); });

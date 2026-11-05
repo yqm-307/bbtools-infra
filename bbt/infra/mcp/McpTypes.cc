@@ -16,25 +16,32 @@ namespace {
 
 // 规范 base64（RFC 4648 §4 标准字母表）：长度 4 的倍数、仅尾部 '=' 填充（≤2 个）、
 // 不接受 URL-safe 字母表、空白或其它字符。
-bool IsCanonicalBase64(const std::string& text) {
-    if (text.size() % 4 != 0) return false;
+bool IsCanonicalBase64(const std::string& text)
+{
+    if (text.size() % 4 != 0)
+        return false;
     std::size_t first_pad = std::string::npos;
     for (std::size_t i = 0; i < text.size(); ++i) {
         const unsigned char c = static_cast<unsigned char>(text[i]);
         if (c == '=') {
-            if (first_pad == std::string::npos) first_pad = i;
+            if (first_pad == std::string::npos)
+                first_pad = i;
             continue;
         }
-        if (first_pad != std::string::npos) return false;  // 填充后不得再出现数据字符
-        const bool alphabet = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                              (c >= '0' && c <= '9') || c == '+' || c == '/';
-        if (!alphabet) return false;
+        if (first_pad != std::string::npos)
+            return false; // 填充后不得再出现数据字符
+        const bool alphabet =
+            (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '+' || c == '/';
+        if (!alphabet)
+            return false;
     }
-    if (first_pad == std::string::npos) return true;
+    if (first_pad == std::string::npos)
+        return true;
     return text.size() - first_pad <= 2;
 }
 
-Error MakeTypeError(const char* domain_code, const char* message) {
+Error MakeTypeError(const char* domain_code, const char* message)
+{
     Error e;
     e.code = ErrorCode::InvalidArgument;
     e.domain_code = domain_code;
@@ -44,39 +51,41 @@ Error MakeTypeError(const char* domain_code, const char* message) {
 
 } // namespace
 
-JsonValue RequestId::ToJson() const {
-    if (IsString()) return JsonValue(AsString());
-    if (std::holds_alternative<std::int64_t>(m_value)) return JsonValue(AsInt64());
+JsonValue RequestId::ToJson() const
+{
+    if (IsString())
+        return JsonValue(AsString());
+    if (std::holds_alternative<std::int64_t>(m_value))
+        return JsonValue(AsInt64());
     return JsonValue(AsUInt64());
 }
 
 // 前缀区分类型：字符串 "1" 与整数 1 不得折叠成同一身份（在途去重/订阅 id 用）。
-std::string RequestId::Key() const {
-    if (IsString()) return "s:" + std::string(AsString());
-    if (std::holds_alternative<std::int64_t>(m_value)) return "i:" + std::to_string(AsInt64());
+std::string RequestId::Key() const
+{
+    if (IsString())
+        return "s:" + std::string(AsString());
+    if (std::holds_alternative<std::int64_t>(m_value))
+        return "i:" + std::to_string(AsInt64());
     return "u:" + std::to_string(AsUInt64());
 }
 
-result<ResourceContents> ResourceContents::Text(std::string uri, std::string mime_type,
-                                                std::string text) {
+result<ResourceContents> ResourceContents::Text(std::string uri, std::string mime_type, std::string text)
+{
     if (uri.empty())
-        return result<ResourceContents>::err(
-            MakeTypeError("mcp.resource.uri", "resource uri is required"));
+        return result<ResourceContents>::err(MakeTypeError("mcp.resource.uri", "resource uri is required"));
     if (!detail::IsValidUtf8(uri) || !detail::IsValidUtf8(mime_type))
         return result<ResourceContents>::err(
             MakeTypeError("mcp.resource.uri", "resource uri/mimeType must be valid UTF-8"));
     if (!detail::IsValidUtf8(text))
-        return result<ResourceContents>::err(
-            MakeTypeError("mcp.resource.text", "resource text must be valid UTF-8"));
-    return result<ResourceContents>::ok(
-        ResourceContents(std::move(uri), std::move(mime_type), std::move(text), true));
+        return result<ResourceContents>::err(MakeTypeError("mcp.resource.text", "resource text must be valid UTF-8"));
+    return result<ResourceContents>::ok(ResourceContents(std::move(uri), std::move(mime_type), std::move(text), true));
 }
 
-result<ResourceContents> ResourceContents::Blob(std::string uri, std::string mime_type,
-                                                std::string base64) {
+result<ResourceContents> ResourceContents::Blob(std::string uri, std::string mime_type, std::string base64)
+{
     if (uri.empty())
-        return result<ResourceContents>::err(
-            MakeTypeError("mcp.resource.uri", "resource uri is required"));
+        return result<ResourceContents>::err(MakeTypeError("mcp.resource.uri", "resource uri is required"));
     if (!detail::IsValidUtf8(uri) || !detail::IsValidUtf8(mime_type))
         return result<ResourceContents>::err(
             MakeTypeError("mcp.resource.uri", "resource uri/mimeType must be valid UTF-8"));
@@ -87,7 +96,8 @@ result<ResourceContents> ResourceContents::Blob(std::string uri, std::string mim
         ResourceContents(std::move(uri), std::move(mime_type), std::move(base64), false));
 }
 
-Content Content::Text(std::string text) {
+Content Content::Text(std::string text)
+{
     if (!detail::IsValidUtf8(text))
         throw std::invalid_argument("content text must be valid UTF-8");
     Content content;
@@ -100,9 +110,9 @@ Content Content::Text(std::string text) {
 
 namespace bbt::infra::mcp {
 
-result<InputRequired> InputRequired::Create(
-    std::map<std::string, ClientInputRequest> input_requests,
-    std::optional<std::string> request_state) {
+result<InputRequired> InputRequired::Create(std::map<std::string, ClientInputRequest> input_requests,
+                                            std::optional<std::string> request_state)
+{
     if (input_requests.empty() && !request_state) {
         Error error;
         error.code = ErrorCode::InvalidArgument;

@@ -15,15 +15,16 @@ struct MongoProcessState {
     std::unordered_map<std::string, std::weak_ptr<MongoPoolLease>> pools;
 };
 
-MongoProcessState& ProcessState() {
+MongoProcessState& ProcessState()
+{
     static MongoProcessState state;
     return state;
 }
 
 } // namespace
 
-result<std::shared_ptr<MongoPoolLease>> AcquireMongoPool(
-    const std::string& effective_uri) {
+result<std::shared_ptr<MongoPoolLease>> AcquireMongoPool(const std::string& effective_uri)
+{
     auto& state = ProcessState();
     std::lock_guard<std::mutex> lk(state.mtx);
 
@@ -37,30 +38,25 @@ result<std::shared_ptr<MongoPoolLease>> AcquireMongoPool(
     const auto found = state.pools.find(effective_uri);
     if (found != state.pools.end()) {
         if (auto lease = found->second.lock())
-            return result<std::shared_ptr<MongoPoolLease>>::ok(
-                std::move(lease));
+            return result<std::shared_ptr<MongoPoolLease>>::ok(std::move(lease));
         state.pools.erase(found);
     }
     if (state.pools.size() >= kMongoMaxPools)
-        return result<std::shared_ptr<MongoPoolLease>>::err(MakeError(
-            ErrorCode::InvalidArgument,
-            "mongo: distinct effective uri count exceeds process pool limit"));
+        return result<std::shared_ptr<MongoPoolLease>>::err(
+            MakeError(ErrorCode::InvalidArgument, "mongo: distinct effective uri count exceeds process pool limit"));
 
     try {
         if (!state.instance)
             state.instance = std::make_shared<mongocxx::v1::instance>();
         mongocxx::v1::uri uri{bsoncxx::v1::stdx::string_view{effective_uri}};
-        auto lease = std::make_shared<MongoPoolLease>(state.instance,
-                                                      std::move(uri));
+        auto lease = std::make_shared<MongoPoolLease>(state.instance, std::move(uri));
         state.pools.emplace(effective_uri, lease);
         return result<std::shared_ptr<MongoPoolLease>>::ok(std::move(lease));
     } catch (const mongocxx::v1::exception& e) {
-        return result<std::shared_ptr<MongoPoolLease>>::err(
-            ClassifyDriverError(e, "mongo: init driver pool"));
+        return result<std::shared_ptr<MongoPoolLease>>::err(ClassifyDriverError(e, "mongo: init driver pool"));
     } catch (const std::exception& e) {
-        return result<std::shared_ptr<MongoPoolLease>>::err(MakeError(
-            ErrorCode::InternalError,
-            std::string("mongo: init driver pool: ") + e.what()));
+        return result<std::shared_ptr<MongoPoolLease>>::err(
+            MakeError(ErrorCode::InternalError, std::string("mongo: init driver pool: ") + e.what()));
     }
 }
 

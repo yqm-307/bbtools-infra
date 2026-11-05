@@ -67,47 +67,47 @@ public:
     // 记录（released=false，责任存活到 fd 真实关闭且 owner 清理）；带句柄
     // CoDial 传入本次预分配的同一记录（与 ReclaimReceipt 同终态）。缺省（如
     // detail 单测的独立 state）从无 backend fd，视为已无责任。
-    ConnectionState(std::uint64_t id, std::size_t inbound_max, std::size_t outbound_max,
-                    std::size_t max_ops, std::shared_ptr<std::atomic<bool>> service_sealed,
+    ConnectionState(std::uint64_t id, std::size_t inbound_max, std::size_t outbound_max, std::size_t max_ops,
+                    std::shared_ptr<std::atomic<bool>> service_sealed,
                     std::shared_ptr<ReclaimRecord> owner_released = {})
-        : m_id(id),
-          ring(inbound_max),
-          m_queue(std::min<std::size_t>(outbound_max, 64 * 1024), outbound_max, max_ops),
-          m_outbound_max(outbound_max),
-          m_max_ops(max_ops),
-          m_service_sealed(std::move(service_sealed)),
-          m_owner_released(owner_released ? std::move(owner_released)
-                                          : std::make_shared<ReclaimRecord>(true)) {
+        : m_id(id), ring(inbound_max), m_queue(std::min<std::size_t>(outbound_max, 64 * 1024), outbound_max, max_ops),
+          m_outbound_max(outbound_max), m_max_ops(max_ops), m_service_sealed(std::move(service_sealed)),
+          m_owner_released(owner_released ? std::move(owner_released) : std::make_shared<ReclaimRecord>(true))
+    {
         m_pending_terminal.set_capacity(std::max<std::size_t>(1, max_ops));
     }
 
     // ---- 物理回收观察 ----
-    bool OwnerReleased() const noexcept {
+    bool OwnerReleased() const noexcept
+    {
         return m_owner_released->released.load(std::memory_order_acquire);
     }
     // 本连接回收责任的共享记录：ReclaimReceipt 凭它观察同一真源
     // （Released() 与 Connection::Released() 同终态）。
-    const std::shared_ptr<ReclaimRecord>& OwnerReleasedRecord() const noexcept {
+    const std::shared_ptr<ReclaimRecord>& OwnerReleasedRecord() const noexcept
+    {
         return m_owner_released;
     }
     // 仅 owner/控制域在 fd 真实关闭且本连接责任清理后调用；幂等。
-    void MarkOwnerReleased() noexcept {
+    void MarkOwnerReleased() noexcept
+    {
         m_owner_released->released.store(true, std::memory_order_release);
     }
 
     const std::uint64_t m_id;
 
     ReceiveRing ring;
-    std::function<void()> owner_dirty;  // owner 设置：把本连接加入可达推进集合
+    std::function<void()> owner_dirty; // owner 设置：把本连接加入可达推进集合
 
     // ---- 接纳（任意线程）----
-    std::error_code AcceptWrite(std::string data, std::shared_ptr<WriteOpRecord>& out) {
+    std::error_code AcceptWrite(std::string data, std::shared_ptr<WriteOpRecord>& out)
+    {
         if (m_service_sealed && m_service_sealed->load(std::memory_order_acquire)) {
             return make_error_code(NetErrc::Closed);
         }
         std::unique_lock<std::mutex> lock(m_write_mutex);
         if (m_close_requested) {
-            return make_error_code(NetErrc::Closed);  // 关闭意图从首次请求起永久拒绝
+            return make_error_code(NetErrc::Closed); // 关闭意图从首次请求起永久拒绝
         }
         if (m_acceptance == AcceptanceState::Closed) {
             return make_error_code(NetErrc::Closed);
@@ -148,7 +148,7 @@ public:
             record->id = m_next_op++;
             record->total = bytes;
             record->remaining = bytes;
-            m_ops.push_back(record);  // 先占活动责任，再接纳字节
+            m_ops.push_back(record); // 先占活动责任，再接纳字节
         } catch (...) {
             return std::make_error_code(std::errc::not_enough_memory);
         }
@@ -159,7 +159,7 @@ public:
             append_error = std::make_error_code(std::errc::not_enough_memory);
         }
         if (append_error) {
-            m_ops.pop_back();  // 事务撤销：没有字节入队，记录未发布
+            m_ops.pop_back(); // 事务撤销：没有字节入队，记录未发布
             return append_error;
         }
         out = std::move(record);
@@ -179,8 +179,8 @@ public:
 
     // sink(views,count) 必须非阻塞，返回实际发送字节数或 -1（errno 表达）。
     // 单次调用受 rounds 与 byte_budget 双重约束。
-    template <class Sink>
-    SendResult PumpWrites(std::size_t max_rounds, std::size_t byte_budget, Sink&& sink) {
+    template <class Sink> SendResult PumpWrites(std::size_t max_rounds, std::size_t byte_budget, Sink&& sink)
+    {
         SendResult result;
         {
             std::unique_lock<std::mutex> lock(m_write_mutex);
@@ -200,7 +200,7 @@ public:
                     m_queue.ConsumeSent(static_cast<std::size_t>(sent));
                     result.terminal_changed |= AttributeSentLocked(static_cast<std::size_t>(sent));
                     result.bytes += static_cast<std::size_t>(sent);
-                    result.capacity_freed = true;  // 部分发送也释放字节额度
+                    result.capacity_freed = true; // 部分发送也释放字节额度
                     continue;
                 }
                 if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -230,7 +230,8 @@ public:
     // 无分配弹出（vector capacity 在构造时预留）；每次释放 op 额度后锁外通知
     // 容量 waiter，确保 max_ops=1 在 terminal notify 与 drain 之间复查失败后，
     // drain 仍有新事件唤醒。
-    bool TryPopTerminal(CompletedWrite& out) {
+    bool TryPopTerminal(CompletedWrite& out)
+    {
         bool popped = false;
         {
             std::lock_guard<std::mutex> lock(m_write_mutex);
@@ -246,7 +247,8 @@ public:
         return popped;
     }
 
-    std::vector<CompletedWrite> DrainTerminal() {
+    std::vector<CompletedWrite> DrainTerminal()
+    {
         std::vector<CompletedWrite> out;
         CompletedWrite item;
         while (TryPopTerminal(item)) {
@@ -255,17 +257,20 @@ public:
         return out;
     }
 
-    bool HasPendingWrites() {
+    bool HasPendingWrites()
+    {
         std::lock_guard<std::mutex> lock(m_write_mutex);
         return !m_ops.empty();
     }
 
-    std::size_t ActiveOpCount() {
+    std::size_t ActiveOpCount()
+    {
         std::lock_guard<std::mutex> lock(m_write_mutex);
         return m_ops.size();
     }
 
-    bool CanAcceptWrite(std::size_t bytes) {
+    bool CanAcceptWrite(std::size_t bytes)
+    {
         if (m_service_sealed && m_service_sealed->load(std::memory_order_acquire)) {
             return false;
         }
@@ -273,17 +278,17 @@ public:
         if (m_close_requested || m_acceptance != AcceptanceState::Open) {
             return false;
         }
-        return m_ops.size() + PendingCountLocked() < m_max_ops
-            && bytes <= m_outbound_max - m_queue.TotalBytes();
+        return m_ops.size() + PendingCountLocked() < m_max_ops && bytes <= m_outbound_max - m_queue.TotalBytes();
     }
 
     // 任意线程：请求封口（立即拒绝新写、保留 reason、唤 owner）。读侧最终 EOF
     // 由 owner 在已 recv hold 全部转入 state 真源后调用 MarkClosed 发布。
-    void RequestClose(std::error_code reason) {
+    void RequestClose(std::error_code reason)
+    {
         {
             std::lock_guard<std::mutex> lock(m_write_mutex);
             if (m_read_closed_published) {
-                return;  // 最终关闭后保留已经发布的原因
+                return; // 最终关闭后保留已经发布的原因
             }
             if (!m_close_requested) {
                 // 首次请求：即使 reason 默认 {} 也固定为首请求 reason，后续不覆盖。
@@ -303,23 +308,24 @@ public:
         WakeOwner();
     }
 
-    bool CloseRequested() {
+    bool CloseRequested()
+    {
         std::lock_guard<std::mutex> lock(m_write_mutex);
-        return m_close_requested;  // 持久 intent，不被写结算暂态清除
+        return m_close_requested; // 持久 intent，不被写结算暂态清除
     }
 
     // owner/控制域：已 recv hold 已 stage 后才发布最终读 closed 并结算写。
-    void MarkClosed(std::error_code reason) {
+    void MarkClosed(std::error_code reason)
+    {
         bool notify = false;
         bool publish_read_closed = false;
         {
             std::lock_guard<std::mutex> lock(m_write_mutex);
-            if (m_acceptance == AcceptanceState::Closed && m_ops.empty()
-                && m_read_closed_published) {
+            if (m_acceptance == AcceptanceState::Closed && m_ops.empty() && m_read_closed_published) {
                 return;
             }
             if (m_close_requested) {
-                reason = m_close_reason;  // owner 发布不能替换首次请求原因
+                reason = m_close_reason; // owner 发布不能替换首次请求原因
             } else {
                 m_close_reason = reason;
             }
@@ -327,8 +333,7 @@ public:
             // 未发完写必须以 Done+非空错误结算：默认空 reason 只描述关闭
             // 意图，不能让未完整发送的写冒充本地成功（已完成写早已带着
             // 空错误进 m_pending_terminal，不受此影响）。
-            const std::error_code settle =
-                reason ? reason : std::make_error_code(std::errc::operation_canceled);
+            const std::error_code settle = reason ? reason : std::make_error_code(std::errc::operation_canceled);
             bool settled_any = false;
             while (!m_ops.empty()) {
                 auto& op = m_ops.front();
@@ -352,7 +357,7 @@ public:
             publish_read_closed = !m_read_closed_published;
         }
         if (publish_read_closed) {
-            ring.MarkClosed();  // 即使 acceptance 已因 sealed 写失败置 Closed，也要发布读 EOF
+            ring.MarkClosed(); // 即使 acceptance 已因 sealed 写失败置 Closed，也要发布读 EOF
             std::lock_guard<std::mutex> lock(m_write_mutex);
             m_read_closed_published = true;
         }
@@ -363,31 +368,40 @@ public:
         WakeOwner();
     }
 
-    bool Closed() {
+    bool Closed()
+    {
         std::lock_guard<std::mutex> lock(m_write_mutex);
         return m_acceptance == AcceptanceState::Closed;
     }
-    std::error_code CloseReason() {
+    std::error_code CloseReason()
+    {
         std::lock_guard<std::mutex> lock(m_write_mutex);
         return m_close_reason;
     }
-    AcceptanceState Acceptance() {
+    AcceptanceState Acceptance()
+    {
         std::lock_guard<std::mutex> lock(m_write_mutex);
         return m_acceptance;
     }
-    std::size_t MaxOutboundBytes() const noexcept { return m_outbound_max; }
+    std::size_t MaxOutboundBytes() const noexcept
+    {
+        return m_outbound_max;
+    }
 
-    std::error_code LastWriteError(std::uint64_t* operation = nullptr) {
+    std::error_code LastWriteError(std::uint64_t* operation = nullptr)
+    {
         std::lock_guard<std::mutex> lock(m_write_mutex);
         if (operation != nullptr) {
             *operation = m_last_error_op;
         }
         return m_last_error;
     }
-    std::shared_ptr<bbt::coroutine::sync::CoWaiter> CreateWriteWaiter() {
+    std::shared_ptr<bbt::coroutine::sync::CoWaiter> CreateWriteWaiter()
+    {
         return m_write_hub.Create();
     }
-    bool AddWriteWaiter(const std::shared_ptr<bbt::coroutine::sync::CoWaiter>& waiter) {
+    bool AddWriteWaiter(const std::shared_ptr<bbt::coroutine::sync::CoWaiter>& waiter)
+    {
         const bool added = m_write_hub.Add(waiter);
         if (added) {
             if (auto& hook = WriteAddHookForTest()) {
@@ -396,7 +410,8 @@ public:
         }
         return added;
     }
-    std::shared_ptr<bbt::coroutine::sync::CoWaiter> RegisterWriteWaiter() {
+    std::shared_ptr<bbt::coroutine::sync::CoWaiter> RegisterWriteWaiter()
+    {
         return m_write_hub.Register();
     }
     // close hub 的等待订阅必须走 Create/Add 两段：Add 放进
@@ -404,10 +419,12 @@ public:
     // 不能直接拿 RegisterCloseWaiter 在登记前注册——否则早到
     // MarkClosed 的 NotifyAll 落在未登记事件上丢失（与 ring/write hub
     // 同一模式）。
-    std::shared_ptr<bbt::coroutine::sync::CoWaiter> CreateCloseWaiter() {
+    std::shared_ptr<bbt::coroutine::sync::CoWaiter> CreateCloseWaiter()
+    {
         return m_close_hub.Create();
     }
-    bool AddCloseWaiter(const std::shared_ptr<bbt::coroutine::sync::CoWaiter>& waiter) {
+    bool AddCloseWaiter(const std::shared_ptr<bbt::coroutine::sync::CoWaiter>& waiter)
+    {
         const bool added = m_close_hub.Add(waiter);
         if (added) {
             if (auto& hook = CloseAddHookForTest()) {
@@ -416,42 +433,51 @@ public:
         }
         return added;
     }
-    std::shared_ptr<bbt::coroutine::sync::CoWaiter> RegisterCloseWaiter() {
+    std::shared_ptr<bbt::coroutine::sync::CoWaiter> RegisterCloseWaiter()
+    {
         return m_close_hub.Register();
     }
-    std::shared_ptr<bbt::coroutine::sync::CoWaiter> RegisterReadWaiter() {
+    std::shared_ptr<bbt::coroutine::sync::CoWaiter> RegisterReadWaiter()
+    {
         return ring.RegisterWaiter();
     }
     // 测试接缝：对应 hub Add 成功后调用（在 on_registered 内、等待者
     // 已随 runtime 登记），用于确定性制造「等待已挂起后再触发事件」的
     // 屏障，替代 sleep（正常为空）。与 ReceiveRing 的 AfterAddHook 同模式。
-    static void SetWriteAddHookForTest(std::function<void()> hook) {
+    static void SetWriteAddHookForTest(std::function<void()> hook)
+    {
         WriteAddHookForTest() = std::move(hook);
     }
-    static void SetCloseAddHookForTest(std::function<void()> hook) {
+    static void SetCloseAddHookForTest(std::function<void()> hook)
+    {
         CloseAddHookForTest() = std::move(hook);
     }
-    void WakeOwner() {
+    void WakeOwner()
+    {
         if (owner_dirty) {
             owner_dirty();
         }
     }
 
 private:
-    static std::function<void()>& WriteAddHookForTest() {
+    static std::function<void()>& WriteAddHookForTest()
+    {
         static std::function<void()> hook;
         return hook;
     }
-    static std::function<void()>& CloseAddHookForTest() {
+    static std::function<void()>& CloseAddHookForTest()
+    {
         static std::function<void()> hook;
         return hook;
     }
 
-    std::size_t PendingCountLocked() const noexcept {
+    std::size_t PendingCountLocked() const noexcept
+    {
         return m_pending_terminal.size();
     }
 
-    bool AttributeSentLocked(std::size_t bytes) {
+    bool AttributeSentLocked(std::size_t bytes)
+    {
         bool changed = false;
         while (bytes != 0 && !m_ops.empty()) {
             auto& op = m_ops.front();
@@ -477,7 +503,8 @@ private:
         return changed;
     }
 
-    void FailCurrentLocked(std::error_code error) {
+    void FailCurrentLocked(std::error_code error)
+    {
         if (m_ops.empty()) {
             return;
         }
@@ -501,8 +528,7 @@ private:
         // 有关闭意图时保持 Settling，等 owner stage 后发布最终终态；普通 I/O
         // 错误只结算写责任，不升级为自动关闭。
         if (!m_close_requested) {
-            const bool sealed = m_service_sealed
-                && m_service_sealed->load(std::memory_order_acquire);
+            const bool sealed = m_service_sealed && m_service_sealed->load(std::memory_order_acquire);
             m_acceptance = sealed ? AcceptanceState::Closed : AcceptanceState::Open;
         }
     }

@@ -45,21 +45,27 @@ namespace {
 // 非异步安全调用，也不依赖协程栈展开）。
 volatile std::sig_atomic_t g_stop = 0;
 
-void OnStopSignal(int) { g_stop = 1; }
+void OnStopSignal(int)
+{
+    g_stop = 1;
+}
 
 // --- 确定性业务 handler：echo，无外部依赖、无随机性 --------------------------------
 
 #ifdef BBT_MCP_SCHEMA_ADAPTER
 std::atomic<int> g_tool_calls{0};
 
-bbt::infra::result<bbt::infra::mcp::HandlerResult<bbt::infra::mcp::ToolResult>> EchoTool(
-    const bbt::infra::mcp::RequestContext&, bbt::infra::mcp::JsonValue arguments) {
+bbt::infra::result<bbt::infra::mcp::HandlerResult<bbt::infra::mcp::ToolResult>>
+EchoTool(const bbt::infra::mcp::RequestContext&, bbt::infra::mcp::JsonValue arguments)
+{
     using namespace bbt::infra::mcp;
     using Result = bbt::infra::result<HandlerResult<ToolResult>>;
     auto found = arguments.Find("message");
-    if (!found) return Result::err(found.error());
+    if (!found)
+        return Result::err(found.error());
     auto message = found.value().AsString();
-    if (!message) return Result::err(message.error());
+    if (!message)
+        return Result::err(message.error());
     ToolResult out;
     out.content.push_back(Content::Text(message.value()));
     auto structured = JsonValue::Object();
@@ -72,10 +78,10 @@ bbt::infra::result<bbt::infra::mcp::HandlerResult<bbt::infra::mcp::ToolResult>> 
 #endif
 
 // resources/read：回显注册 uri（与注册 uri 相同，库已校验）。
-bbt::infra::result<bbt::infra::mcp::ResourceResult> EchoResource(
-    const bbt::infra::mcp::RequestContext&, const std::string& uri) {
-    auto content =
-        bbt::infra::mcp::ResourceContents::Text(uri, "text/plain", "echo:" + uri);
+bbt::infra::result<bbt::infra::mcp::ResourceResult> EchoResource(const bbt::infra::mcp::RequestContext&,
+                                                                 const std::string& uri)
+{
+    auto content = bbt::infra::mcp::ResourceContents::Text(uri, "text/plain", "echo:" + uri);
     if (!content)
         return bbt::infra::result<bbt::infra::mcp::ResourceResult>::err(content.error());
     bbt::infra::mcp::ResourceResult out;
@@ -84,40 +90,43 @@ bbt::infra::result<bbt::infra::mcp::ResourceResult> EchoResource(
 }
 
 // prompts/get：取 params.arguments.text（缺省「你好」），回显到单条 user 消息。
-bbt::infra::result<bbt::infra::mcp::PromptResult> EchoPrompt(
-    const bbt::infra::mcp::RequestContext&, const bbt::infra::mcp::JsonValue& arguments) {
+bbt::infra::result<bbt::infra::mcp::PromptResult> EchoPrompt(const bbt::infra::mcp::RequestContext&,
+                                                             const bbt::infra::mcp::JsonValue& arguments)
+{
     std::string text = "你好";
     if (arguments.IsObject()) {
         auto found = arguments.Find("text");
         if (found && found.value().IsString()) {
             auto as_string = found.value().AsString();
-            if (as_string) text = as_string.value();
+            if (as_string)
+                text = as_string.value();
         }
     }
     bbt::infra::mcp::PromptResult out;
     out.description = "echo 提示词：把 text 回显为一条 user 消息";
     bbt::infra::mcp::PromptMessage message;
-    message.role    = bbt::infra::mcp::PromptRole::User;
+    message.role = bbt::infra::mcp::PromptRole::User;
     message.content = bbt::infra::mcp::Content::Text("echo:" + text);
     out.messages.push_back(std::move(message));
     return bbt::infra::result<bbt::infra::mcp::PromptResult>::ok(std::move(out));
 }
 
-void PrintUsage(std::FILE* out) {
-    std::fprintf(out,
-                 "用法：Example_mcp_stdio_server --stdio\n"
-                 "  --stdio  逐行 JSON 帧（stdin/stdout 必须是管道）\n");
+void PrintUsage(std::FILE* out)
+{
+    std::fprintf(out, "用法：Example_mcp_stdio_server --stdio\n"
+                      "  --stdio  逐行 JSON 帧（stdin/stdout 必须是管道）\n");
 }
 
 } // namespace
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv)
+{
     if (argc != 2 || std::strcmp(argv[1], "--stdio") != 0) {
         PrintUsage(stderr);
         return 2;
     }
 
-    struct sigaction action {};  // 先装信号，再启动运行时
+    struct sigaction action{}; // 先装信号，再启动运行时
     action.sa_handler = OnStopSignal;
     ::sigemptyset(&action.sa_mask);
     ::sigaction(SIGINT, &action, nullptr);
@@ -127,9 +136,8 @@ int main(int argc, char** argv) {
     // 纤程栈给到 256KB，避免深调用链撞默认栈保护页。
     auto* config = bbt::coroutine::detail::GlobalConfig::GetInstance().get();
     config->m_cfg_static_thread_num = 2;
-    config->m_cfg_stack_size        = 1024 * 256;
-    bbt::coroutine::detail::Scheduler::GetInstance()->Start(
-        bbt::coroutine::SCHE_START_OPT_SCHE_THREAD);
+    config->m_cfg_stack_size = 1024 * 256;
+    bbt::coroutine::detail::Scheduler::GetInstance()->Start(bbt::coroutine::SCHE_START_OPT_SCHE_THREAD);
 
     // server core：注册（Start 前）→ Start 一次冻结快照并开协议接纳。
     bbt::infra::mcp::ServerOptions options;
@@ -138,7 +146,7 @@ int main(int argc, char** argv) {
 #else
     options.instructions = "bbtools-infra 示例 server：echo 资源与提示词（Schema 选件 OFF）";
 #endif
-    auto server_handle   = bbt::infra::mcp::McpServer::Create(options);
+    auto server_handle = bbt::infra::mcp::McpServer::Create(options);
     if (!server_handle) {
         std::fprintf(stderr, "mcp-example: McpServer::Create 失败\n");
         return 1;
@@ -172,22 +180,22 @@ int main(int argc, char** argv) {
 #endif
 
     bbt::infra::mcp::ResourceDefinition resource;
-    resource.uri         = "memo://echo";
-    resource.name        = "echo";
+    resource.uri = "memo://echo";
+    resource.name = "echo";
     resource.description = "回显注册 uri 的确定性资源";
-    resource.mime_type   = "text/plain";
+    resource.mime_type = "text/plain";
     if (!server->AddResource(resource, EchoResource)) {
         std::fprintf(stderr, "mcp-example: AddResource 失败\n");
         return 1;
     }
 
     bbt::infra::mcp::PromptDefinition prompt;
-    prompt.name        = "echo";
+    prompt.name = "echo";
     prompt.description = "回显 text 参数（缺省「你好」）的提示词";
     bbt::infra::mcp::PromptArgument argument;
-    argument.name        = "text";
+    argument.name = "text";
     argument.description = "要回显的文本";
-    argument.required    = false;
+    argument.required = false;
     prompt.arguments.push_back(argument);
     if (!server->AddPrompt(prompt, EchoPrompt)) {
         std::fprintf(stderr, "mcp-example: AddPrompt 失败\n");
@@ -201,8 +209,7 @@ int main(int argc, char** argv) {
 
     auto started = bbt::infra::mcp::McpStdioTransport::Start(server);
     if (!started) {
-        std::fprintf(stderr,
-                     "mcp-example: stdio transport 启动失败（stdin/stdout 必须是独占管道）\n");
+        std::fprintf(stderr, "mcp-example: stdio transport 启动失败（stdin/stdout 必须是独占管道）\n");
         server->Close();
         return 1;
     }
@@ -210,13 +217,12 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "mcp-example: ready mode=stdio\n");
 
     // stdin EOF 由 transport 自行走同一收口序列；信号则由本线程补一次同步 Close。
-    while (!transport->IsClosed() && g_stop == 0) ::usleep(20000);
-    transport->Close();  // 幂等：EOF 已收口时等首次真实落定
+    while (!transport->IsClosed() && g_stop == 0)
+        ::usleep(20000);
+    transport->Close(); // 幂等：EOF 已收口时等首次真实落定
     const auto evidence = transport->LastCloseEvidence();
-    std::fprintf(stderr,
-                 "mcp-example: stdio closed eof=%d nonblock_restored=%d dropped=%zu\n",
-                 evidence.eof ? 1 : 0, evidence.nonblock_restored ? 1 : 0,
-                 evidence.dropped_frames);
+    std::fprintf(stderr, "mcp-example: stdio closed eof=%d nonblock_restored=%d dropped=%zu\n", evidence.eof ? 1 : 0,
+                 evidence.nonblock_restored ? 1 : 0, evidence.dropped_frames);
 
     // core 生命周期由业务决定：transport 不代管，这里显式封口（幂等）。
     server->Close();

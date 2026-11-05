@@ -24,17 +24,28 @@ namespace co = bbt::coroutine;
 
 namespace {
 struct Runtime {
-    Runtime() { if (!g_scheduler->IsInitialized()) g_scheduler->Start(); }
+    Runtime()
+    {
+        if (!g_scheduler->IsInitialized())
+            g_scheduler->Start();
+    }
 };
 
-void OnCo(std::function<void()> action) {
+void OnCo(std::function<void()> action)
+{
     auto done = std::make_shared<std::promise<void>>();
     auto future = done->get_future();
     bool submitted = false;
-    g_scheduler->RegistCoroutineTask([done, action = std::move(action)] {
-        try { action(); done->set_value(); }
-        catch (...) { done->set_exception(std::current_exception()); }
-    }, submitted);
+    g_scheduler->RegistCoroutineTask(
+        [done, action = std::move(action)] {
+            try {
+                action();
+                done->set_value();
+            } catch (...) {
+                done->set_exception(std::current_exception());
+            }
+        },
+        submitted);
     BOOST_REQUIRE(submitted);
     if (future.wait_for(std::chrono::seconds(5)) != std::future_status::ready)
         std::terminate(); // 超时不允许在途 action 借用已退出的用例栈。
@@ -44,7 +55,8 @@ void OnCo(std::function<void()> action) {
 
 BOOST_FIXTURE_TEST_SUITE(co_lifecycle, Runtime)
 
-BOOST_AUTO_TEST_CASE(non_co_dial_accept_have_no_submission) {
+BOOST_AUTO_TEST_CASE(non_co_dial_accept_have_no_submission)
+{
     net::Engine engine(nullptr);
     std::error_code error;
     const auto address = net::Address::Ip("127.0.0.1", 1, error);
@@ -62,12 +74,11 @@ BOOST_AUTO_TEST_CASE(non_co_dial_accept_have_no_submission) {
     engine.RequestClose();
     // 同一封口对象的 Co 调用返回真实终态，不再是上下文错误。
     BOOST_CHECK(engine.CoAccept({}).error == std::errc::operation_not_permitted);
-    OnCo([&] {
-        BOOST_CHECK(engine.CoAccept({}).error == std::errc::operation_canceled);
-    });
+    OnCo([&] { BOOST_CHECK(engine.CoAccept({}).error == std::errc::operation_canceled); });
 }
 
-BOOST_AUTO_TEST_CASE(non_co_connection_ready_paths_do_not_consume) {
+BOOST_AUTO_TEST_CASE(non_co_connection_ready_paths_do_not_consume)
+{
     auto state = std::make_shared<net::ConnectionState>(1, 4096, 4096, 8, nullptr);
     net::CoTcpConnection connection(net::ConnectionTestAccess::Make(state));
     const auto before = connection.Status();
@@ -95,7 +106,8 @@ BOOST_AUTO_TEST_CASE(non_co_connection_ready_paths_do_not_consume) {
     OnCo([&] { BOOST_CHECK(!connection.WaitClosed({})); });
 }
 
-BOOST_AUTO_TEST_CASE(engine_observation_does_not_require_co_or_own_engine) {
+BOOST_AUTO_TEST_CASE(engine_observation_does_not_require_co_or_own_engine)
+{
     static_assert(!std::is_base_of_v<co::CoRuntimeOnly, net::Engine>);
     const auto before = co::GetCoObjectStats("infra.net.Engine");
     auto engine = net::Engine::Create(nullptr);

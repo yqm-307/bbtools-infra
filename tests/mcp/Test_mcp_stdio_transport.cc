@@ -42,7 +42,8 @@ namespace {
 int g_checks = 0;
 int g_failures = 0;
 
-void Check(bool ok, const char* expr, int line) {
+void Check(bool ok, const char* expr, int line)
+{
     ++g_checks;
     if (!ok) {
         ++g_failures;
@@ -61,18 +62,20 @@ using bbt::infra::mcp::ServerOptions;
 using bbt::infra::mcp::StdioCloseEvidence;
 using bbt::infra::mcp::StdioOptions;
 
-constexpr std::size_t kBigResourceBytes = 2U << 20;  // 大响应载荷
+constexpr std::size_t kBigResourceBytes = 2U << 20; // 大响应载荷
 
 // --- 帧构造 --------------------------------------------------------------------
 
-JsonValue ModernMeta() {
+JsonValue ModernMeta()
+{
     JsonValue meta = JsonValue::Object();
     meta.Set("io.modelcontextprotocol/protocolVersion", JsonValue("2026-07-28"));
     meta.Set("io.modelcontextprotocol/clientCapabilities", JsonValue::Object());
     return meta;
 }
 
-std::string Frame(const std::string& id, const std::string& method, JsonValue params) {
+std::string Frame(const std::string& id, const std::string& method, JsonValue params)
+{
     JsonValue frame = JsonValue::Object();
     frame.Set("jsonrpc", JsonValue("2.0"));
     frame.Set("id", JsonValue(id));
@@ -82,17 +85,20 @@ std::string Frame(const std::string& id, const std::string& method, JsonValue pa
     return frame.Serialize();
 }
 
-std::string DiscoverFrame(const std::string& id) {
+std::string DiscoverFrame(const std::string& id)
+{
     return Frame(id, "server/discover", JsonValue::Object());
 }
 
-std::string ReadFrame(const std::string& id, const std::string& uri) {
+std::string ReadFrame(const std::string& id, const std::string& uri)
+{
     JsonValue params = JsonValue::Object();
     params.Set("uri", JsonValue(uri));
     return Frame(id, "resources/read", std::move(params));
 }
 
-std::string ListenFrame(const std::string& id, const std::string& uri) {
+std::string ListenFrame(const std::string& id, const std::string& uri)
+{
     JsonValue filter = JsonValue::Object();
     JsonValue uris = JsonValue::Array();
     uris.Push(JsonValue(uri));
@@ -102,7 +108,8 @@ std::string ListenFrame(const std::string& id, const std::string& uri) {
     return Frame(id, "subscriptions/listen", std::move(params));
 }
 
-std::string CancelNotification(const std::string& request_id) {
+std::string CancelNotification(const std::string& request_id)
+{
     JsonValue params = JsonValue::Object();
     params.Set("requestId", JsonValue(request_id));
     JsonValue frame = JsonValue::Object();
@@ -114,7 +121,8 @@ std::string CancelNotification(const std::string& request_id) {
 
 // --- 装配 ----------------------------------------------------------------------
 
-std::shared_ptr<McpServer> MakeServer() {
+std::shared_ptr<McpServer> MakeServer()
+{
     ServerOptions options;
     auto server = std::move(McpServer::Create(std::move(options)).value());
     {
@@ -122,43 +130,47 @@ std::shared_ptr<McpServer> MakeServer() {
         definition.uri = "mem://a";
         definition.name = "a";
         definition.mime_type = "text/plain";
-        auto add = server->AddResource(
-            std::move(definition), [](const auto&, const std::string& uri) {
-                ResourceResult result;
-                auto contents = ResourceContents::Text(uri, "text/plain", "中文内容αβγ");
-                if (!contents) return bbt::infra::result<ResourceResult>::err(contents.error());
-                result.contents.push_back(std::move(contents).value());
-                return bbt::infra::result<ResourceResult>::ok(std::move(result));
-            });
-        if (!add) std::fprintf(stderr, "FAIL add mem://a\n"), ++g_failures;
+        auto add = server->AddResource(std::move(definition), [](const auto&, const std::string& uri) {
+            ResourceResult result;
+            auto contents = ResourceContents::Text(uri, "text/plain", "中文内容αβγ");
+            if (!contents)
+                return bbt::infra::result<ResourceResult>::err(contents.error());
+            result.contents.push_back(std::move(contents).value());
+            return bbt::infra::result<ResourceResult>::ok(std::move(result));
+        });
+        if (!add)
+            std::fprintf(stderr, "FAIL add mem://a\n"), ++g_failures;
     }
     {
         ResourceDefinition definition;
         definition.uri = "mem://big";
         definition.name = "big";
         definition.mime_type = "text/plain";
-        auto add = server->AddResource(
-            std::move(definition), [](const auto&, const std::string& uri) {
-                ResourceResult result;
-                std::string body(kBigResourceBytes, 'x');
-                auto contents = ResourceContents::Text(uri, "text/plain", body);
-                if (!contents) return bbt::infra::result<ResourceResult>::err(contents.error());
-                result.contents.push_back(std::move(contents).value());
-                return bbt::infra::result<ResourceResult>::ok(std::move(result));
-            });
-        if (!add) std::fprintf(stderr, "FAIL add mem://big\n"), ++g_failures;
+        auto add = server->AddResource(std::move(definition), [](const auto&, const std::string& uri) {
+            ResourceResult result;
+            std::string body(kBigResourceBytes, 'x');
+            auto contents = ResourceContents::Text(uri, "text/plain", body);
+            if (!contents)
+                return bbt::infra::result<ResourceResult>::err(contents.error());
+            result.contents.push_back(std::move(contents).value());
+            return bbt::infra::result<ResourceResult>::ok(std::move(result));
+        });
+        if (!add)
+            std::fprintf(stderr, "FAIL add mem://big\n"), ++g_failures;
     }
     auto started = server->Start();
-    if (!started) std::fprintf(stderr, "FAIL server start\n"), ++g_failures;
+    if (!started)
+        std::fprintf(stderr, "FAIL server start\n"), ++g_failures;
     return server;
 }
 
 struct Pipes {
-    int req[2] = {-1, -1};  // 测试写 req[1] → transport 读 req[0]
-    int res[2] = {-1, -1};  // transport 写 res[1] → 测试读 res[0]
+    int req[2] = {-1, -1}; // 测试写 req[1] → transport 读 req[0]
+    int res[2] = {-1, -1}; // transport 写 res[1] → 测试读 res[0]
 };
 
-Pipes MakePipes() {
+Pipes MakePipes()
+{
     Pipes p;
     if (::pipe(p.req) != 0 || ::pipe(p.res) != 0) {
         std::fprintf(stderr, "FAIL pipe errno=%d\n", errno);
@@ -171,12 +183,14 @@ Pipes MakePipes() {
     return p;
 }
 
-void WriteAll(int fd, const std::string& data) {
+void WriteAll(int fd, const std::string& data)
+{
     std::size_t off = 0;
     while (off < data.size()) {
         const ssize_t n = ::write(fd, data.data() + off, data.size() - off);
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR)
+                continue;
             std::fprintf(stderr, "FAIL write errno=%d\n", errno);
             ++g_failures;
             return;
@@ -186,14 +200,15 @@ void WriteAll(int fd, const std::string& data) {
 }
 
 // 读至恰好 want 条完整行或 deadline；返回行集合（不含 '\n'）。
-std::vector<std::string> ReadLines(int fd, std::size_t want, int timeout_ms) {
+std::vector<std::string> ReadLines(int fd, std::size_t want, int timeout_ms)
+{
     std::vector<std::string> lines;
     std::string pending;
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::milliseconds(timeout_ms);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     char buffer[65536];
     while (lines.size() < want) {
-        if (std::chrono::steady_clock::now() > deadline) break;
+        if (std::chrono::steady_clock::now() > deadline)
+            break;
         const ssize_t n = ::read(fd, buffer, sizeof(buffer));
         if (n > 0) {
             for (ssize_t i = 0; i < n; ++i) {
@@ -206,8 +221,10 @@ std::vector<std::string> ReadLines(int fd, std::size_t want, int timeout_ms) {
             }
             continue;
         }
-        if (n == 0) break;
-        if (errno == EINTR) continue;
+        if (n == 0)
+            break;
+        if (errno == EINTR)
+            continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             ::usleep(2000);
             continue;
@@ -217,11 +234,11 @@ std::vector<std::string> ReadLines(int fd, std::size_t want, int timeout_ms) {
     return lines;
 }
 
-JsonValue ParseLine(const std::string& line) {
+JsonValue ParseLine(const std::string& line)
+{
     auto parsed = JsonValue::Parse(line, 64U << 20, 32);
     if (!parsed) {
-        std::fprintf(stderr, "FAIL stdout line is not valid JSON (%zu bytes): %.80s\n",
-                     line.size(), line.c_str());
+        std::fprintf(stderr, "FAIL stdout line is not valid JSON (%zu bytes): %.80s\n", line.size(), line.c_str());
         ++g_failures;
         return JsonValue();
     }
@@ -229,13 +246,14 @@ JsonValue ParseLine(const std::string& line) {
 }
 
 // 无新行到达（S17「取消后不再发帧」的观察面）。
-bool NoLineWithin(int fd, int timeout_ms) {
+bool NoLineWithin(int fd, int timeout_ms)
+{
     return ReadLines(fd, 1, timeout_ms).empty();
 }
 
-void WaitClosed(const std::shared_ptr<McpStdioTransport>& transport, int timeout_ms) {
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::milliseconds(timeout_ms);
+void WaitClosed(const std::shared_ptr<McpStdioTransport>& transport, int timeout_ms)
+{
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     while (!transport->IsClosed()) {
         if (std::chrono::steady_clock::now() > deadline) {
             std::fprintf(stderr, "FAIL transport not closed within %dms\n", timeout_ms);
@@ -246,7 +264,8 @@ void WaitClosed(const std::shared_ptr<McpStdioTransport>& transport, int timeout
     }
 }
 
-void CheckCleanEvidence(const StdioCloseEvidence& e, bool expect_eof) {
+void CheckCleanEvidence(const StdioCloseEvidence& e, bool expect_eof)
+{
     CHECK(e.reader_joined);
     CHECK(e.writer_joined);
     CHECK(e.input_sealed);
@@ -257,12 +276,14 @@ void CheckCleanEvidence(const StdioCloseEvidence& e, bool expect_eof) {
     CHECK(e.pending_frames == 0);
     CHECK(e.pending_bytes == 0);
     CHECK(e.dropped_frames == 0);
-    if (expect_eof) CHECK(e.eof);
+    if (expect_eof)
+        CHECK(e.eof);
 }
 
 // --- T1：分割 UTF-8/JSON 与同次多帧 ----------------------------------------------
 
-void TestSplitUtf8AndMultiFrame() {
+void TestSplitUtf8AndMultiFrame()
+{
     auto server = MakeServer();
     Pipes pipes = MakePipes();
     StdioOptions options;
@@ -274,14 +295,14 @@ void TestSplitUtf8AndMultiFrame() {
     // 同一帧在多字节字符内部切割 + 两次 write 间留间隙（真实非阻塞重组）。
     const std::string whole = ReadFrame("r1", "mem://a") + "\n";
     std::size_t cut = whole.find("mem://a") + strlen("mem://") + 1; // '中' 的第二字节内
-    if (cut >= whole.size()) cut = whole.size() / 2;
+    if (cut >= whole.size())
+        cut = whole.size() / 2;
     WriteAll(pipes.req[1], whole.substr(0, cut));
     ::usleep(5000);
     WriteAll(pipes.req[1], whole.substr(cut));
 
     // 同次多帧：一次 write 携带两个完整帧。
-    const std::string batch = DiscoverFrame("r2") + "\n" +
-                              Frame("r3", "resources/list", JsonValue::Object()) + "\n";
+    const std::string batch = DiscoverFrame("r2") + "\n" + Frame("r3", "resources/list", JsonValue::Object()) + "\n";
     WriteAll(pipes.req[1], batch);
 
     auto lines = ReadLines(pipes.res[0], 3, 8000);
@@ -298,8 +319,7 @@ void TestSplitUtf8AndMultiFrame() {
         CHECK(contents && contents.value().Size() == 1);
         if (contents && contents.value().Size() == 1) {
             auto text = contents.value().At(0).value().Find("text");
-            CHECK(text && text.value().AsString().value().find("中文内容αβγ") !=
-                              std::string::npos);
+            CHECK(text && text.value().AsString().value().find("中文内容αβγ") != std::string::npos);
         }
     }
     CHECK(transport->DroppedOutputFrames() == 0);
@@ -314,13 +334,14 @@ void TestSplitUtf8AndMultiFrame() {
 
 // --- T2：大响应与输出背压有界 ------------------------------------------------------
 
-void TestLargeResponseAndBackpressure() {
+void TestLargeResponseAndBackpressure()
+{
     auto server = MakeServer();
     Pipes pipes = MakePipes();
     StdioOptions options;
     options.stdin_fd = pipes.req[0];
     options.stdout_fd = pipes.res[1];
-    options.max_pending_bytes = 3U << 20;  // 两条 ~2MiB 响应必然越限 → 分派侧等待
+    options.max_pending_bytes = 3U << 20; // 两条 ~2MiB 响应必然越限 → 分派侧等待
     auto transport = std::move(McpStdioTransport::Start(server, options).value());
 
     WriteAll(pipes.req[1], ReadFrame("b1", "mem://big") + "\n");
@@ -354,7 +375,8 @@ void TestLargeResponseAndBackpressure() {
 
 // --- T3：超长行有界截断 + 错误帧不污染后续请求 ---------------------------------------
 
-void TestOversizedLineDoesNotCorruptDispatch() {
+void TestOversizedLineDoesNotCorruptDispatch()
+{
     auto server = MakeServer();
     Pipes pipes = MakePipes();
     StdioOptions options;
@@ -363,8 +385,8 @@ void TestOversizedLineDoesNotCorruptDispatch() {
     options.max_line_bytes = 64U << 10;
     auto transport = std::move(McpStdioTransport::Start(server, options).value());
 
-    WriteAll(pipes.req[1], std::string(200U << 10, 'a') + "\n");  // 超长垃圾行
-    WriteAll(pipes.req[1], DiscoverFrame("ok") + "\n");           // 同通道后续合法请求
+    WriteAll(pipes.req[1], std::string(200U << 10, 'a') + "\n"); // 超长垃圾行
+    WriteAll(pipes.req[1], DiscoverFrame("ok") + "\n");          // 同通道后续合法请求
 
     auto lines = ReadLines(pipes.res[0], 2, 8000);
     CHECK(lines.size() == 2);
@@ -375,8 +397,7 @@ void TestOversizedLineDoesNotCorruptDispatch() {
         CHECK(err.Find("error") && err.Find("id") && err.Find("id").value().IsNull());
         // 错误帧不错关联：后续请求按自己的 id 正常应答，恰好一次终态。
         CHECK(ok.Find("id").value().AsString().value() == "ok");
-        CHECK(ok.Find("result").value().Find("resultType").value().AsString().value() ==
-              "complete");
+        CHECK(ok.Find("result").value().Find("resultType").value().AsString().value() == "complete");
     }
     transport->Close();
     CheckCleanEvidence(transport->LastCloseEvidence(), false);
@@ -388,7 +409,8 @@ void TestOversizedLineDoesNotCorruptDispatch() {
 
 // --- T4：EOF 自收口 + 返回当刻证据 + fd 复用 -----------------------------------------
 
-void TestEofTeardownEvidenceAndFdReuse() {
+void TestEofTeardownEvidenceAndFdReuse()
+{
     auto server = MakeServer();
     Pipes pipes = MakePipes();
     StdioOptions options;
@@ -403,12 +425,12 @@ void TestEofTeardownEvidenceAndFdReuse() {
     // 客户端关 stdin → EOF → transport 自行走收口序列。
     ::close(pipes.req[1]);
     WaitClosed(transport, 5000);
-    transport->Close();  // 幂等：等待/读取首次收口当刻快照
+    transport->Close(); // 幂等：等待/读取首次收口当刻快照
     CheckCleanEvidence(transport->LastCloseEvidence(), true);
     CHECK(transport->LastCloseEvidence().abandoned_frames == 0);
 
     // 物理 fd：transport 不归属也不关闭（返回当刻两者仍可用）。
-    struct stat st {};
+    struct stat st{};
     CHECK(::fstat(pipes.req[0], &st) == 0);
     CHECK(::fstat(pipes.res[1], &st) == 0);
 
@@ -440,7 +462,8 @@ void TestEofTeardownEvidenceAndFdReuse() {
 
 // --- T5：S17 订阅 cancel/流结束帧/晚到 cancel ----------------------------------------
 
-void TestCancelSubscriptionAndLateCancel() {
+void TestCancelSubscriptionAndLateCancel()
+{
     auto server = MakeServer();
     Pipes pipes = MakePipes();
     StdioOptions options;
@@ -456,10 +479,8 @@ void TestCancelSubscriptionAndLateCancel() {
         // 带 subscriptionId meta）。
         const auto ack = ParseLine(ack_lines[0]);
         auto method = ack.Find("method");
-        CHECK(method &&
-              method.value().AsString().value() == "notifications/subscriptions/acknowledged");
-        auto sub_id = ack.Find("params").value().Find("_meta").value().Find(
-            "io.modelcontextprotocol/subscriptionId");
+        CHECK(method && method.value().AsString().value() == "notifications/subscriptions/acknowledged");
+        auto sub_id = ack.Find("params").value().Find("_meta").value().Find("io.modelcontextprotocol/subscriptionId");
         CHECK(sub_id && sub_id.value().AsString().value() == "sub-1");
     }
 
@@ -471,10 +492,8 @@ void TestCancelSubscriptionAndLateCancel() {
     if (event_lines.size() == 1) {
         const auto event = ParseLine(event_lines[0]);
         auto method = event.Find("method");
-        CHECK(method &&
-              method.value().AsString().value() == "notifications/resources/updated");
-        auto sub_id = event.Find("params").value().Find("_meta").value().Find(
-            "io.modelcontextprotocol/subscriptionId");
+        CHECK(method && method.value().AsString().value() == "notifications/resources/updated");
+        auto sub_id = event.Find("params").value().Find("_meta").value().Find("io.modelcontextprotocol/subscriptionId");
         CHECK(sub_id && sub_id.value().AsString().value() == "sub-1");
     }
 
@@ -485,18 +504,21 @@ void TestCancelSubscriptionAndLateCancel() {
     if (end_lines.size() == 1) {
         const auto end = ParseLine(end_lines[0]);
         CHECK(end.Find("id").value().AsString().value() == "sub-1");
-        CHECK(end.Find("result").value().Find("resultType").value().AsString().value() ==
-              "complete");
-        CHECK(end.Find("result").value().Find("_meta").value().Find(
-                  "io.modelcontextprotocol/subscriptionId")
+        CHECK(end.Find("result").value().Find("resultType").value().AsString().value() == "complete");
+        CHECK(end.Find("result")
+                  .value()
+                  .Find("_meta")
+                  .value()
+                  .Find("io.modelcontextprotocol/subscriptionId")
                   .value()
                   .AsString()
-                  .value() == "sub-1");
+                  .value()
+              == "sub-1");
     }
 
     // 取消后不再发送被取消请求的消息；晚到 cancel 无害。
     auto publish2 = server->PublishResourceChanged("mem://a");
-    CHECK(publish2 && publish2.value() == 0);  // 无在册订阅 → 0 投递
+    CHECK(publish2 && publish2.value() == 0); // 无在册订阅 → 0 投递
     CHECK(NoLineWithin(pipes.res[0], 600));
     WriteAll(pipes.req[1], CancelNotification("sub-1") + "\n");
     CHECK(NoLineWithin(pipes.res[0], 600));
@@ -511,7 +533,8 @@ void TestCancelSubscriptionAndLateCancel() {
 
 // --- T6：Close 与在册订阅竞争（流结束帧有界排空，封口后无帧）----------------------------
 
-void TestCloseWithLiveSubscription() {
+void TestCloseWithLiveSubscription()
+{
     auto server = MakeServer();
     Pipes pipes = MakePipes();
     StdioOptions options;
@@ -523,15 +546,14 @@ void TestCloseWithLiveSubscription() {
     auto ack_lines = ReadLines(pipes.res[0], 1, 8000);
     CHECK(ack_lines.size() == 1);
 
-    transport->Close();  // 显式 Close：先投流结束帧再封队（有界排空）
+    transport->Close(); // 显式 Close：先投流结束帧再封队（有界排空）
     WaitClosed(transport, 5000);
     auto end_lines = ReadLines(pipes.res[0], 1, 3000);
     CHECK(end_lines.size() == 1);
     if (end_lines.size() == 1) {
         const auto end = ParseLine(end_lines[0]);
         CHECK(end.Find("id").value().AsString().value() == "sub-2");
-        CHECK(end.Find("result").value().Find("resultType").value().AsString().value() ==
-              "complete");
+        CHECK(end.Find("result").value().Find("resultType").value().AsString().value() == "complete");
     }
     CheckCleanEvidence(transport->LastCloseEvidence(), false);
     // 封口后：发布不产生任何出帧（「取消/Close 竞争不再发送被取消请求消息」）。
@@ -545,9 +567,10 @@ void TestCloseWithLiveSubscription() {
 
 // --- T7：真实子进程全栈交互（S16 的 fork/exec 形态；SDK 互通属 4-2/S23）----------------
 
-int ChildMain() {
+int ChildMain()
+{
     auto server = MakeServer();
-    StdioOptions options;  // 默认 fd 0/1（父进程已接好 pipe）
+    StdioOptions options; // 默认 fd 0/1（父进程已接好 pipe）
     auto started = McpStdioTransport::Start(server, options);
     if (!started) {
         std::fprintf(stderr, "CHILD_FAIL start\n");
@@ -563,23 +586,22 @@ int ChildMain() {
         }
         ::usleep(10000);
     }
-    transport->Close();  // 幂等：取首次收口当刻快照
+    transport->Close(); // 幂等：取首次收口当刻快照
     const auto& e = transport->LastCloseEvidence();
     std::fprintf(stderr,
                  "CHILD_EVIDENCE reader_joined=%d writer_joined=%d eof=%d "
                  "sink_mounted=%d waiters_empty=%d nonblock_restored=%d "
                  "pending_bytes=%zu dropped=%zu peak=%zu\n",
-                 e.reader_joined ? 1 : 0, e.writer_joined ? 1 : 0, e.eof ? 1 : 0,
-                 e.sink_mounted ? 1 : 0, e.waiters_empty ? 1 : 0,
-                 e.nonblock_restored ? 1 : 0, e.pending_bytes, e.dropped_frames,
+                 e.reader_joined ? 1 : 0, e.writer_joined ? 1 : 0, e.eof ? 1 : 0, e.sink_mounted ? 1 : 0,
+                 e.waiters_empty ? 1 : 0, e.nonblock_restored ? 1 : 0, e.pending_bytes, e.dropped_frames,
                  e.peak_pending_bytes);
-    const bool ok = e.reader_joined && e.writer_joined && e.eof && !e.sink_mounted &&
-                    e.waiters_empty && e.nonblock_restored && e.pending_bytes == 0 &&
-                    e.dropped_frames == 0;
+    const bool ok = e.reader_joined && e.writer_joined && e.eof && !e.sink_mounted && e.waiters_empty
+                    && e.nonblock_restored && e.pending_bytes == 0 && e.dropped_frames == 0;
     return ok ? 0 : 4;
 }
 
-void TestChildSubprocess() {
+void TestChildSubprocess()
+{
     Pipes pipes = MakePipes();
     int errpipe[2] = {-1, -1};
     if (::pipe(errpipe) != 0) {
@@ -600,8 +622,7 @@ void TestChildSubprocess() {
         ::close(pipes.res[0]);
         ::close(pipes.res[1]);
         ::close(errpipe[0]);
-        ::execl("/proc/self/exe", "Test_mcp_stdio_transport", "--mcp-stdio-child",
-                static_cast<char*>(nullptr));
+        ::execl("/proc/self/exe", "Test_mcp_stdio_transport", "--mcp-stdio-child", static_cast<char*>(nullptr));
         std::fprintf(stderr, "CHILD_FAIL exec errno=%d\n", errno);
         ::_exit(127);
     }
@@ -615,8 +636,7 @@ void TestChildSubprocess() {
     WriteAll(pipes.req[1], whole.substr(0, cut));
     ::usleep(3000);
     WriteAll(pipes.req[1], whole.substr(cut));
-    WriteAll(pipes.req[1], DiscoverFrame("c2") + "\n" +
-                               Frame("c3", "resources/list", JsonValue::Object()) + "\n");
+    WriteAll(pipes.req[1], DiscoverFrame("c2") + "\n" + Frame("c3", "resources/list", JsonValue::Object()) + "\n");
     WriteAll(pipes.req[1], ReadFrame("c4", "mem://big") + "\n");
 
     auto lines = ReadLines(pipes.res[0], 4, 20000);
@@ -642,12 +662,13 @@ void TestChildSubprocess() {
     std::string child_stderr;
     for (;;) {
         const ssize_t n = ::read(errpipe[0], errbuf, sizeof(errbuf));
-        if (n <= 0) break;
+        if (n <= 0)
+            break;
         child_stderr.append(errbuf, static_cast<std::size_t>(n));
     }
     CHECK(child_stderr.find("CHILD_EVIDENCE") != std::string::npos);
-    if (child_stderr.find("nonblock_restored=1") == std::string::npos ||
-        child_stderr.find("eof=1") == std::string::npos)
+    if (child_stderr.find("nonblock_restored=1") == std::string::npos
+        || child_stderr.find("eof=1") == std::string::npos)
         std::fprintf(stderr, "CHILD STDERR RAW: %s\n", child_stderr.c_str());
     CHECK(child_stderr.find("eof=1") != std::string::npos);
     CHECK(child_stderr.find("reader_joined=1") != std::string::npos);
@@ -663,7 +684,8 @@ void TestChildSubprocess() {
 // 复审 Important-3：LastCloseEvidence() 曾无锁返回内部引用，与持锁写入的 Close
 // 构成 data race。修复后返回持锁值快照：并发轮询不崩溃、快照字段自洽、终态一致。
 
-void TestConcurrentCloseEvidenceSnapshot() {
+void TestConcurrentCloseEvidenceSnapshot()
+{
     auto server = MakeServer();
     Pipes pipes = MakePipes();
     StdioOptions options;
@@ -705,21 +727,20 @@ void TestConcurrentCloseEvidenceSnapshot() {
 
 } // namespace
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv)
+{
     if (argc > 1 && std::strcmp(argv[1], "--mcp-stdio-child") == 0) {
         auto* config = bbt::coroutine::detail::GlobalConfig::GetInstance().get();
         config->m_cfg_static_thread_num = 2;
-        config->m_cfg_stack_size = 1024 * 256;  // 分派协程要跑 HandleFrame（大帧解析）
-        bbt::coroutine::detail::Scheduler::GetInstance()->Start(
-            bbt::coroutine::SCHE_START_OPT_SCHE_THREAD);
+        config->m_cfg_stack_size = 1024 * 256; // 分派协程要跑 HandleFrame（大帧解析）
+        bbt::coroutine::detail::Scheduler::GetInstance()->Start(bbt::coroutine::SCHE_START_OPT_SCHE_THREAD);
         return ChildMain();
     }
 
     auto* config = bbt::coroutine::detail::GlobalConfig::GetInstance().get();
     config->m_cfg_static_thread_num = 2;
-    config->m_cfg_stack_size = 1024 * 256;  // 同上
-    bbt::coroutine::detail::Scheduler::GetInstance()->Start(
-        bbt::coroutine::SCHE_START_OPT_SCHE_THREAD);
+    config->m_cfg_stack_size = 1024 * 256; // 同上
+    bbt::coroutine::detail::Scheduler::GetInstance()->Start(bbt::coroutine::SCHE_START_OPT_SCHE_THREAD);
 
     TestSplitUtf8AndMultiFrame();
     std::fprintf(stderr, "PROGRESS T1 done\n");

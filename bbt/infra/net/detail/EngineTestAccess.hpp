@@ -11,7 +11,9 @@
 #include <system_error>
 #include <vector>
 
-namespace bbt::coroutine::sync { class CoWaiter; }
+namespace bbt::coroutine::sync {
+class CoWaiter;
+}
 
 namespace bbt::infra::net {
 
@@ -31,14 +33,12 @@ public:
     static void SetConnectStartDelay(Engine& engine, std::chrono::milliseconds delay);
     // 把 op hub 填满到 kMaxWaiters；返回实际加入数（测试持有 keep 保活）。
     static bool ConnectReceiverClaimed(Engine& engine, std::uint64_t id);
-    static std::size_t FillConnectHub(
-        Engine& engine, std::uint64_t id,
-        std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>>& keep);
+    static std::size_t FillConnectHub(Engine& engine, std::uint64_t id,
+                                      std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>>& keep);
     static void SetCancelPostFailureOnce(Engine& engine);
     static void SetSealDelay(Engine& engine, std::chrono::milliseconds delay);
     // 普通回调开始授权点前/后屏障（正常为空）。
-    static void SetAuthBarriers(Engine& engine, std::function<void()> pre_auth,
-                                std::function<void()> post_auth);
+    static void SetAuthBarriers(Engine& engine, std::function<void()> pre_auth, std::function<void()> post_auth);
     static std::size_t ConnectionCount(Engine& engine);
     // 测试屏障：owner recv 后、ring append 前调用（正常为空）。
     static void SetReadAppendHook(Engine& engine, std::function<void()> hook);

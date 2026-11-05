@@ -34,11 +34,13 @@ using namespace std::chrono_literals;
 
 namespace {
 
-bbt::coroutine::WaitOptions Until(std::chrono::milliseconds duration) {
+bbt::coroutine::WaitOptions Until(std::chrono::milliseconds duration)
+{
     return {std::chrono::steady_clock::now() + duration};
 }
 
-bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds timeout) {
+bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds timeout)
+{
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
         if (predicate()) {
@@ -51,7 +53,8 @@ bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds
 
 } // namespace
 
-int main() {
+int main()
+{
     std::atomic<int> failures{0};
     auto check = [&failures](bool value, const char* name) {
         if (!value) {
@@ -76,14 +79,13 @@ int main() {
         config.options.num_event_loop = 1;
         run_error = engine.Run(config);
     });
-    check(WaitUntil([&] { return engine.Phase() == net::EnginePhase::Running; }, 3000ms),
-          "engine running");
+    check(WaitUntil([&] { return engine.Phase() == net::EnginePhase::Running; }, 3000ms), "engine running");
 
     std::vector<net::Address> addresses;
     check(!engine.LocalAddresses(addresses) && addresses.size() == 1, "local addresses");
 
     std::atomic<int> echo_ok{0};
-    std::atomic<int> echo_drained{0};   // 尾部读空后的非等待状态断言
+    std::atomic<int> echo_drained{0}; // 尾部读空后的非等待状态断言
     auto server_task = [&] {
         auto accepted = engine.CoAccept(Until(3000ms));
         if (accepted.error) {
@@ -101,8 +103,7 @@ int main() {
             return;
         }
         // Done 只表示该次发送已到终态，成功还须 error 为空。
-        if (report.outcome.phase == net::WritePhase::Done && !report.outcome.error &&
-            data == "hello") {
+        if (report.outcome.phase == net::WritePhase::Done && !report.outcome.error && data == "hello") {
             echo_ok.store(1);
         }
         // 非等待读取同样移交 owning Buffer；读空后明确返回 WouldBlock。
@@ -114,10 +115,13 @@ int main() {
     };
     auto promise = std::make_shared<std::promise<void>>();
     auto future = promise->get_future();
-    g_scheduler->RegistCoroutineTask(65536, [promise, server_task] {
-        server_task();
-        promise->set_value();
-    }, "example.echo");
+    g_scheduler->RegistCoroutineTask(
+        65536,
+        [promise, server_task] {
+            server_task();
+            promise->set_value();
+        },
+        "example.echo");
 
     std::error_code error;
     auto client = net::NativeSocket::Open(net::AddressFamily::IPv4, net::SocketType::Stream, error);
@@ -129,13 +133,16 @@ int main() {
 
     std::string echoed;
     char buffer[64];
-    check(WaitUntil([&] {
-        const auto result = client.Receive(buffer, sizeof(buffer));
-        if (result.bytes > 0) {
-            echoed.append(buffer, result.bytes);
-        }
-        return echoed.size() >= 5;
-    }, 3000ms), "client recv");
+    check(WaitUntil(
+              [&] {
+                  const auto result = client.Receive(buffer, sizeof(buffer));
+                  if (result.bytes > 0) {
+                      echoed.append(buffer, result.bytes);
+                  }
+                  return echoed.size() >= 5;
+              },
+              3000ms),
+          "client recv");
     check(echoed == "hello", "echo content");
     if (future.wait_for(5s) == std::future_status::ready) {
         future.get();

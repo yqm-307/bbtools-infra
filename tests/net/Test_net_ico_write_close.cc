@@ -50,18 +50,21 @@
 using namespace bbt::infra::net;
 using namespace std::chrono_literals;
 
-static void Check(bool value, const char* expression, int line) {
+static void Check(bool value, const char* expression, int line)
+{
     if (!value) {
         throw std::runtime_error("line " + std::to_string(line) + ": " + expression);
     }
 }
 #define CHECK(expression) Check(static_cast<bool>(expression), #expression, __LINE__)
 
-static bbt::coroutine::WaitOptions Until(std::chrono::milliseconds duration) {
+static bbt::coroutine::WaitOptions Until(std::chrono::milliseconds duration)
+{
     return {std::chrono::steady_clock::now() + duration};
 }
 
-static bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds timeout) {
+static bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds timeout)
+{
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
         if (predicate()) {
@@ -72,32 +75,39 @@ static bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milli
     return predicate();
 }
 
-static void StartRuntime(std::size_t workers) {
+static void StartRuntime(std::size_t workers)
+{
     g_bbt_coroutine_config->m_cfg_static_thread_num = workers;
     g_bbt_coroutine_config->m_cfg_stack_size = 65536;
     g_scheduler->Start();
 }
 
-static std::future<void> Task(std::function<void()> callback) {
+static std::future<void> Task(std::function<void()> callback)
+{
     auto promise = std::make_shared<std::promise<void>>();
     auto future = promise->get_future();
-    g_scheduler->RegistCoroutineTask(65536, [promise, callback] {
-        try {
-            callback();
-            promise->set_value();
-        } catch (...) {
-            promise->set_exception(std::current_exception());
-        }
-    }, "net.ico");
+    g_scheduler->RegistCoroutineTask(
+        65536,
+        [promise, callback] {
+            try {
+                callback();
+                promise->set_value();
+            } catch (...) {
+                promise->set_exception(std::current_exception());
+            }
+        },
+        "net.ico");
     return future;
 }
 
-static void Get(std::future<void>& future) {
+static void Get(std::future<void>& future)
+{
     CHECK(future.wait_for(5s) == std::future_status::ready);
     future.get();
 }
 
-static Address Loopback(int port) {
+static Address Loopback(int port)
+{
     std::error_code error;
     Address address = Address::Ip("127.0.0.1", port, error);
     CHECK(!error);
@@ -109,28 +119,34 @@ struct EngineRunner {
     std::error_code error;
     std::thread thread;
 
-    EngineRunner(Engine& target, EngineConfig config) : engine(target) {
+    EngineRunner(Engine& target, EngineConfig config) : engine(target)
+    {
         thread = std::thread([this, config]() mutable { error = engine.Run(config); });
     }
-    bool WaitForReturn(std::chrono::milliseconds timeout) {
+    bool WaitForReturn(std::chrono::milliseconds timeout)
+    {
         return WaitUntil([&] { return engine.Phase() == EnginePhase::Stopped; }, timeout);
     }
-    void CloseAndJoin() {
+    void CloseAndJoin()
+    {
         engine.RequestClose();
         if (thread.joinable()) {
             thread.join();
         }
     }
-    ~EngineRunner() { CloseAndJoin(); }
+    ~EngineRunner()
+    {
+        CloseAndJoin();
+    }
 };
 
-static NativeSocket ConnectClient(const Address& address) {
+static NativeSocket ConnectClient(const Address& address)
+{
     std::error_code error;
     NativeSocket client = NativeSocket::Open(AddressFamily::IPv4, SocketType::Stream, error);
     CHECK(!error);
     const auto connect_error = client.Connect(address);
-    CHECK(!connect_error || connect_error.value() == EINPROGRESS
-          || connect_error.value() == EWOULDBLOCK);
+    CHECK(!connect_error || connect_error.value() == EINPROGRESS || connect_error.value() == EWOULDBLOCK);
     pollfd descriptor{client.Fd(), POLLOUT, 0};
     CHECK(::poll(&descriptor, 1, 3000) > 0);
     CHECK(!client.PendingError());
@@ -142,15 +158,20 @@ struct StoreHandler : RawHandler {
     std::atomic<int> closed{0};
     std::mutex mutex;
     std::shared_ptr<Connection> stored;
-    void OnAccept(Connection connection) override {
+    void OnAccept(Connection connection) override
+    {
         accepted.fetch_add(1);
         std::lock_guard<std::mutex> lock(mutex);
         stored = std::make_shared<Connection>(connection);
     }
-    void OnClose(Connection, std::error_code) override { closed.fetch_add(1); }
+    void OnClose(Connection, std::error_code) override
+    {
+        closed.fetch_add(1);
+    }
 };
 
-static EngineConfig ServerConfig(const Address& listen, std::size_t subs = 1) {
+static EngineConfig ServerConfig(const Address& listen, std::size_t subs = 1)
+{
     EngineConfig config;
     config.listen_addresses = {listen};
     config.runtime_progress = RuntimeProgress::Independent;
@@ -161,20 +182,27 @@ static EngineConfig ServerConfig(const Address& listen, std::size_t subs = 1) {
 // 独立 ConnectionState + facade：无 owner，终态由测试线程手动 PumpWrites/
 // MarkClosed 推进；等待「已挂起」由 SetWrite/CloseAddHookForTest 在
 // on_registered 内给出屏障信号（Add 成功 = runtime 已登记事件）。
-static CoTcpConnection FacadeOf(const std::shared_ptr<ConnectionState>& state) {
+static CoTcpConnection FacadeOf(const std::shared_ptr<ConnectionState>& state)
+{
     return CoTcpConnection(ConnectionTestAccess::Make(state));
 }
 
 struct ArmedFlag {
     std::atomic<int> armed{0};
-    ~ArmedFlag() { Clear(); }
-    void ArmWriteAdd() {
+    ~ArmedFlag()
+    {
+        Clear();
+    }
+    void ArmWriteAdd()
+    {
         ConnectionState::SetWriteAddHookForTest([this] { armed.fetch_add(1); });
     }
-    void ArmCloseAdd() {
+    void ArmCloseAdd()
+    {
         ConnectionState::SetCloseAddHookForTest([this] { armed.fetch_add(1); });
     }
-    void Clear() {
+    void Clear()
+    {
         ConnectionState::SetWriteAddHookForTest({});
         ConnectionState::SetCloseAddHookForTest({});
     }
@@ -182,7 +210,8 @@ struct ArmedFlag {
 
 // ---------------- cases ----------------
 
-static void MemberWriteDone() {
+static void MemberWriteDone()
+{
     StartRuntime(2);
     auto state = std::make_shared<ConnectionState>(1, 4096, 4096, 8, nullptr);
     auto conn = FacadeOf(state);
@@ -191,9 +220,8 @@ static void MemberWriteDone() {
     std::atomic<int> result{-1};
     auto task = Task([&] {
         auto report = conn.Write("hello", bbt::coroutine::WaitOptions{});
-        if (!report.wait_error && report.outcome.phase == WritePhase::Done
-            && !report.outcome.error && report.outcome.sent == 5
-            && report.operation.Valid() && report.operation.Id() != 0) {
+        if (!report.wait_error && report.outcome.phase == WritePhase::Done && !report.outcome.error
+            && report.outcome.sent == 5 && report.operation.Valid() && report.operation.Id() != 0) {
             result.store(0);
         } else {
             result.store(1);
@@ -212,7 +240,8 @@ static void MemberWriteDone() {
     std::cout << "member_write_done done=ok sampled_after_win=ok\n";
 }
 
-static void AsyncWriteRejectTicket() {
+static void AsyncWriteRejectTicket()
+{
     auto state = std::make_shared<ConnectionState>(2, 4096, 128, 4, nullptr);
     auto conn = FacadeOf(state);
     auto warm = conn.AsyncWrite(std::string(64, 'a'));
@@ -237,7 +266,8 @@ static void AsyncWriteRejectTicket() {
     std::cout << "async_write_reject_ticket rejected=reason closed=reason unknown=default\n";
 }
 
-static void WriteUnsubmittedTimeout() {
+static void WriteUnsubmittedTimeout()
+{
     StartRuntime(1);
     auto state = std::make_shared<ConnectionState>(3, 4096, 128, 4, nullptr);
     auto conn = FacadeOf(state);
@@ -247,8 +277,7 @@ static void WriteUnsubmittedTimeout() {
     auto task = Task([&] {
         auto report = conn.Write(std::string(1, 'c'), Until(30ms));
         if (report.wait_error == std::make_error_code(std::errc::timed_out)
-            && report.outcome.phase == WritePhase::Rejected
-            && report.outcome.error == report.wait_error
+            && report.outcome.phase == WritePhase::Rejected && report.outcome.error == report.wait_error
             && !report.operation.Valid()) {
             result.store(0);
         } else {
@@ -260,7 +289,8 @@ static void WriteUnsubmittedTimeout() {
     std::cout << "write_unsubmitted_timeout rejected=no_op\n";
 }
 
-static void WriteAcceptedTimeout() {
+static void WriteAcceptedTimeout()
+{
     StartRuntime(1);
     auto state = std::make_shared<ConnectionState>(4, 4096, 4096, 8, nullptr);
     auto conn = FacadeOf(state);
@@ -270,8 +300,7 @@ static void WriteAcceptedTimeout() {
         auto report = conn.Write(std::string(8, 'd'), Until(30ms));
         *holder = report.operation;
         if (report.wait_error == std::make_error_code(std::errc::timed_out)
-            && report.outcome.phase == WritePhase::InFlight
-            && report.operation.Valid()) {
+            && report.outcome.phase == WritePhase::InFlight && report.operation.Valid()) {
             result.store(0);
         } else {
             result.store(1);
@@ -290,7 +319,8 @@ static void WriteAcceptedTimeout() {
     std::cout << "write_accepted_timeout inflight_then_done=ok\n";
 }
 
-static void WriteAcceptedCancel() {
+static void WriteAcceptedCancel()
+{
     StartRuntime(2);
     auto state = std::make_shared<ConnectionState>(5, 4096, 4096, 8, nullptr);
     auto conn = FacadeOf(state);
@@ -304,8 +334,7 @@ static void WriteAcceptedCancel() {
         self->set_value(g_bbt_tls_coroutine_co);
         auto report = conn.Write(std::string(8, 'e'), bbt::coroutine::WaitOptions{});
         *holder = report.operation;
-        if (report.wait_error == std::make_error_code(std::errc::operation_canceled)
-            && report.operation.Valid()) {
+        if (report.wait_error == std::make_error_code(std::errc::operation_canceled) && report.operation.Valid()) {
             result.store(0);
         } else {
             result.store(1);
@@ -327,7 +356,8 @@ static void WriteAcceptedCancel() {
     std::cout << "write_accepted_cancel wait=cancelled op=still_done\n";
 }
 
-static void OpWaitPartialError() {
+static void OpWaitPartialError()
+{
     StartRuntime(1);
     auto state = std::make_shared<ConnectionState>(6, 4096, 4096, 8, nullptr);
     auto conn = FacadeOf(state);
@@ -339,8 +369,7 @@ static void OpWaitPartialError() {
     auto task = Task([&] {
         WriteOutcome outcome;
         const auto error = ticket.Wait(bbt::coroutine::WaitOptions{}, &outcome);
-        if (!error && outcome.phase == WritePhase::Done
-            && outcome.error.value() == EPIPE && outcome.sent == 8) {
+        if (!error && outcome.phase == WritePhase::Done && outcome.error.value() == EPIPE && outcome.sent == 8) {
             result.store(0);
         } else {
             result.store(1);
@@ -362,12 +391,12 @@ static void OpWaitPartialError() {
     Get(task);
     CHECK(result.load() == 0);
     const auto terminal = ticket.Query();
-    CHECK(terminal.phase == WritePhase::Done && terminal.sent == 8
-          && terminal.error.value() == EPIPE);
+    CHECK(terminal.phase == WritePhase::Done && terminal.sent == 8 && terminal.error.value() == EPIPE);
     std::cout << "op_wait_partial_error sent=8 epipe=ok\n";
 }
 
-static void WriteZeroLen() {
+static void WriteZeroLen()
+{
     StartRuntime(1);
     auto state = std::make_shared<ConnectionState>(7, 4096, 4096, 8, nullptr);
     auto conn = FacadeOf(state);
@@ -379,8 +408,8 @@ static void WriteZeroLen() {
     std::atomic<int> result{-1};
     auto task = Task([&] {
         auto report = conn.Write("", Until(500ms));
-        if (!report.wait_error && report.outcome.phase == WritePhase::Done
-            && !report.outcome.error && report.operation.Valid()) {
+        if (!report.wait_error && report.outcome.phase == WritePhase::Done && !report.outcome.error
+            && report.operation.Valid()) {
             result.store(0);
         } else {
             result.store(1);
@@ -391,7 +420,8 @@ static void WriteZeroLen() {
     std::cout << "write_zero_len done_immediate=ok\n";
 }
 
-static void CloseDefaultReason() {
+static void CloseDefaultReason()
+{
     auto state = std::make_shared<ConnectionState>(8, 4096, 4096, 8, nullptr);
     auto conn = FacadeOf(state);
     const auto ticket = conn.AsyncWrite(std::string(64, 'u'));
@@ -401,10 +431,10 @@ static void CloseDefaultReason() {
     conn.RequestClose({});
     const auto outcome = ticket.Query();
     CHECK(outcome.phase == WritePhase::Done);
-    CHECK(outcome.error);  // 非空：不能是假成功
+    CHECK(outcome.error); // 非空：不能是假成功
     CHECK(outcome.error == std::make_error_code(std::errc::operation_canceled));
     CHECK(outcome.sent == 0);
-    CHECK(conn.Status().close_reason == std::error_code{});  // reason 仍为空
+    CHECK(conn.Status().close_reason == std::error_code{}); // reason 仍为空
     // 显式 reason 保留原值结算。
     auto state2 = std::make_shared<ConnectionState>(9, 4096, 4096, 8, nullptr);
     auto conn2 = FacadeOf(state2);
@@ -416,7 +446,8 @@ static void CloseDefaultReason() {
     std::cout << "close_default_reason unfinished=canceled reason_kept=ok\n";
 }
 
-static void FacadeReleasedOpQueryable() {
+static void FacadeReleasedOpQueryable()
+{
     StartRuntime(1);
     auto state = std::make_shared<ConnectionState>(10, 4096, 4096, 8, nullptr);
     WriteOperation op;
@@ -424,7 +455,7 @@ static void FacadeReleasedOpQueryable() {
         auto conn = FacadeOf(state);
         op = conn.AsyncWrite(std::string(16, 'f'));
         CHECK(op.Valid());
-    }  // facade 释放：句柄销毁不关闭连接，op 终态仍可查
+    } // facade 释放：句柄销毁不关闭连接，op 终态仍可查
     CHECK(op.Query().phase == WritePhase::InFlight);
     ArmedFlag flag;
     flag.ArmWriteAdd();
@@ -449,7 +480,8 @@ static void FacadeReleasedOpQueryable() {
     std::cout << "facade_released_op_queryable wait_after_release=done\n";
 }
 
-static void WaitClosedDriverFailed() {
+static void WaitClosedDriverFailed()
+{
     StartRuntime(2);
     auto handler = std::make_shared<StoreHandler>();
     Engine engine(handler);
@@ -458,10 +490,12 @@ static void WaitClosedDriverFailed() {
     std::vector<Address> addresses;
     CHECK(!engine.LocalAddresses(addresses));
     auto client = ConnectClient(addresses[0]);
-    CHECK(WaitUntil([&] {
-        std::lock_guard<std::mutex> lock(handler->mutex);
-        return handler->stored != nullptr;
-    }, 3000ms));
+    CHECK(WaitUntil(
+        [&] {
+            std::lock_guard<std::mutex> lock(handler->mutex);
+            return handler->stored != nullptr;
+        },
+        3000ms));
     std::shared_ptr<Connection> raw;
     {
         std::lock_guard<std::mutex> lock(handler->mutex);
@@ -484,7 +518,7 @@ static void WaitClosedDriverFailed() {
     Get(task);
     CHECK(result.load() == 0);
     CHECK(conn.Status().closed);
-    CHECK(handler->closed.load() == 0);  // Failed 路径不伪调 owner 回调
+    CHECK(handler->closed.load() == 0); // Failed 路径不伪调 owner 回调
     CHECK(runner.WaitForReturn(5000ms));
     CHECK(engine.LastError());
     CHECK(!client.Close());
@@ -492,7 +526,8 @@ static void WaitClosedDriverFailed() {
     std::cout << "waitclosed_driver_failed woke=closed no_pseudo_onclose=ok\n";
 }
 
-static void WaitClosedLateNoMiss() {
+static void WaitClosedLateNoMiss()
+{
     StartRuntime(1);
     auto state = std::make_shared<ConnectionState>(11, 4096, 4096, 8, nullptr);
     auto conn = FacadeOf(state);
@@ -510,7 +545,8 @@ static void WaitClosedLateNoMiss() {
     std::cout << "waitclosed_late_no_miss immediate=ok\n";
 }
 
-static void StatusProjection() {
+static void StatusProjection()
+{
     auto state = std::make_shared<ConnectionState>(12, 4096, 4096, 8, nullptr);
     {
         CoTcpConnection invalid;
@@ -537,7 +573,8 @@ static void StatusProjection() {
 
 #include "ProcessRuntimeTestMain.hpp"
 
-static void DumpBacktrace(int signal_number) {
+static void DumpBacktrace(int signal_number)
+{
     void* frames[64];
     const int count = backtrace(frames, 64);
     std::cerr << "caught signal " << signal_number << '\n';
@@ -545,23 +582,38 @@ static void DumpBacktrace(int signal_number) {
     std::_Exit(139);
 }
 
-static int RunCases(int argc, char** argv) {
+static int RunCases(int argc, char** argv)
+{
     try {
         CHECK(argc == 2);
         const std::string test = argv[1];
-        if (test == "member_write_done") { MemberWriteDone(); }
-        else if (test == "async_write_reject_ticket") { AsyncWriteRejectTicket(); }
-        else if (test == "write_unsubmitted_timeout") { WriteUnsubmittedTimeout(); }
-        else if (test == "write_accepted_timeout") { WriteAcceptedTimeout(); }
-        else if (test == "write_accepted_cancel") { WriteAcceptedCancel(); }
-        else if (test == "op_wait_partial_error") { OpWaitPartialError(); }
-        else if (test == "write_zero_len") { WriteZeroLen(); }
-        else if (test == "close_default_reason") { CloseDefaultReason(); }
-        else if (test == "facade_released_op_queryable") { FacadeReleasedOpQueryable(); }
-        else if (test == "waitclosed_driver_failed") { WaitClosedDriverFailed(); }
-        else if (test == "waitclosed_late_no_miss") { WaitClosedLateNoMiss(); }
-        else if (test == "status_projection") { StatusProjection(); }
-        else { throw std::runtime_error("unknown test: " + test); }
+        if (test == "member_write_done") {
+            MemberWriteDone();
+        } else if (test == "async_write_reject_ticket") {
+            AsyncWriteRejectTicket();
+        } else if (test == "write_unsubmitted_timeout") {
+            WriteUnsubmittedTimeout();
+        } else if (test == "write_accepted_timeout") {
+            WriteAcceptedTimeout();
+        } else if (test == "write_accepted_cancel") {
+            WriteAcceptedCancel();
+        } else if (test == "op_wait_partial_error") {
+            OpWaitPartialError();
+        } else if (test == "write_zero_len") {
+            WriteZeroLen();
+        } else if (test == "close_default_reason") {
+            CloseDefaultReason();
+        } else if (test == "facade_released_op_queryable") {
+            FacadeReleasedOpQueryable();
+        } else if (test == "waitclosed_driver_failed") {
+            WaitClosedDriverFailed();
+        } else if (test == "waitclosed_late_no_miss") {
+            WaitClosedLateNoMiss();
+        } else if (test == "status_projection") {
+            StatusProjection();
+        } else {
+            throw std::runtime_error("unknown test: " + test);
+        }
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
@@ -569,7 +621,8 @@ static int RunCases(int argc, char** argv) {
     }
 }
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv)
+{
     signal(SIGSEGV, DumpBacktrace);
     signal(SIGABRT, DumpBacktrace);
     return bbt_net_test::RunTestProcessExit([&] { return RunCases(argc, argv); });

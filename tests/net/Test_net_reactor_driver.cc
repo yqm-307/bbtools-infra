@@ -40,50 +40,65 @@ using namespace bbt::infra::net;
 using namespace std::chrono_literals;
 using bbt::coroutine::detail::ProcesserDriverFailure;
 
-static void Check(bool value, const char* expression, int line) {
+static void Check(bool value, const char* expression, int line)
+{
     if (!value) {
         throw std::runtime_error("line " + std::to_string(line) + ": " + expression);
     }
 }
 #define CHECK(expression) Check(static_cast<bool>(expression), #expression, __LINE__)
 
-static std::future<void> Task(std::function<void()> callback) {
+static std::future<void> Task(std::function<void()> callback)
+{
     auto promise = std::make_shared<std::promise<void>>();
     auto future = promise->get_future();
-    g_scheduler->RegistCoroutineTask(65536, [promise, callback] {
-        try { callback(); promise->set_value(); }
-        catch (...) { promise->set_exception(std::current_exception()); }
-    }, "net.reactor_driver");
+    g_scheduler->RegistCoroutineTask(
+        65536,
+        [promise, callback] {
+            try {
+                callback();
+                promise->set_value();
+            } catch (...) {
+                promise->set_exception(std::current_exception());
+            }
+        },
+        "net.reactor_driver");
     return future;
 }
 
-static void Get(std::future<void>& future) {
+static void Get(std::future<void>& future)
+{
     CHECK(future.wait_for(5s) == std::future_status::ready);
     future.get();
 }
 
-static bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds timeout) {
+static bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds timeout)
+{
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
-        if (predicate()) { return true; }
+        if (predicate()) {
+            return true;
+        }
         std::this_thread::sleep_for(1ms);
     }
     return predicate();
 }
 
-static std::size_t CountTasks() {
-    return static_cast<std::size_t>(std::distance(
-        std::filesystem::directory_iterator("/proc/self/task"),
-        std::filesystem::directory_iterator{}));
+static std::size_t CountTasks()
+{
+    return static_cast<std::size_t>(
+        std::distance(std::filesystem::directory_iterator("/proc/self/task"), std::filesystem::directory_iterator{}));
 }
 
-static void StartRuntime(std::size_t workers) {
+static void StartRuntime(std::size_t workers)
+{
     g_bbt_coroutine_config->m_cfg_static_thread_num = workers;
     g_bbt_coroutine_config->m_cfg_stack_size = 65536;
-    g_scheduler->Start();  // 每进程一次；无 Stop，进程退出走 RunTestProcessExit 边界。
+    g_scheduler->Start(); // 每进程一次；无 Stop，进程退出走 RunTestProcessExit 边界。
 }
 
-static void BindCase() {
+static void BindCase()
+{
     StartRuntime(2);
     const auto threads_before = CountTasks();
 
@@ -127,13 +142,13 @@ static void BindCase() {
     std::this_thread::sleep_for(50ms);
     CHECK(driver->TickCount() == ticks_at_unbind);
 
-    std::cout << "bind processer=" << driver->LastTickProcesserId()
-              << " ticks=" << driver->TickCount()
-              << " threads=" << threads_before << "->" << CountTasks()
-              << " business=" << business.load() << " unbind=ok\n";
+    std::cout << "bind processer=" << driver->LastTickProcesserId() << " ticks=" << driver->TickCount()
+              << " threads=" << threads_before << "->" << CountTasks() << " business=" << business.load()
+              << " unbind=ok\n";
 }
 
-static void WakeCase() {
+static void WakeCase()
+{
     ReactorDriver driver(4);
 
     // 早到：Wake 在 Wait 之前，latch 持久，Wait 不睡满 timeout。
@@ -164,7 +179,9 @@ static void WakeCase() {
             }
         });
     }
-    for (auto& thread : wakers) { thread.join(); }
+    for (auto& thread : wakers) {
+        thread.join();
+    }
     CHECK(driver.WakeCount() >= wakes_before + 400);
 
     // 并发 Wake 后 latch 仍记忆：下一次 Wait 立即返回。
@@ -186,14 +203,15 @@ static void WakeCase() {
     const auto second_elapsed = std::chrono::steady_clock::now() - begin;
     const bool wake_sent_before_return = second_wake_sent.load();
     late_waker.join();
-    CHECK(wake_sent_before_return);  // 不能由旧状态提前返回，再靠 join 等到新 Wake。
+    CHECK(wake_sent_before_return); // 不能由旧状态提前返回，再靠 join 等到新 Wake。
     CHECK(second_elapsed < 300ms);
 
     std::cout << "wake wakes=" << driver.WakeCount() << " waits=" << driver.WaitCount()
               << " early/cross-thread/concurrent=ok\n";
 }
 
-static void BudgetCase() {
+static void BudgetCase()
+{
     // 时间预算置 0 关闭，单独验证 handler 数预算。
     ReactorDriver driver(4, std::chrono::microseconds(0));
     std::atomic<int> ran{0};
@@ -201,11 +219,11 @@ static void BudgetCase() {
         boost::asio::post(driver.Context(), [&ran] { ran.fetch_add(1); });
     }
     CHECK(driver.OnTick(bbt::coroutine::detail::ProcesserDriverPhase::BeforeSchedule)
-        == bbt::coroutine::detail::ProcesserDriverResult::Ok);
+          == bbt::coroutine::detail::ProcesserDriverResult::Ok);
     CHECK(ran.load() == 4);
     CHECK(driver.LastTickHandlers() == 4);
     CHECK(driver.OnTick(bbt::coroutine::detail::ProcesserDriverPhase::BeforeSchedule)
-        == bbt::coroutine::detail::ProcesserDriverResult::Ok);
+          == bbt::coroutine::detail::ProcesserDriverResult::Ok);
     CHECK(ran.load() == 8);
 
     for (int i = 0; i < 40 && ran.load() < 100; ++i) {
@@ -216,10 +234,10 @@ static void BudgetCase() {
     // AfterSchedule 不推进 context，只计数。
     boost::asio::post(driver.Context(), [&ran] { ran.fetch_add(1); });
     CHECK(driver.OnTick(bbt::coroutine::detail::ProcesserDriverPhase::AfterSchedule)
-        == bbt::coroutine::detail::ProcesserDriverResult::Ok);
+          == bbt::coroutine::detail::ProcesserDriverResult::Ok);
     CHECK(ran.load() == 100);
     CHECK(driver.OnTick(bbt::coroutine::detail::ProcesserDriverPhase::BeforeSchedule)
-        == bbt::coroutine::detail::ProcesserDriverResult::Ok);
+          == bbt::coroutine::detail::ProcesserDriverResult::Ok);
     CHECK(ran.load() == 101);
 
     // 回调内部耗时计入时间预算：单次 OnTick 不越过预算继续抽干。
@@ -234,7 +252,7 @@ static void BudgetCase() {
     }
     const auto begin = std::chrono::steady_clock::now();
     CHECK(slow.OnTick(bbt::coroutine::detail::ProcesserDriverPhase::BeforeSchedule)
-        == bbt::coroutine::detail::ProcesserDriverResult::Ok);
+          == bbt::coroutine::detail::ProcesserDriverResult::Ok);
     const auto elapsed = std::chrono::steady_clock::now() - begin;
     CHECK(slow_ran.load() == 1);
     CHECK(elapsed >= 5ms);
@@ -244,7 +262,8 @@ static void BudgetCase() {
               << " after_schedule_no_poll=ok\n";
 }
 
-static void RollbackCase() {
+static void RollbackCase()
+{
     StartRuntime(3);
 
     std::vector<DriverSlot> first;
@@ -278,7 +297,8 @@ static void RollbackCase() {
     std::cout << "rollback slots=3 partial/over-request rollback=ok untouched=ok\n";
 }
 
-static void UnbindCase() {
+static void UnbindCase()
+{
     StartRuntime(2);
 
     std::vector<DriverSlot> slots;
@@ -290,8 +310,7 @@ static void UnbindCase() {
     // 在绑定自己的 worker 回调内解绑：任何副作用前被拒，绑定保留。
     std::atomic<int> self_status{-1};
     boost::asio::post(driver->Context(), [&self_status, &token] {
-        const auto status =
-            bbt::coroutine::detail::Scheduler::GetInstance()->UnregisterProcesserDriver(token);
+        const auto status = bbt::coroutine::detail::Scheduler::GetInstance()->UnregisterProcesserDriver(token);
         self_status.store(static_cast<int>(status));
     });
     CHECK(WaitUntil([&] { return self_status.load() >= 0; }, 3000ms));
@@ -312,11 +331,11 @@ static void UnbindCase() {
     std::this_thread::sleep_for(50ms);
     CHECK(driver->TickCount() == ticks_at_unbind);
 
-    std::cout << "unbind self_detach=ok ticks_stop=" << driver->TickCount()
-              << " stale_token=ok\n";
+    std::cout << "unbind self_detach=ok ticks_stop=" << driver->TickCount() << " stale_token=ok\n";
 }
 
-static void FailedCase() {
+static void FailedCase()
+{
     StartRuntime(2);
 
     std::vector<DriverSlot> slots;
@@ -327,17 +346,21 @@ static void FailedCase() {
 
     driver->InjectTickFailureOnce();
     bbt::coroutine::detail::ProcesserDriverSnapshot snapshot;
-    CHECK(WaitUntil([&] {
-        bbt::coroutine::detail::ProcesserDriverSnapshot current;
-        const auto status =
-            bbt::coroutine::detail::Scheduler::GetInstance()->QueryProcesserDriver(processer_id, current);
-        if (status != bbt::coroutine::detail::ProcesserDriverStatus::Ok) { return false; }
-        if (current.m_state == bbt::coroutine::detail::ProcesserDriverState::Failed) {
-            snapshot = current;
-            return true;
-        }
-        return false;
-    }, 3000ms));
+    CHECK(WaitUntil(
+        [&] {
+            bbt::coroutine::detail::ProcesserDriverSnapshot current;
+            const auto status =
+                bbt::coroutine::detail::Scheduler::GetInstance()->QueryProcesserDriver(processer_id, current);
+            if (status != bbt::coroutine::detail::ProcesserDriverStatus::Ok) {
+                return false;
+            }
+            if (current.m_state == bbt::coroutine::detail::ProcesserDriverState::Failed) {
+                snapshot = current;
+                return true;
+            }
+            return false;
+        },
+        3000ms));
     CHECK(snapshot.m_state == bbt::coroutine::detail::ProcesserDriverState::Failed);
     CHECK(snapshot.m_failure == ProcesserDriverFailure::Tick);
     CHECK(snapshot.m_token == slots[0].token);
@@ -351,7 +374,8 @@ static void FailedCase() {
     std::cout << "failed state=Failed source=Tick query=ok unbind_after_failed=ok\n";
 }
 
-static void BindPreserveCase() {
+static void BindPreserveCase()
+{
     StartRuntime(2);
     std::vector<DriverSlot> out;
     CHECK(!DriverBinder::BindSlots(1, out));
@@ -375,7 +399,8 @@ static void BindPreserveCase() {
     std::cout << "bind_preserve append=" << 2 << " fail_keeps_existing=ok\n";
 }
 
-static void UnbindRefusalCase() {
+static void UnbindRefusalCase()
+{
     StartRuntime(2);
     std::vector<DriverSlot> slots;
     CHECK(!DriverBinder::BindSlots(1, slots));
@@ -385,36 +410,39 @@ static void UnbindRefusalCase() {
     // 依核心契约 / 把 StaleToken 视为安全移出，不伪报仍绑定；
     // 不存在的旧 token 不能解绑后续新代（另测）。
     CHECK(bbt::coroutine::detail::Scheduler::GetInstance()->UnregisterProcesserDriver(token)
-        == bbt::coroutine::detail::ProcesserDriverStatus::Ok);
+          == bbt::coroutine::detail::ProcesserDriverStatus::Ok);
     CHECK(!DriverBinder::UnbindSlots(slots));
     CHECK(slots.empty());
 
     std::cout << "unbind_refusal stale_safe_drop=1 remaining=0\n";
 }
 
-static void ExceptionCase() {
+static void ExceptionCase()
+{
     // 逃逸到 driver 层的未分类异常进入 Failed 可观察出口，不被计数抹平。
     ReactorDriver driver(4);
     boost::asio::post(driver.Context(), [] { throw std::runtime_error("escaped handler"); });
     CHECK(driver.OnTick(bbt::coroutine::detail::ProcesserDriverPhase::BeforeSchedule)
-        == bbt::coroutine::detail::ProcesserDriverResult::Failed);
+          == bbt::coroutine::detail::ProcesserDriverResult::Failed);
     CHECK(driver.UnhandledFailureCount() == 1);
     CHECK(driver.LastFailure() != nullptr);
 
-    std::cout << "exception unhandled=" << driver.UnhandledFailureCount()
-              << " last_failure=set Failed=ok\n";
+    std::cout << "exception unhandled=" << driver.UnhandledFailureCount() << " last_failure=set Failed=ok\n";
 }
 
-static void StopRestartCase() {
+static void StopRestartCase()
+{
     // Wake 的 stop/restart 不是丢 callback 手段：已登记 readiness 在 restart 后兑现。
     ReactorDriver driver(4);
     std::atomic<int> fired{0};
     auto timer = std::make_shared<boost::asio::steady_timer>(driver.Context(), 40ms);
     timer->async_wait([&fired](const boost::system::error_code& error) {
-        if (!error) { fired.fetch_add(1); }
+        if (!error) {
+            fired.fetch_add(1);
+        }
     });
 
-    driver.Wake();  // timer 到期前 stop
+    driver.Wake(); // timer 到期前 stop
     auto begin = std::chrono::steady_clock::now();
     CHECK(driver.Wait(200ms) == bbt::coroutine::detail::ProcesserDriverResult::Ok);
     const auto elapsed = std::chrono::steady_clock::now() - begin;
@@ -422,10 +450,12 @@ static void StopRestartCase() {
     CHECK(fired.load() == 0); // timer 未被提前触发，也未被丢弃
 
     // restart 后 handler 仍会兑现（不是靠 timeout 轮询当正确性证明：这里显式推进）。
-    CHECK(WaitUntil([&] {
-        driver.OnTick(bbt::coroutine::detail::ProcesserDriverPhase::BeforeSchedule);
-        return fired.load() > 0;
-    }, 2000ms));
+    CHECK(WaitUntil(
+        [&] {
+            driver.OnTick(bbt::coroutine::detail::ProcesserDriverPhase::BeforeSchedule);
+            return fired.load() > 0;
+        },
+        2000ms));
     CHECK(fired.load() == 1);
     CHECK(driver.UnhandledFailureCount() == 0);
 
@@ -434,21 +464,34 @@ static void StopRestartCase() {
 
 #include "ProcessRuntimeTestMain.hpp"
 
-static int RunCases(int argc, char** argv) {
+static int RunCases(int argc, char** argv)
+{
     try {
         CHECK(argc == 2);
         const std::string test = argv[1];
-        if (test == "bind") { BindCase(); }
-        else if (test == "wake") { WakeCase(); }
-        else if (test == "budget") { BudgetCase(); }
-        else if (test == "rollback") { RollbackCase(); }
-        else if (test == "unbind") { UnbindCase(); }
-        else if (test == "failed") { FailedCase(); }
-        else if (test == "bind_preserve") { BindPreserveCase(); }
-        else if (test == "unbind_refusal") { UnbindRefusalCase(); }
-        else if (test == "exception") { ExceptionCase(); }
-        else if (test == "stop_restart") { StopRestartCase(); }
-        else { throw std::runtime_error("unknown test: " + test); }
+        if (test == "bind") {
+            BindCase();
+        } else if (test == "wake") {
+            WakeCase();
+        } else if (test == "budget") {
+            BudgetCase();
+        } else if (test == "rollback") {
+            RollbackCase();
+        } else if (test == "unbind") {
+            UnbindCase();
+        } else if (test == "failed") {
+            FailedCase();
+        } else if (test == "bind_preserve") {
+            BindPreserveCase();
+        } else if (test == "unbind_refusal") {
+            UnbindRefusalCase();
+        } else if (test == "exception") {
+            ExceptionCase();
+        } else if (test == "stop_restart") {
+            StopRestartCase();
+        } else {
+            throw std::runtime_error("unknown test: " + test);
+        }
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
@@ -456,6 +499,7 @@ static int RunCases(int argc, char** argv) {
     }
 }
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv)
+{
     return bbt_net_test::RunTestProcessExit([&] { return RunCases(argc, argv); });
 }

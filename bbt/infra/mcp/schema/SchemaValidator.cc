@@ -64,34 +64,45 @@ using jsoncons::json;
 struct BuildError : std::exception {
     SchemaErrorCode code;
     std::string msg;
-    BuildError(SchemaErrorCode c, std::string m) : code(c), msg(std::move(m)) {}
-    const char* what() const noexcept override { return msg.c_str(); }
+    BuildError(SchemaErrorCode c, std::string m) : code(c), msg(std::move(m))
+    {
+    }
+    const char* what() const noexcept override
+    {
+        return msg.c_str();
+    }
 };
 
 struct ResolverRejected : std::exception {
-    const char* what() const noexcept override { return "external or unknown ref rejected"; }
+    const char* what() const noexcept override
+    {
+        return "external or unknown ref rejected";
+    }
 };
 
 // ---------- ICU 私有 pattern 封装 ----------
 
 // ICU C API 的长度参数为 int32_t：size_t→int32 一律先过显式上限检查（固定
 // 要求，MF6），超限 fail-closed。-1 余量给 ToUtf16 目标缓冲上界（+1）留空间。
-constexpr std::size_t kIcuLenMax =
-    static_cast<std::size_t>(std::numeric_limits<int32_t>::max()) - 1;
+constexpr std::size_t kIcuLenMax = static_cast<std::size_t>(std::numeric_limits<int32_t>::max()) - 1;
 constexpr const char* kIcuLenErr = "icu input length limit exceeded";
-bool IcuLenOk(std::size_t n) { return n <= kIcuLenMax; }
+bool IcuLenOk(std::size_t n)
+{
+    return n <= kIcuLenMax;
+}
 
 // 显式长度 UTF-8→UTF-16：保留 NUL，成功后按 pDestLength 截断（不引入尾部 NUL）。
-bool ToUtf16(std::string_view utf8, std::u16string* out, const char** err_name) {
-    if (!IcuLenOk(utf8.size())) {  // MF6：转换前显式检查，不静默截断为负长度
+bool ToUtf16(std::string_view utf8, std::u16string* out, const char** err_name)
+{
+    if (!IcuLenOk(utf8.size())) { // MF6：转换前显式检查，不静默截断为负长度
         *err_name = kIcuLenErr;
         return false;
     }
     UErrorCode st = U_ZERO_ERROR;
-    out->assign(utf8.size() + 1, u'\0');  // 上界：UTF-16 ≤ 2×UTF-8 长度
+    out->assign(utf8.size() + 1, u'\0'); // 上界：UTF-16 ≤ 2×UTF-8 长度
     int32_t len = 0;
-    u_strFromUTF8(&(*out)[0], static_cast<int32_t>(out->size()), &len,
-                  utf8.data(), static_cast<int32_t>(utf8.size()), &st);
+    u_strFromUTF8(&(*out)[0], static_cast<int32_t>(out->size()), &len, utf8.data(), static_cast<int32_t>(utf8.size()),
+                  &st);
     if (U_FAILURE(st)) {
         // 上界足够时不应溢出；任何失败（含溢出）一律 fail-closed。
         *err_name = u_errorName(st);
@@ -101,17 +112,18 @@ bool ToUtf16(std::string_view utf8, std::u16string* out, const char** err_name) 
     return true;
 }
 
-bool TryCompileIcu(std::string_view utf8, const char** err_name) {
+bool TryCompileIcu(std::string_view utf8, const char** err_name)
+{
     std::u16string pat;
-    if (!ToUtf16(utf8, &pat, err_name)) return false;
-    if (!IcuLenOk(pat.size())) {  // MF6：regex-open 入口显式检查
+    if (!ToUtf16(utf8, &pat, err_name))
+        return false;
+    if (!IcuLenOk(pat.size())) { // MF6：regex-open 入口显式检查
         *err_name = kIcuLenErr;
         return false;
     }
     UErrorCode st = U_ZERO_ERROR;
     UParseError pe{};
-    URegularExpression* re =
-        uregex_open(pat.data(), static_cast<int32_t>(pat.size()), 0, &pe, &st);
+    URegularExpression* re = uregex_open(pat.data(), static_cast<int32_t>(pat.size()), 0, &pe, &st);
     if (U_FAILURE(st)) {
         *err_name = u_errorName(st);
         return false;
@@ -123,29 +135,31 @@ bool TryCompileIcu(std::string_view utf8, const char** err_name) {
 // 不可变 pattern 文本 + per-call open/close：无共享可变 ICU 句柄，move-only。
 class IcuPattern {
 public:
-    explicit IcuPattern(std::string utf8) : utf8_(std::move(utf8)) {
+    explicit IcuPattern(std::string utf8) : utf8_(std::move(utf8))
+    {
         const char* err = nullptr;
         if (!ToUtf16(utf8_, &u16_, &err) || !IcuLenOk(u16_.size()))
             Throw(err ? err : kIcuLenErr);
     }
 
     // true=匹配 false=不匹配；runtime_err 非空 = ICU 运行期失败（调用方必须上报）。
-    bool Search(std::string_view utf8, const char** runtime_err) const {
+    bool Search(std::string_view utf8, const char** runtime_err) const
+    {
         *runtime_err = nullptr;
-        if (!IcuLenOk(u16_.size())) {  // MF6：regex-open 入口显式检查
+        if (!IcuLenOk(u16_.size())) { // MF6：regex-open 入口显式检查
             *runtime_err = kIcuLenErr;
             return false;
         }
         std::u16string subj;
-        if (!ToUtf16(utf8, &subj, runtime_err)) return false;
-        if (!IcuLenOk(subj.size())) {  // MF6：setText 入口显式检查
+        if (!ToUtf16(utf8, &subj, runtime_err))
+            return false;
+        if (!IcuLenOk(subj.size())) { // MF6：setText 入口显式检查
             *runtime_err = kIcuLenErr;
             return false;
         }
         UErrorCode st = U_ZERO_ERROR;
         UParseError pe{};
-        URegularExpression* re =
-            uregex_open(u16_.data(), static_cast<int32_t>(u16_.size()), 0, &pe, &st);
+        URegularExpression* re = uregex_open(u16_.data(), static_cast<int32_t>(u16_.size()), 0, &pe, &st);
         if (U_FAILURE(st)) {
             *runtime_err = u_errorName(st);
             return false;
@@ -156,7 +170,7 @@ public:
             *runtime_err = u_errorName(st);
             return false;
         }
-        const UBool found = uregex_find(re, 0, &st);  // 非锚定 = regex_search 语义
+        const UBool found = uregex_find(re, 0, &st); // 非锚定 = regex_search 语义
         if (U_FAILURE(st)) {
             uregex_close(re);
             *runtime_err = u_errorName(st);
@@ -172,7 +186,8 @@ public:
     IcuPattern& operator=(IcuPattern&&) = default;
 
 private:
-    [[noreturn]] static void Throw(const char* err_name) {
+    [[noreturn]] static void Throw(const char* err_name)
+    {
         throw BuildError{SchemaErrorCode::RegexInvalid, std::string("icu regex compile failed: ") + err_name};
     }
     std::string utf8_;
@@ -180,7 +195,8 @@ private:
 };
 
 // std::regex（ECMAScript）可编译的 pattern 保留 jsoncons 原生路径。
-bool StdRegexCompiles(std::string_view p) {
+bool StdRegexCompiles(std::string_view p)
+{
     try {
         std::regex r(std::string(p), std::regex::ECMAScript);
         return true;
@@ -192,8 +208,8 @@ bool StdRegexCompiles(std::string_view p) {
 // ---------- 编译产物 ----------
 
 struct PlanStep {
-    int kind;          // 0=Prop 1=EveryItem 2=ItemAt 3=AddProps
-    std::string arg;   // Prop: 键名；ItemAt: 下标十进制
+    int kind;        // 0=Prop 1=EveryItem 2=ItemAt 3=AddProps
+    std::string arg; // Prop: 键名；ItemAt: 下标十进制
     // kind=3 专属（MF5）：同层 properties 键与 patternProperties 键 pattern
     // 下标。排除集随步骤下发（各 obligation 自带快照），不再依赖 obligation
     // 级共享字段——后者此前从未被写入，导致 additionalProperties 子 schema
@@ -203,28 +219,28 @@ struct PlanStep {
 };
 
 struct Obligation {
-    int kind = 0;  // 0=Pattern 1=PatternProps 2=AddPropsSchema 3=AddPropsClosed
+    int kind = 0; // 0=Pattern 1=PatternProps 2=AddPropsSchema 3=AddPropsClosed
     std::size_t pattern = 0;
-    std::vector<PlanStep> plan;      // schema→instance 位置映射（无条件结构路径）
-    std::string schema_path;         // 展示用指针路径
-    std::shared_ptr<const SchemaValidator::Impl> sub;  // PatternProps 子验证器
+    std::vector<PlanStep> plan;                       // schema→instance 位置映射（无条件结构路径）
+    std::string schema_path;                          // 展示用指针路径
+    std::shared_ptr<const SchemaValidator::Impl> sub; // PatternProps 子验证器
 };
 
 // 待回填的 AddProps 排除快照（MF5）：延迟到所在 schema 节点全部键处理完毕后
 // 再快照 w->excl[spath]，避免文档键序（patternProperties 位于
 // additionalProperties 之后）时 relocated 排除项漏记。
 struct AddPropsPatch {
-    std::size_t ob0;       // additionalProperties 子树新建 obligation 区间起点
-    std::size_t ob1;       // 区间终点（不含）
-    std::size_t step_idx;  // 该子树公共 plan 前缀中 kind=3 步骤的下标
-    std::string spath;     // 所属节点 schema 路径
+    std::size_t ob0;      // additionalProperties 子树新建 obligation 区间起点
+    std::size_t ob1;      // 区间终点（不含）
+    std::size_t step_idx; // 该子树公共 plan 前缀中 kind=3 步骤的下标
+    std::string spath;    // 所属节点 schema 路径
     // PP-AP1：重定位决策载荷。是否将本层 additionalProperties 转由 guard
     // obligation 承担取决于同节点 relocated PP 的存在，而 patternProperties
     // 可能位于本键之后（键序问题与 MF5 排除快照同因），决策延迟到节点处理
     // 完毕、excl 齐备处执行。
-    std::vector<PlanStep> plan;  // 含 kind=3 步骤的完整 plan（guard 受众）
-    jsoncons::json ap_t;         // 变换后的 AP 值（icu-only 已剥离）
-    bool ap_false = false;       // AP 为 boolean false
+    std::vector<PlanStep> plan; // 含 kind=3 步骤的完整 plan（guard 受众）
+    jsoncons::json ap_t;        // 变换后的 AP 值（icu-only 已剥离）
+    bool ap_false = false;      // AP 为 boolean false
 };
 
 // PP-AP1/R1：延迟绑定 guard 登记项。AP:schema guard 的 obligation 与排除集
@@ -232,9 +248,9 @@ struct AddPropsPatch {
 // schema 若提前作独立根编译，$ref#/$defs 等同文档指针只能落向其自身，丢
 // 外层资源引用面而误回退（XR1.e1 覆盖键误拒根因）。
 struct DeferredGuard {
-    std::size_t ob_idx;   // guard obligation 在 Walk::obligations 的下标
-    jsoncons::json ap_t;  // 变换后的 AP 子 schema（guard 编译输入）
-    std::string spath;    // 所属节点 spath（原样键段，非 RFC6901 转义形式）
+    std::size_t ob_idx;  // guard obligation 在 Walk::obligations 的下标
+    jsoncons::json ap_t; // 变换后的 AP 子 schema（guard 编译输入）
+    std::string spath;   // 所属节点 spath（原样键段，非 RFC6901 转义形式）
 };
 
 // 编译产物完整类型（SchemaValidator::Impl）定义在匿名 ns 与外层边界之间：
@@ -257,7 +273,7 @@ struct Walk {
     std::set<std::string> relocated_pp_nodes;
     long nodes = 0;
 };
-}  // namespace
+} // namespace
 
 // 嵌套 Impl：在外层命名空间定义（嵌套成员类不能在匿名命名空间内定义）。
 // validator 以成员直初始化持有编译产物，副本不可变，IsValid 可并发调用。
@@ -266,27 +282,30 @@ struct SchemaValidator::Impl {
     std::vector<IcuPattern> patterns;
     std::vector<Obligation> obligations;
     SchemaOptions opt;
-    Impl(const jsoncons::json& doc,
-         const std::function<json(const jsoncons::uri&)>& resolver,
+    Impl(const jsoncons::json& doc, const std::function<json(const jsoncons::uri&)>& resolver,
          const jsoncons::jsonschema::evaluation_options& options)
-        : validator(jsoncons::jsonschema::make_json_schema(doc, resolver, options)) {}
-    bool IsValid(const jsoncons::json& j) const { return validator.is_valid(j); }
+        : validator(jsoncons::jsonschema::make_json_schema(doc, resolver, options))
+    {
+    }
+    bool IsValid(const jsoncons::json& j) const
+    {
+        return validator.is_valid(j);
+    }
 };
 
 namespace {
 
-jsoncons::json TransformNode(const jsoncons::json& node, std::vector<PlanStep> plan,
-                             bool positional, int depth, const std::string& spath, Walk* w);
-std::shared_ptr<const SchemaValidator::Impl> CompileDoc(const jsoncons::json& doc,
-                                                        const SchemaOptions& opt);
-std::shared_ptr<const SchemaValidator::Impl> CompileDocCore(const jsoncons::json& doc,
-                                                            const SchemaOptions& opt,
+jsoncons::json TransformNode(const jsoncons::json& node, std::vector<PlanStep> plan, bool positional, int depth,
+                             const std::string& spath, Walk* w);
+std::shared_ptr<const SchemaValidator::Impl> CompileDoc(const jsoncons::json& doc, const SchemaOptions& opt);
+std::shared_ptr<const SchemaValidator::Impl> CompileDocCore(const jsoncons::json& doc, const SchemaOptions& opt,
                                                             const jsoncons::json* ref_base,
                                                             const std::set<std::string>* seed_ids = nullptr);
 
 // AddProps 的排除集预扫：同层 properties 键 + std::regex 可编译的
 // patternProperties 键（relocated 键在其处理器内补记）。
-void PrescanExclusions(const jsoncons::json& node, const std::string& spath, Walk* w) {
+void PrescanExclusions(const jsoncons::json& node, const std::string& spath, Walk* w)
+{
     if (node.contains("properties") && node.at("properties").is_object()) {
         for (const auto& pm : node.at("properties").object_range())
             w->excl[spath].second.push_back(std::string(pm.key()));
@@ -294,17 +313,20 @@ void PrescanExclusions(const jsoncons::json& node, const std::string& spath, Wal
     if (node.contains("patternProperties") && node.at("patternProperties").is_object()) {
         for (const auto& pm : node.at("patternProperties").object_range()) {
             const std::string pk(pm.key());
-            if (!StdRegexCompiles(pk)) continue;  // relocated 条目由其处理器补记
+            if (!StdRegexCompiles(pk))
+                continue; // relocated 条目由其处理器补记
             const char* err = nullptr;
-            if (!TryCompileIcu(pk, &err)) continue;  // ICU 也拒的保留键无法参与排除（已知限制）
+            if (!TryCompileIcu(pk, &err))
+                continue; // ICU 也拒的保留键无法参与排除（已知限制）
             w->patterns.emplace_back(pk);
             w->excl[spath].first.push_back(w->patterns.size() - 1);
         }
     }
 }
 
-jsoncons::json TransformNode(const jsoncons::json& node, std::vector<PlanStep> plan,
-                             bool positional, int depth, const std::string& spath, Walk* w) {
+jsoncons::json TransformNode(const jsoncons::json& node, std::vector<PlanStep> plan, bool positional, int depth,
+                             const std::string& spath, Walk* w)
+{
     if (depth > static_cast<int>(w->opt->max_schema_depth))
         throw BuildError{SchemaErrorCode::LimitExceeded, "schema depth limit exceeded"};
     if (++w->nodes > static_cast<long>(w->opt->max_schema_nodes))
@@ -318,20 +340,26 @@ jsoncons::json TransformNode(const jsoncons::json& node, std::vector<PlanStep> p
             const jsoncons::json& val = m.value();
 
             if (key == "$id") {
-                if (val.is_string()) w->ids->insert(val.as_string());
+                if (val.is_string())
+                    w->ids->insert(val.as_string());
             }
 
             if (key == "pattern") {
-                if (!val.is_string()) { out[key] = val; continue; }  // 类型错误交 jsoncons 报
+                if (!val.is_string()) {
+                    out[key] = val;
+                    continue;
+                } // 类型错误交 jsoncons 报
                 const std::string pat(val.as_string());
-                if (StdRegexCompiles(pat)) { out[key] = val; continue; }
+                if (StdRegexCompiles(pat)) {
+                    out[key] = val;
+                    continue;
+                }
                 const char* err = nullptr;
                 if (!TryCompileIcu(pat, &err))
                     throw BuildError{SchemaErrorCode::RegexInvalid,
                                      std::string("invalid regex pattern (icu: ") + (err ? err : "?") + ")"};
                 if (!positional)
-                    throw BuildError{SchemaErrorCode::Unsupported,
-                                     "icu-only pattern in conditional/ref position"};
+                    throw BuildError{SchemaErrorCode::Unsupported, "icu-only pattern in conditional/ref position"};
                 w->patterns.emplace_back(pat);
                 Obligation ob;
                 ob.kind = 0;
@@ -339,26 +367,30 @@ jsoncons::json TransformNode(const jsoncons::json& node, std::vector<PlanStep> p
                 ob.plan = plan;
                 ob.schema_path = spath + "/pattern";
                 w->obligations.push_back(std::move(ob));
-                continue;  // 关键词重定位，不进入 jsoncons
+                continue; // 关键词重定位，不进入 jsoncons
             }
 
             if (key == "patternProperties") {
-                if (!val.is_object()) { out[key] = val; continue; }
+                if (!val.is_object()) {
+                    out[key] = val;
+                    continue;
+                }
                 jsoncons::json kept;
                 bool any_kept = false;
                 for (const auto& pm : val.object_range()) {
                     const std::string pk(pm.key());
                     const jsoncons::json& sub = pm.value();
                     if (StdRegexCompiles(pk)) {
-                        kept[pk] = TransformNode(sub, plan, positional, depth + 1,
-                                                 spath + "/patternProperties/" + pk, w);
+                        kept[pk] =
+                            TransformNode(sub, plan, positional, depth + 1, spath + "/patternProperties/" + pk, w);
                         any_kept = true;
                         continue;
                     }
                     const char* err = nullptr;
                     if (!TryCompileIcu(pk, &err))
                         throw BuildError{SchemaErrorCode::RegexInvalid,
-                                         std::string("invalid patternProperties regex (icu: ") + (err ? err : "?") + ")"};
+                                         std::string("invalid patternProperties regex (icu: ") + (err ? err : "?")
+                                             + ")"};
                     if (!positional)
                         throw BuildError{SchemaErrorCode::Unsupported,
                                          "icu-only patternProperties in conditional/ref position"};
@@ -373,8 +405,8 @@ jsoncons::json TransformNode(const jsoncons::json& node, std::vector<PlanStep> p
                     // positional=false 使子树任意深度的 icu-only pattern/PP 在
                     // 门禁处抛 Unsupported（fail-closed，不静默）；std::regex 可
                     // 编译的 pattern 仍保留 jsoncons 原生路径，不受影响。
-                    jsoncons::json sub_t = TransformNode(sub, {}, false, depth + 1,
-                                                         spath + "/patternProperties/__sub", w);
+                    jsoncons::json sub_t =
+                        TransformNode(sub, {}, false, depth + 1, spath + "/patternProperties/__sub", w);
                     std::shared_ptr<const SchemaValidator::Impl> sub_impl;
                     try {
                         sub_impl = CompileDoc(sub_t, *w->opt);
@@ -395,7 +427,8 @@ jsoncons::json TransformNode(const jsoncons::json& node, std::vector<PlanStep> p
                     w->excl[spath].first.push_back(idx);
                     w->relocated_pp_nodes.insert(spath);
                 }
-                if (any_kept) out["patternProperties"] = kept;
+                if (any_kept)
+                    out["patternProperties"] = kept;
                 continue;
             }
 
@@ -404,9 +437,8 @@ jsoncons::json TransformNode(const jsoncons::json& node, std::vector<PlanStep> p
                 for (const auto& pm : val.object_range()) {
                     std::vector<PlanStep> cp = plan;
                     cp.push_back({0, std::string(pm.key())});
-                    t[std::string(pm.key())] = TransformNode(
-                        pm.value(), cp, positional, depth + 1,
-                        spath + "/properties/" + std::string(pm.key()), w);
+                    t[std::string(pm.key())] = TransformNode(pm.value(), cp, positional, depth + 1,
+                                                             spath + "/properties/" + std::string(pm.key()), w);
                 }
                 out[key] = t;
                 continue;
@@ -423,8 +455,8 @@ jsoncons::json TransformNode(const jsoncons::json& node, std::vector<PlanStep> p
                 for (const auto& el : val.array_range()) {
                     std::vector<PlanStep> cp = plan;
                     cp.push_back({2, std::to_string(i)});
-                    t.push_back(TransformNode(el, cp, positional, depth + 1,
-                                              spath + "/prefixItems/" + std::to_string(i), w));
+                    t.push_back(
+                        TransformNode(el, cp, positional, depth + 1, spath + "/prefixItems/" + std::to_string(i), w));
                     ++i;
                 }
                 out[key] = t;
@@ -440,15 +472,13 @@ jsoncons::json TransformNode(const jsoncons::json& node, std::vector<PlanStep> p
                 std::vector<PlanStep> cp = plan;
                 cp.push_back({3, ""});
                 const std::size_t ob0 = w->obligations.size();
-                jsoncons::json ap_t = TransformNode(val, cp, positional, depth + 1,
-                                                    spath + "/additionalProperties", w);
+                jsoncons::json ap_t = TransformNode(val, cp, positional, depth + 1, spath + "/additionalProperties", w);
                 const bool ap_false = val.is_bool() && !val.as_bool();
                 if (ap_false || val.is_object()) {
-                    w->pending_addprops.push_back({ob0, w->obligations.size(),
-                                                   cp.size() - 1, spath, std::move(cp),
-                                                   std::move(ap_t), ap_false});
+                    w->pending_addprops.push_back(
+                        {ob0, w->obligations.size(), cp.size() - 1, spath, std::move(cp), std::move(ap_t), ap_false});
                 } else {
-                    out[key] = std::move(ap_t);  // AP:true：无语义，保持 jsoncons 原样
+                    out[key] = std::move(ap_t); // AP:true：无语义，保持 jsoncons 原样
                 }
                 continue;
             }
@@ -456,8 +486,8 @@ jsoncons::json TransformNode(const jsoncons::json& node, std::vector<PlanStep> p
                 jsoncons::json t(jsoncons::json_array_arg);
                 std::size_t i = 0;
                 for (const auto& el : val.array_range()) {
-                    t.push_back(TransformNode(el, plan, positional, depth + 1,
-                                              spath + "/allOf/" + std::to_string(i), w));
+                    t.push_back(
+                        TransformNode(el, plan, positional, depth + 1, spath + "/allOf/" + std::to_string(i), w));
                     ++i;
                 }
                 out[key] = t;
@@ -469,19 +499,22 @@ jsoncons::json TransformNode(const jsoncons::json& node, std::vector<PlanStep> p
             // 向下单调传播，嵌套的 properties/items 等实例位置不再重置回
             // 无条件，避免未命中分支的 icu-only pattern 被当全局 obligation
             // 强制执行（组合语义缺陷，父级 fixture 实测复现）。
-            if (key == "not" || key == "if" || key == "then" || key == "else" ||
-                key == "contains" || key == "propertyNames" || key == "contentSchema" ||
-                key == "unevaluatedProperties" || key == "unevaluatedItems") {
+            if (key == "not" || key == "if" || key == "then" || key == "else" || key == "contains"
+                || key == "propertyNames" || key == "contentSchema" || key == "unevaluatedProperties"
+                || key == "unevaluatedItems") {
                 out[key] = TransformNode(val, plan, false, depth + 1, spath + "/" + key, w);
                 continue;
             }
             if (key == "anyOf" || key == "oneOf") {
-                if (!val.is_array()) { out[key] = val; continue; }
+                if (!val.is_array()) {
+                    out[key] = val;
+                    continue;
+                }
                 jsoncons::json t(jsoncons::json_array_arg);
                 std::size_t i = 0;
                 for (const auto& el : val.array_range()) {
-                    t.push_back(TransformNode(el, plan, false, depth + 1,
-                                              spath + "/" + key + "/" + std::to_string(i), w));
+                    t.push_back(
+                        TransformNode(el, plan, false, depth + 1, spath + "/" + key + "/" + std::to_string(i), w));
                     ++i;
                 }
                 out[key] = t;
@@ -490,13 +523,12 @@ jsoncons::json TransformNode(const jsoncons::json& node, std::vector<PlanStep> p
             // schema 对象位置：值各为 schema。definitions/dependencies 历史兼容
             // 按官方 metaschema 同样声明为 schema 值位置（dependencies 的
             // stringArray 形态在数组/标量分支原样保留，无 obligation 副作用）。
-            if ((key == "$defs" || key == "definitions" || key == "dependencies" ||
-                 key == "dependentSchemas") && val.is_object()) {
+            if ((key == "$defs" || key == "definitions" || key == "dependencies" || key == "dependentSchemas")
+                && val.is_object()) {
                 jsoncons::json t;
                 for (const auto& pm : val.object_range())
-                    t[std::string(pm.key())] = TransformNode(
-                        pm.value(), plan, false, depth + 1,
-                        spath + "/" + key + "/" + std::string(pm.key()), w);
+                    t[std::string(pm.key())] = TransformNode(pm.value(), plan, false, depth + 1,
+                                                             spath + "/" + key + "/" + std::string(pm.key()), w);
                 out[key] = t;
                 continue;
             }
@@ -513,7 +545,10 @@ jsoncons::json TransformNode(const jsoncons::json& node, std::vector<PlanStep> p
         if (!w->pending_addprops.empty()) {
             std::vector<AddPropsPatch> rest;
             for (auto& pp : w->pending_addprops) {
-                if (pp.spath != spath) { rest.push_back(std::move(pp)); continue; }
+                if (pp.spath != spath) {
+                    rest.push_back(std::move(pp));
+                    continue;
+                }
                 const auto eit = w->excl.find(spath);
                 // PP-AP1 决策：本节点含 relocated patternProperties 时，该层
                 // additionalProperties 的语义义务整体转由 guard obligation 承担
@@ -521,12 +556,11 @@ jsoncons::json TransformNode(const jsoncons::json& node, std::vector<PlanStep> p
                 // 键集合外），不再进入 jsoncons——被 PP 匹配的键不被误拒/误套，
                 // 未匹配额外键与覆盖键值 schema 失败仍由各自路径拒绝。guard 的
                 // 排除快照在 excl 齐备的此处直接写入。
-                const bool reloc =
-                    w->relocated_pp_nodes.count(spath) > 0 && eit != w->excl.end();
+                const bool reloc = w->relocated_pp_nodes.count(spath) > 0 && eit != w->excl.end();
                 bool guard_done = false;
                 if (reloc && pp.ap_false) {
                     Obligation guard;
-                    guard.kind = 3;  // AddPropsClosed：AP:false，排除集外一律拒绝
+                    guard.kind = 3; // AddPropsClosed：AP:false，排除集外一律拒绝
                     guard.plan = pp.plan;
                     guard.plan[pp.step_idx].excl_keys = eit->second.second;
                     guard.plan[pp.step_idx].excl_patterns = eit->second.first;
@@ -540,14 +574,13 @@ jsoncons::json TransformNode(const jsoncons::json& node, std::vector<PlanStep> p
                     // 失败（ref 超出资源/网络面）由收尾处撤销 guard 回退 jsoncons
                     // 原生路径，不新增编译期拒绝、不降级既有 $ref 面。
                     Obligation guard;
-                    guard.kind = 2;  // AddPropsSchema
+                    guard.kind = 2; // AddPropsSchema
                     guard.plan = pp.plan;
                     guard.plan[pp.step_idx].excl_keys = eit->second.second;
                     guard.plan[pp.step_idx].excl_patterns = eit->second.first;
                     guard.schema_path = spath + "/additionalProperties";
                     w->obligations.push_back(std::move(guard));
-                    w->deferred_guards.push_back(
-                        {w->obligations.size() - 1, std::move(pp.ap_t), spath});
+                    w->deferred_guards.push_back({w->obligations.size() - 1, std::move(pp.ap_t), spath});
                     guard_done = true;
                 }
                 // 循环界只看 obligation 区间与现存容器：个别 obligation 的 plan
@@ -558,18 +591,18 @@ jsoncons::json TransformNode(const jsoncons::json& node, std::vector<PlanStep> p
                 // AP 子树既有 obligation 的快照（guard 自身下标在区间外，已在
                 // 上方直接快照，二者不重叠）。
                 if (eit != w->excl.end()) {
-                    for (std::size_t i = pp.ob0;
-                         i < pp.ob1 && i < w->obligations.size(); ++i) {
-                        if (pp.step_idx >= w->obligations[i].plan.size() ||
-                            w->obligations[i].plan[pp.step_idx].kind != 3)
+                    for (std::size_t i = pp.ob0; i < pp.ob1 && i < w->obligations.size(); ++i) {
+                        if (pp.step_idx >= w->obligations[i].plan.size()
+                            || w->obligations[i].plan[pp.step_idx].kind != 3)
                             continue;
                         PlanStep& st = w->obligations[i].plan[pp.step_idx];
                         st.excl_keys = eit->second.second;
                         st.excl_patterns = eit->second.first;
                     }
                 }
-                if (guard_done) continue;  // AP 已由 guard 承担，不进入 jsoncons
-                out["additionalProperties"] = std::move(pp.ap_t);  // 原生/回退路径
+                if (guard_done)
+                    continue;                                     // AP 已由 guard 承担，不进入 jsoncons
+                out["additionalProperties"] = std::move(pp.ap_t); // 原生/回退路径
             }
             w->pending_addprops.swap(rest);
         }
@@ -580,31 +613,32 @@ jsoncons::json TransformNode(const jsoncons::json& node, std::vector<PlanStep> p
         jsoncons::json t(jsoncons::json_array_arg);
         std::size_t i = 0;
         for (const auto& el : node.array_range()) {
-            t.push_back(TransformNode(el, plan, positional, depth + 1,
-                                      spath + "/" + std::to_string(i), w));
+            t.push_back(TransformNode(el, plan, positional, depth + 1, spath + "/" + std::to_string(i), w));
             ++i;
         }
         return t;
     }
-    return node;  // 标量：值语义复制
+    return node; // 标量：值语义复制
 }
 
 // PP-AP1/R1 回退：按 walk 记录的 spath（原样键段，非 RFC6901 转义形式）在
 // transformed 内逐段定位对象成员并补写叶键；段/叶均按原样键比较。
-bool AddMemberAtPath(jsoncons::json& doc, const std::string& spath,
-                     const std::string& leaf, const jsoncons::json& val) {
+bool AddMemberAtPath(jsoncons::json& doc, const std::string& spath, const std::string& leaf, const jsoncons::json& val)
+{
     jsoncons::json* cur = &doc;
     std::size_t beg = 0;
     while (!spath.empty()) {
         const std::size_t end = spath.find('/', beg);
-        const std::string seg = spath.substr(
-            beg, end == std::string::npos ? std::string::npos : end - beg);
-        if (!cur->is_object() || !cur->contains(seg)) return false;
+        const std::string seg = spath.substr(beg, end == std::string::npos ? std::string::npos : end - beg);
+        if (!cur->is_object() || !cur->contains(seg))
+            return false;
         cur = &cur->at(seg);
-        if (end == std::string::npos) break;
+        if (end == std::string::npos)
+            break;
         beg = end + 1;
     }
-    if (!cur->is_object()) return false;
+    if (!cur->is_object())
+        return false;
     (*cur)[leaf] = val;
     return true;
 }
@@ -619,7 +653,8 @@ bool AddMemberAtPath(jsoncons::json& doc, const std::string& spath,
 // 检索基编译并登记外层 transformed 文档的 #/ 指针与 $anchor——本地 ref 由此
 // 正确指向原资源。urn 基不参与网络解析；不开放外部 URI/文件，外部 ref 默认
 // 仍 ResolverRejected。
-std::string SyntheticResourceBase() {
+std::string SyntheticResourceBase()
+{
     static std::atomic<std::uint64_t> seq{0};
     return "urn:bbt:mcp:schema-apref:" + std::to_string(++seq);
 }
@@ -630,40 +665,48 @@ std::string SyntheticResourceBase() {
 // $id 原生登记，其引用本就指向自身资源（S3 语义），改写反而丢资源边界。
 // annotation/const/enum/未知扩展与已为绝对形式的 ref 原样保留；$ref 值类型
 // 错误交 jsoncons 编译期报错（fail-closed 回退路径不变）。
-void RewriteFragmentRefs(jsoncons::json& node, const std::string& base) {
-    if (!node.is_object()) return;
-    if (node.contains("$id")) return;  // 资源边界：子树引用按自身资源解析
+void RewriteFragmentRefs(jsoncons::json& node, const std::string& base)
+{
+    if (!node.is_object())
+        return;
+    if (node.contains("$id"))
+        return; // 资源边界：子树引用按自身资源解析
     for (const char* key : {"$ref", "$dynamicRef"}) {
-        if (!node.contains(key)) continue;
+        if (!node.contains(key))
+            continue;
         jsoncons::json& ref = node.at(key);
-        if (!ref.is_string()) continue;
+        if (!ref.is_string())
+            continue;
         const std::string& v = ref.as_string();
-        if (v.empty() || v[0] == '#') ref = jsoncons::json(base + v);
+        if (v.empty() || v[0] == '#')
+            ref = jsoncons::json(base + v);
     }
-    for (const char* key : {"properties", "patternProperties", "$defs", "definitions",
-                            "dependencies", "dependentSchemas"}) {
-        if (!node.contains(key) || !node.at(key).is_object()) continue;
+    for (const char* key :
+         {"properties", "patternProperties", "$defs", "definitions", "dependencies", "dependentSchemas"}) {
+        if (!node.contains(key) || !node.at(key).is_object())
+            continue;
         for (auto& m : node.at(key).object_range())
             RewriteFragmentRefs(m.value(), base);
     }
-    for (const char* key : {"items", "additionalProperties", "not", "if", "then", "else",
-                            "contains", "propertyNames", "contentSchema",
-                            "unevaluatedProperties", "unevaluatedItems"}) {
-        if (node.contains(key)) RewriteFragmentRefs(node.at(key), base);
+    for (const char* key : {"items", "additionalProperties", "not", "if", "then", "else", "contains", "propertyNames",
+                            "contentSchema", "unevaluatedProperties", "unevaluatedItems"}) {
+        if (node.contains(key))
+            RewriteFragmentRefs(node.at(key), base);
     }
     if (node.contains("prefixItems") && node.at("prefixItems").is_array()) {
         for (auto& el : node.at("prefixItems").array_range())
             RewriteFragmentRefs(el, base);
     }
     for (const char* key : {"allOf", "anyOf", "oneOf"}) {
-        if (!node.contains(key) || !node.at(key).is_array()) continue;
+        if (!node.contains(key) || !node.at(key).is_array())
+            continue;
         for (auto& el : node.at(key).array_range())
             RewriteFragmentRefs(el, base);
     }
 }
 
-std::shared_ptr<const SchemaValidator::Impl> CompileDoc(const jsoncons::json& doc,
-                                                        const SchemaOptions& opt) {
+std::shared_ptr<const SchemaValidator::Impl> CompileDoc(const jsoncons::json& doc, const SchemaOptions& opt)
+{
     return CompileDocCore(doc, opt, nullptr);
 }
 
@@ -671,15 +714,16 @@ std::shared_ptr<const SchemaValidator::Impl> CompileDoc(const jsoncons::json& do
 // fragment/文档内 $id 的本地 ref 解析基指向外层资源 transformed 文档（jsoncons
 // 对 resolver 返回文档按检索基编译并登记 #/... 指针与 $anchor 目标——与主文档
 // 兜底路径同机制），不拷贝 $defs、不注入网络解析，默认外部 ref 仍 ResolverRejected。
-std::shared_ptr<const SchemaValidator::Impl> CompileDocCore(const jsoncons::json& doc,
-                                                            const SchemaOptions& opt,
+std::shared_ptr<const SchemaValidator::Impl> CompileDocCore(const jsoncons::json& doc, const SchemaOptions& opt,
                                                             const jsoncons::json* ref_base,
-                                                            const std::set<std::string>* seed_ids) {
+                                                            const std::set<std::string>* seed_ids)
+{
     Walk w;
     w.opt = &opt;
     // APREF-C1：外层资源检索基由调用方注入（guard 编译时 resolver 的既有 ids
     // 放行分支据此返回 ref_base 文档）。
-    if (seed_ids) w.ids->insert(seed_ids->begin(), seed_ids->end());
+    if (seed_ids)
+        w.ids->insert(seed_ids->begin(), seed_ids->end());
     jsoncons::json transformed = TransformNode(doc, {}, true, 0, "", &w);
 
     // 延迟 guard 绑定（PP-AP1/R1）：资源 transformed 文档此时已齐备。逆序处理
@@ -695,15 +739,14 @@ std::shared_ptr<const SchemaValidator::Impl> CompileDocCore(const jsoncons::json
         try {
             jsoncons::json guard_doc(jsoncons::json_object_arg);
             jsoncons::json arr(jsoncons::json_array_arg);
-            jsoncons::json ap_copy = it->ap_t;  // 改写只作用于编译输入副本；回退仍用原值
+            jsoncons::json ap_copy = it->ap_t; // 改写只作用于编译输入副本；回退仍用原值
             const std::string retrieval_base = SyntheticResourceBase();
             RewriteFragmentRefs(ap_copy, retrieval_base);
             arr.push_back(std::move(ap_copy));
-            guard_doc["$id"] = SyntheticResourceBase();  // guard 根资源身份与外层隔离
+            guard_doc["$id"] = SyntheticResourceBase(); // guard 根资源身份与外层隔离
             guard_doc["allOf"] = std::move(arr);
             const std::set<std::string> seed_ids{retrieval_base};
-            w.obligations[it->ob_idx].sub =
-                CompileDocCore(guard_doc, opt, &transformed, &seed_ids);
+            w.obligations[it->ob_idx].sub = CompileDocCore(guard_doc, opt, &transformed, &seed_ids);
             bound = w.obligations[it->ob_idx].sub != nullptr;
         } catch (const ResolverRejected&) {
         } catch (const jsoncons::jsonschema::schema_error&) {
@@ -715,8 +758,7 @@ std::shared_ptr<const SchemaValidator::Impl> CompileDocCore(const jsoncons::json
             // 失 AP 约束的半状态。
             if (!AddMemberAtPath(transformed, it->spath, "additionalProperties", it->ap_t))
                 throw BuildError{SchemaErrorCode::Internal, "deferred AP fallback lost"};
-            w.obligations.erase(w.obligations.begin() +
-                                static_cast<std::ptrdiff_t>(it->ob_idx));
+            w.obligations.erase(w.obligations.begin() + static_cast<std::ptrdiff_t>(it->ob_idx));
         }
     }
 
@@ -747,27 +789,34 @@ std::shared_ptr<const SchemaValidator::Impl> CompileDocCore(const jsoncons::json
 
 // ---------- 验证 ----------
 
-bool CountInstance(const jsoncons::json& n, int depth, const SchemaOptions& o, long* nodes) {
-    if (++*nodes > static_cast<long>(o.max_instance_nodes)) return false;
-    if (depth > static_cast<int>(o.max_instance_depth)) return false;
+bool CountInstance(const jsoncons::json& n, int depth, const SchemaOptions& o, long* nodes)
+{
+    if (++*nodes > static_cast<long>(o.max_instance_nodes))
+        return false;
+    if (depth > static_cast<int>(o.max_instance_depth))
+        return false;
     if (n.is_array()) {
         for (const auto& e : n.array_range())
-            if (!CountInstance(e, depth + 1, o, nodes)) return false;
+            if (!CountInstance(e, depth + 1, o, nodes))
+                return false;
     } else if (n.is_object()) {
         for (const auto& m : n.object_range())
-            if (!CountInstance(m.value(), depth + 1, o, nodes)) return false;
+            if (!CountInstance(m.value(), depth + 1, o, nodes))
+                return false;
     }
     return true;
 }
 
 // runtime_failed（MF3）：仅 ICU/UErrorCode 级运行期失败置位并写 *err；成功与
 // 普通 schema mismatch 不触碰 error，避免默认 Internal 值污染成功路径。
-ValidationResult ValidateImpl(const SchemaValidator::Impl& impl, const jsoncons::json& root,
-                              SchemaError* err, bool* runtime_failed) {
+ValidationResult ValidateImpl(const SchemaValidator::Impl& impl, const jsoncons::json& root, SchemaError* err,
+                              bool* runtime_failed)
+{
     ValidationResult r;
     bool ok = true;
     auto fail_internal = [&](const char* what) {
-        if (err) *err = SchemaError{SchemaErrorCode::Internal, what};
+        if (err)
+            *err = SchemaError{SchemaErrorCode::Internal, what};
         *runtime_failed = true;
     };
     try {
@@ -778,7 +827,8 @@ ValidationResult ValidateImpl(const SchemaValidator::Impl& impl, const jsoncons:
         r.issues.push_back({"internal", "/", ""});
         return r;
     }
-    if (!ok) r.issues.push_back({"jsonschema", "/", ""});
+    if (!ok)
+        r.issues.push_back({"jsonschema", "/", ""});
 
     for (const auto& ob : impl.obligations) {
         std::vector<std::pair<const jsoncons::json*, std::string>> cur{{&root, ""}};
@@ -799,20 +849,26 @@ ValidationResult ValidateImpl(const SchemaValidator::Impl& impl, const jsoncons:
                     if (n->is_array()) {
                         const long idx = std::stol(st.arg);
                         if (idx >= 0 && static_cast<std::size_t>(idx) < n->size())
-                            next.emplace_back(&n->at(static_cast<std::size_t>(idx)),
-                                              p.second + "/" + st.arg);
+                            next.emplace_back(&n->at(static_cast<std::size_t>(idx)), p.second + "/" + st.arg);
                     }
-                } else {  // AddProps：排除同层 properties 键与全部 PP 键匹配者（MF5：用步骤快照）
-                    if (!n->is_object()) continue;
+                } else { // AddProps：排除同层 properties 键与全部 PP 键匹配者（MF5：用步骤快照）
+                    if (!n->is_object())
+                        continue;
                     for (const auto& pm : n->object_range()) {
                         const std::string k(pm.key());
                         bool excl = false;
                         for (const auto& ek : st.excl_keys)
-                            if (ek == k) { excl = true; break; }
+                            if (ek == k) {
+                                excl = true;
+                                break;
+                            }
                         if (!excl) {
                             for (std::size_t pi : st.excl_patterns) {
                                 const char* rte = nullptr;
-                                if (impl.patterns[pi].Search(k, &rte)) { excl = true; break; }
+                                if (impl.patterns[pi].Search(k, &rte)) {
+                                    excl = true;
+                                    break;
+                                }
                                 if (rte) {
                                     fail_internal("icu pattern evaluation failed");
                                     r.issues.push_back({"pattern_runtime", ob.schema_path, p.second});
@@ -821,17 +877,19 @@ ValidationResult ValidateImpl(const SchemaValidator::Impl& impl, const jsoncons:
                                 }
                             }
                         }
-                        if (!excl) next.emplace_back(&pm.value(), p.second + "/" + k);
+                        if (!excl)
+                            next.emplace_back(&pm.value(), p.second + "/" + k);
                     }
                 }
             }
             cur = std::move(next);
         }
 
-        bool extra_reported = false;  // kind=3 guard 每 obligation 只报一条（脱敏）
+        bool extra_reported = false; // kind=3 guard 每 obligation 只报一条（脱敏）
         for (const auto& p : cur) {
             if (ob.kind == 0) {
-                if (!p.first->is_string()) continue;  // pattern 仅作用于 string
+                if (!p.first->is_string())
+                    continue; // pattern 仅作用于 string
                 const char* rte = nullptr;
                 const bool hit = impl.patterns[ob.pattern].Search(p.first->as_string(), &rte);
                 if (rte) {
@@ -845,7 +903,8 @@ ValidationResult ValidateImpl(const SchemaValidator::Impl& impl, const jsoncons:
                     r.ok = false;
                 }
             } else if (ob.kind == 1) {
-                if (!p.first->is_object()) continue;
+                if (!p.first->is_object())
+                    continue;
                 for (const auto& pm : p.first->object_range()) {
                     const std::string k(pm.key());
                     const char* rte = nullptr;
@@ -856,7 +915,8 @@ ValidationResult ValidateImpl(const SchemaValidator::Impl& impl, const jsoncons:
                         r.ok = false;
                         continue;
                     }
-                    if (!hit) continue;
+                    if (!hit)
+                        continue;
                     ValidationResult subr = ValidateImpl(*ob.sub, pm.value(), err, runtime_failed);
                     if (!subr.ok) {
                         r.ok = false;
@@ -877,7 +937,7 @@ ValidationResult ValidateImpl(const SchemaValidator::Impl& impl, const jsoncons:
                         r.issues.push_back(std::move(iss));
                     }
                 }
-            } else {  // kind == 3：AP:false guard——额外键集合非空即拒绝（脱敏单条）
+            } else { // kind == 3：AP:false guard——额外键集合非空即拒绝（脱敏单条）
                 if (!extra_reported) {
                     extra_reported = true;
                     r.issues.push_back({"additionalProperties", ob.schema_path, p.second});
@@ -895,7 +955,8 @@ ValidationResult ValidateImpl(const SchemaValidator::Impl& impl, const jsoncons:
 // 完整输入预算（字节上限已在 Compile 入口、先于 parse）：进入任何
 // transform/编译前对完整 doc 计数，超限先拒（LimitExceeded 优先于
 // InvalidSchema，不以非法形状短路预算门禁）。
-void CountSchemaBudget(const jsoncons::json& n, int depth, const SchemaOptions& o, long* nodes) {
+void CountSchemaBudget(const jsoncons::json& n, int depth, const SchemaOptions& o, long* nodes)
+{
     if (++*nodes > static_cast<long>(o.max_schema_nodes))
         throw BuildError{SchemaErrorCode::LimitExceeded, "schema node limit exceeded"};
     if (depth > static_cast<int>(o.max_schema_depth))
@@ -915,32 +976,31 @@ void CountSchemaBudget(const jsoncons::json& n, int depth, const SchemaOptions& 
 // jsoncons v1.10.0 内嵌官方 root+7 vocabulary allOf bundle；兜底 resolver 只
 // 服务 *.json-schema.org/draft/2020-12/*（同一 bundle，离线、无网络），与用户
 // schema 的外部 ref resolver（CompileDoc，默认全拒）完全隔离。
-const jsoncons::jsonschema::json_schema<jsoncons::json>& MetaValidator() {
+const jsoncons::jsonschema::json_schema<jsoncons::json>& MetaValidator()
+{
     jsoncons::jsonschema::evaluation_options options;
     options.default_version(jsoncons::jsonschema::schema_version::draft202012());
     options.require_format_validation(false);
-    static const jsoncons::jsonschema::json_schema<jsoncons::json> meta(
-        jsoncons::jsonschema::make_json_schema(
-            jsoncons::jsonschema::draft202012::schema_draft202012<jsoncons::json>::get_schema(),
-            [](const jsoncons::uri& u) -> jsoncons::json {
-                const std::string base = u.base().string();
-                if (base.rfind("https://json-schema.org/draft/2020-12/", 0) == 0)
-                    return jsoncons::jsonschema::draft202012::
-                        schema_draft202012<jsoncons::json>::get_schema();
-                return jsoncons::json::null();
-            },
-            options));
+    static const jsoncons::jsonschema::json_schema<jsoncons::json> meta(jsoncons::jsonschema::make_json_schema(
+        jsoncons::jsonschema::draft202012::schema_draft202012<jsoncons::json>::get_schema(),
+        [](const jsoncons::uri& u) -> jsoncons::json {
+            const std::string base = u.base().string();
+            if (base.rfind("https://json-schema.org/draft/2020-12/", 0) == 0)
+                return jsoncons::jsonschema::draft202012::schema_draft202012<jsoncons::json>::get_schema();
+            return jsoncons::json::null();
+        },
+        options));
     return meta;
 }
 
 // 原始 schema 进入 Transform/jsoncons 编译前的全文 metaschema 校验（RG1）。
 // 失败 InvalidSchema 脱敏（固定短语，不回显 schema 内容）；校验引擎自身异常
 // 上报脱敏 Internal，不冒充「schema 非法」。
-void ValidateMetaSchema(const jsoncons::json& doc) {
+void ValidateMetaSchema(const jsoncons::json& doc)
+{
     try {
         if (!MetaValidator().is_valid(doc))
-            throw BuildError{SchemaErrorCode::InvalidSchema,
-                             "schema rejected by draft 2020-12 metaschema validation"};
+            throw BuildError{SchemaErrorCode::InvalidSchema, "schema rejected by draft 2020-12 metaschema validation"};
     } catch (const BuildError&) {
         throw;
     } catch (const std::exception&) {
@@ -948,23 +1008,27 @@ void ValidateMetaSchema(const jsoncons::json& doc) {
     }
 }
 
-}  // namespace
+} // namespace
 
 // ---------- 公共 API ----------
 
-bool SchemaValidator::Compile(const JsonValue& schema, const SchemaOptions& options,
-                              SchemaValidator* out, SchemaError* error) {
+bool SchemaValidator::Compile(const JsonValue& schema, const SchemaOptions& options, SchemaValidator* out,
+                              SchemaError* error)
+{
     // 契约：失败路径全部显式写 *error；成功不写（调用方原值保留，与 Validate
     // 同一语义，回修 2-3）。out 为空是调用方 bug，报脱敏 Internal。
     if (!out) {
-        if (error) *error = SchemaError{SchemaErrorCode::Internal, "null output argument"};
+        if (error)
+            *error = SchemaError{SchemaErrorCode::Internal, "null output argument"};
         return false;
     }
     try {
         // Boost.JSON → 文本 → jsoncons：整数词法精确传递（两库均 int64/uint64）。
         const std::string text = schema.Serialize();
         if (text.size() > options.max_schema_bytes) {
-            if (error) *error = SchemaError{SchemaErrorCode::LimitExceeded, "schema byte limit exceeded"};  // MF1：*error 判空，error=nullptr 不崩
+            if (error)
+                *error = SchemaError{SchemaErrorCode::LimitExceeded,
+                                     "schema byte limit exceeded"}; // MF1：*error 判空，error=nullptr 不崩
             return false;
         }
         const jsoncons::json doc = jsoncons::json::parse(text);
@@ -973,28 +1037,34 @@ bool SchemaValidator::Compile(const JsonValue& schema, const SchemaOptions& opti
         long schema_nodes = 0;
         CountSchemaBudget(doc, 0, options, &schema_nodes);
         ValidateMetaSchema(doc);
-        out->impl_ = CompileDoc(doc, options);  // 全部构建完成后一次性发布：无半注册状态
+        out->impl_ = CompileDoc(doc, options); // 全部构建完成后一次性发布：无半注册状态
         return true;
     } catch (const BuildError& e) {
-        if (error) *error = SchemaError{e.code, e.msg};
+        if (error)
+            *error = SchemaError{e.code, e.msg};
     } catch (const ResolverRejected&) {
-        if (error) *error = SchemaError{SchemaErrorCode::ExternalRef, "external ref rejected"};
+        if (error)
+            *error = SchemaError{SchemaErrorCode::ExternalRef, "external ref rejected"};
     } catch (const jsoncons::jsonschema::schema_error&) {
-        if (error) *error = SchemaError{SchemaErrorCode::InvalidSchema,
-                                        "schema rejected by draft 2020-12 compilation"};
+        if (error)
+            *error = SchemaError{SchemaErrorCode::InvalidSchema, "schema rejected by draft 2020-12 compilation"};
     } catch (const std::regex_error&) {
-        if (error) *error = SchemaError{SchemaErrorCode::RegexInvalid, "invalid regex"};
+        if (error)
+            *error = SchemaError{SchemaErrorCode::RegexInvalid, "invalid regex"};
     } catch (const std::exception&) {
-        if (error) *error = SchemaError{SchemaErrorCode::Internal, "schema compilation failed"};
+        if (error)
+            *error = SchemaError{SchemaErrorCode::Internal, "schema compilation failed"};
     }
     return false;
 }
 
-ValidationResult SchemaValidator::Validate(const JsonValue& instance, SchemaError* error) const {
+ValidationResult SchemaValidator::Validate(const JsonValue& instance, SchemaError* error) const
+{
     ValidationResult r;
     // MF2：默认构造 / Compile 失败对象无实现，fail-closed 而非空指针解引用。
     if (!impl_) {
-        if (error) *error = SchemaError{SchemaErrorCode::Internal, "validator not compiled"};
+        if (error)
+            *error = SchemaError{SchemaErrorCode::Internal, "validator not compiled"};
         r.ok = false;
         r.issues.push_back({"internal", "/", ""});
         return r;
@@ -1002,26 +1072,28 @@ ValidationResult SchemaValidator::Validate(const JsonValue& instance, SchemaErro
     try {
         const std::string text = instance.Serialize();
         if (text.size() > impl_->opt.max_instance_bytes) {
-            if (error) *error = SchemaError{SchemaErrorCode::LimitExceeded,
-                                            "instance byte limit exceeded"};
+            if (error)
+                *error = SchemaError{SchemaErrorCode::LimitExceeded, "instance byte limit exceeded"};
             r.ok = false;
             return r;
         }
         const jsoncons::json parsed = jsoncons::json::parse(text);
         long nodes = 0;
         if (!CountInstance(parsed, 0, impl_->opt, &nodes)) {
-            if (error) *error = SchemaError{SchemaErrorCode::LimitExceeded,
-                                            "instance depth/node limit exceeded"};
+            if (error)
+                *error = SchemaError{SchemaErrorCode::LimitExceeded, "instance depth/node limit exceeded"};
             r.ok = false;
             return r;
         }
         SchemaError verr;
         bool runtime_failed = false;
         ValidationResult rr = ValidateImpl(*impl_, parsed, &verr, &runtime_failed);
-        if (error && runtime_failed) *error = verr;  // MF3：仅运行期失败传播，成功/mismatch 不污染
+        if (error && runtime_failed)
+            *error = verr; // MF3：仅运行期失败传播，成功/mismatch 不污染
         return rr;
     } catch (const std::exception&) {
-        if (error) *error = SchemaError{SchemaErrorCode::Internal, "validation failed"};
+        if (error)
+            *error = SchemaError{SchemaErrorCode::Internal, "validation failed"};
         r.ok = false;
         return r;
     }
@@ -1037,7 +1109,8 @@ ValidationResult SchemaValidator::Validate(const JsonValue& instance, SchemaErro
 // 发生：注册与校验同表）→ 拒绝（fail-closed）。
 namespace {
 
-Error MakeToolSchemaError(ErrorCode code, const char* domain_code, const char* message) {
+Error MakeToolSchemaError(ErrorCode code, const char* domain_code, const char* message)
+{
     Error e;
     e.code = code;
     e.domain_code = domain_code;
@@ -1050,48 +1123,51 @@ struct ToolsSchemaState {
     std::map<std::string, std::shared_ptr<const SchemaValidator>> output_validators;
 };
 
-}  // namespace
+} // namespace
 
-result<void> EnableToolsSchemaValidation(McpServer& server) {
+result<void> EnableToolsSchemaValidation(McpServer& server)
+{
     auto state = std::make_shared<ToolsSchemaState>();
     McpServer::Impl& impl = *server.m_impl;
     std::lock_guard<std::mutex> lock(impl.m_mutex);
     if (impl.m_closed)
-        return result<void>::err(
-            MakeToolSchemaError(ErrorCode::Closed, "mcp.server.closed", "server is closed"));
+        return result<void>::err(MakeToolSchemaError(ErrorCode::Closed, "mcp.server.closed", "server is closed"));
     if (impl.m_started)
-        return result<void>::err(MakeToolSchemaError(
-            ErrorCode::InvalidContext, "mcp.tools.frozen", "registration snapshot is frozen"));
+        return result<void>::err(
+            MakeToolSchemaError(ErrorCode::InvalidContext, "mcp.tools.frozen", "registration snapshot is frozen"));
     if (impl.m_tools_hooks.set)
-        return result<void>::err(MakeToolSchemaError(ErrorCode::InvalidContext,
-                                                     "mcp.tools.already_enabled",
+        return result<void>::err(MakeToolSchemaError(ErrorCode::InvalidContext, "mcp.tools.already_enabled",
                                                      "tools schema validation already enabled"));
     ToolsSchemaHooks hooks;
     hooks.compile = [state](const ToolDefinition& definition) -> result<void> {
         auto compiled = std::make_shared<SchemaValidator>();
         SchemaError error;
-        if (!SchemaValidator::Compile(definition.input_schema, SchemaOptions{}, compiled.get(),
-                                      &error)) {
+        if (!SchemaValidator::Compile(definition.input_schema, SchemaOptions{}, compiled.get(), &error)) {
             std::string message = "tool input schema rejected";
-            if (error.code == SchemaErrorCode::ExternalRef) message = "tool input schema external ref rejected";
-            else if (error.code == SchemaErrorCode::LimitExceeded) message = "tool input schema limits exceeded";
-            else if (error.code == SchemaErrorCode::Unsupported) message = "tool input schema unsupported construct";
-            return result<void>::err(MakeToolSchemaError(ErrorCode::InvalidArgument,
-                                                         "mcp.tools.schema", message.c_str()));
+            if (error.code == SchemaErrorCode::ExternalRef)
+                message = "tool input schema external ref rejected";
+            else if (error.code == SchemaErrorCode::LimitExceeded)
+                message = "tool input schema limits exceeded";
+            else if (error.code == SchemaErrorCode::Unsupported)
+                message = "tool input schema unsupported construct";
+            return result<void>::err(
+                MakeToolSchemaError(ErrorCode::InvalidArgument, "mcp.tools.schema", message.c_str()));
         }
         state->input_validators[definition.name] = std::move(compiled);
         if (definition.output_schema) {
             auto out_compiled = std::make_shared<SchemaValidator>();
             SchemaError out_error;
-            if (!SchemaValidator::Compile(*definition.output_schema, SchemaOptions{},
-                                          out_compiled.get(), &out_error)) {
-                state->input_validators.erase(definition.name);  // 无半条记录
+            if (!SchemaValidator::Compile(*definition.output_schema, SchemaOptions{}, out_compiled.get(), &out_error)) {
+                state->input_validators.erase(definition.name); // 无半条记录
                 std::string message = "tool output schema rejected";
-                if (out_error.code == SchemaErrorCode::ExternalRef) message = "tool output schema external ref rejected";
-                else if (out_error.code == SchemaErrorCode::LimitExceeded) message = "tool output schema limits exceeded";
-                else if (out_error.code == SchemaErrorCode::Unsupported) message = "tool output schema unsupported construct";
-                return result<void>::err(MakeToolSchemaError(ErrorCode::InvalidArgument,
-                                                             "mcp.tools.schema", message.c_str()));
+                if (out_error.code == SchemaErrorCode::ExternalRef)
+                    message = "tool output schema external ref rejected";
+                else if (out_error.code == SchemaErrorCode::LimitExceeded)
+                    message = "tool output schema limits exceeded";
+                else if (out_error.code == SchemaErrorCode::Unsupported)
+                    message = "tool output schema unsupported construct";
+                return result<void>::err(
+                    MakeToolSchemaError(ErrorCode::InvalidArgument, "mcp.tools.schema", message.c_str()));
             }
             state->output_validators[definition.name] = std::move(out_compiled);
         }
@@ -1099,13 +1175,15 @@ result<void> EnableToolsSchemaValidation(McpServer& server) {
     };
     hooks.validate_input = [state](const std::string& tool_name, const JsonValue& instance) -> bool {
         auto found = state->input_validators.find(tool_name);
-        if (found == state->input_validators.end()) return false;  // fail-closed
+        if (found == state->input_validators.end())
+            return false; // fail-closed
         SchemaError ignored;
         return found->second->Validate(instance, &ignored).ok;
     };
     hooks.validate_output = [state](const std::string& tool_name, const JsonValue& structured) -> bool {
         auto found = state->output_validators.find(tool_name);
-        if (found == state->output_validators.end()) return false;  // 未声明 output schema
+        if (found == state->output_validators.end())
+            return false; // 未声明 output schema
         SchemaError ignored;
         return found->second->Validate(structured, &ignored).ok;
     };
@@ -1114,4 +1192,4 @@ result<void> EnableToolsSchemaValidation(McpServer& server) {
     return result<void>::ok();
 }
 
-}  // namespace bbt::infra::mcp
+} // namespace bbt::infra::mcp

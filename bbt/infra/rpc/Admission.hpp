@@ -1,5 +1,5 @@
 #pragma once
-// bbtools-infra v2：RPC 入站 admission 公共类型（ReplyCompletion /
+// RPC 入站 admission 公共类型（ReplyCompletion /
 // AdmissionLease / AdmissionItem / AdmissionHandler / AdmissionQueue）。
 //
 // 一次入站帧的生命周期，谁在什么时候负责什么：
@@ -41,7 +41,7 @@ namespace detail {
 struct ReplyCompletionImpl;
 struct AdmissionLeaseImpl;
 struct AdmissionQueueImpl;
-class AdmissionAccess;   // 内部接缝的唯一入口，见 detail/Session.hpp
+class AdmissionAccess; // 内部接缝的唯一入口，见 detail/Session.hpp
 } // namespace detail
 
 /**
@@ -76,8 +76,9 @@ public:
 private:
     friend class detail::AdmissionAccess;
 
-    explicit ReplyCompletion(std::shared_ptr<detail::ReplyCompletionImpl> impl)
-        : m_impl(std::move(impl)) {}
+    explicit ReplyCompletion(std::shared_ptr<detail::ReplyCompletionImpl> impl) : m_impl(std::move(impl))
+    {
+    }
 
     /// @brief 供 detail::AdmissionAccess 使用：标记 terminal 并交出 impl。
     ///
@@ -108,8 +109,9 @@ public:
 private:
     friend class detail::AdmissionAccess;
 
-    explicit AdmissionLease(std::shared_ptr<detail::AdmissionLeaseImpl> impl)
-        : m_impl(std::move(impl)) {}
+    explicit AdmissionLease(std::shared_ptr<detail::AdmissionLeaseImpl> impl) : m_impl(std::move(impl))
+    {
+    }
 
     std::shared_ptr<detail::AdmissionLeaseImpl> m_impl;
 };
@@ -122,9 +124,9 @@ private:
  * 创建，业务不能自己造。
  */
 struct AdmissionItem {
-    Request                          request;
-    std::shared_ptr<ReplyCompletion> reply;
-    std::shared_ptr<AdmissionLease>  lease;
+    Request request;                        ///< owning 请求，Context 已由 infra 填好
+    std::shared_ptr<ReplyCompletion> reply; ///< 本项的回复终态结算器
+    std::shared_ptr<AdmissionLease> lease;  ///< 本项的在飞名额租约
 };
 
 /**
@@ -155,9 +157,8 @@ public:
      * @return 队列；参数非法为 InvalidArgument，worker 登记失败为
      *         RuntimeUnavailable（此时没有留下常驻任务）。
      */
-    static result<std::shared_ptr<AdmissionQueue>> Create(
-        std::size_t max_items, std::size_t max_bytes,
-        AdmissionHandler handler);
+    static result<std::shared_ptr<AdmissionQueue>> Create(std::size_t max_items, std::size_t max_bytes,
+                                                          AdmissionHandler handler);
 
     /// @brief 不可挂起；满 → Overloaded，封口后 → Closed。
     result<void> Admit(AdmissionItem item);
@@ -183,8 +184,9 @@ public:
 private:
     friend class detail::AdmissionAccess;
 
-    explicit AdmissionQueue(std::shared_ptr<detail::AdmissionQueueImpl> impl)
-        : m_impl(std::move(impl)) {}
+    explicit AdmissionQueue(std::shared_ptr<detail::AdmissionQueueImpl> impl) : m_impl(std::move(impl))
+    {
+    }
 
     std::shared_ptr<detail::AdmissionQueueImpl> m_impl;
 };

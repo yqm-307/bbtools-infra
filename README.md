@@ -37,6 +37,7 @@ ctest --test-dir <build> -j1 -R '^example_http_net_consumer$' --output-on-failur
 - [示例](examples/README.md)：公开 target 的独立消费。
 - [测试策略](docs/guides/testing.md)与 [CI](docs/guides/ci.md)：PR smoke + 直接耦合 focused；真实 Redis/Mongo 由独占 live 环境执行，不以 skip 冒充通过。
 - [开发规范](docs/guides/development.md)、[代码约定](docs/conventions.md)、[Agent 规范](AGENTS.md)。
+- API 文档本地导出：`scripts/docs/build_docs.sh`（需 `doxygen`、`dot`；约定 Doxygen 1.15.0，版本不一致只告警；输出目录默认 `build-docs/`，也可用 `DOCS_OUT` 指定 `build/` 或 `build-*/` 下的路径，均在忽略范围；产物含 `site/` HTML 与 `ai/` 分层 Markdown）。CI 导出尚未接入。
 - [网络执行域契约](docs/architecture/gnet-network-execution.md)与 [历史决策](docs/decisions/)；ADR 正文保留原决策，不代表旧 API 仍可消费。
 - [Consul 指南](docs/guides/consul-registry.md)：agent HTTP adapter 的契约、错误映射、关闭语义与真后端验证。
 

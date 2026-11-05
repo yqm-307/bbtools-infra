@@ -39,8 +39,9 @@ public:
     EventSnapshot(const EventSnapshot&) = default;
     EventSnapshot& operator=(const EventSnapshot&) = default;
     EventSnapshot(EventSnapshot&& other) noexcept
-        : data_(std::move(other.data_)),
-          cursor_(std::exchange(other.cursor_, 0)) {}
+        : data_(std::move(other.data_)), cursor_(std::exchange(other.cursor_, 0))
+    {
+    }
     EventSnapshot& operator=(EventSnapshot&& other) noexcept
     {
         if (this != &other) {
@@ -50,8 +51,14 @@ public:
         return *this;
     }
 
-    std::size_t Remaining() const noexcept { return data_.size() - cursor_; }
-    bool Empty() const noexcept { return Remaining() == 0; }
+    std::size_t Remaining() const noexcept
+    {
+        return data_.size() - cursor_;
+    }
+    bool Empty() const noexcept
+    {
+        return Remaining() == 0;
+    }
 
     std::string_view Peek() const noexcept
     {
@@ -81,10 +88,11 @@ public:
 
 private:
     friend class EventRingBuffer;
-    explicit EventSnapshot(std::string data)
-        : data_(std::move(data)) {}
+    explicit EventSnapshot(std::string data) : data_(std::move(data))
+    {
+    }
 
-    std::string data_;          // 独立连续 backing storage
+    std::string data_; // 独立连续 backing storage
     std::size_t cursor_{0};
 };
 
@@ -95,14 +103,17 @@ public:
     static constexpr std::size_t kInitialCapacity = 1024;
 
     // max_bytes == 0 时仅空操作合法；构造不预分配。
-    explicit EventRingBuffer(std::size_t max_bytes) noexcept
-        : max_bytes_(max_bytes) {}
+    explicit EventRingBuffer(std::size_t max_bytes) noexcept : max_bytes_(max_bytes)
+    {
+    }
 
     EventRingBuffer(const EventRingBuffer&) = delete;
     EventRingBuffer& operator=(const EventRingBuffer&) = delete;
     // Boost 移动后来源 Size/Capacity 为 0，max_bytes 保留，可继续追加。
     EventRingBuffer(EventRingBuffer&& other) noexcept
-        : storage_(std::move(other.storage_)), max_bytes_(other.max_bytes_) {}
+        : storage_(std::move(other.storage_)), max_bytes_(other.max_bytes_)
+    {
+    }
     EventRingBuffer& operator=(EventRingBuffer&& other) noexcept
     {
         if (this != &other) {
@@ -112,10 +123,22 @@ public:
         return *this;
     }
 
-    std::size_t Size() const noexcept { return storage_.size(); }
-    std::size_t Capacity() const noexcept { return storage_.capacity(); }
-    std::size_t MaxBytes() const noexcept { return max_bytes_; }
-    bool Empty() const noexcept { return storage_.empty(); }
+    std::size_t Size() const noexcept
+    {
+        return storage_.size();
+    }
+    std::size_t Capacity() const noexcept
+    {
+        return storage_.capacity();
+    }
+    std::size_t MaxBytes() const noexcept
+    {
+        return max_bytes_;
+    }
+    bool Empty() const noexcept
+    {
+        return storage_.empty();
+    }
 
     // 支持自身 Peek view/子串作为输入：修改前保存别名副本。超限拒绝或
     // 分配失败时原缓冲不变；外部非别名输入不额外复制。
@@ -130,9 +153,8 @@ public:
         const auto overlaps = [data](const auto& segment) {
             // std::less 提供不相关指针的全序；只在各有效区间内求尾指针。
             const std::less<const char*> less;
-            return segment.second != 0
-                && less(data.data(), segment.first + segment.second)
-                && less(segment.first, data.data() + data.size());
+            return segment.second != 0 && less(data.data(), segment.first + segment.second)
+                   && less(segment.first, data.data() + data.size());
         };
         std::string owned_input;
         if (overlaps(storage_.array_one()) || overlaps(storage_.array_two())) {
@@ -229,15 +251,17 @@ public:
         return std::make_shared<const boost::circular_buffer<char>>(std::move(storage_));
     }
 
-    void Clear() noexcept { storage_.clear(); }
+    void Clear() noexcept
+    {
+        storage_.clear();
+    }
 
 private:
     // need <= max_bytes_；先判 max/2 再翻倍，无溢出。
     std::size_t GrowTarget(std::size_t need) const noexcept
     {
-        std::size_t target = Capacity() == 0
-            ? (max_bytes_ < kInitialCapacity ? max_bytes_ : kInitialCapacity)
-            : Capacity();
+        std::size_t target =
+            Capacity() == 0 ? (max_bytes_ < kInitialCapacity ? max_bytes_ : kInitialCapacity) : Capacity();
         while (target < need) {
             if (target > max_bytes_ / 2) {
                 return max_bytes_;

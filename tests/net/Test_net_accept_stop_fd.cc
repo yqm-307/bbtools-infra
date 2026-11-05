@@ -28,7 +28,8 @@ static std::atomic<bool> arm{false}, arrived{false}, release_accept{false};
 static std::atomic<int> acquired{-1};
 
 extern "C" long __real_syscall(long, ...);
-extern "C" long __wrap_syscall(long number, ...) {
+extern "C" long __wrap_syscall(long number, ...)
+{
     va_list args;
     va_start(args, number);
     long result = -1;
@@ -40,7 +41,7 @@ extern "C" long __wrap_syscall(long number, ...) {
         result = __real_syscall(number, fd, address, length, flags);
         if (result >= 0 && arm.exchange(false)) {
             acquired = static_cast<int>(result);
-            arrived = true;  // 内核已建立连接并返回 fd，Engine 尚未见到返回值
+            arrived = true; // 内核已建立连接并返回 fd，Engine 尚未见到返回值
             const auto end = std::chrono::steady_clock::now() + 3s;
             while (!release_accept && std::chrono::steady_clock::now() < end) {
                 timespec delay{0, 1000000};
@@ -64,29 +65,37 @@ extern "C" long __wrap_syscall(long number, ...) {
     return result;
 }
 
-template<class P> static bool Until(P predicate) {
+template <class P> static bool Until(P predicate)
+{
     const auto end = std::chrono::steady_clock::now() + 3s;
     while (std::chrono::steady_clock::now() < end) {
-        if (predicate()) { return true; }
+        if (predicate()) {
+            return true;
+        }
         std::this_thread::sleep_for(1ms);
     }
     return predicate();
 }
 
-int main() {
+int main()
+{
     g_bbt_coroutine_config->m_cfg_static_thread_num = 2;
     g_bbt_coroutine_config->m_cfg_processer_auto_scale = false;
     g_scheduler->Start();
 
     net::Engine engine{std::shared_ptr<net::RawHandler>{}};
-    if (engine.EnableAcceptHandoff(1)) { std::_Exit(2); }
+    if (engine.EnableAcceptHandoff(1)) {
+        std::_Exit(2);
+    }
 
     net::EngineConfig config;
     config.runtime_progress = net::RuntimeProgress::Independent;
     config.options.num_event_loop = 1;
     std::error_code error;
     config.listen_addresses = {net::Address::Ip("127.0.0.1", 0, error)};
-    if (error) { std::_Exit(2); }
+    if (error) {
+        std::_Exit(2);
+    }
 
     std::error_code run_error;
     std::thread runner([&] { run_error = engine.Run(config); });
@@ -102,24 +111,20 @@ int main() {
             address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
             address.sin_port = htons(addresses.at(0).Port());
             arm = true;
-            if (!::connect(peer, reinterpret_cast<sockaddr*>(&address), sizeof(address)) &&
-                Until([] { return arrived.load(); })) {
-                std::printf("PHASE kernel_accept_succeeded=1 acquired_fd=%d before_engine_raii=1\n",
-                            acquired.load());
+            if (!::connect(peer, reinterpret_cast<sockaddr*>(&address), sizeof(address))
+                && Until([] { return arrived.load(); })) {
+                std::printf("PHASE kernel_accept_succeeded=1 acquired_fd=%d before_engine_raii=1\n", acquired.load());
                 engine.RequestStopAccepting();
                 release_accept = true;
                 const bool stopped = Until([&] { return engine.AcceptingStopped(); });
-                std::printf("PHASE accept_stopped=%d connections=%zu\n",
-                            stopped, engine.CountConnections());
+                std::printf("PHASE accept_stopped=%d connections=%zu\n", stopped, engine.CountConnections());
 
                 // 核心断言：已 accept 但未交付的 fd 必须被物理关闭。
                 const int fd = acquired.load();
                 const bool fd_closed = (fd >= 0) && (::fcntl(fd, F_GETFD) < 0);
                 std::printf("RESULT run_error=%d stopped=%d connections=%zu "
                             "accepted_fd_closed=%d\n",
-                            run_error.value(),
-                            engine.Phase() == net::EnginePhase::Stopped,
-                            engine.CountConnections(),
+                            run_error.value(), engine.Phase() == net::EnginePhase::Stopped, engine.CountConnections(),
                             fd_closed ? 1 : 0);
 
                 result = (stopped && engine.CountConnections() == 0 && fd_closed) ? 0 : 2;
@@ -129,7 +134,9 @@ int main() {
     release_accept = true;
     engine.RequestClose();
     runner.join();
-    if (peer >= 0) { ::close(peer); }
+    if (peer >= 0) {
+        ::close(peer);
+    }
     std::fflush(nullptr);
     std::_Exit(result);
 }

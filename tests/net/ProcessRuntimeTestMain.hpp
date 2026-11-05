@@ -33,23 +33,30 @@ namespace bbt_net_test {
 // 刷新 C++ 与 C 标准流；返回 false 表示存在可检测到的刷新失败。
 // 注意：默认 sync_with_stdio 下，stdio 写失败的错误标志不会同步进 C++ 流
 // 状态，所以除 fflush 返回值外还要查 ferror(stdout/stderr)。
-inline bool FlushTestOutput() {
+inline bool FlushTestOutput()
+{
     std::cout.flush();
     std::cerr.flush();
     std::clog.flush();
-    if (std::fflush(nullptr) != 0) { return false; }
-    if (std::ferror(stdout) != 0 || std::ferror(stderr) != 0) { return false; }
+    if (std::fflush(nullptr) != 0) {
+        return false;
+    }
+    if (std::ferror(stdout) != 0 || std::ferror(stderr) != 0) {
+        return false;
+    }
     return !std::cout.fail() && !std::cerr.fail() && !std::clog.fail();
 }
 
 // 测试进程唯一出口：run() 返回原退出码；此处所有测试局部对象已析构，
 // 刷新输出后以 std::_Exit 结束，跳过静态析构/atexit 窗口。
-template <typename Run>
-int RunTestProcessExit(Run&& run) {
+template <typename Run> int RunTestProcessExit(Run&& run)
+{
     int code = run();
     const bool output_flushed = FlushTestOutput();
-    if (code == 0 && !output_flushed) { code = 1; }
+    if (code == 0 && !output_flushed) {
+        code = 1;
+    }
     std::_Exit(code);
 }
 
-}  // namespace bbt_net_test
+} // namespace bbt_net_test

@@ -12,7 +12,7 @@
 // 实现放 .cc：Read/Write/WaitClosed 的等待路径要复用 ConnectionState/
 // ReceiveRing/close hub 与统一 gate；这些是 detail 部件，不进公共头。
 //
-// Read 走 ring 的 pop-all 移交：Busy/WouldBlock 等待舞步与 CoRead 同构
+// Read 走 ring 的 pop-all 移交：Busy/WouldBlock 的等待步骤与 ring 等待协议一致
 // （Busy 前先采 release 代次、waiter 在 on_registered 才入 hub、复查谓词），
 // 唯一差异是取数原语——TryPopAll 移交整段 backing（含绕环两段与
 // pending/detached 尾部），载荷零复制；额度在移交成功瞬间立即释放。
@@ -32,14 +32,13 @@ ConnectionStatus CoTcpConnection::Status() const
     status.closed = m_conn.Closed();
     status.close_reason = m_conn.CloseReason();
     status.released = m_conn.Released();
-    status.write = m_conn.WriteAcceptance();  // 写接纳状态真源采样
+    status.write = m_conn.WriteAcceptance(); // 写接纳状态真源采样
     return status;
 }
 
-std::error_code CoTcpConnection::Read(
-    Buffer& out, const bbt::coroutine::WaitOptions& options)
+std::error_code CoTcpConnection::Read(Buffer& out, const bbt::coroutine::WaitOptions& options)
 {
-    // gate 与 CoRead 同源且先于任何状态判定/保护取得。
+    // gate 先于任何状态判定与保护的获取。
     if (const auto gate = RequireCoroutineContext()) {
         return gate;
     }
@@ -48,13 +47,12 @@ std::error_code CoTcpConnection::Read(
         if (!state) {
             return make_error_code(NetErrc::Closed);
         }
-        // 与 CoRead 相同的关键时序：在导致 Busy 的尝试之前采 release 代次，
+        // 关键时序：在导致 Busy 的尝试之前采 release 代次，
         // 否则持锁方可能在「Busy 返回」与「采样」之间释放并推进代次，造成
         // on_registered 复查相等而永久等下一次 release。
         const std::uint64_t generation = state->ring.AccessGeneration();
         const auto error = m_conn.TryRead(out);
-        if (error != make_error_code(NetErrc::WouldBlock)
-            && error != make_error_code(NetErrc::Busy)) {
+        if (error != make_error_code(NetErrc::WouldBlock) && error != make_error_code(NetErrc::Busy)) {
             return error;
         }
         const bool busy = error == make_error_code(NetErrc::Busy);
@@ -63,25 +61,22 @@ std::error_code CoTcpConnection::Read(
         } else {
             state->ring.InvokeWouldBlockBeforeWaiterHookForTest();
         }
-        auto waiter = busy ? state->ring.CreateReleaseWaiter()
-                           : state->ring.CreateDataWaiter();
+        auto waiter = busy ? state->ring.CreateReleaseWaiter() : state->ring.CreateDataWaiter();
         if (!waiter) {
             return std::make_error_code(std::errc::no_buffer_space);
         }
         bool add_failed = false;
         const auto status = waiter->WaitWithCallback(options, [&] {
-            const bool added = busy ? state->ring.AddReleaseWaiter(waiter)
-                                    : state->ring.AddDataWaiter(waiter);
+            const bool added = busy ? state->ring.AddReleaseWaiter(waiter) : state->ring.AddDataWaiter(waiter);
             if (!added) {
                 add_failed = true;
                 waiter->Notify();
                 return true;
             }
             state->ring.InvokeAfterAddHookForTest();
-            const bool ready = busy
-                ? (state->ring.AccessGeneration() != generation)
-                : (state->ring.Size() > 0 || state->ring.ReadEof()
-                   || state->ring.HasReadError() || state->ring.ReadClosed());
+            const bool ready = busy ? (state->ring.AccessGeneration() != generation)
+                                    : (state->ring.Size() > 0 || state->ring.ReadEof() || state->ring.HasReadError()
+                                       || state->ring.ReadClosed());
             if (ready) {
                 waiter->Notify();
             }
@@ -113,8 +108,7 @@ WriteOperation CoTcpConnection::AsyncWrite(std::string data)
     return WriteOperation(std::move(record), state);
 }
 
-WriteReport CoTcpConnection::Write(std::string data,
-                                   const bbt::coroutine::WaitOptions& options)
+WriteReport CoTcpConnection::Write(std::string data, const bbt::coroutine::WaitOptions& options)
 {
     // 等容量 → 接纳 → 等本地完成，同一绝对 deadline 沿重试保持。
     // wait_error 只描述等待/调用结果：接纳后 Done+error 落在
@@ -194,16 +188,15 @@ WriteReport CoTcpConnection::Write(std::string data,
     }
 }
 
-std::error_code CoTcpConnection::WaitClosed(
-    const bbt::coroutine::WaitOptions& options)
+std::error_code CoTcpConnection::WaitClosed(const bbt::coroutine::WaitOptions& options)
 {
-    // gate 先于状态判定（与 CoRead/CoWrite 同契约）。
+    // gate 先于状态判定。
     if (const auto gate = RequireCoroutineContext()) {
         return gate;
     }
     const auto state = CoAccess::StateOf(m_conn);
     if (!state) {
-        return {};  // 无效句柄视为已关闭终态
+        return {}; // 无效句柄视为已关闭终态
     }
     for (;;) {
         if (m_conn.Closed()) {
@@ -232,7 +225,7 @@ std::error_code CoTcpConnection::WaitClosed(
             return std::make_error_code(std::errc::no_buffer_space);
         }
         if (status != bbt::coroutine::WaitStatus::Completed) {
-            return WaitStatusError(status);  // 超时/取消不关闭连接
+            return WaitStatusError(status); // 超时/取消不关闭连接
         }
     }
 }

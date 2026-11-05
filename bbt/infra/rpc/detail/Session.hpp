@@ -36,23 +36,18 @@ namespace detail {
  */
 class AdmissionAccess {
 public:
-    static std::shared_ptr<AdmissionQueue> MakeQueue(
-        std::shared_ptr<AdmissionQueueImpl> impl);
-    static std::shared_ptr<ReplyCompletion> MakeReply(
-        std::shared_ptr<ReplyCompletionImpl> impl);
-    static std::shared_ptr<AdmissionLease> MakeLease(
-        std::shared_ptr<AdmissionLeaseImpl> impl);
+    static std::shared_ptr<AdmissionQueue> MakeQueue(std::shared_ptr<AdmissionQueueImpl> impl);
+    static std::shared_ptr<ReplyCompletion> MakeReply(std::shared_ptr<ReplyCompletionImpl> impl);
+    static std::shared_ptr<AdmissionLease> MakeLease(std::shared_ptr<AdmissionLeaseImpl> impl);
 
     /// @brief 把 reply 标记为 terminal 并交出 impl；非首次/无效返回 nullptr。
     ///
     /// 给 reader 上的拒绝路径用：reader 不能挂起等写终态，只能把错误帧入队，
     /// 写责任仍由 writer/Kill 在真实终态结算。
-    static std::shared_ptr<ReplyCompletionImpl> ClaimTerminal(
-        ReplyCompletion& reply) noexcept;
+    static std::shared_ptr<ReplyCompletionImpl> ClaimTerminal(ReplyCompletion& reply) noexcept;
 
     /// @brief 把队列挂到 server 台账（只由 ServerV2Start 调一次）。
-    static void AttachQueue(const std::shared_ptr<AdmissionQueue>& queue,
-                            const std::shared_ptr<ServerV2State>& server);
+    static void AttachQueue(const std::shared_ptr<AdmissionQueue>& queue, const std::shared_ptr<ServerV2State>& server);
 };
 
 // 受控检查点控制器 SessionHooks 是公开类型（bbt/infra/rpc/Hooks.hpp），
@@ -74,8 +69,7 @@ struct ServerV2Ledger {
 ServerV2Ledger ServerV2LedgerForTest(const Server& server) noexcept;
 
 /// @brief ServerV2State 直参版本的台账快照（供 Server.cc 的句柄版本转调）。
-ServerV2Ledger ServerV2LedgerOf(
-    const std::shared_ptr<ServerV2State>& v2) noexcept;
+ServerV2Ledger ServerV2LedgerOf(const std::shared_ptr<ServerV2State>& v2) noexcept;
 
 /**
  * @brief 在一个注入的 `ICoConnection` 上跑一次入站握手。
@@ -86,11 +80,10 @@ ServerV2Ledger ServerV2LedgerOf(
  * 函数不接管、不关闭连接。返回选定的 epoch，`out_decoder` 收编握手后同批
  * 余帧。
  */
-result<std::uint64_t> InboundHandshakeOnConnection(
-    net::ICoConnection& conn, const ClientOptions& options,
-    std::uint64_t proposal, std::uint64_t nonce,
-    std::string& out_peer_identity, SessionFrameDecoder& out_decoder,
-    bbt::coroutine::Deadline deadline);
+result<std::uint64_t> InboundHandshakeOnConnection(net::ICoConnection& conn, const ClientOptions& options,
+                                                   std::uint64_t proposal, std::uint64_t nonce,
+                                                   std::string& out_peer_identity, SessionFrameDecoder& out_decoder,
+                                                   bbt::coroutine::Deadline deadline);
 
 /**
  * @brief v2 owner 逻辑封口：幂等、不可重开，发布首个关闭原因。
@@ -101,8 +94,7 @@ result<std::uint64_t> InboundHandshakeOnConnection(
  * 等待顺序与业务任务停止由用户控制。关闭原因不在内部出口附加，统一由
  * Call/Send 的调用方可见返回点读取 owner 原因后附加到 Error.details。
  */
-void SessionOwnerSeal(const std::shared_ptr<SessionOwnerState>& owner,
-                      Error reason) noexcept;
+void SessionOwnerSeal(const std::shared_ptr<SessionOwnerState>& owner, Error reason) noexcept;
 bool SessionOwnerClosed(const SessionOwnerState& owner) noexcept;
 std::optional<Error> SessionOwnerCloseReason(const SessionOwnerState& owner);
 
@@ -115,17 +107,13 @@ std::optional<Error> SessionOwnerCloseReason(const SessionOwnerState& owner);
  * 关闭原因，已排空先胜返回 ok；重复调用仍 Draining 且有在途返回
  * Overloaded（Busy）；已 Closed 返回首个关闭原因。
  */
-result<void> SessionOwnerShutdown(
-    const std::shared_ptr<SessionOwnerState>& owner,
-    bbt::coroutine::Deadline deadline);
+result<void> SessionOwnerShutdown(const std::shared_ptr<SessionOwnerState>& owner, bbt::coroutine::Deadline deadline);
 
 // Call/Send 的接纳责任：与 Closed/Draining 同门（owner->mu）拒绝或计数；
 // 每个成功接纳必须恰好一次 EndOperation 归还。EndOperation 唤醒 Shutdown
 // 等待者。
-bool SessionOwnerBeginOperation(const std::shared_ptr<SessionOwnerState>& owner,
-                                Error& closed_error);
-void SessionOwnerEndOperation(
-    const std::shared_ptr<SessionOwnerState>& owner) noexcept;
+bool SessionOwnerBeginOperation(const std::shared_ptr<SessionOwnerState>& owner, Error& closed_error);
+void SessionOwnerEndOperation(const std::shared_ptr<SessionOwnerState>& owner) noexcept;
 
 /**
  * @brief v2 Server 生命周期入口（实现唯一在 Session.cc）。
@@ -141,12 +129,9 @@ bool ServerV2Closed(const ServerV2State& v2) noexcept;
 std::optional<Error> ServerV2CloseReason(const ServerV2State& v2);
 void ServerV2StopAccepting(const std::shared_ptr<ServerV2State>& v2) noexcept;
 result<void> ServerV2Start(const std::shared_ptr<ServerV2State>& v2);
-result<void> ServerV2Shutdown(const std::shared_ptr<ServerV2State>& v2,
-                              bbt::coroutine::Deadline deadline);
-result<void> ServerV2Drain(const std::shared_ptr<ServerV2State>& v2,
-                           bbt::coroutine::Deadline deadline);
-result<void> ServerV2WaitStopped(const std::shared_ptr<ServerV2State>& v2,
-                                 bbt::coroutine::Deadline deadline);
+result<void> ServerV2Shutdown(const std::shared_ptr<ServerV2State>& v2, bbt::coroutine::Deadline deadline);
+result<void> ServerV2Drain(const std::shared_ptr<ServerV2State>& v2, bbt::coroutine::Deadline deadline);
+result<void> ServerV2WaitStopped(const std::shared_ptr<ServerV2State>& v2, bbt::coroutine::Deadline deadline);
 
 } // namespace detail
 } // namespace bbt::infra::rpc

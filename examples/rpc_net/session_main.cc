@@ -32,33 +32,36 @@ using Clock = std::chrono::steady_clock;
 
 namespace {
 
-int Fail(const char* message) {
+int Fail(const char* message)
+{
     std::cerr << "FAIL " << message << '\n';
     return 1;
 }
 
-template <class F>
-auto SubmitCo(F fn) -> std::future<decltype(fn())> {
+template <class F> auto SubmitCo(F fn) -> std::future<decltype(fn())>
+{
     using T = decltype(fn());
     auto promise = std::make_shared<std::promise<T>>();
     auto future = promise->get_future();
     bool registered = false;
-    g_scheduler->RegistCoroutineTask(256 * 1024,
+    g_scheduler->RegistCoroutineTask(
+        256 * 1024,
         [promise, callback = std::move(fn)]() mutable {
-            try { promise->set_value(callback()); }
-            catch (...) { promise->set_exception(std::current_exception()); }
+            try {
+                promise->set_value(callback());
+            } catch (...) {
+                promise->set_exception(std::current_exception());
+            }
         },
         registered);
     if (!registered) {
-        promise->set_exception(std::make_exception_ptr(
-            std::runtime_error("task registration failed")));
+        promise->set_exception(std::make_exception_ptr(std::runtime_error("task registration failed")));
     }
     return future;
 }
 
 struct Assembly {
-    std::shared_ptr<net::Engine> engine{
-        net::Engine::Create(std::shared_ptr<net::RawHandler>{})};
+    std::shared_ptr<net::Engine> engine{net::Engine::Create(std::shared_ptr<net::RawHandler>{})};
     std::shared_ptr<rpc::Client> client;
     std::shared_ptr<rpc::Server> server;
     std::thread runner;
@@ -68,59 +71,80 @@ struct Assembly {
     std::deque<rpc::AdmissionItem> admitted;
     std::uint64_t admitted_total = 0;
 
-    bool Start(const std::string& identity, bool listen) {
+    bool Start(const std::string& identity, bool listen)
+    {
         rpc::ClientOptions co;
         co.SetLocalIdentity(identity).SetTrustedNetworkPlaintext(true);
         auto made_client = rpc::Client::Create(engine, co);
-        if (!made_client) { return false; }
+        if (!made_client) {
+            return false;
+        }
         client = std::move(made_client).value();
 
         rpc::ServerOptions so;
         std::error_code error;
         so.SetListenAddress(net::Address::Ip("127.0.0.1", 0, error));
-        if (error) { return false; }
-        auto made = rpc::Server::Create(engine, client,
+        if (error) {
+            return false;
+        }
+        auto made = rpc::Server::Create(
+            engine, client,
             [this](rpc::AdmissionItem&& item) -> bbt::infra::result<void> {
                 std::lock_guard<std::mutex> lock(mu);
                 admitted.push_back(std::move(item));
                 return bbt::infra::result<void>::ok();
             },
             so);
-        if (!made) { return false; }
+        if (!made) {
+            return false;
+        }
         server = std::move(made).value();
 
         net::EngineConfig config;
         config.runtime_progress = net::RuntimeProgress::Independent;
         config.options.num_event_loop = 1;
-        if (listen) { config.listen_addresses = {so.ListenAddress()}; }
-        runner = std::thread([this, config] {
-            run_error = engine->Run(config);
-        });
+        if (listen) {
+            config.listen_addresses = {so.ListenAddress()};
+        }
+        runner = std::thread([this, config] { run_error = engine->Run(config); });
         const auto deadline = Clock::now() + 5s;
         while (engine->Phase() != net::EnginePhase::Running) {
-            if (Clock::now() > deadline) { return false; }
+            if (Clock::now() > deadline) {
+                return false;
+            }
             std::this_thread::sleep_for(1ms);
         }
-        if (!server->Start()) { return false; }
+        if (!server->Start()) {
+            return false;
+        }
         if (listen) {
             auto local = server->LocalAddress();
-            if (!local) { return false; }
+            if (!local) {
+                return false;
+            }
             address = local.value();
         }
         return true;
     }
-    ~Assembly() {
-        if (server) { server->Close(); }
+    ~Assembly()
+    {
+        if (server) {
+            server->Close();
+        }
         engine->RequestClose();
-        if (runner.joinable()) { runner.join(); }
+        if (runner.joinable()) {
+            runner.join();
+        }
     }
 
-    bool HasPendingAdmissions() {
+    bool HasPendingAdmissions()
+    {
         std::lock_guard<std::mutex> lock(mu);
         return !admitted.empty();
     }
 
-    void PumpOnce() {
+    void PumpOnce()
+    {
         std::deque<rpc::AdmissionItem> items;
         {
             std::lock_guard<std::mutex> lock(mu);
@@ -135,17 +159,19 @@ struct Assembly {
                 // native pump 线程不能直接调用（返回 InvalidContext 且不回
                 // 复）。把 Complete 提交到 scheduler 的受管协程执行，回复
                 // 是否到达由对端 Call 结果证明；不静默丢弃 InvalidContext。
-                SubmitCo([reply = item.reply,
-                          response = std::move(response)]() mutable {
+                SubmitCo([reply = item.reply, response = std::move(response)]() mutable {
                     return bbt_co_await reply->Complete(std::move(response));
                 });
             }
-            if (item.lease) { item.lease->Release(); }
+            if (item.lease) {
+                item.lease->Release();
+            }
         }
     }
 };
 
-int RunServer() {
+int RunServer()
+{
     Assembly app;
     if (!app.Start("session-server", /*listen=*/true)) {
         return Fail("server start failed");
@@ -159,7 +185,9 @@ int RunServer() {
     std::thread stdin_watcher([&stop] {
         std::string line;
         while (std::getline(std::cin, line)) {
-            if (line.rfind("shutdown", 0) == 0) { break; }
+            if (line.rfind("shutdown", 0) == 0) {
+                break;
+            }
         }
         stop.store(true);
     });
@@ -180,21 +208,25 @@ int RunServer() {
     }
     const auto drained = app.server->Shutdown(Clock::now() + 3s);
     app.server->Close();
-    if (!drained) { return Fail("server shutdown failed"); }
-    if (!app.server->IsClosed()) { return Fail("server not closed after close"); }
+    if (!drained) {
+        return Fail("server shutdown failed");
+    }
+    if (!app.server->IsClosed()) {
+        return Fail("server not closed after close");
+    }
     const auto server_stats = app.server->Stats();
     if (!normal_stop) {
         std::cerr << "FAIL server hit 60s backstop (driver lost?)\n";
         return 1;
     }
-    std::cout << "SERVER CLOSED ok admitted=" << app.admitted_total
-              << " accepted=" << server_stats.accepted_connections
+    std::cout << "SERVER CLOSED ok admitted=" << app.admitted_total << " accepted=" << server_stats.accepted_connections
               << " active=" << server_stats.active_connections << '\n'
               << std::flush;
     return 0;
 }
 
-int RunClient(std::uint16_t port) {
+int RunClient(std::uint16_t port)
+{
     Assembly app;
     if (!app.Start("session-client", /*listen=*/false)) {
         return Fail("client start failed");
@@ -207,26 +239,28 @@ int RunClient(std::uint16_t port) {
         request.SetRequestId("consumer-call")
             .SetReply(rpc::ReplyMode::Required)
             .SetTraffic(rpc::TrafficClass::Service)
-            .SetOrderingKey("k").SetSequence(1)
-            .SetRequestSchema("req").SetResponseSchema("resp");
+            .SetOrderingKey("k")
+            .SetSequence(1)
+            .SetRequestSchema("req")
+            .SetResponseSchema("resp");
         std::string payload = "consumer-payload";
         request.SetPayload({payload.begin(), payload.end()});
         CallOptions options;
         options.deadline = Clock::now() + 5s;
-        return bbt_co_await app.client->Call(target, std::move(request),
-                                           options);
+        return bbt_co_await app.client->Call(target, std::move(request), options);
     });
     // pump server admission from client side thread (server 进程已 pump)。
     const auto reply = [&] {
         const auto status = call_future.wait_for(5s);
         if (status != std::future_status::ready) {
             return bbt::infra::result<rpc::Response>::err(
-                bbt::infra::MakeError(bbt::infra::ErrorCode::TimedOut,
-                                      "call wait timed out"));
+                bbt::infra::MakeError(bbt::infra::ErrorCode::TimedOut, "call wait timed out"));
         }
         return call_future.get();
     }();
-    if (!reply) { return Fail("call failed"); }
+    if (!reply) {
+        return Fail("call failed");
+    }
     if (reply.value().RequestId() != "consumer-call") {
         return Fail("call correlation mismatch");
     }
@@ -237,38 +271,42 @@ int RunClient(std::uint16_t port) {
         message.SetMessageId("consumer-send")
             .SetReply(rpc::ReplyMode::None)
             .SetTraffic(rpc::TrafficClass::Service)
-            .SetOrderingKey("k").SetSequence(2)
-            .SetRequestSchema("req").SetResponseSchema("resp");
+            .SetOrderingKey("k")
+            .SetSequence(2)
+            .SetRequestSchema("req")
+            .SetResponseSchema("resp");
         rpc::SendOptions options;
         options.SetDeadline(Clock::now() + 5s);
         options.RequireRemoteAcceptance(true);
-        return bbt_co_await app.client->Send(target, std::move(message),
-                                           options);
+        return bbt_co_await app.client->Send(target, std::move(message), options);
     });
     const auto sent = [&] {
         const auto status = send_future.wait_for(5s);
         if (status != std::future_status::ready) {
             return bbt::infra::result<void>::err(
-                bbt::infra::MakeError(bbt::infra::ErrorCode::TimedOut,
-                                      "send wait timed out"));
+                bbt::infra::MakeError(bbt::infra::ErrorCode::TimedOut, "send wait timed out"));
         }
         return send_future.get();
     }();
-    if (!sent) { return Fail("send acceptance failed"); }
+    if (!sent) {
+        return Fail("send acceptance failed");
+    }
 
     const auto stats = app.client->Stats();
     if (stats.sessions != 1 || stats.links != 1) {
         return Fail("expected exactly one session and one link");
     }
-    std::cout << "CONSUMER PASS sessions=" << stats.sessions
-              << " links=" << stats.links << '\n' << std::flush;
+    std::cout << "CONSUMER PASS sessions=" << stats.sessions << " links=" << stats.links << '\n' << std::flush;
     return 0;
 }
 
 } // namespace
 
-int main(int argc, char** argv) {
-    if (argc < 2) { return Fail("usage: server|client <port>"); }
+int main(int argc, char** argv)
+{
+    if (argc < 2) {
+        return Fail("usage: server|client <port>");
+    }
     g_bbt_coroutine_config->m_cfg_static_thread_num = 4;
     g_bbt_coroutine_config->m_cfg_stack_size = 256 * 1024;
     g_bbt_coroutine_config->m_cfg_processer_auto_scale = false;

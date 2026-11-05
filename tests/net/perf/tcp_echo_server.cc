@@ -77,77 +77,102 @@ int g_read_timeout_ms = 200;
 
 struct Metrics {
     std::atomic<std::uint64_t> accepted{0};
-    std::atomic<std::uint64_t> completed{0};     // 成功 echo 的 data 帧数
-    std::atomic<std::uint64_t> echoed_fin{0};    // 已回显的 fin 帧数（fin 对账）
-    std::atomic<std::uint64_t> bytes_in{0};      // 已消费协议字节（含头）
+    std::atomic<std::uint64_t> completed{0};  // 成功 echo 的 data 帧数
+    std::atomic<std::uint64_t> echoed_fin{0}; // 已回显的 fin 帧数（fin 对账）
+    std::atomic<std::uint64_t> bytes_in{0};   // 已消费协议字节（含头）
     std::atomic<std::uint64_t> bytes_out{0};
-    std::atomic<std::uint64_t> errors{0};        // 写失败/连接级错误
-    std::atomic<std::uint64_t> frames_bad{0};    // magic/长度/内容校验失败
-    std::atomic<std::uint64_t> seq_bad{0};       // 帧序重复/缺失/乱序
+    std::atomic<std::uint64_t> errors{0};     // 写失败/连接级错误
+    std::atomic<std::uint64_t> frames_bad{0}; // magic/长度/内容校验失败
+    std::atomic<std::uint64_t> seq_bad{0};    // 帧序重复/缺失/乱序
 };
 Metrics g_metrics;
-std::atomic<std::uint64_t> g_write_closed{0};  // 对端先关导致的良性 echo 写失败
+std::atomic<std::uint64_t> g_write_closed{0}; // 对端先关导致的良性 echo 写失败
 
 // 已接受未释放连接的活动记账（teardown 判据；容器有界=活动数，不积累历史）。
 // co 模式同一计数器同时覆盖 accept 任务与 conn 协程：收口后 pending!=0 即失败。
 std::mutex g_active_mu;
 std::condition_variable g_active_cv;
 std::int64_t g_active_conns = 0;
-std::int64_t g_pending_tasks = 0;  // 已提交未完成的协程任务（accept+conn）
+std::int64_t g_pending_tasks = 0; // 已提交未完成的协程任务（accept+conn）
 
-void TrackTaskBegin() {
+void TrackTaskBegin()
+{
     std::lock_guard<std::mutex> lk(g_active_mu);
     ++g_pending_tasks;
 }
-void TrackTaskEnd() {
+void TrackTaskEnd()
+{
     std::lock_guard<std::mutex> lk(g_active_mu);
     --g_pending_tasks;
     g_active_cv.notify_all();
 }
 
 // 等待所有协程任务归零（deadline 有界）；false=超时仍有未完成任务。
-bool WaitTasksDone(std::chrono::steady_clock::time_point deadline) {
+bool WaitTasksDone(std::chrono::steady_clock::time_point deadline)
+{
     std::unique_lock<std::mutex> lk(g_active_mu);
-    return g_active_cv.wait_until(lk, deadline,
-                                  [] { return g_pending_tasks == 0; });
+    return g_active_cv.wait_until(lk, deadline, [] { return g_pending_tasks == 0; });
 }
-std::int64_t PendingTasks() {
+std::int64_t PendingTasks()
+{
     std::lock_guard<std::mutex> lk(g_active_mu);
     return g_pending_tasks;
 }
-std::int64_t ActiveConns() {
+std::int64_t ActiveConns()
+{
     std::lock_guard<std::mutex> lk(g_active_mu);
     return g_active_conns;
 }
 
-void EmitStatsLine() {
+void EmitStatsLine()
+{
     const auto proc = ReadProcSelf();
     Json j;
-    j.K("role").V("server_stat")
-     .K("accepted").V(static_cast<std::uint64_t>(g_metrics.accepted.load()))
-     .K("completed").V(static_cast<std::uint64_t>(g_metrics.completed.load()))
-     .K("echoed_fin").V(static_cast<std::uint64_t>(g_metrics.echoed_fin.load()))
-     .K("bytes_in").V(static_cast<std::uint64_t>(g_metrics.bytes_in.load()))
-     .K("bytes_out").V(static_cast<std::uint64_t>(g_metrics.bytes_out.load()))
-     .K("errors").V(static_cast<std::uint64_t>(g_metrics.errors.load()))
-     .K("frames_bad").V(static_cast<std::uint64_t>(g_metrics.frames_bad.load()))
-     .K("seq_bad").V(static_cast<std::uint64_t>(g_metrics.seq_bad.load()))
-     .K("write_closed").V(static_cast<std::uint64_t>(g_write_closed.load()))
-     .K("active_conns").V(ActiveConns())
-     .K("proc_ok").V(proc.ok)
-     .K("cpu_ticks").V(proc.utime_ticks + proc.stime_ticks)
-     .K("ticks_per_second").V(static_cast<std::uint64_t>(TicksPerSecond()))
-     .K("rss_bytes").V(proc.rss_pages * static_cast<std::uint64_t>(PageBytes()));
+    j.K("role")
+        .V("server_stat")
+        .K("accepted")
+        .V(static_cast<std::uint64_t>(g_metrics.accepted.load()))
+        .K("completed")
+        .V(static_cast<std::uint64_t>(g_metrics.completed.load()))
+        .K("echoed_fin")
+        .V(static_cast<std::uint64_t>(g_metrics.echoed_fin.load()))
+        .K("bytes_in")
+        .V(static_cast<std::uint64_t>(g_metrics.bytes_in.load()))
+        .K("bytes_out")
+        .V(static_cast<std::uint64_t>(g_metrics.bytes_out.load()))
+        .K("errors")
+        .V(static_cast<std::uint64_t>(g_metrics.errors.load()))
+        .K("frames_bad")
+        .V(static_cast<std::uint64_t>(g_metrics.frames_bad.load()))
+        .K("seq_bad")
+        .V(static_cast<std::uint64_t>(g_metrics.seq_bad.load()))
+        .K("write_closed")
+        .V(static_cast<std::uint64_t>(g_write_closed.load()))
+        .K("active_conns")
+        .V(ActiveConns())
+        .K("proc_ok")
+        .V(proc.ok)
+        .K("cpu_ticks")
+        .V(proc.utime_ticks + proc.stime_ticks)
+        .K("ticks_per_second")
+        .V(static_cast<std::uint64_t>(TicksPerSecond()))
+        .K("rss_bytes")
+        .V(proc.rss_pages * static_cast<std::uint64_t>(PageBytes()));
     std::cout << j.Done() << '\n';
     std::cout.flush();
 }
 
-void EmitFinOverheadLine() {
+void EmitFinOverheadLine()
+{
     Json j;
-    j.K("role").V("fin_overhead")
-     .K("accepted").V(static_cast<std::uint64_t>(g_metrics.accepted.load()))
-     .K("echoed_fin").V(static_cast<std::uint64_t>(g_metrics.echoed_fin.load()))
-     .K("active_conns").V(ActiveConns());
+    j.K("role")
+        .V("fin_overhead")
+        .K("accepted")
+        .V(static_cast<std::uint64_t>(g_metrics.accepted.load()))
+        .K("echoed_fin")
+        .V(static_cast<std::uint64_t>(g_metrics.echoed_fin.load()))
+        .K("active_conns")
+        .V(ActiveConns());
     std::cout << j.Done() << '\n';
     std::cout.flush();
 }
@@ -164,12 +189,12 @@ struct RawEchoHandler : RawHandler {
     struct Slot {
         std::mutex mu;
         FrameParser parser;
-        std::deque<std::string> pending;          // 待 echo 的完整帧（含头），FIFO
-        std::shared_ptr<ConnectionState> state;   // 身份：防 Id 复用后误删后继 slot
-        std::uint64_t expected_seq{0};            // 下一帧期望 seq（帧序完整性）
-        bool eof{false};                          // 对端 FIN（读终态）已见；
+        std::deque<std::string> pending;        // 待 echo 的完整帧（含头），FIFO
+        std::shared_ptr<ConnectionState> state; // 身份：防 Id 复用后误删后继 slot
+        std::uint64_t expected_seq{0};          // 下一帧期望 seq（帧序完整性）
+        bool eof{false};                        // 对端 FIN（读终态）已见；
                                                 // pending 排空后须 RequestClose
-        bool close_requested{false};              // 已发起 RequestClose（幂等去重）
+        bool close_requested{false};            // 已发起 RequestClose（幂等去重）
     };
     std::mutex mu;
     std::map<std::uint64_t, std::shared_ptr<Slot>> parsers;
@@ -177,7 +202,8 @@ struct RawEchoHandler : RawHandler {
     // key=conn Id，值=slot；OnClose 时按 state 匹配删（同 OnClose 的 Id 复用防御）。
     std::map<std::uint64_t, std::shared_ptr<Slot>> eof_pending;
 
-    void OnAccept(Connection connection) override {
+    void OnAccept(Connection connection) override
+    {
         g_metrics.accepted.fetch_add(1);
         {
             std::lock_guard<std::mutex> lk(g_active_mu);
@@ -195,7 +221,8 @@ struct RawEchoHandler : RawHandler {
 
     // 尽力发 pending 头部（FIFO，遇容量满停）。false=对端终态/真实写错（调用方
     // 收尾 RequestClose）。调用方持 slot->mu；用 front() 引用发送避免移动丢失。
-    bool FlushPending(Connection& connection, Slot& slot) {
+    bool FlushPending(Connection& connection, Slot& slot)
+    {
         while (!slot.pending.empty()) {
             WriteOperation op;
             const auto err = connection.AsyncWrite(slot.pending.front(), op);
@@ -205,13 +232,11 @@ struct RawEchoHandler : RawHandler {
                 continue;
             }
             if (err == std::make_error_code(std::errc::no_buffer_space)) {
-                return true;  // 仍满：留给下一次 OnWrite/OnRead 补投
+                return true; // 仍满：留给下一次 OnWrite/OnRead 补投
             }
-            if (err == make_error_code(NetErrc::Closed) ||
-                err == make_error_code(NetErrc::Eof) ||
-                err == make_error_code(NetErrc::WriteSettling)) {
-                g_write_closed.fetch_add(
-                    static_cast<std::uint64_t>(slot.pending.size()));
+            if (err == make_error_code(NetErrc::Closed) || err == make_error_code(NetErrc::Eof)
+                || err == make_error_code(NetErrc::WriteSettling)) {
+                g_write_closed.fetch_add(static_cast<std::uint64_t>(slot.pending.size()));
                 slot.pending.clear();
                 return false;
             }
@@ -224,7 +249,8 @@ struct RawEchoHandler : RawHandler {
 
     // EOF 收尾：读终态后 pending 已空（或 FlushPending 排空）→ RequestClose；
     // 仍有待发 → 登记 eof_pending 由 OnWrite 排空后关。调用方持 slot->mu。
-    void CloseOrDefer(Connection& connection, std::shared_ptr<Slot>& slot) {
+    void CloseOrDefer(Connection& connection, std::shared_ptr<Slot>& slot)
+    {
         if (!slot->pending.empty()) {
             std::lock_guard<std::mutex> lk(mu);
             eof_pending[connection.Id()] = slot;
@@ -238,8 +264,8 @@ struct RawEchoHandler : RawHandler {
 
     // 喂一段字节流并把所有完整帧入 pending；false=协议错（frames_bad/seq_bad
     // 已计数），调用方 RequestClose。调用方持 slot->mu。
-    bool DrainToPending(Slot& slot,
-                        const char* data, std::size_t size) {
+    bool DrainToPending(Slot& slot, const char* data, std::size_t size)
+    {
         if (!slot.parser.Feed(data, size)) {
             g_metrics.frames_bad.fetch_add(1);
             g_metrics.errors.fetch_add(1);
@@ -261,18 +287,22 @@ struct RawEchoHandler : RawHandler {
                 return false;
             }
             slot.pending.push_back(std::move(frame));
-            if (kind == kKindData) g_metrics.completed.fetch_add(1);
-            else if (kind == kKindFin) g_metrics.echoed_fin.fetch_add(1);
+            if (kind == kKindData)
+                g_metrics.completed.fetch_add(1);
+            else if (kind == kKindFin)
+                g_metrics.echoed_fin.fetch_add(1);
         }
         return true;
     }
 
-    void OnRead(Connection connection) override {
+    void OnRead(Connection connection) override
+    {
         std::shared_ptr<Slot> slot;
         {
             std::lock_guard<std::mutex> lk(mu);
             const auto it = parsers.find(connection.Id());
-            if (it == parsers.end()) return;
+            if (it == parsers.end())
+                return;
             slot = it->second;
         }
         std::lock_guard<std::mutex> data_lk(slot->mu);
@@ -281,7 +311,8 @@ struct RawEchoHandler : RawHandler {
             std::string data;
             const auto result = connection.TryRead(data);
             if (result.status == ReadStatus::Ok) {
-                if (data.empty()) break;  // Ok 但无数据：本批已尽
+                if (data.empty())
+                    break; // Ok 但无数据：本批已尽
                 g_metrics.bytes_in.fetch_add(data.size());
                 if (!DrainToPending(*slot, data.data(), data.size())) {
                     slot->close_requested = true;
@@ -290,8 +321,7 @@ struct RawEchoHandler : RawHandler {
                 }
                 continue;
             }
-            if (result.status == ReadStatus::Busy ||
-                result.status == ReadStatus::WouldBlock) {
+            if (result.status == ReadStatus::Busy || result.status == ReadStatus::WouldBlock) {
                 // Busy：他线程正在读，留待其释放触发的重投 OnRead；
                 // WouldBlock：本批可读数据已尽且无终态——正常中途，不关。
                 break;
@@ -299,10 +329,11 @@ struct RawEchoHandler : RawHandler {
             if (result.status == ReadStatus::Error) {
                 g_metrics.errors.fetch_add(1);
             }
-            terminal = true;  // Eof / Error 终态
+            terminal = true; // Eof / Error 终态
             break;
         }
-        if (terminal) slot->eof = true;
+        if (terminal)
+            slot->eof = true;
         // 尽力补投；剩余容量不足时留队，由 OnWrite/下次 OnRead 继续。
         if (!FlushPending(connection, *slot)) {
             slot->close_requested = true;
@@ -311,16 +342,19 @@ struct RawEchoHandler : RawHandler {
         }
         // 产品契约：EOF 不关闭写侧——应用层见对端 FIN 必须自己 RequestClose，
         // 否则连接状态永不释放。pending 未空先登记，OnWrite 排空后关。
-        if (slot->eof && !slot->close_requested) CloseOrDefer(connection, slot);
+        if (slot->eof && !slot->close_requested)
+            CloseOrDefer(connection, slot);
     }
 
-    void OnWrite(Connection connection, WriteResult) override {
+    void OnWrite(Connection connection, WriteResult) override
+    {
         // 写完成/容量释放：补投 pending echo；EOF 连接排空后即 RequestClose。
         std::shared_ptr<Slot> slot;
         {
             std::lock_guard<std::mutex> lk(mu);
             const auto it = parsers.find(connection.Id());
-            if (it == parsers.end()) return;
+            if (it == parsers.end())
+                return;
             slot = it->second;
         }
         std::lock_guard<std::mutex> data_lk(slot->mu);
@@ -339,14 +373,14 @@ struct RawEchoHandler : RawHandler {
         }
     }
 
-    void OnClose(Connection connection, std::error_code) override {
+    void OnClose(Connection connection, std::error_code) override
+    {
         std::lock_guard<std::mutex> lk(mu);
         const auto it = parsers.find(connection.Id());
         // Id 复用：迟到的 OnClose 只删属于自己 state 的 slot——同 id 已有新连接
         // 登记时，表中 slot 属于新连接，不得擦除（否则新连接 OnRead 提前返回，
         // echo 永远不到 → 对端 3s 超时，conns 负载尾部稳定丢 clients 个连接）。
-        if (it != parsers.end() &&
-            it->second->state == ConnectionTestAccess::StateOf(connection)) {
+        if (it != parsers.end() && it->second->state == ConnectionTestAccess::StateOf(connection)) {
             // 丢弃未发出的 echo（对端已走）；如实计数不静默。
             const auto dropped = it->second->pending.size();
             if (dropped > 0) {
@@ -355,8 +389,7 @@ struct RawEchoHandler : RawHandler {
             parsers.erase(it);
         }
         const auto eit = eof_pending.find(connection.Id());
-        if (eit != eof_pending.end() &&
-            eit->second->state == ConnectionTestAccess::StateOf(connection)) {
+        if (eit != eof_pending.end() && eit->second->state == ConnectionTestAccess::StateOf(connection)) {
             eof_pending.erase(eit);
         }
         {
@@ -368,13 +401,15 @@ struct RawEchoHandler : RawHandler {
 };
 
 // ---------------- co 模式：协程 echo 循环（read-timeout 周期复查 g_stop） ----------------
-void CoServeConnection(Connection connection) {
+void CoServeConnection(Connection connection)
+{
     {
         std::lock_guard<std::mutex> lk(g_active_mu);
         ++g_active_conns;
     }
     struct ConnGuard {
-        ~ConnGuard() {
+        ~ConnGuard()
+        {
             std::lock_guard<std::mutex> lk(g_active_mu);
             --g_active_conns;
             g_active_cv.notify_all();
@@ -384,19 +419,19 @@ void CoServeConnection(Connection connection) {
     std::uint64_t expected_seq = 0;
     CoTcpConnection co_conn{connection};
     for (;;) {
-        if (g_stop.load()) { connection.RequestClose(); return; }
+        if (g_stop.load()) {
+            connection.RequestClose();
+            return;
+        }
         std::string data;
         bbt::coroutine::WaitOptions opts;
-        opts.deadline = std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(g_read_timeout_ms);
+        opts.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(g_read_timeout_ms);
         auto [read_data, read_error] = co_conn.Read(opts);
-        if (bool(read_error) &&
-            read_error == std::make_error_code(std::errc::timed_out)) {
+        if (bool(read_error) && read_error == std::make_error_code(std::errc::timed_out)) {
             continue;
         }
-        if (read_error == bbt::infra::net::make_error_code(bbt::infra::net::NetErrc::Eof) ||
-            (bool(read_error) &&
-             read_error == make_error_code(NetErrc::Closed))) {
+        if (read_error == bbt::infra::net::make_error_code(bbt::infra::net::NetErrc::Eof)
+            || (bool(read_error) && read_error == make_error_code(NetErrc::Closed))) {
             // 产品契约：EOF 不关闭写侧——本协程的顺序 Write 在读到 EOF 前
             // 已全部终态，此处 RequestClose 是连接释放的唯一发起方。
             connection.RequestClose();
@@ -436,14 +471,12 @@ void CoServeConnection(Connection connection) {
             const auto report = co_conn.Write(frame, wopts);
             // 有效写错误：等待失败取 wait_error；等待完成但发送未确认取
             // outcome.error（与旧 CoWrite err+outcome 终态同口径）。
-            const auto werr = report.wait_error
-                ? report.wait_error : report.outcome.error;
+            const auto werr = report.wait_error ? report.wait_error : report.outcome.error;
             if (werr) {
-                if (werr == make_error_code(NetErrc::Closed) ||
-                    werr == make_error_code(NetErrc::Eof)) {
+                if (werr == make_error_code(NetErrc::Closed) || werr == make_error_code(NetErrc::Eof)) {
                     ++g_write_closed;
                     connection.RequestClose();
-                    return;  // 对端先关：良性拆除，不计 errors
+                    return; // 对端先关：良性拆除，不计 errors
                 }
                 g_metrics.errors.fetch_add(1);
                 connection.RequestClose();
@@ -466,10 +499,11 @@ void CoServeConnection(Connection connection) {
     }
 }
 
-int RunServer(int argc, char** argv) {
+int RunServer(int argc, char** argv)
+{
     const Args args = ParseArgs(argc, argv,
-        /*required*/{"mode"},
-        /*optional*/{"port", "runtime-workers", "subs", "accept-cap", "read-timeout-ms"});
+                                /*required*/ {"mode"},
+                                /*optional*/ {"port", "runtime-workers", "subs", "accept-cap", "read-timeout-ms"});
     if (!args.ok) {
         std::cerr << "args error: " << args.error << '\n';
         return 2;
@@ -492,8 +526,7 @@ int RunServer(int argc, char** argv) {
     if (workers == 0) {
         workers = min_workers;
     } else if (workers < min_workers) {
-        std::cerr << "args error: --runtime-workers=" << workers
-                  << " < subs+1=" << min_workers
+        std::cerr << "args error: --runtime-workers=" << workers << " < subs+1=" << min_workers
                   << "（server 需 1 main + " << eff_subs << " sub owner 槽）\n";
         return 2;
     }
@@ -521,9 +554,8 @@ int RunServer(int argc, char** argv) {
     }
     Engine engine(handler);
     if (mode == "co") {
-        const std::size_t cap = accept_cap > 0
-            ? static_cast<std::size_t>(accept_cap)
-            : static_cast<std::size_t>(eff_subs * 256);
+        const std::size_t cap =
+            accept_cap > 0 ? static_cast<std::size_t>(accept_cap) : static_cast<std::size_t>(eff_subs * 256);
         if (engine.EnableAcceptHandoff(cap)) {
             std::cerr << "EnableAcceptHandoff failed\n";
             return 2;
@@ -533,7 +565,10 @@ int RunServer(int argc, char** argv) {
     EngineConfig config;
     std::error_code addr_err;
     const Address listen = Address::Ip("127.0.0.1", port, addr_err);
-    if (addr_err) { std::cerr << "bad listen addr\n"; return 2; }
+    if (addr_err) {
+        std::cerr << "bad listen addr\n";
+        return 2;
+    }
     config.listen_addresses = {listen};
     config.runtime_progress = RuntimeProgress::Independent;
     config.options.num_event_loop = static_cast<std::int64_t>(eff_subs);
@@ -543,13 +578,17 @@ int RunServer(int argc, char** argv) {
     const auto deadline = std::chrono::steady_clock::now() + 5000ms;
     bool ready = false;
     while (std::chrono::steady_clock::now() < deadline) {
-        if (engine.Phase() == EnginePhase::Running) { ready = true; break; }
+        if (engine.Phase() == EnginePhase::Running) {
+            ready = true;
+            break;
+        }
         std::this_thread::sleep_for(5ms);
     }
     if (!ready) {
         std::cerr << "engine 未在 5s 内进入 Running\n";
         engine.RequestClose();
-        if (engine_thread.joinable()) engine_thread.join();
+        if (engine_thread.joinable())
+            engine_thread.join();
         return 2;
     }
     std::vector<Address> bound;
@@ -568,23 +607,31 @@ int RunServer(int argc, char** argv) {
     bool teardown_incomplete = false;
     if (mode == "co") {
         TrackTaskBegin();
-        g_scheduler->RegistCoroutineTask(65536, [&engine] {
-            while (!g_stop.load()) {
-                bbt::coroutine::WaitOptions opts;
-                opts.deadline = std::chrono::steady_clock::now() + 200ms;
-                const auto res = engine.CoAccept(opts);
-                if (res.error == std::make_error_code(std::errc::timed_out)) continue;
-                if (res.error) break;
-                const Connection c = res.connection.Raw();
-                g_metrics.accepted.fetch_add(1);
-                TrackTaskBegin();
-                g_scheduler->RegistCoroutineTask(65536, [c] {
-                    CoServeConnection(c);
-                    TrackTaskEnd();
-                }, "bench.conn");
-            }
-            TrackTaskEnd();
-        }, "bench.accept");
+        g_scheduler->RegistCoroutineTask(
+            65536,
+            [&engine] {
+                while (!g_stop.load()) {
+                    bbt::coroutine::WaitOptions opts;
+                    opts.deadline = std::chrono::steady_clock::now() + 200ms;
+                    const auto res = engine.CoAccept(opts);
+                    if (res.error == std::make_error_code(std::errc::timed_out))
+                        continue;
+                    if (res.error)
+                        break;
+                    const Connection c = res.connection.Raw();
+                    g_metrics.accepted.fetch_add(1);
+                    TrackTaskBegin();
+                    g_scheduler->RegistCoroutineTask(
+                        65536,
+                        [c] {
+                            CoServeConnection(c);
+                            TrackTaskEnd();
+                        },
+                        "bench.conn");
+                }
+                TrackTaskEnd();
+            },
+            "bench.accept");
     }
 
     // 就绪协议：唯一一行 PORT= 到 stdout（driver 按行读，非 JSON）。
@@ -594,19 +641,26 @@ int RunServer(int argc, char** argv) {
     // stdin 命令循环：stat/fin_overhead 回一行 JSON；quit/EOF 收口。
     std::string line;
     while (std::getline(std::cin, line)) {
-        if (line == "quit") break;
-        if (line == "stat") { EmitStatsLine(); continue; }
-        if (line == "fin_overhead") { EmitFinOverheadLine(); continue; }
+        if (line == "quit")
+            break;
+        if (line == "stat") {
+            EmitStatsLine();
+            continue;
+        }
+        if (line == "fin_overhead") {
+            EmitFinOverheadLine();
+            continue;
+        }
     }
 
     g_stop.store(true);
     engine.RequestClose();
-    if (engine_thread.joinable()) engine_thread.join();
+    if (engine_thread.joinable())
+        engine_thread.join();
     if (mode == "co") {
         const auto conn_deadline = std::chrono::steady_clock::now() + 5000ms;
         if (!WaitTasksDone(conn_deadline)) {
-            std::cerr << "FAIL: conn/accept coroutine 未在 5s 内退出（pending="
-                      << PendingTasks() << "）\n";
+            std::cerr << "FAIL: conn/accept coroutine 未在 5s 内退出（pending=" << PendingTasks() << "）\n";
             teardown_incomplete = true;
         }
     }
@@ -614,8 +668,7 @@ int RunServer(int argc, char** argv) {
     // 有未释放连接或未完成协程即 teardown 不全——非零退出而非 WARN 放行。
     const auto remaining_conns = ActiveConns();
     if (remaining_conns != 0) {
-        std::cerr << "FAIL: teardown 后仍有 " << remaining_conns
-                  << " 个未释放连接\n";
+        std::cerr << "FAIL: teardown 后仍有 " << remaining_conns << " 个未释放连接\n";
         teardown_incomplete = true;
     }
 
@@ -626,38 +679,61 @@ int RunServer(int argc, char** argv) {
     const std::uint64_t completed = g_metrics.completed.load();
 
     Json j;
-    j.K("role").V("server")
-     .K("mode").V(mode)
-     .K("port").V(static_cast<std::uint64_t>(bound_port))
-     .K("runtime_workers").V(workers)
-     .K("subs").V(static_cast<std::uint64_t>(config.options.num_event_loop))
-     .K("accepted").V(static_cast<std::uint64_t>(g_metrics.accepted.load()))
-     .K("completed").V(completed)
-     .K("echoed_fin").V(static_cast<std::uint64_t>(g_metrics.echoed_fin.load()))
-     .K("bytes_in").V(static_cast<std::uint64_t>(g_metrics.bytes_in.load()))
-     .K("bytes_out").V(static_cast<std::uint64_t>(g_metrics.bytes_out.load()))
-     .K("errors").V(static_cast<std::uint64_t>(g_metrics.errors.load()))
-     .K("frames_bad").V(static_cast<std::uint64_t>(g_metrics.frames_bad.load()))
-     .K("seq_bad").V(static_cast<std::uint64_t>(g_metrics.seq_bad.load()))
-     .K("write_closed").V(static_cast<std::uint64_t>(g_write_closed.load()))
-     .K("active_conns_end").V(remaining_conns)
-     .K("wall_seconds").V(wall_s)
-     .K("cpu_seconds").V(cpu_s)
-     .K("cpu_per_op").V(completed > 0 ? cpu_s / completed : 0.0)
-     .K("proc_ok").V(observer.ProcOk())
-     .K("rss_max_bytes").V(observer.RssMaxBytes())
-     .K("rss_end_bytes").V(observer.RssEndBytes());
+    j.K("role")
+        .V("server")
+        .K("mode")
+        .V(mode)
+        .K("port")
+        .V(static_cast<std::uint64_t>(bound_port))
+        .K("runtime_workers")
+        .V(workers)
+        .K("subs")
+        .V(static_cast<std::uint64_t>(config.options.num_event_loop))
+        .K("accepted")
+        .V(static_cast<std::uint64_t>(g_metrics.accepted.load()))
+        .K("completed")
+        .V(completed)
+        .K("echoed_fin")
+        .V(static_cast<std::uint64_t>(g_metrics.echoed_fin.load()))
+        .K("bytes_in")
+        .V(static_cast<std::uint64_t>(g_metrics.bytes_in.load()))
+        .K("bytes_out")
+        .V(static_cast<std::uint64_t>(g_metrics.bytes_out.load()))
+        .K("errors")
+        .V(static_cast<std::uint64_t>(g_metrics.errors.load()))
+        .K("frames_bad")
+        .V(static_cast<std::uint64_t>(g_metrics.frames_bad.load()))
+        .K("seq_bad")
+        .V(static_cast<std::uint64_t>(g_metrics.seq_bad.load()))
+        .K("write_closed")
+        .V(static_cast<std::uint64_t>(g_write_closed.load()))
+        .K("active_conns_end")
+        .V(remaining_conns)
+        .K("wall_seconds")
+        .V(wall_s)
+        .K("cpu_seconds")
+        .V(cpu_s)
+        .K("cpu_per_op")
+        .V(completed > 0 ? cpu_s / completed : 0.0)
+        .K("proc_ok")
+        .V(observer.ProcOk())
+        .K("rss_max_bytes")
+        .V(observer.RssMaxBytes())
+        .K("rss_end_bytes")
+        .V(observer.RssEndBytes());
     std::cout << j.Done() << '\n';
     std::cout.flush();
 
-    return (run_err || g_metrics.errors.load() != 0 ||
-            g_metrics.frames_bad.load() != 0 || g_metrics.seq_bad.load() != 0 ||
-            teardown_incomplete) ? 1 : 0;
+    return (run_err || g_metrics.errors.load() != 0 || g_metrics.frames_bad.load() != 0 || g_metrics.seq_bad.load() != 0
+            || teardown_incomplete)
+               ? 1
+               : 0;
 }
 
-}  // namespace
+} // namespace
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv)
+{
     // 进程寿命 runtime 无静态析构收口：engine join + 自有任务归零验证后走
     // _Exit 边界（见 ProcessRuntimeTestMain.hpp 头注的已知限制说明）。
     return bbt_net_test::RunTestProcessExit([&] { return RunServer(argc, argv); });

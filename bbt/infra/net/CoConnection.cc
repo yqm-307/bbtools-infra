@@ -18,7 +18,7 @@
 // 实现放 .cc：WriteOperation::Wait、Engine::CoAccept/CoDial 依赖的内部装配
 // （统一 gate、ConnectionState、Engine 私有等待步骤、拨号测试屏障）不能经
 // 公共头传出；同时避免把 <bbt/coroutine/coroutine.hpp> 带进消费 TU。
-// CoRead/CoWrite/CoAccept/CoDial 自由函数已删除：协程消费面收口为
+// 公开的 Co* 自由函数不存在：协程消费面收口为
 // Engine::CoAccept/CoDial 与 CoTcpConnection 成员（docs/decisions/0012-icoconn-member-interface.md）。
 
 namespace bbt::infra::net {
@@ -92,9 +92,8 @@ std::shared_ptr<ConnectionState> CoAccess::StateOf(const Connection& connection)
     return connection.m_state;
 }
 
-std::error_code CoAccess::SubmitConnect(Engine& engine, const Address& address,
-                                       std::uint64_t& out_connect_id,
-                                       const std::shared_ptr<ReclaimRecord>& reclaim)
+std::error_code CoAccess::SubmitConnect(Engine& engine, const Address& address, std::uint64_t& out_connect_id,
+                                        const std::shared_ptr<ReclaimRecord>& reclaim)
 {
     if (reclaim) {
         return engine.CoSubmitConnect(address, out_connect_id, reclaim);
@@ -108,21 +107,19 @@ ReclaimReceipt CoAccess::MakeReceipt(std::shared_ptr<ReclaimRecord> record)
 }
 
 std::error_code CoAccess::WaitConnect(Engine& engine, std::uint64_t connect_id, Connection& out,
-                                     const bbt::coroutine::WaitOptions& options)
+                                      const bbt::coroutine::WaitOptions& options)
 {
     return engine.CoWaitConnect(connect_id, out, options);
 }
 
-std::error_code CoAccess::WaitAccepted(Engine& engine, Connection& out,
-                                      const bbt::coroutine::WaitOptions& options)
+std::error_code CoAccess::WaitAccepted(Engine& engine, Connection& out, const bbt::coroutine::WaitOptions& options)
 {
     return engine.CoWaitAccepted(out, options);
 }
 
-std::error_code WriteOperation::Wait(const bbt::coroutine::WaitOptions& options,
-                                     WriteOutcome* outcome) const
+std::error_code WriteOperation::Wait(const bbt::coroutine::WaitOptions& options, WriteOutcome* outcome) const
 {
-    // gate 在查任何快路径之前（与 CoRead/CoWrite 同契约）：非法域即使
+    // gate 在查任何快路径之前（与 ICoConnection::Write 同契约）：非法域即使
     // 票已落定也返回 operation_not_permitted。
     if (const auto gate = RequireCoroutineContext()) {
         if (outcome) {
@@ -138,7 +135,7 @@ std::error_code WriteOperation::Wait(const bbt::coroutine::WaitOptions& options,
         return {};
     }
     if (!m_record) {
-        return std::make_error_code(std::errc::invalid_argument);  // 无身份票
+        return std::make_error_code(std::errc::invalid_argument); // 无身份票
     }
     const auto state = m_state.lock();
     for (;;) {
