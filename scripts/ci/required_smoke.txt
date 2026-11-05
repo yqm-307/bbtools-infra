@@ -14,7 +14,6 @@ http.net.server_inflight_limit
 redis.net.fragmented_reply
 redis.net.close_pending_command_once
 redis.net.connect_failure_owned
-redis.net.close_invalidates_immediately
 rpc.payload
 net.buffer
 net.options
