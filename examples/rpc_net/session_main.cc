@@ -110,7 +110,7 @@ struct Assembly {
         return true;
     }
     ~Assembly() {
-        if (server) { (void)server->Close(Clock::now() + 3s); }
+        if (server) { server->Close(); }
         engine->RequestClose();
         if (runner.joinable()) { runner.join(); }
     }
@@ -183,8 +183,9 @@ int RunServer() {
         app.PumpOnce();
         std::this_thread::sleep_for(1ms);
     }
-    const auto closed = app.server->Close(Clock::now() + 3s);
-    if (!closed) { return Fail("server close failed"); }
+    const auto drained = app.server->Shutdown(Clock::now() + 3s);
+    app.server->Close();
+    if (!drained) { return Fail("server shutdown failed"); }
     if (!app.server->IsClosed()) { return Fail("server not closed after close"); }
     const auto server_stats = app.server->Stats();
     if (!normal_stop) {
