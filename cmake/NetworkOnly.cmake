@@ -31,3 +31,8 @@ endif()
 if(BBT_INFRA_RPC_NET)
     include("${CMAKE_CURRENT_LIST_DIR}/RpcNet.cmake")
 endif()
+# Consul adapter 属于新协议闭包（只消费 bbt::infra_http_net；底座由 Common/NetBase
+# 提供）。
+if(BBT_INFRA_CONSUL)
+    include("${CMAKE_CURRENT_LIST_DIR}/Consul.cmake")
+endif()
