@@ -160,6 +160,10 @@ jobs:
       - name: "必要 focused 实跑（映射命中时；同一构建树）"
         if: ${{ needs.changes.outputs.focused != '' }}
         timeout-minutes: 10
+        env:
+          # 子 consumer 由 CTest 另行 configure，不继承父 cache；与 network_gate.sh 同口径传 Boost 前缀。
+          BOOST_ROOT: ${{ env.BOOST_PREFIX }}
+          CMAKE_PREFIX_PATH: ${{ env.BOOST_PREFIX }}
         run: >
           bash infra/scripts/ci/run_test_profile.sh --build-dir "$BUILD_DIR"
           --profile focused --label-expr "unit|integration" --timeout 180 --junit "$BUILD_DIR/junit-focused.xml"

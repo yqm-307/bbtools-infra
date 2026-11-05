@@ -119,9 +119,9 @@ void CloseDropsInflightReply() {
 }
 
 void ReleasedClientHandle() {
-    // 在途调用期间释放最后外部 RPC 句柄：协程持有局部安全引用，调用照常真实
-    // 完成（Close 只逻辑封口，在飞借用不受影响）；共享 transport 随析构封口，
-    // 连接退役出账、Engine 收口。
+    // 在途调用期间释放最后外部 RPC 句柄：句柄析构即 Close，在途调用被失败
+    // 且晚到回包被丢弃（不 UAF、不重复结算）；协程持有的局部引用保证返回路径
+    // 安全。共享 transport 随之封口，连接退役出账、Engine 收口。
     auto gate = std::make_shared<Gate>();
     ServerHost server([&](IncomingCallContext, RpcEnvelope request)
                           -> result<RpcEnvelope> {
@@ -139,12 +139,14 @@ void ReleasedClientHandle() {
     only.reset();                                            // 释放最后外部句柄
     gate->Release();
     const auto reply = Get(inflight);
-    CHECK(reply && reply.value().request_id == "rh-1");
+    CHECK(!reply);
+    CHECK(reply.error().code == ErrorCode::Closed ||
+          reply.error().code == ErrorCode::OutcomeUnknown);
     // 句柄析构已封口共享 transport；连接退役出账（物理回收凭据）。
     CHECK(client.host.Call([&] { return client.http_client->IsClosed(); }));
     CHECK(WaitUntil([&] { return client.http_client->Stats().budget == 0; }));
     server.Finish();
-    std::cout << "rpc released client handle inflight=completed "
+    std::cout << "rpc released client handle inflight=failed "
                  "transport=closed budget=0\n";
 }
 
