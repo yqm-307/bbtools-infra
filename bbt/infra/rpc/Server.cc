@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <mutex>
 #include <utility>
 
 #include <bbt/infra/rpc/RpcWire.hpp>
@@ -99,6 +100,8 @@ struct Server::State {
     // 一侧不成环、Server 析构不等待在途 handler 时回调不会悬空。
     std::shared_ptr<WireInboundHandler> wire;
     std::atomic<bool> closed{false};
+    std::mutex reason_mtx;
+    std::optional<Error> close_reason;  // Close 发布；首个原因固定
 };
 
 Server::Server(std::shared_ptr<State> state) noexcept
@@ -162,10 +165,36 @@ result<void> Server::Drain(bbt::coroutine::Deadline deadline) {
     return m_state->inbound->Drain(deadline);
 }
 
-void Server::Close() noexcept {
-    if (m_v2) { detail::ServerV2Seal(m_v2); return; }
-    if (!m_state) { return; }
-    if (!m_state->closed.exchange(true)) m_state->inbound->Close();
+void Server::Close(Error reason) noexcept {
+    try {
+        if (m_v2) { detail::ServerV2Seal(m_v2, std::move(reason)); return; }
+        if (!m_state) { return; }
+        {
+            std::lock_guard<std::mutex> lock(m_state->reason_mtx);
+            if (!m_state->close_reason) { m_state->close_reason = reason; }
+        }
+        // 首个封口者把已记录的原因转给 adapter；后续调用只保持原因不变。
+        if (!m_state->closed.exchange(true)) {
+            m_state->inbound->Close(std::move(reason));
+        }
+    } catch (...) {
+        // noexcept 契约：closed/close_reason 已在上面写定，原因复制失败不放大。
+    }
+}
+
+result<void> Server::Shutdown(bbt::coroutine::Deadline deadline) {
+    if (m_v2) { return detail::ServerV2Shutdown(m_v2, deadline); }
+    if (!m_state) {
+        return result<void>::err(MakeError(ErrorCode::Closed, "rpc server: closed"));
+    }
+    return m_state->inbound->Shutdown(deadline);
+}
+
+std::optional<Error> Server::CloseReason() const noexcept {
+    if (m_v2) { return detail::ServerV2CloseReason(*m_v2); }
+    if (!m_state) { return std::nullopt; }
+    std::lock_guard<std::mutex> lock(m_state->reason_mtx);
+    return m_state->close_reason;
 }
 
 result<void> Server::WaitStopped(bbt::coroutine::Deadline deadline) {

@@ -4,7 +4,8 @@ add_executable(Test_http_net_contract Test_http_net_contract.cc)
 target_link_libraries(Test_http_net_contract PRIVATE bbt::infra_http_net)
 target_compile_options(Test_http_net_contract PRIVATE -Wall -Wextra -Wpedantic)
 foreach(_case get_post_reuse pool_queue_timeout close_cancel_race bad_stream_retire
-        keepalive_expiry omitted_call_options)
+        keepalive_expiry omitted_call_options client_close_reason client_shutdown_drain
+        client_shutdown_interrupted_by_close)
     add_test(NAME http.net.${_case} COMMAND Test_http_net_contract ${_case})
     set_tests_properties(http.net.${_case} PROPERTIES TIMEOUT 30 LABELS "unit")
 endforeach()
@@ -12,7 +13,7 @@ endforeach()
 add_executable(Test_http_net_regressions Test_http_net_regressions.cc)
 target_link_libraries(Test_http_net_regressions PRIVATE bbt::infra_http_net)
 target_compile_options(Test_http_net_regressions PRIVATE -Wall -Wextra -Wpedantic)
-foreach(_case fragment_header fragment_body chunked head_interim eof_truncated body_limit
+foreach(_case fragment_header fragment_body chunked head_interim eof_truncated body_limit quotas
         input_boundary preexpired_cancelled phase_timeouts per_read_total cross_origin
         handoff_concurrency physical_budget physical_budget_two physical_cancel)
     add_test(NAME http.net.${_case} COMMAND Test_http_net_regressions ${_case})
@@ -23,6 +24,7 @@ add_executable(Test_http_net_server Test_http_net_server.cc)
 target_link_libraries(Test_http_net_server PRIVATE bbt::infra_http_net)
 target_compile_options(Test_http_net_server PRIVATE -Wall -Wextra -Wpedantic)
 foreach(_case server_wire server_stop_authorization server_reply_drain server_close_timeout
+        server_shutdown_drain server_shutdown_timeout server_shutdown_interrupted_by_close
         server_security server_incoming_deadline server_start_capacity server_physical_capacity server_inflight_limit)
     add_test(NAME http.net.${_case} COMMAND Test_http_net_server ${_case})
     set_tests_properties(http.net.${_case} PROPERTIES TIMEOUT 30 LABELS "unit")
@@ -47,3 +49,5 @@ target_compile_options(Test_http_net_stop_regressions PRIVATE -Wall -Wextra -Wpe
 target_link_options(Test_http_net_stop_regressions PRIVATE -rdynamic -Wl,--wrap=_Znwm)
 add_test(NAME http.net.stop_regressions COMMAND Test_http_net_stop_regressions)
 set_tests_properties(http.net.stop_regressions PROPERTIES TIMEOUT 60 LABELS "unit")
+
+set_tests_properties(http.net.get_post_reuse http.net.close_cancel_race http.net.client_shutdown_drain http.net.server_wire http.net.server_reply_drain http.net.server_shutdown_drain http.net.server_inflight_limit PROPERTIES LABELS "smoke;unit")

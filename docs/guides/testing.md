@@ -20,14 +20,8 @@ smoke 是各层性质的选集子集（本仓当前 smoke 项均同为 `unit`）
 
 ## 2. smoke 选集口径
 
-- 每模块/每覆盖轴至少 1 项秒级代表用例打 `smoke;unit`：当前 13 项
-  （`contract.basics`、`config.unit`、`iowait.combined_wait`、`rpc.payload`、
-  `tcp.loopback`、`udp.loopback`、`transport.runtime`、`transport.acceptance`、
-  `http.loopback`、`http.session_lifetime`、`http.outbound_quota`、
-  `http.child_unregister`、`redis.unit`），实测约 4s。
-- 重项刻意不进 smoke：`mongo.unit`（基线实测约 129s，占非 live 耗时 79%）、
-  `config.watch`、`http.lifecycle`/`failure_close`/`request_phase` 等归
-  full/extended 路径。
+- 新 HTTP 的请求/错误/关闭与 Redis 的分帧/错误/关闭采用秒级真实 loopback 代表项；net 原语、contract/config/iowait/payload 一并冒烟。
+- Mongo worker 与 config watch 归聚焦/深度验证。
 - 必选清单钉死：`scripts/ci/required_smoke.txt`；label 改动必须同步清单，
   契约测试（`scripts/ci/tests/run_tests.py` 的 `SmokeSelectionTests`）
   比对 CMakeLists `LABELS` 与清单一致性，漂移即 FATAL。
@@ -76,14 +70,9 @@ skipped/failure/error 一律 FATAL（live 在选集阶段经 `-LE live` 排除�
 **必要 focused（PR 入口）**：`changed_files.py` 把本次变更路径经仓内
 `FOCUS_MAP`（路径前缀 → 测试名正则）归并为 focused 正则输出；非空时
 `build-and-gates` 在同一构建树追加一次
-`run_test_profile.sh --profile focused --regex <focused>`（junit 落
+`run_test_profile.sh --profile focused --label-expr "unit|integration" --regex <focused>`（junit 落
 `<build>/junit-focused.xml`）；无映射命中（纯 docs/scripts 等）不追加。
-映射表按模块轴维护：src/include 旧栈 → `<module>.*`；`bbt/infra/{net,http,
-rpc,rpc_tcp,redis,mcp}` → `net.*`/`http.net.*`/`rpc.*`/`rpc.tcp.*`/
-`redis.net.*|redis.*`/`mcp.*`；`proto/` → `rpc.*`；`tests/<group>/` 按组映射；
-`cmake/`、`CMakeLists.txt`、其余 `src/`、`include/`、`tests/` 兜底 →
-`contract.*`；`examples/` → `example_*` + 消费面 integration。新增模块或
-测试组时同步扩表，`test_changed_files.py` 的 `FocusedRegexTests` 钉死映射。
+映射表以活动 `bbt/infra/` 路径维护：net 同时覆盖 HTTP/Redis/RPC；HTTP 同时覆盖 RPC/MCP HTTP；config/Mongo 私有 helper 各自覆盖本模块。构建入口选择新栈闭包，普通 focused 只选 unit/integration，真实 Redis 项由独占 live 门禁完整实跑。`test_changed_files.py` 钉死映射。
 
 深度门禁（debug STRINGENT_DEBUG 契约、network-only ≥111 项、redis-net 容器
 实跑、Redis/Mongo live）没有删除，只移出普通 PR 默认路径，由 `test-depth`

@@ -28,7 +28,8 @@ foreach(_case v2s_roundtrip v2s_bidirectional v2s_send_acceptance
         v2s_handshake_coalesced_big
         v2s_handshake_coalesced_big_pinned
         v2s_handshake_stash_tail
-        v2s_handshake_prefix_reject v2s_close_drain
+        v2s_handshake_prefix_reject v2s_close_drain v2s_close_reason
+        v2s_close_reason_pending
         v2s_admission_inflight v2s_admission_reject
         v2s_admission_bytes v2s_admission_sealed
         v2s_reply_write_deferred v2s_reply_write_fail_close
@@ -39,7 +40,10 @@ foreach(_case v2s_roundtrip v2s_bidirectional v2s_send_acceptance
         v2s_never_started_drain_close v2s_queue_full_drain_stats
         v2s_hook_state v2s_hook_pause_deadline
         v2s_hook_pause_cancel_close
-        v2s_hook_outbound_throw v2s_hook_write_throw)
+        v2s_hook_outbound_throw v2s_hook_write_throw
+        v2s_shutdown_timeout_draining
+        v2s_shutdown_interrupted_by_close
+        v2s_close_inflight_reason)
     add_test(NAME rpc.net.${_case} COMMAND Test_rpc_v2_session ${_case})
     set_tests_properties(rpc.net.${_case} PROPERTIES TIMEOUT 60 LABELS "rpc_net")
 endforeach()

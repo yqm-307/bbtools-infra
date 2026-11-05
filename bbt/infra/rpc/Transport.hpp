@@ -53,6 +53,21 @@ public:
         const RpcAddress&, WireRequest, const CallOptions&) = 0;
     virtual void Close() noexcept = 0;
     virtual bool IsClosed() const noexcept = 0;
+
+    // 关闭原因版本：默认丢弃原因转 Close()，保持既有 adapter 源兼容；
+    // 需要把原因传到底座（HTTP 池）的 adapter 覆盖。
+    virtual void Close(Error reason) noexcept {
+        (void)reason;
+        Close();
+    }
+    // 封口并等待已接纳调用真实归还责任。默认实现诚实报告本 adapter 未提供
+    // 排空谓词（能力边界，不伪装成功）；HTTP adapter 覆盖为底座排空。
+    virtual result<void> Shutdown(bbt::coroutine::Deadline deadline) {
+        (void)deadline;
+        return result<void>::err(MakeError(
+            ErrorCode::UnsupportedRoute,
+            "rpc transport: Shutdown not implemented by this adapter"));
+    }
 };
 
 class IRpcInboundTransport {
@@ -64,6 +79,18 @@ public:
     virtual void Close() noexcept = 0;
     virtual result<void> WaitStopped(bbt::coroutine::Deadline) = 0;
     virtual bool IsClosed() const noexcept = 0;
+
+    // 关闭原因版本：默认丢弃原因转 Close()，既有 adapter 源兼容。
+    virtual void Close(Error reason) noexcept {
+        (void)reason;
+        Close();
+    }
+    // 单入口封口 + 排空：默认复用既有两段（StopAccepting → Drain），
+    // 有更真实排空谓词的 adapter 覆盖。
+    virtual result<void> Shutdown(bbt::coroutine::Deadline deadline) {
+        StopAccepting();
+        return Drain(deadline);
+    }
 };
 
 } // namespace bbt::infra::rpc

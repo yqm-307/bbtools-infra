@@ -2,7 +2,7 @@
 //
 // 消费面：只 include 公开头 <bbt/infra/mongo/Bson.hpp> /
 // <bbt/infra/mongo/Client.hpp> / <bbt/infra/Result.hpp>，只链接公开 target
-// bbt::infra_mongo。不引用 src/mongo 内部头，不出现 mongocxx/bsoncxx 类型。
+// bbt::infra_mongo。不引用 bbt/infra/mongo/detail 内部头，不出现 mongocxx/bsoncxx 类型。
 //
 // 真实后端：读取 BBT_TEST_MONGO_URI（例如 tests/mongo-live/run.sh 注入的
 // mongodb://127.0.0.1:<port>/）。未设置时打印 "skip:" 并返回 77（ctest 记为

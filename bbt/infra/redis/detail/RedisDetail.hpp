@@ -1,7 +1,7 @@
 #pragma once
 // infra redis 内部工具：redisReply 解码为拥有型 RawReply、hiredis 错误码
 // 与 Redis 服务端错误到契约 Error 的分类。
-// 仅供 src/redis/ 实现使用，不安装、不进公开面；允许出现 hiredis 类型。
+// 仅供 Redis 模块私有实现使用，不安装、不进公开面；允许出现 hiredis 类型。
 
 #include <cstdint>
 #include <string>

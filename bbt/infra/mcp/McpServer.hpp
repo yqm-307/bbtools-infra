@@ -7,7 +7,7 @@
 //
 // 本切片（tasks 2-4 中不依赖 Schema 的部分）：
 //   - 公共面只出现自有类型（JsonValue / McpTypes / McpServer）：无 Boost/Beast/jsoncons、
-//     不需要 consumer include src/、无裸 JSON-RPC 帧入口（帧入口仍属内部 session /
+//     不需要 consumer include bbt/infra/、无裸 JSON-RPC 帧入口（帧入口仍属内部 session /
 //     transport 面，不因省事 promote 成公共 API）；
 //   - 注册必须在 Start 前完成，Start 冻结快照；非法注册整体拒绝、不留半条记录；
 //   - resources/list、resources/read、resources/templates/list、prompts/list、

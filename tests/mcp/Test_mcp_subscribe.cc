@@ -11,7 +11,7 @@
 //
 // 边界（不冒充）：真实 stdio/HTTP SSE transport 属 3-x，本文件经内部面 sink 驱动
 // 帧出口；业务 handler 返回 InputRequired 的接线不在本切片（无端到端
-// input_required 产出断言）。无第三方测试框架；经 src/ 内部头消费实现面。
+// input_required 产出断言）。无第三方测试框架；经 模块私有头消费实现面。
 
 #include <sys/wait.h>
 #include <unistd.h>

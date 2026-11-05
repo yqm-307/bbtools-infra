@@ -1,0 +1,359 @@
+#include "bbt/infra/mongo/detail/MongoDetail.hpp"
+
+#include <algorithm>
+#include <cctype>
+#include <cstring>
+
+#include <bsoncxx/document/element.hpp>
+#include <bsoncxx/document/view.hpp>
+#include <bsoncxx/types.hpp>
+#include <bsoncxx/validate.hpp>
+#include <bsoncxx/v1/element/view.hpp>
+#include <bsoncxx/v1/exception.hpp>
+#include <bsoncxx/v1/types/id.hpp>
+#include <mongocxx/exception/operation_exception.hpp>
+#include <mongocxx/v1/client.hpp>
+#include <mongocxx/v1/collection.hpp>
+#include <mongocxx/v1/database.hpp>
+#include <mongocxx/v1/pool.hpp>
+#include <mongocxx/v1/server_error.hpp>
+
+namespace bbt::infra::mongo_detail {
+
+namespace {
+
+Error InvalidArg(std::string msg) {
+    return MakeError(ErrorCode::InvalidArgument, std::move(msg));
+}
+
+// mongoc/mongoc-error.h（mongoc 2.5.4）mongoc_error_code_t：
+// MONGOC_ERROR_COMMAND_INVALID_ARG = 22。mongoc 的 URI 解析错误
+// （mongoc-uri.c 的 MONGOC_URI_ERROR）与选项值校验均以该码汇报（无效
+// host specifier、端口越界/非数字、选项值非法等）。mongocxx 的
+// v1::exception 只保留该码、丢弃 mongoc domain，故只能在 mongoc 域内
+// 以该码区分「调用方输入错误」与 server selection/socket 等驱动侧失败。
+// 未直接包含 mongoc 头：其 mongoc-prelude.h 禁止经非 mongoc/mongoc.h
+// 直接包含，且该前缀 include 目录不在本 TU 的 include 路径上。
+constexpr int kMongocErrorCommandInvalidArg = 22;
+
+} // namespace
+
+result<bsoncxx::v1::document::view> ViewOf(const MongoDocument& doc,
+                                         const char*        what) {
+    if (doc.bytes.empty())
+        return result<bsoncxx::v1::document::view>::err(InvalidArg(
+            std::string("mongo: empty ") + what + " document"));
+    // libbson 全结构校验（长度、元素边界、终止符），不是仅看首部长度。
+    if (!bsoncxx::validate(doc.bytes.data(), doc.bytes.size()))
+        return result<bsoncxx::v1::document::view>::err(InvalidArg(
+            std::string("mongo: malformed BSON in ") + what));
+    try {
+        return result<bsoncxx::v1::document::view>::ok(
+            bsoncxx::v1::document::view{doc.bytes.data(), doc.bytes.size()});
+    } catch (const bsoncxx::v1::exception&) {
+        return result<bsoncxx::v1::document::view>::err(InvalidArg(
+            std::string("mongo: invalid BSON view in ") + what));
+    }
+}
+
+MongoDocument DocOf(bsoncxx::v1::document::view v) {
+    MongoDocument out;
+    if (v.data() != nullptr && v.length() > 0)
+        out.bytes.assign(v.data(), v.data() + v.length());
+    return out;
+}
+
+bool IsEmptyBson(const MongoDocument& doc) noexcept {
+    if (doc.bytes.empty())
+        return true;
+    // 结构良构的空文档恰好 5 字节：int32 总长 + 终止符。
+    if (doc.bytes.size() == 5 &&
+        doc.bytes[0] == 5 && doc.bytes[1] == 0 && doc.bytes[2] == 0 &&
+        doc.bytes[3] == 0 && doc.bytes[4] == 0)
+        return true;
+    return false;
+}
+
+Error ClassifyDriverError(const mongocxx::v1::exception& e,
+                          const char*                    what) {
+    Error err;
+    err.message           = std::string(what) + ": " + e.what();
+    err.backend_category  = "mongocxx";
+    err.backend_code      = e.code().value();
+
+    // v1::server_error：raw() 文档承载服务端 codeName/code。
+    // 注意：CRUD 失败在 r4.x 实际抛 v_noabi::operation_exception（不是
+    // v1::exception 子类），由 ClassifyOperationError 单独归类。
+    if (const auto* se =
+            dynamic_cast<const mongocxx::v1::server_error*>(&e)) {
+        err.code        = ErrorCode::RemoteError;
+        err.domain_code = "server";
+        try {
+            const auto raw = se->raw();
+            const auto el  = raw["codeName"];
+            if (el &&
+                el.type_id() == bsoncxx::v1::types::id::k_string) {
+                const auto sv = el.get_string().value;
+                err.domain_code.assign(sv.data(), sv.size());
+            }
+            const auto ce = raw["code"];
+            if (ce && ce.type_id() == bsoncxx::v1::types::id::k_int32)
+                err.backend_code = ce.get_int32().value;
+            else if (ce &&
+                     ce.type_id() == bsoncxx::v1::types::id::k_int64)
+                err.backend_code = ce.get_int64().value;
+        } catch (...) {
+        }
+        if (err.domain_code == "server" &&
+            (err.backend_code == 11000 || err.backend_code == 11001 ||
+             err.backend_code == 12582))
+            err.domain_code = "DuplicateKey";
+        return err;
+    }
+
+    const std::error_code ec = e.code();
+    if (ec == mongocxx::v1::type_errc::invalid_argument) {
+        err.code        = ErrorCode::InvalidArgument;
+        err.domain_code = "invalid_argument";
+        return err;
+    }
+    const auto& cat = ec.category();
+    if (cat == mongocxx::v1::pool::error_category()) {
+        if (ec.value() ==
+            static_cast<int>(mongocxx::v1::pool::errc::wait_queue_timeout)) {
+            err.code        = ErrorCode::Overloaded;
+            err.domain_code = "wait_queue_timeout";
+        } else {
+            err.code        = ErrorCode::Unavailable;
+            err.domain_code = "pool";
+        }
+        return err;
+    }
+    if ((cat == mongocxx::v1::client::error_category() &&
+         ec.value() == static_cast<int>(
+             mongocxx::v1::client::errc::invalid_database_name)) ||
+        (cat == mongocxx::v1::database::error_category() &&
+         ec.value() == static_cast<int>(
+             mongocxx::v1::database::errc::invalid_collection_name)) ||
+        (cat == mongocxx::v1::collection::error_category() &&
+         ec.value() == static_cast<int>(
+             mongocxx::v1::collection::errc::invalid_collection_name))) {
+        err.code        = ErrorCode::InvalidArgument;
+        err.domain_code = "invalid_name";
+        return err;
+    }
+    // 服务端错误的非 server_error 形态：驱动部分路径只以普通
+    // v1::exception + server_error_category 抛出（其 equivalent() 使
+    // ec == source_errc::server 成立）；codeName 不可得时按已知码归类。
+    if (ec == mongocxx::v1::source_errc::server) {
+        err.code        = ErrorCode::RemoteError;
+        err.domain_code = "server";
+        if (ec.value() == 11000 || ec.value() == 11001 ||
+            ec.value() == 12582)
+            err.domain_code = "DuplicateKey";
+        return err;
+    }
+    // mongoc 域：URI/选项解析失败以 MONGOC_ERROR_COMMAND_INVALID_ARG 汇报，
+    // 属调用方输入错误；其余 server selection/socket/stream/pool 失败统一
+    // Unavailable。该码只在 mongoc 域内比较（mongocrypt 码空间不同，不参与）。
+    if (ec == mongocxx::v1::source_errc::mongoc &&
+        ec.value() == kMongocErrorCommandInvalidArg) {
+        err.code        = ErrorCode::InvalidArgument;
+        err.domain_code = "invalid_argument";
+        return err;
+    }
+    if (ec == mongocxx::v1::source_errc::mongoc ||
+        ec == mongocxx::v1::source_errc::mongocrypt) {
+        err.code        = ErrorCode::Unavailable;
+        err.domain_code = "mongoc";
+        return err;
+    }
+    err.code        = ErrorCode::InternalError;
+    err.domain_code = "internal";
+    return err;
+}
+
+Error ClassifyOperationError(
+    const mongocxx::v_noabi::operation_exception& e, const char* what) {
+    Error err;
+    err.message           = std::string(what) + ": " + e.what();
+    err.backend_category  = "mongocxx";
+    err.backend_code      = e.code().value();
+    // raw_server_error() 存在 → 服务端拒绝 → RemoteError；
+    // 无服务端回复（客户端侧 operation 失败）→ Unavailable。
+    if (!e.raw_server_error()) {
+        err.code        = ErrorCode::Unavailable;
+        err.domain_code = "driver";
+        return err;
+    }
+    err.code        = ErrorCode::RemoteError;
+    err.domain_code = "server";
+    try {
+        const auto raw = e.raw_server_error()->view();
+        const auto el  = raw["codeName"];
+        if (el && el.type() == bsoncxx::v_noabi::type::k_string) {
+            const auto sv = el.get_string().value;
+            err.domain_code.assign(sv.data(), sv.size());
+        }
+        const auto ce = raw["code"];
+        if (ce && ce.type() == bsoncxx::v_noabi::type::k_int32)
+            err.backend_code = ce.get_int32().value;
+        else if (ce && ce.type() == bsoncxx::v_noabi::type::k_int64)
+            err.backend_code = ce.get_int64().value;
+        // 有序批量/写命令的部分成功：服务端回执里的 nInserted / nMatched /
+        // nModified / nDeleted 落进 details，调用方按结构化字段观察
+        // 「失败前已生效的写量」（契约：details["inserted_count"] 等）。
+        // writeErrors 数组存在时附带首个失败下标供定位。
+        auto put_count = [&](const char* name, const char* key) {
+            const auto n = raw[name];
+            if (n && (n.type() == bsoncxx::v_noabi::type::k_int32 ||
+                      n.type() == bsoncxx::v_noabi::type::k_int64)) {
+                const std::int64_t v =
+                    n.type() == bsoncxx::v_noabi::type::k_int32
+                        ? n.get_int32().value
+                        : n.get_int64().value;
+                err.details.emplace_back(key, std::to_string(v));
+            }
+        };
+        put_count("nInserted", "inserted_count");
+        put_count("nMatched", "matched_count");
+        put_count("nModified", "modified_count");
+        put_count("nRemoved", "deleted_count");
+        const auto we = raw["writeErrors"];
+        if (we && we.type() == bsoncxx::v_noabi::type::k_array) {
+            const auto arr = we.get_array().value;
+            for (const auto& w : arr) {
+                if (w.type() != bsoncxx::v_noabi::type::k_document)
+                    continue;
+                const auto idx = w["index"];
+                if (idx && (idx.type() == bsoncxx::v_noabi::type::k_int32 ||
+                            idx.type() == bsoncxx::v_noabi::type::k_int64)) {
+                    const std::int64_t v =
+                        idx.type() == bsoncxx::v_noabi::type::k_int32
+                            ? idx.get_int32().value
+                            : idx.get_int64().value;
+                    err.details.emplace_back("failed_index",
+                                             std::to_string(v));
+                    break;
+                }
+            }
+        }
+        // 有序批量写命令失败时服务端回执用「n」表示已生效写数（writeErrors
+        // 回执里没有 nInserted 字段）；nInserted 缺省时回退取 n，仍缺省则
+        // 用首个 writeErrors.index（ordered 写入：index 即已插入数）。
+        bool has_inserted = false;
+        for (const auto& d : err.details)
+            if (d.first == "inserted_count") { has_inserted = true; break; }
+        if (!has_inserted)
+            put_count("n", "inserted_count");
+        for (const auto& d : err.details)
+            if (d.first == "inserted_count") { has_inserted = true; break; }
+        if (!has_inserted)
+            for (const auto& d : err.details)
+                if (d.first == "failed_index") {
+                    err.details.emplace_back("inserted_count", d.second);
+                    break;
+                }
+    } catch (...) {
+    }
+    if (err.domain_code == "server" &&
+        (err.backend_code == 11000 || err.backend_code == 11001 ||
+         err.backend_code == 12582))
+        err.domain_code = "DuplicateKey";
+    return err;
+}
+
+Error ClassifyVNoabiError(const mongocxx::v_noabi::exception& e,
+                          const char*                       what) {
+    Error err;
+    err.message           = std::string(what) + ": " + e.what();
+    err.backend_category  = "mongocxx";
+    err.backend_code      = e.code().value();
+    err.code              = ErrorCode::InternalError;
+    err.domain_code       = "internal";
+    return err;
+}
+
+Error ClassifyBsonError(const bsoncxx::v1::exception& e, const char* what) {
+    Error err;
+    err.message          = std::string(what) + ": " + e.what();
+    err.backend_category = "bsoncxx";
+    err.backend_code     = e.code().value();
+    if (e.code() == bsoncxx::v1::type_errc::invalid_argument) {
+        err.code        = ErrorCode::InvalidArgument;
+        err.domain_code = "invalid_argument";
+    } else {
+        err.code        = ErrorCode::InternalError;
+        err.domain_code = "internal";
+    }
+    return err;
+}
+
+std::string EffectiveUri(const mongo::MongoRuntimeConfig& cfg) {
+    std::string uri = cfg.uri;
+    // 只认 '?' 之后的 query：按 '&' 分段，每段取第一个 '=' 之前的参数名，
+    // 大小写不敏感比较。避免 URI 其他位置（userinfo、参数值）中的
+    // "connectTimeoutMS=" 等子串被误判为真实 query key。
+    auto has_key = [&](const char* key) {
+        const std::size_t q = uri.find('?');
+        if (q == std::string::npos)
+            return false;
+        std::string needle = key;
+        std::transform(needle.begin(), needle.end(), needle.begin(),
+                       [](unsigned char c) {
+                           return static_cast<char>(std::tolower(c));
+                       });
+        std::size_t pos = q + 1;
+        while (pos <= uri.size()) {
+            const std::size_t amp = uri.find('&', pos);
+            const std::size_t end =
+                (amp == std::string::npos) ? uri.size() : amp;
+            const std::size_t eq = uri.find('=', pos);
+            const std::size_t name_end =
+                (eq == std::string::npos || eq > end) ? end : eq;
+            if (name_end - pos == needle.size()) {
+                bool match = true;
+                for (std::size_t i = 0; i < needle.size(); ++i)
+                    if (std::tolower(static_cast<unsigned char>(uri[pos + i])) !=
+                        needle[i])
+                        { match = false; break; }
+                if (match)
+                    return true;
+            }
+            if (amp == std::string::npos)
+                break;
+            pos = amp + 1;
+        }
+        return false;
+    };
+    auto append = [&](const char* key, long long value) {
+        if (has_key(key))
+            return;   // URI 已显式给出：不覆盖调用方取值
+        // 无 query 时首参用 '?'；query 已存在时用 '&' 分隔，
+        // URI 以 '?'/'&' 结尾（空 query/空段）则不再追加分隔符。
+        if (uri.find('?') == std::string::npos)
+            uri += '?';
+        else if (uri.back() != '?' && uri.back() != '&')
+            uri += '&';
+        std::string needle = key;
+        std::transform(needle.begin(), needle.end(), needle.begin(),
+                       [](unsigned char c) {
+                           return static_cast<char>(std::tolower(c));
+                       });
+        uri += needle + '=' + std::to_string(value);
+    };
+    append("serverSelectionTimeoutMS",
+           static_cast<long long>(cfg.server_selection_timeout.count()));
+    append("connectTimeoutMS",
+           static_cast<long long>(cfg.connect_timeout.count()));
+    append("socketTimeoutMS",
+           static_cast<long long>(cfg.socket_timeout.count()));
+    append("waitQueueTimeoutMS",
+           static_cast<long long>(cfg.wait_queue_timeout.count()));
+    // 每项 operation 在同一 worker 上 acquire/use/release：并发 lease
+    // 上限即 worker 数，连接池按此显式有界。
+    append("maxPoolSize", static_cast<long long>(cfg.worker_threads));
+    return uri;
+}
+
+} // namespace bbt::infra::mongo_detail

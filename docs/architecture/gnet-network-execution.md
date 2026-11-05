@@ -122,6 +122,18 @@ RequestClose 是服务封口，Run 返回才确认该 Engine 的网络资源、c
 
 不提供 Engine Close(deadline) 硬返回时限：同步解绑无 deadline，不捏造可取消解绑。调用者先 RequestClose、等 Run 返回再销毁 Engine，不并发销毁仍被 Run 使用的对象。不建后台 reaper、不 terminate，不以 context.stop 丢 callback 或 runtime 停机伪造资源完成。
 
+上层适配（http/rpc）在此之上区分两个承诺，不与 Engine 收口混为一谈：
+
+- 立即关闭（`Close(reason)`）：封新、发布原因、对自有连接 `RequestClose`，
+  令等待中的调用失败/唤醒；不等待业务 handler，也不要求 Engine 先 `Stopped`。
+- 优雅退出（`Shutdown(deadline)`）：封口后只等本对象承诺的用户可见责任归还
+  （池 active/dialing/waiting、server inflight、RPC admission/写责任、owner
+  已接纳操作计数）；`Retiring` 只是逻辑退役，仍按真实回收凭据出账。
+- 物理收口仍看 `Close()` + `WaitStopped(deadline)`：callback 销毁、连接
+  `Released()`、listener `AcceptingStopped()`；Engine 的 `Run` 返回与其
+  `Stopped` 相位才是网络资源、回调与 driver 的最终凭据。逻辑关闭成功不等于
+  物理释放，物理释放也不反过来证明业务排空。
+
 ### 既有 driver 异常边界
 
 不假设正常 Reactor 必然失败，不新增自愈/迁移或容错平台。普通 fd errno、EOF、协程超时不升级为 driver Failed。
@@ -321,7 +333,7 @@ worker server 布局已支持。
 
 | 对象/行为 | 处理 | 目标名/创建入口 | 所有权与执行域 | 错误/测试映射 |
 |---|---|---|---|---|
-| `include/bbt/infra/ICoObject.hpp` 与 `bbt::coroutine::ICoObject` | reuse | 不复制类型；继续聚合 coroutine 的 `ICoObject/CoObjectInfo/Deadline/WaitOptions` | 不拥有对象；公共类型由 coroutine 真源提供 | 公开头 selfcheck、`Test_contract_basics`；不新增 infra 同名接口 |
+| `bbt/infra/ICoObject.hpp` 与 `bbt::coroutine::ICoObject` | reuse | 不复制类型；继续聚合 coroutine 的 `ICoObject/CoObjectInfo/Deadline/WaitOptions` | 不拥有对象；公共类型由 coroutine 真源提供 | 公开头 selfcheck、`Test_contract_basics`；不新增 infra 同名接口 |
 | `rpc::Client::Create`、`rpc::Server::Create` | adapt | 既有 Create 委托 `MakeCoObject<T>(kind,name,creator)` → coroutine ManagerBase 唯一路径，沿用合法 shared_ptr creator/deleter | Client/Server owner 仍由 infra/framework AppNetwork 持有；观测索引只存 weak_ptr，Member 析构通知不保活；业务/回收 owner 不改弱 | 工厂构造/观测登记失败不提交计数；已创建后业务发布失败正常 destroyed；测试见 §10.4 实名映射 |
 | `net::Engine` | adapt observation, reuse native execution | 保留 Engine 名与 EnginePhase；`Engine::Run` 是唯一 native 控制入口；R3 创建点统一经 `Engine::Create`（委托 `MakeCoObject<Engine>("infra.net.Engine",name,creator)`），Engine 接 CoObject 身份/Member 实际析构通知 | 保留 native owner 和既有合法 owner/deleter；不继承 CoRuntimeOnly，Run 仍仅 native；物理回收与 G01 不因观测解决 | 创建/实际析构计数一次，RequestClose/Run 返回均不减 alive；观察不保活；现有 net.reactor_driver_*/net.stop_*/net.reclaim_* 另证明原执行/物理语义 |
 | `Connection`/`CoTcpConnection` | reuse behavior, omit factory | `CoTcpConnection` 继续是值语义视图；不新增对象 registry | 视图销毁不关连接；owner 兑现 close；Co 方法在受管协程，状态/RequestClose 可观察 | `WaitClosed` 不等 `Released`；`net.ico_*`、`net.reclaim_*` |

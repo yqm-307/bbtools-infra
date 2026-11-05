@@ -103,8 +103,11 @@ struct ClientOptions {
     QueryParams params;   // client 级默认查询参数（请求级追加在后）
     Timeout timeout{};
     PoolLimits limits{};
-    // 单响应体上限（Beast body_limit）；上限含 header 上界兜底。
+    // 单响应体上限（Beast body_limit）。
     std::uint64_t max_body_bytes{8 * 1024 * 1024};
+    // 请求 body 与响应 header 的可选字节上限；未设置时保留原有行为。
+    std::optional<std::uint64_t> max_request_body_bytes;
+    std::optional<std::uint64_t> max_header_bytes;
 };
 
 // 请求体（原始内容里程碑）。content 原样发送；content_type 非空时写入
@@ -184,11 +187,24 @@ public:
                                         const CallOptions& call = {
                                             bbt::coroutine::Deadline::max()});
 
-    // 立即逻辑封口：拒绝新请求、唤醒全部排队等待者（Closed）、退役空闲连接；
-    // 幂等不可重开。在飞请求按已持有借用完成或失败；不关共享 Engine，不假装
-    // 物理排空（退役连接的 fd 由 Engine owner 收口）。
-    void Close() noexcept;
+    // Open → Draining → Closed 单向前状态机。Close 立即逻辑封口：拒绝新
+    // 请求、唤醒全部排队等待者、对在飞与拨号条目请求关闭并结算全部未终结
+    // 操作（「失败在途」恰好一次，Draining 下同样执行，与 Shutdown 不共用
+    // 位）、发布首个关闭原因；幂等不可重开。不等待在飞请求，不关共享
+    // Engine，不假装物理排空（退役连接的 fd 由 Engine owner 收口）。
+    void Close(Error reason = MakeError(
+                   ErrorCode::Closed, "http client: closed by owner")) noexcept;
+    // 非 Open 即 true：Shutdown 置位 Draining 后同样报已封口。
     bool IsClosed() const noexcept;
+    // Close 发布的原因；Shutdown 只置 Draining 不发布原因，故未 Close 时为空。
+    std::optional<Error> CloseReason() const noexcept;
+    // 置 Draining（拒新）并等已接纳调用责任归零（在途借用与排队，不看条目
+    // phase；Retiring 属延迟物理回收不计入）。有限期限超时返回 TimedOut
+    // 且保持拒新；等待期间被 Close 且仍有在途返回其关闭原因，先排空先胜
+    // 返回 ok（成功不被追改）；重复调用仍 Draining 且有在途返回
+    // Overloaded（Busy）；已 Closed 返回首个关闭原因。native 宿主专用；
+    // 协程/Processer 域返回 InvalidContext。
+    result<void> Shutdown(bbt::coroutine::Deadline deadline);
 
     PoolStats Stats() const noexcept;
 

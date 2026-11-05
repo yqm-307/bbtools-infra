@@ -162,7 +162,7 @@ jobs:
         timeout-minutes: 10
         run: >
           bash infra/scripts/ci/run_test_profile.sh --build-dir "$BUILD_DIR"
-          --profile focused --timeout 180 --junit "$BUILD_DIR/junit-focused.xml"
+          --profile focused --label-expr "unit|integration" --timeout 180 --junit "$BUILD_DIR/junit-focused.xml"
           --regex "${{ needs.changes.outputs.focused }}"
       - name: "smoke/focused junit artifact 恒上传（仅 smoke 深度）"
         if: ${{ always() && env.TEST_DEPTH == 'smoke' }}
@@ -255,13 +255,13 @@ jobs:
           set -euo pipefail
           rm -rf "$BUILD_DIR" && mkdir -p "$BUILD_DIR"
           cmake -S "$REPO_DIR" -B "$BUILD_DIR" -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DBBT_INFRA_REDIS_NET=ON \
             -DBOOST_ROOT="$BOOST_PREFIX" -DCMAKE_PREFIX_PATH="$BOOST_PREFIX" \
             -DBBT_COROUTINE_SOURCE_DIR="$COROUTINE_DIR" -DBBT_CORE_SOURCE_DIR="$CORE_DIR" \
             -DBBT_HIREDIS_PREFIX="$DEPS_PREFIX/hiredis" \
             -DBBT_MONGOCXX_PREFIX="$DEPS_PREFIX/mongocxx" -DBBT_MONGOC_PREFIX="$DEPS_PREFIX/mongoc"
           cmake --build "$BUILD_DIR" --parallel "$JOBS" --target \
-            Test_redis_live Test_redis_cotcp_binding Test_mongo_live
+            Test_redis_net_contract redis_net_example Test_mongo_live
       - name: "真实 Redis live 门禁（有界 fail-closed）"
         timeout-minutes: 19
         run: bash infra/scripts/ci/live_redis_gate.sh

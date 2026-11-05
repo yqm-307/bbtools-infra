@@ -13,8 +13,7 @@ add_library(bbt_infra_rpc_tcp STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/../rpc/TcpTransport.cc")
 add_library(bbt::infra_rpc_tcp ALIAS bbt_infra_rpc_tcp)
 target_include_directories(bbt_infra_rpc_tcp
-    PUBLIC "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>"
-           "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>")
+    PUBLIC "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>")
 target_compile_features(bbt_infra_rpc_tcp PUBLIC cxx_std_17)
 target_link_libraries(bbt_infra_rpc_tcp
     PUBLIC bbt::infra_rpc_core bbt::infra_net)

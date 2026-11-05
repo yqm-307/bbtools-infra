@@ -206,6 +206,9 @@ struct SessionCore final : std::enable_shared_from_this<SessionCore> {
     std::atomic<std::uint64_t>      seq_counter{1};
 
     bool Submit(std::size_t stack, std::function<void()> fn);
+    // 唯一「失败在途」入口：幂等（dead.exchange），丢弃出站队列、关闭物理
+    // 连接、结算全部未终结 pending。关闭原因不在此附加——统一由 Call/Send
+    // 调用方可见的返回点读取 owner 原因后附加。
     void Kill(std::error_code reason);
     // 一份退出责任结算（reader/writer/物理连接）。返回到达 0：唯一归零
     // 点负责唤醒 server/owner 收口观察。
@@ -241,7 +244,16 @@ struct SessionOwnerState {
     // owner 活得久，owner 收口后只读到 closed。
     std::shared_ptr<SessionHooks> hooks{new SessionHooks()};
     mutable std::mutex           mu;
+    std::condition_variable      cv;      // Shutdown 排空等待
+    // Open → Draining → Closed：draining 由 Shutdown 置位（拒新、等
+    // active_ops 归零），closed 由 Seal 置位（失败在途、发布首个原因）——
+    // 两位不共用，Close 在 Draining 下同样执行「失败在途」。
     bool                         closed{false};
+    bool                         draining{false};
+    std::optional<Error>         close_reason;  // Close 发布；首个原因固定
+    // 已接纳 Call/Send 责任计数：与 closed/draining 同门（mu）接纳/归还，
+    // Shutdown 等它归零，不依赖连接物理 Released。
+    std::uint64_t                active_ops{0};
     std::unordered_map<std::string, std::weak_ptr<SessionCore>>   by_endpoint;
     std::unordered_map<std::string, std::shared_ptr<SessionCore>> by_identity;
     struct Establishing {
@@ -363,6 +375,10 @@ struct ServerV2State final : std::enable_shared_from_this<ServerV2State> {
     bool                           started{false};
     bool                           stopping{false};
     bool                           closed{false};
+    // Open → Draining → Closed：draining 只由 Shutdown 置位（StopAccepting
+    // 不算重复 Shutdown），Close 经 closed 表达；两位不共用。
+    bool                           draining{false};
+    std::optional<Error>           close_reason;  // Close 发布；首个原因固定
     bool                           queue_started{false};
     std::shared_ptr<AdmissionQueue> queue;
     std::uint64_t                  accepted{0};
@@ -845,40 +861,49 @@ void SessionCore::WriterLoop() {
     }
 }
 
+namespace {
+
+// 关闭原因作为可观察详情附加：保留既有失败分类（未提交 Closed /
+// 已提交 OutcomeUnknown+request_phase），只增加原因 code/message。
+// 唯一附加点是 Call/Send 调用方可见的返回点，不在内部各失败出口分别补。
+void AttachCloseReason(Error& error, const Error& reason) {
+    error.details.emplace_back("close_reason", reason.message);
+    error.details.emplace_back("close_reason_code",
+                               std::to_string(static_cast<int>(reason.code)));
+    if (!reason.domain_code.empty()) {
+        error.details.emplace_back("close_reason_domain_code", reason.domain_code);
+    }
+}
+
+// pending 唯一终态仲裁：committed_only 下未提交按 Closed、已提交按
+// OutcomeUnknown + RequestCommitted；关闭原因不在此附加（见 AttachCloseReason）。
+Error SettledPendingError(bool committed_only, bool committed, const Error& error) {
+    if (committed_only && !committed) {
+        return Err(ErrorCode::Closed, "session closed before commit");
+    }
+    if (!committed_only) { return error; }
+    return ErrPhase(ErrorCode::OutcomeUnknown, "session lost after commit",
+                    RequestPhase::RequestCommitted);
+}
+
+} // namespace
+
 void SessionCore::FailPending(Error error, bool committed_only) {
     std::vector<std::shared_ptr<CoWaiter>> wake;
     {
         std::lock_guard<std::mutex> lock(pending_mu);
         for (auto it = calls.begin(); it != calls.end();) {
             auto& pending = it->second;
-            if (committed_only && !pending->committed) {
-                pending->outcome = result<Response>::err(
-                    Err(ErrorCode::Closed, "session closed before commit"));
-            } else if (!committed_only) {
-                pending->outcome = result<Response>::err(error);
-            } else {
-                pending->outcome = result<Response>::err(
-                    ErrPhase(ErrorCode::OutcomeUnknown,
-                             "session lost after commit",
-                             RequestPhase::RequestCommitted));
-            }
+            pending->outcome = result<Response>::err(SettledPendingError(
+                committed_only, pending->committed, error));
             pending->done = true;
             wake.push_back(pending->waiter);
             it = calls.erase(it);
         }
         for (auto it = sends.begin(); it != sends.end();) {
             auto& pending = it->second;
-            if (committed_only && !pending->committed) {
-                pending->outcome = result<void>::err(
-                    Err(ErrorCode::Closed, "session closed before commit"));
-            } else if (!committed_only) {
-                pending->outcome = result<void>::err(error);
-            } else {
-                pending->outcome = result<void>::err(
-                    ErrPhase(ErrorCode::OutcomeUnknown,
-                             "session lost after commit",
-                             RequestPhase::RequestCommitted));
-            }
+            pending->outcome = result<void>::err(SettledPendingError(
+                committed_only, pending->committed, error));
             pending->done = true;
             wake.push_back(pending->waiter);
             it = sends.erase(it);
@@ -2537,7 +2562,20 @@ void AcceptLoop(std::shared_ptr<ServerV2State> server) {
             server->engine->CoAccept({Clock::now() + 50ms});
         if (accepted.error == std::errc::timed_out) { continue; }
         if (accepted.error) {
-            detail::ServerV2Seal(server);
+            // RequestStopAccepting/Seal 会取消在途 CoAccept：这是正常封口路径，
+            // 不是 accept 故障，不得发布失败原因覆盖调用方的 Close/Shutdown。
+            bool sealed = false;
+            {
+                std::lock_guard<std::mutex> lock(server->mu);
+                sealed = server->stopping;
+            }
+            if (sealed) {
+                exit_loop();
+                return;
+            }
+            detail::ServerV2Seal(
+                server, Err(ErrorCode::RuntimeUnavailable,
+                            "rpc server: accept loop failed"));
             exit_loop();
             return;
         }
@@ -2660,17 +2698,46 @@ result<void> ParseTarget(std::string_view target, std::string& host,
     return detail::ParseTcpEndpoint(value.substr(6), host, port);
 }
 
+// 已接纳调用的一次性责任：与 owner 封口同门登记，作用域结束（含所有
+// 早退/异常路径）归还并唤醒 Shutdown 等待者。
+struct OwnerOperationGuard {
+    std::shared_ptr<SessionOwnerState> owner;
+    ~OwnerOperationGuard() { detail::SessionOwnerEndOperation(owner); }
+};
+
 } // namespace
 
-bbt_co_async(result<Response>) Client::Call(
+namespace {
+
+// v2 出站关闭原因的统一附加点：Call/Send 返回失败且 owner 已发布原因时，
+// 在调用方可见的返回点把首个关闭原因附到 Error.details；内部各失败出口
+// 只保留失败分类（未提交 Closed / 已提交 OutcomeUnknown+request_phase /
+// 超时 / 取消），不分别补原因。错误本身即关闭原因或已含 close_reason 键
+// 时不重复附加；成功结果不改。
+void AttachOwnerCloseReason(const std::shared_ptr<SessionOwnerState>& owner,
+                            Error& error) {
+    const auto reason = detail::SessionOwnerCloseReason(*owner);
+    if (!reason) { return; }
+    if (error.code == reason->code && error.message == reason->message) {
+        return;
+    }
+    for (const auto& detail : error.details) {
+        if (detail.first == "close_reason") { return; }
+    }
+    AttachCloseReason(error, *reason);
+}
+
+result<Response> CallImpl(
+    const std::shared_ptr<SessionOwnerState>& owner,
     std::string_view target, Request request, const CallOptions& options) {
     using R = result<Response>;
     if (!bbt::coroutine::IsInCoroutineContext())
         return R::err(Err(ErrorCode::InvalidContext, "coroutine context required"));
-    auto owner = m_owner;
-    if (!owner) {
-        return R::err(Err(ErrorCode::Closed, "client not a v2 owner"));
+    Error closed_error;
+    if (!detail::SessionOwnerBeginOperation(owner, closed_error)) {
+        return R::err(std::move(closed_error));
     }
+    OwnerOperationGuard operation_guard{owner};
     if (const auto gate = CheckCall(options.deadline)) {
         if (gate == std::errc::operation_not_permitted) {
             return R::err(Err(ErrorCode::InvalidContext,
@@ -2817,15 +2884,17 @@ bbt_co_async(result<Response>) Client::Call(
     return R::err(Err(ErrorCode::TimedOut, "call timed out"));
 }
 
-bbt_co_async(result<void>) Client::Send(
+result<void> SendImpl(
+    const std::shared_ptr<SessionOwnerState>& owner,
     std::string_view target, Request message, const SendOptions& options) {
     using R = result<void>;
     if (!bbt::coroutine::IsInCoroutineContext())
         return R::err(Err(ErrorCode::InvalidContext, "coroutine context required"));
-    auto owner = m_owner;
-    if (!owner) {
-        return R::err(Err(ErrorCode::Closed, "client not a v2 owner"));
+    Error closed_error;
+    if (!detail::SessionOwnerBeginOperation(owner, closed_error)) {
+        return R::err(std::move(closed_error));
     }
+    OwnerOperationGuard operation_guard{owner};
     if (auto valid = options.Validate(); !valid) {
         return R::err(valid.error());
     }
@@ -2976,6 +3045,32 @@ bbt_co_async(result<void>) Client::Send(
     return R::err(Err(ErrorCode::TimedOut, "send acceptance timed out"));
 }
 
+} // namespace
+
+bbt_co_async(result<Response>) Client::Call(
+    std::string_view target, Request request, const CallOptions& options) {
+    auto owner = m_owner;
+    if (!owner) {
+        return result<Response>::err(
+            Err(ErrorCode::Closed, "client not a v2 owner"));
+    }
+    auto outcome = CallImpl(owner, target, std::move(request), options);
+    if (!outcome) { AttachOwnerCloseReason(owner, outcome.error()); }
+    return outcome;
+}
+
+bbt_co_async(result<void>) Client::Send(
+    std::string_view target, Request message, const SendOptions& options) {
+    auto owner = m_owner;
+    if (!owner) {
+        return result<void>::err(
+            Err(ErrorCode::Closed, "client not a v2 owner"));
+    }
+    auto outcome = SendImpl(owner, target, std::move(message), options);
+    if (!outcome) { AttachOwnerCloseReason(owner, outcome.error()); }
+    return outcome;
+}
+
 ClientStats Client::Stats() const noexcept {
     ClientStats out;
     auto owner = m_owner;
@@ -3082,7 +3177,9 @@ result<void> detail::ServerV2Start(const std::shared_ptr<ServerV2State>& v2) {
             // 裸协程任务：异常逃逸即 terminate——兜底封 server。
             try { AcceptLoop(v2); }
             catch (...) {
-                detail::ServerV2Seal(v2);
+                detail::ServerV2Seal(
+                    v2, Err(ErrorCode::InternalError,
+                            "rpc server: accept loop threw"));
                 std::lock_guard<std::mutex> lock(v2->mu);
                 v2->accept_loop_exited = true;
                 v2->cv.notify_all();
@@ -3119,20 +3216,60 @@ result<void> detail::ServerV2Drain(const std::shared_ptr<ServerV2State>& v2,
     detail::ServerV2StopAccepting(v2);
     std::unique_lock<std::mutex> lock(v2->mu);
     const auto done = v2->cv.wait_until(lock, deadline, [&] {
-        return v2->DrainedLocked();
+        return v2->DrainedLocked() || v2->close_reason.has_value();
     });
-    if (!done) {
-        return ErrV(ErrorCode::TimedOut, "drain deadline exceeded");
+    if (v2->DrainedLocked()) { return result<void>::ok(); }
+    if (v2->close_reason) {
+        return result<void>::err(*v2->close_reason);
     }
-    return result<void>::ok();
+    (void)done;
+    return ErrV(ErrorCode::TimedOut, "drain deadline exceeded");
 }
 
-void detail::ServerV2Seal(const std::shared_ptr<ServerV2State>& v2) noexcept {
+result<void> detail::ServerV2Shutdown(
+    const std::shared_ptr<ServerV2State>& v2,
+    bbt::coroutine::Deadline deadline) {
+    if (!NativeHost()) {
+        return ErrV(ErrorCode::InvalidContext,
+                    "Shutdown requires native host context");
+    }
+    {
+        std::lock_guard<std::mutex> lock(v2->mu);
+        if (v2->close_reason) {
+            return result<void>::err(*v2->close_reason);   // 已 Closed
+        }
+        if (v2->draining) {
+            // 重复调用（已 Draining）：已排空按 ok，否则 Busy。
+            if (v2->DrainedLocked()) { return result<void>::ok(); }
+            return ErrV(ErrorCode::Overloaded,
+                        "shutdown already in progress");
+        }
+        v2->draining = true;
+    }
+    // 封口拒新（不发布关闭原因：Close 的打断原因才能如实传出）。
+    detail::ServerV2StopAccepting(v2);
+    std::unique_lock<std::mutex> lock(v2->mu);
+    const auto done = v2->cv.wait_until(lock, deadline, [&] {
+        return v2->DrainedLocked() || v2->close_reason.has_value();
+    });
+    // 先完成者胜：真实排空即 ok，不被随后 Close 追改。
+    if (v2->DrainedLocked()) { return result<void>::ok(); }
+    if (v2->close_reason) {
+        return result<void>::err(*v2->close_reason);
+    }
+    (void)done;
+    return ErrV(ErrorCode::TimedOut,
+                "shutdown deadline exceeded; server remains sealed");
+}
+
+void detail::ServerV2Seal(const std::shared_ptr<ServerV2State>& v2,
+                          Error reason) noexcept {
     std::vector<std::shared_ptr<SessionCore>> links;
     std::vector<net::Connection> handshakes;
     std::shared_ptr<AdmissionQueue> queue;
     {
         std::lock_guard<std::mutex> lock(v2->mu);
+        if (!v2->close_reason) { v2->close_reason = std::move(reason); }
         if (v2->closed) { return; }
         v2->closed = true;
         v2->stopping = true;
@@ -3193,22 +3330,15 @@ result<void> detail::ServerV2WaitStopped(
     }
 }
 
-result<void> Server::Close(bbt::coroutine::Deadline deadline) {
-    if (!m_v2) {
-        Close();
-        return result<void>::ok();
-    }
-    if (!NativeHost()) {
-        return ErrV(ErrorCode::InvalidContext,
-                    "Close(deadline) requires native host context");
-    }
-    detail::ServerV2Seal(m_v2);
-    return detail::ServerV2WaitStopped(m_v2, deadline);
-}
-
 bool detail::ServerV2Closed(const ServerV2State& v2) noexcept {
     std::lock_guard<std::mutex> lock(v2.mu);
     return v2.closed;
+}
+
+std::optional<Error> detail::ServerV2CloseReason(
+    const ServerV2State& v2) {
+    std::lock_guard<std::mutex> lock(v2.mu);
+    return v2.close_reason;
 }
 
 result<bbt::infra::net::Address> Server::LocalAddress() const {
@@ -3278,14 +3408,14 @@ ServerStats Server::Stats() const noexcept {
 // ============================================================================
 
 void detail::SessionOwnerSeal(
-    const std::shared_ptr<SessionOwnerState>& owner) noexcept {
+    const std::shared_ptr<SessionOwnerState>& owner, Error reason) noexcept {
     std::vector<std::shared_ptr<SessionCore>> sessions;
     std::vector<net::Connection> handshakes;
-    bool sealing = false;
     {
         std::lock_guard<std::mutex> lock(owner->mu);
+        if (!owner->close_reason) { owner->close_reason = std::move(reason); }
         if (!owner->closed) {
-            sealing = true;
+            // 「失败在途」恰好一次：closed 位唯一表达，Draining 下同样执行。
             owner->closed = true;
             for (auto& [id, session] : owner->by_identity) {
                 (void)id;
@@ -3298,13 +3428,12 @@ void detail::SessionOwnerSeal(
                 if (est->conn.Valid()) { handshakes.push_back(est->conn); }
             }
         }
+        owner->cv.notify_all();
     }
-    if (sealing) {
-        for (auto& session : sessions) { session->Kill({}); }
-        for (auto& conn : handshakes) {
-            conn.RequestClose(
-                std::make_error_code(std::errc::connection_aborted));
-        }
+    for (auto& session : sessions) { session->Kill({}); }
+    for (auto& conn : handshakes) {
+        conn.RequestClose(
+            std::make_error_code(std::errc::connection_aborted));
     }
     // 控制器永久 closed：无论本次是否首次封口都置位，保证 Close 返回后 Arm
     // 一定看到 Closed；在途 Pause 由 runtime 的 owner.closed 检查退出。锁外
@@ -3320,7 +3449,78 @@ SessionOwnerState::~SessionOwnerState() {
 
 bool detail::SessionOwnerClosed(const SessionOwnerState& owner) noexcept {
     std::lock_guard<std::mutex> lock(owner.mu);
-    return owner.closed;
+    return owner.closed || owner.draining;
+}
+
+std::optional<Error> detail::SessionOwnerCloseReason(
+    const SessionOwnerState& owner) {
+    std::lock_guard<std::mutex> lock(owner.mu);
+    return owner.close_reason;
+}
+
+bool detail::SessionOwnerBeginOperation(
+    const std::shared_ptr<SessionOwnerState>& owner, Error& closed_error) {
+    std::lock_guard<std::mutex> lock(owner->mu);
+    // 非 Open 即拒绝：Close 原因优先，否则通用 Closed。
+    if (owner->closed || owner->draining) {
+        closed_error = owner->close_reason
+            ? *owner->close_reason
+            : Err(ErrorCode::Closed, "rpc client: closed");
+        return false;
+    }
+    ++owner->active_ops;
+    return true;
+}
+
+void detail::SessionOwnerEndOperation(
+    const std::shared_ptr<SessionOwnerState>& owner) noexcept {
+    std::lock_guard<std::mutex> lock(owner->mu);
+    if (owner->active_ops != 0) { --owner->active_ops; }
+    owner->cv.notify_all();
+}
+
+result<void> detail::SessionOwnerShutdown(
+    const std::shared_ptr<SessionOwnerState>& owner,
+    bbt::coroutine::Deadline deadline) {
+    if (!NativeHost()) {
+        return ErrV(ErrorCode::InvalidContext,
+                    "Shutdown requires native host context");
+    }
+    {
+        std::lock_guard<std::mutex> lock(owner->mu);
+        if (owner->closed) {
+            // 已 Closed：如实返回首个关闭原因（缺失时不伪造）。
+            if (owner->close_reason) {
+                return result<void>::err(*owner->close_reason);
+            }
+            return ErrV(ErrorCode::Closed, "rpc client: closed");
+        }
+        if (owner->draining) {
+            // 重复调用（已 Draining）：已排空按 ok，否则 Busy。
+            if (owner->active_ops == 0) { return result<void>::ok(); }
+            return ErrV(ErrorCode::Overloaded,
+                        "shutdown already in progress");
+        }
+        // 拒新：与 Call/Send 的接纳同门（BeginOperation 读 draining），
+        // 不发布关闭原因——Close 的打断原因才能如实传出。不占用 closed 位，
+        // Seal 在其后仍执行且仅执行一次「失败在途」。
+        owner->draining = true;
+        owner->cv.notify_all();
+    }
+    std::unique_lock<std::mutex> lock(owner->mu);
+    for (;;) {
+        // 先排空先胜：当前已归还即 ok；等待中被 Close 且仍有在途 → 原因。
+        if (owner->active_ops == 0) { return result<void>::ok(); }
+        if (owner->close_reason) {
+            return result<void>::err(*owner->close_reason);
+        }
+        if (deadline != bbt::coroutine::Deadline::max() &&
+            Clock::now() >= deadline) {
+            return ErrV(ErrorCode::TimedOut,
+                        "shutdown deadline exceeded; owner remains sealed");
+        }
+        owner->cv.wait_until(lock, deadline);
+    }
 }
 
 } // namespace bbt::infra::rpc

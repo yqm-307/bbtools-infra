@@ -77,8 +77,10 @@ result<std::string> SerializeRequest(const PreparedRequest& request);
 
 class Http11Connection {
 public:
-    Http11Connection(net::Connection connection, std::uint64_t max_body_bytes) noexcept
-        : m_connection(std::move(connection)), m_max_body_bytes(max_body_bytes) {}
+    Http11Connection(net::Connection connection, std::uint64_t max_body_bytes,
+                     std::optional<std::uint64_t> max_header_bytes) noexcept
+        : m_connection(std::move(connection)), m_max_body_bytes(max_body_bytes),
+          m_max_header_bytes(max_header_bytes) {}
 
     struct ExchangeResult {
         Response response;
@@ -98,6 +100,7 @@ private:
 
     net::Connection m_connection;
     std::uint64_t m_max_body_bytes;
+    std::optional<std::uint64_t> m_max_header_bytes;
 };
 
 } // namespace detail

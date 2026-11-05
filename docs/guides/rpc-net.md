@@ -14,7 +14,7 @@
 - **wire profile 与 payload 复用不改**：`proto/bbt/infra/rpc/v1/rpc_envelope.proto`
   字节规则逐位不变（POST `/rpc`、`application/x-protobuf`、`remaining_budget_ms`
   1..24h、metadata 前缀白名单）；位置参数 payload codec 仍是
-  `include/bbt/infra/rpc/RpcPayload.hpp`（header-only，framework 消费面不变）。
+  `bbt/infra/rpc/RpcPayload.hpp`（header-only，framework 消费面不变）。
 - 变化点只有一处：`RpcWire` 的 HTTP body 绑定从旧 `bbt::infra::HttpRequest/
   HttpResponse` 改绑新 `http::IncomingRequest`/`http::Response`
   （`ParseRpcWireHttpRequest` / `ParseRpcWireHttpResponse` /
@@ -30,8 +30,10 @@ static result<std::shared_ptr<Client>> Create(std::shared_ptr<http::Client> tran
 bbt_co_async(result<RpcEnvelope>) Call(const RpcAddress& address,
                                        RpcEnvelope request,
                                        const CallOptions& options);
-void Close() noexcept;          // 转发 http::Client，幂等、不可重开
+void Close(Reason);             // 发布首个原因 + 转发 http::Client（幂等、不可重开）
 bool IsClosed() const noexcept; // 转发 http::Client
+std::optional<Error> CloseReason() const noexcept;
+result<void> Shutdown(bbt::coroutine::Deadline);  // 封口 + 等已接纳调用归还
 
 // bbt/infra/rpc/Server.hpp
 static result<std::shared_ptr<Server>> Create(std::shared_ptr<net::Engine> engine,
@@ -39,16 +41,31 @@ static result<std::shared_ptr<Server>> Create(std::shared_ptr<net::Engine> engin
                                               http::ServerOptions options = {});
 result<void> Start();                       // Engine Running 且有监听后，一次性
 void StopAccepting() noexcept;              // 只封新接纳，已授权 handler+回复继续
-result<void> Drain(bbt::coroutine::Deadline);   // 等 handler 返回且回复写终态（native 宿主）
-void Close() noexcept;                      // 幂等强制封口（在途回复明确放弃）
+result<void> Shutdown(bbt::coroutine::Deadline); // 单入口封口 + 排空（native 宿主）
+void Close(Reason);                         // 立即强制封口 + 发布原因（在途回复明确放弃）
+std::optional<Error> CloseReason() const noexcept;
+result<void> Drain(bbt::coroutine::Deadline);       // 两段工具：须先 StopAccepting
 result<void> WaitStopped(bbt::coroutine::Deadline); // listener 停 + callback 销毁 + 连接 Released
-bool IsClosed() const noexcept;             // 唯一补充的观测：RPC Server 上 Close() 已调用
+bool IsClosed() const noexcept;             // Close 已调用（Shutdown 封口不算）
 ```
 
-生命周期语义完全沿用 HTTP：`StopAccepting → Drain → Close → WaitStopped`
-（每个 result 都要检查）；Engine 由应用装配、Run 并最终 `RequestClose` 收口。
-监听地址经共享 Engine 的 `LocalAddresses()` 查询，不在 RPC 面重复暴露
-Stats/LocalAddress。
+生命周期语义完全沿用 HTTP（`Open → Draining → Closed`）：`Shutdown(deadline)` 置
+Draining 拒新，再等已接纳调用真实归还；有限期限超时 `TimedOut` 且保持拒新，
+等待中被 Close 且仍有在途返回其关闭原因，先排空先胜返回 ok；重复调用仍
+Draining 且有在途返回 `Overloaded`（Busy），已 Closed 返回首个原因。立即语义
+用 `Close(reason)`：不等待业务 handler，令在途回复明确放弃，「失败在途」
+恰好执行一次且与 Shutdown 不共用关闭位。物理收口另用
+`Close()` + `WaitStopped(deadline)`（`Shutdown` 成功不冒充连接已 `Released`）。
+Engine 由应用装配、Run 并最终 `RequestClose` 收口。监听地址经共享 Engine 的
+`LocalAddresses()` 查询，不在 RPC 面重复暴露 Stats/LocalAddress。
+
+v2 会话 owner（`rpc::Client::Create(engine, ClientOptions)`）的
+`Shutdown(deadline)` 用 owner 自身「已接纳 Call/Send」（active_ops）计数等待真实归还，
+不依赖连接物理 Released；`Close(reason)` 立即封口并令在途调用以
+`OutcomeUnknown` + `request_phase` 结算，不谎报未执行。仅提供 envelope
+`Exchange` 的外来 transport（如独立 TCP adapter）未实现排空谓词时，
+`Client::Shutdown` 如实返回 `UnsupportedRoute`（能力边界，不伪装成功）；
+inbound adapter 的默认 `Shutdown` 是 `StopAccepting()` + `Drain()`。
 
 ## 错误与关联契约
 
@@ -105,9 +122,7 @@ ctest --test-dir <build> -j1 -R '^rpc\.net\.' --output-on-failure
   只链接 `bbt::infra_http_net` 的消费者不拉入 protobuf。
 - 开关：`BBT_INFRA_RPC_NET=ON` 且缺 `BBT_INFRA_HTTP_NET` 或缺
   `BBT_PROTOBUF_PREFIX` → configure 直接 `FATAL_ERROR`（不静默跳过、不假成功）。
-- 旧入口已删除：`include/bbt/infra/RpcClient.hpp`、`RpcServer.hpp`、
-  `src/rpc/RpcRuntimeImpl.cc`、`NetworkRuntime::CreateRpcClient/ListenRpc`
-  与旧 `rpc.runtime*`/`rpc.wire_*` 测试全量移除；全量闭包不再接入 protobuf。
+- RPC 只通过本模块公开入口消费，wire 生成与依赖由 `BBT_INFRA_RPC_NET` 显式开启。
 
 ## 测试覆盖（`tests/rpc_net/`，CTest `rpc.net.*`）
 

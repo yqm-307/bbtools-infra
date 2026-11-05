@@ -1,4 +1,4 @@
-// 最小能力探针（probe only，非生产代码，不实现 IoWait/CoTCP/CoUDP）：
+// 最小能力探针（probe only，非生产代码，不实现网络适配器）：
 // 实测 bbtools-coroutine detail::CoPollEvent 是否支持在【同一事件】上组合
 // FD readable（真实 socketpair）+ custom wakeup + timeout
 // 四个确定性场景：

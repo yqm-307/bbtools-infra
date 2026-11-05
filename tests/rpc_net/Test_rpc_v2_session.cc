@@ -149,7 +149,11 @@ struct AppHost {
         }
     }
     ~AppHost() {
-        if (server) { (void)server->Close(Clock::now() + 3s); }
+        if (server) {
+            (void)server->Shutdown(Clock::now() + 3s);
+            server->Close();
+            (void)server->WaitStopped(Clock::now() + 3s);
+        }
         engine->RequestClose();
         if (runner.joinable()) { runner.join(); }
     }
@@ -1069,8 +1073,9 @@ void CloseDrain() {
     CHECK(Get(boot));
 
     CHECK(b->server->Drain(Clock::now() + 3s));
-    const auto closed = b->server->Close(Clock::now() + 3s);
-    CHECK(closed);
+    CHECK(b->server->Shutdown(Clock::now() + 3s));
+    b->server->Close();   // 物理收口需要先封口（杀 link），再等 Released
+    CHECK(b->server->WaitStopped(Clock::now() + 3s));
     CHECK(b->server->IsClosed());
     CHECK(WaitUntil([&] { return b->engine->CountConnections() == 0; }, 3s));
 
@@ -1080,6 +1085,90 @@ void CloseDrain() {
     });
     CHECK(!after);
     std::cout << "v2 close drain + physical release ok\n";
+}
+
+// Close(reason)/Shutdown：Server 空 façade 的真实语义——Shutdown 封口 +
+// 等已接纳 item 归还（超时诚实 TimedOut、不隐式 Close）；Close 发布首个原因，
+// 拒绝后续并保留可观察的原因。
+void CloseReason() {
+    auto a = std::make_unique<AppHost>("app-a");
+    auto b = std::make_unique<AppHost>("app-b");
+    auto held = SubmitCo([&] {
+        return bbt_co_await a->client->Call(b->Target(), MakeCall("hold", 1, "k"), UntilMs());
+    });
+    CHECK(WaitUntil([&] { return b->calls.load() == 1; }));
+
+    // 已接纳 item 未释放：Shutdown 必须等它，不谎报排空。
+    ExpectCode(b->server->Shutdown(Clock::now() + 50ms), ErrorCode::TimedOut);
+    CHECK(!b->server->IsClosed());
+    CHECK(!b->server->CloseReason().has_value());
+
+    b->ProcessAdmitted(Echo);
+    CHECK(Get(held));
+    CHECK(b->server->Shutdown(Clock::now() + 3s));
+
+    const auto reason = MakeError(ErrorCode::Unavailable, "owner close");
+    b->server->Close(reason);
+    CHECK(b->server->IsClosed());
+    auto observed = b->server->CloseReason();
+    CHECK(observed.has_value());
+    if (observed) {
+        CHECK(observed->code == ErrorCode::Unavailable);
+        CHECK(observed->message == "owner close");
+    }
+    // 重复 Close 不覆盖首个原因。
+    b->server->Close(MakeError(ErrorCode::TimedOut, "later"));
+    auto again = b->server->CloseReason();
+    CHECK(again.has_value() && again->message == "owner close");
+    CHECK(b->server->WaitStopped(Clock::now() + 3s));
+    std::cout << "v2 shutdown drain/timeout + close reason ok\n";
+}
+
+// Close(custom)：v2 已提交在途 Call 保留 OutcomeUnknown/request_phase，并在
+// 唯一终态上附带首个关闭原因的 code/message，不追改成已胜出的成功。
+void CloseReasonPending() {
+    auto a = std::make_unique<AppHost>("app-a");
+    auto b = std::make_unique<AppHost>("app-b");
+    auto held = SubmitCo([&] {
+        return bbt_co_await a->client->Call(b->Target(), MakeCall("hold", 1, "k"),
+                                           UntilMs(5s));
+    });
+    // 请求已被对端接纳 = 请求字节已完整写出，属于已提交。
+    CHECK(WaitUntil([&] { return b->calls.load() == 1; }));
+
+    a->client->Close(MakeError(ErrorCode::Unavailable, "owner close"));
+    const auto result = Get(held);
+    CHECK(!result);
+    CHECK(result.error().code == ErrorCode::OutcomeUnknown);
+    CHECK(result.error().request_phase == bbt::infra::RequestPhase::RequestCommitted);
+    const auto expected_code =
+        std::to_string(static_cast<int>(ErrorCode::Unavailable));
+    bool has_reason = false;
+    bool has_code = false;
+    for (const auto& detail : result.error().details) {
+        if (detail.first == "close_reason" && detail.second == "owner close") {
+            has_reason = true;
+        }
+        if (detail.first == "close_reason_code" && detail.second == expected_code) {
+            has_code = true;
+        }
+    }
+    CHECK(has_reason);
+    CHECK(has_code);
+
+    // 封口后新调用按同一原因拒绝，已有终态不被追改。
+    const auto late = CallCo([&] {
+        return bbt_co_await a->client->Call(b->Target(), MakeCall("late", 2, "k"),
+                                           UntilMs(3s));
+    });
+    CHECK(!late);
+    CHECK(late.error().code == ErrorCode::Unavailable);
+    CHECK(late.error().message == "owner close");
+
+    // 归还 b 侧已接纳项，避免测试自身留下未终结 handler。
+    b->ProcessAdmitted(Echo);
+    CHECK(b->server->Drain(Clock::now() + 3s));
+    std::cout << "v2 close reason attached to committed pending call\n";
 }
 
 // ---- 9. F3/F10-inflight：持有 lease 超额 → 立即 Overloaded 终态，连接可进展 ---
@@ -1346,17 +1435,19 @@ void ReplyWriteDeferred() {
     CHECK(WaitUntil([&] { return gate2->Entered(HookPoint::BeforeWrite); }, 3s));
     CHECK(rpc::detail::ServerV2LedgerForTest(*b.server).writes_outstanding >= 1);
     CHECK(done2.wait_for(0ms) != std::future_status::ready);
-    // Drain 封口会取消诊断 Pause；不再要求控制方手动放行。
-    CHECK(b.server->Drain(Clock::now() + 3s));
-    CHECK(WaitUntil([&] { return gate2->InFlight() == 0; }));
-    // link 已被 Drain 的 Seal 副作用退役：写失败终态如实返回（不伪报 ok）。
-    const auto done2_result = Get(done2);
-    CHECK(!done2_result);
+    // Drain 不早成功：诊断 Pause 中的在写项仍是未结算写责任——Drain 诚实
+    // 超时，不靠杀 link 提前收口（优雅排空，封口只置 Draining 不 Close）。
+    const auto drained_early = b.server->Drain(Clock::now() + 200ms);
+    CHECK(!drained_early);
+    CHECK(drained_early.error().code == ErrorCode::TimedOut);
+    // 放行后写真实完成：Complete/调用方按真实终态返回，写责任唯一结算。
+    gate2->Release();
+    CHECK(Get(done2));
+    CHECK(Get(held2));
     CHECK(WaitUntil([&] {
         return rpc::detail::ServerV2LedgerForTest(*b.server).writes_outstanding == 0;
     }, 2s));
-    const auto held2_result = Get(held2);
-    CHECK(!held2_result);
+    CHECK(b.server->Drain(Clock::now() + 3s));
     std::cout << "v2 reply write deferred: no early complete/drain ok\n";
 }
 
@@ -1571,7 +1662,9 @@ void CloseReleased() {
     CHECK(done.wait_for(5s) == std::future_status::ready);
     (void)Get(done);
     (void)Get(held);
-    CHECK(b->server->Close(Clock::now() + 3s));
+    CHECK(b->server->Shutdown(Clock::now() + 3s));
+    b->server->Close();
+    CHECK(b->server->WaitStopped(Clock::now() + 3s));
     CHECK(b->server->IsClosed());
     CHECK(WaitUntil([&] { return b->engine->CountConnections() == 0; }, 3s));
     CHECK(WaitUntil([&] {
@@ -1589,8 +1682,9 @@ void CloseHandshake() {
     CHECK(WaitUntil([&] { return gate->Entered(HookPoint::InboundBeforeHandshake) == 1; }, 3s));
     CHECK(rpc::detail::ServerV2LedgerForTest(*b->server).handshakes >= 1);
     CHECK(gate->InFlight() == 1);
-    CHECK(b->server->Close(Clock::now() + 3s));
+    b->server->Close();   // 立即封口：取消握手 Pause，不等待物理收口
     CHECK(b->server->IsClosed());
+    CHECK(b->server->WaitStopped(Clock::now() + 3s));
     CHECK(WaitUntil([&] { return gate->InFlight() == 0; }));
     CHECK(!HookState(b->client->Hooks(), HookPoint::InboundBeforeHandshake).closed);
     CHECK(WaitUntil([&] {
@@ -2105,15 +2199,17 @@ void NeverStartedDrainClose() {
     // 未 Start 的 Drain 立即完成（DrainedLocked 无 queue 也为真）。
     const auto drained = server->Drain(Clock::now() + 1500ms);
     CHECK(drained);
-    // 未 Start 的 Close(deadline) 逻辑封口即完成——不得等
-    // accept_loop_exited（无 accept 任务）。
-    const auto closed = server->Close(Clock::now() + 1500ms);
+    // 未 Start 的 Shutdown 立即完成——不得等 accept_loop_exited（无 accept
+    // 任务）；物理收口谓词同样空即真。
+    const auto closed = server->Shutdown(Clock::now() + 1500ms);
     CHECK(closed);
+    server->Close();
+    CHECK(server->WaitStopped(Clock::now() + 1500ms));
     CHECK(server->IsClosed());
-    // 幂等：再次 Drain/Close 仍成功不崩溃。
+    // 已排空且无在途：Drain 幂等仍 ok；Shutdown 对已 Closed 如实返回首个
+    // 关闭原因（幂等、不覆盖）。
     CHECK(server->Drain(Clock::now() + 500ms));
-    const auto closed2 = server->Close(Clock::now() + 500ms);
-    CHECK(closed2);
+    ExpectCode(server->Shutdown(Clock::now() + 500ms), ErrorCode::Closed);
     // 并发 IsClosed/LocalAddress 与 Close（Start 未发生）同锁读取——
     // 读侧与写侧同一把 v2->mu，不构成数据竞争（P2-3）。在 Close 前
     // 启动 reader 覆盖并发窗口；reads 计数在 stop 前推进即证明循环
@@ -2127,8 +2223,9 @@ void NeverStartedDrainClose() {
             ++reads;
         }
     });
-    const auto closed3 = server->Close(Clock::now() + 500ms);
-    CHECK(closed3);
+    const auto closed3 = server->Shutdown(Clock::now() + 500ms);
+    CHECK(!closed3);
+    CHECK(closed3.error().code == ErrorCode::Closed);
     CHECK(WaitUntil([&] { return reads.load() > 0; }, 1s));
     stop.store(true, std::memory_order_release);
     reader.join();
@@ -2258,8 +2355,9 @@ void QueueFullDrainStatsConcurrent() {
     CHECK(drained);
     // Close 必须收口到真实终态：TimedOut 保留 owner 不是本用例可接受的
     // 终点（ADR0014 §2.3/§5：超时后仍需继续驱动并观察最终收口）。
-    const auto closed = b.server->Close(Clock::now() + 10s);
-    CHECK(closed);
+    CHECK(b.server->Shutdown(Clock::now() + 10s));
+    b.server->Close();
+    CHECK(b.server->WaitStopped(Clock::now() + 10s));
     CHECK(b.server->IsClosed());
     CHECK(WaitUntil([&] { return b.engine->CountConnections() == 0; }, 5s));
     // 最终责任统计：inflight/queue/写责任/link 台账全部归零。
@@ -2511,6 +2609,144 @@ void HookWriteThrow() {
     std::cout << "v2 BeforeWrite ThrowOnce: dequeued write settled once\n";
 }
 
+// close-simplify 契约用例 a：在途时 Shutdown 超时返回 TimedOut 且仍拒新
+// （Draining 不可重开）；已接纳调用照常完成后同态 ok；重复 Shutdown 在
+// 仍有在途时返回 Busy（Overloaded）。屏障：对端已接纳（b.calls==1）+
+// IsClosed()（Draining 即报封口）证明确实在途再触发。
+void ShutdownTimeoutStaysDraining() {
+    auto a = std::make_unique<AppHost>("app-a");
+    auto b = std::make_unique<AppHost>("app-b");
+    auto held = SubmitCo([&] {
+        return bbt_co_await a->client->Call(
+            b->Target(), MakeCall("held", 1, "k"), UntilMs(5s));
+    });
+    CHECK(WaitUntil([&] { return b->calls.load() == 1; }));
+
+    ExpectCode(a->client->Shutdown(Clock::now() + 50ms),
+               ErrorCode::TimedOut);
+    CHECK(a->client->IsClosed());
+    CHECK(!a->client->CloseReason().has_value());   // Shutdown 不发布原因
+
+    const auto rejected = CallCo([&] {
+        return bbt_co_await a->client->Call(
+            b->Target(), MakeCall("late", 2, "k"), UntilMs());
+    });
+    CHECK(!rejected);
+    CHECK(rejected.error().code == ErrorCode::Closed);
+
+    b->ProcessAdmitted(Echo);
+    CHECK(Get(held));                                // 在途完成不拖死
+    CHECK(a->client->Shutdown(Clock::now() + 3s));   // 已排空同态 ok
+
+    a->client->Close();
+    std::cout << "v2 shutdown timeout stays draining + rejects new\n";
+}
+
+// close-simplify 契约用例 b：Shutdown 等待中被 Close 打断返回首个关闭
+// 原因；Close 在 Draining 下仍执行「失败在途」（未提交的 held 结算为
+// Closed + 原因详情）。屏障：writer 停在 BeforeWrite Pause（held 在途
+// 未提交）+ Shutdown 仍在阻塞（Shutdown 线程已置 Draining=IsClosed）。
+void ShutdownInterruptedByClose() {
+    auto a = std::make_unique<AppHost>("app-a");
+    auto b = std::make_unique<AppHost>("app-b");
+    auto gate = std::make_shared<HookGate>();
+    gate->Arm(*a, HookPoint::BeforeWrite);           // 只挡 A 侧 writer
+    auto held = SubmitCo([&] {
+        return bbt_co_await a->client->Call(
+            b->Target(), MakeCall("held", 1, "k"), UntilMs(10s));
+    });
+    CHECK(WaitUntil([&] {
+        return gate->Entered(HookPoint::BeforeWrite) >= 1;
+    }, 3s));
+
+    std::optional<bbt::infra::result<void>> shutdown_result;
+    std::thread waiter([&] {
+        shutdown_result.emplace(
+            a->client->Shutdown(bbt::coroutine::Deadline::max()));
+    });
+    CHECK(WaitUntil([&] { return a->client->IsClosed(); }));
+    CHECK(!shutdown_result.has_value());   // 屏障：Shutdown 仍在等，非先排空
+
+    a->client->Close(MakeError(ErrorCode::Unavailable, "owner abort"));
+    waiter.join();
+    CHECK(shutdown_result.has_value());
+    CHECK(!*shutdown_result);
+    if (shutdown_result && !*shutdown_result) {
+        CHECK(shutdown_result->error().code == ErrorCode::Unavailable);
+        CHECK(shutdown_result->error().message == "owner abort");
+    }
+    // Close 幂等 + 首个原因固定：二次 Close 不覆盖。
+    a->client->Close(MakeError(ErrorCode::TimedOut, "later"));
+    auto observed = a->client->CloseReason();
+    CHECK(observed.has_value() && observed->message == "owner abort");
+
+    const auto held_result = Get(held);
+    CHECK(!held_result);
+    CHECK(held_result.error().code == ErrorCode::Closed);
+    bool has_reason = false;
+    for (const auto& detail : held_result.error().details) {
+        if (detail.first == "close_reason" &&
+            detail.second == "owner abort") {
+            has_reason = true;
+        }
+    }
+    CHECK(has_reason);
+    std::cout << "v2 shutdown interrupted by close returns first reason\n";
+}
+
+// close-simplify 契约用例 c：Close 时在途调用按分类如实收场并统一附加
+// 关闭原因——已提交保持 OutcomeUnknown + request_phase，未提交保持
+// Closed；两种失败都带 close_reason/close_reason_code 详情。屏障：
+// held1 已由对端接纳（请求字节已写出=已提交），held2 停在 BeforeWrite
+// Pause（在途未提交）后才触发 Close。
+void CloseInflightReason() {
+    auto a = std::make_unique<AppHost>("app-a");
+    auto b = std::make_unique<AppHost>("app-b");
+    auto held1 = SubmitCo([&] {
+        return bbt_co_await a->client->Call(
+            b->Target(), MakeCall("held1", 1, "k"), UntilMs(10s));
+    });
+    CHECK(WaitUntil([&] { return b->calls.load() == 1; }));  // committed
+
+    auto gate = std::make_shared<HookGate>();
+    gate->Arm(*a, HookPoint::BeforeWrite);
+    auto held2 = SubmitCo([&] {
+        return bbt_co_await a->client->Call(
+            b->Target(), MakeCall("held2", 2, "k"), UntilMs(10s));
+    });
+    CHECK(WaitUntil([&] {
+        return gate->Entered(HookPoint::BeforeWrite) >= 1;
+    }, 3s));
+
+    a->client->Close(MakeError(ErrorCode::Unavailable, "owner close"));
+
+    const auto r1 = Get(held1);
+    CHECK(!r1);
+    CHECK(r1.error().code == ErrorCode::OutcomeUnknown);
+    CHECK(r1.error().request_phase ==
+          bbt::infra::RequestPhase::RequestCommitted);
+    const auto r2 = Get(held2);
+    CHECK(!r2);
+    CHECK(r2.error().code == ErrorCode::Closed);
+    const auto expected_code =
+        std::to_string(static_cast<int>(ErrorCode::Unavailable));
+    for (const auto* err : {&r1.error(), &r2.error()}) {
+        bool has_reason = false, has_code = false;
+        for (const auto& detail : err->details) {
+            if (detail.first == "close_reason" &&
+                detail.second == "owner close") { has_reason = true; }
+            if (detail.first == "close_reason_code" &&
+                detail.second == expected_code) { has_code = true; }
+        }
+        CHECK(has_reason);
+        CHECK(has_code);
+    }
+    // 归还 b 侧已接纳项，避免测试自身留下未终结 handler。
+    b->ProcessAdmitted(Echo);
+    std::cout << "v2 close inflight: committed keeps OutcomeUnknown, "
+                 "uncommitted gets Closed, both carry reason\n";
+}
+
 } // namespace
 
 int RunCase(const std::string& mode) {
@@ -2537,6 +2773,8 @@ int RunCase(const std::string& mode) {
     }
     else if (mode == "v2s_handshake_prefix_reject") { HandshakePrefixReject(); }
     else if (mode == "v2s_close_drain") { CloseDrain(); }
+    else if (mode == "v2s_close_reason") { CloseReason(); }
+    else if (mode == "v2s_close_reason_pending") { CloseReasonPending(); }
     else if (mode == "v2s_admission_inflight") { AdmissionInflight(); }
     else if (mode == "v2s_admission_reject") { AdmissionReject(); }
     else if (mode == "v2s_admission_bytes") { AdmissionBytes(); }
@@ -2564,6 +2802,13 @@ int RunCase(const std::string& mode) {
     else if (mode == "v2s_hook_pause_cancel_close") { HookPauseCancelClose(); }
     else if (mode == "v2s_hook_outbound_throw") { HookOutboundThrow(); }
     else if (mode == "v2s_hook_write_throw") { HookWriteThrow(); }
+    else if (mode == "v2s_shutdown_timeout_draining") {
+        ShutdownTimeoutStaysDraining();
+    }
+    else if (mode == "v2s_shutdown_interrupted_by_close") {
+        ShutdownInterruptedByClose();
+    }
+    else if (mode == "v2s_close_inflight_reason") { CloseInflightReason(); }
     else { CHECK(false); }
     std::cout << "rpc v2 session " << mode << " PASS\n";
     return 0;

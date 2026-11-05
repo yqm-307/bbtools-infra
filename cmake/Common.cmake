@@ -1,6 +1,6 @@
 # 公共依赖段：普通模式与 NETWORK_ONLY 共用，一次定义，禁止两条路径各自接线。
 #
-# 统一提供：bbt_infra_common（旧公开头树 include/ 的 header-only 契约层，
+# 统一提供：bbt_infra_common（bbt/infra 公共头树的 header-only 契约层，
 # 公共头引用 bbt/coroutine 故必须随 coroutine 接口传播）、
 # bbt_infra_internal_debug（STRINGENT_DEBUG 的目标级传播面）、
 # pin 核验过的 bbt_coroutine 源码接入、AsyncMisuseErrors、Threads。
@@ -38,13 +38,13 @@ else()
     message(STATUS "bbtools-infra: 内部 debug 观测层已关闭（BBT_INFRA_STRINGENT_DEBUG=OFF）")
 endif()
 
-# 公共契约头库：header-only，向外暴露 include/（旧公开头树）。新协议模块
+# 公共契约头库：header-only，向外暴露仓根（bbt/infra 公共头树）。新协议模块
 # （bbt/infra/{redis,http,rpc}）的公开头仍引用该树的 NetworkTypes/Result 等
 # 值层类型，因此 common 不属于「旧栈」，普通模式与 NETWORK_ONLY 共用。
 add_library(bbt_infra_common INTERFACE)
 add_library(bbt::infra_common ALIAS bbt_infra_common)
 target_include_directories(bbt_infra_common INTERFACE
-    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>
     $<INSTALL_INTERFACE:include>)
 target_compile_features(bbt_infra_common INTERFACE cxx_std_17)
 

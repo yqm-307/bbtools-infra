@@ -9,7 +9,7 @@
 #                       保持既有 include consumer 可链接。
 # 公开头与实现同目录（对齐 bbt/infra/http、bbt/infra/net 布局）：include 路径是
 # <bbt/infra/rpc/...>，以 PROJECT_SOURCE_DIR 为 include root；同时公开
-# ${PROJECT_SOURCE_DIR}/include（NetworkTypes/RpcPayload/Result 等公共值层）。
+# ${PROJECT_SOURCE_DIR}（NetworkTypes/RpcPayload/Result 等公共值层）。
 # protobuf 生成物只进 bbt_infra_rpc_proto，不出现在本模块公开头。
 add_library(bbt_infra_rpc_core STATIC
     RpcWire.cc
@@ -19,8 +19,7 @@ add_library(bbt_infra_rpc_core STATIC
     Server.cc)
 add_library(bbt::infra_rpc_core ALIAS bbt_infra_rpc_core)
 target_include_directories(bbt_infra_rpc_core
-    PUBLIC "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>"
-           "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>")
+    PUBLIC "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>")
 target_compile_features(bbt_infra_rpc_core PUBLIC cxx_std_17)
 target_link_libraries(bbt_infra_rpc_core
     PUBLIC bbt::infra_common bbt::infra_net
@@ -31,8 +30,7 @@ add_library(bbt_infra_rpc_http STATIC
     HttpTransport.cc)
 add_library(bbt::infra_rpc_http ALIAS bbt_infra_rpc_http)
 target_include_directories(bbt_infra_rpc_http
-    PUBLIC "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>"
-           "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>")
+    PUBLIC "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>")
 target_compile_features(bbt_infra_rpc_http PUBLIC cxx_std_17)
 target_link_libraries(bbt_infra_rpc_http
     PUBLIC bbt::infra_rpc_core bbt::infra_http_net)

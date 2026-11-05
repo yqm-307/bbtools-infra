@@ -41,6 +41,30 @@ http::ClientOptions ClientOptionsFor(const HttpPeer& peer, http::PoolLimits limi
     return options;
 }
 
+// native 侧真实屏障：对端 hook 读到完整请求后置 entered，主线程 Release 才回
+// 响应——用于证明「请求确实在飞」后再做 Close/Shutdown，不用固定 sleep。
+struct PeerHold {
+    std::promise<void> entered;
+    std::future<void> arrival{entered.get_future()};
+    std::promise<void> release;
+    std::shared_future<void> released{release.get_future().share()};
+    void SignalEntered() {
+        try { entered.set_value(); } catch (...) { }
+    }
+    bool WaitEntered(std::chrono::milliseconds timeout) {
+        return arrival.wait_for(timeout) == std::future_status::ready;
+    }
+    bool WaitRelease(std::chrono::milliseconds timeout) {
+        return released.wait_for(timeout) == std::future_status::ready;
+    }
+    void Release() {
+        try { release.set_value(); } catch (...) { }
+    }
+    // 失败路径兜底：用例中途 CHECK 失败展开时先释放对端 hook，避免
+    // ~HttpPeer().Stop() 等 hold 线程超时而掩盖首个失败原因。
+    ~PeerHold() { Release(); }
+};
+
 // GET/POST/base_url/默认头/params 编码/连接复用（服务端 accept 总数与单连接
 // 请求数为真实证据，不是 client 自述）。
 void GetPostReuse() {
@@ -225,7 +249,8 @@ void CloseCancelRace() {
         CHECK(request);
         first_seen.store(true);
         while (!release.load()) { std::this_thread::sleep_for(1ms); }
-        CHECK(HttpPeer::SendForHook(fd, HttpPeer::HttpResponse(200, "OK", "late")));
+        // Close 已请求关闭本连接：发送可能失败，对端不得因此 abort（失败是预期）。
+        (void)HttpPeer::SendForHook(fd, HttpPeer::HttpResponse(200, "OK", "late"));
     });
 
     // a 占池；请求字节已到对端。
@@ -258,11 +283,13 @@ void CloseCancelRace() {
     ExpectCode(Get(c), ErrorCode::Closed);
     CHECK(client->IsClosed());
 
-    // 在飞 a 持借用完成（封口不抢在飞请求）；服务端正常响应。
+    // 在飞 a：Close 令其失败（不再继续等业务完成）。请求字节已到对端，
+    // 结果未知的事实必须保留，不谎报未执行。
     release.store(true);
     auto a_result = Get(a);
-    CHECK(a_result);
-    CHECK(a_result.value().body == "late");
+    CHECK(!a_result);
+    CHECK(a_result.error().code == ErrorCode::OutcomeUnknown);
+    CHECK(a_result.error().request_phase == bbt::infra::RequestPhase::RequestCommitted);
 
     // 封口后新请求立即 Closed；重复 Close 幂等。
     ExpectCode(host.Call([&] {
@@ -274,6 +301,175 @@ void CloseCancelRace() {
     host.Finish();
     CHECK(WaitUntil([&] { return SocketCount() <= sockets_base; }));
     std::cout << "close_cancel_race cancelled=1 closed_waiter=1 inflight_completed=1\n";
+}
+
+// Close(reason)：立即封口、发布原因，令在飞请求失败；请求已提交时保留
+// OutcomeUnknown + request_phase，原因作为可观察详情，不谎报未执行。
+void ClientCloseReason() {
+    Watchdog watchdog;
+    HttpPeer peer;
+    Host host;
+    auto hold = std::make_shared<PeerHold>();
+    peer.PushConnectionHook([hold](int fd) {
+        auto request = HttpPeer::ReadRequestForHook(fd);
+        CHECK(request);
+        hold->SignalEntered();
+        (void)hold->WaitRelease(5s);
+        (void)HttpPeer::SendForHook(fd, HttpPeer::HttpResponse(200, "OK", "late"));
+    });
+    auto created = http::Client::Create(host.engine, ClientOptionsFor(peer, {}));
+    CHECK(created);
+    auto client = std::move(created).value();
+
+    auto in_flight = host.Submit([&] {
+        return bbt_co_await client->Get("/hold", http::RequestOptions{}, Until(5s));
+    });
+    CHECK(hold->WaitEntered(5s));
+    CHECK(WaitUntil([&] { return client->Stats().active == 1; }));
+
+    client->Close(MakeError(ErrorCode::Unavailable, "owner close"));
+    auto observed = client->CloseReason();
+    CHECK(observed.has_value());
+    if (observed) {
+        CHECK(observed->code == ErrorCode::Unavailable);
+        CHECK(observed->message == "owner close");
+    }
+    auto failed = Get(in_flight);
+    CHECK(!failed);
+    CHECK(failed.error().code == ErrorCode::OutcomeUnknown);
+    CHECK(failed.error().request_phase == bbt::infra::RequestPhase::RequestCommitted);
+    bool has_reason = false;
+    for (const auto& detail : failed.error().details) {
+        if (detail.first == "close_reason" && detail.second == "owner close") {
+            has_reason = true;
+        }
+    }
+    CHECK(has_reason);
+
+    auto late = host.Call([&] {
+        return bbt_co_await client->Get("/late", http::RequestOptions{}, Until());
+    });
+    CHECK(!late);
+    CHECK(late.error().code == ErrorCode::Unavailable);
+    CHECK(late.error().message == "owner close");
+
+    hold->Release();
+    peer.Stop();
+    host.Finish();
+    std::cout << "client close reason observable, inflight failed with phase kept\n";
+}
+
+// Shutdown：封口拒新但已接纳请求照常完成；超时诚实 TimedOut；排空后成功。
+void ClientShutdownDrain() {
+    Watchdog watchdog;
+    HttpPeer peer;
+    Host host;
+    auto hold = std::make_shared<PeerHold>();
+    peer.PushConnectionHook([hold](int fd) {
+        auto request = HttpPeer::ReadRequestForHook(fd);
+        CHECK(request);
+        hold->SignalEntered();
+        (void)hold->WaitRelease(5s);
+        CHECK(HttpPeer::SendForHook(fd, HttpPeer::HttpResponse(200, "OK", "drained")));
+    });
+    auto created = http::Client::Create(host.engine, ClientOptionsFor(peer, {}));
+    CHECK(created);
+    auto client = std::move(created).value();
+
+    auto in_flight = host.Submit([&] {
+        return bbt_co_await client->Get("/drain", http::RequestOptions{}, Until(5s));
+    });
+    CHECK(hold->WaitEntered(5s));
+    CHECK(WaitUntil([&] { return client->Stats().active == 1; }));
+
+    ExpectCode(client->Shutdown(std::chrono::steady_clock::now() + 50ms),
+               ErrorCode::TimedOut);
+    CHECK(client->IsClosed());
+    CHECK(!client->CloseReason().has_value());   // Shutdown 只封口，不发布原因
+
+    auto rejected = host.Call([&] {
+        return bbt_co_await client->Get("/rejected", http::RequestOptions{}, Until());
+    });
+    CHECK(!rejected);
+    CHECK(rejected.error().code == ErrorCode::Closed);
+
+    hold->Release();
+    auto completed = Get(in_flight);
+    CHECK(completed);
+    CHECK(completed.value().body == "drained");
+    CHECK(client->Shutdown(std::chrono::steady_clock::now() + 3s));
+
+    peer.Stop();
+    host.Finish();
+    std::cout << "client shutdown timeout sealed, admitted call completed after release\n";
+}
+
+// Shutdown 等待在飞租借时被 Close 打断：返回首个关闭原因，不能把「条目已
+// 退役」当作排空成功；在飞请求仍按 OutcomeUnknown + 原因详情收场。
+void ClientShutdownInterruptedByClose() {
+    Watchdog watchdog;
+    HttpPeer peer;
+    Host host;
+    auto hold = std::make_shared<PeerHold>();
+    peer.PushConnectionHook([hold](int fd) {
+        auto request = HttpPeer::ReadRequestForHook(fd);
+        CHECK(request);
+        hold->SignalEntered();
+        (void)hold->WaitRelease(5s);
+        (void)HttpPeer::SendForHook(fd, HttpPeer::HttpResponse(200, "OK", "late"));
+    });
+    auto created = http::Client::Create(host.engine, ClientOptionsFor(peer, {}));
+    CHECK(created);
+    auto client = std::move(created).value();
+
+    auto in_flight = host.Submit([&] {
+        return bbt_co_await client->Get("/hold", http::RequestOptions{}, Until(5s));
+    });
+    CHECK(hold->WaitEntered(5s));
+    CHECK(WaitUntil([&] { return client->Stats().active == 1; }));
+
+    // Shutdown 在等待线程阻塞；IsClosed 只由 Shutdown 封口产生，作阶段屏障。
+    std::optional<result<void>> shutdown_result;
+    std::thread waiter([&] {
+        shutdown_result.emplace(client->Shutdown(bbt::coroutine::Deadline::max()));
+    });
+    CHECK(WaitUntil([&] { return client->IsClosed(); }));
+    CHECK(!shutdown_result.has_value());   // 屏障：Shutdown 仍在等，不是先排空后 Close
+
+    client->Close(MakeError(ErrorCode::Unavailable, "owner abort"));
+    waiter.join();
+
+    CHECK(shutdown_result.has_value());
+    CHECK(!*shutdown_result);
+    if (shutdown_result && !*shutdown_result) {
+        CHECK(shutdown_result->error().code == ErrorCode::Unavailable);
+        CHECK(shutdown_result->error().message == "owner abort");
+    }
+    // 租借未归还：排空责任未被退役枚举顶替（Shutdown 返回 Unavailable 而非 ok
+    // 已证明观察点 inflight>0）。物理退役本身是异步的：Stats 的 sweep 可能在
+    // 条目 Released 后已将其出账，故不强行读取 Retiring 瞬态；无论条目是否已
+    // 出账，池内不得留下 idle/active/dialing 连接，预算只由退役出账构成
+    // （与 BadStreamRetire 同口径）。
+    const auto after_close = client->Stats();
+    CHECK(after_close.idle == 0 && after_close.active == 0 && after_close.dialing == 0);
+    CHECK(after_close.retiring <= 1 && after_close.budget == after_close.retiring);
+
+    hold->Release();
+    auto failed = Get(in_flight);
+    CHECK(!failed);
+    CHECK(failed.error().code == ErrorCode::OutcomeUnknown);
+    CHECK(failed.error().request_phase == bbt::infra::RequestPhase::RequestCommitted);
+    bool has_reason = false;
+    for (const auto& detail : failed.error().details) {
+        if (detail.first == "close_reason" && detail.second == "owner abort") {
+            has_reason = true;
+        }
+    }
+    CHECK(has_reason);
+
+    peer.Stop();
+    host.Finish();
+    std::cout << "client shutdown interrupted by close returns first reason\n";
 }
 
 // 坏流退役：非 HTTP 字节→ProtocolError→连接退役不回池；下一请求新建连接成功。
@@ -445,6 +641,11 @@ int Run(int argc, char** argv) {
         if (test_case == "get_post_reuse") { GetPostReuse(); }
         else if (test_case == "pool_queue_timeout") { PoolQueueTimeout(); }
         else if (test_case == "close_cancel_race") { CloseCancelRace(); }
+        else if (test_case == "client_close_reason") { ClientCloseReason(); }
+        else if (test_case == "client_shutdown_drain") { ClientShutdownDrain(); }
+        else if (test_case == "client_shutdown_interrupted_by_close") {
+            ClientShutdownInterruptedByClose();
+        }
         else if (test_case == "bad_stream_retire") { BadStreamRetire(); }
         else if (test_case == "keepalive_expiry") { KeepaliveExpiry(); }
         else if (test_case == "omitted_call_options") { OmittedCallOptionsDeadline(); }
