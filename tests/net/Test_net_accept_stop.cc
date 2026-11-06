@@ -247,12 +247,12 @@ void StopRunningDeliveredConnRW() {
     auto rw_task = Task([&] {
         CoTcpConnection co_conn{*accepted_connection};
         std::string data;
-        auto read = co_conn.Read(Until(5000ms));
-        if (read.state != ReadState::Data || read.data.CopyTo() != "ping") {
-            rw_result.store(read.error ? read.error.value() : -1);
+        auto [read_data, read_error] = co_conn.Read(Until(5000ms));
+        if (bool(read_error) || read_data.CopyTo() != "ping") {
+            rw_result.store(read_error ? read_error.value() : -1);
             return;
         }
-        data = read.data.CopyTo();
+        data = read_data.CopyTo();
         auto report = co_conn.Write(data, Until(3000ms));
         if (report.wait_error || report.outcome.phase != WritePhase::Done || report.outcome.error) {
             rw_result.store(report.wait_error ? report.wait_error.value() : -2);
@@ -455,12 +455,12 @@ void StopClientOnlyDialContinues(bool before_run = false) {
         }
         std::string response;
         while (response.size() < 4) {
-            auto read = co_conn.Read(Until(3000ms));
-            if (read.state != ReadState::Data || read.data.Empty()) {
+            auto [read_data, read_error] = co_conn.Read(Until(3000ms));
+            if (bool(read_error) || read_data.Empty()) {
                 exchange_result.store(-1);
                 return;
             }
-            read.data.AppendTo(response);
+            read_data.AppendTo(response);
         }
         exchange_result.store(response == "pong" ? 0 : -1);
     });

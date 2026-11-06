@@ -337,10 +337,10 @@ GateProbe RunAllCoEntries(Connection& connection, Engine& accept_engine, Engine&
                           const Address& dial_address) {
     GateProbe probe;
     CoTcpConnection co_conn{connection};
-    const auto read = co_conn.Read(Until(50ms));
-    probe.read_error = read.error;
-    if (read.state == ReadState::Data) {
-        read.data.AppendTo(probe.read_out);
+    auto [read_data, read_error] = co_conn.Read(Until(50ms));
+    probe.read_error = read_error;
+    if (!read_error) {
+        read_data.AppendTo(probe.read_out);
     }
     const auto report = co_conn.Write(std::string(4, 'w'), Until(50ms));
     probe.write_error = report.wait_error;
@@ -466,9 +466,9 @@ static void CoContextGate() {
         Connection pos = ConnectionTestAccess::Make(pos_state);
         CoTcpConnection co_pos{pos};
         std::string out;
-        const auto read = co_pos.Read(Until(2000ms));
-        if (read.state == ReadState::Data) {
-            read.data.AppendTo(out);
+        auto [read_data, read_error] = co_pos.Read(Until(2000ms));
+        if (!read_error) {
+            read_data.AppendTo(out);
         }
         if (out != "in-domain") {
             return;
@@ -895,12 +895,12 @@ static void OutputPreservation() {
         std::string out = "keep";
         std::atomic<int> result{-1};
         auto task = Task([&] {
-            const auto read = CoTcpConnection{connection}.Read(Until(30ms));
-            if (read.state == ReadState::Data) {
-                read.data.AppendTo(out);
+            auto [read_data, read_error] = CoTcpConnection{connection}.Read(Until(30ms));
+            if (!read_error) {
+                read_data.AppendTo(out);
             }
-            if (read.state == ReadState::Error
-                && read.error == std::make_error_code(std::errc::timed_out) && out == "keep") {
+            if (bool(read_error)
+                && read_error == std::make_error_code(std::errc::timed_out) && out == "keep") {
                 result.store(0);
             }
         });
@@ -919,11 +919,11 @@ static void OutputPreservation() {
         auto task = Task([&] {
             g_fail_alloc = true;
             try {
-                const auto read = CoTcpConnection{connection}.Read(Until(500ms));
+                auto [read_data, read_error] = CoTcpConnection{connection}.Read(Until(500ms));
                 g_fail_alloc = false;
-                CHECK(static_cast<bool>(read.error));
-                if (read.state == ReadState::Data) {
-                    read.data.AppendTo(*out);
+                CHECK(static_cast<bool>(read_error));
+                if (!read_error) {
+                    read_data.AppendTo(*out);
                 }
             } catch (const std::bad_alloc&) {
                 g_fail_alloc = false;  // 分配失败未交付任何数据，等价 Error 路径

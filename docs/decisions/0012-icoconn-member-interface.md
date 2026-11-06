@@ -41,3 +41,5 @@
 
 - `infra_net_full` umbrella、Buffer 连续化 helper、backing 池化、Engine graceful drain、shutdown-write/半关闭控制、per-op cancel 在有真实需求时另立提案。
 - TLS/DNS/UDP、跨平台、长压、sanitizer 与性能门槛沿各模块未覆盖边界继续，不从 TCP 冒烟推导支持。
+
+读取结果的 ReadOutcome/ReadState 承诺由 [0016：owning 读取重载](0016-owning-read-overloads.md) 取代；旧 raw 复制/借用兼容面仍保留。

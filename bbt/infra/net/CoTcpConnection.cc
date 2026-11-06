@@ -3,7 +3,6 @@
 #include <string>
 #include <system_error>
 #include <utility>
-#include <vector>
 
 #include <bbt/infra/net/CoConnection.hpp>
 #include <bbt/infra/net/Error.hpp>
@@ -37,52 +36,28 @@ ConnectionStatus CoTcpConnection::Status() const
     return status;
 }
 
-ReadOutcome CoTcpConnection::Read(
-    const bbt::coroutine::WaitOptions& options)
+std::error_code CoTcpConnection::Read(
+    Buffer& out, const bbt::coroutine::WaitOptions& options)
 {
-    ReadOutcome outcome;
     // gate 与 CoRead 同源且先于任何状态判定/保护取得。
     if (const auto gate = RequireCoroutineContext()) {
-        outcome.state = ReadState::Error;
-        outcome.error = gate;
-        return outcome;
+        return gate;
     }
     for (;;) {
         auto state = CoAccess::StateOf(m_conn);
         if (!state) {
-            outcome.state = ReadState::Error;
-            outcome.error = make_error_code(NetErrc::Closed);
-            return outcome;
+            return make_error_code(NetErrc::Closed);
         }
         // 与 CoRead 相同的关键时序：在导致 Busy 的尝试之前采 release 代次，
         // 否则持锁方可能在「Busy 返回」与「采样」之间释放并推进代次，造成
         // on_registered 复查相等而永久等下一次 release。
         const std::uint64_t generation = state->ring.AccessGeneration();
-        auto attempt = state->ring.TryPopAll();
-        if (attempt.status == ReadStatus::Ok) {
-            // 段元数据在 pop 事务内已构造为 Buffer-ready：Read 不做任何
-            // post-pop 分配，直接把 takeout 与段表移进 Buffer——pop 已提交的
-            // 字节在此后没有可失败的中间步骤。
-            outcome.state = ReadState::Data;
-            // shared_ptr move 后 takeout 本身置空：先取走段表（move vector
-            // 不分配），再转 backing——两步都不抛。
-            std::vector<BufferSegment> segments =
-                std::move(attempt.takeout->segments);
-            outcome.data = Buffer(std::move(attempt.takeout), std::move(segments));
-            outcome.error = {};
-            return outcome;
+        const auto error = m_conn.TryRead(out);
+        if (error != make_error_code(NetErrc::WouldBlock)
+            && error != make_error_code(NetErrc::Busy)) {
+            return error;
         }
-        if (attempt.status == ReadStatus::Eof) {
-            outcome.state = ReadState::Eof;
-            outcome.error = {};
-            return outcome;
-        }
-        if (attempt.status == ReadStatus::Error) {
-            outcome.state = ReadState::Error;
-            outcome.error = attempt.error;
-            return outcome;
-        }
-        const bool busy = attempt.status == ReadStatus::Busy;
+        const bool busy = error == make_error_code(NetErrc::Busy);
         if (busy) {
             state->ring.InvokeBusyBeforeWaiterHookForTest();
         } else {
@@ -91,9 +66,7 @@ ReadOutcome CoTcpConnection::Read(
         auto waiter = busy ? state->ring.CreateReleaseWaiter()
                            : state->ring.CreateDataWaiter();
         if (!waiter) {
-            outcome.state = ReadState::Error;
-            outcome.error = std::make_error_code(std::errc::no_buffer_space);
-            return outcome;
+            return std::make_error_code(std::errc::no_buffer_space);
         }
         bool add_failed = false;
         const auto status = waiter->WaitWithCallback(options, [&] {
@@ -115,14 +88,10 @@ ReadOutcome CoTcpConnection::Read(
             return true;
         });
         if (add_failed) {
-            outcome.state = ReadState::Error;
-            outcome.error = std::make_error_code(std::errc::no_buffer_space);
-            return outcome;
+            return std::make_error_code(std::errc::no_buffer_space);
         }
         if (status != bbt::coroutine::WaitStatus::Completed) {
-            outcome.state = ReadState::Error;
-            outcome.error = WaitStatusError(status);  // 超时/取消不消费
-            return outcome;
+            return WaitStatusError(status);
         }
     }
 }

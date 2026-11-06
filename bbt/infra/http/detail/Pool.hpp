@@ -57,10 +57,37 @@ struct Origin {
 };
 
 class ConnectionPool {
+    struct State;
+
 public:
-    struct Lease {
+    // 独占在途归还责任；共享状态使租借可安全活过池句柄，不保留裸 pool 引用。
+    class Lease {
+    public:
+        Lease() = default;
+        Lease(const Lease&) = delete;
+        Lease& operator=(const Lease&) = delete;
+        Lease(Lease&&) noexcept = default;
+        Lease& operator=(Lease&& other) noexcept {
+            if (this != &other) {
+                Release(false);
+                connection = std::move(other.connection);
+                m_state = std::move(other.m_state);
+            }
+            return *this;
+        }
+        ~Lease() noexcept { Release(false); }
+
+        // 只有完整响应确认可复用后才传 healthy；默认析构保守退役，不挂起。
+        void Release(bool healthy) noexcept;
+
         std::shared_ptr<Http11Connection> connection;
-        Origin origin;
+
+    private:
+        friend class ConnectionPool;
+        Lease(std::shared_ptr<State> state, std::shared_ptr<Http11Connection> http) noexcept
+            : connection(std::move(http)), m_state(std::move(state)) {}
+
+        std::shared_ptr<State> m_state;
     };
 
     ConnectionPool(std::shared_ptr<net::Engine> engine, PoolLimits limits,
@@ -94,46 +121,6 @@ public:
             state->cv.notify_all();
         }
         return lease_result;
-    }
-
-    // 归还：healthy 且对端 keepalive → 回池或交队首同 origin 等待者；否则退役。
-    // 每个未归还租借恰好归还一次——inflight-- 与条目去向在同一出口结算。
-    void Release(const Lease& lease, bool healthy) {
-        if (!lease.connection) { return; }
-        if (!healthy) { Retire(lease); return; }
-        const auto state = m_state;
-        std::lock_guard<std::mutex> lock(state->mutex);
-        --state->inflight;  // 本租借的在途责任到此归还（含条目已被出账的情形）
-        auto* entry = state->FindLocked(lease.connection->Net().Id());
-        if (!entry) { state->cv.notify_all(); return; }
-        if (state->phase != Phase::Open) {
-            state->RetireLocked(*entry);
-            return;
-        }
-        for (auto waiter : state->waiters) {
-            if (waiter->origin == lease.origin) {
-                // 物理租借原样转交等待者：其在途名额归等待者自己的 Acquire。
-                entry->phase = Entry::Phase::Active;
-                waiter->handed = lease;
-                waiter->has_handed = true;
-                state->DequeueLocked(waiter);
-                waiter->gate->Notify();
-                return;
-            }
-        }
-        state->AdmitToIdleLocked(*entry);
-    }
-
-    // 退役：请求封口并转入 Retiring；名额只在真实物理回收后出账。
-    void Retire(const Lease& lease) {
-        if (!lease.connection) { return; }
-        const auto state = m_state;
-        std::lock_guard<std::mutex> lock(state->mutex);
-        --state->inflight;  // 与 Release 同一归还口径
-        if (auto* entry = state->FindLocked(lease.connection->Net().Id())) {
-            state->RetireLocked(*entry);
-        }
-        state->cv.notify_all();
     }
 
     // 立即逻辑封口：拒绝新请求、对全部条目（含在飞/拨号）请求关闭并退役、
@@ -253,7 +240,8 @@ private:
     struct Waiter {
         bbt::coroutine::sync::CoWaiter::SPtr gate;
         Origin origin;
-        Lease handed;
+        // 待领取连接不拥有归还责任；Acquire 领取成功后才构造 Lease。
+        std::shared_ptr<Http11Connection> handed;
         bool has_handed{false};
         bool in_queue{false};
     };
@@ -312,11 +300,10 @@ private:
         }
 
         // 快路径：sweep 后取一条同 origin 空闲连接（Idle→Active 原子预留）。
-        bool TakeIdleLocked(const Origin& origin, Lease& out) {
+        bool TakeIdleLocked(const Origin& origin, std::shared_ptr<Http11Connection>& out) {
             for (auto& entry : entries) {
                 if (entry->phase != Entry::Phase::Idle || entry->origin != origin) { continue; }
-                out.connection = entry->http;
-                out.origin = origin;
+                out = entry->http;
                 entry->phase = Entry::Phase::Active;
                 entry->expire_at = std::chrono::steady_clock::time_point::max();
                 cv.notify_all();
@@ -347,19 +334,19 @@ private:
         // 孤儿 handoff 回池：封口即退役；否则交下一个同 origin 等待者或回空闲。
         void AdmitHandedLocked(const std::shared_ptr<Waiter>& waiter) {
             if (!waiter->has_handed) { return; }
-            Lease lease = std::move(waiter->handed);
+            auto connection = std::move(waiter->handed);
             waiter->has_handed = false;
-            auto* entry = FindLocked(lease.connection->Net().Id());
+            auto* entry = FindLocked(connection->Net().Id());
             if (!entry) { return; }
             if (phase != Phase::Open) {
                 RetireLocked(*entry);
                 return;
             }
             for (auto next : waiters) {
-                if (next->origin == lease.origin) {
+                if (next->origin == entry->origin) {
                     // 责任转交下一个等待者，仍算在途。
                     entry->phase = Entry::Phase::Active;
-                    next->handed = std::move(lease);
+                    next->handed = std::move(connection);
                     next->has_handed = true;
                     DequeueLocked(next);
                     next->gate->Notify();
@@ -425,9 +412,9 @@ private:
             std::lock_guard<std::mutex> lock(state->mutex);
             if (state->phase != Phase::Open) { return result<Lease>::err(state->ClosedErrorLocked()); }
             state->SweepLocked();
-            Lease lease;
-            if (state->TakeIdleLocked(origin, lease)) {
-                return result<Lease>::ok(std::move(lease));
+            std::shared_ptr<Http11Connection> connection;
+            if (state->TakeIdleLocked(origin, connection)) {
+                return result<Lease>::ok(Lease(state, std::move(connection)));
             }
         }
         // 预算内新建（Dialing 名额锁内预留、锁外 Engine::CoDial）。
@@ -442,7 +429,7 @@ private:
                 state->entries.push_back(std::move(entry));
                 Entry* dial_entry = state->entries.back().get();  // deque 引用稳定
                 lock.unlock();
-                return DialReserved(state, dial_entry, origin, deadlines);
+                return DialReserved(state, dial_entry, deadlines);
             }
         }
         // 排队：有界队列 + 分片等待。片内事件：handoff / 封口 / 预算释放重试；
@@ -469,9 +456,9 @@ private:
                     return result<Lease>::err(state->ClosedErrorLocked());
                 }
                 state->SweepLocked();
-                Lease lease;
-                if (state->TakeIdleLocked(origin, lease)) {
-                    return result<Lease>::ok(std::move(lease));
+                std::shared_ptr<Http11Connection> connection;
+                if (state->TakeIdleLocked(origin, connection)) {
+                    return result<Lease>::ok(Lease(state, std::move(connection)));
                 }
                 if (state->entries.size() < state->limits.max_connections) {
                     auto entry = std::make_unique<Entry>();
@@ -481,7 +468,7 @@ private:
                     state->entries.push_back(std::move(entry));
                     Entry* dial_entry = state->entries.back().get();
                     lock.unlock();
-                    return DialReserved(state, dial_entry, origin, deadlines);
+                    return DialReserved(state, dial_entry, deadlines);
                 }
                 state->RetireOtherIdleLocked(origin);
                 if (state->waiters.size() >= state->limits.max_queue) {
@@ -500,9 +487,9 @@ private:
                         return true;
                     }
                     state->SweepLocked();
-                    Lease lease;
-                    if (state->TakeIdleLocked(waiter->origin, lease)) {
-                        waiter->handed = std::move(lease);
+                    std::shared_ptr<Http11Connection> connection;
+                    if (state->TakeIdleLocked(waiter->origin, connection)) {
+                        waiter->handed = std::move(connection);
                         waiter->has_handed = true;
                         state->DequeueLocked(waiter);
                         waiter->gate->Notify();
@@ -518,9 +505,9 @@ private:
                 std::lock_guard<std::mutex> lock(state->mutex);
                 state->DequeueLocked(waiter);
                 if (waiter->has_handed && status == bbt::coroutine::WaitStatus::Completed) {
-                    Lease lease = std::move(waiter->handed);
+                    auto connection = std::move(waiter->handed);
                     waiter->has_handed = false;
-                    return result<Lease>::ok(std::move(lease));
+                    return result<Lease>::ok(Lease(state, std::move(connection)));
                 }
                 if (waiter->has_handed) {
                     // 首胜不是本等待者（超时/取消/封口赢）：孤儿 handoff 回池。
@@ -546,7 +533,7 @@ private:
 
     // 完成预留的 Dialing entry：锁外 Engine::CoDial，失败/封口在锁内出账。
     static result<Lease> DialReserved(const std::shared_ptr<State>& state, Entry* dial_entry,
-                                      const Origin& origin, const PhaseDeadlines& deadlines) {
+                                      const PhaseDeadlines& deadlines) {
         net::ConnectionResult dialed;
         auto error = CheckCall(deadlines.total);
         if (!error) {
@@ -581,10 +568,10 @@ private:
         try {
             dial_entry->http = std::make_shared<Http11Connection>(
                 dial_entry->connection, state->body_limit, state->header_limit);
-            Lease lease{dial_entry->http, origin};
+            auto connection = dial_entry->http;
             dial_entry->phase = Entry::Phase::Active;
             state->cv.notify_all();
-            return result<Lease>::ok(std::move(lease));
+            return result<Lease>::ok(Lease(state, std::move(connection)));
         } catch (const std::exception& error) {
             state->RetireLocked(*dial_entry);
             return result<Lease>::err(MakeError(ErrorCode::InternalError, error.what()));
@@ -595,6 +582,33 @@ private:
 
     std::shared_ptr<State> m_state;
 };
+
+inline void ConnectionPool::Lease::Release(bool healthy) noexcept {
+    // 先取走责任；重复调用、移动源与析构都不再结算。锁内只做本地状态变更。
+    const auto state = std::move(m_state);
+    auto http = std::move(connection);
+    if (!state) { return; }
+    std::lock_guard<std::mutex> lock(state->mutex);
+    --state->inflight;
+    auto* entry = state->FindLocked(http->Net().Id());
+    if (!entry) { state->cv.notify_all(); return; }
+    if (!healthy || state->phase != Phase::Open) {
+        state->RetireLocked(*entry);
+        return;
+    }
+    for (auto waiter : state->waiters) {
+        if (waiter->origin == entry->origin) {
+            // 连接转交等待者；其在途名额仍属于自己的 Acquire，未领取前不造 Lease。
+            entry->phase = Entry::Phase::Active;
+            waiter->handed = std::move(http);
+            waiter->has_handed = true;
+            state->DequeueLocked(waiter);
+            waiter->gate->Notify();
+            return;
+        }
+    }
+    state->AdmitToIdleLocked(*entry);
+}
 
 } // namespace detail
 } // namespace bbt::infra::http

@@ -11,6 +11,7 @@
 #include <bbt/infra/rpc/Stats.hpp>
 #include <bbt/infra/rpc/detail/Session.hpp>
 #include <bbt/infra/net/detail/TestAccess.hpp>
+#include <bbt/infra/net/Error.hpp>
 
 #include <deque>
 #include <map>
@@ -233,12 +234,8 @@ CallOptions UntilMs(std::chrono::milliseconds duration = 3s) {
 }
 
 rpc::Response Echo(const rpc::Request& request) {
-    rpc::Response response;
-    response.SetRequestId(request.RequestId())
-        .SetService(request.Service()).SetMethod(request.Method())
-        .SetRequestSchema(request.RequestSchema())
-        .SetResponseSchema(request.ResponseSchema())
-        .SetPayload(request.Payload());
+    auto response = rpc::Response::FromRequest(request);
+    response.SetPayload(request.Payload());
     return response;
 }
 
@@ -787,7 +784,7 @@ void HandshakeCoalescedBig() {
     std::cout << "v2 handshake coalesced ack+192KiB-call admitted\\n";
 }
 
-// ---- 8d. F2 确定性钉批：脚本化 ICoConnection 单次 ReadOutcome 交付 -------
+// ---- 8d. F2 确定性钉批：脚本化 ICoConnection 单次 Buffer 交付 -------
 // 「echo HelloAck + 192KiB Call」整批 >131076（4+2*64KiB 握手 pending
 // 界）。不经 TCP：批大小由脚本字节序固定钉住，不靠 TCP 分段/排程偶合。
 // 修复前整批先按 hello_phase Feed → pending 硬界拒绝；修复后 Ack 在
@@ -798,13 +795,13 @@ public:
     // 握手协程与测试线程并发访问，全部状态经 mu 同步。
     std::mutex mu;
     std::condition_variable cv;                         // 有新剧本/关闭时通知
-    std::deque<net::ReadOutcome> script;
+    std::deque<net::Buffer> script;
     std::string written;          // 按调用序拼接全部 Write 载荷
     std::atomic<int> reads{0};
     std::atomic<int> writes{0};
     bool closed{false};
 
-    void Enqueue(net::ReadOutcome outcome) {
+    void Enqueue(net::Buffer outcome) {
         {
             std::lock_guard<std::mutex> lock(mu);
             script.push_back(std::move(outcome));
@@ -823,7 +820,18 @@ public:
         return written;
     }
 
-    net::ReadOutcome Read(const bbt::coroutine::WaitOptions&) override {
+    using net::ICoConnection::Read;
+    using net::ICoConnection::TryRead;
+    std::error_code TryRead(net::Buffer& out) override {
+        std::lock_guard<std::mutex> lock(mu);
+        if (script.empty()) {
+            return net::make_error_code(closed ? net::NetErrc::Eof : net::NetErrc::WouldBlock);
+        }
+        out = std::move(script.front());
+        script.pop_front();
+        return {};
+    }
+    std::error_code Read(net::Buffer& buffer, const bbt::coroutine::WaitOptions&) override {
         ++reads;
         std::unique_lock<std::mutex> lock(mu);
         // 脚本未备好时等测试线程投递（有界 8s；不裸等——避免协程线程
@@ -832,11 +840,12 @@ public:
             return !script.empty() || closed;
         });
         if (script.empty()) {
-            return {net::ReadState::Eof, {}, {}};
+            return net::make_error_code(net::NetErrc::Eof);
         }
         auto out = std::move(script.front());
         script.pop_front();
-        return out;
+        buffer = std::move(out);
+        return {};
     }
     net::WriteOperation AsyncWrite(std::string) override { return {}; }
     net::WriteReport Write(std::string data,
@@ -886,8 +895,7 @@ void HandshakeCoalescedBigPinned() {
     peer_hello.peer_identity = "zz-peer";
     peer_hello.session_epoch = 7;
     peer_hello.connection_nonce = 0xABCDEF;
-    conn.Enqueue({net::ReadState::Data,
-                  OneShotBuffer(Framed(peer_hello)), {}});
+    conn.Enqueue(OneShotBuffer(Framed(peer_hello)));
 
     // 握手协程跑出第一帧后阻塞在第二次 conn.Read（script 空→cv 等测试
     // 线程投递）；server Hello+HelloAck 已写进 fake 的 written，从中取出
@@ -939,12 +947,12 @@ void HandshakeCoalescedBigPinned() {
     call.remaining_budget_ms = 3000;
     call.payload.assign(192 * 1024, 0x5A);
 
-    // 钉住边界：echo+192KiB Call 为同一 ReadOutcome 单段交付，批大小
+    // 钉住边界：echo+192KiB Call 为同一 Buffer 单段交付，批大小
     // 确定性 >4+2*64KiB 握手 pending 界（不靠 TCP 分段时机，也不拆两次
     // Read/另一次 Feed 冒充合包）。
     const std::string batch = Framed(echo) + Framed(call);
     CHECK(batch.size() > 4 + 2 * 64 * 1024);
-    conn.Enqueue({net::ReadState::Data, OneShotBuffer(batch), {}});
+    conn.Enqueue(OneShotBuffer(batch));
 
     const auto result = Get(future);
     CHECK(result && result.value() == selected);
@@ -998,11 +1006,11 @@ void HandshakeStashTailPreserved() {
     call.remaining_budget_ms = 3000;
     call.payload.assign(192 * 1024, 0x5A);
 
-    // 单个 ReadOutcome 单段：Hello+echoAck+192KiB Call。Call >32KiB 保证
+    // 单个 Buffer 单段：Hello+echoAck+192KiB Call。Call >32KiB 保证
     // stash 补喂解出 Ack 时仍存在未喂尾部（触发旧覆盖缺陷的必要条件）。
     const std::string batch =
         Framed(peer_hello) + Framed(echo) + Framed(call);
-    conn.Enqueue({net::ReadState::Data, OneShotBuffer(batch), {}});
+    conn.Enqueue(OneShotBuffer(batch));
 
     rpc::SessionFrameDecoder decoder(8 * 1024 * 1024);
     auto future = SubmitCo([&]() -> bbt::infra::result<std::uint64_t> {
@@ -1502,6 +1510,104 @@ void ReplyWriteFailClose() {
     std::cout << "v2 reply write fail-close: real failure returned\n";
 }
 
+// 同一真实 link：先证明成功写终态，再同时保留一条 writer 持有项和两条
+// 排队项。Close 必须唤醒全部 Complete，不能漏结算或重复扣写责任。
+void WriteTerminalOnce() {
+    AppHost a("app-a"), b("app-b");
+    auto boot = SubmitCo([&] {
+        return bbt_co_await a.client->Call(
+            b.Target(), MakeCall("boot", 1, "k"), UntilMs());
+    });
+    CHECK(WaitUntil([&] { return b.calls.load() == 1; }));
+    b.ProcessAdmitted(Echo);
+    CHECK(Get(boot));
+    CHECK(WaitUntil([&] {
+        return rpc::detail::ServerV2LedgerForTest(*b.server).writes_outstanding == 0;
+    }));
+
+    std::vector<std::future<bbt::infra::result<rpc::Response>>> calls;
+    for (unsigned i = 0; i != 3; ++i) {
+        calls.push_back(SubmitCo([&, i] {
+            return bbt_co_await a.client->Call(b.Target(),
+                MakeCall("held" + std::to_string(i), i + 2, "k"), UntilMs(10s));
+        }));
+    }
+    CHECK(WaitUntil([&] { return b.calls.load() == 4; }));
+    auto gate = MakeWriterGate(a, b);
+    std::vector<rpc::Request> requests;
+    std::vector<std::shared_ptr<rpc::ReplyCompletion>> replies;
+    {
+        std::lock_guard<std::mutex> lock(b.mu);
+        CHECK(b.admitted.size() == 3);
+        while (!b.admitted.empty()) {
+            auto& item = b.admitted.front();
+            requests.push_back(item.request);
+            replies.push_back(item.reply);
+            CHECK(item.lease->Release());
+            b.admitted.pop_front();
+        }
+    }
+    std::atomic<unsigned> completed{0};
+    std::vector<std::future<bbt::infra::result<void>>> writes;
+    for (unsigned i = 0; i != 3; ++i) {
+        writes.push_back(SubmitCo([&, i] {
+            auto result = bbt_co_await replies[i]->Complete(Echo(requests[i]));
+            ++completed;
+            return result;
+        }));
+        if (i == 0) {
+            CHECK(WaitUntil([&] {
+                return gate->Entered(HookPoint::BeforeWrite) == 1;
+            }));
+        }
+    }
+    // writer 被检查点扣留期间队列静止：三份责任中恰有两条仍排队。
+    CHECK(WaitUntil([&] {
+        const auto stats = b.client->Stats().service;
+        return stats.queued == 2 && stats.bytes_queued > 0 &&
+               rpc::detail::ServerV2LedgerForTest(*b.server).writes_outstanding == 3;
+    }));
+    CHECK(completed.load() == 0);
+    for (auto& write : writes) {
+        CHECK(write.wait_for(0ms) != std::future_status::ready);
+    }
+    b.server->Close();
+    b.server->Close(); // 重复封口不再拥有任何队列/写结算责任。
+    for (auto& write : writes) {
+        const auto result = Get(write);
+        CHECK(!result);
+        CHECK(result.error().code == ErrorCode::Closed);
+    }
+    CHECK(completed.load() == 3);
+    CHECK(WaitUntil([&] { return gate->InFlight() == 0; }));
+    for (auto& call : calls) {
+        const auto result = Get(call);
+        CHECK(!result && result.error().code == ErrorCode::OutcomeUnknown);
+        CHECK(result.error().request_phase == bbt::infra::RequestPhase::RequestCommitted);
+    }
+    for (unsigned i = 0; i != 3; ++i) {
+        CHECK(replies[i]->IsTerminal());
+        const auto duplicate = CallCo([&, i] {
+            return bbt_co_await replies[i]->Complete(Echo(requests[i]));
+        });
+        CHECK(!duplicate && duplicate.error().code == ErrorCode::InvalidArgument);
+    }
+    CHECK(b.server->WaitStopped(Clock::now() + 3s));
+    const auto ledger = rpc::detail::ServerV2LedgerForTest(*b.server);
+    CHECK(ledger.writes_outstanding == 0);
+    CHECK(ledger.links == 0 && ledger.handshakes == 0);
+    CHECK(b.client->Stats().service.queued == 0);
+    CHECK(b.client->Stats().service.bytes_queued == 0);
+    CHECK(b.server->Stats().service.inflight == 0);
+    a.server->Close();
+    CHECK(a.server->WaitStopped(Clock::now() + 3s));
+    CHECK(WaitUntil([&] {
+        return a.engine->CountConnections() == 0 && b.engine->CountConnections() == 0;
+    }));
+    CHECK(completed.load() == 3);
+    std::cout << "write terminal once: writer + queued close, all waiters and resources settled\n";
+}
+
 // 13c. 回复等待预算 = 入站请求有限预算（min(remaining, incoming_timeout)），
 //      不是任意重置 30s。
 void ReplyWriteBudget() {
@@ -1583,7 +1689,7 @@ void ReplyCorrelationMismatch() {
         b.admitted.front().lease->Release();
         b.admitted.pop_front();
     }
-    // handler 改写关联字段 → ProtocolError；错误终态仍要写出。
+    // FromRequest 初始化后再误改关联字段仍须拒绝；错误终态仍要写出。
     auto bad = Echo(request);
     bad.SetService("other-service");
     auto done = SubmitCo([&] {
@@ -2781,6 +2887,7 @@ int RunCase(const std::string& mode) {
     else if (mode == "v2s_admission_sealed") { AdmissionSealed(); }
     else if (mode == "v2s_reply_write_deferred") { ReplyWriteDeferred(); }
     else if (mode == "v2s_reply_write_fail_close") { ReplyWriteFailClose(); }
+    else if (mode == "write_terminal_once") { WriteTerminalOnce(); }
     else if (mode == "v2s_reply_write_budget") { ReplyWriteBudget(); }
     else if (mode == "v2s_reply_corr_mismatch") { ReplyCorrelationMismatch(); }
     else if (mode == "v2s_close_released") { CloseReleased(); }

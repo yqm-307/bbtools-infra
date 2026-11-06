@@ -83,17 +83,17 @@ public:
     }
 
 private:
-    // owning backing 句柄：实现由 CoTcpConnection 的 Read 路径从
+    // owning backing 句柄：实现由 Connection 的非等待移交原语从
     // ReceiveRing::TryPopAll 的 PopAllTakeout 构造；布局不出公共契约。
     // shared_ptr<void> 保证「分段共享同一移交存储」的引用计数成立。
-    // private 构造责任：只有移交路径（CoTcpConnection::Read）与测试接缝
+    // private 构造责任：只有移交路径（Connection::TryRead）与测试接缝
     // 可凭 backing+段构造非空 Buffer；消费者不能伪造「段来自 backing」的
     // owning 不变量。
     explicit Buffer(std::shared_ptr<void> backing,
                     std::vector<BufferSegment> segments)
         : m_backing(std::move(backing)), m_segments(std::move(segments)) {}
 
-    friend class CoTcpConnection;
+    friend class Connection;
     friend struct BufferTestAccess;
 
     std::shared_ptr<void> m_backing;

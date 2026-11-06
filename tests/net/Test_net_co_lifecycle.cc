@@ -73,7 +73,8 @@ BOOST_AUTO_TEST_CASE(non_co_connection_ready_paths_do_not_consume) {
     const auto before = connection.Status();
     const auto read = connection.Read({});
     const auto written = connection.Write("payload", {});
-    BOOST_CHECK(read.error == std::errc::operation_not_permitted);
+    BOOST_CHECK(std::get<1>(read) == std::errc::operation_not_permitted);
+    BOOST_CHECK(std::get<0>(read).Empty());
     BOOST_CHECK(written.wait_error == std::errc::operation_not_permitted);
     BOOST_CHECK(!written.operation.Valid());
     BOOST_CHECK_EQUAL(written.outcome.sent, 0U);

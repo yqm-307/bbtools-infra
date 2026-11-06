@@ -267,16 +267,13 @@ struct CoRedisCli::State {
 
         // Read 交付一次可用字节而非一条 RESP 帧。整个循环复用同一个绝对 deadline。
         for (;;) {
-            const auto read = co.Read(wait);
-            if (read.state != net::ReadState::Data) {
+            auto [read_data, read_error] = co.Read(wait);
+            if (bool(read_error)) {
                 bool sealed;
                 { std::lock_guard<std::mutex> lock(mutex); sealed = closed; }
-                // EOF 与错误统一按流断裂处理：Eof 时 error 为空，补 NetErrc::Eof。
-                const auto cause = read.state == net::ReadState::Eof
-                    ? net::make_error_code(net::NetErrc::Eof) : read.error;
-                return result<RawReply>::err(Fail(NetError(cause, sealed), true));
+                return result<RawReply>::err(Fail(NetError(read_error, sealed), true));
             }
-            const auto bytes = read.data.CopyTo();
+            const auto bytes = read_data.CopyTo();
             if (redisReaderFeed(reader.get(), bytes.data(), bytes.size()) != REDIS_OK) {
                 return result<RawReply>::err(Fail(redis_detail::ClassifyHiredisError(
                     reader->err, reader->errstr, "redis: reader feed failed"), true));

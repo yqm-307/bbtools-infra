@@ -469,16 +469,9 @@ bbt_co_async(result<Response>) Client::Send(const PreparedRequest& request, cons
                                                         std::chrono::steady_clock::now());
         auto leased = bbt_co_await state->pool.Acquire(valid.value().origin, request.address, deadlines);
         if (!leased) { return fail(std::move(leased.error())); }
-        struct LeaseGuard {
-            detail::ConnectionPool& pool;
-            detail::ConnectionPool::Lease& lease;
-            bool returned{false};
-            ~LeaseGuard() { if (!returned) { pool.Retire(lease); } }
-        } guard{state->pool, leased.value()};
         auto exchanged = bbt_co_await leased.value().connection->Exchange(request, serialized.value(), deadlines);
         if (!exchanged) { return fail(std::move(exchanged.error())); }
-        state->pool.Release(leased.value(), exchanged.value().keep_alive);
-        guard.returned = true;
+        leased.value().Release(exchanged.value().keep_alive);
         return result<Response>::ok(std::move(exchanged.value().response));
     } catch (const std::exception& error) {
         return result<Response>::err(MakeError(ErrorCode::InternalError,

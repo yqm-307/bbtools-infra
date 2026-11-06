@@ -179,22 +179,23 @@ BOOST_AUTO_TEST_CASE(read_post_pop_oom_no_loss) {
         std::atomic<std::size_t> retry_bytes{0};
         std::atomic<int> used_after{-1};
         auto task = Task([&, index] {
-            ReadOutcome outcome;
+            Buffer outcome_data;
+            std::error_code outcome_error;
             bool threw_local = false;
             Arm(index);
             try {
-                outcome = conn.Read(Until(2000ms));
+                outcome_error = conn.Read(outcome_data, Until(2000ms));
             } catch (const std::bad_alloc&) {
                 threw_local = true;
             }
             Disarm();
             threw.store(threw_local ? 1 : 0);
-            first_state.store(static_cast<int>(outcome.state));
-            first_bytes.store(outcome.data.Size());
+            first_state.store(outcome_error.value());
+            first_bytes.store(outcome_data.Size());
             used_after.store(static_cast<int>(state->ring.Size()));
-            const auto retry = conn.Read(Until(2000ms));
-            retry_state.store(static_cast<int>(retry.state));
-            retry_bytes.store(retry.data.Size());
+            auto [retry_data, retry_error] = conn.Read(Until(2000ms));
+            retry_state.store(retry_error.value());
+            retry_bytes.store(retry_data.Size());
         });
         BOOST_REQUIRE(task.wait_for(10s) == std::future_status::ready);
         task.get();
@@ -208,7 +209,7 @@ BOOST_AUTO_TEST_CASE(read_post_pop_oom_no_loss) {
         // 修复后契约：bad_alloc 不逃出 Read（post-pop 分配已消失，pop 内部
         // 分配失败被 TryPopAll 折成 Error+ENOMEM）。
         BOOST_CHECK_EQUAL(threw.load(), 0);
-        if (first_state.load() == static_cast<int>(ReadState::Data)) {
+        if (first_state.load() == 0) {
             // 成功交付：字节完整取回。
             saw_data = true;
             BOOST_CHECK_EQUAL(first_bytes.load(), 64);
@@ -217,9 +218,9 @@ BOOST_AUTO_TEST_CASE(read_post_pop_oom_no_loss) {
             // 失败路径：状态是 Error+ENOMEM 且零消费（ring 字节仍在），
             // 重试取回全部 64 字节——失败零消费不变量成立。
             saw_error = true;
-            BOOST_CHECK(first_state.load() == static_cast<int>(ReadState::Error));
+            BOOST_CHECK(first_state.load() == std::make_error_code(std::errc::not_enough_memory).value());
             BOOST_CHECK_EQUAL(used_after.load(), 64);
-            BOOST_CHECK(retry_state.load() == static_cast<int>(ReadState::Data));
+            BOOST_CHECK(retry_state.load() == 0);
             BOOST_CHECK_EQUAL(retry_bytes.load(), 64);
         }
     }

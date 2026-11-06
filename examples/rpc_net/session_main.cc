@@ -129,13 +129,8 @@ struct Assembly {
         admitted_total += items.size();
         for (auto& item : items) {
             if (item.reply && item.request.Reply() == rpc::ReplyMode::Required) {
-                rpc::Response response;
-                response.SetRequestId(item.request.RequestId())
-                    .SetService(item.request.Service())
-                    .SetMethod(item.request.Method())
-                    .SetRequestSchema(item.request.RequestSchema())
-                    .SetResponseSchema(item.request.ResponseSchema())
-                    .SetPayload(item.request.Payload());
+                auto response = rpc::Response::FromRequest(item.request);
+                response.SetPayload(item.request.Payload());
                 // P2-6：Complete 是 bbt_co_async（仅受管协程可挂起等写终态）——
                 // native pump 线程不能直接调用（返回 InvalidContext 且不回
                 // 复）。把 Complete 提交到 scheduler 的受管协程执行，回复

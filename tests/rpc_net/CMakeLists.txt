@@ -12,7 +12,7 @@ endforeach()
 add_executable(Test_rpc_v2_wire Test_rpc_v2_wire.cc)
 target_link_libraries(Test_rpc_v2_wire PRIVATE bbt::infra_rpc_net Boost::headers)
 target_compile_options(Test_rpc_v2_wire PRIVATE -Wall -Wextra -Wpedantic)
-foreach(_case v2_roundtrip v2_reject v2_malformed v2_framing v2_values)
+foreach(_case v2_roundtrip v2_reject v2_malformed v2_framing v2_values response_from_request)
     add_test(NAME rpc.net.${_case} COMMAND Test_rpc_v2_wire ${_case})
     set_tests_properties(rpc.net.${_case} PROPERTIES TIMEOUT 30 LABELS "unit")
 endforeach()
@@ -43,10 +43,11 @@ foreach(_case v2s_roundtrip v2s_bidirectional v2s_send_acceptance
         v2s_hook_outbound_throw v2s_hook_write_throw
         v2s_shutdown_timeout_draining
         v2s_shutdown_interrupted_by_close
-        v2s_close_inflight_reason)
+        v2s_close_inflight_reason write_terminal_once)
     add_test(NAME rpc.net.${_case} COMMAND Test_rpc_v2_session ${_case})
     set_tests_properties(rpc.net.${_case} PROPERTIES TIMEOUT 60 LABELS "rpc_net")
 endforeach()
+set_tests_properties(rpc.net.write_terminal_once PROPERTIES LABELS "integration")
 
 add_executable(Test_rpc_net_roundtrip Test_rpc_net_roundtrip.cc)
 target_link_libraries(Test_rpc_net_roundtrip PRIVATE bbt::infra_rpc_net Boost::headers)

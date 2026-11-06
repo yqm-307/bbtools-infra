@@ -4,6 +4,7 @@
 
 #include <bbt/infra/rpc/Codec.hpp>
 #include <bbt/infra/rpc/Options.hpp>
+#include <bbt/infra/rpc/Response.hpp>
 #include <bbt/infra/rpc/Stats.hpp>
 
 #include <chrono>
@@ -751,6 +752,51 @@ void Framing() {
     }
 }
 
+void ResponseFromRequest() {
+    rpc::Response response;
+    {
+        rpc::Request request("echo-service", "Say");
+        request.SetRequestId("req-from-request")
+            .SetRequestSchema("request-schema").SetResponseSchema("response-schema")
+            .SetPayload({1, 0, 2}).SetMetadata({{"trace.id", "request-trace"}})
+            .SetMessageId("message-only").SetTraffic(TrafficClass::Actor)
+            .SetReply(ReplyMode::Required).SetOrderingKey("actor-key").SetSequence(9);
+        rpc::RequestContext context;
+        context.peer_identity = "request-peer";
+        context.peer_principal = "request-principal";
+        rpc::detail::RequestContextAccess::Set(request, std::move(context));
+
+        response = rpc::Response::FromRequest(request);
+        CHECK(response.RequestId() == request.RequestId());
+        CHECK(response.Service() == request.Service());
+        CHECK(response.Method() == request.Method());
+        CHECK(response.RequestSchema() == request.RequestSchema());
+        CHECK(response.ResponseSchema() == request.ResponseSchema());
+        CHECK(response.Payload().empty());
+        CHECK(response.Metadata().empty());
+
+        response.SetPayload({8, 0, 9}).SetMetadata({{"trace.id", "response-trace"}});
+        CHECK(request.Payload() == std::vector<std::uint8_t>({1, 0, 2}));
+        CHECK(request.Metadata() == rpc::Metadata({{"trace.id", "request-trace"}}));
+        request.SetRequestId("changed-id").SetService("changed-service").SetMethod("changed-method")
+            .SetRequestSchema("changed-request-schema").SetResponseSchema("changed-response-schema")
+            .SetPayload({3}).SetMetadata({{"trace.id", "changed-trace"}});
+        CHECK(response.RequestId() == "req-from-request");
+        CHECK(response.Service() == "echo-service");
+        CHECK(response.Method() == "Say");
+        CHECK(response.RequestSchema() == "request-schema");
+        CHECK(response.ResponseSchema() == "response-schema");
+    }
+    // 源请求及上下文已销毁，响应仍拥有自己的字段与业务数据。
+    CHECK(response.RequestId() == "req-from-request");
+    CHECK(response.Service() == "echo-service");
+    CHECK(response.Method() == "Say");
+    CHECK(response.RequestSchema() == "request-schema");
+    CHECK(response.ResponseSchema() == "response-schema");
+    CHECK(response.Payload() == std::vector<std::uint8_t>({8, 0, 9}));
+    CHECK(response.Metadata() == rpc::Metadata({{"trace.id", "response-trace"}}));
+}
+
 // ---- Options/Stats 值层 ---------------------------------------------------------
 
 void Values() {
@@ -827,6 +873,7 @@ int RunCase(const std::string& mode) {
     else if (mode == "v2_malformed") { Malformed(); }
     else if (mode == "v2_framing") { Framing(); }
     else if (mode == "v2_values") { Values(); }
+    else if (mode == "response_from_request") { ResponseFromRequest(); }
     else { CHECK(false); }
     std::cout << "rpc v2 wire " << mode << " PASS\n";
     return 0;

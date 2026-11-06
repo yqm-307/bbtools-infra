@@ -1,5 +1,7 @@
 # gnet 风格网络：执行域、物理线程与所有权
 
+读取职责：Connection::TryRead(Buffer&) 是唯一非等待 owning 移交；ICoConnection::Read(Buffer&, options) 的 TCP 实现只增加执行域校验和等待。两者的 tuple 便捷重载仅转调出参版本。成功非空，失败 out 不变、零消费；错误码表达 WouldBlock/Busy/Eof 及原有系统错误。旧 raw string/ReadAccess 为已有消费者保留，尚未完成全部读取面简化。见 [0016](../decisions/0016-owning-read-overloads.md)。
+
 **状态：R2 TCP 契约与实现已合入主线**（PR #84，合入提交 `99d0821a0175c43d9ec2fff78de1f90af068f92b`）。本文描述执行模型与生命周期约束；当前实现落点与已知缺口见第 7 节。旧线程、事件快照及局部验证记录在文末历史区保留，不作为当前实施约束或新版本验收证据。
 
 ## 1. 决定与适用范围
@@ -143,6 +145,17 @@ Run 用有限间隔谓词等待，控制唤醒或到期后通过 QueryProcesserD
 正常 OnWrite/OnClose 由 owner 发出；driver 已失败时控制域不伪调用 owner 回调。替代出口为 Engine 控制域错误报告与可查询 Conn/operation 冻结结果；内部完成订阅在发布状态后锁外唤醒。物理与 callback 未收口不发布 Stopped、不释放 context，保持责任可达；持续 OOM、永久阻塞回调、线程不获调度不承诺有界完成。这里维持既有故障底线，不把假设扩为新需求。
 
 ## 7. 当前实现与验证边界
+
+owning 读取的公共非等待原语为
+`Connection::TryRead(Buffer&)`；`CoTcpConnection::Read` 在它之上
+增加执行域校验与等待。成功时移交 `ReceiveRing::TryPopAll` 的 backing 和分段表，
+不拼接载荷，立即释放连接未交付字节额度；Busy、WouldBlock、EOF 和错误都不替换
+输出。Buffer 不持连接状态、锁或 socket，持有已交付数据不阻碍物理回收。
+这不保证上层总内存有界，也不使 Buffer 可并发修改。公共 raw
+`Connection::TryRead(std::string&)` 与 `TryAccess()` 仍按既有契约提供复制和借用；
+内部统一不代表这些入口已退役。生命周期行为由 `net.buffer_transfer_lifetime`
+覆盖：真实 TCP 数据跨读等待保留，关闭后仍可读，并核对 Released、对端 EOF
+及 socket 基线恢复。
 
 设计依据为 design 期 infra `2cb3ebf60a101bb9cbf93f065db4d41e2130d3cd`、coroutine PR #396 合并提交 `1e9f0e8c25de85dde003def65bb58b90bdac0e0b`；R2 原分析使用的 PR head 为 `8d7b4383c8631f4dccad74df088abe54ca000b87`，不冒充 merge SHA。构建实际消费的 coroutine 版本由 CI 拉取 `coroutine@main` 并在 run 中记录 SHA。
 
