@@ -11,8 +11,9 @@
 namespace bbt::infra::net {
 
 struct ReclaimRecord {
-    explicit ReclaimRecord(bool initial_released) noexcept
-        : released(initial_released) {}
+    explicit ReclaimRecord(bool initial_released) noexcept : released(initial_released)
+    {
+    }
 
     std::atomic<bool> released;
 };

@@ -44,39 +44,49 @@ using namespace bbt::infra;
 using namespace std::chrono_literals;
 using Access = net::EngineTestAccess;
 
-inline void Check(bool value, const char* expression, int line) {
+inline void Check(bool value, const char* expression, int line)
+{
     if (!value) {
         throw std::runtime_error("line " + std::to_string(line) + ": " + expression);
     }
 }
 #define CHECK(expression) ::http_net_test::Check(static_cast<bool>(expression), #expression, __LINE__)
 
-inline CallOptions Until(std::chrono::milliseconds duration = 2s) {
+inline CallOptions Until(std::chrono::milliseconds duration = 2s)
+{
     return {std::chrono::steady_clock::now() + duration};
 }
-inline bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds timeout = 3s) {
+inline bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds timeout = 3s)
+{
     const auto end = std::chrono::steady_clock::now() + timeout;
     while (!predicate()) {
-        if (std::chrono::steady_clock::now() >= end) { return false; }
+        if (std::chrono::steady_clock::now() >= end) {
+            return false;
+        }
         std::this_thread::sleep_for(1ms);
     }
     return true;
 }
-template<class T> T Get(std::future<T>& future) {
+template <class T> T Get(std::future<T>& future)
+{
     CHECK(future.wait_for(5s) == std::future_status::ready);
     return future.get();
 }
-template<class T> void ExpectCode(const result<T>& value, ErrorCode code) {
+template <class T> void ExpectCode(const result<T>& value, ErrorCode code)
+{
     CHECK(!value);
     CHECK(value.error().code == code);
 }
 
-inline std::size_t SocketCount() {
+inline std::size_t SocketCount()
+{
     std::size_t count = 0;
     for (const auto& item : std::filesystem::directory_iterator("/proc/self/fd")) {
         std::error_code ec;
         const auto target = std::filesystem::read_symlink(item.path(), ec).string();
-        if (!ec && target.rfind("socket:", 0) == 0) { ++count; }
+        if (!ec && target.rfind("socket:", 0) == 0) {
+            ++count;
+        }
     }
     return count;
 }
@@ -84,18 +94,26 @@ inline std::size_t SocketCount() {
 // 测试进程 watchdog：超时仍为失败；不把强制退出当资源清理成功。
 class Watchdog {
 public:
-    Watchdog() : m_thread([this] {
-        std::unique_lock<std::mutex> lock(m_mutex);
-        if (!m_cv.wait_for(lock, 20s, [this] { return m_done; })) {
-            std::cerr << "FAIL watchdog: bounded test did not finish\n" << std::flush;
-            std::_Exit(3);
+    Watchdog()
+        : m_thread([this] {
+              std::unique_lock<std::mutex> lock(m_mutex);
+              if (!m_cv.wait_for(lock, 20s, [this] { return m_done; })) {
+                  std::cerr << "FAIL watchdog: bounded test did not finish\n" << std::flush;
+                  std::_Exit(3);
+              }
+          })
+    {
+    }
+    ~Watchdog()
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_done = true;
         }
-    }) {}
-    ~Watchdog() {
-        { std::lock_guard<std::mutex> lock(m_mutex); m_done = true; }
         m_cv.notify_one();
         m_thread.join();
     }
+
 private:
     mutable std::mutex m_mutex;
     std::condition_variable m_cv;
@@ -107,23 +125,34 @@ private:
 struct Gate {
     std::atomic<bool> entered{false};
     std::shared_ptr<bbt::coroutine::sync::CoWaiter> waiter;
-    Gate() : waiter(bbt::coroutine::sync::CoWaiter::Create()) { CHECK(waiter); }
-    void Pause() {
+    Gate() : waiter(bbt::coroutine::sync::CoWaiter::Create())
+    {
+        CHECK(waiter);
+    }
+    void Pause()
+    {
         const auto status = waiter->WaitWithCallback({std::chrono::steady_clock::now() + 5s}, [this] {
             entered.store(true);
             return true;
         });
         CHECK(status == bbt::coroutine::WaitStatus::Completed);
     }
-    void Release() { waiter->Notify(); }
-    ~Gate() { Release(); }
+    void Release()
+    {
+        waiter->Notify();
+    }
+    ~Gate()
+    {
+        Release();
+    }
 };
 
 struct Ledger {
     std::atomic<unsigned> submitted{0};
     std::atomic<unsigned> completed{0};
 };
-inline bool Drained(bool run_returned, net::EnginePhase phase, unsigned submitted, unsigned completed) {
+inline bool Drained(bool run_returned, net::EnginePhase phase, unsigned submitted, unsigned completed)
+{
     return run_returned && phase == net::EnginePhase::Stopped && submitted == completed;
 }
 
@@ -135,7 +164,8 @@ public:
     std::error_code run_error;
     std::atomic<bool> run_returned{false};
 
-    Host() : engine(net::Engine::Create(std::shared_ptr<net::RawHandler>{})) {
+    Host() : engine(net::Engine::Create(std::shared_ptr<net::RawHandler>{}))
+    {
         net::EngineConfig config;
         config.runtime_progress = net::RuntimeProgress::Independent;
         config.options.num_event_loop = 1;
@@ -143,14 +173,16 @@ public:
             run_error = engine->Run(config);
             run_returned.store(true);
         });
-        CHECK(WaitUntil([this] {
-            return engine->Phase() == net::EnginePhase::Running || run_returned.load();
-        }));
+        CHECK(WaitUntil([this] { return engine->Phase() == net::EnginePhase::Running || run_returned.load(); }));
         CHECK(engine->Phase() == net::EnginePhase::Running);
     }
-    ~Host() { Stop(); }
+    ~Host()
+    {
+        Stop();
+    }
 
-    template<class F> auto Submit(F fn) -> std::future<decltype(fn())> {
+    template <class F> auto Submit(F fn) -> std::future<decltype(fn())>
+    {
         using T = decltype(fn());
         auto promise = std::make_shared<std::promise<T>>();
         auto future = promise->get_future();
@@ -158,45 +190,52 @@ public:
         auto counts = ledger;
         counts->submitted.fetch_add(1);
         bool registered = false;
-        g_scheduler->RegistCoroutineTask(128 * 1024, [promise, callback = std::move(callback), counts]() mutable {
-            try {
-                if constexpr (std::is_void_v<T>) {
-                    callback();
+        g_scheduler->RegistCoroutineTask(
+            128 * 1024,
+            [promise, callback = std::move(callback), counts]() mutable {
+                try {
+                    if constexpr (std::is_void_v<T>) {
+                        callback();
+                        callback = {};
+                        counts->completed.fetch_add(1);
+                        promise->set_value();
+                    } else {
+                        auto value = callback();
+                        callback = {};
+                        counts->completed.fetch_add(1);
+                        promise->set_value(std::move(value));
+                    }
+                } catch (...) {
                     callback = {};
                     counts->completed.fetch_add(1);
-                    promise->set_value();
-                } else {
-                    auto value = callback();
-                    callback = {};
-                    counts->completed.fetch_add(1);
-                    promise->set_value(std::move(value));
+                    promise->set_exception(std::current_exception());
                 }
-            } catch (...) {
-                callback = {};
-                counts->completed.fetch_add(1);
-                promise->set_exception(std::current_exception());
-            }
-        }, registered);
+            },
+            registered);
         if (!registered) {
             counts->completed.fetch_add(1);
             promise->set_exception(std::make_exception_ptr(std::runtime_error("task registration failed")));
         }
         return future;
     }
-    template<class F> auto Call(F fn) -> decltype(fn()) {
+    template <class F> auto Call(F fn) -> decltype(fn())
+    {
         auto future = Submit(std::move(fn));
         return Get(future);
     }
-    void Stop() {
-        if (!m_thread.joinable()) { return; }
+    void Stop()
+    {
+        if (!m_thread.joinable()) {
+            return;
+        }
         engine->RequestClose();
         m_thread.join();
     }
-    void Finish() {
+    void Finish()
+    {
         Stop();
         CHECK(WaitUntil([this] { return ledger->submitted.load() == ledger->completed.load(); }));
-        CHECK(Drained(run_returned.load(), engine->Phase(), ledger->submitted.load(),
-                      ledger->completed.load()));
+        CHECK(Drained(run_returned.load(), engine->Phase(), ledger->submitted.load(), ledger->completed.load()));
         CHECK(!run_error);
         CHECK(!engine->LastError());
         CHECK(!engine->LastFailure());
@@ -204,10 +243,10 @@ public:
         CHECK(Access::ConnectTableSize(*engine) == 0);
         CHECK(Access::PendingConnectCount(*engine) == 0);
         CHECK(Access::DirtyCount(*engine) == 0);
-        std::cout << "receipt run_returned=1 joined=1 phase=Stopped tasks="
-                  << ledger->completed.load() << "/" << ledger->submitted.load()
-                  << " connections=0 connect_table=0 pending_dials=0 dirty=0\n";
+        std::cout << "receipt run_returned=1 joined=1 phase=Stopped tasks=" << ledger->completed.load() << "/"
+                  << ledger->submitted.load() << " connections=0 connect_table=0 pending_dials=0 dirty=0\n";
     }
+
 private:
     std::thread m_thread;
 };
@@ -225,10 +264,9 @@ public:
     };
 
     // canned 响应构造。
-    static std::string HttpResponse(int status, const std::string& reason,
-                                    const std::string& body,
-                                    const bbt::infra::http::Headers& extra = {},
-                                    bool include_content_length = true) {
+    static std::string HttpResponse(int status, const std::string& reason, const std::string& body,
+                                    const bbt::infra::http::Headers& extra = {}, bool include_content_length = true)
+    {
         std::string out = "HTTP/1.1 " + std::to_string(status) + " " + reason + "\r\n";
         if (include_content_length) {
             out += "Content-Length: " + std::to_string(body.size()) + "\r\n";
@@ -241,7 +279,8 @@ public:
         return out;
     }
 
-    HttpPeer() {
+    HttpPeer()
+    {
         m_listener = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
         CHECK(m_listener >= 0);
         int one = 1;
@@ -258,68 +297,110 @@ public:
         CHECK(!m_address_error);
         m_thread = std::thread([this] { AcceptLoop(); });
     }
-    ~HttpPeer() {
+    ~HttpPeer()
+    {
         Stop();
         ::close(m_listener);
     }
 
     // hook 复用入口：读完整 HTTP 请求（header+\r\n\r\n+Content-Length body）与发送。
-    static std::optional<Recorded> ReadRequestForHook(int fd) { return ReadRequest(fd); }
-    static bool SendForHook(int fd, const std::string& bytes) { return Send(fd, bytes); }
+    static std::optional<Recorded> ReadRequestForHook(int fd)
+    {
+        return ReadRequest(fd);
+    }
+    static bool SendForHook(int fd, const std::string& bytes)
+    {
+        return Send(fd, bytes);
+    }
 
-    int port() const noexcept { return m_port; }
-    const net::Address& address() const noexcept { return m_address; }
-    std::string base_url() const { return "http://127.0.0.1:" + std::to_string(m_port); }
+    int port() const noexcept
+    {
+        return m_port;
+    }
+    const net::Address& address() const noexcept
+    {
+        return m_address;
+    }
+    std::string base_url() const
+    {
+        return "http://127.0.0.1:" + std::to_string(m_port);
+    }
 
-    unsigned accept_total() const noexcept { return m_accept_total.load(); }
-    unsigned requests_total() const noexcept { return m_requests_total.load(); }
-    unsigned max_requests_on_one_connection() const noexcept {
+    unsigned accept_total() const noexcept
+    {
+        return m_accept_total.load();
+    }
+    unsigned requests_total() const noexcept
+    {
+        return m_requests_total.load();
+    }
+    unsigned max_requests_on_one_connection() const noexcept
+    {
         return m_max_requests_single.load();
     }
-    std::vector<Recorded> requests() const {
+    std::vector<Recorded> requests() const
+    {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_requests;
     }
 
     // 一次性连接 hook（按 accept 顺序消费）：完全接管一条连接（可阻塞、可发
     // 坏流）；没有 hook 的连接走默认 keep-alive 服务循环。
-    void PushConnectionHook(std::function<void(int)> hook) {
+    void PushConnectionHook(std::function<void(int)> hook)
+    {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_hooks.push_back(std::move(hook));
     }
-    void set_canned(std::function<std::string(const Recorded&)> canned) {
+    void set_canned(std::function<std::string(const Recorded&)> canned)
+    {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_canned = std::move(canned);
     }
-    void Stop() {
+    void Stop()
+    {
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            if (m_stopped) { return; }
+            if (m_stopped) {
+                return;
+            }
             m_stopped = true;
-            for (const int fd : m_conns) { ::shutdown(fd, SHUT_RDWR); }
+            for (const int fd : m_conns) {
+                ::shutdown(fd, SHUT_RDWR);
+            }
         }
         ::shutdown(m_listener, SHUT_RDWR);
-        if (m_thread.joinable()) { m_thread.join(); }
+        if (m_thread.joinable()) {
+            m_thread.join();
+        }
         // 活跃连接线程的 fd 由 shutdown 触发收尾；等待全部线程退出与 fd 关闭。
         CHECK(WaitUntil([this] {
             std::lock_guard<std::mutex> lock(m_mutex);
             return m_conns.empty();
         }));
-        for (auto& thread : m_threads) { thread.join(); }
+        for (auto& thread : m_threads) {
+            thread.join();
+        }
         m_threads.clear();
     }
 
 private:
-    void AcceptLoop() {
+    void AcceptLoop()
+    {
         while (true) {
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
-                if (m_stopped) { return; }
+                if (m_stopped) {
+                    return;
+                }
             }
             pollfd pfd{m_listener, POLLIN, 0};
-            if (::poll(&pfd, 1, 100) != 1) { continue; }
+            if (::poll(&pfd, 1, 100) != 1) {
+                continue;
+            }
             const int fd = ::accept4(m_listener, nullptr, nullptr, SOCK_CLOEXEC);
-            if (fd < 0) { continue; }
+            if (fd < 0) {
+                continue;
+            }
             m_accept_total.fetch_add(1);
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
@@ -329,7 +410,8 @@ private:
         }
     }
 
-    void ServeConnection(int fd) {
+    void ServeConnection(int fd)
+    {
         timeval timeout{8, 0};
         (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
         int nodelay = 1;
@@ -344,14 +426,19 @@ private:
         }
         if (hook) {
             hook(fd);
-            { std::lock_guard<std::mutex> lock(m_mutex); ::close(fd); }
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                ::close(fd);
+            }
             RetireFd(fd);
             return;
         }
         unsigned served = 0;
         for (;;) {
             auto request = ReadRequest(fd);
-            if (!request) { break; }
+            if (!request) {
+                break;
+            }
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 m_requests.push_back(*request);
@@ -359,39 +446,51 @@ private:
             m_requests_total.fetch_add(1);
             served++;
             unsigned observed = m_max_requests_single.load();
-            while (observed < served &&
-                   !m_max_requests_single.compare_exchange_weak(observed, served)) {
+            while (observed < served && !m_max_requests_single.compare_exchange_weak(observed, served)) {
             }
             std::string response;
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 response = m_canned ? m_canned(*request) : HttpResponse(200, "OK", "peer-default");
             }
-            if (!Send(fd, response)) { break; }
+            if (!Send(fd, response)) {
+                break;
+            }
         }
-        { std::lock_guard<std::mutex> lock(m_mutex); ::close(fd); }
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            ::close(fd);
+        }
         RetireFd(fd);
     }
 
-    void RetireFd(int fd) {
+    void RetireFd(int fd)
+    {
         std::lock_guard<std::mutex> lock(m_mutex);
         for (auto it = m_conns.begin(); it != m_conns.end(); ++it) {
-            if (*it == fd) { m_conns.erase(it); return; }
+            if (*it == fd) {
+                m_conns.erase(it);
+                return;
+            }
         }
     }
 
-    static bool Send(int fd, const std::string& bytes) {
+    static bool Send(int fd, const std::string& bytes)
+    {
         std::size_t offset = 0;
         while (offset < bytes.size()) {
             const auto n = ::send(fd, bytes.data() + offset, bytes.size() - offset, MSG_NOSIGNAL);
-            if (n <= 0) { return false; }
+            if (n <= 0) {
+                return false;
+            }
             offset += static_cast<std::size_t>(n);
         }
         return true;
     }
 
     // 读完整 HTTP 请求（hook 复用）：header 直到 \r\n\r\n，再按 Content-Length 读 body。
-    static std::optional<Recorded> ReadRequest(int fd) {
+    static std::optional<Recorded> ReadRequest(int fd)
+    {
         std::string buffer;
         char chunk[4096];
         const auto head_end = [&] {
@@ -399,9 +498,13 @@ private:
         };
         while (head_end() == std::string::npos) {
             const auto n = ::recv(fd, chunk, sizeof(chunk), 0);
-            if (n <= 0) { return std::nullopt; }
+            if (n <= 0) {
+                return std::nullopt;
+            }
             buffer.append(chunk, static_cast<std::size_t>(n));
-            if (buffer.size() > 64 * 1024) { return std::nullopt; }
+            if (buffer.size() > 64 * 1024) {
+                return std::nullopt;
+            }
         }
         Recorded out;
         const std::string head = buffer.substr(0, head_end());
@@ -424,30 +527,39 @@ private:
             if (colon != std::string::npos) {
                 std::string name = line.substr(0, colon);
                 std::size_t value_start = colon + 1;
-                while (value_start < line.size() && line[value_start] == ' ') { ++value_start; }
+                while (value_start < line.size() && line[value_start] == ' ') {
+                    ++value_start;
+                }
                 const std::string value = line.substr(value_start);
                 if (EqualsNoCase(name, "Content-Length")) {
                     content_length = static_cast<std::size_t>(std::atoll(value.c_str()));
                 }
                 out.headers.emplace_back(name, value);
             }
-            if (eol == std::string::npos) { break; }
+            if (eol == std::string::npos) {
+                break;
+            }
             pos = eol + 2;
         }
         while (rest.size() < content_length) {
             const auto n = ::recv(fd, chunk, sizeof(chunk), 0);
-            if (n <= 0) { return std::nullopt; }
+            if (n <= 0) {
+                return std::nullopt;
+            }
             rest.append(chunk, static_cast<std::size_t>(n));
         }
         out.body = rest.substr(0, content_length);
         return out;
     }
 
-    static bool EqualsNoCase(std::string_view left, std::string_view right) {
-        if (left.size() != right.size()) { return false; }
+    static bool EqualsNoCase(std::string_view left, std::string_view right)
+    {
+        if (left.size() != right.size()) {
+            return false;
+        }
         for (std::size_t i = 0; i < left.size(); ++i) {
-            if (std::tolower(static_cast<unsigned char>(left[i])) !=
-                std::tolower(static_cast<unsigned char>(right[i]))) {
+            if (std::tolower(static_cast<unsigned char>(left[i]))
+                != std::tolower(static_cast<unsigned char>(right[i]))) {
                 return false;
             }
         }

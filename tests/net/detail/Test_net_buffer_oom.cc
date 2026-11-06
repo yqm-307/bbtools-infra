@@ -64,16 +64,21 @@ thread_local int g_fail_at = 0;
 thread_local int g_calls = 0;
 thread_local std::size_t g_alloc_sizes[16]{};
 
-void Arm(int index) {
+void Arm(int index)
+{
     g_calls = 0;
     for (auto& size : g_alloc_sizes) {
         size = 0;
     }
     g_fail_at = index;
 }
-void Disarm() { g_fail_at = 0; }
+void Disarm()
+{
+    g_fail_at = 0;
+}
 
-std::string AllocTrace() {
+std::string AllocTrace()
+{
     std::string out = "calls=" + std::to_string(g_calls) + " sizes=";
     for (int i = 0; i < g_calls && i < 16; ++i) {
         out += std::to_string(g_alloc_sizes[i]);
@@ -82,8 +87,9 @@ std::string AllocTrace() {
     return out;
 }
 
-}  // namespace
-void* operator new(std::size_t size) {
+} // namespace
+void* operator new(std::size_t size)
+{
     if (g_fail_at != 0) {
         const int index = ++g_calls;
         if (index <= 16) {
@@ -99,18 +105,34 @@ void* operator new(std::size_t size) {
     }
     return memory;
 }
-void* operator new[](std::size_t size) { return ::operator new(size); }
-void operator delete(void* memory) noexcept { std::free(memory); }
-void operator delete[](void* memory) noexcept { std::free(memory); }
-void operator delete(void* memory, std::size_t) noexcept { std::free(memory); }
-void operator delete[](void* memory, std::size_t) noexcept { std::free(memory); }
+void* operator new[](std::size_t size)
+{
+    return ::operator new(size);
+}
+void operator delete(void* memory) noexcept
+{
+    std::free(memory);
+}
+void operator delete[](void* memory) noexcept
+{
+    std::free(memory);
+}
+void operator delete(void* memory, std::size_t) noexcept
+{
+    std::free(memory);
+}
+void operator delete[](void* memory, std::size_t) noexcept
+{
+    std::free(memory);
+}
 
 namespace {
 
 using namespace bbt::infra::net;
 using namespace std::chrono_literals;
 
-bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds timeout) {
+bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds timeout)
+{
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
         if (predicate()) {
@@ -121,39 +143,45 @@ bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds
     return predicate();
 }
 
-void StartRuntime(std::size_t workers) {
+void StartRuntime(std::size_t workers)
+{
     g_bbt_coroutine_config->m_cfg_static_thread_num = workers;
     g_bbt_coroutine_config->m_cfg_stack_size = 65536;
     g_scheduler->Start();
 }
 
-std::future<void> Task(std::function<void()> callback) {
+std::future<void> Task(std::function<void()> callback)
+{
     auto promise = std::make_shared<std::promise<void>>();
     auto future = promise->get_future();
-    g_scheduler->RegistCoroutineTask(65536, [promise, callback] {
-        try {
-            callback();
-            promise->set_value();
-        } catch (...) {
-            promise->set_exception(std::current_exception());
-        }
-    }, "net.buffer_oom");
+    g_scheduler->RegistCoroutineTask(
+        65536,
+        [promise, callback] {
+            try {
+                callback();
+                promise->set_value();
+            } catch (...) {
+                promise->set_exception(std::current_exception());
+            }
+        },
+        "net.buffer_oom");
     return future;
 }
 
-bbt::coroutine::WaitOptions Until(std::chrono::milliseconds duration) {
+bbt::coroutine::WaitOptions Until(std::chrono::milliseconds duration)
+{
     return {std::chrono::steady_clock::now() + duration};
 }
 
 // 由 TryPopAll 结果按 CoTcpConnection::Read 相同方式构造 Buffer（复刻 Read
 // 的移交步骤，用于 d4/d5 的 Buffer 形态断言）。
-Buffer Convert(ReceiveRing::PopAllResult& popped) {
-    std::vector<BufferSegment> segments =
-        std::move(popped.takeout->segments);
+Buffer Convert(ReceiveRing::PopAllResult& popped)
+{
+    std::vector<BufferSegment> segments = std::move(popped.takeout->segments);
     return BufferTestAccess::Make(std::move(popped.takeout), std::move(segments));
 }
 
-}  // namespace
+} // namespace
 
 BOOST_AUTO_TEST_SUITE(net_buffer_oom)
 
@@ -161,7 +189,8 @@ BOOST_AUTO_TEST_SUITE(net_buffer_oom)
 // 注入逐序号扫描：TryPopAll 内部的可失败步骤仍允许出现（它们先于首个变更
 // 步骤，失败零消费可重试），但 Read 侧不再有第 4 次分配——任何序号下
 // bad_alloc 都不会逃出 Read，已提交字节不会随异常丢失。
-BOOST_AUTO_TEST_CASE(read_post_pop_oom_no_loss) {
+BOOST_AUTO_TEST_CASE(read_post_pop_oom_no_loss)
+{
     StartRuntime(1);
     // 修复后断言：任何注入序号下 Read 要么成功交付、要么 Error+not_enough_memory
     // 且零消费可重试；绝不抛出且绝不丢已提交字节。
@@ -170,7 +199,7 @@ BOOST_AUTO_TEST_CASE(read_post_pop_oom_no_loss) {
     for (int index = 1; index <= 6; ++index) {
         auto state = std::make_shared<ConnectionState>(1, 256, 1024, 4, nullptr);
         BOOST_REQUIRE(state->ring.TryAppend(std::string(64, 'X')).status == ReadStatus::Ok);
-        state->ring.MarkEof();  // 交尽后重试应得 Eof——丢字节可观测
+        state->ring.MarkEof(); // 交尽后重试应得 Eof——丢字节可观测
         CoTcpConnection conn(ConnectionTestAccess::Make(state));
         std::atomic<int> threw{-1};
         std::atomic<int> first_state{-1};
@@ -199,13 +228,10 @@ BOOST_AUTO_TEST_CASE(read_post_pop_oom_no_loss) {
         });
         BOOST_REQUIRE(task.wait_for(10s) == std::future_status::ready);
         task.get();
-        BOOST_TEST_MESSAGE("read_fail_at=" << index
-            << " threw=" << threw.load()
-            << " state=" << first_state.load()
-            << " bytes=" << first_bytes.load()
-            << " used_after=" << used_after.load()
-            << " retry_state=" << retry_state.load()
-            << " retry_bytes=" << retry_bytes.load());
+        BOOST_TEST_MESSAGE("read_fail_at=" << index << " threw=" << threw.load() << " state=" << first_state.load()
+                                           << " bytes=" << first_bytes.load() << " used_after=" << used_after.load()
+                                           << " retry_state=" << retry_state.load()
+                                           << " retry_bytes=" << retry_bytes.load());
         // 修复后契约：bad_alloc 不逃出 Read（post-pop 分配已消失，pop 内部
         // 分配失败被 TryPopAll 折成 Error+ENOMEM）。
         BOOST_CHECK_EQUAL(threw.load(), 0);
@@ -235,7 +261,8 @@ BOOST_AUTO_TEST_CASE(read_post_pop_oom_no_loss) {
 // TryAppend 在「grant 后 pop 移走 backing」交错下需要重新分配；分配失败
 // 折成 Error+not_enough_memory 返回值，SubmitReceivedOwner 的 m_recv_hold
 // 登记分支可达，owner 已 recv 字节不再随异常丢失。
-BOOST_AUTO_TEST_CASE(grant_pop_append_oom_no_throw) {
+BOOST_AUTO_TEST_CASE(grant_pop_append_oom_no_throw)
+{
     ReceiveRing ring(256);
     BOOST_REQUIRE(ring.TryAppend("old").status == ReadStatus::Ok);
     const auto grant = ring.TryReserveForAppend(64);
@@ -254,15 +281,13 @@ BOOST_AUTO_TEST_CASE(grant_pop_append_oom_no_throw) {
         threw = true;
     }
     Disarm();
-    BOOST_TEST_MESSAGE("d2 grant_then_pop capacity_after_pop=0 append_threw=" << threw
-        << " appended_status=" << static_cast<int>(appended.status)
-        << " appended_error=" << appended.error.value()
-        << " used_after=" << ring.Size() << " " << AllocTrace());
+    BOOST_TEST_MESSAGE("d2 grant_then_pop capacity_after_pop=0 append_threw="
+                       << threw << " appended_status=" << static_cast<int>(appended.status) << " appended_error="
+                       << appended.error.value() << " used_after=" << ring.Size() << " " << AllocTrace());
     // 修复后契约：OOM 不抛出，以 Error+not_enough_memory 返回；
     // SubmitReceivedOwner 据此登记 m_recv_hold，字节不丢（ring 未接纳）。
     BOOST_CHECK(!threw);
-    BOOST_CHECK(appended.status == ReadStatus::WouldBlock ||
-                appended.status == ReadStatus::Error);
+    BOOST_CHECK(appended.status == ReadStatus::WouldBlock || appended.status == ReadStatus::Error);
     BOOST_CHECK(appended.error);
     BOOST_CHECK_EQUAL(ring.Size(), 0);
     // 正对照：同一交错下不注入失败时 append 成功。
@@ -278,7 +303,8 @@ BOOST_AUTO_TEST_CASE(grant_pop_append_oom_no_throw) {
 // ---- （修复后契约）：pending/detached 移交不复制载荷 ----
 // 短载荷仍可在移交后保持「段指针不落在 takeout string 对象内联区间」——
 // pending/detached 在移交前已确保持有堆 backing，move 即指针移交。
-BOOST_AUTO_TEST_CASE(sso_payload_not_copied) {
+BOOST_AUTO_TEST_CASE(sso_payload_not_copied)
+{
     auto ring = std::make_unique<ReceiveRing>(256);
     BOOST_REQUIRE(ring->AppendDeferred("P"));
     auto popped = ring->TryPopAll();
@@ -286,15 +312,12 @@ BOOST_AUTO_TEST_CASE(sso_payload_not_copied) {
     BOOST_REQUIRE_EQUAL(popped.takeout->pending, "P");
     // 移交后段指针不再落在 takeout->pending 对象的 SSO 内联区间：
     // 短载荷也拥有独立堆 backing，移交不复制。
-    const auto* seg_ptr =
-        reinterpret_cast<const unsigned char*>(popped.takeout->segments.front().data);
-    const auto* pending_obj =
-        reinterpret_cast<const unsigned char*>(&popped.takeout->pending);
-    const bool seg_inside_object =
-        seg_ptr >= pending_obj && seg_ptr < pending_obj + sizeof(popped.takeout->pending);
+    const auto* seg_ptr = reinterpret_cast<const unsigned char*>(popped.takeout->segments.front().data);
+    const auto* pending_obj = reinterpret_cast<const unsigned char*>(&popped.takeout->pending);
+    const bool seg_inside_object = seg_ptr >= pending_obj && seg_ptr < pending_obj + sizeof(popped.takeout->pending);
     BOOST_TEST_MESSAGE("d3 sso seg_inside_takeout_object=" << seg_inside_object
-        << " pending_size=" << popped.takeout->pending.size()
-        << " pending_data_is_heap=" << (seg_ptr != nullptr));
+                                                           << " pending_size=" << popped.takeout->pending.size()
+                                                           << " pending_data_is_heap=" << (seg_ptr != nullptr));
     BOOST_CHECK(!seg_inside_object);
     BOOST_CHECK_EQUAL(popped.takeout->segments.front().size, 1);
     BOOST_CHECK_EQUAL(*popped.takeout->segments.front().data, 'P');
@@ -305,12 +328,9 @@ BOOST_AUTO_TEST_CASE(sso_payload_not_copied) {
     auto popped_d = ring_d->TryPopAll();
     BOOST_REQUIRE(popped_d.status == ReadStatus::Ok);
     BOOST_REQUIRE_EQUAL(popped_d.takeout->detached, "D");
-    const auto* dseg =
-        reinterpret_cast<const unsigned char*>(popped_d.takeout->segments.front().data);
-    const auto* dobj =
-        reinterpret_cast<const unsigned char*>(&popped_d.takeout->detached);
-    const bool dseg_inline =
-        dseg >= dobj && dseg < dobj + sizeof(popped_d.takeout->detached);
+    const auto* dseg = reinterpret_cast<const unsigned char*>(popped_d.takeout->segments.front().data);
+    const auto* dobj = reinterpret_cast<const unsigned char*>(&popped_d.takeout->detached);
+    const bool dseg_inline = dseg >= dobj && dseg < dobj + sizeof(popped_d.takeout->detached);
     BOOST_CHECK(!dseg_inline);
 
     // 对照：长载荷（>SSO）依然真移动，指针同址。
@@ -319,25 +339,19 @@ BOOST_AUTO_TEST_CASE(sso_payload_not_copied) {
     BOOST_REQUIRE(big->AppendDeferred(payload));
     auto big_pop = big->TryPopAll();
     BOOST_REQUIRE(big_pop.status == ReadStatus::Ok);
-    const auto* big_seg = reinterpret_cast<const unsigned char*>(
-        big_pop.takeout->segments.front().data);
-    const auto* big_obj = reinterpret_cast<const unsigned char*>(
-        &big_pop.takeout->pending);
-    const bool big_inline =
-        big_seg >= big_obj && big_seg < big_obj + sizeof(big_pop.takeout->pending);
+    const auto* big_seg = reinterpret_cast<const unsigned char*>(big_pop.takeout->segments.front().data);
+    const auto* big_obj = reinterpret_cast<const unsigned char*>(&big_pop.takeout->pending);
+    const bool big_inline = big_seg >= big_obj && big_seg < big_obj + sizeof(big_pop.takeout->pending);
     BOOST_CHECK(!big_inline);
 }
 
 // ---- （修复后契约）：Buffer 拷贝已删除，OOM 悬空段形态不可达 ----
-BOOST_AUTO_TEST_CASE(copy_assign_deleted) {
-    static_assert(!std::is_copy_constructible_v<Buffer>,
-                  "修复后契约：Buffer 不可拷贝构造");
-    static_assert(!std::is_copy_assignable_v<Buffer>,
-                  "修复后契约：Buffer 不可拷贝赋值");
-    static_assert(std::is_move_constructible_v<Buffer>,
-                  "修复后契约：Buffer 可移动构造");
-    static_assert(std::is_move_assignable_v<Buffer>,
-                  "修复后契约：Buffer 可移动赋值");
+BOOST_AUTO_TEST_CASE(copy_assign_deleted)
+{
+    static_assert(!std::is_copy_constructible_v<Buffer>, "修复后契约：Buffer 不可拷贝构造");
+    static_assert(!std::is_copy_assignable_v<Buffer>, "修复后契约：Buffer 不可拷贝赋值");
+    static_assert(std::is_move_constructible_v<Buffer>, "修复后契约：Buffer 可移动构造");
+    static_assert(std::is_move_assignable_v<Buffer>, "修复后契约：Buffer 可移动赋值");
     // 移动语义仍可用：move 后来源为空、目标持有全部段。
     ReceiveRing one(256);
     BOOST_REQUIRE(one.TryAppend(std::string(64, 'A')).status == ReadStatus::Ok);
@@ -356,17 +370,16 @@ BOOST_AUTO_TEST_CASE(copy_assign_deleted) {
 }
 
 // ---- （修复后契约）：backing+segments 构造已收回 private ----
-BOOST_AUTO_TEST_CASE(public_ctor_forge_denied) {
-    static_assert(!std::is_constructible_v<Buffer, std::shared_ptr<void>,
-                                         std::vector<BufferSegment>>,
+BOOST_AUTO_TEST_CASE(public_ctor_forge_denied)
+{
+    static_assert(!std::is_constructible_v<Buffer, std::shared_ptr<void>, std::vector<BufferSegment>>,
                   "修复后契约：公共构造已收回，owning 不变量不可伪造");
     // 内部接缝仍可构造（等价于 Read 移交路径）：BufferTestAccess::Make。
     char backing_byte = 'B';
     auto backing = std::make_shared<char>(backing_byte);
     const char* seg_ptr = backing.get();
-    Buffer made = BufferTestAccess::Make(
-        std::static_pointer_cast<void>(backing),
-        std::vector<BufferSegment>{{seg_ptr, 1}});
+    Buffer made =
+        BufferTestAccess::Make(std::static_pointer_cast<void>(backing), std::vector<BufferSegment>{{seg_ptr, 1}});
     BOOST_CHECK(BufferTestAccess::Backing(made) == backing.get());
     BOOST_CHECK_EQUAL(made.Size(), 1);
     BOOST_CHECK_EQUAL(made.CopyTo(), "B");
@@ -374,7 +387,8 @@ BOOST_AUTO_TEST_CASE(public_ctor_forge_denied) {
 }
 
 // ---- （修复后契约）：CoAccept reclaim 与连接同一事实源 ----
-BOOST_AUTO_TEST_CASE(coaccept_reclaim_valid_ticket) {
+BOOST_AUTO_TEST_CASE(coaccept_reclaim_valid_ticket)
+{
     struct NullHandler : RawHandler {};
     auto handler = std::make_shared<NullHandler>();
     Engine engine(handler);
@@ -392,7 +406,8 @@ BOOST_AUTO_TEST_CASE(coaccept_reclaim_valid_ticket) {
     struct RunnerGuard {
         Engine& engine;
         std::thread& thread;
-        ~RunnerGuard() {
+        ~RunnerGuard()
+        {
             engine.RequestClose();
             if (thread.joinable()) {
                 thread.join();
@@ -427,23 +442,20 @@ BOOST_AUTO_TEST_CASE(coaccept_reclaim_valid_ticket) {
     NativeSocket client = NativeSocket::Open(AddressFamily::IPv4, SocketType::Stream, ec);
     BOOST_REQUIRE(!ec);
     const auto conn_err = client.Connect(addresses[0]);
-    BOOST_CHECK(!conn_err || conn_err.value() == EINPROGRESS
-                || conn_err.value() == EWOULDBLOCK);
+    BOOST_CHECK(!conn_err || conn_err.value() == EINPROGRESS || conn_err.value() == EWOULDBLOCK);
     pollfd pfd{client.Fd(), POLLOUT, 0};
     BOOST_REQUIRE(::poll(&pfd, 1, 3000) > 0);
     BOOST_REQUIRE(!client.PendingError());
     BOOST_REQUIRE(task.wait_for(10s) == std::future_status::ready);
     task.get();
-    BOOST_TEST_MESSAGE("d6 accept_error=" << accept_error.load()
-        << " conn_valid=" << conn_valid.load()
-        << " reclaim_valid=" << reclaim_valid.load()
-        << " reclaim_released=" << reclaim_released.load()
-        << " conn_released=" << conn_released.load());
+    BOOST_TEST_MESSAGE("d6 accept_error=" << accept_error.load() << " conn_valid=" << conn_valid.load()
+                                          << " reclaim_valid=" << reclaim_valid.load() << " reclaim_released="
+                                          << reclaim_released.load() << " conn_released=" << conn_released.load());
     BOOST_REQUIRE_EQUAL(accept_error.load(), 0);
     // 修复后契约：reclaim 有效且与连接同一事实源——fd 存活时 ticket 报未释放。
     BOOST_CHECK_EQUAL(conn_valid.load(), 1);
     BOOST_CHECK_EQUAL(conn_released.load(), 0);
-    BOOST_CHECK_EQUAL(reclaim_valid.load(), 1);   // 有效票
+    BOOST_CHECK_EQUAL(reclaim_valid.load(), 1);    // 有效票
     BOOST_CHECK_EQUAL(reclaim_released.load(), 0); // 与 conn 同一事实：未释放
     (void)client.Close();
     engine.RequestClose();
@@ -453,9 +465,13 @@ BOOST_AUTO_TEST_CASE(coaccept_reclaim_valid_ticket) {
 
 BOOST_AUTO_TEST_SUITE_END()
 
-bool init_unit_test() { return true; }
+bool init_unit_test()
+{
+    return true;
+}
 
-int main(int argc, char* argv[]) {
+int main(int argc, char* argv[])
+{
     const int code = boost::unit_test::unit_test_main(&init_unit_test, argc, argv);
     std::cout.flush();
     std::cerr.flush();

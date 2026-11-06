@@ -20,7 +20,8 @@ namespace {
 int g_checks = 0;
 int g_failures = 0;
 
-void Check(bool ok, const char* expr, int line) {
+void Check(bool ok, const char* expr, int line)
+{
     ++g_checks;
     if (!ok) {
         ++g_failures;
@@ -37,24 +38,24 @@ using bbt::infra::mcp::JsonKind;
 using bbt::infra::mcp::JsonValue;
 
 // 解析成功断言（返回解析结果供继续检查）。
-bool ParsedOk(bbt::infra::result<JsonValue>& parsed, int line) {
+bool ParsedOk(bbt::infra::result<JsonValue>& parsed, int line)
+{
     ++g_checks;
     if (!parsed) {
         ++g_failures;
-        std::fprintf(stderr, "FAIL %s:%d  parse should succeed: %s\n", __FILE__, line,
-                     parsed.error().message.c_str());
+        std::fprintf(stderr, "FAIL %s:%d  parse should succeed: %s\n", __FILE__, line, parsed.error().message.c_str());
         return false;
     }
     return true;
 }
 
 // 解析被拒断言 + domain_code 精确匹配（固定文本，不回显输入）。
-void RejectedWith(bbt::infra::result<JsonValue>& parsed, const char* domain_code, int line) {
+void RejectedWith(bbt::infra::result<JsonValue>& parsed, const char* domain_code, int line)
+{
     ++g_checks;
     if (parsed) {
         ++g_failures;
-        std::fprintf(stderr, "FAIL %s:%d  parse should be rejected (%s)\n", __FILE__, line,
-                     domain_code);
+        std::fprintf(stderr, "FAIL %s:%d  parse should be rejected (%s)\n", __FILE__, line, domain_code);
         return;
     }
     ++g_checks;
@@ -68,7 +69,8 @@ void RejectedWith(bbt::infra::result<JsonValue>& parsed, const char* domain_code
 constexpr std::size_t kBig = 1U << 20;
 constexpr std::size_t kDeep = 32;
 
-void TestDefaultsAndFactories() {
+void TestDefaultsAndFactories()
+{
     JsonValue null_value;
     CHECK(null_value.IsNull());
     CHECK(null_value.Kind() == JsonKind::Null);
@@ -91,7 +93,8 @@ void TestDefaultsAndFactories() {
     CHECK(JsonValue(0).AsInt64().value() == 0);
 }
 
-void TestScalarsAndTypeErrors() {
+void TestScalarsAndTypeErrors()
+{
     CHECK(JsonValue(true).IsBool());
     CHECK(JsonValue(true).AsBool().value());
     CHECK(JsonValue(std::int64_t(-7)).IsInt64());
@@ -105,8 +108,7 @@ void TestScalarsAndTypeErrors() {
 
     // 类型不匹配一律 TypeMismatch，不做隐式转换。
     CHECK(!JsonValue(true).AsInt64());
-    CHECK(!JsonValue(true).AsInt64() &&
-          JsonValue(true).AsInt64().error().code == ErrorCode::TypeMismatch);
+    CHECK(!JsonValue(true).AsInt64() && JsonValue(true).AsInt64().error().code == ErrorCode::TypeMismatch);
     CHECK(!JsonValue(std::int64_t(1)).AsString());
     CHECK(!JsonValue(std::int64_t(1)).AsBool());
     CHECK(!JsonValue("1").AsUInt64());
@@ -116,24 +118,37 @@ void TestScalarsAndTypeErrors() {
 
     // 非有限 double 拒绝（JSON 无法表达），不静默写入。
     bool threw_nan = false;
-    try { JsonValue v(std::numeric_limits<double>::quiet_NaN()); (void)v; }
-    catch (const std::invalid_argument&) { threw_nan = true; }
+    try {
+        JsonValue v(std::numeric_limits<double>::quiet_NaN());
+        (void)v;
+    } catch (const std::invalid_argument&) {
+        threw_nan = true;
+    }
     CHECK(threw_nan);
     bool threw_inf = false;
-    try { JsonValue v(std::numeric_limits<double>::infinity()); (void)v; }
-    catch (const std::invalid_argument&) { threw_inf = true; }
+    try {
+        JsonValue v(std::numeric_limits<double>::infinity());
+        (void)v;
+    } catch (const std::invalid_argument&) {
+        threw_inf = true;
+    }
     CHECK(threw_inf);
 
     // 非法 UTF-8 字符串构造拒绝。
     const std::string bad_utf8 = std::string("\"\xC3\x28\"");
     bool threw_utf8 = false;
-    try { JsonValue v(std::string_view("\xFF\xFE")); (void)v; }
-    catch (const std::invalid_argument&) { threw_utf8 = true; }
+    try {
+        JsonValue v(std::string_view("\xFF\xFE"));
+        (void)v;
+    } catch (const std::invalid_argument&) {
+        threw_utf8 = true;
+    }
     CHECK(threw_utf8);
     (void)bad_utf8;
 }
 
-void TestExactIntegers() {
+void TestExactIntegers()
+{
     // 2^53+1：double 无法精确表示，必须保持整数身份与原值。
     auto beyond = JsonValue::Parse("9007199254740993", kBig, kDeep);
     if (ParsedOk(beyond, __LINE__)) {
@@ -179,17 +194,15 @@ void TestExactIntegers() {
     }
 
     // 整数 + 小数混合结构往返不失真。
-    const std::string text =
-        "{\"a\":9007199254740993,\"b\":18446744073709551615,"
-        "\"c\":-9223372036854775808,\"d\":1.5,\"e\":true,\"f\":null,"
-        "\"g\":\"\\u4e2d\",\"h\":[1,2,{\"i\":[]}]}";
+    const std::string text = "{\"a\":9007199254740993,\"b\":18446744073709551615,"
+                             "\"c\":-9223372036854775808,\"d\":1.5,\"e\":true,\"f\":null,"
+                             "\"g\":\"\\u4e2d\",\"h\":[1,2,{\"i\":[]}]}";
     // 期望的重新序列化结果：\u4e2d 解码为 UTF-8「中」，非 ASCII 不再转义；
     // Boost.JSON 1.90 的 double 输出用科学计数法（1.5 → "1.5E0"，合法 JSON，
     // 回读仍得同一 double），整数不受影响（精确原值）。
-    const std::string expected_serialized =
-        "{\"a\":9007199254740993,\"b\":18446744073709551615,"
-        "\"c\":-9223372036854775808,\"d\":1.5E0,\"e\":true,\"f\":null,"
-        "\"g\":\"\u4e2d\",\"h\":[1,2,{\"i\":[]}]}";
+    const std::string expected_serialized = "{\"a\":9007199254740993,\"b\":18446744073709551615,"
+                                            "\"c\":-9223372036854775808,\"d\":1.5E0,\"e\":true,\"f\":null,"
+                                            "\"g\":\"\u4e2d\",\"h\":[1,2,{\"i\":[]}]}";
     auto nested = JsonValue::Parse(text, kBig, kDeep);
     if (ParsedOk(nested, __LINE__)) {
         JsonValue v = std::move(nested).value();
@@ -203,14 +216,14 @@ void TestExactIntegers() {
             CHECK(round_trip.Find("d").value().AsDouble().value() == 1.5);
         }
         CHECK(v.Find("a").value().AsInt64().value() == 9007199254740993LL);
-        CHECK(v.Find("b").value().AsUInt64().value() ==
-              std::numeric_limits<std::uint64_t>::max());
+        CHECK(v.Find("b").value().AsUInt64().value() == std::numeric_limits<std::uint64_t>::max());
         CHECK(v.Find("g").value().AsString().value() == "中");
         CHECK(v.Find("h").value().At(2).value().Find("i").value().IsArray());
     }
 }
 
-void TestRejections() {
+void TestRejections()
+{
     auto dup = JsonValue::Parse("{\"a\":1,\"a\":2}", kBig, kDeep);
     RejectedWith(dup, "mcp.json.duplicate_key", __LINE__);
 
@@ -278,7 +291,8 @@ void TestRejections() {
     RejectedWith(deep_object, "mcp.json.max_depth", __LINE__);
 }
 
-void TestNumberRepresentability() {
+void TestNumberRepresentability()
+{
     // 非有限字面量：不可表示，固定 domain mcp.json.number（不是 syntax/duplicate），
     // 且不留 DOM（Parse 直接失败，调用方拿不到值）。
     auto inf_309 = JsonValue::Parse("1e309", kBig, kDeep);
@@ -299,9 +313,9 @@ void TestNumberRepresentability() {
     RejectedWith(deep, "mcp.json.number", __LINE__);
 
     // 超 int64/uint64 的整数词法不得悄悄降级为 double（保精确整数承诺）。
-    auto over_u64 = JsonValue::Parse("18446744073709551616", kBig, kDeep);   // 2^64
+    auto over_u64 = JsonValue::Parse("18446744073709551616", kBig, kDeep); // 2^64
     RejectedWith(over_u64, "mcp.json.number", __LINE__);
-    auto under_i64 = JsonValue::Parse("-9223372036854775809", kBig, kDeep);  // int64 min - 1
+    auto under_i64 = JsonValue::Parse("-9223372036854775809", kBig, kDeep); // int64 min - 1
     RejectedWith(under_i64, "mcp.json.number", __LINE__);
     auto big_int = JsonValue::Parse("123456789012345678901234567890", kBig, kDeep);
     RejectedWith(big_int, "mcp.json.number", __LINE__);
@@ -319,18 +333,15 @@ void TestNumberRepresentability() {
     // 整数边界未被误拒：uint64 上界与 int64 上界仍精确接受。
     auto u64max = JsonValue::Parse("18446744073709551615", kBig, kDeep);
     if (ParsedOk(u64max, __LINE__)) {
-        CHECK(std::move(u64max).value().AsUInt64().value() ==
-              std::numeric_limits<std::uint64_t>::max());
+        CHECK(std::move(u64max).value().AsUInt64().value() == std::numeric_limits<std::uint64_t>::max());
     }
     auto i64max = JsonValue::Parse("9223372036854775807", kBig, kDeep);
     if (ParsedOk(i64max, __LINE__)) {
-        CHECK(std::move(i64max).value().AsInt64().value() ==
-              std::numeric_limits<std::int64_t>::max());
+        CHECK(std::move(i64max).value().AsInt64().value() == std::numeric_limits<std::int64_t>::max());
     }
     auto i64min = JsonValue::Parse("-9223372036854775808", kBig, kDeep);
     if (ParsedOk(i64min, __LINE__)) {
-        CHECK(std::move(i64min).value().AsInt64().value() ==
-              std::numeric_limits<std::int64_t>::min());
+        CHECK(std::move(i64min).value().AsInt64().value() == std::numeric_limits<std::int64_t>::min());
     }
 
     // 下溢到 0 属 IEEE 语义、非拒绝面：1e-999 → 0（显式记录，非静默丢精度）。
@@ -362,9 +373,11 @@ void TestNumberRepresentability() {
     }
 }
 
-void TestObjectArrayAccessAndMutation() {
+void TestObjectArrayAccessAndMutation()
+{
     auto parsed = JsonValue::Parse("{\"a\":{\"n\":1},\"b\":[10,20]}", kBig, kDeep);
-    if (!ParsedOk(parsed, __LINE__)) return;
+    if (!ParsedOk(parsed, __LINE__))
+        return;
     JsonValue v = std::move(parsed).value();
     CHECK(v.Size() == 2);
 
@@ -385,7 +398,7 @@ void TestObjectArrayAccessAndMutation() {
 
     auto element = v.Find("b").value().At(1);
     CHECK(element && element.value().AsInt64().value() == 20);
-    auto oob = v.Find("b").value().At(3);  // 上一步写回后 b=[10,20,30]
+    auto oob = v.Find("b").value().At(3); // 上一步写回后 b=[10,20,30]
     CHECK(!oob && oob.error().domain_code == "mcp.json.index_out_of_range");
     auto at_object = v.At(0);
     CHECK(!at_object && at_object.error().domain_code == "mcp.json.not_array");
@@ -417,7 +430,7 @@ void TestObjectArrayAccessAndMutation() {
     CHECK(object.Size() == 2);
     CHECK(object.Find("k").value().AsString().value() == "v");
     CHECK(object.Serialize() == "{\"k\":\"v\",\"n\":3}");
-    CHECK(object.Set("k", JsonValue("w")));  // 覆盖同键
+    CHECK(object.Set("k", JsonValue("w"))); // 覆盖同键
     CHECK(object.Size() == 2);
     CHECK(object.Serialize() == "{\"k\":\"w\",\"n\":3}");
 
@@ -427,9 +440,11 @@ void TestObjectArrayAccessAndMutation() {
     CHECK(array.Serialize() == "[1,\"two\"]");
 }
 
-void TestCopyAndMoveSemantics() {
+void TestCopyAndMoveSemantics()
+{
     auto parsed = JsonValue::Parse("{\"a\":[1,2],\"b\":\"x\"}", kBig, kDeep);
-    if (!ParsedOk(parsed, __LINE__)) return;
+    if (!ParsedOk(parsed, __LINE__))
+        return;
     JsonValue original = std::move(parsed).value();
 
     // copy 深复制：改副本不动原值，改原值不动副本。
@@ -473,7 +488,8 @@ void TestCopyAndMoveSemantics() {
     CHECK(move_assign_target.Serialize() == "{\"a\":[1,2],\"b\":\"x\",\"c\":9}");
 }
 
-void TestUtf8Strings() {
+void TestUtf8Strings()
+{
     // 多字节 UTF-8 原样保留（不做转义/规范化）。
     JsonValue s = JsonValue("中\u00e9\U0001F600");
     CHECK(s.AsString().value() == "中\u00e9\U0001F600");
@@ -488,12 +504,14 @@ void TestUtf8Strings() {
 
 // Keys()：object 键枚举（M2 依赖的最小 owned API）。空 object、Unicode/内嵌 NUL 键、
 // 插入顺序、owned copy 语义、非 object（含 move 后 null）拒绝；不新增第二套 DOM。
-void TestObjectKeys() {
+void TestObjectKeys()
+{
     // 空 object → 空键列表。
     JsonValue empty = JsonValue::Object();
     auto empty_keys = empty.Keys();
     CHECK(empty_keys);
-    if (empty_keys) CHECK(empty_keys.value().empty());
+    if (empty_keys)
+        CHECK(empty_keys.value().empty());
 
     // 插入顺序保持；Unicode（3/4 字节）与内嵌 NUL 键按字节原样返回。
     JsonValue object = JsonValue::Object();
@@ -558,7 +576,8 @@ void TestObjectKeys() {
 
 } // namespace
 
-int main() {
+int main()
+{
     TestDefaultsAndFactories();
     TestScalarsAndTypeErrors();
     TestExactIntegers();

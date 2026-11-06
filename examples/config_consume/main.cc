@@ -19,7 +19,8 @@ using namespace bbt::infra::config;
 
 namespace {
 
-std::string MakeTempPath(const char* name) {
+std::string MakeTempPath(const char* name)
+{
     const char* t = std::getenv("TMPDIR");
     std::string dir = (t && *t) ? t : ".";
     std::string tmpl = dir + "/" + name + "_XXXXXX";
@@ -34,7 +35,8 @@ std::string MakeTempPath(const char* name) {
     return std::string(buf.data());
 }
 
-void WriteFile(const std::string& path, const std::string& content) {
+void WriteFile(const std::string& path, const std::string& content)
+{
     std::ofstream f(path, std::ios::trunc);
     f << content;
 }
@@ -46,26 +48,27 @@ struct Validation {
     std::string reason;
 };
 
-Validation Validate(const Snapshot& s) {
+Validation Validate(const Snapshot& s)
+{
     auto port = s.value.GetInt64("server.port");
-    if (!port) return {false, "server.port 缺失或非整数"};
+    if (!port)
+        return {false, "server.port 缺失或非整数"};
     if (port.value() < 1 || port.value() > 65535)
         return {false, "server.port 越界"};
     return {true, ""};
 }
 
-void Run(const char* label, const Snapshot& s) {
+void Run(const char* label, const Snapshot& s)
+{
     const Validation v = Validate(s);
-    std::printf("[%s] version=%llu revision=%.16s -> %s (%s)\n", label,
-                static_cast<unsigned long long>(s.version),
-                s.revision.c_str(),
-                v.accepted ? "ACCEPT" : "REJECT",
-                v.accepted ? "port ok" : v.reason.c_str());
+    std::printf("[%s] version=%llu revision=%.16s -> %s (%s)\n", label, static_cast<unsigned long long>(s.version),
+                s.revision.c_str(), v.accepted ? "ACCEPT" : "REJECT", v.accepted ? "port ok" : v.reason.c_str());
 }
 
 } // namespace
 
-int main() {
+int main()
+{
     // 1. 本地文件源：有效配置 → 读取 → 校验 → 接受
     const std::string path = MakeTempPath("cfg_example");
     WriteFile(path, R"(version = 1
@@ -73,8 +76,7 @@ server.port = 8080
 )");
     auto fsrc = FileSource::Create(path, "app", "server");
     if (!fsrc) {
-        std::fprintf(stderr, "create source failed: %s\n",
-                     fsrc.error().message.c_str());
+        std::fprintf(stderr, "create source failed: %s\n", fsrc.error().message.c_str());
         return 1;
     }
     auto r = fsrc.value()->Read();
@@ -89,7 +91,8 @@ server.port = 8080
 server.port = 99999
 )");
     auto r2 = fsrc.value()->Read();
-    if (!r2) return 1;
+    if (!r2)
+        return 1;
     Run("invalid", r2.value());
 
     // 3. 覆盖为格式错误 → 读取失败，不发布伪成功快照
@@ -99,8 +102,8 @@ server.port = 99999
         std::fprintf(stderr, "expected read failure\n");
         return 1;
     }
-    std::printf("[malformed] read failed (code=%d): %s\n",
-                static_cast<int>(r3.error().code), r3.error().message.c_str());
+    std::printf("[malformed] read failed (code=%d): %s\n", static_cast<int>(r3.error().code),
+                r3.error().message.c_str());
 
     // 4. 内存源：同一版本化快照语义（version 单调 + revision 内容指纹）
     MemorySource mem("app", "server");

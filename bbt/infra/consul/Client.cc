@@ -30,25 +30,28 @@ namespace {
 using bbt::infra::Error;
 using bbt::infra::ErrorCode;
 
-Error InvalidArgument(std::string message) {
+Error InvalidArgument(std::string message)
+{
     return MakeError(ErrorCode::InvalidArgument, "consul: " + std::move(message));
 }
 
-Error Protocol(std::string message) {
+Error Protocol(std::string message)
+{
     return MakeError(ErrorCode::ProtocolError, "consul: " + std::move(message));
 }
 
-Error ClosedError() {
+Error ClosedError()
+{
     return MakeError(ErrorCode::Closed, "consul: client closed");
 }
 
-bool EqualsNoCase(std::string_view left, std::string_view right) {
+bool EqualsNoCase(std::string_view left, std::string_view right)
+{
     if (left.size() != right.size()) {
         return false;
     }
     for (std::size_t i = 0; i < left.size(); ++i) {
-        if (std::tolower(static_cast<unsigned char>(left[i])) !=
-            std::tolower(static_cast<unsigned char>(right[i]))) {
+        if (std::tolower(static_cast<unsigned char>(left[i])) != std::tolower(static_cast<unsigned char>(right[i]))) {
             return false;
         }
     }
@@ -57,14 +60,14 @@ bool EqualsNoCase(std::string_view left, std::string_view right) {
 
 // RFC 3986 unreserved 之外的字节一律 %XX：service 名与实例 ID 是用户输入，
 // 直接拼进路径会让 '/'、'?'、'#' 改变目标路由。
-std::string PercentEncode(std::string_view value) {
+std::string PercentEncode(std::string_view value)
+{
     static constexpr char kHex[] = "0123456789ABCDEF";
     std::string out;
     out.reserve(value.size());
     for (const unsigned char c : value) {
-        const bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                                (c >= '0' && c <= '9') || c == '-' || c == '_' ||
-                                c == '.' || c == '~';
+        const bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-'
+                                || c == '_' || c == '.' || c == '~';
         if (unreserved) {
             out.push_back(static_cast<char>(c));
             continue;
@@ -76,7 +79,8 @@ std::string PercentEncode(std::string_view value) {
     return out;
 }
 
-bool IsNumericIpv4(std::string_view address) {
+bool IsNumericIpv4(std::string_view address)
+{
     if (address.empty()) {
         return false;
     }
@@ -85,7 +89,8 @@ bool IsNumericIpv4(std::string_view address) {
     return ::inet_pton(AF_INET, text.c_str(), &parsed) == 1;
 }
 
-bool IsLoopbackIpv4(std::string_view address) {
+bool IsLoopbackIpv4(std::string_view address)
+{
     in_addr parsed{};
     const std::string text(address);
     if (::inet_pton(AF_INET, text.c_str(), &parsed) != 1) {
@@ -96,7 +101,8 @@ bool IsLoopbackIpv4(std::string_view address) {
 
 // agent 地址归一为无尾斜杠的 "http://<ipv4>:<port>"：https、主机名、路径、远端
 // 地址都在此拒绝——该层只承诺本机 agent，远端注册中心不是它假装支持的形态。
-result<void> NormalizeAgentUrl(std::string_view url, std::string* out) {
+result<void> NormalizeAgentUrl(std::string_view url, std::string* out)
+{
     constexpr std::string_view kScheme = "http://";
     if (url.substr(0, kScheme.size()) != kScheme) {
         return result<void>::err(InvalidArgument("agent_url must start with http://"));
@@ -125,15 +131,15 @@ result<void> NormalizeAgentUrl(std::string_view url, std::string* out) {
     }
     std::uint32_t port = 0;
     const auto parsed = std::from_chars(port_text.data(), port_text.data() + port_text.size(), port);
-    if (parsed.ec != std::errc() || parsed.ptr != port_text.data() + port_text.size() ||
-        port == 0 || port > 65535) {
+    if (parsed.ec != std::errc() || parsed.ptr != port_text.data() + port_text.size() || port == 0 || port > 65535) {
         return result<void>::err(InvalidArgument("agent_url port must be 1..65535"));
     }
     out->assign("http://" + host + ":" + std::to_string(port));
     return result<void>::ok();
 }
 
-result<void> ValidateRegistration(const ServiceRegistration& registration) {
+result<void> ValidateRegistration(const ServiceRegistration& registration)
+{
     if (registration.id.empty()) {
         return result<void>::err(InvalidArgument("registration id must not be empty"));
     }
@@ -152,19 +158,20 @@ result<void> ValidateRegistration(const ServiceRegistration& registration) {
 // 200/2xx 之外一律 TransportError 并保留状态码：Consul 的拒绝不是传输失败，但
 // 对本层调用人是「后端明确拒绝」，与协议错（ProtocolError）、超时（TimedOut）
 // 可区分即可；不把响应体拼进消息（可能含注册数据）。
-result<void> CheckStatus(const http::Response& response, std::string_view action) {
+result<void> CheckStatus(const http::Response& response, std::string_view action)
+{
     if (response.Ok()) {
         return result<void>::ok();
     }
-    Error error = MakeError(ErrorCode::TransportError,
-                            "consul: " + std::string(action) + " rejected with HTTP " +
-                                std::to_string(response.status_code));
+    Error error = MakeError(ErrorCode::TransportError, "consul: " + std::string(action) + " rejected with HTTP "
+                                                           + std::to_string(response.status_code));
     error.backend_category = "consul.http";
     error.backend_code = response.status_code;
     return result<void>::err(std::move(error));
 }
 
-std::optional<std::string> HeaderValue(const http::Headers& headers, std::string_view name) {
+std::optional<std::string> HeaderValue(const http::Headers& headers, std::string_view name)
+{
     for (const auto& header : headers) {
         if (EqualsNoCase(header.first, name)) {
             return header.second;
@@ -173,11 +180,13 @@ std::optional<std::string> HeaderValue(const http::Headers& headers, std::string
     return std::nullopt;
 }
 
-const boost::json::value* Member(const boost::json::object& object, std::string_view key) {
+const boost::json::value* Member(const boost::json::object& object, std::string_view key)
+{
     return object.if_contains(key);
 }
 
-std::optional<std::string> StringMember(const boost::json::object& object, std::string_view key) {
+std::optional<std::string> StringMember(const boost::json::object& object, std::string_view key)
+{
     const auto* value = Member(object, key);
     if (value == nullptr || !value->is_string()) {
         return std::nullopt;
@@ -185,7 +194,8 @@ std::optional<std::string> StringMember(const boost::json::object& object, std::
     return std::string(value->get_string());
 }
 
-std::optional<std::uint16_t> PortMember(const boost::json::object& object, std::string_view key) {
+std::optional<std::uint16_t> PortMember(const boost::json::object& object, std::string_view key)
+{
     const auto* value = Member(object, key);
     if (value == nullptr) {
         return std::nullopt;
@@ -212,14 +222,15 @@ std::optional<std::uint16_t> PortMember(const boost::json::object& object, std::
 
 struct Client::State {
     State(std::shared_ptr<bbt::infra::http::Client> client, Options opts)
-        : http(std::move(client)), options(std::move(opts)) {}
+        : http(std::move(client)), options(std::move(opts))
+    {
+    }
 
     // 单次 HTTP 交换：token 头、分阶段超时、总期限在此统一收口，业务路径只给
     // 方法与 target（target 以 '/' 开头的 origin-form）。
-    bbt_co_async(result<http::Response>) Send(std::string_view method,
-                                              const std::string& target,
-                                              std::string body,
-                                              std::chrono::milliseconds read_budget) const {
+    bbt_co_async(result<http::Response>) Send(std::string_view method, const std::string& target, std::string body,
+                                              std::chrono::milliseconds read_budget) const
+    {
         http::RequestOptions request;
         request.headers.emplace_back("Accept", "application/json");
         if (!options.token.empty()) {
@@ -247,7 +258,8 @@ struct Client::State {
 
     // 阻塞查询的读档必须容纳 Consul 允许的 wait/16 附加抖动，否则「阻塞返回」
     // 会先被读档超时打断；非阻塞快照使用整个 request_timeout。
-    std::chrono::milliseconds ReadBudgetForQuery(bool blocking) const {
+    std::chrono::milliseconds ReadBudgetForQuery(bool blocking) const
+    {
         if (!blocking || options.query_wait <= std::chrono::milliseconds{0}) {
             return options.request_timeout;
         }
@@ -260,8 +272,8 @@ struct Client::State {
     const Options options;
     std::string base;
 
-    mutable std::mutex mutex;     // 保护 inflight/terminal 与协程等待者登记
-    std::condition_variable idle; // 宿主线程 Close 等真实终态
+    mutable std::mutex mutex;                                     // 保护 inflight/terminal 与协程等待者登记
+    std::condition_variable idle;                                 // 宿主线程 Close 等真实终态
     std::vector<bbt::coroutine::sync::CoWaiter::SPtr> co_waiters; // 协程域 Close
     std::size_t inflight{0};
     std::atomic<bool> closed{false}; // 封口：拒绝新操作（IsClosed 同此语义）
@@ -271,7 +283,8 @@ struct Client::State {
 
     // 终态发布（锁内调用）：仅当三条件同时成立才置位，并摘下全部协程等待者。
     // 返回 true 表示本次发布；woken 供调用方在锁外 Notify（不持锁唤醒）。
-    bool MarkTerminalLocked(std::vector<bbt::coroutine::sync::CoWaiter::SPtr>* woken) {
+    bool MarkTerminalLocked(std::vector<bbt::coroutine::sync::CoWaiter::SPtr>* woken)
+    {
         if (terminal || inflight != 0 || !closed.load() || !http_closed) {
             return false;
         }
@@ -282,7 +295,8 @@ struct Client::State {
 
     // adapter 先封口，待已接纳操作全部离开后再关闭专属 HTTP Client。当前 HTTP
     // Client::Close() 会立即让在途交换失败，因此不能在 adapter Close 的第一步调用。
-    bool BeginHttpCloseLocked() {
+    bool BeginHttpCloseLocked()
+    {
         if (!closed.load() || inflight != 0 || http_close_started) {
             return false;
         }
@@ -290,7 +304,8 @@ struct Client::State {
         return true;
     }
 
-    void CompleteHttpClose() noexcept {
+    void CompleteHttpClose() noexcept
+    {
         http->Close();
         std::vector<bbt::coroutine::sync::CoWaiter::SPtr> woken;
         bool published = false;
@@ -306,7 +321,8 @@ struct Client::State {
 
     // 锁外唤醒：宿主线程 cv + 协程等待者。Notify 对已决议/已解绑的 waiter 返回
     // -1，无副作用，可安全重复。
-    void WakeAll(const std::vector<bbt::coroutine::sync::CoWaiter::SPtr>& woken) noexcept {
+    void WakeAll(const std::vector<bbt::coroutine::sync::CoWaiter::SPtr>& woken) noexcept
+    {
         idle.notify_all();
         for (const auto& waiter : woken) {
             waiter->Notify();
@@ -319,7 +335,8 @@ struct Client::State {
 // Client 析构也不会悬空。
 class Client::OpScope {
 public:
-    explicit OpScope(std::shared_ptr<State> state) : m_state(std::move(state)) {
+    explicit OpScope(std::shared_ptr<State> state) : m_state(std::move(state))
+    {
         std::lock_guard<std::mutex> lock(m_state->mutex);
         if (m_state->closed.load()) {
             m_error = ClosedError();
@@ -328,7 +345,8 @@ public:
         ++m_state->inflight;
         m_entered = true;
     }
-    ~OpScope() {
+    ~OpScope()
+    {
         if (!m_entered) {
             return;
         }
@@ -353,9 +371,18 @@ public:
     OpScope(const OpScope&) = delete;
     OpScope& operator=(const OpScope&) = delete;
 
-    bool entered() const noexcept { return m_entered; }
-    Error error() const { return m_error; }
-    const std::shared_ptr<State>& state() const noexcept { return m_state; }
+    bool entered() const noexcept
+    {
+        return m_entered;
+    }
+    Error error() const
+    {
+        return m_error;
+    }
+    const std::shared_ptr<State>& state() const noexcept
+    {
+        return m_state;
+    }
 
 private:
     std::shared_ptr<State> m_state;
@@ -363,14 +390,13 @@ private:
     bool m_entered{false};
 };
 
-result<std::shared_ptr<Client>> Client::Create(
-    std::shared_ptr<bbt::infra::http::Client> http, Options options) {
+result<std::shared_ptr<Client>> Client::Create(std::shared_ptr<bbt::infra::http::Client> http, Options options)
+{
     if (!http) {
         return result<std::shared_ptr<Client>>::err(InvalidArgument("http client required"));
     }
     if (options.request_timeout <= std::chrono::milliseconds{0}) {
-        return result<std::shared_ptr<Client>>::err(
-            InvalidArgument("request_timeout must be positive"));
+        return result<std::shared_ptr<Client>>::err(InvalidArgument("request_timeout must be positive"));
     }
     if (options.query_wait < std::chrono::milliseconds{0}) {
         return result<std::shared_ptr<Client>>::err(InvalidArgument("query_wait must not be negative"));
@@ -378,11 +404,9 @@ result<std::shared_ptr<Client>> Client::Create(
     if (options.query_wait > std::chrono::milliseconds{0}) {
         constexpr auto kQueryMargin = std::chrono::milliseconds{250};
         const auto wait_count = options.query_wait.count();
-        const auto jitter = std::chrono::milliseconds{
-            wait_count / 16 + (wait_count % 16 == 0 ? 0 : 1)};
-        if (options.request_timeout <= kQueryMargin ||
-            jitter >= options.request_timeout - kQueryMargin ||
-            options.query_wait >= options.request_timeout - kQueryMargin - jitter) {
+        const auto jitter = std::chrono::milliseconds{wait_count / 16 + (wait_count % 16 == 0 ? 0 : 1)};
+        if (options.request_timeout <= kQueryMargin || jitter >= options.request_timeout - kQueryMargin
+            || options.query_wait >= options.request_timeout - kQueryMargin - jitter) {
             return result<std::shared_ptr<Client>>::err(
                 InvalidArgument("query_wait must leave wait/16 jitter and 250ms margin"));
         }
@@ -396,13 +420,17 @@ result<std::shared_ptr<Client>> Client::Create(
     return result<std::shared_ptr<Client>>::ok(std::shared_ptr<Client>(new Client(state)));
 }
 
-Client::Client(std::shared_ptr<State> state) noexcept : m_state(std::move(state)) {}
+Client::Client(std::shared_ptr<State> state) noexcept : m_state(std::move(state))
+{
+}
 
-Client::~Client() noexcept {
+Client::~Client() noexcept
+{
     Close();
 }
 
-bbt_co_async(result<void>) Client::Register(ServiceRegistration registration) {
+bbt_co_async(result<void>) Client::Register(ServiceRegistration registration)
+{
     OpScope scope(m_state);
     if (!scope.entered()) {
         return result<void>::err(scope.error());
@@ -430,8 +458,7 @@ bbt_co_async(result<void>) Client::Register(ServiceRegistration registration) {
     check["DeregisterCriticalServiceAfter"] = "1m";
     payload["Check"] = std::move(check);
 
-    auto response = bbt_co_await state->Send("PUT", "/v1/agent/service/register",
-                                             boost::json::serialize(payload),
+    auto response = bbt_co_await state->Send("PUT", "/v1/agent/service/register", boost::json::serialize(payload),
                                              state->options.request_timeout);
     if (!response) {
         return result<void>::err(std::move(response.error()));
@@ -439,7 +466,8 @@ bbt_co_async(result<void>) Client::Register(ServiceRegistration registration) {
     return CheckStatus(response.value(), "register");
 }
 
-bbt_co_async(result<void>) Client::Deregister(std::string_view id) {
+bbt_co_async(result<void>) Client::Deregister(std::string_view id)
+{
     OpScope scope(m_state);
     if (!scope.entered()) {
         return result<void>::err(scope.error());
@@ -448,23 +476,22 @@ bbt_co_async(result<void>) Client::Deregister(std::string_view id) {
         return result<void>::err(InvalidArgument("deregister id must not be empty"));
     }
     const auto& state = scope.state();
-    auto response = bbt_co_await state->Send("PUT", "/v1/agent/service/deregister/" + PercentEncode(id),
-                                             std::string{}, state->options.request_timeout);
+    auto response = bbt_co_await state->Send("PUT", "/v1/agent/service/deregister/" + PercentEncode(id), std::string{},
+                                             state->options.request_timeout);
     if (!response) {
         return result<void>::err(std::move(response.error()));
     }
     // agent 对已不存在的 ID 返回 404（实测 1.20.2："Unknown service ID"）。注销的
     // 语义是「结束登记」，只有 agent 明确返回该 body 才视为目标已不存在；其它 404
     // 仍是明确拒绝，避免把错误代理/路径误判为幂等成功。
-    if (response.value().status_code == 404 &&
-        response.value().body.find("Unknown service ID") != std::string::npos) {
+    if (response.value().status_code == 404 && response.value().body.find("Unknown service ID") != std::string::npos) {
         return result<void>::ok();
     }
     return CheckStatus(response.value(), "deregister");
 }
 
-bbt_co_async(result<ServiceSnapshot>) Client::HealthyInstances(std::string_view service,
-                                                               std::uint64_t index) {
+bbt_co_async(result<ServiceSnapshot>) Client::HealthyInstances(std::string_view service, std::uint64_t index)
+{
     OpScope scope(m_state);
     if (!scope.entered()) {
         return result<ServiceSnapshot>::err(scope.error());
@@ -495,8 +522,7 @@ bbt_co_async(result<ServiceSnapshot>) Client::HealthyInstances(std::string_view 
     }
 
     const bool blocking = index != 0 && state->options.query_wait > std::chrono::milliseconds{0};
-    auto response = bbt_co_await state->Send("GET", target, std::string{},
-                                             state->ReadBudgetForQuery(blocking));
+    auto response = bbt_co_await state->Send("GET", target, std::string{}, state->ReadBudgetForQuery(blocking));
     if (!response) {
         return result<ServiceSnapshot>::err(std::move(response.error()));
     }
@@ -510,10 +536,9 @@ bbt_co_async(result<ServiceSnapshot>) Client::HealthyInstances(std::string_view 
         return result<ServiceSnapshot>::err(Protocol("health response missing X-Consul-Index"));
     }
     std::uint64_t revision = 0;
-    const auto parsed_index = std::from_chars(index_header->data(),
-                                              index_header->data() + index_header->size(), revision);
-    if (parsed_index.ec != std::errc() ||
-        parsed_index.ptr != index_header->data() + index_header->size()) {
+    const auto parsed_index =
+        std::from_chars(index_header->data(), index_header->data() + index_header->size(), revision);
+    if (parsed_index.ec != std::errc() || parsed_index.ptr != index_header->data() + index_header->size()) {
         return result<ServiceSnapshot>::err(Protocol("health response has invalid X-Consul-Index"));
     }
 
@@ -600,7 +625,8 @@ bbt_co_async(result<ServiceSnapshot>) Client::HealthyInstances(std::string_view 
     return result<ServiceSnapshot>::ok(std::move(snapshot));
 }
 
-void Client::WaitTerminal(const std::shared_ptr<State>& state) noexcept {
+void Client::WaitTerminal(const std::shared_ptr<State>& state) noexcept
+{
     if (bbt::coroutine::IsInCoroutineContext()) {
         // 协程域必须协作挂起：阻塞 Processer 线程会让在途操作无法恢复（单 worker
         // 直接死锁；并发 Close 也能占满多 worker），因此不用 condition_variable。
@@ -621,40 +647,36 @@ void Client::WaitTerminal(const std::shared_ptr<State>& state) noexcept {
             }
             bbt::coroutine::WaitStatus status = bbt::coroutine::WaitStatus::RuntimeUnavailable;
             try {
-                status = waiter->WaitWithCallback(
-                    bbt::coroutine::WaitOptions{},
-                    [state, waiter] {
-                        bool done = false;
-                        {
-                            std::lock_guard<std::mutex> lock(state->mutex);
-                            done = state->terminal;
-                        }
-                        // 登记成功后的复查：终态若落在「入表」与「真正挂起」之间，
-                        // 这里同步 Notify 走 PENDING 早到路径，不丢唤醒。
-                        if (done) {
-                            waiter->Notify();
-                        }
-                        return true;
-                    });
+                status = waiter->WaitWithCallback(bbt::coroutine::WaitOptions{}, [state, waiter] {
+                    bool done = false;
+                    {
+                        std::lock_guard<std::mutex> lock(state->mutex);
+                        done = state->terminal;
+                    }
+                    // 登记成功后的复查：终态若落在「入表」与「真正挂起」之间，
+                    // 这里同步 Notify 走 PENDING 早到路径，不丢唤醒。
+                    if (done) {
+                        waiter->Notify();
+                    }
+                    return true;
+                });
             } catch (...) {
                 // 装配失败：先摘掉登记再退化，避免留下不会被等待的孤儿 waiter。
                 std::lock_guard<std::mutex> lock(state->mutex);
-                state->co_waiters.erase(
-                    std::remove(state->co_waiters.begin(), state->co_waiters.end(), waiter),
-                    state->co_waiters.end());
+                state->co_waiters.erase(std::remove(state->co_waiters.begin(), state->co_waiters.end(), waiter),
+                                        state->co_waiters.end());
                 break;
             }
             {
                 std::lock_guard<std::mutex> lock(state->mutex);
                 auto& waiters = state->co_waiters;
-                waiters.erase(std::remove(waiters.begin(), waiters.end(), waiter),
-                              waiters.end());
+                waiters.erase(std::remove(waiters.begin(), waiters.end(), waiter), waiters.end());
                 if (state->terminal) {
                     return;
                 }
             }
-            if (status == bbt::coroutine::WaitStatus::Cancelled ||
-                status == bbt::coroutine::WaitStatus::RuntimeUnavailable) {
+            if (status == bbt::coroutine::WaitStatus::Cancelled
+                || status == bbt::coroutine::WaitStatus::RuntimeUnavailable) {
                 // 预取消或等待设施不可用：CoWaiter 入口即返回，不能挂起；
                 // Hook_Sleep/YieldUntilTimeout 同样在取消态立即返回。bbtco_yield
                 // 不检查取消位，真实把 worker 还给就绪队列，让在飞操作恢复并推进
@@ -667,7 +689,8 @@ void Client::WaitTerminal(const std::shared_ptr<State>& state) noexcept {
     state->idle.wait(lock, [&state] { return state->terminal; });
 }
 
-void Client::Close() noexcept {
+void Client::Close() noexcept
+{
     const auto state = m_state;
     bool close_http = false;
     {
@@ -682,11 +705,12 @@ void Client::Close() noexcept {
     }
     // 首个与并发 Close 都等同一真实终态：返回即已封口、专属 HTTP Client 已关闭、
     // 已登记操作全部离开。每个操作受 request_timeout 绝对期限约束，终态可达；
-    // 这里不设提前返回上限（0005 §6.4：不以 drain timeout 放弃等待）。
+    // 这里不设提前返回上限，不以 drain timeout 放弃等待（见 docs/decisions/0005-co-io-adapter-contract.md）。
     WaitTerminal(state);
 }
 
-bool Client::IsClosed() const noexcept {
+bool Client::IsClosed() const noexcept
+{
     return m_state->closed.load();
 }
 

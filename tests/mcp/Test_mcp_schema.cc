@@ -4,7 +4,7 @@
 // NUL）、AddProps 排除、脱敏、并发 Validate、离线 remote fixture。
 // 不覆盖（OPEN）：tools/handler 接线、注册表聚合、完整 JSON Schema Test Suite。
 
-#include "mcp/schema/SchemaValidator.hpp"  // 私有实现头：仅测试目标可见（bbt/infra/mcp/schema/）
+#include "mcp/schema/SchemaValidator.hpp" // 私有实现头：仅测试目标可见（bbt/infra/mcp/schema/）
 
 #include <atomic>
 #include <cstdio>
@@ -26,7 +26,8 @@ static int g_fail = 0;
         }                                                  \
     } while (0)
 
-static JsonValue V(std::string_view text) {
+static JsonValue V(std::string_view text)
+{
     auto parsed = JsonValue::Parse(text, 1u << 20, 128);
     if (!parsed) {
         std::printf("FATAL fixture parse: %s\n", parsed.error().message.c_str());
@@ -35,13 +36,14 @@ static JsonValue V(std::string_view text) {
     return std::move(parsed).value();
 }
 
-int main() {
+int main()
+{
     // 1. 结构非法 schema：draft 2020-12 编译拒绝，错误不回显 schema 内容。
     {
         sc::SchemaValidator v;
         sc::SchemaError err;
-        const bool ok = sc::SchemaValidator::Compile(
-            V("{\"description\":\"ZZMARKER\",\"type\":123}"), sc::SchemaOptions{}, &v, &err);
+        const bool ok = sc::SchemaValidator::Compile(V("{\"description\":\"ZZMARKER\",\"type\":123}"),
+                                                     sc::SchemaOptions{}, &v, &err);
         CHECK(!ok);
         CHECK(err.code == sc::SchemaErrorCode::InvalidSchema);
         CHECK(err.message.find("ZZMARKER") == std::string::npos);
@@ -50,11 +52,9 @@ int main() {
     {
         sc::SchemaValidator v;
         sc::SchemaError err;
-        CHECK(!sc::SchemaValidator::Compile(V("{\"$ref\":\"https://evil.test/x\"}"),
-                                            sc::SchemaOptions{}, &v, &err));
+        CHECK(!sc::SchemaValidator::Compile(V("{\"$ref\":\"https://evil.test/x\"}"), sc::SchemaOptions{}, &v, &err));
         CHECK(err.code == sc::SchemaErrorCode::ExternalRef);
-        CHECK(!sc::SchemaValidator::Compile(V("{\"$ref\":\"file:///etc/passwd\"}"),
-                                            sc::SchemaOptions{}, &v, &err));
+        CHECK(!sc::SchemaValidator::Compile(V("{\"$ref\":\"file:///etc/passwd\"}"), sc::SchemaOptions{}, &v, &err));
         CHECK(err.code == sc::SchemaErrorCode::ExternalRef);
         CHECK(sc::SchemaValidator::Compile(V("{\"type\":\"string\"}"), sc::SchemaOptions{}, &v, &err));
         auto r = v.Validate(V("\"ok\""), &err);
@@ -70,8 +70,8 @@ int main() {
         CHECK(v.Validate(V("5"), &err).ok);
         CHECK(!v.Validate(V("\"x\""), &err).ok);
         sc::SchemaValidator v2;
-        CHECK(!sc::SchemaValidator::Compile(V("{\"$ref\":\"https://offline.test/missing\"}"),
-                                            sc::SchemaOptions{}, &v2, &err));
+        CHECK(!sc::SchemaValidator::Compile(V("{\"$ref\":\"https://offline.test/missing\"}"), sc::SchemaOptions{}, &v2,
+                                            &err));
         CHECK(err.code == sc::SchemaErrorCode::ExternalRef);
     }
     // 4. 复杂度上限 fail-closed（schema 与 instance，显式配置）。
@@ -81,7 +81,8 @@ int main() {
         sc::SchemaValidator v;
         sc::SchemaError err;
         std::string big = "[";
-        for (int i = 0; i < 100; ++i) big += "null,";
+        for (int i = 0; i < 100; ++i)
+            big += "null,";
         big += "null]";
         CHECK(!sc::SchemaValidator::Compile(V(big.c_str()), opt, &v, &err));
         CHECK(err.code == sc::SchemaErrorCode::LimitExceeded);
@@ -97,9 +98,8 @@ int main() {
     {
         sc::SchemaValidator v;
         sc::SchemaError err;
-        CHECK(sc::SchemaValidator::Compile(
-            V("{\"type\":\"integer\",\"exclusiveMaximum\":9007199254740993}"),
-            sc::SchemaOptions{}, &v, &err));
+        CHECK(sc::SchemaValidator::Compile(V("{\"type\":\"integer\",\"exclusiveMaximum\":9007199254740993}"),
+                                           sc::SchemaOptions{}, &v, &err));
         CHECK(v.Validate(V("9007199254740992"), &err).ok);
         CHECK(!v.Validate(V("9007199254740993"), &err).ok);
         CHECK(sc::SchemaValidator::Compile(V("{\"type\":\"integer\",\"maximum\":9007199254740993}"),
@@ -110,8 +110,7 @@ int main() {
     {
         sc::SchemaValidator v;
         sc::SchemaError err;
-        CHECK(sc::SchemaValidator::Compile(V("{\"pattern\":\"^\\\\p{Letter}+$\"}"),
-                                           sc::SchemaOptions{}, &v, &err));
+        CHECK(sc::SchemaValidator::Compile(V("{\"pattern\":\"^\\\\p{Letter}+$\"}"), sc::SchemaOptions{}, &v, &err));
         CHECK(v.Validate(V("\"π\""), &err).ok);
         CHECK(v.Validate(V("\"École\""), &err).ok);
         auto bad = v.Validate(V("\"123\""), &err);
@@ -134,16 +133,16 @@ int main() {
     {
         sc::SchemaValidator v;
         sc::SchemaError err;
-        CHECK(!sc::SchemaValidator::Compile(V("{\"pattern\":\"\\\\p{NoSuchProperty}\"}"),
-                                            sc::SchemaOptions{}, &v, &err));
+        CHECK(
+            !sc::SchemaValidator::Compile(V("{\"pattern\":\"\\\\p{NoSuchProperty}\"}"), sc::SchemaOptions{}, &v, &err));
         CHECK(err.code == sc::SchemaErrorCode::RegexInvalid);
     }
     // 9. icu-only pattern 出现在条件位置 → Unsupported（不静默跳过）。
     {
         sc::SchemaValidator v;
         sc::SchemaError err;
-        CHECK(!sc::SchemaValidator::Compile(V("{\"anyOf\":[{\"pattern\":\"^\\\\p{Letter}+$\"}]}"),
-                                            sc::SchemaOptions{}, &v, &err));
+        CHECK(!sc::SchemaValidator::Compile(V("{\"anyOf\":[{\"pattern\":\"^\\\\p{Letter}+$\"}]}"), sc::SchemaOptions{},
+                                            &v, &err));
         CHECK(err.code == sc::SchemaErrorCode::Unsupported);
     }
     // 11. patternProperties 语义：保留（std::regex 可编译）与 ICU 重定位组合。
@@ -151,20 +150,17 @@ int main() {
         sc::SchemaValidator v;
         sc::SchemaError err;
         // 全保留 + additionalProperties:false：jsoncons 原生路径。
-        CHECK(sc::SchemaValidator::Compile(
-            V("{\"patternProperties\":{\"^[0-9]+$\":{\"type\":\"integer\"}},"
-              "\"additionalProperties\":false}"),
-            sc::SchemaOptions{}, &v, &err));
+        CHECK(sc::SchemaValidator::Compile(V("{\"patternProperties\":{\"^[0-9]+$\":{\"type\":\"integer\"}},"
+                                             "\"additionalProperties\":false}"),
+                                           sc::SchemaOptions{}, &v, &err));
         CHECK(v.Validate(V("{\"1\":2}"), &err).ok);
         CHECK(!v.Validate(V("{\"1\":true}"), &err).ok);
-        CHECK(!v.Validate(V("{\"%\":1}"), &err).ok);  // 未被任何键 pattern 覆盖 → additional 拒绝
+        CHECK(!v.Validate(V("{\"%\":1}"), &err).ok); // 未被任何键 pattern 覆盖 → additional 拒绝
         // 仅 ICU 重定位（无 additionalProperties）：键名匹配走 ICU，值交子验证器。
         bool pp_ok = sc::SchemaValidator::Compile(
-            V("{\"patternProperties\":{\"^\\\\p{Letter}+$\":{\"type\":\"string\"}}}"),
-            sc::SchemaOptions{}, &v, &err);
+            V("{\"patternProperties\":{\"^\\\\p{Letter}+$\":{\"type\":\"string\"}}}"), sc::SchemaOptions{}, &v, &err);
         if (!pp_ok)
-            std::printf("DIAG pp-only: code=%d msg=%s\n", static_cast<int>(err.code),
-                        err.message.c_str());
+            std::printf("DIAG pp-only: code=%d msg=%s\n", static_cast<int>(err.code), err.message.c_str());
         CHECK(pp_ok);
         CHECK(v.Validate(V("{\"π\":\"ok\"}"), &err).ok);
         CHECK(!v.Validate(V("{\"π\":1}"), &err).ok);
@@ -172,18 +168,17 @@ int main() {
         // PP-AP1 回修：relocated patternProperties 与 additionalProperties:false
         // 组合按标准语义执行——被 pattern 匹配的键不再是额外字段，未被匹配的
         // 额外键仍拒绝，PP 值 schema 失败仍拒绝。
-        bool pp2_ok = sc::SchemaValidator::Compile(
-            V("{\"patternProperties\":{\"^\\\\p{Letter}+$\":{\"type\":\"string\"}},"
-              "\"additionalProperties\":false}"),
-            sc::SchemaOptions{}, &v, &err);
+        bool pp2_ok =
+            sc::SchemaValidator::Compile(V("{\"patternProperties\":{\"^\\\\p{Letter}+$\":{\"type\":\"string\"}},"
+                                           "\"additionalProperties\":false}"),
+                                         sc::SchemaOptions{}, &v, &err);
         if (!pp2_ok)
-            std::printf("DIAG pp-mixed: code=%d msg=%s\n", static_cast<int>(err.code),
-                        err.message.c_str());
+            std::printf("DIAG pp-mixed: code=%d msg=%s\n", static_cast<int>(err.code), err.message.c_str());
         CHECK(pp2_ok);
-        CHECK(v.Validate(V("{\"π\":\"ok\"}"), &err).ok);   // PP 覆盖键不再当额外字段
-        CHECK(!v.Validate(V("{\"π\":1}"), &err).ok);       // PP 值 schema 失败仍拒绝
-        CHECK(!v.Validate(V("{\"zz\":1}"), &err).ok);      // 未匹配额外键仍拒绝
-        CHECK(v.Validate(V("{}"), &err).ok);               // 空对象合法
+        CHECK(v.Validate(V("{\"π\":\"ok\"}"), &err).ok); // PP 覆盖键不再当额外字段
+        CHECK(!v.Validate(V("{\"π\":1}"), &err).ok);     // PP 值 schema 失败仍拒绝
+        CHECK(!v.Validate(V("{\"zz\":1}"), &err).ok);    // 未匹配额外键仍拒绝
+        CHECK(v.Validate(V("{}"), &err).ok);             // 空对象合法
     }
     // 12. NUL 保留：icu-only 语法（\x{0} 为字面 NUL）+ 实例嵌入 NUL。
     {
@@ -198,10 +193,9 @@ int main() {
     {
         sc::SchemaValidator v;
         sc::SchemaError err;
-        CHECK(sc::SchemaValidator::Compile(
-            V("{\"if\":{\"properties\":{\"a\":{\"const\":1}}},"
-              "\"then\":{\"properties\":{\"b\":{\"pattern\":\"^[a-z]+$\"}}}}"),
-            sc::SchemaOptions{}, &v, &err));
+        CHECK(sc::SchemaValidator::Compile(V("{\"if\":{\"properties\":{\"a\":{\"const\":1}}},"
+                                             "\"then\":{\"properties\":{\"b\":{\"pattern\":\"^[a-z]+$\"}}}}"),
+                                           sc::SchemaOptions{}, &v, &err));
         CHECK(!v.Validate(V("{\"a\":1,\"b\":\"AB\"}"), &err).ok);
         CHECK(v.Validate(V("{\"a\":2,\"b\":\"AB\"}"), &err).ok);
     }
@@ -209,32 +203,34 @@ int main() {
     {
         sc::SchemaValidator v;
         sc::SchemaError err;
-        CHECK(sc::SchemaValidator::Compile(
-            V("{\"properties\":{\"x\":{\"pattern\":\"^\\\\p{Letter}+$\"},"
-              "\"y\":{\"type\":\"integer\"}}}"),
-            sc::SchemaOptions{}, &v, &err));
+        CHECK(sc::SchemaValidator::Compile(V("{\"properties\":{\"x\":{\"pattern\":\"^\\\\p{Letter}+$\"},"
+                                             "\"y\":{\"type\":\"integer\"}}}"),
+                                           sc::SchemaOptions{}, &v, &err));
         std::atomic<int> mismatches{0};
         std::vector<std::thread> ts;
         for (int t = 0; t < 4; ++t) {
             ts.emplace_back([&v, &mismatches] {
                 for (int i = 0; i < 300; ++i) {
                     sc::SchemaError e;
-                    if (!v.Validate(V("{\"x\":\"π\",\"y\":1}"), &e).ok) ++mismatches;
-                    if (v.Validate(V("{\"x\":\"123\",\"y\":1}"), &e).ok) ++mismatches;
-                    if (v.Validate(V("{\"x\":\"π\",\"y\":\"s\"}"), &e).ok) ++mismatches;
+                    if (!v.Validate(V("{\"x\":\"π\",\"y\":1}"), &e).ok)
+                        ++mismatches;
+                    if (v.Validate(V("{\"x\":\"123\",\"y\":1}"), &e).ok)
+                        ++mismatches;
+                    if (v.Validate(V("{\"x\":\"π\",\"y\":\"s\"}"), &e).ok)
+                        ++mismatches;
                 }
             });
         }
-        for (auto& th : ts) th.join();
+        for (auto& th : ts)
+            th.join();
         CHECK(mismatches.load() == 0);
     }
     // 15. 内部 $defs/$ref 正常解析（默认 resolver 不干预内部引用）。
     {
         sc::SchemaValidator v;
         sc::SchemaError err;
-        CHECK(sc::SchemaValidator::Compile(
-            V("{\"$defs\":{\"s\":{\"type\":\"string\"}},\"$ref\":\"#/$defs/s\"}"),
-            sc::SchemaOptions{}, &v, &err));
+        CHECK(sc::SchemaValidator::Compile(V("{\"$defs\":{\"s\":{\"type\":\"string\"}},\"$ref\":\"#/$defs/s\"}"),
+                                           sc::SchemaOptions{}, &v, &err));
         CHECK(v.Validate(V("\"a\""), &err).ok);
         CHECK(!v.Validate(V("3"), &err).ok);
         sc::SchemaValidator v2;
@@ -249,11 +245,11 @@ int main() {
         sc::SchemaValidator v;
         CHECK(!sc::SchemaValidator::Compile(V("{\"type\":\"string\"}"), opt, &v, nullptr));
         sc::SchemaError err;
-        auto r = v.Validate(V("\"x\""), &err);  // Compile 失败后 impl_ 未发布
+        auto r = v.Validate(V("\"x\""), &err); // Compile 失败后 impl_ 未发布
         CHECK(!r.ok);
         CHECK(err.code == sc::SchemaErrorCode::Internal);
-        CHECK(v.Validate(V("\"x\""), nullptr).ok == false);  // error=nullptr 同样不崩
-        sc::SchemaValidator fresh;  // 默认构造
+        CHECK(v.Validate(V("\"x\""), nullptr).ok == false); // error=nullptr 同样不崩
+        sc::SchemaValidator fresh;                          // 默认构造
         auto r2 = fresh.Validate(V("\"x\""), &err);
         CHECK(!r2.ok);
         CHECK(!r2.issues.empty() && r2.issues[0].keyword == "internal");
@@ -268,23 +264,21 @@ int main() {
         CHECK(err.code == sc::SchemaErrorCode::RegexInvalid && err.message == "sentinel");
         CHECK(v.Validate(V("\"ok\""), &err).ok);
         CHECK(err.code == sc::SchemaErrorCode::RegexInvalid && err.message == "sentinel");
-        CHECK(!v.Validate(V("3"), &err).ok);  // 普通 schema mismatch 不是 Internal
+        CHECK(!v.Validate(V("3"), &err).ok); // 普通 schema mismatch 不是 Internal
         CHECK(err.code == sc::SchemaErrorCode::RegexInvalid && err.message == "sentinel");
     }
     // 18. 回修 MF4：draft 2020-12 "type" 接受非空全 string 数组。
     {
         sc::SchemaValidator v;
         sc::SchemaError err;
-        CHECK(sc::SchemaValidator::Compile(V("{\"type\":[\"string\",\"null\"]}"),
-                                           sc::SchemaOptions{}, &v, &err));
+        CHECK(sc::SchemaValidator::Compile(V("{\"type\":[\"string\",\"null\"]}"), sc::SchemaOptions{}, &v, &err));
         CHECK(v.Validate(V("\"s\""), &err).ok);
         CHECK(v.Validate(V("null"), &err).ok);
         CHECK(!v.Validate(V("1"), &err).ok);
         CHECK(sc::SchemaValidator::Compile(V("{\"type\":[\"integer\"]}"), sc::SchemaOptions{}, &v, &err));
         CHECK(!sc::SchemaValidator::Compile(V("{\"type\":[]}"), sc::SchemaOptions{}, &v, &err));
         CHECK(err.code == sc::SchemaErrorCode::InvalidSchema);
-        CHECK(!sc::SchemaValidator::Compile(V("{\"type\":[\"string\",123]}"),
-                                            sc::SchemaOptions{}, &v, &err));
+        CHECK(!sc::SchemaValidator::Compile(V("{\"type\":[\"string\",123]}"), sc::SchemaOptions{}, &v, &err));
         CHECK(err.code == sc::SchemaErrorCode::InvalidSchema);
     }
     // 19. 回修 MF5：additionalProperties 子 schema 的 icu-only pattern 不越权
@@ -292,46 +286,42 @@ int main() {
     {
         sc::SchemaValidator v;
         sc::SchemaError err;
-        CHECK(sc::SchemaValidator::Compile(
-            V("{\"properties\":{\"name\":{\"type\":\"string\"}},"
-              "\"additionalProperties\":{\"pattern\":\"^\\\\p{Letter}+$\"}}"),
-            sc::SchemaOptions{}, &v, &err));
-        CHECK(v.Validate(V("{\"name\":\"123\"}"), &err).ok);     // name 由 properties 覆盖
+        CHECK(sc::SchemaValidator::Compile(V("{\"properties\":{\"name\":{\"type\":\"string\"}},"
+                                             "\"additionalProperties\":{\"pattern\":\"^\\\\p{Letter}+$\"}}"),
+                                           sc::SchemaOptions{}, &v, &err));
+        CHECK(v.Validate(V("{\"name\":\"123\"}"), &err).ok); // name 由 properties 覆盖
         CHECK(v.Validate(V("{\"other\":\"abc\"}"), &err).ok);
-        CHECK(!v.Validate(V("{\"other\":\"123\"}"), &err).ok);   // 未知键仍按 pattern 校验
-        CHECK(!v.Validate(V("{\"name\":\"a\",\"zz9\":\"123\"}"), &err).ok);  // 未知键值不匹配
+        CHECK(!v.Validate(V("{\"other\":\"123\"}"), &err).ok);              // 未知键仍按 pattern 校验
+        CHECK(!v.Validate(V("{\"name\":\"a\",\"zz9\":\"123\"}"), &err).ok); // 未知键值不匹配
         // additionalProperties 在前：relocated patternProperties 排除项延迟快照。
-        CHECK(sc::SchemaValidator::Compile(
-            V("{\"additionalProperties\":{\"pattern\":\"^\\\\p{Nd}+$\"},"
-              "\"patternProperties\":{\"^\\\\p{Letter}+$\":{\"type\":\"string\"}}}"),
-            sc::SchemaOptions{}, &v, &err));
-        CHECK(v.Validate(V("{\"π\":\"ok\",\"9\":7}"), &err).ok);  // π 走 PP；9 走 addProps
-        CHECK(!v.Validate(V("{\"π\":\"ok\",\"z\":1}"), &err).ok);  // z 命中 PP 子 type:string
-        CHECK(!v.Validate(V("{\"π\":\"ok\",\"!\":1}"), &err).ok == false);  // pattern 不作用于非 string 值
-        CHECK(!v.Validate(V("{\"π\":\"ok\",\"5\":\"x\"}"), &err).ok);  // 未知 string 值仅 addProps pattern 管辖
+        CHECK(sc::SchemaValidator::Compile(V("{\"additionalProperties\":{\"pattern\":\"^\\\\p{Nd}+$\"},"
+                                             "\"patternProperties\":{\"^\\\\p{Letter}+$\":{\"type\":\"string\"}}}"),
+                                           sc::SchemaOptions{}, &v, &err));
+        CHECK(v.Validate(V("{\"π\":\"ok\",\"9\":7}"), &err).ok);           // π 走 PP；9 走 addProps
+        CHECK(!v.Validate(V("{\"π\":\"ok\",\"z\":1}"), &err).ok);          // z 命中 PP 子 type:string
+        CHECK(!v.Validate(V("{\"π\":\"ok\",\"!\":1}"), &err).ok == false); // pattern 不作用于非 string 值
+        CHECK(!v.Validate(V("{\"π\":\"ok\",\"5\":\"x\"}"), &err).ok);      // 未知 string 值仅 addProps pattern 管辖
     }
     // 20. 回修 MF7：条件/组合/$defs 位置的 icu-only pattern → compile 期
     // Unsupported（降级向下传播，不静默移除也不强制执行未选分支）。
     {
         sc::SchemaValidator v;
         sc::SchemaError err;
-        CHECK(!sc::SchemaValidator::Compile(
-            V("{\"anyOf\":[{\"properties\":{\"x\":{\"pattern\":\"^\\\\p{Letter}+$\"}}},"
-              "{\"properties\":{\"y\":{\"type\":\"integer\"}}}]}"),
-            sc::SchemaOptions{}, &v, &err));
+        CHECK(!sc::SchemaValidator::Compile(V("{\"anyOf\":[{\"properties\":{\"x\":{\"pattern\":\"^\\\\p{Letter}+$\"}}},"
+                                              "{\"properties\":{\"y\":{\"type\":\"integer\"}}}]}"),
+                                            sc::SchemaOptions{}, &v, &err));
         CHECK(err.code == sc::SchemaErrorCode::Unsupported);
         CHECK(!sc::SchemaValidator::Compile(
             V("{\"if\":{\"properties\":{\"kind\":{\"const\":\"letters\"}},\"required\":[\"kind\"]},"
               "\"then\":{\"properties\":{\"text\":{\"pattern\":\"^\\\\p{Letter}+$\"}}}}"),
             sc::SchemaOptions{}, &v, &err));
         CHECK(err.code == sc::SchemaErrorCode::Unsupported);
-        CHECK(!sc::SchemaValidator::Compile(
-            V("{\"anyOf\":[{\"items\":{\"pattern\":\"^\\\\p{Letter}+$\"}}]}"),
-            sc::SchemaOptions{}, &v, &err));
+        CHECK(!sc::SchemaValidator::Compile(V("{\"anyOf\":[{\"items\":{\"pattern\":\"^\\\\p{Letter}+$\"}}]}"),
+                                            sc::SchemaOptions{}, &v, &err));
         CHECK(err.code == sc::SchemaErrorCode::Unsupported);
         CHECK(!sc::SchemaValidator::Compile(
-            V("{\"$defs\":{\"s\":{\"pattern\":\"^\\\\p{Letter}+$\"}},\"$ref\":\"#/$defs/s\"}"),
-            sc::SchemaOptions{}, &v, &err));
+            V("{\"$defs\":{\"s\":{\"pattern\":\"^\\\\p{Letter}+$\"}},\"$ref\":\"#/$defs/s\"}"), sc::SchemaOptions{}, &v,
+            &err));
         CHECK(err.code == sc::SchemaErrorCode::Unsupported);
     }
 
@@ -343,23 +333,22 @@ int main() {
     {
         sc::SchemaValidator v;
         sc::SchemaError err;
-        CHECK(!sc::SchemaValidator::Compile(
-            V("{\"properties\":{\"keep\":{}},\"additionalProperties\":"
-              "{\"patternProperties\":{\"^\\\\p{Letter}+$\":"
-              "{\"pattern\":\"^\\\\p{Nd}+$\",\"required\":[\"tag\"]}}}}"),
-            sc::SchemaOptions{}, &v, &err));
+        CHECK(!sc::SchemaValidator::Compile(V("{\"properties\":{\"keep\":{}},\"additionalProperties\":"
+                                              "{\"patternProperties\":{\"^\\\\p{Letter}+$\":"
+                                              "{\"pattern\":\"^\\\\p{Nd}+$\",\"required\":[\"tag\"]}}}}"),
+                                            sc::SchemaOptions{}, &v, &err));
         CHECK(err.code == sc::SchemaErrorCode::Unsupported);
         // 同形状但子 schema 无 icu-only pattern：回填语义保持——properties
         // 覆盖键不被误拒（原 G2 实例），未知键约束不丢失。
         sc::SchemaValidator v2;
-        CHECK(sc::SchemaValidator::Compile(
-            V("{\"properties\":{\"keep\":{}},\"additionalProperties\":"
-              "{\"patternProperties\":{\"^\\\\p{Letter}+$\":{\"required\":[\"tag\"]}}}}"),
-            sc::SchemaOptions{}, &v2, &err));
-        CHECK(v2.Validate(V("{\"keep\":{\"zzz\":{}}}"), &err).ok);    // keep 由 properties 覆盖
+        CHECK(
+            sc::SchemaValidator::Compile(V("{\"properties\":{\"keep\":{}},\"additionalProperties\":"
+                                           "{\"patternProperties\":{\"^\\\\p{Letter}+$\":{\"required\":[\"tag\"]}}}}"),
+                                         sc::SchemaOptions{}, &v2, &err));
+        CHECK(v2.Validate(V("{\"keep\":{\"zzz\":{}}}"), &err).ok); // keep 由 properties 覆盖
         CHECK(v2.Validate(V("{\"keep\":{}}"), &err).ok);
-        CHECK(!v2.Validate(V("{\"other\":{\"zzz\":{}}}"), &err).ok);  // 未知键值仍受子 schema required
-        CHECK(v2.Validate(V("{\"other\":{}}"), &err).ok);             // 子 PP 未命中键合法
+        CHECK(!v2.Validate(V("{\"other\":{\"zzz\":{}}}"), &err).ok); // 未知键值仍受子 schema required
+        CHECK(v2.Validate(V("{\"other\":{}}"), &err).ok);            // 子 PP 未命中键合法
     }
     // 22. 回修 MF7：patternProperties 子 schema 内（契约位置集之外）任意深度
     // 的 icu-only pattern / patternProperties → compile 期 Unsupported
@@ -369,27 +358,24 @@ int main() {
         sc::SchemaValidator v;
         sc::SchemaError err;
         // A：外层 icu PP 子 schema 内 properties 值的 icu-only pattern。
-        CHECK(!sc::SchemaValidator::Compile(
-            V("{\"patternProperties\":{\"^\\\\p{Nd}+$\":"
-              "{\"properties\":{\"a\":{\"pattern\":\"^\\\\p{Nd}+$\"}}}}}"),
-            sc::SchemaOptions{}, &v, &err));
+        CHECK(!sc::SchemaValidator::Compile(V("{\"patternProperties\":{\"^\\\\p{Nd}+$\":"
+                                              "{\"properties\":{\"a\":{\"pattern\":\"^\\\\p{Nd}+$\"}}}}}"),
+                                            sc::SchemaOptions{}, &v, &err));
         CHECK(err.code == sc::SchemaErrorCode::Unsupported);
         // B：外层 icu PP 子 schema 内嵌套 icu-only patternProperties（根数值
         // 键本应合法的形状，语义在契约外 → 安全预期 compile Unsupported）。
-        CHECK(!sc::SchemaValidator::Compile(
-            V("{\"patternProperties\":{\"^\\\\p{Letter}+$\":"
-              "{\"patternProperties\":{\"^\\\\p{Nd}+$\":{\"type\":\"string\"}}}}}"),
-            sc::SchemaOptions{}, &v, &err));
+        CHECK(!sc::SchemaValidator::Compile(V("{\"patternProperties\":{\"^\\\\p{Letter}+$\":"
+                                              "{\"patternProperties\":{\"^\\\\p{Nd}+$\":{\"type\":\"string\"}}}}}"),
+                                            sc::SchemaOptions{}, &v, &err));
         CHECK(err.code == sc::SchemaErrorCode::Unsupported);
         // 原生路径保留 + 根键不错位：子内 ASCII pattern 正确作用于子值。
         sc::SchemaValidator v2;
-        CHECK(sc::SchemaValidator::Compile(
-            V("{\"patternProperties\":{\"^\\\\p{Nd}+$\":"
-              "{\"properties\":{\"a\":{\"pattern\":\"^[A-Z]+$\"}}}}}"),
-            sc::SchemaOptions{}, &v2, &err));
-        CHECK(v2.Validate(V("{\"9\":1}"), &err).ok);                 // 数值键命中外层 PP；值非 object
-        CHECK(v2.Validate(V("{\"a\":\"999\"}"), &err).ok);           // 非数字键不适用外层 PP（不误拒）
-        CHECK(!v2.Validate(V("{\"9\":{\"a\":\"999\"}}"), &err).ok);  // 子 pattern 正确作用于子值
+        CHECK(sc::SchemaValidator::Compile(V("{\"patternProperties\":{\"^\\\\p{Nd}+$\":"
+                                             "{\"properties\":{\"a\":{\"pattern\":\"^[A-Z]+$\"}}}}}"),
+                                           sc::SchemaOptions{}, &v2, &err));
+        CHECK(v2.Validate(V("{\"9\":1}"), &err).ok);                // 数值键命中外层 PP；值非 object
+        CHECK(v2.Validate(V("{\"a\":\"999\"}"), &err).ok);          // 非数字键不适用外层 PP（不误拒）
+        CHECK(!v2.Validate(V("{\"9\":{\"a\":\"999\"}}"), &err).ok); // 子 pattern 正确作用于子值
         CHECK(v2.Validate(V("{\"9\":{\"a\":\"ABC\"}}"), &err).ok);
     }
 
@@ -422,8 +408,8 @@ int main() {
         for (const char* n : negs) {
             const bool ok = sc::SchemaValidator::Compile(V(n), sc::SchemaOptions{}, &v, &err);
             if (ok || err.code != sc::SchemaErrorCode::InvalidSchema) {
-                std::printf("FAIL %d: %s -> ok=%d code=%d msg=%s\n", __LINE__, n,
-                            ok ? 1 : 0, static_cast<int>(err.code), err.message.c_str());
+                std::printf("FAIL %d: %s -> ok=%d code=%d msg=%s\n", __LINE__, n, ok ? 1 : 0,
+                            static_cast<int>(err.code), err.message.c_str());
                 ++g_fail;
             }
         }
@@ -434,13 +420,12 @@ int main() {
     {
         sc::SchemaValidator v;
         sc::SchemaError err;
-        CHECK(sc::SchemaValidator::Compile(
-            V("{\"default\":{\"type\":123,\"pattern\":\"\\\\p{...}\"},"
-              "\"examples\":[{\"$ref\":\"https://x.test/a\"}],"
-              "\"const\":{\"type\":[]},"
-              "\"enum\":[{\"required\":7}],"
-              "\"x-ext\":{\"$ref\":\"http://evil.test\"}}"),
-            sc::SchemaOptions{}, &v, &err));
+        CHECK(sc::SchemaValidator::Compile(V("{\"default\":{\"type\":123,\"pattern\":\"\\\\p{...}\"},"
+                                             "\"examples\":[{\"$ref\":\"https://x.test/a\"}],"
+                                             "\"const\":{\"type\":[]},"
+                                             "\"enum\":[{\"required\":7}],"
+                                             "\"x-ext\":{\"$ref\":\"http://evil.test\"}}"),
+                                           sc::SchemaOptions{}, &v, &err));
         CHECK(sc::SchemaValidator::Compile(V("{\"enum\":[]}"), sc::SchemaOptions{}, &v, &err));
         CHECK(!v.Validate(V("\"anything\""), &err).ok);
         CHECK(!v.Validate(V("5"), &err).ok);
@@ -452,8 +437,7 @@ int main() {
         CHECK(sc::SchemaValidator::Compile(V("false"), sc::SchemaOptions{}, &vf, &err));
         CHECK(!vf.Validate(V("1"), &err).ok);
         sc::SchemaValidator vu;
-        CHECK(sc::SchemaValidator::Compile(V("{\"type\":[\"string\",\"null\"]}"),
-                                           sc::SchemaOptions{}, &vu, &err));
+        CHECK(sc::SchemaValidator::Compile(V("{\"type\":[\"string\",\"null\"]}"), sc::SchemaOptions{}, &vu, &err));
         CHECK(vu.Validate(V("\"s\""), &err).ok);
         CHECK(vu.Validate(V("null"), &err).ok);
         CHECK(!vu.Validate(V("1"), &err).ok);
@@ -462,17 +446,15 @@ int main() {
         // 固定 jsoncons 依赖的既有限制（基线 probe 同样拒绝，见 REPORT），
         // 本包不改第三方树；指针支持路径为 "#/$defs/..."。
         sc::SchemaValidator vd;
-        CHECK(sc::SchemaValidator::Compile(
-            V("{\"definitions\":{\"s\":{\"type\":\"string\",\"minLength\":2}},"
-              "\"properties\":{\"a\":{\"type\":\"string\"}}}"),
-            sc::SchemaOptions{}, &vd, &err));
+        CHECK(sc::SchemaValidator::Compile(V("{\"definitions\":{\"s\":{\"type\":\"string\",\"minLength\":2}},"
+                                             "\"properties\":{\"a\":{\"type\":\"string\"}}}"),
+                                           sc::SchemaOptions{}, &vd, &err));
         CHECK(vd.Validate(V("{\"a\":\"ok\"}"), &err).ok);
         CHECK(!vd.Validate(V("{\"a\":3}"), &err).ok);
-        CHECK(sc::SchemaValidator::Compile(V("{\"dependencies\":{\"a\":[\"b\"]}}"),
-                                           sc::SchemaOptions{}, &v, &err));
+        CHECK(sc::SchemaValidator::Compile(V("{\"dependencies\":{\"a\":[\"b\"]}}"), sc::SchemaOptions{}, &v, &err));
         sc::SchemaValidator vm;
-        CHECK(!sc::SchemaValidator::Compile(V("{\"description\":\"ZZMETA\",\"minLength\":-1}"),
-                                            sc::SchemaOptions{}, &vm, &err));
+        CHECK(!sc::SchemaValidator::Compile(V("{\"description\":\"ZZMETA\",\"minLength\":-1}"), sc::SchemaOptions{},
+                                            &vm, &err));
         CHECK(err.code == sc::SchemaErrorCode::InvalidSchema);
         CHECK(err.message.find("ZZMETA") == std::string::npos);
     }
@@ -483,16 +465,16 @@ int main() {
         opt.max_schema_nodes = 10;
         sc::SchemaValidator v;
         sc::SchemaError err;
-        std::string big = "[";  // 根形状非法（数组）但预算门禁必须先命中
-        for (int i = 0; i < 40; ++i) big += "null,";
+        std::string big = "["; // 根形状非法（数组）但预算门禁必须先命中
+        for (int i = 0; i < 40; ++i)
+            big += "null,";
         big += "null]";
         CHECK(!sc::SchemaValidator::Compile(V(big.c_str()), opt, &v, &err));
         CHECK(err.code == sc::SchemaErrorCode::LimitExceeded);
-        CHECK(!sc::SchemaValidator::Compile(V("{\"pattern\":\"\\\\p{NoSuchProperty}\"}"),
-                                            sc::SchemaOptions{}, &v, &err));
+        CHECK(
+            !sc::SchemaValidator::Compile(V("{\"pattern\":\"\\\\p{NoSuchProperty}\"}"), sc::SchemaOptions{}, &v, &err));
         CHECK(err.code == sc::SchemaErrorCode::RegexInvalid);
-        CHECK(!sc::SchemaValidator::Compile(V("{\"$ref\":\"https://evil.test/x\"}"),
-                                            sc::SchemaOptions{}, &v, &err));
+        CHECK(!sc::SchemaValidator::Compile(V("{\"$ref\":\"https://evil.test/x\"}"), sc::SchemaOptions{}, &v, &err));
         CHECK(err.code == sc::SchemaErrorCode::ExternalRef);
     }
 
@@ -505,53 +487,47 @@ int main() {
         sc::SchemaValidator v;
         sc::SchemaError err;
         // 官方 G1：\p{Letter}cole + AP:false（ascii/字面 é/\u 转义三种键写法）。
-        CHECK(sc::SchemaValidator::Compile(
-            V("{\"type\":\"object\",\"patternProperties\":{\"\\\\p{Letter}cole\":true},"
-              "\"additionalProperties\":false}"),
-            sc::SchemaOptions{}, &v, &err));
+        CHECK(sc::SchemaValidator::Compile(V("{\"type\":\"object\",\"patternProperties\":{\"\\\\p{Letter}cole\":true},"
+                                             "\"additionalProperties\":false}"),
+                                           sc::SchemaOptions{}, &v, &err));
         CHECK(v.Validate(V("{\"l'ecole\":\"pas de vraie vie\"}"), &err).ok);
         CHECK(v.Validate(V("{\"l'école\":\"pas de vraie vie\"}"), &err).ok);
         CHECK(v.Validate(V("{\"l'\\u00e9cole\":\"pas de vraie vie\"}"), &err).ok);
-        CHECK(!v.Validate(V("{\"l'9cole\":1}"), &err).ok);  // 正控反例：未匹配额外键拒绝
+        CHECK(!v.Validate(V("{\"l'9cole\":1}"), &err).ok); // 正控反例：未匹配额外键拒绝
         // 官方 G2：^\\p{digit}+$ + AP:false（含非 ASCII 孟加拉数字键）。
-        CHECK(sc::SchemaValidator::Compile(
-            V("{\"type\":\"object\",\"patternProperties\":{\"^\\\\p{digit}+$\":true},"
-              "\"additionalProperties\":false}"),
-            sc::SchemaOptions{}, &v, &err));
+        CHECK(sc::SchemaValidator::Compile(V("{\"type\":\"object\",\"patternProperties\":{\"^\\\\p{digit}+$\":true},"
+                                             "\"additionalProperties\":false}"),
+                                           sc::SchemaOptions{}, &v, &err));
         CHECK(v.Validate(V("{\"42\":\"life\"}"), &err).ok);
         CHECK(v.Validate(V("{\"৪২\":\"khajit\"}"), &err).ok);
-        CHECK(!v.Validate(V("{\"x\":1}"), &err).ok);        // 正控反例
+        CHECK(!v.Validate(V("{\"x\":1}"), &err).ok); // 正控反例
         // 父级自有正例：^\\p{Lu}+$ + AP:false。
-        CHECK(sc::SchemaValidator::Compile(
-            V("{\"type\":\"object\",\"patternProperties\":{\"^\\\\p{Lu}+$\":true},"
-              "\"additionalProperties\":false}"),
-            sc::SchemaOptions{}, &v, &err));
+        CHECK(sc::SchemaValidator::Compile(V("{\"type\":\"object\",\"patternProperties\":{\"^\\\\p{Lu}+$\":true},"
+                                             "\"additionalProperties\":false}"),
+                                           sc::SchemaOptions{}, &v, &err));
         CHECK(v.Validate(V("{\"ABC\":\"ok\"}"), &err).ok);
         CHECK(v.Validate(V("{}"), &err).ok);
-        CHECK(!v.Validate(V("{\"abc\":\"ok\"}"), &err).ok);  // 正控反例
+        CHECK(!v.Validate(V("{\"abc\":\"ok\"}"), &err).ok); // 正控反例
         // ICU/原生 PP 混合 + AP:false：两类匹配键都排除在额外键集合外。
-        CHECK(sc::SchemaValidator::Compile(
-            V("{\"patternProperties\":{\"^[a-z]+$\":{\"type\":\"integer\"},"
-              "\"^\\\\p{Lu}+$\":{\"type\":\"string\"}},\"additionalProperties\":false}"),
-            sc::SchemaOptions{}, &v, &err));
+        CHECK(sc::SchemaValidator::Compile(V("{\"patternProperties\":{\"^[a-z]+$\":{\"type\":\"integer\"},"
+                                             "\"^\\\\p{Lu}+$\":{\"type\":\"string\"}},\"additionalProperties\":false}"),
+                                           sc::SchemaOptions{}, &v, &err));
         CHECK(v.Validate(V("{\"a\":1,\"ABC\":\"ok\"}"), &err).ok);
-        CHECK(!v.Validate(V("{\"a\":\"x\"}"), &err).ok);      // 原生 PP 值 schema 失败
-        CHECK(!v.Validate(V("{\"ABC\":1}"), &err).ok);        // relocated PP 值 schema 失败
-        CHECK(!v.Validate(V("{\"$\":1}"), &err).ok);          // 两类 pattern 均未命中 → 拒绝
+        CHECK(!v.Validate(V("{\"a\":\"x\"}"), &err).ok); // 原生 PP 值 schema 失败
+        CHECK(!v.Validate(V("{\"ABC\":1}"), &err).ok);   // relocated PP 值 schema 失败
+        CHECK(!v.Validate(V("{\"$\":1}"), &err).ok);     // 两类 pattern 均未命中 → 拒绝
         // AP:schema 不越权：覆盖键不套 AP 子 schema，未覆盖键仍受 AP 约束。
-        CHECK(sc::SchemaValidator::Compile(
-            V("{\"patternProperties\":{\"^\\\\p{Lu}+$\":{\"type\":\"string\"}},"
-              "\"additionalProperties\":{\"type\":\"integer\"}}"),
-            sc::SchemaOptions{}, &v, &err));
-        CHECK(v.Validate(V("{\"ABC\":\"ok\"}"), &err).ok);    // 覆盖键不受 AP:integer 影响
-        CHECK(!v.Validate(V("{\"ABC\":1}"), &err).ok);        // PP 值 schema 仍拒绝
-        CHECK(v.Validate(V("{\"zz\":5}"), &err).ok);          // 未覆盖键走 AP
-        CHECK(!v.Validate(V("{\"zz\":\"s\"}"), &err).ok);     // 未覆盖键 AP 拒绝非 integer
+        CHECK(sc::SchemaValidator::Compile(V("{\"patternProperties\":{\"^\\\\p{Lu}+$\":{\"type\":\"string\"}},"
+                                             "\"additionalProperties\":{\"type\":\"integer\"}}"),
+                                           sc::SchemaOptions{}, &v, &err));
+        CHECK(v.Validate(V("{\"ABC\":\"ok\"}"), &err).ok); // 覆盖键不受 AP:integer 影响
+        CHECK(!v.Validate(V("{\"ABC\":1}"), &err).ok);     // PP 值 schema 仍拒绝
+        CHECK(v.Validate(V("{\"zz\":5}"), &err).ok);       // 未覆盖键走 AP
+        CHECK(!v.Validate(V("{\"zz\":\"s\"}"), &err).ok);  // 未覆盖键 AP 拒绝非 integer
         // AP:true：额外键放行，PP 子 schema 不跳过。
-        CHECK(sc::SchemaValidator::Compile(
-            V("{\"patternProperties\":{\"^\\\\p{Lu}+$\":{\"type\":\"string\"}},"
-              "\"additionalProperties\":true}"),
-            sc::SchemaOptions{}, &v, &err));
+        CHECK(sc::SchemaValidator::Compile(V("{\"patternProperties\":{\"^\\\\p{Lu}+$\":{\"type\":\"string\"}},"
+                                             "\"additionalProperties\":true}"),
+                                           sc::SchemaOptions{}, &v, &err));
         CHECK(v.Validate(V("{\"ABC\":\"ok\",\"x\":1}"), &err).ok);
         CHECK(!v.Validate(V("{\"ABC\":1}"), &err).ok);
         // properties+PP 同键多约束 + AP:false；PP 与 properties 键序互换同语义。
@@ -560,20 +536,18 @@ int main() {
               "\"properties\":{\"ABC\":{\"minLength\":5}},\"additionalProperties\":false}"),
             sc::SchemaOptions{}, &v, &err));
         CHECK(v.Validate(V("{\"ABC\":\"12345\"}"), &err).ok);
-        CHECK(!v.Validate(V("{\"ABC\":\"ab\"}"), &err).ok);   // properties minLength 仍生效
-        CHECK(!v.Validate(V("{\"ABC\":1}"), &err).ok);        // PP type 仍生效
-        CHECK(sc::SchemaValidator::Compile(
-            V("{\"properties\":{\"ABC\":{\"minLength\":5}},"
-              "\"patternProperties\":{\"^\\\\p{Lu}+$\":{\"type\":\"string\"}},"
-              "\"additionalProperties\":false}"),
-            sc::SchemaOptions{}, &v, &err));
+        CHECK(!v.Validate(V("{\"ABC\":\"ab\"}"), &err).ok); // properties minLength 仍生效
+        CHECK(!v.Validate(V("{\"ABC\":1}"), &err).ok);      // PP type 仍生效
+        CHECK(sc::SchemaValidator::Compile(V("{\"properties\":{\"ABC\":{\"minLength\":5}},"
+                                             "\"patternProperties\":{\"^\\\\p{Lu}+$\":{\"type\":\"string\"}},"
+                                             "\"additionalProperties\":false}"),
+                                           sc::SchemaOptions{}, &v, &err));
         CHECK(v.Validate(V("{\"ABC\":\"12345\"}"), &err).ok);
         CHECK(!v.Validate(V("{\"ABC\":\"ab\"}"), &err).ok);
         // AP 在 PP 之前（MF5 延迟快照路径）：重定位决策同样延迟生效。
-        CHECK(sc::SchemaValidator::Compile(
-            V("{\"additionalProperties\":false,"
-              "\"patternProperties\":{\"^\\\\p{Lu}+$\":{\"type\":\"string\"}}}"),
-            sc::SchemaOptions{}, &v, &err));
+        CHECK(sc::SchemaValidator::Compile(V("{\"additionalProperties\":false,"
+                                             "\"patternProperties\":{\"^\\\\p{Lu}+$\":{\"type\":\"string\"}}}"),
+                                           sc::SchemaOptions{}, &v, &err));
         CHECK(v.Validate(V("{\"ABC\":\"ok\"}"), &err).ok);
         CHECK(!v.Validate(V("{\"zz\":1}"), &err).ok);
     }
@@ -584,15 +558,14 @@ int main() {
     {
         sc::SchemaValidator v;
         sc::SchemaError err;
-        CHECK(sc::SchemaValidator::Compile(
-            V("{\"patternProperties\":{\"^\\\\p{Lu}+$\":{\"type\":\"string\"}},"
-              "\"additionalProperties\":{\"$ref\":\"#/$defs/posint\"},"
-              "\"$defs\":{\"posint\":{\"type\":\"integer\",\"minimum\":1}}}"),
-            sc::SchemaOptions{}, &v, &err));
-        CHECK(v.Validate(V("{\"ABC\":\"ok\"}"), &err).ok);   // 覆盖键不受 AP 约束
-        CHECK(v.Validate(V("{\"zz\":2}"), &err).ok);         // 未覆盖键过 $ref
-        CHECK(!v.Validate(V("{\"zz\":0}"), &err).ok);        // minimum 仍拒绝
-        CHECK(!v.Validate(V("{\"zz\":\"s\"}"), &err).ok);    // type 仍拒绝
+        CHECK(sc::SchemaValidator::Compile(V("{\"patternProperties\":{\"^\\\\p{Lu}+$\":{\"type\":\"string\"}},"
+                                             "\"additionalProperties\":{\"$ref\":\"#/$defs/posint\"},"
+                                             "\"$defs\":{\"posint\":{\"type\":\"integer\",\"minimum\":1}}}"),
+                                           sc::SchemaOptions{}, &v, &err));
+        CHECK(v.Validate(V("{\"ABC\":\"ok\"}"), &err).ok); // 覆盖键不受 AP 约束
+        CHECK(v.Validate(V("{\"zz\":2}"), &err).ok);       // 未覆盖键过 $ref
+        CHECK(!v.Validate(V("{\"zz\":0}"), &err).ok);      // minimum 仍拒绝
+        CHECK(!v.Validate(V("{\"zz\":\"s\"}"), &err).ok);  // type 仍拒绝
     }
     // 28. R1 指针语义对立回归：AP 子 schema 自带同名影子 $defs。#/$defs/...
     // 是全文档指针，必须指向根定义（integer）；若误以 AP 子 schema 为解析根
@@ -600,15 +573,14 @@ int main() {
     {
         sc::SchemaValidator v;
         sc::SchemaError err;
-        CHECK(sc::SchemaValidator::Compile(
-            V("{\"patternProperties\":{\"^\\\\p{Lu}+$\":{\"type\":\"string\"}},"
-              "\"additionalProperties\":"
-              "{\"$defs\":{\"posint\":{\"type\":\"string\"}},"
-              "\"$ref\":\"#/$defs/posint\"},"
-              "\"$defs\":{\"posint\":{\"type\":\"integer\",\"minimum\":1}}}"),
-            sc::SchemaOptions{}, &v, &err));
-        CHECK(v.Validate(V("{\"zz\":2}"), &err).ok);         // 根 integer 定义生效
-        CHECK(!v.Validate(V("{\"zz\":\"s\"}"), &err).ok);    // 影子 string 不生效
+        CHECK(sc::SchemaValidator::Compile(V("{\"patternProperties\":{\"^\\\\p{Lu}+$\":{\"type\":\"string\"}},"
+                                             "\"additionalProperties\":"
+                                             "{\"$defs\":{\"posint\":{\"type\":\"string\"}},"
+                                             "\"$ref\":\"#/$defs/posint\"},"
+                                             "\"$defs\":{\"posint\":{\"type\":\"integer\",\"minimum\":1}}}"),
+                                           sc::SchemaOptions{}, &v, &err));
+        CHECK(v.Validate(V("{\"zz\":2}"), &err).ok);      // 根 integer 定义生效
+        CHECK(!v.Validate(V("{\"zz\":\"s\"}"), &err).ok); // 影子 string 不生效
     }
 
     // 29. APREF-C1 回归：guard 包装文档不得抢注本地 JSON Pointer。AP 内
@@ -618,27 +590,27 @@ int main() {
     {
         sc::SchemaValidator v;
         sc::SchemaError err;
-        CHECK(sc::SchemaValidator::Compile(
-            V("{\"allOf\":[{\"minLength\":2}],"
-              "\"patternProperties\":{\"^\\\\p{Lu}+$\":{\"type\":\"string\"}},"
-              "\"additionalProperties\":{\"$ref\":\"#/allOf/0\"}}"),
-            sc::SchemaOptions{}, &v, &err));
-        CHECK(v.Validate(V("{\"zz\":\"ok\"}"), &err).ok);    // AP 值长度 2
-        CHECK(!v.Validate(V("{\"zz\":\"x\"}"), &err).ok);    // AP 值长度 1
-        CHECK(v.Validate(V("{\"zz\":2}"), &err).ok);         // minLength 不约束 number
+        CHECK(sc::SchemaValidator::Compile(V("{\"allOf\":[{\"minLength\":2}],"
+                                             "\"patternProperties\":{\"^\\\\p{Lu}+$\":{\"type\":\"string\"}},"
+                                             "\"additionalProperties\":{\"$ref\":\"#/allOf/0\"}}"),
+                                           sc::SchemaOptions{}, &v, &err));
+        CHECK(v.Validate(V("{\"zz\":\"ok\"}"), &err).ok); // AP 值长度 2
+        CHECK(!v.Validate(V("{\"zz\":\"x\"}"), &err).ok); // AP 值长度 1
+        CHECK(v.Validate(V("{\"zz\":2}"), &err).ok);      // minLength 不约束 number
         // 原始对照（根 allOf[0]=type:string 约束整个实例）：对象一律 false，
         // 且必须无崩溃（此前同样在 Validate SIGSEGV）。
         sc::SchemaValidator v2;
-        CHECK(sc::SchemaValidator::Compile(
-            V("{\"allOf\":[{\"type\":\"string\"}],"
-              "\"patternProperties\":{\"^\\\\p{Lu}+$\":{\"type\":\"string\"}},"
-              "\"additionalProperties\":{\"$ref\":\"#/allOf/0\"}}"),
-            sc::SchemaOptions{}, &v2, &err));
+        CHECK(sc::SchemaValidator::Compile(V("{\"allOf\":[{\"type\":\"string\"}],"
+                                             "\"patternProperties\":{\"^\\\\p{Lu}+$\":{\"type\":\"string\"}},"
+                                             "\"additionalProperties\":{\"$ref\":\"#/allOf/0\"}}"),
+                                           sc::SchemaOptions{}, &v2, &err));
         CHECK(!v2.Validate(V("{\"zz\":\"s\"}"), &err).ok);
         CHECK(!v2.Validate(V("{\"zz\":2}"), &err).ok);
     }
 
-    if (g_fail == 0) std::printf("mcp.schema: all checks passed\n");
-    else std::printf("mcp.schema: %d check(s) failed\n", g_fail);
+    if (g_fail == 0)
+        std::printf("mcp.schema: all checks passed\n");
+    else
+        std::printf("mcp.schema: %d check(s) failed\n", g_fail);
     return g_fail == 0 ? 0 : 1;
 }

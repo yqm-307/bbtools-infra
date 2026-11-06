@@ -22,26 +22,26 @@ namespace bbt::infra::redis_detail {
 // 超出本入口的数据面定位，按不支持回复退役连接。数组解码不做增量，
 // 一次 DecodeReply 完整物化。
 inline constexpr std::size_t kMaxArrayElements = 65536;
-inline constexpr std::size_t kMaxArrayBytes    = 16 * 1024 * 1024;
+inline constexpr std::size_t kMaxArrayBytes = 16 * 1024 * 1024;
 
 // redisReply 的值语义快照：回调返回前完成拷贝，之后不再触碰 hiredis 内存。
 struct RawReply {
     enum class Type {
-        Status,   // REDIS_REPLY_STATUS（PONG/OK 等）
-        Integer,  // REDIS_REPLY_INTEGER
-        Bulk,     // REDIS_REPLY_STRING（二进制安全）
-        Nil,      // REDIS_REPLY_NIL
-        Array,    // REDIS_REPLY_ARRAY 的一维扁平快照（元素按服务端顺序）
-        Other,    // 本切片命令不期望的类型（MAP/DOUBLE/嵌套 ARRAY...）
+        Status,  // REDIS_REPLY_STATUS（PONG/OK 等）
+        Integer, // REDIS_REPLY_INTEGER
+        Bulk,    // REDIS_REPLY_STRING（二进制安全）
+        Nil,     // REDIS_REPLY_NIL
+        Array,   // REDIS_REPLY_ARRAY 的一维扁平快照（元素按服务端顺序）
+        Other,   // 当前命令集不期望的类型（MAP/DOUBLE/嵌套 ARRAY 等）
     };
     // 一维数组元素的扁平视图：只保留调用方需要的形态，不递归。
     struct Element {
-        bool        is_nil = false; // true 时忽略 str（数组内 nil 元素）
-        std::string str;            // Bulk/Status 负载或 Integer 的十进制文本
+        bool is_nil = false; // true 时忽略 str（数组内 nil 元素）
+        std::string str;     // Bulk/Status 负载或 Integer 的十进制文本
     };
-    Type        type;
-    std::string str;        // Status/Bulk 负载（str+len 拷贝，二进制安全）
-    long long   integer = 0;
+    Type type;
+    std::string str; // Status/Bulk 负载（str+len 拷贝，二进制安全）
+    long long integer = 0;
     // Type==Array 时的元素序列（服务端顺序，二进制安全）；其余类型恒空。
     std::vector<Element> elements;
 };
@@ -64,7 +64,6 @@ result<RawReply> DecodeReply(const redisReply* reply);
 //   - TIMEOUT → TimedOut；OOM → InternalError；
 //   - OTHER（含 getaddrinfo 解析失败）→ Unavailable；未知 → InternalError。
 // backend_category 固定 "hiredis"，backend_code 为原始 err。
-Error ClassifyHiredisError(int err, const char* errstr,
-                         std::string fallback_message);
+Error ClassifyHiredisError(int err, const char* errstr, std::string fallback_message);
 
 } // namespace bbt::infra::redis_detail

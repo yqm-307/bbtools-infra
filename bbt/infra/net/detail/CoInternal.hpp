@@ -2,7 +2,7 @@
 
 // Co 内部步骤与执行域 gate（内部部件，不列入公共头自检）。
 //
-// 为什么独立：CoRead/CoWrite/CoAccept/CoDial 需要（a）在消费/提交前统一校验
+// 为什么独立：Read、Write、CoAccept、CoDial 需要（a）在消费或提交前统一校验
 // 当前执行域，(b) 访问连接内部状态与 Engine 的私有等待步骤。这两件事都不能
 // 出现在公共头里——否则等于把测试接缝与等待实现冻结成公共契约。
 //
@@ -23,7 +23,7 @@ namespace bbt::infra::net {
 class ConnectionState;
 class Buffer;
 class Engine;
-struct ReclaimRecord;  // detail：物理回收共享释放记录
+struct ReclaimRecord; // detail：物理回收共享释放记录
 
 // 统一执行域 gate：复用上游无创建查询 GetLocalCoroutineId，
 // 与 ICoObject::RequireCoroutine 判定同源。不为检查构造 CoObject、不缓存 TLS、
@@ -52,16 +52,14 @@ struct CoAccess {
     // 提交：只用于无 handler 的 Engine（否则 operation_not_supported 且零提交）。
     // reclaim 非空时为带句柄 CoDial 的本次责任记录；同时是 ReclaimReceipt 的
     // 唯一内部构造入口。
-    static std::error_code SubmitConnect(Engine& engine, const Address& address,
-                                        std::uint64_t& out_connect_id,
-                                        const std::shared_ptr<ReclaimRecord>& reclaim = {});
+    static std::error_code SubmitConnect(Engine& engine, const Address& address, std::uint64_t& out_connect_id,
+                                         const std::shared_ptr<ReclaimRecord>& reclaim = {});
     static ReclaimReceipt MakeReceipt(std::shared_ptr<ReclaimRecord> record);
     // 领取：成功才写 out；任何未交付失败都由内部归还 claim 并让 owner 回收 fd。
     static std::error_code WaitConnect(Engine& engine, std::uint64_t connect_id, Connection& out,
-                                      const bbt::coroutine::WaitOptions& options);
-    // 从 handoff 队列取连接；配置/生命周期错误立即返回，不等永远不会来的事件。
-    static std::error_code WaitAccepted(Engine& engine, Connection& out,
                                        const bbt::coroutine::WaitOptions& options);
+    // 从 handoff 队列取连接；配置/生命周期错误立即返回，不等永远不会来的事件。
+    static std::error_code WaitAccepted(Engine& engine, Connection& out, const bbt::coroutine::WaitOptions& options);
 };
 
 } // namespace bbt::infra::net

@@ -37,41 +37,48 @@ using bbt::coroutine::SCHE_START_OPT_SCHE_THREAD;
 // 重启（Start 一次性，重复 Start 抛 std::logic_error）。旧用例在每个 case
 // 里 Start→Stop 的写法在进程寿命契约下不可用，统一经本函数取运行时。
 // 资源收口由各对象自己的 Close() 承担，不再依赖运行时代际。
-bool EnsureRuntime() {
+bool EnsureRuntime()
+{
     auto& sched = Scheduler::GetInstance();
     if (!sched->IsInitialized())
         sched->Start(SCHE_START_OPT_SCHE_THREAD);
     return sched->IsInitialized();
 }
 
-Value Map(std::initializer_list<std::pair<std::string, std::string>> kv) {
+Value Map(std::initializer_list<std::pair<std::string, std::string>> kv)
+{
     Value::Map m;
-    for (const auto& p : kv) m.emplace(p.first, p.second);
+    for (const auto& p : kv)
+        m.emplace(p.first, p.second);
     return Value::FromMap(std::move(m));
 }
 
 struct EventLog {
     std::mutex mtx;
     std::vector<WatchEvent> events;
-    void Add(WatchEvent e) {
+    void Add(WatchEvent e)
+    {
         std::lock_guard<std::mutex> lk(mtx);
         events.push_back(std::move(e));
     }
-    std::size_t Size() {
+    std::size_t Size()
+    {
         std::lock_guard<std::mutex> lk(mtx);
         return events.size();
     }
-    WatchEvent At(std::size_t i) {
+    WatchEvent At(std::size_t i)
+    {
         std::lock_guard<std::mutex> lk(mtx);
         return events.at(i);
     }
 };
 
-bool WaitUntil(const std::function<bool()>& cond, int timeout_ms) {
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+bool WaitUntil(const std::function<bool()>& cond, int timeout_ms)
+{
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     while (std::chrono::steady_clock::now() < deadline) {
-        if (cond()) return true;
+        if (cond())
+            return true;
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     return cond();
@@ -79,14 +86,16 @@ bool WaitUntil(const std::function<bool()>& cond, int timeout_ms) {
 
 // 非协程测试线程上的定长睡眠：直达内核 syscall，避开协程 Hook 对
 // libc nanosleep 的拦截（本文件链接 coroutine，不假设 Hook 未生效）。
-void SleepRawMs(int ms) {
+void SleepRawMs(int ms)
+{
     timespec req{ms / 1000, static_cast<long>(ms % 1000) * 1000000L};
     timespec rem{};
     while (::syscall(SYS_nanosleep, &req, &rem) != 0 && errno == EINTR)
         req = rem;
 }
 
-std::string MakeTempPath(const char* name) {
+std::string MakeTempPath(const char* name)
+{
     const char* t = std::getenv("TMPDIR");
     std::string dir = (t && *t) ? t : ".";
     std::string tmpl = dir + "/" + name + "_XXXXXX";
@@ -98,13 +107,15 @@ std::string MakeTempPath(const char* name) {
     return std::string(buf.data());
 }
 
-void WriteFile(const std::string& path, const std::string& content) {
+void WriteFile(const std::string& path, const std::string& content)
+{
     std::ofstream f(path, std::ios::trunc);
     f << content;
     BOOST_REQUIRE(f.good());
 }
 
-std::string MakeTempFile(const char* name, const std::string& content) {
+std::string MakeTempFile(const char* name, const std::string& content)
+{
     const std::string path = MakeTempPath(name);
     WriteFile(path, content);
     return path;
@@ -121,7 +132,8 @@ struct GateSource : ISource {
     std::atomic<bool> close_requested_from_tick{false};
     Snapshot current;
 
-    GateSource() {
+    GateSource()
+    {
         current.ns = "app";
         current.key = "server";
         current.source = "test:gate";
@@ -130,7 +142,8 @@ struct GateSource : ISource {
         current.value = Map({{"a", "1"}});
     }
 
-    result<Snapshot> Read() override {
+    result<Snapshot> Read() override
+    {
         const int n = ++reads;
         if (close_on_read.load(std::memory_order_acquire) == n) {
             // 本拍读到的是新版本（其余拍在本窗口内仍返回旧版本，不产生事件），
@@ -146,7 +159,10 @@ struct GateSource : ISource {
         return result<Snapshot>::ok(current);
     }
 
-    std::string SourceId() const noexcept override { return "test:gate"; }
+    std::string SourceId() const noexcept override
+    {
+        return "test:gate";
+    }
 };
 
 // 测试门闩：gate 为 true 时 Read 自旋阻塞在轮询协程内，制造「协程确实未
@@ -157,7 +173,8 @@ struct BlockableSource : ISource {
     std::atomic<bool> gate{false}; // true：Read 自旋，直到测试放行
     Snapshot current;
 
-    BlockableSource() {
+    BlockableSource()
+    {
         current.ns = "app";
         current.key = "server";
         current.source = "test:blockable";
@@ -166,14 +183,18 @@ struct BlockableSource : ISource {
         current.value = Map({{"a", "1"}});
     }
 
-    result<Snapshot> Read() override {
+    result<Snapshot> Read() override
+    {
         ++reads;
         while (gate.load(std::memory_order_acquire))
             SleepRawMs(1); // 让出 OS 线程的小睡；协程保持未退出
         return result<Snapshot>::ok(current);
     }
 
-    std::string SourceId() const noexcept override { return "test:blockable"; }
+    std::string SourceId() const noexcept override
+    {
+        return "test:blockable";
+    }
 };
 
 // 带析构标记的测试源：验证收口之后耐久资源（源）随句柄释放而析构，
@@ -181,18 +202,26 @@ struct BlockableSource : ISource {
 struct TrackedSource : ISource {
     std::shared_ptr<std::atomic_bool> destroyed;
     Snapshot current;
-    explicit TrackedSource(std::shared_ptr<std::atomic_bool> d)
-        : destroyed(std::move(d)) {
+    explicit TrackedSource(std::shared_ptr<std::atomic_bool> d) : destroyed(std::move(d))
+    {
         current.ns = "app";
         current.key = "server";
         current.source = "test:tracked";
         current.value = Map({{"a", "1"}});
     }
-    ~TrackedSource() override {
-        if (destroyed) destroyed->store(true);
+    ~TrackedSource() override
+    {
+        if (destroyed)
+            destroyed->store(true);
     }
-    result<Snapshot> Read() override { return result<Snapshot>::ok(current); }
-    std::string SourceId() const noexcept override { return "test:tracked"; }
+    result<Snapshot> Read() override
+    {
+        return result<Snapshot>::ok(current);
+    }
+    std::string SourceId() const noexcept override
+    {
+        return "test:tracked";
+    }
 };
 
 } // namespace
@@ -200,7 +229,8 @@ struct TrackedSource : ISource {
 // 未初始化协程运行时（进程寿命下即「从未 Start」）时 Create 返回
 // RuntimeUnavailable，不注册协程也不抛异常。必须是本文件第一个用例：
 // 任何一次 Start 都会让运行时进入初始化后的常驻状态。
-BOOST_AUTO_TEST_CASE(watch_create_without_running_scheduler) {
+BOOST_AUTO_TEST_CASE(watch_create_without_running_scheduler)
+{
     auto& sched = Scheduler::GetInstance();
     if (sched->IsInitialized()) {
         BOOST_TEST_MESSAGE("skipped: coroutine runtime already initialized (test order changed)");
@@ -209,11 +239,11 @@ BOOST_AUTO_TEST_CASE(watch_create_without_running_scheduler) {
     auto source = std::make_shared<MemorySource>("app", "server");
     auto r = Watcher::Create(source, [](const WatchEvent&) {}, WatchOptions{});
     BOOST_REQUIRE(!r);
-    BOOST_CHECK(static_cast<int>(r.error().code) ==
-                static_cast<int>(ErrorCode::RuntimeUnavailable));
+    BOOST_CHECK(static_cast<int>(r.error().code) == static_cast<int>(ErrorCode::RuntimeUnavailable));
 }
 
-BOOST_AUTO_TEST_CASE(watch_initial_dedup_update_memory) {
+BOOST_AUTO_TEST_CASE(watch_initial_dedup_update_memory)
+{
     BOOST_REQUIRE(EnsureRuntime());
 
     auto source = std::make_shared<MemorySource>("app", "server");
@@ -222,8 +252,7 @@ BOOST_AUTO_TEST_CASE(watch_initial_dedup_update_memory) {
     auto log = std::make_shared<EventLog>();
     WatchOptions opt;
     opt.poll_interval = std::chrono::milliseconds(10);
-    auto wres = Watcher::Create(
-        source, [log](const WatchEvent& e) { log->Add(e); }, opt);
+    auto wres = Watcher::Create(source, [log](const WatchEvent& e) { log->Add(e); }, opt);
     BOOST_REQUIRE(wres);
     auto watcher = std::move(wres).value();
 
@@ -251,12 +280,12 @@ BOOST_AUTO_TEST_CASE(watch_initial_dedup_update_memory) {
     // 轮询协程真退出——返回即等待与定时器已释放，物理收口落定。
     watcher->RequestClose();
     BOOST_CHECK(watcher->IsClosed());
-    auto stopped = watcher->WaitStopped(
-        std::chrono::steady_clock::now() + std::chrono::seconds(5));
+    auto stopped = watcher->WaitStopped(std::chrono::steady_clock::now() + std::chrono::seconds(5));
     BOOST_REQUIRE(stopped);
 }
 
-BOOST_AUTO_TEST_CASE(watch_no_callback_after_close) {
+BOOST_AUTO_TEST_CASE(watch_no_callback_after_close)
+{
     BOOST_REQUIRE(EnsureRuntime());
 
     auto source = std::make_shared<MemorySource>("app", "server");
@@ -265,8 +294,7 @@ BOOST_AUTO_TEST_CASE(watch_no_callback_after_close) {
     auto log = std::make_shared<EventLog>();
     WatchOptions opt;
     opt.poll_interval = std::chrono::milliseconds(10);
-    auto wres = Watcher::Create(
-        source, [log](const WatchEvent& e) { log->Add(e); }, opt);
+    auto wres = Watcher::Create(source, [log](const WatchEvent& e) { log->Add(e); }, opt);
     BOOST_REQUIRE(wres);
     auto watcher = std::move(wres).value();
 
@@ -274,8 +302,7 @@ BOOST_AUTO_TEST_CASE(watch_no_callback_after_close) {
 
     watcher->RequestClose();
     BOOST_CHECK(watcher->IsClosed());
-    auto stopped = watcher->WaitStopped(
-        std::chrono::steady_clock::now() + std::chrono::seconds(5));
+    auto stopped = watcher->WaitStopped(std::chrono::steady_clock::now() + std::chrono::seconds(5));
     BOOST_REQUIRE(stopped);
 
     // 关闭后更新源 → 晚到变更不得再回调消费者；轮询协程已退出。
@@ -287,15 +314,15 @@ BOOST_AUTO_TEST_CASE(watch_no_callback_after_close) {
 
 // 关闭落在「本次拍 Read 已完成、事件尚未投递」之间：该事件必须被丢弃，
 // 关闭后不再调用消费者；循环退出后源不再被读取（有界窗口内的负向检查）。
-BOOST_AUTO_TEST_CASE(watch_close_during_inflight_read_drops_pending_event) {
+BOOST_AUTO_TEST_CASE(watch_close_during_inflight_read_drops_pending_event)
+{
     BOOST_REQUIRE(EnsureRuntime());
 
     auto source = std::make_shared<GateSource>();
     auto log = std::make_shared<EventLog>();
     WatchOptions opt;
     opt.poll_interval = std::chrono::milliseconds(5);
-    auto wres = Watcher::Create(
-        source, [log](const WatchEvent& e) { log->Add(e); }, opt);
+    auto wres = Watcher::Create(source, [log](const WatchEvent& e) { log->Add(e); }, opt);
     BOOST_REQUIRE(wres);
     auto watcher = std::move(wres).value();
 
@@ -309,8 +336,7 @@ BOOST_AUTO_TEST_CASE(watch_close_during_inflight_read_drops_pending_event) {
     // 关闭在轮询协程内发生：RequestClose 是逻辑封口，IsClosed 立即为真；
     // 物理退出由 WaitStopped 证明。
     BOOST_REQUIRE(WaitUntil([&] { return watcher->IsClosed(); }, 3000));
-    auto stopped = watcher->WaitStopped(
-        std::chrono::steady_clock::now() + std::chrono::seconds(5));
+    auto stopped = watcher->WaitStopped(std::chrono::steady_clock::now() + std::chrono::seconds(5));
     BOOST_REQUIRE(stopped);
 
     // 交错确实发生在 tick 内（读→投递之间的窗口）
@@ -320,17 +346,16 @@ BOOST_AUTO_TEST_CASE(watch_close_during_inflight_read_drops_pending_event) {
 
     // 循环协程已退出：有界窗口内源不再被读取
     const int reads_after_close = source->reads.load();
-    const bool ticked_again =
-        WaitUntil([&] { return source->reads.load() > reads_after_close; }, 100);
+    const bool ticked_again = WaitUntil([&] { return source->reads.load() > reads_after_close; }, 100);
     BOOST_CHECK(!ticked_again);
     BOOST_CHECK_EQUAL(log->Size(), 1u);
 }
 
-BOOST_AUTO_TEST_CASE(watch_failure_recovery_file) {
+BOOST_AUTO_TEST_CASE(watch_failure_recovery_file)
+{
     BOOST_REQUIRE(EnsureRuntime());
 
-    const std::string path =
-        MakeTempFile("cfg_watch", "version = 1\nserver.port = 8080\n");
+    const std::string path = MakeTempFile("cfg_watch", "version = 1\nserver.port = 8080\n");
     auto fsrc = FileSource::Create(path, "app", "server");
     BOOST_REQUIRE(fsrc);
     auto source = std::static_pointer_cast<ISource>(fsrc.value());
@@ -338,8 +363,7 @@ BOOST_AUTO_TEST_CASE(watch_failure_recovery_file) {
     auto log = std::make_shared<EventLog>();
     WatchOptions opt;
     opt.poll_interval = std::chrono::milliseconds(10);
-    auto wres = Watcher::Create(
-        source, [log](const WatchEvent& e) { log->Add(e); }, opt);
+    auto wres = Watcher::Create(source, [log](const WatchEvent& e) { log->Add(e); }, opt);
     BOOST_REQUIRE(wres);
     auto watcher = std::move(wres).value();
 
@@ -352,8 +376,7 @@ BOOST_AUTO_TEST_CASE(watch_failure_recovery_file) {
     BOOST_REQUIRE(WaitUntil([&] { return log->Size() >= 2; }, 2000));
     auto e_fail = log->At(1);
     BOOST_CHECK(e_fail.kind == WatchEventKind::Failed);
-    BOOST_CHECK(static_cast<int>(e_fail.error.code) ==
-                static_cast<int>(ErrorCode::NotFound));
+    BOOST_CHECK(static_cast<int>(e_fail.error.code) == static_cast<int>(ErrorCode::NotFound));
 
     // 失败去重：持续失败不重复通知
     SleepRawMs(60);
@@ -371,13 +394,11 @@ BOOST_AUTO_TEST_CASE(watch_failure_recovery_file) {
     BOOST_REQUIRE(WaitUntil([&] { return log->Size() >= 4; }, 2000));
     auto e_mal = log->At(3);
     BOOST_CHECK(e_mal.kind == WatchEventKind::Failed);
-    BOOST_CHECK(static_cast<int>(e_mal.error.code) ==
-                static_cast<int>(ErrorCode::ProtocolError));
+    BOOST_CHECK(static_cast<int>(e_mal.error.code) == static_cast<int>(ErrorCode::ProtocolError));
 
     watcher->RequestClose();
     BOOST_CHECK(watcher->IsClosed());
-    auto stopped = watcher->WaitStopped(
-        std::chrono::steady_clock::now() + std::chrono::seconds(5));
+    auto stopped = watcher->WaitStopped(std::chrono::steady_clock::now() + std::chrono::seconds(5));
     BOOST_REQUIRE(stopped);
     ::unlink(path.c_str());
 }
@@ -386,7 +407,8 @@ BOOST_AUTO_TEST_CASE(watch_failure_recovery_file) {
 // （初始投递后循环进入 200ms 挂起），此时 RequestClose() 必须封口并唤醒它，
 // WaitStopped 在调用线程上等它真退出；释放句柄后源（耐久资源）由
 // 句柄析构释放——不再用 Scheduler::Stop 的硬停/栈不展开口径。
-BOOST_AUTO_TEST_CASE(watch_close_stops_loop_and_releases_source) {
+BOOST_AUTO_TEST_CASE(watch_close_stops_loop_and_releases_source)
+{
     BOOST_REQUIRE(EnsureRuntime());
 
     auto destroyed = std::make_shared<std::atomic_bool>(false);
@@ -395,8 +417,7 @@ BOOST_AUTO_TEST_CASE(watch_close_stops_loop_and_releases_source) {
     WatchOptions opt;
     // 较大间隔：初始投递立即发生，随后循环确定性地挂起在睡眠里。
     opt.poll_interval = std::chrono::milliseconds(200);
-    auto wres = Watcher::Create(
-        source, [log](const WatchEvent& e) { log->Add(e); }, opt);
+    auto wres = Watcher::Create(source, [log](const WatchEvent& e) { log->Add(e); }, opt);
     BOOST_REQUIRE(wres);
     auto watcher = std::move(wres).value();
     source.reset(); // 测试侧句柄释放：源只由 Watcher 持有，便于观察析构
@@ -405,13 +426,12 @@ BOOST_AUTO_TEST_CASE(watch_close_stops_loop_and_releases_source) {
 
     // 初始投递后循环已进入 200ms 挂起；再等 100ms，确保 RequestClose 命中挂起点。
     SleepRawMs(100);
-    BOOST_CHECK(!destroyed->load());   // 收前：源仍由句柄持有
+    BOOST_CHECK(!destroyed->load()); // 收前：源仍由句柄持有
 
     // 显式收口：RequestClose 封口 + 唤醒挂起的轮询协程，WaitStopped 等其退出。
     watcher->RequestClose();
     BOOST_CHECK(watcher->IsClosed());
-    auto stopped = watcher->WaitStopped(
-        std::chrono::steady_clock::now() + std::chrono::seconds(5));
+    auto stopped = watcher->WaitStopped(std::chrono::steady_clock::now() + std::chrono::seconds(5));
     BOOST_REQUIRE(stopped);
 
     // 关闭后源不再被读取（循环已退出，有界负向检查）。
@@ -429,31 +449,30 @@ BOOST_AUTO_TEST_CASE(watch_close_stops_loop_and_releases_source) {
 
 // 未封口的 WaitStopped 不是合法等待（轮询协程不会自行退出），返回
 // InvalidArgument——关闭决定归 owner，不允许「等一个永不发生的事件」。
-BOOST_AUTO_TEST_CASE(watch_waitstopped_requires_request_close) {
+BOOST_AUTO_TEST_CASE(watch_waitstopped_requires_request_close)
+{
     BOOST_REQUIRE(EnsureRuntime());
 
     auto source = std::make_shared<MemorySource>("app", "server");
     source->Set(Map({{"a", "1"}}));
-    auto wres = Watcher::Create(
-        source, [](const WatchEvent&) {}, WatchOptions{});
+    auto wres = Watcher::Create(source, [](const WatchEvent&) {}, WatchOptions{});
     BOOST_REQUIRE(wres);
     auto watcher = std::move(wres).value();
 
     auto early = watcher->WaitStopped(std::chrono::steady_clock::now());
     BOOST_REQUIRE(!early);
-    BOOST_CHECK(static_cast<int>(early.error().code) ==
-                static_cast<int>(ErrorCode::InvalidArgument));
+    BOOST_CHECK(static_cast<int>(early.error().code) == static_cast<int>(ErrorCode::InvalidArgument));
 
     watcher->RequestClose();
-    auto stopped = watcher->WaitStopped(
-        std::chrono::steady_clock::now() + std::chrono::seconds(5));
+    auto stopped = watcher->WaitStopped(std::chrono::steady_clock::now() + std::chrono::seconds(5));
     BOOST_REQUIRE(stopped);
 }
 
 // 回调内 RequestClose 只完成逻辑封口（不提前 MarkClosed），外部
 // WaitStopped 等到的是协程真实退出；回调内 WaitStopped 是等待自身，
 // 立即返回 InvalidContext。
-BOOST_AUTO_TEST_CASE(watch_request_close_from_callback_then_waitstopped) {
+BOOST_AUTO_TEST_CASE(watch_request_close_from_callback_then_waitstopped)
+{
     BOOST_REQUIRE(EnsureRuntime());
 
     auto source = std::make_shared<MemorySource>("app", "server");
@@ -477,29 +496,23 @@ BOOST_AUTO_TEST_CASE(watch_request_close_from_callback_then_waitstopped) {
                 // Create 可在首个回调投递前返回（首个 initial 事件可在注册后
                 // 立即被另一线程调度）：等待测试发布 Watcher*，不读未发布值
                 // （发布门在回调侧等 owner 线性化点，产品面不改契约）。
-                const auto deadline = std::chrono::steady_clock::now() +
-                                      std::chrono::seconds(5);
-                while (!probe->create_returned.load(std::memory_order_acquire) &&
-                       std::chrono::steady_clock::now() < deadline) {
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                while (!probe->create_returned.load(std::memory_order_acquire)
+                       && std::chrono::steady_clock::now() < deadline) {
                     std::this_thread::yield();
                 }
                 auto* w = probe->watcher.load(std::memory_order_acquire);
                 if (w == nullptr) {
                     // 发布门超时：记失败码离开（不触发空指针解引用）。
-                    probe->waitstopped_from_callback_code.store(
-                        -1, std::memory_order_release);
-                    probe->waitstopped_from_callback_done.store(
-                        true, std::memory_order_release);
+                    probe->waitstopped_from_callback_code.store(-1, std::memory_order_release);
+                    probe->waitstopped_from_callback_done.store(true, std::memory_order_release);
                     return;
                 }
                 // 回调内 WaitStopped：受管协程域，必须立即 InvalidContext。
-                auto r = w->WaitStopped(std::chrono::steady_clock::now() +
-                                        std::chrono::seconds(1));
-                probe->waitstopped_from_callback_code.store(
-                    r ? 0 : static_cast<int>(r.error().code),
-                    std::memory_order_release);
-                probe->waitstopped_from_callback_done.store(
-                    true, std::memory_order_release);
+                auto r = w->WaitStopped(std::chrono::steady_clock::now() + std::chrono::seconds(1));
+                probe->waitstopped_from_callback_code.store(r ? 0 : static_cast<int>(r.error().code),
+                                                            std::memory_order_release);
+                probe->waitstopped_from_callback_done.store(true, std::memory_order_release);
                 // 回调内自关闭：只逻辑封口，循环在回调返回后的下一拍退出。
                 w->RequestClose();
             }
@@ -510,15 +523,12 @@ BOOST_AUTO_TEST_CASE(watch_request_close_from_callback_then_waitstopped) {
     probe->watcher.store(watcher.get(), std::memory_order_release);
     probe->create_returned.store(true, std::memory_order_release);
 
-    BOOST_REQUIRE(WaitUntil(
-        [&] { return probe->waitstopped_from_callback_done.load(); }, 3000));
-    BOOST_CHECK(probe->waitstopped_from_callback_code.load() ==
-                static_cast<int>(ErrorCode::InvalidContext));
+    BOOST_REQUIRE(WaitUntil([&] { return probe->waitstopped_from_callback_done.load(); }, 3000));
+    BOOST_CHECK(probe->waitstopped_from_callback_code.load() == static_cast<int>(ErrorCode::InvalidContext));
     BOOST_CHECK(watcher->IsClosed()); // 逻辑封口立即为真
 
     // 外部等协程真退出：返回即循环已停，此后源不再被读、回调不再发生。
-    auto stopped = watcher->WaitStopped(
-        std::chrono::steady_clock::now() + std::chrono::seconds(5));
+    auto stopped = watcher->WaitStopped(std::chrono::steady_clock::now() + std::chrono::seconds(5));
     BOOST_REQUIRE(stopped);
     SleepRawMs(60);
     BOOST_CHECK(probe->calls.load() == 1);
@@ -526,15 +536,15 @@ BOOST_AUTO_TEST_CASE(watch_request_close_from_callback_then_waitstopped) {
 
 // 协程确实未退出时 WaitStopped 到期返回 TimedOut，不冒充完成；
 // 放行后同一 watcher 的 WaitStopped 成功（真实退出），不残留等待责任。
-BOOST_AUTO_TEST_CASE(watch_waitstopped_timeout_not_fake_completion) {
+BOOST_AUTO_TEST_CASE(watch_waitstopped_timeout_not_fake_completion)
+{
     BOOST_REQUIRE(EnsureRuntime());
 
     auto source = std::make_shared<BlockableSource>();
     auto log = std::make_shared<EventLog>();
     WatchOptions opt;
     opt.poll_interval = std::chrono::milliseconds(10);
-    auto wres = Watcher::Create(
-        source, [log](const WatchEvent& e) { log->Add(e); }, opt);
+    auto wres = Watcher::Create(source, [log](const WatchEvent& e) { log->Add(e); }, opt);
     BOOST_REQUIRE(wres);
     auto watcher = std::move(wres).value();
 
@@ -542,21 +552,17 @@ BOOST_AUTO_TEST_CASE(watch_waitstopped_timeout_not_fake_completion) {
 
     // 关门让下一拍 Read 卡在协程内，再封口：协程在 PollTick 里无法退出。
     source->gate.store(true, std::memory_order_release);
-    BOOST_REQUIRE(WaitUntil(
-        [&] { return source->reads.load() >= 2; }, 2000)); // 已进入下一拍 Read
+    BOOST_REQUIRE(WaitUntil([&] { return source->reads.load() >= 2; }, 2000)); // 已进入下一拍 Read
     watcher->RequestClose();
     BOOST_CHECK(watcher->IsClosed()); // 逻辑封口；协程仍卡在 Read 里
 
-    auto timed_out = watcher->WaitStopped(std::chrono::steady_clock::now() +
-                                          std::chrono::milliseconds(150));
+    auto timed_out = watcher->WaitStopped(std::chrono::steady_clock::now() + std::chrono::milliseconds(150));
     BOOST_REQUIRE(!timed_out);
-    BOOST_CHECK(static_cast<int>(timed_out.error().code) ==
-                static_cast<int>(ErrorCode::TimedOut));
+    BOOST_CHECK(static_cast<int>(timed_out.error().code) == static_cast<int>(ErrorCode::TimedOut));
 
     // 放行：本拍返回后下一拍见封口退出，WaitStopped 真实成功。
     source->gate.store(false, std::memory_order_release);
-    auto stopped = watcher->WaitStopped(
-        std::chrono::steady_clock::now() + std::chrono::seconds(5));
+    auto stopped = watcher->WaitStopped(std::chrono::steady_clock::now() + std::chrono::seconds(5));
     BOOST_REQUIRE(stopped);
 
     const int reads_at_stop = source->reads.load();
@@ -571,7 +577,8 @@ BOOST_AUTO_TEST_CASE(watch_waitstopped_timeout_not_fake_completion) {
 // 是空指针解引用。本探针不改写既有测试：循环 N 次，记录首次回调
 // (a) 是否运行在 Create 返回前（create_returned==false），
 // (b) 是否看到 probe->watcher 仍为 nullptr。
-BOOST_AUTO_TEST_CASE(probe_initial_callback_before_watcher_published) {
+BOOST_AUTO_TEST_CASE(probe_initial_callback_before_watcher_published)
+{
     BOOST_REQUIRE(EnsureRuntime());
 
     constexpr int kIterations = 400;
@@ -599,19 +606,14 @@ BOOST_AUTO_TEST_CASE(probe_initial_callback_before_watcher_published) {
             [probe](const WatchEvent&) {
                 const int n = ++probe->calls;
                 if (n == 1) {
-                    if (!probe->create_returned.load(
-                            std::memory_order_acquire))
-                        probe->first_call_before_return.store(
-                            true, std::memory_order_release);
+                    if (!probe->create_returned.load(std::memory_order_acquire))
+                        probe->first_call_before_return.store(true, std::memory_order_release);
                     // 修复后：回调侧按发布门等待 watcher 指针（同
                     // watch_request_close_from_callback_then_waitstopped），
                     // 故首调读到的必非 nullptr——该位仍是产品可见事实。
-                    if (probe->create_returned.load(
-                            std::memory_order_acquire) &&
-                        probe->watcher.load(std::memory_order_acquire) ==
-                            nullptr)
-                        probe->first_call_saw_null.store(
-                            true, std::memory_order_release);
+                    if (probe->create_returned.load(std::memory_order_acquire)
+                        && probe->watcher.load(std::memory_order_acquire) == nullptr)
+                        probe->first_call_saw_null.store(true, std::memory_order_release);
                 }
             },
             opt);
@@ -621,8 +623,7 @@ BOOST_AUTO_TEST_CASE(probe_initial_callback_before_watcher_published) {
         probe->create_returned.store(true, std::memory_order_release);
 
         // 等首次回调发生（initial 投递是下一拍），再判定次序。
-        const bool called = WaitUntil([&] { return probe->calls.load() >= 1; },
-                                      3000);
+        const bool called = WaitUntil([&] { return probe->calls.load() >= 1; }, 3000);
         if (called) {
             ++first_call_seen;
             if (probe->first_call_before_return.load())
@@ -632,16 +633,13 @@ BOOST_AUTO_TEST_CASE(probe_initial_callback_before_watcher_published) {
         }
 
         watcher->RequestClose();
-        auto stopped = watcher->WaitStopped(
-            std::chrono::steady_clock::now() + std::chrono::seconds(5));
+        auto stopped = watcher->WaitStopped(std::chrono::steady_clock::now() + std::chrono::seconds(5));
         BOOST_REQUIRE(stopped);
     }
 
-    BOOST_TEST_MESSAGE("iterations=" << kIterations
-                       << " first_call_seen=" << first_call_seen
-                       << " callback_before_create_return="
-                       << saw_callback_before_return
-                       << " first_call_saw_null_watcher=" << saw_null_watcher);
+    BOOST_TEST_MESSAGE("iterations=" << kIterations << " first_call_seen=" << first_call_seen
+                                     << " callback_before_create_return=" << saw_callback_before_return
+                                     << " first_call_saw_null_watcher=" << saw_null_watcher);
     // 修复后契约：首回调可见已发布的 Watcher*（或回调本身发生在 Create
     // 返回前——该位本身不违契约，仅记录交错形态）。
     BOOST_CHECK_EQUAL(saw_null_watcher, 0);

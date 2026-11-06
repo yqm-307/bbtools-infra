@@ -15,38 +15,50 @@ namespace http = bbt::infra::http;
 namespace net = bbt::infra::net;
 using namespace std::chrono_literals;
 namespace {
-void Check(bool condition, const char* message) {
-    if (!condition) { throw std::runtime_error(message); }
+void Check(bool condition, const char* message)
+{
+    if (!condition) {
+        throw std::runtime_error(message);
+    }
 }
 struct Runner {
     std::shared_ptr<net::Engine> engine;
     std::error_code error;
     std::thread thread;
-    Runner(std::shared_ptr<net::Engine> value, net::EngineConfig config) : engine(std::move(value)) {
+    Runner(std::shared_ptr<net::Engine> value, net::EngineConfig config) : engine(std::move(value))
+    {
         thread = std::thread([this, config] { error = engine->Run(config); });
     }
-    void Join() {
+    void Join()
+    {
         engine->RequestClose();
-        if (thread.joinable()) { thread.join(); }
+        if (thread.joinable()) {
+            thread.join();
+        }
     }
-    ~Runner() { Join(); }
+    ~Runner()
+    {
+        Join();
+    }
 };
-void Running(const std::shared_ptr<net::Engine>& engine) {
+void Running(const std::shared_ptr<net::Engine>& engine)
+{
     const auto end = std::chrono::steady_clock::now() + 3s;
     while (engine->Phase() != net::EnginePhase::Running && std::chrono::steady_clock::now() < end) {
         std::this_thread::sleep_for(1ms);
     }
     Check(engine->Phase() == net::EnginePhase::Running, "Engine did not start");
 }
-int Example() {
+int Example()
+{
     g_bbt_coroutine_config->m_cfg_static_thread_num = 4; // server 2 driver 槽 + client 1 + 业务
     g_bbt_coroutine_config->m_cfg_stack_size = 128 * 1024;
     g_bbt_coroutine_config->m_cfg_processer_auto_scale = false;
     g_scheduler->Start();
     auto server_engine = net::Engine::Create(std::shared_ptr<net::RawHandler>{});
     std::atomic<unsigned> peer_requests{0};
-    auto made = http::Server::Create(server_engine,
-        [&peer_requests](bbt::infra::IncomingCallContext ctx, http::IncomingRequest request) {
+    auto made = http::Server::Create(
+        server_engine, [&peer_requests](bbt::infra::IncomingCallContext ctx, http::IncomingRequest request) {
             Check(ctx.peer_principal.empty(), "unauthenticated peer is not a principal");
             Check(ctx.deadline > std::chrono::steady_clock::now(), "finite incoming deadline");
             ++peer_requests;
@@ -86,19 +98,28 @@ int Example() {
     auto future = done.get_future();
     std::atomic<unsigned> completed{0};
     bool registered = false;
-    g_scheduler->RegistCoroutineTask(128 * 1024, [&] {
-        try {
-            const auto until = [] { return bbt::infra::CallOptions{std::chrono::steady_clock::now() + 3s}; };
-            auto first = bbt_co_await client->Get("/items", {}, until());
-            Check(first && first.value().status_code == 200 && first.value().body == "example-get", "first GET");
-            auto second = bbt_co_await client->Get("/missing", {}, until());
-            Check(second && second.value().status_code == 404 && second.value().body == "example-get", "second GET status");
-            auto post = bbt_co_await client->Post("/submit", {"post-payload- bytes", "text/plain"}, {}, until());
-            Check(post && post.value().body == "post-payload- bytes", "POST reply bytes");
-            ++completed;
-            done.set_value();
-        } catch (...) { ++completed; done.set_exception(std::current_exception()); }
-    }, registered);
+    g_scheduler->RegistCoroutineTask(
+        128 * 1024,
+        [&] {
+            try {
+                const auto until = [] {
+                    return bbt::infra::CallOptions{std::chrono::steady_clock::now() + 3s};
+                };
+                auto first = bbt_co_await client->Get("/items", {}, until());
+                Check(first && first.value().status_code == 200 && first.value().body == "example-get", "first GET");
+                auto second = bbt_co_await client->Get("/missing", {}, until());
+                Check(second && second.value().status_code == 404 && second.value().body == "example-get",
+                      "second GET status");
+                auto post = bbt_co_await client->Post("/submit", {"post-payload- bytes", "text/plain"}, {}, until());
+                Check(post && post.value().body == "post-payload- bytes", "POST reply bytes");
+                ++completed;
+                done.set_value();
+            } catch (...) {
+                ++completed;
+                done.set_exception(std::current_exception());
+            }
+        },
+        registered);
     Check(registered, "consumer task registration");
     Check(future.wait_for(5s) == std::future_status::ready, "consumer completed");
     future.get();
@@ -112,7 +133,8 @@ int Example() {
     server->Close();
     Check(static_cast<bool>(server->WaitStopped(std::chrono::steady_clock::now() + 3s)), "HTTP physical stop");
     stats = server->Stats();
-    Check(stats.tasks == 0 && stats.sessions == 0 && stats.inflight == 0 && server_engine->AcceptingStopped(), "HTTP receipt");
+    Check(stats.tasks == 0 && stats.sessions == 0 && stats.inflight == 0 && server_engine->AcceptingStopped(),
+          "HTTP receipt");
     std::cout << "HTTP stopped tasks=0 sessions=0 inflight=0 listener_stopped=1 engines_still_running="
               << (server_engine->Phase() == net::EnginePhase::Running) << '\n';
     client->Close();
@@ -127,10 +149,14 @@ int Example() {
     return 0;
 }
 } // namespace
-int main() {
+int main()
+{
     int result = 1;
-    try { result = Example(); }
-    catch (const std::exception& error) { std::cerr << "FAIL " << error.what() << '\n'; }
+    try {
+        result = Example();
+    } catch (const std::exception& error) {
+        std::cerr << "FAIL " << error.what() << '\n';
+    }
     std::cout.flush();
     std::cerr.flush();
     std::fflush(nullptr);

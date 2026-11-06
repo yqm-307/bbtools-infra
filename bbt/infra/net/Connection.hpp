@@ -1,18 +1,22 @@
 #pragma once
 
-// 公共连接句柄：稳定值语义，持共享连接状态（ring/操作结果/关闭状态）。
-// 句柄寿命独立于 socket/context：显式关闭或 Engine 收口后，已收数据仍可读；
-// 残留句柄不访问已销毁 context，也不与 Engine 成强环。
-//
-// 线程/域约束：AsyncWrite/TryRead/状态查询/RequestClose 可在任意合法调用域；
-// 物理 I/O 与原始回调只由 owner 推进。net 不做分帧、请求匹配或重发。
-//
-// 身份：Id() 只在创建它的 Engine 内唯一（连接 id 与建连操作 id 各自递增），
-// 不是跨 Engine/跨进程身份，也不是取消、等待或查找句柄。无效句柄 Id() 为 0。
-//
-// 状态不公开：内部状态类型与 ring 表示不属冻结面。实现放在 Connection.cc，
-// 本头只前向声明内部类型，因此消费者无法依赖 state/ring 布局，也不能凭任意
-// 状态构造句柄——构造仅供 Engine owner 与内部 TestAccess 使用。
+/**
+ * @file Connection.hpp
+ * @brief 公共连接句柄：值语义，持有共享的连接状态（ring、操作结果、关闭状态）。
+ *
+ * 句柄寿命独立于 socket 与 context。显式关闭或 Engine 收口后，已收数据仍可读。
+ * 残留句柄不访问已销毁的 context，也不与 Engine 形成强引用环。
+ *
+ * 线程与域约束：AsyncWrite、TryRead、状态查询与 RequestClose 可在任意合法调用域使用。
+ * 物理 I/O 与原始回调只由 owner 推进。net 不做分帧、请求匹配或重发。
+ *
+ * 身份：Id() 只在创建它的 Engine 内唯一。连接 id 与建连操作 id 各自递增。它不是跨 Engine
+ * 或跨进程的身份，也不是取消、等待或查找句柄。无效句柄的 Id() 为 0。
+ *
+ * 状态不公开：内部状态类型与 ring 表示不属于公共契约。实现位于 Connection.cc，本头只前向
+ * 声明内部类型。消费方不能依赖 state 或 ring 的布局，也不能凭任意状态构造句柄，构造只供
+ * Engine owner 与内部测试接缝使用。
+ */
 
 #include <cstddef>
 #include <cstdint>
@@ -31,23 +35,29 @@
 namespace bbt::infra::net {
 
 class ConnectionState;
-struct ReclaimRecord;  // detail：物理回收共享释放记录，布局不出公共面
-struct CoAccess;       // detail：Co 内部步骤门面（唯一内部构造入口）
+struct ReclaimRecord; // detail：物理回收共享释放记录，布局不出公共面
+struct CoAccess;      // detail：Co 内部步骤门面（唯一内部构造入口）
 
-// 一次带句柄 CoDial 的物理回收观察句柄（值语义，默认无效）：
-//   - 无效句柄 Released()=true：没有已提交资源责任（默认构造，或本次调用在
-//     上下文/提交前被拒绝）。
-//   - 有效句柄 Released()=false：本次建连/物理 socket 责任仍存活——排队、
-//     建连中、已连接未交付或已交付连接尚未物理收口。
-//   - 有效句柄 Released()=true：本次 fd 已真实关闭且 owner 资源责任清理
-//     （未交付失败由 owner 回收收口；成功交付则与该连接 Released 同终态）。
-// 句柄只观察：不等待、不取消、不收回；寿命不延长 socket/Engine，也不与
-// Engine 成环——持句柄不阻碍 Engine 回收物理资源。不是 Future/等待平台。
+/**
+ * @brief 一次带句柄 CoDial 的物理回收观察句柄。
+ *
+ * 值语义，默认无效。
+ *   - 无效句柄：Released() 为 true。没有已提交的资源责任，即默认构造，或调用在上下文或提交前被拒绝。
+ *   - 有效句柄：Released() 为 false 时，本次建连与物理 socket 责任仍存活，包括排队、建连中、
+ *     已连接但未交付，以及已交付但尚未物理收口的连接。
+ *   - 有效句柄：Released() 为 true 时，本次 fd 已真实关闭，owner 资源责任已清理。未交付的失败由
+ *     owner 回收收口；成功交付则与该连接的 Released 同为终态。
+ *
+ * 句柄只做观察，不等待、不取消、不收回。它不延长 socket 或 Engine 的寿命，也不与 Engine 成环。
+ * 持有句柄不阻碍 Engine 回收物理资源。它不是 Future，也不是等待机制。
+ */
 class ReclaimReceipt {
 public:
     ReclaimReceipt() = default;
 
+    /// @brief 是否来自一次已提交的建连；默认构造与提交前被拒绝的调用为 false。
     bool Valid() const noexcept;
+    /// @brief 本次 fd 是否已真实关闭且 owner 责任已清理；无效句柄恒为 true。
     bool Released() const noexcept;
 
 private:
@@ -58,48 +68,86 @@ private:
     std::shared_ptr<ReclaimRecord> m_record;
 };
 
+/**
+ * @brief 协议无关的连接句柄，读侧提供 ring 访问，写侧提供非挂起提交。
+ *
+ * 副本共享同一连接状态，销毁副本不关闭连接。不做分帧、请求匹配与重发。
+ */
 class Connection {
 public:
     Connection() = default;
 
+    /// @brief 是否持有有效共享状态。
     bool Valid() const noexcept;
+    /// @brief 连接身份，仅在创建它的 Engine 内唯一；无效句柄为 0。
     std::uint64_t Id() const noexcept;
 
-    // 全量接纳或零接纳；成功后库取得数据所有权，观察句柄用于终态查询/等待。
-    // 每次调用先置 out_operation 无效：拒绝时保持无效且不泄露上次结果，
-    // 成功时写入本次新身份。
+    /**
+     * @brief 非挂起提交一次写，全量接纳或零接纳。
+     *
+     * 成功后库取得数据所有权，观察句柄用于终态查询/等待。每次调用先将 out_operation 置为无效：
+     * 拒绝时保持无效，不泄露上次结果；成功时写入本次新身份。
+     */
     std::error_code AsyncWrite(std::string data, WriteOperation& out_operation);
 
-    // owning 交付：成功非空；失败 out 不变、零消费。
+    /// @brief owning 交付：成功非空；失败 out 不变、零消费。
     std::error_code TryRead(Buffer& out);
+    /**
+     * @brief 非挂起读取并以 tuple 返回缓冲区和结果。
+     *
+     * 委托给 TryRead(Buffer&)；失败时不消费数据，返回的 Buffer 为空。
+     *
+     * @return 包含读取缓冲区和错误码的 tuple；成功时错误码为空。
+     */
     std::tuple<Buffer, std::error_code> TryRead();
 
-    // 兼容复制入口：竞争 Busy（零消费）；空且无终态 WouldBlock。
+    /// @brief 兼容复制入口：竞争 Busy（零消费）；空且无终态 WouldBlock。
     ReadResult TryRead(std::string& out);
 
-    // 组合 Peek+Consume 守卫（见 ReadAccess.hpp 的寿命与有效期约束）。
-    // 守卫持本连接状态强引用：即使随后释放本句柄，守卫内访问仍安全。
+    /**
+     * @brief 组合 Peek 与 Consume 的守卫，寿命与有效期约束见 ReadAccess.hpp。
+     *
+     * 守卫持有本连接状态的强引用，因此即使随后释放本句柄，守卫内的访问仍然安全。
+     */
     ReadAccess TryAccess();
 
+    /// @brief 已发布、尚未交付的字节数采样；无效句柄为 0。
     std::size_t ReadableBytes();
+    /// @brief 持久读错误，可与尾部字节共存；无效句柄视为无错误。
     std::error_code ReadError() const;
+    /// @brief 读方向是否已见 EOF，可与尾部字节共存；无效句柄视为已到 EOF。
     bool ReadEof() const;
 
+    /**
+     * @brief 最近一次写失败的原因。
+     *
+     * operation 非空时写入对应操作身份，无对应操作时为 0。无效句柄返回 NetErrc::Closed。
+     */
     std::error_code LastWriteError(std::uint64_t* operation = nullptr);
+    /// @brief 写方向接纳状态的真源采样；无效句柄为 Closed。
     AcceptanceState WriteAcceptance() const;
 
+    /// @brief 逻辑关闭终态；无效句柄视为已关闭。
     bool Closed() const;
+    /// @brief 第一次请求封口的关闭原因；无效句柄返回 NetErrc::Closed。
     std::error_code CloseReason() const;
 
-    // 物理回收观察：无效句柄=true；有效句柄仅底层 fd 已物理关闭且 owner 对
-    // 本连接的资源责任清理后为 true。Closed() 是逻辑接纳终态（可能先于物理
-    // 收口，如请求封口后 fd 仍在 owner 手中）；Released() 不取代 Closed()。
+    /**
+     * @brief 物理回收观察：无效句柄返回 true。
+     *
+     * 有效句柄仅在底层 fd 已物理关闭，且 owner 清理完对本连接的资源责任后才返回 true。
+     * Closed() 是逻辑接纳的终态，可能早于物理收口，例如请求封口后 fd 仍由 owner 持有。
+     * Released() 不替代 Closed()。
+     */
     bool Released() const noexcept;
 
-    // 请求封口：立即拒绝新写并唤 owner；物理 fd 关闭、已 recv 尾部入真源、
-    // 最终读 EOF 与 OnClose 由 owner 兑现。请求后读侧可能短暂 WouldBlock，
-    // 不得在尾部尚未入 ring 前返回 EOF。幂等；首次请求的 reason（包括默认 {}）
-    // 固定，后续请求不覆盖，最终关闭状态不回退。
+    /**
+     * @brief 请求封口：立即拒绝新写并唤醒 owner。
+     *
+     * 物理 fd 关闭、已接收的尾部数据入库、最终读 EOF 与 OnClose，均由 owner 完成。请求之后读侧
+     * 可能短暂返回 WouldBlock，在尾部数据入 ring 之前不会返回 EOF。该操作幂等。首次请求的 reason
+     * （包括默认的 {}）被固定，之后的请求不覆盖，已达到的关闭状态不会回退。
+     */
     void RequestClose(std::error_code reason = {});
 
 private:

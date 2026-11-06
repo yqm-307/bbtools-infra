@@ -6,39 +6,41 @@
 namespace rpc_net_test {
 namespace {
 
-void ClientClose() {
+void ClientClose()
+{
     ServerHost server(EchoHandler());
     ClientFixture client(server.Base());
     // 正常一次调用后 Close：幂等、IsClosed、后续 Call 拒绝（Closed）。
-    auto ok = client.host.Call([&] {
-        return bbt_co_await client.client->Call(server.Endpoint(),
-            MakeEnvelope("s", "m", "lc-0"), Until());
-    });
+    auto ok = client.host.Call(
+        [&] { return bbt_co_await client.client->Call(server.Endpoint(), MakeEnvelope("s", "m", "lc-0"), Until()); });
     CHECK(ok);
-    client.host.Call([&] { client.client->Close(); return true; });
+    client.host.Call([&] {
+        client.client->Close();
+        return true;
+    });
     CHECK(client.host.Call([&] { return client.client->IsClosed(); }));
     // 底层 http owner 同步封口（共享同一份关闭状态，不出现第二份）。
     CHECK(client.host.Call([&] { return client.http_client->IsClosed(); }));
-    auto rejected = client.host.Call([&] {
-        return bbt_co_await client.client->Call(server.Endpoint(),
-            MakeEnvelope("s", "m", "lc-1"), Until());
-    });
+    auto rejected = client.host.Call(
+        [&] { return bbt_co_await client.client->Call(server.Endpoint(), MakeEnvelope("s", "m", "lc-1"), Until()); });
     ExpectCode(rejected, ErrorCode::Closed);
     // 重复 Close 幂等（不崩溃、不重开）。
-    client.host.Call([&] { client.client->Close(); return true; });
+    client.host.Call([&] {
+        client.client->Close();
+        return true;
+    });
     CHECK(client.host.Call([&] { return client.client->IsClosed(); }));
     server.Finish();
     std::cout << "rpc client close idempotent=1 rejected=Closed shared-owner=1\n";
 }
 
-void ServerLifecycle() {
+void ServerLifecycle()
+{
     std::atomic<unsigned> handled{0};
     ServerHost server(EchoHandler(&handled));
     ClientFixture client(server.Base());
-    auto ok = client.host.Call([&] {
-        return bbt_co_await client.client->Call(server.Endpoint(),
-            MakeEnvelope("s", "m", "sl-0"), Until());
-    });
+    auto ok = client.host.Call(
+        [&] { return bbt_co_await client.client->Call(server.Endpoint(), MakeEnvelope("s", "m", "sl-0"), Until()); });
     CHECK(ok && handled.load() == 1);
 
     // StopAccepting：listener 物理停（新拨号被拒），既有连接收尾。
@@ -46,10 +48,8 @@ void ServerLifecycle() {
     CHECK(WaitUntil([&] { return server.engine->AcceptingStopped(); }));
     // 未 Close 前 IsClosed 仍为 false（IsClosed 只跟 RPC Server 的 Close 走）。
     CHECK(!client.host.Call([&] { return server.server->IsClosed(); }));
-    auto refused = client.host.Call([&] {
-        return bbt_co_await client.client->Call(server.Endpoint(),
-            MakeEnvelope("s", "m", "sl-1"), Until(2s));
-    });
+    auto refused = client.host.Call(
+        [&] { return bbt_co_await client.client->Call(server.Endpoint(), MakeEnvelope("s", "m", "sl-1"), Until(2s)); });
     ExpectCode(refused, ErrorCode::TransportError);
 
     // Close → IsClosed；Drain/WaitStopped 依序收口。
@@ -62,20 +62,18 @@ void ServerLifecycle() {
     std::cout << "rpc server lifecycle stop=listener-stopped close=is_closed receipts=1\n";
 }
 
-void InflightAuthorization() {
+void InflightAuthorization()
+{
     // StopAccepting 不取消已授权 handler：gate 上挂起 → 停接纳 → 放行后
     // 回复仍真实送达（客户端拿到成功回包），随后 Drain 才能完成。
     auto gate = std::make_shared<Gate>();
-    ServerHost server([&](IncomingCallContext, RpcEnvelope request)
-                          -> result<RpcEnvelope> {
+    ServerHost server([&](IncomingCallContext, RpcEnvelope request) -> result<RpcEnvelope> {
         gate->Pause();
         return result<RpcEnvelope>::ok(std::move(request));
     });
     ClientFixture client(server.Base());
-    auto inflight = client.host.Submit([&] {
-        return bbt_co_await client.client->Call(server.Endpoint(),
-            MakeEnvelope("s", "m", "ia-0"), Until(5s));
-    });
+    auto inflight = client.host.Submit(
+        [&] { return bbt_co_await client.client->Call(server.Endpoint(), MakeEnvelope("s", "m", "ia-0"), Until(5s)); });
     CHECK(WaitUntil([&] { return gate->entered.load(); }));
     server.server->StopAccepting();
     CHECK(WaitUntil([&] { return server.engine->AcceptingStopped(); }));
@@ -90,20 +88,18 @@ void InflightAuthorization() {
     std::cout << "rpc inflight stop-accept kept handler=1 drain-after-reply=1\n";
 }
 
-void CloseDropsInflightReply() {
+void CloseDropsInflightReply()
+{
     // Close 强制封口：在途请求不再交付成功回复（回复明确放弃，客户端按
     // 非成功终态收场），不悬挂、不假装送达。
     auto gate = std::make_shared<Gate>();
-    ServerHost server([&](IncomingCallContext, RpcEnvelope request)
-                          -> result<RpcEnvelope> {
+    ServerHost server([&](IncomingCallContext, RpcEnvelope request) -> result<RpcEnvelope> {
         gate->Pause();
         return result<RpcEnvelope>::ok(std::move(request));
     });
     ClientFixture client(server.Base());
-    auto inflight = client.host.Submit([&] {
-        return bbt_co_await client.client->Call(server.Endpoint(),
-            MakeEnvelope("s", "m", "cd-0"), Until(5s));
-    });
+    auto inflight = client.host.Submit(
+        [&] { return bbt_co_await client.client->Call(server.Endpoint(), MakeEnvelope("s", "m", "cd-0"), Until(5s)); });
     CHECK(WaitUntil([&] { return gate->entered.load(); }));
     server.server->Close();
     CHECK(client.host.Call([&] { return server.server->IsClosed(); }));
@@ -114,34 +110,30 @@ void CloseDropsInflightReply() {
     CHECK(!outcome);
     CHECK(server.server->WaitStopped(std::chrono::steady_clock::now() + 3s));
     server.Finish();
-    std::cout << "rpc close drops inflight reply success=false code="
-              << static_cast<int>(outcome.error().code) << "\n";
+    std::cout << "rpc close drops inflight reply success=false code=" << static_cast<int>(outcome.error().code) << "\n";
 }
 
-void ReleasedClientHandle() {
+void ReleasedClientHandle()
+{
     // 在途调用期间释放最后外部 RPC 句柄：句柄析构即 Close，在途调用被失败
     // 且晚到回包被丢弃（不 UAF、不重复结算）；协程持有的局部引用保证返回路径
     // 安全。共享 transport 随之封口，连接退役出账、Engine 收口。
     auto gate = std::make_shared<Gate>();
-    ServerHost server([&](IncomingCallContext, RpcEnvelope request)
-                          -> result<RpcEnvelope> {
+    ServerHost server([&](IncomingCallContext, RpcEnvelope request) -> result<RpcEnvelope> {
         gate->Pause();
         return result<RpcEnvelope>::ok(std::move(request));
     });
     ClientFixture client(server.Base());
-    auto only = client.client;   // 外部唯一 RPC 句柄
+    auto only = client.client; // 外部唯一 RPC 句柄
     client.client.reset();
-    auto inflight = client.host.Submit([&] {
-        return bbt_co_await only->Call(server.Endpoint(),
-            MakeEnvelope("s", "m", "rh-1"), Until(5s));
-    });
-    CHECK(WaitUntil([&] { return gate->entered.load(); }));  // 请求已提交
-    only.reset();                                            // 释放最后外部句柄
+    auto inflight = client.host.Submit(
+        [&] { return bbt_co_await only->Call(server.Endpoint(), MakeEnvelope("s", "m", "rh-1"), Until(5s)); });
+    CHECK(WaitUntil([&] { return gate->entered.load(); })); // 请求已提交
+    only.reset();                                           // 释放最后外部句柄
     gate->Release();
     const auto reply = Get(inflight);
     CHECK(!reply);
-    CHECK(reply.error().code == ErrorCode::Closed ||
-          reply.error().code == ErrorCode::OutcomeUnknown);
+    CHECK(reply.error().code == ErrorCode::Closed || reply.error().code == ErrorCode::OutcomeUnknown);
     // 句柄析构已封口共享 transport；连接退役出账（物理回收凭据）。
     CHECK(client.host.Call([&] { return client.http_client->IsClosed(); }));
     CHECK(WaitUntil([&] { return client.http_client->Stats().budget == 0; }));
@@ -150,13 +142,13 @@ void ReleasedClientHandle() {
                  "transport=closed budget=0\n";
 }
 
-void CompatFactory() {
+void CompatFactory()
+{
     // 源兼容工厂仍装配同一 HTTP adapter 栈：rpc::Server::Create(engine, handler)
     // 与 rpc::Client::Create(http_client) 可链接、行为与 seam 路径等价
     // （旧 include consumer 兼容窗口证据）。
     std::atomic<unsigned> handled{0};
-    auto server_engine =
-        net::Engine::Create(std::shared_ptr<net::RawHandler>{});
+    auto server_engine = net::Engine::Create(std::shared_ptr<net::RawHandler>{});
     auto made_server = rpc::Server::Create(server_engine, EchoHandler(&handled));
     CHECK(made_server);
     auto server = std::move(made_server).value();
@@ -172,8 +164,7 @@ void CompatFactory() {
     CHECK(server->Start());
     std::vector<net::Address> addresses;
     CHECK(!server_engine->LocalAddresses(addresses) && addresses.size() == 1);
-    const std::string endpoint =
-        "127.0.0.1:" + std::to_string(addresses.front().Port());
+    const std::string endpoint = "127.0.0.1:" + std::to_string(addresses.front().Port());
 
     Host host;
     http::ClientOptions options;
@@ -184,8 +175,8 @@ void CompatFactory() {
     CHECK(made_client);
     auto client = std::move(made_client).value();
     auto reply = host.Call([&] {
-        return bbt_co_await client->Call({"http", endpoint},
-            MakeEnvelope("echo", "Say", "cf-1", Pack("c", 7)), Until());
+        return bbt_co_await client->Call({"http", endpoint}, MakeEnvelope("echo", "Say", "cf-1", Pack("c", 7)),
+                                         Until());
     });
     CHECK(reply && reply.value().request_id == "cf-1" && handled.load() == 1);
     client->Close();
@@ -199,7 +190,8 @@ void CompatFactory() {
     std::cout << "rpc compat factory engine/http_client overloads link+roundtrip=1\n";
 }
 
-void InboundCycleRelease() {
+void InboundCycleRelease()
+{
     // B-1：HTTP inbound adapter 不得成环——rpc::Server Close + 释放全部外部
     // 强引用后，weak<Engine> 必须 expired（对照组 adapter/Server 同理释放）。
     // 引用环会让 http::Server 持有的 bridge lambda 反向持有 adapter State，
@@ -207,15 +199,12 @@ void InboundCycleRelease() {
     std::weak_ptr<net::Engine> weak_engine;
     std::weak_ptr<rpc::Server> weak_server;
     {
-        auto engine =
-            net::Engine::Create(std::shared_ptr<net::RawHandler>{});
+        auto engine = net::Engine::Create(std::shared_ptr<net::RawHandler>{});
         weak_engine = engine;
         auto inbound = rpc::HttpRpcInboundTransport::Create(engine, {});
         CHECK(inbound);
-        auto made = rpc::Server::Create(
-            std::shared_ptr<rpc::IRpcInboundTransport>(
-                std::move(inbound).value()),
-            EchoHandler());
+        auto made =
+            rpc::Server::Create(std::shared_ptr<rpc::IRpcInboundTransport>(std::move(inbound).value()), EchoHandler());
         CHECK(made);
         auto server = std::move(made).value();
         weak_server = server;
@@ -224,12 +213,12 @@ void InboundCycleRelease() {
         server.reset();
     }
     CHECK(weak_server.expired());
-    CHECK(weak_engine.expired());   // 引用环已断开：Engine 随 Close 释放
-    std::cout << "rpc inbound cycle release engine expired="
-              << weak_engine.expired() << "\n";
+    CHECK(weak_engine.expired()); // 引用环已断开：Engine 随 Close 释放
+    std::cout << "rpc inbound cycle release engine expired=" << weak_engine.expired() << "\n";
 }
 
-void DestroyDuringInflight() {
+void DestroyDuringInflight()
+{
     // B-2：rpc::Server 析构不等待在途 handler——handler 必须靠共享计数
     // 的 wire handler 保持引用稳定，不能借裸 State*。在途 handler 挂在
     // gate 上、Server 析构后放行，回调必须安全完成（不悬空、不 UAF）。
@@ -238,20 +227,16 @@ void DestroyDuringInflight() {
     std::weak_ptr<net::Engine> weak_engine;
     net::Address address;
     {
-        auto engine =
-            net::Engine::Create(std::shared_ptr<net::RawHandler>{});
+        auto engine = net::Engine::Create(std::shared_ptr<net::RawHandler>{});
         weak_engine = engine;
         auto inbound = rpc::HttpRpcInboundTransport::Create(engine, {});
         CHECK(inbound);
-        auto made = rpc::Server::Create(
-            std::shared_ptr<rpc::IRpcInboundTransport>(
-                std::move(inbound).value()),
-            [&](IncomingCallContext, RpcEnvelope request)
-                -> result<RpcEnvelope> {
-                entered.fetch_add(1);
-                gate->Pause();   // 阻塞在 Server 析构之后
-                return result<RpcEnvelope>::ok(std::move(request));
-            });
+        auto made = rpc::Server::Create(std::shared_ptr<rpc::IRpcInboundTransport>(std::move(inbound).value()),
+                                        [&](IncomingCallContext, RpcEnvelope request) -> result<RpcEnvelope> {
+                                            entered.fetch_add(1);
+                                            gate->Pause(); // 阻塞在 Server 析构之后
+                                            return result<RpcEnvelope>::ok(std::move(request));
+                                        });
         CHECK(made);
         auto server = std::move(made).value();
         net::EngineConfig config;
@@ -261,8 +246,7 @@ void DestroyDuringInflight() {
         config.listen_addresses = {net::Address::Ip("127.0.0.1", 0, error)};
         CHECK(!error);
         std::thread runner([&] { (void)engine->Run(config); });
-        CHECK(WaitUntil([&] {
-            return engine->Phase() == net::EnginePhase::Running; }));
+        CHECK(WaitUntil([&] { return engine->Phase() == net::EnginePhase::Running; }));
         CHECK(server->Start());
         std::vector<net::Address> addresses;
         CHECK(!engine->LocalAddresses(addresses) && !addresses.empty());
@@ -273,18 +257,14 @@ void DestroyDuringInflight() {
         options.base_url = "http://127.0.0.1:" + std::to_string(address.Port());
         auto made_http = http::Client::Create(host.engine, options);
         CHECK(made_http);
-        auto transport = rpc::HttpRpcTransport::Create(
-            std::move(made_http).value());
+        auto transport = rpc::HttpRpcTransport::Create(std::move(made_http).value());
         CHECK(transport);
-        auto made_client = rpc::Client::Create(
-            std::shared_ptr<rpc::IRpcTransport>(
-                std::move(transport).value()));
+        auto made_client = rpc::Client::Create(std::shared_ptr<rpc::IRpcTransport>(std::move(transport).value()));
         CHECK(made_client);
         auto client = std::move(made_client).value();
         auto inflight = host.Submit([&] {
-            return bbt_co_await client->Call(
-                {"http", "127.0.0.1:" + std::to_string(address.Port())},
-                MakeEnvelope("s", "m", "dd-0"), Until(5s));
+            return bbt_co_await client->Call({"http", "127.0.0.1:" + std::to_string(address.Port())},
+                                             MakeEnvelope("s", "m", "dd-0"), Until(5s));
         });
         CHECK(WaitUntil([&] { return entered.load() == 1; }));
         // 在途 handler 已进 gate 时析构 rpc::Server：Close 封 listener/
@@ -302,26 +282,36 @@ void DestroyDuringInflight() {
         engine.reset();
     }
     CHECK(weak_engine.expired());
-    std::cout << "rpc destroy-during-inflight handler=safe engine expired="
-              << weak_engine.expired() << "\n";
+    std::cout << "rpc destroy-during-inflight handler=safe engine expired=" << weak_engine.expired() << "\n";
 }
 
 } // namespace
 
-int RunCase(const std::string& mode) {
+int RunCase(const std::string& mode)
+{
     g_bbt_coroutine_config->m_cfg_static_thread_num = 4;
     g_bbt_coroutine_config->m_cfg_stack_size = 256 * 1024;
     g_bbt_coroutine_config->m_cfg_processer_auto_scale = false;
     g_scheduler->Start();
-    if (mode == "client_close") { ClientClose(); }
-    else if (mode == "server_lifecycle") { ServerLifecycle(); }
-    else if (mode == "inflight_authorization") { InflightAuthorization(); }
-    else if (mode == "close_drops_inflight") { CloseDropsInflightReply(); }
-    else if (mode == "released_client_handle") { ReleasedClientHandle(); }
-    else if (mode == "compat_factory") { CompatFactory(); }
-    else if (mode == "inbound_cycle_release") { InboundCycleRelease(); }
-    else if (mode == "destroy_during_inflight") { DestroyDuringInflight(); }
-    else { CHECK(false); }
+    if (mode == "client_close") {
+        ClientClose();
+    } else if (mode == "server_lifecycle") {
+        ServerLifecycle();
+    } else if (mode == "inflight_authorization") {
+        InflightAuthorization();
+    } else if (mode == "close_drops_inflight") {
+        CloseDropsInflightReply();
+    } else if (mode == "released_client_handle") {
+        ReleasedClientHandle();
+    } else if (mode == "compat_factory") {
+        CompatFactory();
+    } else if (mode == "inbound_cycle_release") {
+        InboundCycleRelease();
+    } else if (mode == "destroy_during_inflight") {
+        DestroyDuringInflight();
+    } else {
+        CHECK(false);
+    }
     std::cout << "rpc lifetime " << mode << " PASS\n";
     return 0;
 }
@@ -330,7 +320,8 @@ int RunCase(const std::string& mode) {
 
 #include "../net/ProcessRuntimeTestMain.hpp"
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv)
+{
     return bbt_net_test::RunTestProcessExit([&] {
         rpc_net_test::Watchdog watchdog;
         try {

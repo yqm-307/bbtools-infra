@@ -16,7 +16,8 @@ static bool allocation_window = false;
 static std::size_t allocation_count = 0;
 static std::size_t fail_at = 0;
 
-void* operator new(std::size_t size) {
+void* operator new(std::size_t size)
+{
     if (allocation_window && ++allocation_count == fail_at) {
         throw std::bad_alloc();
     }
@@ -25,32 +26,53 @@ void* operator new(std::size_t size) {
     }
     throw std::bad_alloc();
 }
-void* operator new[](std::size_t size) { return ::operator new(size); }
-void operator delete(void* p) noexcept { std::free(p); }
-void operator delete(void* p, std::size_t) noexcept { std::free(p); }
-void operator delete[](void* p) noexcept { std::free(p); }
-void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+void* operator new[](std::size_t size)
+{
+    return ::operator new(size);
+}
+void operator delete(void* p) noexcept
+{
+    std::free(p);
+}
+void operator delete(void* p, std::size_t) noexcept
+{
+    std::free(p);
+}
+void operator delete[](void* p) noexcept
+{
+    std::free(p);
+}
+void operator delete[](void* p, std::size_t) noexcept
+{
+    std::free(p);
+}
 
 class AllocationWindow {
 public:
-    explicit AllocationWindow(std::size_t k) {
+    explicit AllocationWindow(std::size_t k)
+    {
         allocation_count = 0;
         fail_at = k; // 0 只计数，不注入
         allocation_window = true;
     }
-    ~AllocationWindow() { allocation_window = false; }
+    ~AllocationWindow()
+    {
+        allocation_window = false;
+    }
     AllocationWindow(const AllocationWindow&) = delete;
     AllocationWindow& operator=(const AllocationWindow&) = delete;
 };
 
-static void Check(bool value, const char* expression, int line) {
+static void Check(bool value, const char* expression, int line)
+{
     if (!value) {
         throw std::runtime_error("line " + std::to_string(line) + ": " + expression);
     }
 }
 #define CHECK(expression) Check(static_cast<bool>(expression), #expression, __LINE__)
 
-static std::string Bytes(const OutboundQueue& q) {
+static std::string Bytes(const OutboundQueue& q)
+{
     std::string_view views[16];
     const auto count = q.GatherViews(views, 16);
     std::string result;
@@ -60,7 +82,8 @@ static std::string Bytes(const OutboundQueue& q) {
     return result;
 }
 
-static std::size_t MoveAttempt(std::size_t k, bool must_fail) {
+static std::size_t MoveAttempt(std::size_t k, bool must_fail)
+{
     OutboundQueue source(8, 4096, 8);
     const std::string payload = "abcdefgh" + std::string(80, 'x');
     CHECK(!source.Append(payload));
@@ -84,7 +107,10 @@ static std::size_t MoveAttempt(std::size_t k, bool must_fail) {
         // placement 对象也由 RAII 清理，断言抛出时不泄漏。
         struct Destroy {
             OutboundQueue* q;
-            ~Destroy() { q->~OutboundQueue(); }
+            ~Destroy()
+            {
+                q->~OutboundQueue();
+            }
         } destroy{target};
         CHECK(!must_fail && !failed);
         CHECK(Bytes(*target) == expected);
@@ -114,7 +140,8 @@ static std::size_t MoveAttempt(std::size_t k, bool must_fail) {
     return attempts;
 }
 
-static void TestMove() {
+static void TestMove()
+{
     static_assert(!std::is_nothrow_move_constructible_v<OutboundQueue>);
     static_assert(std::is_nothrow_move_assignable_v<OutboundQueue>);
     const auto allocations = MoveAttempt(0, false);
@@ -147,7 +174,8 @@ static void TestMove() {
     CHECK(Bytes(target) == expected);
 }
 
-static std::size_t AppendAttempt(std::size_t k, bool merge, bool must_fail) {
+static std::size_t AppendAttempt(std::size_t k, bool merge, bool must_fail)
+{
     OutboundQueue queue(8, 4096, 8);
     const std::string before = merge ? "abcdefgh" + std::string(80, 'x') : "abcd";
     const std::string input(128, 'y'); // 超 SSO，未超总量
@@ -188,7 +216,8 @@ static std::size_t AppendAttempt(std::size_t k, bool merge, bool must_fail) {
     return attempts;
 }
 
-static void TestAppend() {
+static void TestAppend()
+{
     for (const bool merge : {false, true}) {
         const auto allocations = AppendAttempt(0, merge, false);
         CHECK(allocations > 0 && allocations <= 8);
@@ -200,7 +229,8 @@ static void TestAppend() {
     }
 }
 
-static std::size_t AliasAttempt(std::size_t k, bool must_fail) {
+static std::size_t AliasAttempt(std::size_t k, bool must_fail)
+{
     EventRingBuffer ring(4096);
     const std::string input(700, 'x');
     CHECK(!ring.Append(input));
@@ -227,7 +257,8 @@ static std::size_t AliasAttempt(std::size_t k, bool must_fail) {
     return attempts;
 }
 
-static void TestAliasAllocation() {
+static void TestAliasAllocation()
+{
     const auto allocations = AliasAttempt(0, false);
     CHECK(allocations > 0 && allocations <= 8);
     for (std::size_t k = 1; k <= allocations; ++k) {
@@ -239,7 +270,8 @@ static void TestAliasAllocation() {
 
 // Reserve 原语直接回归：有效预留/越界拒绝/扩容失败内容容量保持；已备
 // 容量内追加不再首次分配。旧 move/append 回归保持不变。
-static std::size_t ReserveAttempt(std::size_t k, bool must_fail) {
+static std::size_t ReserveAttempt(std::size_t k, bool must_fail)
+{
     EventRingBuffer ring(4096);
     const std::string seed = "seed-data";
     CHECK(!ring.Append(seed));
@@ -283,7 +315,8 @@ static std::size_t ReserveAttempt(std::size_t k, bool must_fail) {
     return attempts;
 }
 
-static void TestReserve() {
+static void TestReserve()
+{
     const auto allocations = ReserveAttempt(0, false);
     CHECK(allocations > 0 && allocations <= 8);
     for (std::size_t k = 1; k <= allocations; ++k) {
@@ -293,7 +326,8 @@ static void TestReserve() {
     std::printf("reserve allocations=%zu; every failure unchanged\n", allocations);
 }
 
-int main() {
+int main()
+{
     try {
         TestMove();
         TestAppend();

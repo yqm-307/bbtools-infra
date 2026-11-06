@@ -10,7 +10,10 @@ if(BBT_INFRA_CONFIG)
 add_library(bbt_infra_config STATIC
     config/MemorySource.cc
     config/FileSource.cc
-    config/Watch.cc)
+    config/Watch.cc
+    config/Value.cc
+    config/Snapshot.cc
+    config/detail/CloseSupport.cc)
 add_library(bbt::infra_config ALIAS bbt_infra_config)
 
 target_include_directories(bbt_infra_config PRIVATE ${PROJECT_SOURCE_DIR})
@@ -33,7 +36,9 @@ if(BBT_INFRA_MONGO AND BBT_MONGOCXX_PREFIX)
         mongo/Bson.cc
         mongo/detail/MongoDetail.cc
         mongo/detail/MongoProcess.cc
-        mongo/detail/MongoRuntime.cc)
+        mongo/detail/MongoRuntime.cc
+        mongo/Client.cc
+        mongo/detail/MongoSupport.cc)
     add_library(bbt::infra_mongo ALIAS bbt_infra_mongo)
 
     target_include_directories(bbt_infra_mongo PRIVATE ${PROJECT_SOURCE_DIR})

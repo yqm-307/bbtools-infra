@@ -25,10 +25,11 @@
 
 namespace {
 
-int g_checks   = 0;
+int g_checks = 0;
 int g_failures = 0;
 
-void Check(bool cond, const char* expr, const char* file, int line) {
+void Check(bool cond, const char* expr, const char* file, int line)
+{
     ++g_checks;
     if (!cond) {
         ++g_failures;
@@ -40,7 +41,8 @@ void Check(bool cond, const char* expr, const char* file, int line) {
 
 using namespace bbt::infra;
 
-void TestResultOkErrVoid() {
+void TestResultOkErrVoid()
+{
     // ok 分支：&/const&/&& 访问
     auto ok = result<int>::ok(42);
     CHECK(ok);
@@ -50,8 +52,11 @@ void TestResultOkErrVoid() {
     CHECK(std::move(ok).value() == 42);
 
     bool threw = false;
-    try { (void)cok.error(); }
-    catch (const std::logic_error&) { threw = true; }
+    try {
+        (void)cok.error();
+    } catch (const std::logic_error&) {
+        threw = true;
+    }
     CHECK(threw);
 
     // err 分支
@@ -62,8 +67,11 @@ void TestResultOkErrVoid() {
     CHECK(cbad.error().message == "nope");
 
     threw = false;
-    try { (void)cbad.value(); }
-    catch (const std::logic_error&) { threw = true; }
+    try {
+        (void)cbad.value();
+    } catch (const std::logic_error&) {
+        threw = true;
+    }
     CHECK(threw);
 
     // move-only T 支持
@@ -83,29 +91,37 @@ void TestResultOkErrVoid() {
     CHECK(cverr.error().code == ErrorCode::Closed);
 
     threw = false;
-    try { (void)vok.error(); }
-    catch (const std::logic_error&) { threw = true; }
+    try {
+        (void)vok.error();
+    } catch (const std::logic_error&) {
+        threw = true;
+    }
     CHECK(threw);
 }
 
-Error MakeDomainError(std::string domain, ErrorDetails details) {
+Error MakeDomainError(std::string domain, ErrorDetails details)
+{
     Error e = MakeError(ErrorCode::ProtocolError, "test");
-    e.domain  = std::move(domain);
+    e.domain = std::move(domain);
     e.details = std::move(details);
     return e;
 }
 
 // 取 error() 需要 result 为 err 分支；调用前已 CHECK(!r)。
-ErrorCode ErrCodeOf(result<void>& r) { return r.error().code; }
+ErrorCode ErrCodeOf(result<void>& r)
+{
+    return r.error().code;
+}
 
-void TestErrorDetails() {
+void TestErrorDetails()
+{
     // 合法：恰好 16 项，键 64 字节，值 256 字节，含多字节 UTF-8
     ErrorDetails good;
     for (int i = 0; i < 16; ++i)
         good.emplace_back("k" + std::to_string(i), "v");
-    good[0].first  = std::string(kMaxKeyBytes, 'k');
+    good[0].first = std::string(kMaxKeyBytes, 'k');
     good[0].second = std::string(kMaxValueBytes, 'v');
-    good[1]        = {"键", "值"};
+    good[1] = {"键", "值"};
     auto e = MakeDomainError(std::string(kErrorDomainInfra), good);
     auto r = ValidateErrorDetails(e);
     CHECK(r);
@@ -116,128 +132,118 @@ void TestErrorDetails() {
     e.details = too_many;
     r = ValidateErrorDetails(e);
     CHECK(!r);
-    if (!r) CHECK(ErrCodeOf(r) == ErrorCode::ProtocolError);
+    if (!r)
+        CHECK(ErrCodeOf(r) == ErrorCode::ProtocolError);
 
     // 键 65 字节拒绝
     e.details = ErrorDetails{{std::string(kMaxKeyBytes + 1, 'k'), "v"}};
     r = ValidateErrorDetails(e);
     CHECK(!r);
-    if (!r) CHECK(ErrCodeOf(r) == ErrorCode::ProtocolError);
+    if (!r)
+        CHECK(ErrCodeOf(r) == ErrorCode::ProtocolError);
 
     // 值 257 字节拒绝
     e.details = ErrorDetails{{"k", std::string(kMaxValueBytes + 1, 'v')}};
     r = ValidateErrorDetails(e);
     CHECK(!r);
-    if (!r) CHECK(ErrCodeOf(r) == ErrorCode::ProtocolError);
+    if (!r)
+        CHECK(ErrCodeOf(r) == ErrorCode::ProtocolError);
 
     // 重复键拒绝
     e.details = ErrorDetails{{"a", "1"}, {"a", "2"}};
     r = ValidateErrorDetails(e);
     CHECK(!r);
-    if (!r) CHECK(ErrCodeOf(r) == ErrorCode::ProtocolError);
+    if (!r)
+        CHECK(ErrCodeOf(r) == ErrorCode::ProtocolError);
 
     // 非法 UTF-8 拒绝：孤立高位字节与过长编码
     e.details = ErrorDetails{{"k\xff", "v"}};
     r = ValidateErrorDetails(e);
     CHECK(!r);
-    if (!r) CHECK(ErrCodeOf(r) == ErrorCode::ProtocolError);
+    if (!r)
+        CHECK(ErrCodeOf(r) == ErrorCode::ProtocolError);
 
     e.details = ErrorDetails{{"k", "\xC0\xAF"}};
     r = ValidateErrorDetails(e);
     CHECK(!r);
-    if (!r) CHECK(ErrCodeOf(r) == ErrorCode::ProtocolError);
+    if (!r)
+        CHECK(ErrCodeOf(r) == ErrorCode::ProtocolError);
 
     // 上层域专属键不再是 infra 保留键：infra 只做结构校验，接受任意
     // 域+键组合（结构合法时）；expected_sequence 的域归属/数字格式校验
     // 已由 framework 侧 ErrorDomainRule 接管（见 decisions/0002 第 76 行）。
-    e = MakeDomainError("framework.actor",
-                        {{"expected_sequence", "12"}});
+    e = MakeDomainError("framework.actor", {{"expected_sequence", "12"}});
     r = ValidateErrorDetails(e);
     CHECK(r);
 
-    e = MakeDomainError("framework.actor",
-                        {{"expected_sequence", "x12"}});
+    e = MakeDomainError("framework.actor", {{"expected_sequence", "x12"}});
     r = ValidateErrorDetails(e);
-    CHECK(r);  // infra 层不再拒绝；framework 边界负责拒绝
+    CHECK(r); // infra 层不再拒绝；framework 边界负责拒绝
 
-    e = MakeDomainError(std::string(kErrorDomainInfra),
-                        {{"expected_sequence", "12"}});
+    e = MakeDomainError(std::string(kErrorDomainInfra), {{"expected_sequence", "12"}});
     r = ValidateErrorDetails(e);
-    CHECK(r);  // 同上：infra 层结构合法即通过
+    CHECK(r); // 同上：infra 层结构合法即通过
 
     // 非 actor 合法扩展键：上层自定义域 + 自定义键照常通过结构校验
-    e = MakeDomainError("app.billing",
-                        {{"invoice_id", "INV-2026-001"}, {"retry_after", "30"}});
+    e = MakeDomainError("app.billing", {{"invoice_id", "INV-2026-001"}, {"retry_after", "30"}});
     r = ValidateErrorDetails(e);
     CHECK(r);
 }
 
-void TestNetworkLimits() {
-    const NetworkLimits ok{1024, 256, 64 * 1024, 1024 * 1024,
-                           std::chrono::milliseconds{5000}};
+void TestNetworkLimits()
+{
+    const NetworkLimits ok{1024, 256, 64 * 1024, 1024 * 1024, std::chrono::milliseconds{5000}};
     auto r = ValidateNetworkLimits(ok);
     CHECK(r);
 
     auto expect_invalid = [](const NetworkLimits& l) {
         auto res = ValidateNetworkLimits(l);
         CHECK(!res);
-        if (!res) CHECK(ErrCodeOf(res) == ErrorCode::InvalidArgument);
+        if (!res)
+            CHECK(ErrCodeOf(res) == ErrorCode::InvalidArgument);
     };
 
     // 各项为 0 拒绝
-    expect_invalid(NetworkLimits{0, ok.max_inflight, ok.max_header_bytes,
-                                 ok.max_body_bytes, ok.incoming_timeout});
-    expect_invalid(NetworkLimits{ok.max_connections, 0, ok.max_header_bytes,
-                                 ok.max_body_bytes, ok.incoming_timeout});
-    expect_invalid(NetworkLimits{ok.max_connections, ok.max_inflight, 0,
-                                 ok.max_body_bytes, ok.incoming_timeout});
-    expect_invalid(NetworkLimits{ok.max_connections, ok.max_inflight,
-                                 ok.max_header_bytes, 0, ok.incoming_timeout});
-    expect_invalid(NetworkLimits{ok.max_connections, ok.max_inflight,
-                                 ok.max_header_bytes, ok.max_body_bytes,
+    expect_invalid(NetworkLimits{0, ok.max_inflight, ok.max_header_bytes, ok.max_body_bytes, ok.incoming_timeout});
+    expect_invalid(NetworkLimits{ok.max_connections, 0, ok.max_header_bytes, ok.max_body_bytes, ok.incoming_timeout});
+    expect_invalid(NetworkLimits{ok.max_connections, ok.max_inflight, 0, ok.max_body_bytes, ok.incoming_timeout});
+    expect_invalid(NetworkLimits{ok.max_connections, ok.max_inflight, ok.max_header_bytes, 0, ok.incoming_timeout});
+    expect_invalid(NetworkLimits{ok.max_connections, ok.max_inflight, ok.max_header_bytes, ok.max_body_bytes,
                                  std::chrono::milliseconds{0}});
 
     // 超过上限拒绝
-    expect_invalid(NetworkLimits{kNetworkLimitsMaxConnections + 1,
-                                 ok.max_inflight, ok.max_header_bytes,
+    expect_invalid(NetworkLimits{kNetworkLimitsMaxConnections + 1, ok.max_inflight, ok.max_header_bytes,
                                  ok.max_body_bytes, ok.incoming_timeout});
-    expect_invalid(NetworkLimits{ok.max_connections,
-                                 kNetworkLimitsMaxInflight + 1,
-                                 ok.max_header_bytes, ok.max_body_bytes,
-                                 ok.incoming_timeout});
-    expect_invalid(NetworkLimits{ok.max_connections, ok.max_inflight,
-                                 kNetworkLimitsMaxHeaderBytes + 1,
+    expect_invalid(NetworkLimits{ok.max_connections, kNetworkLimitsMaxInflight + 1, ok.max_header_bytes,
                                  ok.max_body_bytes, ok.incoming_timeout});
-    expect_invalid(NetworkLimits{ok.max_connections, ok.max_inflight,
-                                 ok.max_header_bytes,
-                                 kNetworkLimitsMaxBodyBytes + 1,
-                                 ok.incoming_timeout});
-    expect_invalid(NetworkLimits{ok.max_connections, ok.max_inflight,
-                                 ok.max_header_bytes, ok.max_body_bytes,
-                                 kNetworkLimitsMaxIncomingTimeout +
-                                     std::chrono::milliseconds{1}});
+    expect_invalid(NetworkLimits{ok.max_connections, ok.max_inflight, kNetworkLimitsMaxHeaderBytes + 1,
+                                 ok.max_body_bytes, ok.incoming_timeout});
+    expect_invalid(NetworkLimits{ok.max_connections, ok.max_inflight, ok.max_header_bytes,
+                                 kNetworkLimitsMaxBodyBytes + 1, ok.incoming_timeout});
+    expect_invalid(NetworkLimits{ok.max_connections, ok.max_inflight, ok.max_header_bytes, ok.max_body_bytes,
+                                 kNetworkLimitsMaxIncomingTimeout + std::chrono::milliseconds{1}});
 
     // 边界值恰等于上限：接受
-    const NetworkLimits at_cap{kNetworkLimitsMaxConnections,
-                               kNetworkLimitsMaxInflight,
-                               kNetworkLimitsMaxHeaderBytes,
-                               kNetworkLimitsMaxBodyBytes,
-                               kNetworkLimitsMaxIncomingTimeout};
+    const NetworkLimits at_cap{kNetworkLimitsMaxConnections, kNetworkLimitsMaxInflight, kNetworkLimitsMaxHeaderBytes,
+                               kNetworkLimitsMaxBodyBytes, kNetworkLimitsMaxIncomingTimeout};
     r = ValidateNetworkLimits(at_cap);
     CHECK(r);
 }
 
-void TestCodec() {
+void TestCodec()
+{
     // Codec<void>
     CHECK(Codec<void>::SchemaId() == "bbt.void/v1");
     auto enc = Codec<void>::Encode();
     CHECK(enc);
-    if (enc) CHECK(enc.value().empty());
+    if (enc)
+        CHECK(enc.value().empty());
     auto dv = Codec<void>::Decode({});
     CHECK(dv);
     dv = Codec<void>::Decode({0x00});
     CHECK(!dv);
-    if (!dv) CHECK(ErrCodeOf(dv) == ErrorCode::ProtocolError);
+    if (!dv)
+        CHECK(ErrCodeOf(dv) == ErrorCode::ProtocolError);
 
     // Codec<std::string>
     CHECK(Codec<std::string>::SchemaId() == "bbt.string.utf8/v1");
@@ -246,26 +252,31 @@ void TestCodec() {
     auto sd = se ? Codec<std::string>::Decode(se.value())
                  : result<std::string>::err(MakeError(ErrorCode::InternalError, "enc"));
     CHECK(sd);
-    if (sd) CHECK(sd.value() == "hello 世界");
+    if (sd)
+        CHECK(sd.value() == "hello 世界");
 
     sd = Codec<std::string>::Decode({0xFF, 0xFE});
     CHECK(!sd);
-    if (!sd) CHECK(sd.error().code == ErrorCode::ProtocolError);
+    if (!sd)
+        CHECK(sd.error().code == ErrorCode::ProtocolError);
 
     se = Codec<std::string>::Encode(std::string("a\xff", 2));
     CHECK(!se);
-    if (!se) CHECK(se.error().code == ErrorCode::ProtocolError);
+    if (!se)
+        CHECK(se.error().code == ErrorCode::ProtocolError);
 }
 
 struct FakeObject : bbt::coroutine::ICoObject {
-    bbt::coroutine::CoObjectInfo GetObjectInfo() const override {
+    bbt::coroutine::CoObjectInfo GetObjectInfo() const override
+    {
         // CoObjectInfo 无代际字段：{id, kind, name}
         return bbt::coroutine::CoObjectInfo{1, "fake", "fakeobj"};
     }
 };
 
 struct FakeNet : ICoNetwork {
-    bbt::coroutine::CoObjectInfo GetObjectInfo() const override {
+    bbt::coroutine::CoObjectInfo GetObjectInfo() const override
+    {
         return bbt::coroutine::CoObjectInfo{2, "net", "fakenet"};
     }
 };
@@ -274,12 +285,19 @@ struct FakeNet : ICoNetwork {
 // 这本身就是「接口只剩两个纯虚函数」的编译期证据（旧面还需实现
 // RequestClose/WaitClosed，缺一个就无法实例化）。
 struct FakeCloseable : ICoCloseable {
-    void Close() noexcept override { closed = true; }
-    bool IsClosed() const noexcept override { return closed; }
+    void Close() noexcept override
+    {
+        closed = true;
+    }
+    bool IsClosed() const noexcept override
+    {
+        return closed;
+    }
     bool closed = false;
 };
 
-void TestInterfaces() {
+void TestInterfaces()
+{
     FakeObject obj;
     CHECK(obj.GetObjectInfo().id == 1);
 
@@ -297,19 +315,14 @@ void TestInterfaces() {
 
     // 已删取消令牌不留兼容字段：调用选项/等待选项的尺寸就是 deadline
     // 的尺寸（多一个 token 成员即失败）。
-    static_assert(std::is_same<decltype(CallOptions::deadline),
-                               bbt::coroutine::Deadline>::value,
+    static_assert(std::is_same<decltype(CallOptions::deadline), bbt::coroutine::Deadline>::value,
                   "CallOptions 只应携带 deadline");
-    static_assert(sizeof(CallOptions) == sizeof(bbt::coroutine::Deadline),
-                  "CallOptions 不得保留 cancel/令牌字段");
-    static_assert(std::is_same<decltype(IncomingCallContext::deadline),
-                               bbt::coroutine::Deadline>::value,
+    static_assert(sizeof(CallOptions) == sizeof(bbt::coroutine::Deadline), "CallOptions 不得保留 cancel/令牌字段");
+    static_assert(std::is_same<decltype(IncomingCallContext::deadline), bbt::coroutine::Deadline>::value,
                   "IncomingCallContext 只应携带 deadline");
-    static_assert(std::is_same<decltype(bbt::coroutine::WaitOptions::deadline),
-                               bbt::coroutine::Deadline>::value,
+    static_assert(std::is_same<decltype(bbt::coroutine::WaitOptions::deadline), bbt::coroutine::Deadline>::value,
                   "WaitOptions 只应携带 deadline");
-    static_assert(sizeof(bbt::coroutine::WaitOptions) ==
-                      sizeof(bbt::coroutine::Deadline),
+    static_assert(sizeof(bbt::coroutine::WaitOptions) == sizeof(bbt::coroutine::Deadline),
                   "WaitOptions 不得保留 cancel 字段");
 
     // CallOptions / IncomingCallContext 聚合可构造（仅 deadline + 身份）。
@@ -324,7 +337,8 @@ void TestInterfaces() {
     };
     auto hr = hh(ctx, HttpRequest{});
     CHECK(hr);
-    if (hr) CHECK(hr.value().status == 200);
+    if (hr)
+        CHECK(hr.value().status == 200);
 
     RpcHandler rh = [](IncomingCallContext, RpcEnvelope) {
         return result<RpcEnvelope>::ok(RpcEnvelope{});
@@ -335,7 +349,8 @@ void TestInterfaces() {
 
 } // namespace
 
-int main() {
+int main()
+{
     TestResultOkErrVoid();
     TestErrorDetails();
     TestNetworkLimits();

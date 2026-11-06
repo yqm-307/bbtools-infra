@@ -20,13 +20,11 @@ namespace {
 // 单请求处理：wire 解析 → deadline local-min → handler → 关联校验 → 回信封
 // 字节。任何失败都转成 wire error envelope（不是 transport 错误）；解析失败
 // 无法取关联字段时用确定占位值（unparsed/unknown）。与旧实现逐分支一致。
-result<WireReply> EncodeErrorReply(const Error& error,
-                                   const RpcWireEnvelope* wire) {
-    RpcWireEnvelope out = wire
-        ? detail::ErrorEnvelope(error, wire->request_id, wire->service,
-                                wire->method, wire->request_schema,
-                                wire->response_schema)
-        : detail::ErrorEnvelope(error, "", "", "", "", "");
+result<WireReply> EncodeErrorReply(const Error& error, const RpcWireEnvelope* wire)
+{
+    RpcWireEnvelope out = wire ? detail::ErrorEnvelope(error, wire->request_id, wire->service, wire->method,
+                                                       wire->request_schema, wire->response_schema)
+                               : detail::ErrorEnvelope(error, "", "", "", "", "");
     auto body = EncodeRpcWireEnvelope(out, /*is_response=*/true);
     if (!body) {
         return result<WireReply>::err(body.error());
@@ -34,9 +32,8 @@ result<WireReply> EncodeErrorReply(const Error& error,
     return result<WireReply>::ok(WireReply{std::move(body).value()});
 }
 
-result<WireReply> HandleWireRequest(const IncomingCallContext& context,
-                                    WireRequest request,
-                                    const RpcHandler& handler) {
+result<WireReply> HandleWireRequest(const IncomingCallContext& context, WireRequest request, const RpcHandler& handler)
+{
     auto parsed = DecodeRpcWireEnvelope(request.body, /*is_response=*/false);
     if (!parsed) {
         return EncodeErrorReply(parsed.error(), nullptr);
@@ -48,13 +45,10 @@ result<WireReply> HandleWireRequest(const IncomingCallContext& context,
     }
 
     IncomingCallContext effective = context;
-    const auto remote_deadline = std::chrono::steady_clock::now() +
-        std::chrono::milliseconds{wire.remaining_budget_ms};
+    const auto remote_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{wire.remaining_budget_ms};
     effective.deadline = std::min(context.deadline, remote_deadline);
     if (effective.deadline <= std::chrono::steady_clock::now()) {
-        return EncodeErrorReply(
-            MakeError(ErrorCode::TimedOut, "rpc request deadline expired"),
-            &wire);
+        return EncodeErrorReply(MakeError(ErrorCode::TimedOut, "rpc request deadline expired"), &wire);
     }
 
     const auto handler_deadline = effective.deadline;
@@ -63,15 +57,9 @@ result<WireReply> HandleWireRequest(const IncomingCallContext& context,
         return EncodeErrorReply(handled.error(), &wire);
     }
     auto reply = std::move(handled.value());
-    if (reply.request_id != wire.request_id ||
-        reply.service != wire.service ||
-        reply.method != wire.method ||
-        reply.request_schema != wire.request_schema ||
-        reply.response_schema != wire.response_schema) {
-        return EncodeErrorReply(
-            MakeError(ErrorCode::ProtocolError,
-                      "rpc handler changed association fields"),
-            &wire);
+    if (reply.request_id != wire.request_id || reply.service != wire.service || reply.method != wire.method
+        || reply.request_schema != wire.request_schema || reply.response_schema != wire.response_schema) {
+        return EncodeErrorReply(MakeError(ErrorCode::ProtocolError, "rpc handler changed association fields"), &wire);
     }
 
     result<void> budget_status = result<void>::ok();
@@ -101,43 +89,47 @@ struct Server::State {
     std::shared_ptr<WireInboundHandler> wire;
     std::atomic<bool> closed{false};
     std::mutex reason_mtx;
-    std::optional<Error> close_reason;  // Close 发布；首个原因固定
+    std::optional<Error> close_reason; // Close 发布；首个原因固定
 };
 
-Server::Server(std::shared_ptr<State> state) noexcept
-    : m_state(std::move(state)) {}
+Server::Server(std::shared_ptr<State> state) noexcept : m_state(std::move(state))
+{
+}
 
-Server::Server(std::shared_ptr<ServerV2State> v2) noexcept
-    : m_v2(std::move(v2)) {}
+Server::Server(std::shared_ptr<ServerV2State> v2) noexcept : m_v2(std::move(v2))
+{
+}
 
-Server::~Server() noexcept { Close(); }
+Server::~Server() noexcept
+{
+    Close();
+}
 
-result<std::shared_ptr<Server>> Server::Create(
-    std::shared_ptr<IRpcInboundTransport> inbound, RpcHandler handler) {
+result<std::shared_ptr<Server>> Server::Create(std::shared_ptr<IRpcInboundTransport> inbound, RpcHandler handler)
+{
     if (!inbound) {
-        return result<std::shared_ptr<Server>>::err(MakeError(
-            ErrorCode::InvalidArgument,
-            "rpc server: inbound transport required"));
+        return result<std::shared_ptr<Server>>::err(
+            MakeError(ErrorCode::InvalidArgument, "rpc server: inbound transport required"));
     }
     if (!handler) {
-        return result<std::shared_ptr<Server>>::err(MakeError(
-            ErrorCode::InvalidArgument, "rpc server: handler must not be null"));
+        return result<std::shared_ptr<Server>>::err(
+            MakeError(ErrorCode::InvalidArgument, "rpc server: handler must not be null"));
     }
     auto state = std::make_shared<State>();
     state->inbound = std::move(inbound);
     state->handler = std::move(handler);
-    return result<std::shared_ptr<Server>>::ok(
-        bbt::coroutine::MakeCoObject<Server>("infra.rpc.Server", "", [&] {
-            return std::shared_ptr<Server>(new Server(std::move(state)));
-        }));
+    return result<std::shared_ptr<Server>>::ok(bbt::coroutine::MakeCoObject<Server>(
+        "infra.rpc.Server", "", [&] { return std::shared_ptr<Server>(new Server(std::move(state))); }));
 }
 
-result<void> Server::Start() {
-    if (m_v2) { return detail::ServerV2Start(m_v2); }
+result<void> Server::Start()
+{
+    if (m_v2) {
+        return detail::ServerV2Start(m_v2);
+    }
     auto state = m_state;
     if (state->closed.load()) {
-        return result<void>::err(
-            MakeError(ErrorCode::Closed, "rpc server: closed"));
+        return result<void>::err(MakeError(ErrorCode::Closed, "rpc server: closed"));
     }
     // RpcHandler 按值收进共享计数的 wire handler（std::function 内拷一份；
     // 不回指 State，避免 State↔wire 自持环）。wire 由 State 强持有、adapter
@@ -145,33 +137,45 @@ result<void> Server::Start() {
     // adapter 弱引用失效，回调不会悬空。
     if (!state->wire) {
         state->wire = std::make_shared<WireInboundHandler>(
-            [handler = state->handler](IncomingCallContext context,
-                                       WireRequest request)
-                -> result<WireReply> {
-                return HandleWireRequest(context, std::move(request),
-                                         handler);
+            [handler = state->handler](IncomingCallContext context, WireRequest request) -> result<WireReply> {
+                return HandleWireRequest(context, std::move(request), handler);
             });
     }
     return state->inbound->Start(*state->wire);
 }
 
-void Server::StopAccepting() noexcept {
-    if (m_v2) { detail::ServerV2StopAccepting(m_v2); return; }
+void Server::StopAccepting() noexcept
+{
+    if (m_v2) {
+        detail::ServerV2StopAccepting(m_v2);
+        return;
+    }
     m_state->inbound->StopAccepting();
 }
 
-result<void> Server::Drain(bbt::coroutine::Deadline deadline) {
-    if (m_v2) { return detail::ServerV2Drain(m_v2, deadline); }
+result<void> Server::Drain(bbt::coroutine::Deadline deadline)
+{
+    if (m_v2) {
+        return detail::ServerV2Drain(m_v2, deadline);
+    }
     return m_state->inbound->Drain(deadline);
 }
 
-void Server::Close(Error reason) noexcept {
+void Server::Close(Error reason) noexcept
+{
     try {
-        if (m_v2) { detail::ServerV2Seal(m_v2, std::move(reason)); return; }
-        if (!m_state) { return; }
+        if (m_v2) {
+            detail::ServerV2Seal(m_v2, std::move(reason));
+            return;
+        }
+        if (!m_state) {
+            return;
+        }
         {
             std::lock_guard<std::mutex> lock(m_state->reason_mtx);
-            if (!m_state->close_reason) { m_state->close_reason = reason; }
+            if (!m_state->close_reason) {
+                m_state->close_reason = reason;
+            }
         }
         // 首个封口者把已记录的原因转给 adapter；后续调用只保持原因不变。
         if (!m_state->closed.exchange(true)) {
@@ -182,33 +186,47 @@ void Server::Close(Error reason) noexcept {
     }
 }
 
-result<void> Server::Shutdown(bbt::coroutine::Deadline deadline) {
-    if (m_v2) { return detail::ServerV2Shutdown(m_v2, deadline); }
+result<void> Server::Shutdown(bbt::coroutine::Deadline deadline)
+{
+    if (m_v2) {
+        return detail::ServerV2Shutdown(m_v2, deadline);
+    }
     if (!m_state) {
         return result<void>::err(MakeError(ErrorCode::Closed, "rpc server: closed"));
     }
     return m_state->inbound->Shutdown(deadline);
 }
 
-std::optional<Error> Server::CloseReason() const noexcept {
-    if (m_v2) { return detail::ServerV2CloseReason(*m_v2); }
-    if (!m_state) { return std::nullopt; }
+std::optional<Error> Server::CloseReason() const noexcept
+{
+    if (m_v2) {
+        return detail::ServerV2CloseReason(*m_v2);
+    }
+    if (!m_state) {
+        return std::nullopt;
+    }
     std::lock_guard<std::mutex> lock(m_state->reason_mtx);
     return m_state->close_reason;
 }
 
-result<void> Server::WaitStopped(bbt::coroutine::Deadline deadline) {
-    if (m_v2) { return detail::ServerV2WaitStopped(m_v2, deadline); }
+result<void> Server::WaitStopped(bbt::coroutine::Deadline deadline)
+{
+    if (m_v2) {
+        return detail::ServerV2WaitStopped(m_v2, deadline);
+    }
     return m_state->inbound->WaitStopped(deadline);
 }
 
-bool Server::IsClosed() const noexcept {
-    if (m_v2) { return detail::ServerV2Closed(*m_v2); }
+bool Server::IsClosed() const noexcept
+{
+    if (m_v2) {
+        return detail::ServerV2Closed(*m_v2);
+    }
     return !m_state || m_state->closed.load();
 }
 
-detail::ServerV2Ledger detail::ServerV2LedgerForTest(
-    const Server& server) noexcept {
+detail::ServerV2Ledger detail::ServerV2LedgerForTest(const Server& server) noexcept
+{
     return detail::ServerV2LedgerOf(server.m_v2);
 }
 

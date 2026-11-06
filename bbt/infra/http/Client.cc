@@ -18,49 +18,62 @@ namespace {
 
 using detail::Origin;
 
-Error InvalidArgument(std::string message) {
+Error InvalidArgument(std::string message)
+{
     return MakeError(ErrorCode::InvalidArgument, "http client: " + std::move(message));
 }
 
-Error Unsupported(std::string message) {
+Error Unsupported(std::string message)
+{
     return MakeError(ErrorCode::UnsupportedRoute, "http client: " + std::move(message));
 }
 
 // 排空只能在 native 宿主域等待：受管协程/Processer 域挂起会占住调度资源
 // （与 Server::Drain 同口径）。
-bool NativeHost() {
-    return bbt::coroutine::GetLocalCoroutineId() == 0 &&
-           bbt::coroutine::detail::Processer::TryGetLocalProcesser() == nullptr;
+bool NativeHost()
+{
+    return bbt::coroutine::GetLocalCoroutineId() == 0
+           && bbt::coroutine::detail::Processer::TryGetLocalProcesser() == nullptr;
 }
 
-bool EqualsNoCase(std::string_view left, std::string_view right) {
-    if (left.size() != right.size()) { return false; }
+bool EqualsNoCase(std::string_view left, std::string_view right)
+{
+    if (left.size() != right.size()) {
+        return false;
+    }
     for (std::size_t i = 0; i < left.size(); ++i) {
-        if (std::tolower(static_cast<unsigned char>(left[i])) !=
-            std::tolower(static_cast<unsigned char>(right[i]))) {
+        if (std::tolower(static_cast<unsigned char>(left[i])) != std::tolower(static_cast<unsigned char>(right[i]))) {
             return false;
         }
     }
     return true;
 }
 
-bool Token(std::string_view value) {
-    if (value.empty()) { return false; }
+bool Token(std::string_view value)
+{
+    if (value.empty()) {
+        return false;
+    }
     for (unsigned char c : value) {
         const bool alpha = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
-        if (!alpha && !(c >= '0' && c <= '9') &&
-            std::string_view("!#$%&'*+-.^_`|~").find(c) == std::string_view::npos) { return false; }
+        if (!alpha && !(c >= '0' && c <= '9')
+            && std::string_view("!#$%&'*+-.^_`|~").find(c) == std::string_view::npos) {
+            return false;
+        }
     }
     return true;
 }
 
-result<void> ValidateHeaders(const Headers& headers) {
+result<void> ValidateHeaders(const Headers& headers)
+{
     std::size_t bytes = 0;
     unsigned hosts = 0;
     for (const auto& header : headers) {
-        if (!Token(header.first)) { return result<void>::err(InvalidArgument("invalid header name")); }
-        if (header.first.size() > 8192 || header.second.size() > 32768 ||
-            (bytes += header.first.size() + header.second.size() + 4) > 65536) {
+        if (!Token(header.first)) {
+            return result<void>::err(InvalidArgument("invalid header name"));
+        }
+        if (header.first.size() > 8192 || header.second.size() > 32768
+            || (bytes += header.first.size() + header.second.size() + 4) > 65536) {
             return result<void>::err(InvalidArgument("request headers exceed limit"));
         }
         for (unsigned char c : header.second) {
@@ -68,8 +81,7 @@ result<void> ValidateHeaders(const Headers& headers) {
                 return result<void>::err(InvalidArgument("invalid header value"));
             }
         }
-        if (EqualsNoCase(header.first, "Content-Length") ||
-            EqualsNoCase(header.first, "Transfer-Encoding")) {
+        if (EqualsNoCase(header.first, "Content-Length") || EqualsNoCase(header.first, "Transfer-Encoding")) {
             return result<void>::err(InvalidArgument("request framing is managed by Client"));
         }
         if (EqualsNoCase(header.first, "Host") && ++hosts > 1) {
@@ -80,14 +92,15 @@ result<void> ValidateHeaders(const Headers& headers) {
 }
 
 // 最小百分号编码：保留 unreserved，其余 %XX（空格同样编码，不用 +）。
-std::string PercentEncode(std::string_view value) {
+std::string PercentEncode(std::string_view value)
+{
     static const char* hex = "0123456789ABCDEF";
     std::string out;
     out.reserve(value.size());
     for (const char byte : value) {
         const auto c = static_cast<unsigned char>(byte);
-        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_'
+            || c == '.' || c == '~') {
             out.push_back(static_cast<char>(c));
         } else {
             out.push_back('%');
@@ -101,12 +114,13 @@ std::string PercentEncode(std::string_view value) {
 struct ParsedUrl {
     Origin origin;
     net::Address address;
-    std::string path;    // 含起始 '/'
-    std::string query;   // URL 自带 query（原样透传）
+    std::string path;  // 含起始 '/'
+    std::string query; // URL 自带 query（原样透传）
 };
 
 // 仅 http scheme 与数值 IP host（DNS 未交付：显式报错，不静默降级）。
-result<ParsedUrl> ParseUrl(const std::string& url) {
+result<ParsedUrl> ParseUrl(const std::string& url)
+{
     for (unsigned char c : url) {
         if (c <= 32 || c == 127) {
             return result<ParsedUrl>::err(InvalidArgument("invalid URL character"));
@@ -131,8 +145,12 @@ result<ParsedUrl> ParseUrl(const std::string& url) {
     const auto path_start = rest.find('/');
     const auto query_start = rest.find('?');
     std::size_t authority_end = rest.size();
-    if (path_start != std::string::npos) { authority_end = std::min(authority_end, path_start); }
-    if (query_start != std::string::npos) { authority_end = std::min(authority_end, query_start); }
+    if (path_start != std::string::npos) {
+        authority_end = std::min(authority_end, path_start);
+    }
+    if (query_start != std::string::npos) {
+        authority_end = std::min(authority_end, query_start);
+    }
     authority = rest.substr(0, authority_end);
     if (path_start != std::string::npos) {
         const auto from = path_start;
@@ -144,7 +162,9 @@ result<ParsedUrl> ParseUrl(const std::string& url) {
             path = "/";
         }
     }
-    if (query_start != std::string::npos) { query = rest.substr(query_start + 1); }
+    if (query_start != std::string::npos) {
+        query = rest.substr(query_start + 1);
+    }
 
     std::string host;
     int port = 80;
@@ -168,9 +188,8 @@ result<ParsedUrl> ParseUrl(const std::string& url) {
         }
     } else {
         const auto colon = authority.rfind(':');
-        if (colon != std::string::npos &&
-            colon + 1 < authority.size() &&
-            authority.find(':') == colon) {  // 仅一个冒号（IPv4/host:port）
+        if (colon != std::string::npos && colon + 1 < authority.size()
+            && authority.find(':') == colon) { // 仅一个冒号（IPv4/host:port）
             host = authority.substr(0, colon);
             if (!parse_port(std::string_view(authority).substr(colon + 1))) {
                 return result<ParsedUrl>::err(InvalidArgument("invalid URL port"));
@@ -179,7 +198,9 @@ result<ParsedUrl> ParseUrl(const std::string& url) {
             host = authority;
         }
     }
-    if (host.empty()) { return result<ParsedUrl>::err(InvalidArgument("url missing host")); }
+    if (host.empty()) {
+        return result<ParsedUrl>::err(InvalidArgument("url missing host"));
+    }
     if (port <= 0 || port > 65535) {
         return result<ParsedUrl>::err(InvalidArgument("url port out of range"));
     }
@@ -188,8 +209,7 @@ result<ParsedUrl> ParseUrl(const std::string& url) {
     auto address = net::Address::Ip(host, port, error);
     if (error) {
         // net Address 仅数值：主机名在这里被拒绝（DNS 未交付，非静默降级）。
-        return result<ParsedUrl>::err(
-            InvalidArgument("host must be numeric IP (DNS 未交付): " + host));
+        return result<ParsedUrl>::err(InvalidArgument("host must be numeric IP (DNS 未交付): " + host));
     }
     ParsedUrl out;
     out.origin = std::move(origin);
@@ -199,15 +219,23 @@ result<ParsedUrl> ParseUrl(const std::string& url) {
     return result<ParsedUrl>::ok(std::move(out));
 }
 
-std::string HostHeader(const ParsedUrl& parsed) {
+std::string HostHeader(const ParsedUrl& parsed)
+{
     auto host = parsed.origin.host;
-    if (host.find(':') != std::string::npos) { host = "[" + host + "]"; }
-    if (parsed.origin.port != 80) { host += ":" + std::to_string(parsed.origin.port); }
+    if (host.find(':') != std::string::npos) {
+        host = "[" + host + "]";
+    }
+    if (parsed.origin.port != 80) {
+        host += ":" + std::to_string(parsed.origin.port);
+    }
     return host;
 }
 
-result<ParsedUrl> ValidatePrepared(const PreparedRequest& request) {
-    if (!Token(request.method)) { return result<ParsedUrl>::err(InvalidArgument("invalid method")); }
+result<ParsedUrl> ValidatePrepared(const PreparedRequest& request)
+{
+    if (!Token(request.method)) {
+        return result<ParsedUrl>::err(InvalidArgument("invalid method"));
+    }
     if (request.method == "CONNECT") {
         return result<ParsedUrl>::err(Unsupported("CONNECT tunnel unsupported"));
     }
@@ -216,27 +244,34 @@ result<ParsedUrl> ValidatePrepared(const PreparedRequest& request) {
     }
     unsigned hosts = 0;
     for (const auto& header : request.headers) {
-        if (EqualsNoCase(header.first, "Host") && !header.second.empty()) { ++hosts; }
+        if (EqualsNoCase(header.first, "Host") && !header.second.empty()) {
+            ++hosts;
+        }
     }
-    if (hosts != 1) { return result<ParsedUrl>::err(InvalidArgument("exactly one Host required")); }
-    for (const auto& phase : {request.timeout.connect, request.timeout.read,
-                              request.timeout.write, request.timeout.pool}) {
+    if (hosts != 1) {
+        return result<ParsedUrl>::err(InvalidArgument("exactly one Host required"));
+    }
+    for (const auto& phase :
+         {request.timeout.connect, request.timeout.read, request.timeout.write, request.timeout.pool}) {
         if (phase.IsInherit() || (phase.Finite() && *phase.Finite() <= std::chrono::milliseconds{0})) {
             return result<ParsedUrl>::err(InvalidArgument("unresolved or invalid timeout"));
         }
     }
     auto parsed = ParseUrl(request.url);
-    if (!parsed) { return parsed; }
+    if (!parsed) {
+        return parsed;
+    }
     const auto& url = parsed.value();
     const auto target = url.path + (url.query.empty() ? "" : "?" + url.query);
-    if (request.target_for_wire != target || request.target_for_wire.find('#') != std::string::npos ||
-        request.address.ToString() != url.address.ToString() || request.host_header != HostHeader(url)) {
+    if (request.target_for_wire != target || request.target_for_wire.find('#') != std::string::npos
+        || request.address.ToString() != url.address.ToString() || request.host_header != HostHeader(url)) {
         return result<ParsedUrl>::err(InvalidArgument("inconsistent prepared URL/address/target"));
     }
     return parsed;
 }
 
-PhaseTimeout ResolvePhase(const PhaseTimeout& request_phase, const PhaseTimeout& client_phase) {
+PhaseTimeout ResolvePhase(const PhaseTimeout& request_phase, const PhaseTimeout& client_phase)
+{
     return request_phase.IsInherit() ? client_phase : request_phase;
 }
 
@@ -246,39 +281,36 @@ PhaseTimeout ResolvePhase(const PhaseTimeout& request_phase, const PhaseTimeout&
 struct Client::State {
     State(std::shared_ptr<net::Engine> engine_arg, ClientOptions options_arg)
         : engine(std::move(engine_arg)), options(std::move(options_arg)),
-          pool(engine, options.limits, options.max_body_bytes, options.max_header_bytes) {}
+          pool(engine, options.limits, options.max_body_bytes, options.max_header_bytes)
+    {
+    }
 
     const std::shared_ptr<net::Engine> engine;
     const ClientOptions options;
     detail::ConnectionPool pool;
 };
 
-result<std::shared_ptr<Client>> Client::Create(std::shared_ptr<net::Engine> engine,
-                                               ClientOptions options) {
+result<std::shared_ptr<Client>> Client::Create(std::shared_ptr<net::Engine> engine, ClientOptions options)
+{
     if (!engine || engine->Phase() == net::EnginePhase::Stopped) {
-        return result<std::shared_ptr<Client>>::err(
-            InvalidArgument("engine required (client 不自建执行底座)"));
+        return result<std::shared_ptr<Client>>::err(InvalidArgument("engine required (client 不自建执行底座)"));
     }
     if (options.limits.max_connections == 0) {
         return result<std::shared_ptr<Client>>::err(
             InvalidArgument("limits.max_connections must be greater than zero"));
     }
     if (options.max_body_bytes == 0) {
-        return result<std::shared_ptr<Client>>::err(
-            InvalidArgument("max_body_bytes must be greater than zero"));
+        return result<std::shared_ptr<Client>>::err(InvalidArgument("max_body_bytes must be greater than zero"));
     }
     if (options.max_request_body_bytes && *options.max_request_body_bytes == 0) {
         return result<std::shared_ptr<Client>>::err(
             InvalidArgument("max_request_body_bytes must be greater than zero"));
     }
     if (options.max_header_bytes && *options.max_header_bytes == 0) {
-        return result<std::shared_ptr<Client>>::err(
-            InvalidArgument("max_header_bytes must be greater than zero"));
+        return result<std::shared_ptr<Client>>::err(InvalidArgument("max_header_bytes must be greater than zero"));
     }
-    if (options.max_header_bytes &&
-        *options.max_header_bytes > std::numeric_limits<std::uint32_t>::max()) {
-        return result<std::shared_ptr<Client>>::err(
-            InvalidArgument("max_header_bytes exceeds HTTP parser limit"));
+    if (options.max_header_bytes && *options.max_header_bytes > std::numeric_limits<std::uint32_t>::max()) {
+        return result<std::shared_ptr<Client>>::err(InvalidArgument("max_header_bytes exceeds HTTP parser limit"));
     }
     if (auto headers = ValidateHeaders(options.headers); !headers) {
         return result<std::shared_ptr<Client>>::err(std::move(headers.error()));
@@ -289,26 +321,34 @@ result<std::shared_ptr<Client>> Client::Create(std::shared_ptr<net::Engine> engi
     // base_url 允许为空（每请求给绝对 URL）；非空则必须能解析。
     if (!options.base_url.empty()) {
         auto parsed = ParseUrl(options.base_url);
-        if (!parsed) { return result<std::shared_ptr<Client>>::err(std::move(parsed.error())); }
+        if (!parsed) {
+            return result<std::shared_ptr<Client>>::err(std::move(parsed.error()));
+        }
     }
-    for (const auto& phase : {options.timeout.connect, options.timeout.read,
-                              options.timeout.write, options.timeout.pool}) {
+    for (const auto& phase :
+         {options.timeout.connect, options.timeout.read, options.timeout.write, options.timeout.pool}) {
         const auto finite = phase.Finite();
         if (phase.IsInherit() || (finite && *finite <= std::chrono::milliseconds{0})) {
             return result<std::shared_ptr<Client>>::err(
                 InvalidArgument("timeout must be positive, disabled or inherit"));
         }
     }
-    return result<std::shared_ptr<Client>>::ok(std::shared_ptr<Client>(
-        new Client(std::make_shared<State>(std::move(engine), std::move(options)))));
+    return result<std::shared_ptr<Client>>::ok(
+        std::shared_ptr<Client>(new Client(std::make_shared<State>(std::move(engine), std::move(options)))));
 }
 
-Client::Client(std::shared_ptr<State> state) noexcept : m_state(std::move(state)) {}
+Client::Client(std::shared_ptr<State> state) noexcept : m_state(std::move(state))
+{
+}
 
-Client::~Client() noexcept { Close(); }
+Client::~Client() noexcept
+{
+    Close();
+}
 
 result<PreparedRequest> Client::BuildRequest(std::string_view method, std::string_view url,
-                                     const RequestOptions& options) const {
+                                             const RequestOptions& options) const
+{
     const auto state = m_state;
     if (!Token(method)) {
         return result<PreparedRequest>::err(InvalidArgument("method must not be empty"));
@@ -316,8 +356,7 @@ result<PreparedRequest> Client::BuildRequest(std::string_view method, std::strin
     std::string absolute(url);
     if (absolute.find("://") == std::string::npos) {
         if (state->options.base_url.empty()) {
-            return result<PreparedRequest>::err(
-                InvalidArgument("relative url requires client base_url"));
+            return result<PreparedRequest>::err(InvalidArgument("relative url requires client base_url"));
         }
         if (!absolute.empty() && absolute.front() != '/') {
             absolute.insert(absolute.begin(), '/');
@@ -329,7 +368,9 @@ result<PreparedRequest> Client::BuildRequest(std::string_view method, std::strin
         absolute = base + absolute;
     }
     auto parsed = ParseUrl(absolute);
-    if (!parsed) { return result<PreparedRequest>::err(std::move(parsed.error())); }
+    if (!parsed) {
+        return result<PreparedRequest>::err(std::move(parsed.error()));
+    }
 
     // headers merge：client 打底，同名（不区分大小写）请求级覆盖。
     Headers headers = state->options.headers;
@@ -342,35 +383,48 @@ result<PreparedRequest> Client::BuildRequest(std::string_view method, std::strin
                 break;
             }
         }
-        if (!replaced) { headers.emplace_back(header.first, header.second); }
+        if (!replaced) {
+            headers.emplace_back(header.first, header.second);
+        }
     }
     bool has_host = false;
     for (const auto& header : headers) {
-        if (EqualsNoCase(header.first, "Host")) { has_host = true; break; }
+        if (EqualsNoCase(header.first, "Host")) {
+            has_host = true;
+            break;
+        }
     }
     std::string host_header = HostHeader(parsed.value());
-    if (!has_host) { headers.emplace_back("Host", host_header); }
+    if (!has_host) {
+        headers.emplace_back("Host", host_header);
+    }
 
     // params merge：client 在前，请求级追加在后；URL 自带 query 透传保留。
     QueryParams params = state->options.params;
-    for (const auto& param : options.params) { params.push_back(param); }
+    for (const auto& param : options.params) {
+        params.push_back(param);
+    }
     std::string target = parsed.value().path;
     std::string query = parsed.value().query;
     for (const auto& param : params) {
-        if (!query.empty()) { query.push_back('&'); }
+        if (!query.empty()) {
+            query.push_back('&');
+        }
         query += PercentEncode(param.first) + "=" + PercentEncode(param.second);
     }
-    if (!query.empty()) { target += "?" + query; }
+    if (!query.empty()) {
+        target += "?" + query;
+    }
 
     Timeout effective;
     effective.connect = ResolvePhase(options.timeout ? options.timeout->connect : PhaseTimeout::Inherit(),
                                      state->options.timeout.connect);
-    effective.read = ResolvePhase(options.timeout ? options.timeout->read : PhaseTimeout::Inherit(),
-                                  state->options.timeout.read);
-    effective.write = ResolvePhase(options.timeout ? options.timeout->write : PhaseTimeout::Inherit(),
-                                   state->options.timeout.write);
-    effective.pool = ResolvePhase(options.timeout ? options.timeout->pool : PhaseTimeout::Inherit(),
-                                  state->options.timeout.pool);
+    effective.read =
+        ResolvePhase(options.timeout ? options.timeout->read : PhaseTimeout::Inherit(), state->options.timeout.read);
+    effective.write =
+        ResolvePhase(options.timeout ? options.timeout->write : PhaseTimeout::Inherit(), state->options.timeout.write);
+    effective.pool =
+        ResolvePhase(options.timeout ? options.timeout->pool : PhaseTimeout::Inherit(), state->options.timeout.pool);
     for (const auto& phase : {effective.connect, effective.read, effective.write, effective.pool}) {
         const auto finite = phase.Finite();
         if (phase.IsInherit() || (finite && *finite <= std::chrono::milliseconds{0})) {
@@ -388,27 +442,36 @@ result<PreparedRequest> Client::BuildRequest(std::string_view method, std::strin
     request.headers = std::move(headers);
     request.timeout = effective;
     auto valid = ValidatePrepared(request);
-    if (!valid) { return result<PreparedRequest>::err(std::move(valid.error())); }
+    if (!valid) {
+        return result<PreparedRequest>::err(std::move(valid.error()));
+    }
     return result<PreparedRequest>::ok(std::move(request));
 }
 
-bbt_co_async(result<Response>) Client::Get(std::string_view url, const RequestOptions& options,
-                                           const CallOptions& call) {
+bbt_co_async(result<Response>) Client::Get(std::string_view url, const RequestOptions& options, const CallOptions& call)
+{
     auto request = BuildRequest("GET", url, options);
-    if (!request) { return result<Response>::err(std::move(request.error())); }
+    if (!request) {
+        return result<Response>::err(std::move(request.error()));
+    }
     return Send(request.value(), call);
 }
 
-bbt_co_async(result<Response>) Client::Post(std::string_view url, RequestBody body,
-                                            const RequestOptions& options,
-                                            const CallOptions& call) {
+bbt_co_async(result<Response>) Client::Post(std::string_view url, RequestBody body, const RequestOptions& options,
+                                            const CallOptions& call)
+{
     auto request = BuildRequest("POST", url, options);
-    if (!request) { return result<Response>::err(std::move(request.error())); }
+    if (!request) {
+        return result<Response>::err(std::move(request.error()));
+    }
     // body 与 Content-Type：请求级 headers 已含同名头时不覆盖。
     if (!body.content_type.empty()) {
         bool has_type = false;
         for (const auto& header : request.value().headers) {
-            if (EqualsNoCase(header.first, "Content-Type")) { has_type = true; break; }
+            if (EqualsNoCase(header.first, "Content-Type")) {
+                has_type = true;
+                break;
+            }
         }
         if (!has_type) {
             request.value().headers.emplace_back("Content-Type", body.content_type);
@@ -419,18 +482,20 @@ bbt_co_async(result<Response>) Client::Post(std::string_view url, RequestBody bo
 }
 
 bbt_co_async(result<Response>) Client::Request(std::string_view method, std::string_view url,
-                                               const RequestOptions& options,
-                                               const CallOptions& call) {
+                                               const RequestOptions& options, const CallOptions& call)
+{
     auto request = BuildRequest(method, url, options);
-    if (!request) { return result<Response>::err(std::move(request.error())); }
+    if (!request) {
+        return result<Response>::err(std::move(request.error()));
+    }
     return Send(request.value(), call);
 }
 
-bbt_co_async(result<Response>) Client::Send(const PreparedRequest& request, const CallOptions& call) {
+bbt_co_async(result<Response>) Client::Send(const PreparedRequest& request, const CallOptions& call)
+{
     const auto state = m_state;
     if (bbt::coroutine::GetLocalCoroutineId() == 0) {
-        return result<Response>::err(
-            MakeError(ErrorCode::InvalidContext, "http client: coroutine context required"));
+        return result<Response>::err(MakeError(ErrorCode::InvalidContext, "http client: coroutine context required"));
     }
     if (state->pool.IsClosed()) {
         if (const auto reason = state->pool.CloseReason()) {
@@ -442,9 +507,10 @@ bbt_co_async(result<Response>) Client::Send(const PreparedRequest& request, cons
     // 事实不追改，只附加关闭原因供排障。
     const auto fail = [&state](Error error) {
         const auto reason = state->pool.CloseReason();
-        if (!reason) { return result<Response>::err(std::move(error)); }
-        if (error.request_phase &&
-            *error.request_phase == RequestPhase::RequestCommitted) {
+        if (!reason) {
+            return result<Response>::err(std::move(error));
+        }
+        if (error.request_phase && *error.request_phase == RequestPhase::RequestCommitted) {
             error.details.emplace_back("close_reason", reason->message);
             return result<Response>::err(std::move(error));
         }
@@ -452,36 +518,44 @@ bbt_co_async(result<Response>) Client::Send(const PreparedRequest& request, cons
     };
     try {
         auto valid = ValidatePrepared(request);
-        if (!valid) { return result<Response>::err(std::move(valid.error())); }
+        if (!valid) {
+            return result<Response>::err(std::move(valid.error()));
+        }
         if (const auto gate = detail::CheckCall(call.deadline)) {
-            return result<Response>::err(MakeError(
-                gate == std::errc::operation_canceled ? ErrorCode::Cancelled : ErrorCode::TimedOut,
-                "http client: call ended before submission"));
+            return result<Response>::err(
+                MakeError(gate == std::errc::operation_canceled ? ErrorCode::Cancelled : ErrorCode::TimedOut,
+                          "http client: call ended before submission"));
         }
         auto serialized = detail::SerializeRequest(request);
-        if (!serialized) { return result<Response>::err(std::move(serialized.error())); }
-        if (state->options.max_request_body_bytes &&
-            request.body.size() > *state->options.max_request_body_bytes) {
-            return result<Response>::err(InvalidArgument(
-                "request body exceeds max_request_body_bytes"));
+        if (!serialized) {
+            return result<Response>::err(std::move(serialized.error()));
         }
-        const auto deadlines = detail::ResolveDeadlines(request.timeout, call.deadline,
-                                                        std::chrono::steady_clock::now());
+        if (state->options.max_request_body_bytes && request.body.size() > *state->options.max_request_body_bytes) {
+            return result<Response>::err(InvalidArgument("request body exceeds max_request_body_bytes"));
+        }
+        const auto deadlines =
+            detail::ResolveDeadlines(request.timeout, call.deadline, std::chrono::steady_clock::now());
         auto leased = bbt_co_await state->pool.Acquire(valid.value().origin, request.address, deadlines);
-        if (!leased) { return fail(std::move(leased.error())); }
+        if (!leased) {
+            return fail(std::move(leased.error()));
+        }
         auto exchanged = bbt_co_await leased.value().connection->Exchange(request, serialized.value(), deadlines);
-        if (!exchanged) { return fail(std::move(exchanged.error())); }
+        if (!exchanged) {
+            return fail(std::move(exchanged.error()));
+        }
         leased.value().Release(exchanged.value().keep_alive);
         return result<Response>::ok(std::move(exchanged.value().response));
     } catch (const std::exception& error) {
-        return result<Response>::err(MakeError(ErrorCode::InternalError,
-            "http client: " + std::string(error.what())));
+        return result<Response>::err(MakeError(ErrorCode::InternalError, "http client: " + std::string(error.what())));
     }
 }
 
-void Client::Close(Error reason) noexcept {
+void Client::Close(Error reason) noexcept
+{
     const auto state = m_state;
-    if (!state) { return; }
+    if (!state) {
+        return;
+    }
     try {
         state->pool.Close(std::move(reason));
     } catch (...) {
@@ -489,20 +563,22 @@ void Client::Close(Error reason) noexcept {
     }
 }
 
-bool Client::IsClosed() const noexcept {
+bool Client::IsClosed() const noexcept
+{
     const auto state = m_state;
     return state && state->pool.IsClosed();
 }
 
-std::optional<Error> Client::CloseReason() const noexcept {
+std::optional<Error> Client::CloseReason() const noexcept
+{
     const auto state = m_state;
     return state ? state->pool.CloseReason() : std::nullopt;
 }
 
-result<void> Client::Shutdown(bbt::coroutine::Deadline deadline) {
+result<void> Client::Shutdown(bbt::coroutine::Deadline deadline)
+{
     if (!NativeHost()) {
-        return result<void>::err(MakeError(
-            ErrorCode::InvalidContext, "http client: Shutdown requires native host"));
+        return result<void>::err(MakeError(ErrorCode::InvalidContext, "http client: Shutdown requires native host"));
     }
     const auto state = m_state;
     if (!state) {
@@ -511,9 +587,32 @@ result<void> Client::Shutdown(bbt::coroutine::Deadline deadline) {
     return state->pool.Shutdown(deadline);
 }
 
-PoolStats Client::Stats() const noexcept {
+PoolStats Client::Stats() const noexcept
+{
     const auto state = m_state;
     return state ? state->pool.Stats() : PoolStats{};
+}
+
+} // namespace bbt::infra::http
+
+namespace bbt::infra::http {
+
+std::optional<std::chrono::milliseconds> PhaseTimeout::Finite() const noexcept
+{
+    if (m_kind != Kind::Finite) {
+        return std::nullopt;
+    }
+    return m_value;
+}
+
+Timeout Timeout::Uniform(PhaseTimeout phase) noexcept
+{
+    Timeout value;
+    value.connect = phase;
+    value.read = phase;
+    value.write = phase;
+    value.pool = phase;
+    return value;
 }
 
 } // namespace bbt::infra::http

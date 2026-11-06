@@ -20,14 +20,17 @@ using bbt::infra::ErrorCode;
 
 namespace {
 
-Value Map(std::initializer_list<std::pair<std::string, std::string>> kv) {
+Value Map(std::initializer_list<std::pair<std::string, std::string>> kv)
+{
     Value::Map m;
-    for (const auto& p : kv) m.emplace(p.first, p.second);
+    for (const auto& p : kv)
+        m.emplace(p.first, p.second);
     return Value::FromMap(std::move(m));
 }
 
 // 临时文件统一落在 TMPDIR（进程 scratch），不放系统 /tmp。
-std::string MakeTempPath(const char* name) {
+std::string MakeTempPath(const char* name)
+{
     const char* t = std::getenv("TMPDIR");
     std::string dir = (t && *t) ? t : ".";
     std::string tmpl = dir + "/" + name + "_XXXXXX";
@@ -39,24 +42,24 @@ std::string MakeTempPath(const char* name) {
     return std::string(buf.data());
 }
 
-void WriteFile(const std::string& path, const std::string& content) {
+void WriteFile(const std::string& path, const std::string& content)
+{
     std::ofstream f(path, std::ios::trunc);
     f << content;
     BOOST_REQUIRE(f.good());
 }
 
-std::string MakeTempFile(const char* name, const std::string& content) {
+std::string MakeTempFile(const char* name, const std::string& content)
+{
     const std::string path = MakeTempPath(name);
     WriteFile(path, content);
     return path;
 }
 
-BOOST_AUTO_TEST_CASE(value_typed_getters) {
-    auto v = Map({{"server.host", "127.0.0.1"},
-                  {"server.port", "8080"},
-                  {"enabled", "true"},
-                  {"ratio", "0.5"},
-                  {"empty", ""}});
+BOOST_AUTO_TEST_CASE(value_typed_getters)
+{
+    auto v = Map(
+        {{"server.host", "127.0.0.1"}, {"server.port", "8080"}, {"enabled", "true"}, {"ratio", "0.5"}, {"empty", ""}});
     BOOST_CHECK(v.Has("server.host"));
     BOOST_CHECK(!v.Has("nope"));
     BOOST_CHECK_EQUAL(v.Size(), 5u);
@@ -80,8 +83,7 @@ BOOST_AUTO_TEST_CASE(value_typed_getters) {
     // 缺失键 → NotFound
     auto missing = v.GetString("nope");
     BOOST_CHECK(!missing);
-    BOOST_CHECK(static_cast<int>(missing.error().code) ==
-                static_cast<int>(ErrorCode::NotFound));
+    BOOST_CHECK(static_cast<int>(missing.error().code) == static_cast<int>(ErrorCode::NotFound));
 
     // 空串是「存在且为空」，与缺失区分
     auto empty = v.GetString("empty");
@@ -90,14 +92,13 @@ BOOST_AUTO_TEST_CASE(value_typed_getters) {
 
     // 类型不匹配 → TypeMismatch
     BOOST_CHECK(!v.GetInt64("server.host"));
-    BOOST_CHECK(static_cast<int>(v.GetInt64("server.host").error().code) ==
-                static_cast<int>(ErrorCode::TypeMismatch));
+    BOOST_CHECK(static_cast<int>(v.GetInt64("server.host").error().code) == static_cast<int>(ErrorCode::TypeMismatch));
     BOOST_CHECK(!v.GetBool("server.host"));
     BOOST_CHECK(!v.GetDouble("server.host"));
 
     // bool 全真/全假集合
-    auto b = Map({{"a", "1"}, {"b", "0"}, {"c", "yes"}, {"d", "no"},
-                  {"e", "on"}, {"f", "off"}, {"g", "TRUE"}, {"h", "False"}});
+    auto b = Map(
+        {{"a", "1"}, {"b", "0"}, {"c", "yes"}, {"d", "no"}, {"e", "on"}, {"f", "off"}, {"g", "TRUE"}, {"h", "False"}});
     BOOST_CHECK(b.GetBool("a").value());
     BOOST_CHECK(!b.GetBool("b").value());
     BOOST_CHECK(b.GetBool("c").value());
@@ -108,7 +109,8 @@ BOOST_AUTO_TEST_CASE(value_typed_getters) {
     BOOST_CHECK(!b.GetBool("h").value());
 }
 
-BOOST_AUTO_TEST_CASE(value_fingerprint_stable) {
+BOOST_AUTO_TEST_CASE(value_fingerprint_stable)
+{
     const auto v1 = Map({{"a", "1"}, {"b", "2"}});
     const auto v2 = Map({{"a", "1"}, {"b", "2"}});
     const auto v3 = Map({{"b", "2"}, {"a", "1"}}); // 乱序构造，映射排序后一致
@@ -119,7 +121,8 @@ BOOST_AUTO_TEST_CASE(value_fingerprint_stable) {
     BOOST_CHECK_EQUAL(v1.Fingerprint().size(), 16u);
 }
 
-BOOST_AUTO_TEST_CASE(memory_source_versions) {
+BOOST_AUTO_TEST_CASE(memory_source_versions)
+{
     MemorySource src("app", "server");
 
     const auto s0 = src.Current();
@@ -151,17 +154,17 @@ BOOST_AUTO_TEST_CASE(memory_source_versions) {
     // 显式版本必须严格递增
     const auto bad = src.Set(Map({{"a", "3"}}), 3);
     BOOST_CHECK(!bad);
-    BOOST_CHECK(static_cast<int>(bad.error().code) ==
-                static_cast<int>(ErrorCode::InvalidArgument));
+    BOOST_CHECK(static_cast<int>(bad.error().code) == static_cast<int>(ErrorCode::InvalidArgument));
 
     const auto s4 = src.Set(Map({{"a", "4"}}), 10);
     BOOST_REQUIRE(s4);
     BOOST_CHECK_EQUAL(s4.value().version, 10u);
 }
 
-BOOST_AUTO_TEST_CASE(file_source_read_and_update) {
-    const std::string path = MakeTempFile(
-        "cfg_unit", "# comment\nversion = 5\nserver.host = 127.0.0.1\nserver.port = 8080\n");
+BOOST_AUTO_TEST_CASE(file_source_read_and_update)
+{
+    const std::string path =
+        MakeTempFile("cfg_unit", "# comment\nversion = 5\nserver.host = 127.0.0.1\nserver.port = 8080\n");
     auto src = FileSource::Create(path, "app", "server");
     BOOST_REQUIRE(src);
 
@@ -190,7 +193,8 @@ BOOST_AUTO_TEST_CASE(file_source_read_and_update) {
     ::unlink(path.c_str());
 }
 
-BOOST_AUTO_TEST_CASE(file_source_malformed_no_pseudo_success) {
+BOOST_AUTO_TEST_CASE(file_source_malformed_no_pseudo_success)
+{
     // version 非数字
     {
         const std::string p = MakeTempFile("cfg_badver", "version = abc\nk = v\n");
@@ -198,8 +202,7 @@ BOOST_AUTO_TEST_CASE(file_source_malformed_no_pseudo_success) {
         BOOST_REQUIRE(src);
         auto r = src.value()->Read();
         BOOST_CHECK(!r);
-        BOOST_CHECK(static_cast<int>(r.error().code) ==
-                    static_cast<int>(ErrorCode::ProtocolError));
+        BOOST_CHECK(static_cast<int>(r.error().code) == static_cast<int>(ErrorCode::ProtocolError));
         ::unlink(p.c_str());
     }
     // 重复键
@@ -209,8 +212,7 @@ BOOST_AUTO_TEST_CASE(file_source_malformed_no_pseudo_success) {
         BOOST_REQUIRE(src);
         auto r = src.value()->Read();
         BOOST_CHECK(!r);
-        BOOST_CHECK(static_cast<int>(r.error().code) ==
-                    static_cast<int>(ErrorCode::ProtocolError));
+        BOOST_CHECK(static_cast<int>(r.error().code) == static_cast<int>(ErrorCode::ProtocolError));
         ::unlink(p.c_str());
     }
     // 无 '='
@@ -220,8 +222,7 @@ BOOST_AUTO_TEST_CASE(file_source_malformed_no_pseudo_success) {
         BOOST_REQUIRE(src);
         auto r = src.value()->Read();
         BOOST_CHECK(!r);
-        BOOST_CHECK(static_cast<int>(r.error().code) ==
-                    static_cast<int>(ErrorCode::ProtocolError));
+        BOOST_CHECK(static_cast<int>(r.error().code) == static_cast<int>(ErrorCode::ProtocolError));
         ::unlink(p.c_str());
     }
     // 空键
@@ -234,16 +235,17 @@ BOOST_AUTO_TEST_CASE(file_source_malformed_no_pseudo_success) {
     }
 }
 
-BOOST_AUTO_TEST_CASE(file_source_missing) {
+BOOST_AUTO_TEST_CASE(file_source_missing)
+{
     auto src = FileSource::Create("/nonexistent/definitely/missing.cfg", "app", "k");
     BOOST_REQUIRE(src);
     auto r = src.value()->Read();
     BOOST_CHECK(!r);
-    BOOST_CHECK(static_cast<int>(r.error().code) ==
-                static_cast<int>(ErrorCode::NotFound));
+    BOOST_CHECK(static_cast<int>(r.error().code) == static_cast<int>(ErrorCode::NotFound));
 }
 
-BOOST_AUTO_TEST_CASE(file_source_directory_and_empty) {
+BOOST_AUTO_TEST_CASE(file_source_directory_and_empty)
+{
     // 目录路径：open 成功但读取失败 → InternalError，不得发布伪成功空快照
     const char* t = std::getenv("TMPDIR");
     std::string dir = (t && *t) ? t : ".";
@@ -257,8 +259,7 @@ BOOST_AUTO_TEST_CASE(file_source_directory_and_empty) {
         BOOST_REQUIRE(src);
         auto r = src.value()->Read();
         BOOST_CHECK(!r);
-        BOOST_CHECK(static_cast<int>(r.error().code) ==
-                    static_cast<int>(ErrorCode::InternalError));
+        BOOST_CHECK(static_cast<int>(r.error().code) == static_cast<int>(ErrorCode::InternalError));
     }
     ::rmdir(dirpath.c_str());
 

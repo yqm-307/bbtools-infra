@@ -24,17 +24,21 @@ struct ServerHost {
     std::error_code run_error;
     net::Address address;
     ServerHost(http::StreamingServerHandler handler, http::ServerOptions options = {},
-               http::StreamingOptions streaming = {}, bool start = true,
-               std::int64_t outbound = 1024 * 1024, unsigned loops = 1,
-               int send_buffer = 4096, bool ordinary = false) {
-        auto made = ordinary
-            ? http::Server::Create(engine,
-                [handler = std::move(handler)](IncomingCallContext context, http::IncomingRequest request) {
-                    auto reply = handler(std::move(context), std::move(request));
-                    if (!reply) { return result<http::Response>::err(reply.error()); }
-                    return result<http::Response>::ok(std::get<http::Response>(std::move(reply).value()));
-                }, options)
-            : http::Server::CreateStreaming(engine, std::move(handler), options, streaming);
+               http::StreamingOptions streaming = {}, bool start = true, std::int64_t outbound = 1024 * 1024,
+               unsigned loops = 1, int send_buffer = 4096, bool ordinary = false)
+    {
+        auto made =
+            ordinary ? http::Server::Create(
+                           engine,
+                           [handler = std::move(handler)](IncomingCallContext context, http::IncomingRequest request) {
+                               auto reply = handler(std::move(context), std::move(request));
+                               if (!reply) {
+                                   return result<http::Response>::err(reply.error());
+                               }
+                               return result<http::Response>::ok(std::get<http::Response>(std::move(reply).value()));
+                           },
+                           options)
+                     : http::Server::CreateStreaming(engine, std::move(handler), options, streaming);
         CHECK(made);
         server = std::move(made).value();
         CHECK(engine->Phase() == net::EnginePhase::Idle);
@@ -51,14 +55,20 @@ struct ServerHost {
         std::vector<net::Address> addresses;
         CHECK(!engine->LocalAddresses(addresses) && addresses.size() == 1);
         address = addresses[0];
-        if (start) { CHECK(server->Start()); }
+        if (start) {
+            CHECK(server->Start());
+        }
     }
-    ~ServerHost() {
+    ~ServerHost()
+    {
         server->Close();
         engine->RequestClose();
-        if (runner.joinable()) { runner.join(); }
+        if (runner.joinable()) {
+            runner.join();
+        }
     }
-    void Finish() {
+    void Finish()
+    {
         server->StopAccepting();
         CHECK(server->Drain(std::chrono::steady_clock::now() + 3s));
         server->Close();
@@ -71,7 +81,8 @@ struct ServerHost {
         runner.join();
         CHECK(!run_error && engine->Phase() == net::EnginePhase::Stopped);
         CHECK(engine->CountConnections() == 0 && Access::FirstConnectionFd(*engine) == -1);
-        std::cout << "server receipt http_tasks=0 sessions=0 inflight=0 listener_stopped=1 run_joined=1 connections=0\n";
+        std::cout
+            << "server receipt http_tasks=0 sessions=0 inflight=0 listener_stopped=1 run_joined=1 connections=0\n";
     }
 };
 
@@ -89,23 +100,27 @@ public:
     http::StreamStart start;
     std::vector<Step> steps;
     std::atomic<unsigned> starts{0}, nexts{0}, cancels{0}, pauses{0};
-    std::shared_ptr<bbt::coroutine::sync::CoWaiter> release{
-        bbt::coroutine::sync::CoWaiter::Create()};
+    std::shared_ptr<bbt::coroutine::sync::CoWaiter> release{bbt::coroutine::sync::CoWaiter::Create()};
 
-    static std::shared_ptr<ListBody> Make(http::StreamStart start, std::vector<Step> steps) {
+    static std::shared_ptr<ListBody> Make(http::StreamStart start, std::vector<Step> steps)
+    {
         auto body = std::make_shared<ListBody>();
         body->start = std::move(start);
         body->steps = std::move(steps);
         return body;
     }
-    void Release() { release->Notify(); }
+    void Release()
+    {
+        release->Notify();
+    }
 
-    bbt_co_async(result<http::StreamStart>) Start(const bbt::coroutine::WaitOptions&) override {
+    bbt_co_async(result<http::StreamStart>) Start(const bbt::coroutine::WaitOptions&) override
+    {
         ++starts;
         return result<http::StreamStart>::ok(start);
     }
-    bbt_co_async(result<std::optional<std::string>>) Next(
-        const bbt::coroutine::WaitOptions& options) override {
+    bbt_co_async(result<std::optional<std::string>>) Next(const bbt::coroutine::WaitOptions& options) override
+    {
         const auto index = nexts.fetch_add(1);
         if (index >= steps.size()) {
             return result<std::optional<std::string>>::ok(std::optional<std::string>{});
@@ -113,8 +128,7 @@ public:
         const auto& step = steps[index];
         switch (step.kind) {
         case Step::Kind::Chunk:
-            return result<std::optional<std::string>>::ok(
-                std::optional<std::string>{step.data});
+            return result<std::optional<std::string>>::ok(std::optional<std::string>{step.data});
         case Step::Kind::Eof:
             return result<std::optional<std::string>>::ok(std::optional<std::string>{});
         case Step::Kind::Error:
@@ -122,34 +136,44 @@ public:
         case Step::Kind::Pause: {
             ++pauses;
             const auto status = release->WaitWithCallback(options, [] { return true; });
-            if (status == bbt::coroutine::WaitStatus::TimedOut ||
-                status == bbt::coroutine::WaitStatus::Cancelled) {
-                return result<std::optional<std::string>>::err(
-                    MakeError(ErrorCode::TimedOut, "source wait expired"));
+            if (status == bbt::coroutine::WaitStatus::TimedOut || status == bbt::coroutine::WaitStatus::Cancelled) {
+                return result<std::optional<std::string>>::err(MakeError(ErrorCode::TimedOut, "source wait expired"));
             }
-            return result<std::optional<std::string>>::ok(
-                std::optional<std::string>{step.data});
+            return result<std::optional<std::string>>::ok(std::optional<std::string>{step.data});
         }
         }
-        return result<std::optional<std::string>>::err(
-            MakeError(ErrorCode::InternalError, "unreachable"));
+        return result<std::optional<std::string>>::err(MakeError(ErrorCode::InternalError, "unreachable"));
     }
-    void Cancel() noexcept override {
+    void Cancel() noexcept override
+    {
         ++cancels;
         release->Notify();
     }
 };
 
 using Step = ListBody::Step;
-Step Chunk(std::string data) { return {Step::Kind::Chunk, std::move(data), {}}; }
-Step Eof() { return {Step::Kind::Eof, {}, {}}; }
-Step Fail(ErrorCode code) { return {Step::Kind::Error, {}, code}; }
-Step Pause(std::string data = {}) { return {Step::Kind::Pause, std::move(data), {}}; }
+Step Chunk(std::string data)
+{
+    return {Step::Kind::Chunk, std::move(data), {}};
+}
+Step Eof()
+{
+    return {Step::Kind::Eof, {}, {}};
+}
+Step Fail(ErrorCode code)
+{
+    return {Step::Kind::Error, {}, code};
+}
+Step Pause(std::string data = {})
+{
+    return {Step::Kind::Pause, std::move(data), {}};
+}
 
 struct Peer {
     int fd{-1};
     std::string pending;
-    explicit Peer(const net::Address& address) {
+    explicit Peer(const net::Address& address)
+    {
         fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
         CHECK(fd >= 0);
         timeval timeout{5, 0};
@@ -161,20 +185,35 @@ struct Peer {
         target.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         CHECK(::connect(fd, reinterpret_cast<sockaddr*>(&target), sizeof(target)) == 0);
     }
-    ~Peer() { if (fd >= 0) { ::close(fd); } }
-    void Send(const std::string& bytes) { CHECK(HttpPeer::SendForHook(fd, bytes)); }
+    ~Peer()
+    {
+        if (fd >= 0) {
+            ::close(fd);
+        }
+    }
+    void Send(const std::string& bytes)
+    {
+        CHECK(HttpPeer::SendForHook(fd, bytes));
+    }
     // 读原始字节（含小睡等的有限尝试；不做协议解析，chunk wire 逐字节比对）。
-    std::string ReadRaw(std::size_t want, std::chrono::milliseconds patience = 3s) {
+    std::string ReadRaw(std::size_t want, std::chrono::milliseconds patience = 3s)
+    {
         const auto end = std::chrono::steady_clock::now() + patience;
         while (pending.size() < want) {
             const auto left = end - std::chrono::steady_clock::now();
-            if (left <= 0ms) { break; }
+            if (left <= 0ms) {
+                break;
+            }
             pollfd pfd{fd, POLLIN, 0};
             const auto ms = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(left).count());
-            if (::poll(&pfd, 1, std::max(1, ms)) != 1) { break; }
+            if (::poll(&pfd, 1, std::max(1, ms)) != 1) {
+                break;
+            }
             char bytes[65536];
             const auto n = ::recv(fd, bytes, sizeof(bytes), 0);
-            if (n <= 0) { break; }
+            if (n <= 0) {
+                break;
+            }
             pending.append(bytes, static_cast<std::size_t>(n));
         }
         auto out = pending.substr(0, want);
@@ -182,24 +221,32 @@ struct Peer {
         return out;
     }
     // 读至 EOF 或超时，返回全部字节（诊断/断言用）。
-    std::string Drain(std::chrono::milliseconds patience = 3s) {
+    std::string Drain(std::chrono::milliseconds patience = 3s)
+    {
         const auto end = std::chrono::steady_clock::now() + patience;
         for (;;) {
             const auto left = end - std::chrono::steady_clock::now();
-            if (left <= 0ms) { break; }
+            if (left <= 0ms) {
+                break;
+            }
             pollfd pfd{fd, POLLIN, 0};
             const auto ms = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(left).count());
-            if (::poll(&pfd, 1, std::max(1, ms)) != 1) { break; }
+            if (::poll(&pfd, 1, std::max(1, ms)) != 1) {
+                break;
+            }
             char bytes[65536];
             const auto n = ::recv(fd, bytes, sizeof(bytes), 0);
-            if (n <= 0) { break; }
+            if (n <= 0) {
+                break;
+            }
             pending.append(bytes, static_cast<std::size_t>(n));
         }
         auto out = std::move(pending);
         pending.clear();
         return out;
     }
-    http::Response Read(bool head = false) {
+    http::Response Read(bool head = false)
+    {
         wire::response_parser<wire::string_body> parser;
         parser.body_limit(16 * 1024 * 1024);
         parser.eager(true);
@@ -210,8 +257,12 @@ struct Peer {
                 const auto consumed = parser.put(boost::asio::buffer(pending), error);
                 pending.erase(0, consumed);
                 CHECK(!error || error == wire::error::need_more);
-                if (parser.is_done()) { break; }
-                if (consumed) { continue; }
+                if (parser.is_done()) {
+                    break;
+                }
+                if (consumed) {
+                    continue;
+                }
             }
             char bytes[32768];
             auto size = ::recv(fd, bytes, sizeof(bytes), 0);
@@ -220,37 +271,46 @@ struct Peer {
         }
         const auto& message = parser.get();
         http::Response out{static_cast<int>(message.result_int()), {}, message.body()};
-        for (auto& field : message) { out.headers.emplace_back(std::string(field.name_string()), std::string(field.value())); }
+        for (auto& field : message) {
+            out.headers.emplace_back(std::string(field.name_string()), std::string(field.value()));
+        }
         return out;
     }
-    bool Eof() {
+    bool Eof()
+    {
         char bytes[64];
         const auto n = ::recv(fd, bytes, sizeof(bytes), 0);
         return n == 0 || (n < 0 && errno == ECONNRESET);
     }
 };
 
-http::StreamingServerHandler Route(
-    std::function<result<http::ServerReply>(IncomingCallContext, http::IncomingRequest)> fn) {
+http::StreamingServerHandler
+Route(std::function<result<http::ServerReply>(IncomingCallContext, http::IncomingRequest)> fn)
+{
     return fn;
 }
 
-result<http::ServerReply> Buffered(int status, std::string body, http::Headers headers = {}) {
-    return result<http::ServerReply>::ok(http::ServerReply{http::Response{status, std::move(headers), std::move(body)}});
+result<http::ServerReply> Buffered(int status, std::string body, http::Headers headers = {})
+{
+    return result<http::ServerReply>::ok(
+        http::ServerReply{http::Response{status, std::move(headers), std::move(body)}});
 }
-result<http::ServerReply> Stream(std::shared_ptr<http::ResponseBody> body) {
+result<http::ServerReply> Stream(std::shared_ptr<http::ResponseBody> body)
+{
     return result<http::ServerReply>::ok(http::ServerReply{std::move(body)});
 }
 
 // 1) chunked wire 字节证据：TE 头 + HEX 块边界 + 0 终止块；keep-alive 后连接复用。
-void ChunkedWire() {
+void ChunkedWire()
+{
     std::atomic<unsigned> calls{0};
-    auto body = ListBody::Make(
-        {http::StreamStart::Mode::Chunked, 200, {{"X-Stream", "yes"}}, "", {}},
-        {Chunk("hello-"), Chunk(std::string(300, 'x')), Eof()});
+    auto body = ListBody::Make({http::StreamStart::Mode::Chunked, 200, {{"X-Stream", "yes"}}, "", {}},
+                               {Chunk("hello-"), Chunk(std::string(300, 'x')), Eof()});
     ServerHost host(Route([&](IncomingCallContext, http::IncomingRequest request) {
         ++calls;
-        if (request.target == "/stream") { return Stream(body); }
+        if (request.target == "/stream") {
+            return Stream(body);
+        }
         return Buffered(200, "plain");
     }));
     Peer peer(host.address);
@@ -279,13 +339,18 @@ void ChunkedWire() {
 }
 
 // 2) ServerReply variant：Response 与 StreamStart::Buffered 均走普通 buffered 路径。
-void VariantBuffered() {
-    auto body = ListBody::Make({http::StreamStart::Mode::Buffered, 201,
-                                {{"X-Mode", "buffered"}}, "body-from-start", ""},
-                               {Fail(ErrorCode::InternalError)}); // Next 不应被调用
+void VariantBuffered()
+{
+    auto body =
+        ListBody::Make({http::StreamStart::Mode::Buffered, 201, {{"X-Mode", "buffered"}}, "body-from-start", ""},
+                       {Fail(ErrorCode::InternalError)}); // Next 不应被调用
     ServerHost host(Route([&](IncomingCallContext, http::IncomingRequest request) {
-        if (request.target == "/buffered") { return Stream(body); }
-        if (request.target == "/direct") { return Buffered(202, "direct-reply"); }
+        if (request.target == "/buffered") {
+            return Stream(body);
+        }
+        if (request.target == "/direct") {
+            return Buffered(202, "direct-reply");
+        }
         return Buffered(404, "missing");
     }));
     {
@@ -310,15 +375,20 @@ void VariantBuffered() {
 }
 
 // 3) HEAD/204/304 拒绝 chunked：Start 已调用但 commit 前协议拒绝、明确断开。
-void ChunkedDisallowed() {
+void ChunkedDisallowed()
+{
     std::atomic<unsigned> calls{0};
     auto make_body = [&](int status) {
         return ListBody::Make({http::StreamStart::Mode::Chunked, status, {}, {}, "x"}, {Eof()});
     };
     ServerHost host(Route([&](IncomingCallContext, http::IncomingRequest request) {
         ++calls;
-        if (request.target == "/204") { return Stream(make_body(204)); }
-        if (request.target == "/304") { return Stream(make_body(304)); }
+        if (request.target == "/204") {
+            return Stream(make_body(204));
+        }
+        if (request.target == "/304") {
+            return Stream(make_body(304));
+        }
         return Stream(make_body(200));
     }));
     {
@@ -343,27 +413,35 @@ void ChunkedDisallowed() {
 // Start 失败的源包装：Start 返回 err，Next 不可达。
 class FailStartBody : public http::ResponseBody {
 public:
-    explicit FailStartBody(std::shared_ptr<ListBody> inner) : m_inner(std::move(inner)) {}
-    bbt_co_async(result<http::StreamStart>) Start(const bbt::coroutine::WaitOptions&) override {
+    explicit FailStartBody(std::shared_ptr<ListBody> inner) : m_inner(std::move(inner))
+    {
+    }
+    bbt_co_async(result<http::StreamStart>) Start(const bbt::coroutine::WaitOptions&) override
+    {
         ++m_inner->starts;
         return result<http::StreamStart>::err(MakeError(ErrorCode::InternalError, "start failed"));
     }
-    bbt_co_async(result<std::optional<std::string>>) Next(
-        const bbt::coroutine::WaitOptions&) override {
+    bbt_co_async(result<std::optional<std::string>>) Next(const bbt::coroutine::WaitOptions&) override
+    {
         ++m_inner->nexts;
-        return result<std::optional<std::string>>::err(
-            MakeError(ErrorCode::InternalError, "must not reach"));
+        return result<std::optional<std::string>>::err(MakeError(ErrorCode::InternalError, "must not reach"));
     }
-    void Cancel() noexcept override { ++m_inner->cancels; }
+    void Cancel() noexcept override
+    {
+        ++m_inner->cancels;
+    }
+
 private:
     std::shared_ptr<ListBody> m_inner;
 };
-std::shared_ptr<http::ResponseBody> BodyStartFails(std::shared_ptr<ListBody> inner) {
+std::shared_ptr<http::ResponseBody> BodyStartFails(std::shared_ptr<ListBody> inner)
+{
     return std::make_shared<FailStartBody>(std::move(inner));
 }
 
 // 4) commit 前后错误分界：Start err → 500；Next err（commit 后）→ 断连无终止块。
-void CommitBoundary() {
+void CommitBoundary()
+{
     ServerHost host(Route([&](IncomingCallContext, http::IncomingRequest request) {
         if (request.target == "/start-fail") {
             auto body = ListBody::Make({http::StreamStart::Mode::Chunked, 200, {}, "", {}}, {Eof()});
@@ -397,12 +475,11 @@ void CommitBoundary() {
 }
 
 // 5) peer FIN/RST：写路径失败即收口（不重发），连接关闭、源取消一次。
-void PeerAbort() {
+void PeerAbort()
+{
     auto body = ListBody::Make({http::StreamStart::Mode::Chunked, 200, {}, {}, "first"},
                                {Chunk("second"), Pause(), Chunk("never")});
-    ServerHost host(Route([&](IncomingCallContext, http::IncomingRequest) {
-        return Stream(body);
-    }));
+    ServerHost host(Route([&](IncomingCallContext, http::IncomingRequest) { return Stream(body); }));
     {
         Peer peer(host.address);
         peer.Send("GET / HTTP/1.1\r\nHost: a\r\n\r\n");
@@ -426,17 +503,16 @@ void PeerAbort() {
 //    断连且源取消；Drain 计数覆盖到最终写终态而非 handler 返回。
 //    阶段证据：写超时计时从请求时刻起算，取消断言 ≥ 配置 timeout 才可通过；
 //    与 B3 的 max_chunk_bytes 守卫取消区分（守卫路径 elapsed < 1ms）。
-void SlowReaderBackpressure() {
+void SlowReaderBackpressure()
+{
     const std::string big(512 * 1024, 'B');
-    auto body = ListBody::Make({http::StreamStart::Mode::Chunked, 200, {}, "", {}},
-                               {Chunk(big), Chunk(big), Eof()});
+    auto body = ListBody::Make({http::StreamStart::Mode::Chunked, 200, {}, "", {}}, {Chunk(big), Chunk(big), Eof()});
     http::ServerOptions options;
     http::StreamingOptions streaming;
     streaming.max_chunk_bytes = 1024 * 1024; // ≥ 512KiB 块通过 max_chunk 守卫，进入写超时阶段
     streaming.stream_write_timeout = 120ms;
-    ServerHost host(Route([&](IncomingCallContext, http::IncomingRequest) {
-        return Stream(body);
-    }), options, streaming, true, 8 * 1024, 1, 2048); // 小 outbound/send buffer 放大背压
+    ServerHost host(Route([&](IncomingCallContext, http::IncomingRequest) { return Stream(body); }), options, streaming,
+                    true, 8 * 1024, 1, 2048); // 小 outbound/send buffer 放大背压
     Peer peer(host.address);
     int rcvbuf = 2048;
     CHECK(::setsockopt(peer.fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) == 0);
@@ -444,8 +520,8 @@ void SlowReaderBackpressure() {
     // 不读制造 slow reader；写侧在 stream_write_timeout 内失败 → 取消源、断连。
     const auto started = std::chrono::steady_clock::now();
     CHECK(WaitUntil([&] { return body->cancels.load() >= 1; }, 6s));
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - started);
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started);
     // 阶段证据：必须实际等待 write timeout（≥120ms）；max_chunk 守卫路径 <1ms。
     CHECK(elapsed >= streaming.stream_write_timeout);
     std::cout << "stage_evidence write_timeout_elapsed_ms=" << elapsed.count()
@@ -455,12 +531,10 @@ void SlowReaderBackpressure() {
 }
 
 // 7) 生命周期收口：StopAccepting→Drain(超时)→Close(取消源)→WaitStopped→Released。
-void LifecycleDrain() {
-    auto body = ListBody::Make({http::StreamStart::Mode::Chunked, 200, {}, {}, "head"},
-                               {Pause("tail"), Eof()});
-    ServerHost host(Route([&](IncomingCallContext, http::IncomingRequest) {
-        return Stream(body);
-    }));
+void LifecycleDrain()
+{
+    auto body = ListBody::Make({http::StreamStart::Mode::Chunked, 200, {}, {}, "head"}, {Pause("tail"), Eof()});
+    ServerHost host(Route([&](IncomingCallContext, http::IncomingRequest) { return Stream(body); }));
     Peer peer(host.address);
     peer.Send("GET / HTTP/1.1\r\nHost: a\r\n\r\n");
     CHECK(peer.ReadRaw(128).find("200") != std::string::npos);
@@ -480,14 +554,12 @@ void LifecycleDrain() {
 
 // 8) 流总期限：max_stream_lifetime 到期 → Next 内等待按传入 deadline 到期失败，
 //    提交后错误路径取消源并关连接。
-void StreamLifetime() {
-    auto body = ListBody::Make({http::StreamStart::Mode::Chunked, 200, {}, {}, "x"},
-                               {Chunk("y"), Pause(), Eof()});
+void StreamLifetime()
+{
+    auto body = ListBody::Make({http::StreamStart::Mode::Chunked, 200, {}, {}, "x"}, {Chunk("y"), Pause(), Eof()});
     http::StreamingOptions streaming;
     streaming.max_stream_lifetime = 150ms;
-    ServerHost host(Route([&](IncomingCallContext, http::IncomingRequest) {
-        return Stream(body);
-    }), {}, streaming);
+    ServerHost host(Route([&](IncomingCallContext, http::IncomingRequest) { return Stream(body); }), {}, streaming);
     Peer peer(host.address);
     peer.Send("GET / HTTP/1.1\r\nHost: a\r\n\r\n");
     const auto bytes = peer.ReadRaw(256);
@@ -501,16 +573,16 @@ void StreamLifetime() {
 
 // 9) Start 遵守传入期限：超 incoming 总期限返回 err；此时总期限已尽、回复写
 //    不再可行，按「超限明确断开」收口（500 路径已由 commit_boundary/start-fail 覆盖）。
-void StartDeadline() {
+void StartDeadline()
+{
     http::ServerOptions options;
     options.limits.incoming_timeout = 100ms;
     class SlowStartBody : public http::ResponseBody {
     public:
-        std::shared_ptr<bbt::coroutine::sync::CoWaiter> release{
-            bbt::coroutine::sync::CoWaiter::Create()};
+        std::shared_ptr<bbt::coroutine::sync::CoWaiter> release{bbt::coroutine::sync::CoWaiter::Create()};
         std::atomic<unsigned> cancels{0};
-        bbt_co_async(result<http::StreamStart>) Start(
-            const bbt::coroutine::WaitOptions& options) override {
+        bbt_co_async(result<http::StreamStart>) Start(const bbt::coroutine::WaitOptions& options) override
+        {
             const auto status = release->WaitWithCallback(options, [] { return true; });
             if (status == bbt::coroutine::WaitStatus::TimedOut) {
                 return result<http::StreamStart>::err(MakeError(ErrorCode::TimedOut, "start expired"));
@@ -518,16 +590,18 @@ void StartDeadline() {
             return result<http::StreamStart>::ok(
                 http::StreamStart{http::StreamStart::Mode::Chunked, 200, {}, {}, "late"});
         }
-        bbt_co_async(result<std::optional<std::string>>) Next(
-            const bbt::coroutine::WaitOptions&) override {
+        bbt_co_async(result<std::optional<std::string>>) Next(const bbt::coroutine::WaitOptions&) override
+        {
             return result<std::optional<std::string>>::ok(std::optional<std::string>{});
         }
-        void Cancel() noexcept override { ++cancels; release->Notify(); }
+        void Cancel() noexcept override
+        {
+            ++cancels;
+            release->Notify();
+        }
     };
     auto body = std::make_shared<SlowStartBody>();
-    ServerHost host(Route([&](IncomingCallContext, http::IncomingRequest) {
-        return Stream(body);
-    }), options);
+    ServerHost host(Route([&](IncomingCallContext, http::IncomingRequest) { return Stream(body); }), options);
     Peer peer(host.address);
     peer.Send("GET / HTTP/1.1\r\nHost: a\r\n\r\n");
     CHECK(WaitUntil([&] { return peer.Eof(); }, 5s)); // 期限尽：放弃连接不写 500
@@ -537,7 +611,8 @@ void StartDeadline() {
 
 // 10) Close-during-handler：handler 内 Close 后返回 ResponseBody；source 注册时
 //     closing 已置位，ServeStream 检测后取消一次、不 Start、连接关闭。
-void CloseDuringHandler() {
+void CloseDuringHandler()
+{
     Gate gate; // handler 暂停屏障：测试线程在 handler 执行期间调用 Close
     auto body = ListBody::Make({http::StreamStart::Mode::Chunked, 200, {}, "", "x"}, {Eof()});
     ServerHost host(Route([&](IncomingCallContext, http::IncomingRequest) {
@@ -552,37 +627,38 @@ void CloseDuringHandler() {
     CHECK(WaitUntil([&] { return body->cancels.load() >= 1; }, 5s));
     CHECK(WaitUntil([&] { return peer.Eof(); }, 5s));
     CHECK(WaitUntil([&] { return host.server->Stats().sessions == 0; }, 5s));
-    CHECK(body->cancels == 1);  // 恰好一次
-    CHECK(body->starts == 0);   // closing 窗口：source 不应被 Start
+    CHECK(body->cancels == 1); // 恰好一次
+    CHECK(body->starts == 0);  // closing 窗口：source 不应被 Start
     CHECK(body->nexts == 0);
     host.Finish();
 }
 
 // 同表输入实际经过两种工厂与两种编码，非法头必须在任何字节提交前被拒绝。
-void ResponseHeaderParity() {
+void ResponseHeaderParity()
+{
     struct Case {
         http::Headers headers;
         bool accepted;
     };
-    std::vector<Case> cases{
-        {{}, true},
-        {{{"X-Token!#$%&'*+-.^_`|~", "a\tb"}, {"X-Empty", ""},
-          {"X-Repeat", "first"}, {"X-Repeat", "second"},
-          {"X-Obs", std::string(1, static_cast<char>(0x80))}}, true},
-        {{{"X-Pad", std::string(503, 'x')}}, true}, // 5 + 503 + 4 = 512
-        {{{"X-Pad", std::string(504, 'x')}}, false},
-        {{{"X-A", std::string(249, 'x')}, {"X-B", std::string(249, 'y')}}, true},
-        {{{"X-A", std::string(249, 'x')}, {"X-B", std::string(250, 'y')}}, false},
-        {{{"", "value"}}, false},
-        {{{"Bad Name", "value"}}, false},
-        {{{"Bad:Name", "value"}}, false},
-        {{{"Bad\r\nName", "value"}}, false},
-        {{{std::string("Bad\0Name", 8), "value"}}, false},
-        {{{std::string(1, static_cast<char>(0x80)), "value"}}, false}
-    };
-    for (const std::string name : {"Content-Length", "cOnTeNt-LeNgTh", "Transfer-Encoding",
-                                   "tRaNsFeR-eNcOdInG", "Connection", "cOnNeCtIoN",
-                                   "Upgrade", "uPgRaDe", "Trailer", "tRaIlEr"}) {
+    std::vector<Case> cases{{{}, true},
+                            {{{"X-Token!#$%&'*+-.^_`|~", "a\tb"},
+                              {"X-Empty", ""},
+                              {"X-Repeat", "first"},
+                              {"X-Repeat", "second"},
+                              {"X-Obs", std::string(1, static_cast<char>(0x80))}},
+                             true},
+                            {{{"X-Pad", std::string(503, 'x')}}, true}, // 5 + 503 + 4 = 512
+                            {{{"X-Pad", std::string(504, 'x')}}, false},
+                            {{{"X-A", std::string(249, 'x')}, {"X-B", std::string(249, 'y')}}, true},
+                            {{{"X-A", std::string(249, 'x')}, {"X-B", std::string(250, 'y')}}, false},
+                            {{{"", "value"}}, false},
+                            {{{"Bad Name", "value"}}, false},
+                            {{{"Bad:Name", "value"}}, false},
+                            {{{"Bad\r\nName", "value"}}, false},
+                            {{{std::string("Bad\0Name", 8), "value"}}, false},
+                            {{{std::string(1, static_cast<char>(0x80)), "value"}}, false}};
+    for (const std::string name : {"Content-Length", "cOnTeNt-LeNgTh", "Transfer-Encoding", "tRaNsFeR-eNcOdInG",
+                                   "Connection", "cOnNeCtIoN", "Upgrade", "uPgRaDe", "Trailer", "tRaIlEr"}) {
         cases.push_back({{{name, "x"}}, false});
     }
     for (const unsigned char c : {0, 1, 8, 10, 13, 31, 127}) {
@@ -596,20 +672,23 @@ void ResponseHeaderParity() {
         std::atomic<unsigned> calls{0};
         std::vector<std::shared_ptr<ListBody>> bodies(cases.size());
         ServerHost host(Route([&](IncomingCallContext, http::IncomingRequest request) {
-            ++calls;
-            const auto index = static_cast<std::size_t>(std::stoul(request.target.substr(1)));
-            CHECK(index < cases.size());
-            if (path < 2) { return Buffered(200, "ok", cases[index].headers); }
-            auto body = ListBody::Make({path == 2 ? http::StreamStart::Mode::Buffered
-                                                : http::StreamStart::Mode::Chunked,
-                                        200, cases[index].headers, "ok", "ok"}, {Eof()});
-            bodies[index] = body;
-            return Stream(body);
-        }), options, {}, true, 1024 * 1024, 1, 4096, path == 0);
+                            ++calls;
+                            const auto index = static_cast<std::size_t>(std::stoul(request.target.substr(1)));
+                            CHECK(index < cases.size());
+                            if (path < 2) {
+                                return Buffered(200, "ok", cases[index].headers);
+                            }
+                            auto body = ListBody::Make(
+                                {path == 2 ? http::StreamStart::Mode::Buffered : http::StreamStart::Mode::Chunked, 200,
+                                 cases[index].headers, "ok", "ok"},
+                                {Eof()});
+                            bodies[index] = body;
+                            return Stream(body);
+                        }),
+                        options, {}, true, 1024 * 1024, 1, 4096, path == 0);
         for (std::size_t index = 0; index != cases.size(); ++index) {
             Peer peer(host.address);
-            peer.Send("GET /" + std::to_string(index) +
-                      " HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+            peer.Send("GET /" + std::to_string(index) + " HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
             const auto bytes = peer.Drain();
             CHECK(peer.Eof());
             if (!cases[index].accepted) {
@@ -641,7 +720,8 @@ void ResponseHeaderParity() {
     }
 }
 
-int Run(int argc, char** argv) {
+int Run(int argc, char** argv)
+{
     Watchdog watchdog;
     try {
         CHECK(argc == 2);
@@ -651,18 +731,31 @@ int Run(int argc, char** argv) {
         g_scheduler->Start();
         const auto baseline = SocketCount();
         const std::string name = argv[1];
-        if (name == "stream_wire") { ChunkedWire(); }
-        else if (name == "response_header_parity") { ResponseHeaderParity(); }
-        else if (name == "stream_variant_buffered") { VariantBuffered(); }
-        else if (name == "stream_disallowed") { ChunkedDisallowed(); }
-        else if (name == "stream_commit_boundary") { CommitBoundary(); }
-        else if (name == "stream_peer_abort") { PeerAbort(); }
-        else if (name == "stream_slow_reader") { SlowReaderBackpressure(); }
-        else if (name == "stream_lifecycle") { LifecycleDrain(); }
-        else if (name == "stream_lifetime") { StreamLifetime(); }
-        else if (name == "stream_start_deadline") { StartDeadline(); }
-        else if (name == "stream_close_in_handler") { CloseDuringHandler(); }
-        else { CHECK(false); }
+        if (name == "stream_wire") {
+            ChunkedWire();
+        } else if (name == "response_header_parity") {
+            ResponseHeaderParity();
+        } else if (name == "stream_variant_buffered") {
+            VariantBuffered();
+        } else if (name == "stream_disallowed") {
+            ChunkedDisallowed();
+        } else if (name == "stream_commit_boundary") {
+            CommitBoundary();
+        } else if (name == "stream_peer_abort") {
+            PeerAbort();
+        } else if (name == "stream_slow_reader") {
+            SlowReaderBackpressure();
+        } else if (name == "stream_lifecycle") {
+            LifecycleDrain();
+        } else if (name == "stream_lifetime") {
+            StreamLifetime();
+        } else if (name == "stream_start_deadline") {
+            StartDeadline();
+        } else if (name == "stream_close_in_handler") {
+            CloseDuringHandler();
+        } else {
+            CHECK(false);
+        }
         CHECK(WaitUntil([&] { return SocketCount() == baseline; }));
         std::cout << "PASS " << name << " socket_baseline=" << baseline << " restored=1\n";
         return 0;
@@ -672,6 +765,7 @@ int Run(int argc, char** argv) {
     }
 }
 } // namespace
-int main(int argc, char** argv) {
+int main(int argc, char** argv)
+{
     return bbt_net_test::RunTestProcessExit([&] { return Run(argc, argv); });
 }

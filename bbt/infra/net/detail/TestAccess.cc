@@ -11,20 +11,24 @@
 
 namespace bbt::infra::net {
 
-Connection ConnectionTestAccess::Make(std::shared_ptr<ConnectionState> state) {
+Connection ConnectionTestAccess::Make(std::shared_ptr<ConnectionState> state)
+{
     return Connection(std::move(state));
 }
 
-std::shared_ptr<ConnectionState> ConnectionTestAccess::StateOf(const Connection& connection) {
+std::shared_ptr<ConnectionState> ConnectionTestAccess::StateOf(const Connection& connection)
+{
     return connection.m_state;
 }
 
 WriteOperation ConnectionTestAccess::MakeWrite(std::shared_ptr<WriteOpRecord> record,
-                                               std::shared_ptr<ConnectionState> state) {
+                                               std::shared_ptr<ConnectionState> state)
+{
     return WriteOperation(std::move(record), std::move(state));
 }
 
-ReadAccess ConnectionTestAccess::HoldForTest(std::shared_ptr<ConnectionState> state) {
+ReadAccess ConnectionTestAccess::HoldForTest(std::shared_ptr<ConnectionState> state)
+{
     if (!state) {
         return {};
     }
@@ -32,6 +36,14 @@ ReadAccess ConnectionTestAccess::HoldForTest(std::shared_ptr<ConnectionState> st
     return ReadAccess(std::move(state), std::move(attempt.lock), attempt.status, attempt.error);
 }
 
-void ConnectionTestAccess::Reset(ReadAccess& access) { access = ReadAccess(); }
+void ConnectionTestAccess::Reset(ReadAccess& access)
+{
+    access = ReadAccess();
+}
+
+Buffer BufferTestAccess::Make(std::shared_ptr<void> backing, std::vector<BufferSegment> segments)
+{
+    return Buffer(std::move(backing), std::move(segments));
+}
 
 } // namespace bbt::infra::net

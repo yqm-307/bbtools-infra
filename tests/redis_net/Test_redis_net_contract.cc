@@ -21,7 +21,8 @@ extern "C" redisReader* __real_redisReaderCreate();
 extern "C" void __real_redisReaderFree(redisReader*);
 extern "C" int __real_redisReaderGetReply(redisReader*, void**);
 extern "C" int __real_redisReaderFeed(redisReader*, const char*, std::size_t);
-extern "C" redisReader* __wrap_redisReaderCreate() {
+extern "C" redisReader* __wrap_redisReaderCreate()
+{
     auto* reader = __real_redisReaderCreate();
     if (reader) {
         ++g_readers;
@@ -32,16 +33,24 @@ extern "C" redisReader* __wrap_redisReaderCreate() {
     }
     return reader;
 }
-extern "C" void __wrap_redisReaderFree(redisReader* reader) {
-    if (reader) { --g_readers; ++g_reader_freed; }
+extern "C" void __wrap_redisReaderFree(redisReader* reader)
+{
+    if (reader) {
+        --g_readers;
+        ++g_reader_freed;
+    }
     __real_redisReaderFree(reader);
 }
-extern "C" int __wrap_redisReaderGetReply(redisReader* reader, void** reply) {
+extern "C" int __wrap_redisReaderGetReply(redisReader* reader, void** reply)
+{
     const auto code = __real_redisReaderGetReply(reader, reply);
-    if (reader == g_watch_reader.load() && code == REDIS_OK && !*reply) { ++g_partial; }
+    if (reader == g_watch_reader.load() && code == REDIS_OK && !*reply) {
+        ++g_partial;
+    }
     return code;
 }
-extern "C" int __wrap_redisReaderFeed(redisReader* reader, const char* bytes, std::size_t size) {
+extern "C" int __wrap_redisReaderFeed(redisReader* reader, const char* bytes, std::size_t size)
+{
     if (reader == g_watch_reader.load()) {
         if (const auto error = g_feed_error.exchange(0)) {
             reader->err = error;
@@ -58,22 +67,31 @@ struct NativeBarrier {
     std::mutex mutex;
     std::condition_variable cv;
     bool released{false};
-    void Pause() {
+    void Pause()
+    {
         std::unique_lock<std::mutex> lock(mutex);
         entered.store(true);
         CHECK(cv.wait_for(lock, 3s, [this] { return released; }));
     }
-    void Release() {
-        { std::lock_guard<std::mutex> lock(mutex); released = true; }
+    void Release()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            released = true;
+        }
         cv.notify_all();
     }
-    ~NativeBarrier() { Release(); }
+    ~NativeBarrier()
+    {
+        Release();
+    }
 };
 
 struct Endpoint {
     int fd{-1};
     net::Address address;
-    explicit Endpoint(bool listening) {
+    explicit Endpoint(bool listening)
+    {
         fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
         CHECK(fd >= 0);
         sockaddr_in local{};
@@ -83,20 +101,27 @@ struct Endpoint {
         socklen_t size = sizeof(local);
         CHECK(::getsockname(fd, reinterpret_cast<sockaddr*>(&local), &size) == 0);
         address = Loopback(ntohs(local.sin_port));
-        if (listening) { CHECK(::listen(fd, 4) == 0); }
+        if (listening) {
+            CHECK(::listen(fd, 4) == 0);
+        }
     }
-    ~Endpoint() { ::close(fd); }
+    ~Endpoint()
+    {
+        ::close(fd);
+    }
 };
 
-void CheckUnknown(const Error& error, const std::string& cause) {
+void CheckUnknown(const Error& error, const std::string& cause)
+{
     CHECK(error.code == ErrorCode::OutcomeUnknown);
     CHECK(!error.request_phase);
     CHECK(ValidateErrorDetails(error));
-    CHECK(std::find(error.details.begin(), error.details.end(),
-                    std::make_pair(std::string("cause"), cause)) != error.details.end());
+    CHECK(std::find(error.details.begin(), error.details.end(), std::make_pair(std::string("cause"), cause))
+          != error.details.end());
 }
 
-void RealCommands() {
+void RealCommands()
+{
     RealRedis backend;
     Host host;
     auto cli = host.Make();
@@ -144,7 +169,8 @@ void RealCommands() {
               << " wrongtype=RemoteError same_stream_ping_get=1 empty_args_rejected=1\n";
 }
 
-void FragmentedReply() {
+void FragmentedReply()
+{
     std::atomic<bool> first_sent{false}, release{false};
     Peer peer([&](int fd) {
         CHECK(Peer::ReadCommand(fd) == std::vector<std::string>({"GET", "fragment"}));
@@ -171,13 +197,18 @@ void FragmentedReply() {
     std::cout << "fragmented_reply partial_observed=1 waited_for_tail=1 binary_bulk=1\n";
 }
 
-void UnknownDisconnect() {
+void UnknownDisconnect()
+{
     unsigned sessions = 0;
-    Peer peer([&](int fd) {
-        CHECK(Peer::ReadCommand(fd) == std::vector<std::string>({"PING"}));
-        if (++sessions == 2) { CHECK(Peer::Send(fd, "+PONG\r\n")); }
-        // 第一次读到完整命令后断连；不声称服务端没执行。
-    }, 2);
+    Peer peer(
+        [&](int fd) {
+            CHECK(Peer::ReadCommand(fd) == std::vector<std::string>({"PING"}));
+            if (++sessions == 2) {
+                CHECK(Peer::Send(fd, "+PONG\r\n"));
+            }
+            // 第一次读到完整命令后断连；不声称服务端没执行。
+        },
+        2);
     Host host;
     auto cli = host.Make(peer.address);
     host.Connect(cli);
@@ -188,7 +219,7 @@ void UnknownDisconnect() {
     // 不再是旧的固定 "net" 字面量。
     CHECK(value.error().backend_category == "bbt.net" && value.error().backend_code != 0);
     ExpectCode(host.Call([&] { return bbt_co_await cli->Ping(Until()); }), ErrorCode::TransportError);
-    host.Connect(cli);  // 显式重连必须换连接与 reader，不能凭 Valid() 返回伪成功。
+    host.Connect(cli); // 显式重连必须换连接与 reader，不能凭 Valid() 返回伪成功。
     CHECK(host.Call([&] { return bbt_co_await cli->Ping(Until()); }));
     peer.Join();
     CHECK(sessions == 2);
@@ -197,7 +228,8 @@ void UnknownDisconnect() {
     std::cout << "disconnect accepted=1 cause=TransportError sticky=1 explicit_reconnect=1 requests=2\n";
 }
 
-void ConnectFailureOwned() {
+void ConnectFailureOwned()
+{
     Host host;
     Endpoint refused(false);
     auto cli = host.Make(refused.address);
@@ -248,21 +280,24 @@ void ConnectFailureOwned() {
     auto idle = net::Engine::Create(nullptr);
     auto idle_cli = Client::Create(idle, Loopback());
     CHECK(idle_cli);
-    ExpectCode(raw_host.Call([&] { return bbt_co_await idle_cli.value()->Connect(Until()); }), ErrorCode::RuntimeUnavailable);
+    ExpectCode(raw_host.Call([&] { return bbt_co_await idle_cli.value()->Connect(Until()); }),
+               ErrorCode::RuntimeUnavailable);
     CHECK(!Client::Create(nullptr, Loopback()));
     std::error_code error;
     auto unix_address = net::Address::Unix("/not-used-redis-net", error);
     CHECK(!error);
     auto invalid = Client::Create(idle, unix_address);
     ExpectCode(invalid, ErrorCode::InvalidArgument);
-    std::cout << "connect_failure refused=TransportError expired=TimedOut controlled_cancel=Cancelled raw_handler=RuntimeUnavailable idle=RuntimeUnavailable\n";
+    std::cout
+        << "connect_failure refused=TransportError expired=TimedOut controlled_cancel=Cancelled raw_handler=RuntimeUnavailable idle=RuntimeUnavailable\n";
 }
 
 // 封口发布与建连起点撤销的交错（确定性，不靠概率）：owner 已占用本次
 // pending connect 回调预算、尚未做起点封口检查时发布 seal。此时该次拨号
 // 不登记 pending 描述符，取消投递也找不到它；预算必须在撤销路径归还，
 // 否则 SealServiceOnOwner 永久 defer，Engine 收口对 seal 结果无上界等待。
-void SealDuringConnectStart() {
+void SealDuringConnectStart()
+{
     Host host;
     Endpoint listener(true);
     auto cli = host.Make(listener.address);
@@ -275,18 +310,22 @@ void SealDuringConnectStart() {
     const int code = static_cast<int>(value.error().code);
     cli.reset();
     host.Finish();
-    std::cout << "seal_during_connect_start code=" << code
-              << " sealed_at_start=1 budget_returned=1 join_bounded=1\n";
+    std::cout << "seal_during_connect_start code=" << code << " sealed_at_start=1 budget_returned=1 join_bounded=1\n";
 }
 
-void CloseInvalidates() {
+void CloseInvalidates()
+{
     Host host;
     auto cli = host.Make();
     // await helper 的协程域前置检查先于函数体：非协程直调抛 std::logic_error，
     // 不再经返回值报 InvalidContext（上游 async/await 实际语义）。
     auto expect_logic_error = [](auto&& call) {
         bool thrown = false;
-        try { call(); } catch (const std::logic_error&) { thrown = true; }
+        try {
+            call();
+        } catch (const std::logic_error&) {
+            thrown = true;
+        }
         CHECK(thrown);
     };
     expect_logic_error([&] { bbt_co_await cli->Connect(Until()); });
@@ -295,7 +334,8 @@ void CloseInvalidates() {
     host.Connect(cli);
     host.Call([&] { cli->Close(); });
     CHECK(cli->IsClosed());
-    ExpectCode(host.Call([&] { return bbt_co_await cli->Set("closed-key-not-written", "x", Until()); }), ErrorCode::Closed);
+    ExpectCode(host.Call([&] { return bbt_co_await cli->Set("closed-key-not-written", "x", Until()); }),
+               ErrorCode::Closed);
     ExpectCode(host.Call([&] { return bbt_co_await cli->Connect(Until()); }), ErrorCode::Closed);
     ExpectCode(host.Call([&] { return bbt_co_await cli->Get("x", Until()); }), ErrorCode::Closed);
     ExpectCode(host.Call([&] { return bbt_co_await cli->Get({}, Until()); }), ErrorCode::Closed);
@@ -306,13 +346,17 @@ void CloseInvalidates() {
     std::cout << "close_invalidates closed_codes=4 invalid_context=3 other_task_progress=1 workers=1\n";
 }
 
-void CloseIdempotent() {
+void CloseIdempotent()
+{
     Host host;
     auto cli = host.Make();
     host.Connect(cli);
     NativeBarrier barrier;
     std::atomic<int> removals{0};
-    Access::SetRemoveBarrierOnce(*host.engine, [&] { ++removals; barrier.Pause(); });
+    Access::SetRemoveBarrierOnce(*host.engine, [&] {
+        ++removals;
+        barrier.Pause();
+    });
     cli->Close();
     CHECK(WaitUntil([&] { return barrier.entered.load(); }));
     std::vector<std::future<void>> closers;
@@ -320,9 +364,13 @@ void CloseIdempotent() {
         closers.push_back(std::async(std::launch::async, [cli] { cli->Close(); }));
     }
     bool nonblocking = true;
-    for (auto& closer : closers) { nonblocking &= closer.wait_for(100ms) == std::future_status::ready; }
+    for (auto& closer : closers) {
+        nonblocking &= closer.wait_for(100ms) == std::future_status::ready;
+    }
     barrier.Release();
-    for (auto& closer : closers) { closer.get(); }
+    for (auto& closer : closers) {
+        closer.get();
+    }
     CHECK(nonblocking && cli->IsClosed());
     CHECK(WaitUntil([&] { return host.engine->CountConnections() == 0; }));
     CHECK(removals.load() == 1);
@@ -331,7 +379,8 @@ void CloseIdempotent() {
     std::cout << "close_idempotent concurrent_closes=4 returned_before_owner_release=1 physical_removal=1\n";
 }
 
-void CloseDuringConnect() {
+void CloseDuringConnect()
+{
     Endpoint listener(true);
     Host host;
     auto cli = host.Make(listener.address);
@@ -339,7 +388,8 @@ void CloseDuringConnect() {
     net::CoTestAccess::SetDialBarrier([&] { barrier.Pause(); });
     auto pending = host.Submit([&] { return bbt_co_await cli->Connect(Until()); });
     CHECK(WaitUntil([&] { return barrier.entered.load(); }));
-    CHECK(WaitUntil([&] { return Access::PendingConnectCount(*host.engine) == 0 && host.engine->CountConnections() == 1; }));
+    CHECK(WaitUntil(
+        [&] { return Access::PendingConnectCount(*host.engine) == 0 && host.engine->CountConnections() == 1; }));
     const auto start = std::chrono::steady_clock::now();
     cli->Close();
     CHECK(std::chrono::steady_clock::now() - start < 100ms);
@@ -356,10 +406,12 @@ void CloseDuringConnect() {
     ExpectCode(host.Call([&] { return bbt_co_await published->Ping(Until()); }), ErrorCode::Closed);
     published.reset();
     host.Finish();
-    std::cout << "close_during_connect submitted_barrier=1 real_success_before_claim=1 late_publish_refused=1 publish_first_control=1\n";
+    std::cout
+        << "close_during_connect submitted_barrier=1 real_success_before_claim=1 late_publish_refused=1 publish_first_control=1\n";
 }
 
-void ClosePendingOnce() {
+void ClosePendingOnce()
+{
     std::atomic<bool> received{false}, send_late{false};
     Peer peer([&](int fd) {
         CHECK(Peer::ReadCommand(fd) == std::vector<std::string>({"SET", "fixture-only", "value"}));
@@ -391,10 +443,12 @@ void ClosePendingOnce() {
     cli.reset();
     host.Finish();
     CHECK(terminals.load() == 1);
-    std::cout << "pending full_command_received=1 reply_withheld=1 second=Overloaded workers=1 progress=1 terminal_count=1 late_reply_no_republish=1\n";
+    std::cout
+        << "pending full_command_received=1 reply_withheld=1 second=Overloaded workers=1 progress=1 terminal_count=1 late_reply_no_republish=1\n";
 }
 
-void DestroyLateCallback() {
+void DestroyLateCallback()
+{
     std::atomic<bool> received{false}, send_late{false};
     Peer peer([&](int fd) {
         CHECK(Peer::ReadCommand(fd) == std::vector<std::string>({"PING"}));
@@ -446,10 +500,12 @@ void DestroyLateCallback() {
     ExpectCode(Get(dialing), ErrorCode::Closed);
     net::CoTestAccess::SetDialBarrier({});
     connecting.Finish();
-    std::cout << "destroy_late public_weak_expired=1 readers=0 owner_removal_pending_at_destroy=1 late_completion_terminal_count=1 suspended_connect_state_owned=1\n";
+    std::cout
+        << "destroy_late public_weak_expired=1 readers=0 owner_removal_pending_at_destroy=1 late_completion_terminal_count=1 suspended_connect_state_owned=1\n";
 }
 
-void SharedEngine() {
+void SharedEngine()
+{
     RealRedis backend;
     Host host;
     auto a = host.Make(), b = host.Make();
@@ -463,13 +519,15 @@ void SharedEngine() {
     auto value = host.Call([&] { return bbt_co_await b->Get(key, Until()); });
     CHECK(value && value.value() && *value.value() == "shared");
     CHECK(host.engine->Phase() == net::EnginePhase::Running);
-    a.reset(); b.reset();
+    a.reset();
+    b.reset();
     host.Finish();
     backend.Cleanup();
     std::cout << "shared_engine A=Closed B_ping_set_get=1 engine_running_after_A=1\n";
 }
 
-void HostDrain() {
+void HostDrain()
+{
     Host host;
     auto a = host.Make(), b = host.Make();
     host.Connect(a);
@@ -486,13 +544,17 @@ void HostDrain() {
     auto pending = host.Submit([&] { return bbt_co_await pending_cli->Ping(Until()); });
     CHECK(WaitUntil([&] { return received.load(); }));
     CHECK(!host.Drained());
-    a->Close(); b->Close(); pending_cli->Close();
+    a->Close();
+    b->Close();
+    pending_cli->Close();
     release.store(true);
     host.Finish();
     auto value = Get(pending);
     CHECK(!value);
     CHECK(value.error().code == ErrorCode::OutcomeUnknown);
-    a.reset(); b.reset(); pending_cli.reset();
+    a.reset();
+    b.reset();
+    pending_cli.reset();
     peer.Join();
     CHECK(g_readers.load() == 0);
     // 收尾合取的负对照：Run 返回但 Closing 仍须拒绝。
@@ -502,7 +564,8 @@ void HostDrain() {
     std::cout << "host_drain pending_api_settled=1 capture_release=1 reader_release=1 returned_closing_rejected=1\n";
 }
 
-void FramingAndFaults() {
+void FramingAndFaults()
+{
     for (const std::string response : {"?bad\r\n", ":7\r\n", "+NOTPONG\r\n", "+PONG\r\n+EXTRA\r\n"}) {
         Peer peer([&](int fd) {
             CHECK(Peer::ReadCommand(fd)[0] == "PING");
@@ -606,20 +669,23 @@ void FramingAndFaults() {
     auto cli = host.Make();
     host.Connect(cli);
     const auto key = backend.Key("oversize");
-    ExpectCode(host.Call([&] { return bbt_co_await cli->Set(key, std::string(1024, 'z'), Until()); }), ErrorCode::Overloaded);
+    ExpectCode(host.Call([&] { return bbt_co_await cli->Set(key, std::string(1024, 'z'), Until()); }),
+               ErrorCode::Overloaded);
     auto missing = backend.Command({"EXISTS", key});
     CHECK(missing->type == REDIS_REPLY_INTEGER && missing->integer == 0);
     CHECK(host.Call([&] { return bbt_co_await cli->Ping(Until()); }));
     cli.reset();
     host.Finish();
     backend.Cleanup();
-    std::cout << "faults parse_bad=1 wrong_type=1 wrong_status=1 extra_frame=1 Feed_protocol=1 Feed_oom=1 oversize_zero_acceptance=1\n";
+    std::cout
+        << "faults parse_bad=1 wrong_type=1 wrong_status=1 extra_frame=1 Feed_protocol=1 Feed_oom=1 oversize_zero_acceptance=1\n";
 }
 
 // 池测试辅助：创建带 PoolOptions 的池。
 using Pool = redis::CoRedisPool;
 
-std::shared_ptr<Pool> MakePool(Host& host, std::size_t connections, std::size_t max_waiters) {
+std::shared_ptr<Pool> MakePool(Host& host, std::size_t connections, std::size_t max_waiters)
+{
     Pool::PoolOptions opts{connections, max_waiters};
     auto value = Pool::Create(host.engine, Loopback(), opts);
     CHECK(value);
@@ -627,13 +693,14 @@ std::shared_ptr<Pool> MakePool(Host& host, std::size_t connections, std::size_t 
 }
 
 // 显式 Connect 全池就绪；重复 Connect 幂等；未 Connect 时命令 RuntimeUnavailable。
-void PoolConnect() {
+void PoolConnect()
+{
     Host host;
     auto pool = MakePool(host, 2, 2);
     auto before = host.Call([&] { return bbt_co_await pool->Ping(Until(100ms)); });
     ExpectCode(before, ErrorCode::RuntimeUnavailable);
     CHECK(host.Call([&] { return bbt_co_await pool->Connect(Until()); }));
-    CHECK(host.Call([&] { return bbt_co_await pool->Connect(Until()); }));  // 幂等
+    CHECK(host.Call([&] { return bbt_co_await pool->Connect(Until()); })); // 幂等
     CHECK(host.Call([&] { return bbt_co_await pool->Ping(Until()); }));
     pool->Close();
     ExpectCode(host.Call([&] { return bbt_co_await pool->Connect(Until()); }), ErrorCode::Closed);
@@ -643,7 +710,8 @@ void PoolConnect() {
 }
 
 // 真实 Redis 命令走池：Set/Get/Exists/Delete/Ping。
-void PoolBasicCommands() {
+void PoolBasicCommands()
+{
     RealRedis backend;
     Host host;
     auto pool = MakePool(host, 1, 2);
@@ -676,22 +744,29 @@ void PoolBasicCommands() {
 }
 
 // 并发：命令数多于连接数，全部成功即证明内部借用/归还。
-void PoolConcurrent() {
+void PoolConcurrent()
+{
     RealRedis backend;
     Host host;
     auto pool = MakePool(host, 2, 8);
     CHECK(host.Call([&] { return bbt_co_await pool->Connect(Until()); }));
     std::vector<std::string> keys;
-    for (int i = 0; i < 6; ++i) { keys.push_back(backend.Key("pool-cc-" + std::to_string(i))); }
+    for (int i = 0; i < 6; ++i) {
+        keys.push_back(backend.Key("pool-cc-" + std::to_string(i)));
+    }
     std::vector<std::future<bool>> results;
     for (const auto& key : keys) {
         results.push_back(host.Submit([&key, pool] {
-            if (!(bbt_co_await pool->Set(key, "x", Until()))) { return false; }
+            if (!(bbt_co_await pool->Set(key, "x", Until()))) {
+                return false;
+            }
             auto got = bbt_co_await pool->Get(key, Until());
             return got && got.value() && *got.value() == "x";
         }));
     }
-    for (auto& future : results) { CHECK(Get(future)); }
+    for (auto& future : results) {
+        CHECK(Get(future));
+    }
     pool->Close();
     pool.reset();
     host.Finish();
@@ -700,7 +775,8 @@ void PoolConcurrent() {
 }
 
 // 池满等待有界：max_waiters=0 拒绝排队返回 Overloaded。
-void PoolOverloaded() {
+void PoolOverloaded()
+{
     RealRedis backend;
     Host host;
     // 用 max_waiters=0 的单连接池验证 Acquire 的队列拒绝语义：
@@ -719,14 +795,15 @@ void PoolOverloaded() {
 }
 
 // Close 并发安全幂等：等待者不遗失，Close 后命令 Closed。
-void PoolClose() {
+void PoolClose()
+{
     RealRedis backend;
     Host host;
     auto pool = MakePool(host, 1, 4);
     CHECK(host.Call([&] { return bbt_co_await pool->Connect(Until()); }));
     CHECK(host.Call([&] { return bbt_co_await pool->Ping(Until()); }));
     pool->Close();
-    pool->Close();  // 幂等
+    pool->Close(); // 幂等
     CHECK(pool->IsClosed());
     ExpectCode(host.Call([&] { return bbt_co_await pool->Ping(Until()); }), ErrorCode::Closed);
     ExpectCode(host.Call([&] { return bbt_co_await pool->Set("k", "v", Until()); }), ErrorCode::Closed);
@@ -741,7 +818,8 @@ void PoolClose() {
 #include "PoolCases.hpp"
 #include "DataPlaneCases.hpp"
 
-int Run(int argc, char** argv) {
+int Run(int argc, char** argv)
+{
     Watchdog watchdog;
     try {
         CHECK(argc == 2);
@@ -754,7 +832,8 @@ int Run(int argc, char** argv) {
             CHECK(warm.Call([] {
                 auto waiter = bbt::coroutine::sync::CoWaiter::Create();
                 CHECK(waiter);
-                const auto status = waiter->WaitWithCallback({std::chrono::steady_clock::now() + 5ms}, [] { return true; });
+                const auto status =
+                    waiter->WaitWithCallback({std::chrono::steady_clock::now() + 5ms}, [] { return true; });
                 CHECK(status == bbt::coroutine::WaitStatus::TimedOut);
                 return true;
             }));
@@ -765,39 +844,74 @@ int Run(int argc, char** argv) {
         PrintFds("baseline");
         CHECK(g_readers.load() == 0);
         const std::string name = argv[1];
-        if (name == "set_get_remote_error") { RealCommands(); }
-        else if (name == "fragmented_reply") { FragmentedReply(); }
-        else if (name == "unknown_disconnect") { UnknownDisconnect(); }
-        else if (name == "connect_failure_owned") { ConnectFailureOwned(); }
-        else if (name == "seal_during_connect_start") { SealDuringConnectStart(); }
-        else if (name == "close_invalidates_immediately") { CloseInvalidates(); }
-        else if (name == "close_idempotent") { CloseIdempotent(); }
-        else if (name == "close_during_connect") { CloseDuringConnect(); }
-        else if (name == "close_pending_command_once") { ClosePendingOnce(); }
-        else if (name == "handle_destroy_late_callback") { DestroyLateCallback(); }
-        else if (name == "shared_engine_isolation") { SharedEngine(); }
-        else if (name == "host_drain_no_residue") { HostDrain(); }
-        else if (name == "framing_and_faults") { FramingAndFaults(); }
-        else if (name == "pool_stages") { PoolStages(); }
-        else if (name == "pool_wait_exits") { PoolWaitExits(); }
-        else if (name == "pool_wait_windows") { PoolWaitWindows(); PoolCancelHandoff(); }
-        else if (name == "pool_repair_waiter") { PoolRepairWaiter(); }
-        else if (name == "pool_connect_rollback") { PoolConnectRollback(); }
-        else if (name == "pool_connect") { PoolConnect(); }
-        else if (name == "pool_basic_commands") { PoolBasicCommands(); }
-        else if (name == "pool_concurrent") { PoolConcurrent(); }
-        else if (name == "pool_overloaded") { PoolOverloaded(); }
-        else if (name == "pool_close") { PoolClose(); }
-        else if (name == "set_options_contract") { SetOptionsContract(); }
-        else if (name == "expire_ttl_contract") { ExpireTtlContract(); }
-        else if (name == "incr_family_contract") { IncrFamilyContract(); }
-        else if (name == "hash_contract") { HashContract(); }
-        else if (name == "handshake_auth_select") { HandshakeAuthSelect(); }
-        else if (name == "pool_new_commands") { PoolNewCommands(); }
-        else if (name == "pool_handshake_auth") { PoolHandshakeAuth(); }
-        else if (name == "hgetall_protocol_faults") { HgetallProtocolFaults(); }
-        else if (name == "close_during_handshake") { CloseDuringHandshake(); }
-        else { throw std::runtime_error("unknown case: " + name); }
+        if (name == "set_get_remote_error") {
+            RealCommands();
+        } else if (name == "fragmented_reply") {
+            FragmentedReply();
+        } else if (name == "unknown_disconnect") {
+            UnknownDisconnect();
+        } else if (name == "connect_failure_owned") {
+            ConnectFailureOwned();
+        } else if (name == "seal_during_connect_start") {
+            SealDuringConnectStart();
+        } else if (name == "close_invalidates_immediately") {
+            CloseInvalidates();
+        } else if (name == "close_idempotent") {
+            CloseIdempotent();
+        } else if (name == "close_during_connect") {
+            CloseDuringConnect();
+        } else if (name == "close_pending_command_once") {
+            ClosePendingOnce();
+        } else if (name == "handle_destroy_late_callback") {
+            DestroyLateCallback();
+        } else if (name == "shared_engine_isolation") {
+            SharedEngine();
+        } else if (name == "host_drain_no_residue") {
+            HostDrain();
+        } else if (name == "framing_and_faults") {
+            FramingAndFaults();
+        } else if (name == "pool_stages") {
+            PoolStages();
+        } else if (name == "pool_wait_exits") {
+            PoolWaitExits();
+        } else if (name == "pool_wait_windows") {
+            PoolWaitWindows();
+            PoolCancelHandoff();
+        } else if (name == "pool_repair_waiter") {
+            PoolRepairWaiter();
+        } else if (name == "pool_connect_rollback") {
+            PoolConnectRollback();
+        } else if (name == "pool_connect") {
+            PoolConnect();
+        } else if (name == "pool_basic_commands") {
+            PoolBasicCommands();
+        } else if (name == "pool_concurrent") {
+            PoolConcurrent();
+        } else if (name == "pool_overloaded") {
+            PoolOverloaded();
+        } else if (name == "pool_close") {
+            PoolClose();
+        } else if (name == "set_options_contract") {
+            SetOptionsContract();
+        } else if (name == "expire_ttl_contract") {
+            ExpireTtlContract();
+        } else if (name == "incr_family_contract") {
+            IncrFamilyContract();
+        } else if (name == "hash_contract") {
+            HashContract();
+        } else if (name == "handshake_auth_select") {
+            HandshakeAuthSelect();
+        } else if (name == "pool_new_commands") {
+            PoolNewCommands();
+        } else if (name == "pool_handshake_auth") {
+            PoolHandshakeAuth();
+        } else if (name == "hgetall_protocol_faults") {
+            HgetallProtocolFaults();
+        } else if (name == "close_during_handshake") {
+            CloseDuringHandshake();
+        } else {
+            throw std::runtime_error("unknown case: " + name);
+        }
         CHECK(!RealRedis::CleanupFailed());
         CHECK(g_readers.load() == 0 && g_reader_created.load() == g_reader_freed.load());
         PrintFds("after_scope");
@@ -813,6 +927,7 @@ int Run(int argc, char** argv) {
     }
 }
 } // namespace
-int main(int argc, char** argv) {
+int main(int argc, char** argv)
+{
     return bbt_net_test::RunTestProcessExit([&] { return Run(argc, argv); });
 }

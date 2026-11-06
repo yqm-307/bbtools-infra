@@ -44,8 +44,7 @@ std::error_code NormalizeOptions(const Options& options, NormalizedOptions& out)
         return InvalidArgument();
     }
     if (options.tcp_keep_alive < std::chrono::seconds::zero()
-        || options.tcp_keep_interval < std::chrono::seconds::zero()
-        || options.tcp_keep_count < 0) {
+        || options.tcp_keep_interval < std::chrono::seconds::zero() || options.tcp_keep_count < 0) {
         return InvalidArgument();
     }
     if (options.tcp_keep_alive > std::chrono::seconds{kMaxNativeInt}
@@ -58,12 +57,11 @@ std::error_code NormalizeOptions(const Options& options, NormalizedOptions& out)
         // 值范围验证，失败时 out 保持原值（提交发生在全部通过之后）。
         return OutOfRange();
     }
-    if (options.socket_recv_buffer < 0 || options.socket_recv_buffer > kMaxNativeInt
-        || options.socket_send_buffer < 0 || options.socket_send_buffer > kMaxNativeInt) {
+    if (options.socket_recv_buffer < 0 || options.socket_recv_buffer > kMaxNativeInt || options.socket_send_buffer < 0
+        || options.socket_send_buffer > kMaxNativeInt) {
         return OutOfRange();
     }
-    if (options.max_inbound_bytes <= 0 || options.max_outbound_bytes <= 0
-        || options.max_pending_events <= 0) {
+    if (options.max_inbound_bytes <= 0 || options.max_outbound_bytes <= 0 || options.max_pending_events <= 0) {
         return InvalidArgument();
     }
     // 每连接总量界是 size_t 资源界：超过 size_t 表示范围同样拒绝（不静默截断）。
@@ -75,8 +73,7 @@ std::error_code NormalizeOptions(const Options& options, NormalizedOptions& out)
         || static_cast<std::uint64_t>(options.max_pending_events) > kMaxSizeT) {
         return OutOfRange();
     }
-    if (options.num_event_loop > 0
-        && static_cast<std::uint64_t>(options.num_event_loop) >= kMaxSizeT) {
+    if (options.num_event_loop > 0 && static_cast<std::uint64_t>(options.num_event_loop) >= kMaxSizeT) {
         return OutOfRange();
     }
 
@@ -87,9 +84,8 @@ std::error_code NormalizeOptions(const Options& options, NormalizedOptions& out)
     normalized.reuse_port = options.reuse_port;
     normalized.tcp_no_delay = options.tcp_no_delay;
     // 未指定 loops → 1；不按 CPU 数推导，也不偷偷增线程。
-    normalized.num_event_loop = options.num_event_loop > 0
-        ? static_cast<std::size_t>(options.num_event_loop)
-        : std::size_t{1};
+    normalized.num_event_loop =
+        options.num_event_loop > 0 ? static_cast<std::size_t>(options.num_event_loop) : std::size_t{1};
 
     normalized.tcp_keep_alive = options.tcp_keep_alive;
     normalized.tcp_keep_interval = options.tcp_keep_interval;
@@ -97,19 +93,16 @@ std::error_code NormalizeOptions(const Options& options, NormalizedOptions& out)
         if (options.tcp_keep_interval > std::chrono::seconds::zero()) {
             normalized.tcp_keep_interval = options.tcp_keep_interval;
         } else {
-            normalized.tcp_keep_interval =
-                std::chrono::seconds{options.tcp_keep_alive.count() / 5};
+            normalized.tcp_keep_interval = std::chrono::seconds{options.tcp_keep_alive.count() / 5};
             if (normalized.tcp_keep_interval <= std::chrono::seconds::zero()) {
                 // C++ 差异：最小 1 秒（参考按 Go int 相除可为 0）。
                 normalized.tcp_keep_interval = std::chrono::seconds{1};
             }
         }
-        normalized.tcp_keep_count =
-            options.tcp_keep_count > 0 ? static_cast<std::size_t>(options.tcp_keep_count) : 5u;
+        normalized.tcp_keep_count = options.tcp_keep_count > 0 ? static_cast<std::size_t>(options.tcp_keep_count) : 5u;
     } else {
         // 禁用时不静默修正：保留用户 interval/count 原值，接线层才应用。
-        normalized.tcp_keep_count =
-            options.tcp_keep_count > 0 ? static_cast<std::size_t>(options.tcp_keep_count) : 0u;
+        normalized.tcp_keep_count = options.tcp_keep_count > 0 ? static_cast<std::size_t>(options.tcp_keep_count) : 0u;
     }
 
     normalized.socket_recv_buffer = static_cast<std::size_t>(options.socket_recv_buffer);
@@ -118,7 +111,7 @@ std::error_code NormalizeOptions(const Options& options, NormalizedOptions& out)
     normalized.max_outbound_bytes = static_cast<std::size_t>(options.max_outbound_bytes);
     normalized.max_pending_events = static_cast<std::size_t>(options.max_pending_events);
 
-    out = std::move(normalized);    // 全部通过才提交；失败路径 out 不变。
+    out = std::move(normalized); // 全部通过才提交；失败路径 out 不变。
     return {};
 }
 

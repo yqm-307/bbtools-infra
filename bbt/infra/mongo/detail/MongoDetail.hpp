@@ -22,21 +22,20 @@ namespace bbt::infra::mongo_detail {
 
 // 一次 CRUD 调用的结果载荷（worker 线程产出，协程消费）。
 struct MongoOpOutcome {
-    std::optional<MongoDocument> doc;   // FindOne 命中（未命中为 nullopt）
-    std::vector<MongoDocument>   docs;  // Find 命中页（无匹配为空）
-    std::int64_t matched  = 0;
+    std::optional<MongoDocument> doc; // FindOne 命中（未命中为 nullopt）
+    std::vector<MongoDocument> docs;  // Find 命中页（无匹配为空）
+    std::int64_t matched = 0;
     std::int64_t modified = 0;
     std::int64_t upserted = 0;
-    std::int64_t deleted  = 0;
-    std::int64_t inserted = 0;          // InsertMany 已写入数
-    std::int64_t counted  = 0;          // CountDocuments 精确计数
+    std::int64_t deleted = 0;
+    std::int64_t inserted = 0; // InsertMany 已写入数
+    std::int64_t counted = 0;  // CountDocuments 精确计数
 };
 
 // MongoDocument.bytes → bsoncxx 只读视图：空字节或结构不良构 →
 // InvalidArgument（完整校验经 libbson validate，不止长度一致性）。
 // 视图仅借用入参字节不拷贝；调用方保证 view 使用期内 bytes 存活。
-result<bsoncxx::v1::document::view> ViewOf(const MongoDocument& doc,
-                                         const char*        what);
+result<bsoncxx::v1::document::view> ViewOf(const MongoDocument& doc, const char* what);
 
 // document::view → 拥有型 MongoDocument（整段字节拷贝）。
 MongoDocument DocOf(bsoncxx::v1::document::view v);
@@ -61,20 +60,17 @@ bool IsEmptyBson(const MongoDocument& doc) noexcept;
 //   - 其余 mongoc 域（server selection/socket/stream/pool 等）→ Unavailable；
 //   - 其余 → InternalError。
 // backend_category 固定 "mongocxx"，backend_code 为 e.code().value()。
-Error ClassifyDriverError(const mongocxx::v1::exception& e,
-                          const char*                    what);
+Error ClassifyDriverError(const mongocxx::v1::exception& e, const char* what);
 
 // v_noabi::operation_exception → 契约 Error：raw_server_error() 存在时
 // → RemoteError（codeName→domain_code、code→backend_code）；无服务端
 // 回复的 operation 失败 → Unavailable。独立于 ClassifyDriverError：
 // v_noabi::exception 并非 v1::exception 子类，必须单独捕获。
-Error ClassifyOperationError(
-    const mongocxx::v_noabi::operation_exception& e, const char* what);
+Error ClassifyOperationError(const mongocxx::v_noabi::operation_exception& e, const char* what);
 
 // 其余 v_noabi::exception（query_exception 等驱动层错误）→ InternalError，
 // backend_category 固定 "mongocxx"。
-Error ClassifyVNoabiError(const mongocxx::v_noabi::exception& e,
-                          const char*                       what);
+Error ClassifyVNoabiError(const mongocxx::v_noabi::exception& e, const char* what);
 
 // bsoncxx 异常 → 契约 Error：invalid_argument → InvalidArgument，
 // 其余 → InternalError；backend_category 固定 "bsoncxx"。

@@ -1,5 +1,5 @@
 #pragma once
-// RPC v2：owner 实例级的受控检查点。
+// RPC：owner 实例级的受控检查点。
 //
 // 职责：给 writer 与握手路径各一个固定的诊断/故障位置，生产与测试共用同
 // 一条代码路径。它不是观察者回调——库不在关键路径上执行任何用户代码，
@@ -85,12 +85,12 @@ enum class HookAction {
  * generation 尚未退出的命中次数（Clear 返回不等于 in_flight 为零）。
  */
 struct HookSnapshot {
-    std::uint64_t generation{0};
-    HookAction    action{HookAction::Pause};
-    bool          armed{false};
-    bool          closed{false};
-    std::uint64_t entered{0};
-    std::uint64_t in_flight{0};
+    std::uint64_t generation{0};          ///< 生成代号；Clear 递增
+    HookAction action{HookAction::Pause}; ///< 当前故障动作
+    bool armed{false};                    ///< 是否已布防
+    bool closed{false};                   ///< 控制器是否已封口
+    std::uint64_t entered{0};             ///< 当前 generation 命中的次数
+    std::uint64_t in_flight{0};           ///< 跨 generation 尚未退出的命中次数
 };
 
 /**
@@ -112,44 +112,7 @@ public:
      * 时拒绝注册（不回绕）。新注册会解除旧 generation 的 Pause，旧在途命中
      * 只退出旧 generation。
      */
-    result<std::uint64_t> Arm(HookPoint point, HookAction action,
-                              bbt::coroutine::Deadline expires_at) {
-        const auto index = IndexOf(point);
-        if (index == kHookPointCount) {
-            return result<std::uint64_t>::err(
-                MakeError(ErrorCode::InvalidArgument,
-                          "rpc hook: unknown hook point"));
-        }
-        if (action != HookAction::Pause && action != HookAction::ThrowOnce) {
-            return result<std::uint64_t>::err(
-                MakeError(ErrorCode::InvalidArgument,
-                          "rpc hook: unknown hook action"));
-        }
-        const auto now = std::chrono::steady_clock::now();
-        if (expires_at == bbt::coroutine::Deadline::max() ||
-            expires_at <= now || expires_at > now + kMaxArmLifetime) {
-            return result<std::uint64_t>::err(
-                MakeError(ErrorCode::InvalidArgument,
-                          "rpc hook: arm window must be (now, now + 10s]"));
-        }
-        std::lock_guard<std::mutex> lock(m_mu);
-        if (m_closed) {
-            return result<std::uint64_t>::err(
-                MakeError(ErrorCode::Closed, "rpc hook: owner closed"));
-        }
-        auto& state = m_points[index];
-        if (state.generation == std::numeric_limits<std::uint64_t>::max()) {
-            return result<std::uint64_t>::err(
-                MakeError(ErrorCode::RuntimeUnavailable,
-                          "rpc hook: generation exhausted"));
-        }
-        ++state.generation;
-        state.action = action;
-        state.expires_at = expires_at;
-        state.armed = true;
-        state.entered = 0;
-        return result<std::uint64_t>::ok(state.generation);
-    }
+    result<std::uint64_t> Arm(HookPoint point, HookAction action, bbt::coroutine::Deadline expires_at);
 
     /**
      * @brief 解除匹配 generation 的注册；不等待在途命中退出。
@@ -157,20 +120,7 @@ public:
      * 重复、已过期或不属于当前配置的 token 是成功的 no-op，不会清掉后来的
      * 注册。未知 point 返回 InvalidArgument。
      */
-    result<void> Clear(HookPoint point, std::uint64_t generation) {
-        const auto index = IndexOf(point);
-        if (index == kHookPointCount) {
-            return result<void>::err(
-                MakeError(ErrorCode::InvalidArgument,
-                          "rpc hook: unknown hook point"));
-        }
-        std::lock_guard<std::mutex> lock(m_mu);
-        auto& state = m_points[index];
-        if (!m_closed && state.armed && state.generation == generation) {
-            state.armed = false;
-        }
-        return result<void>::ok();
-    }
+    result<void> Clear(HookPoint point, std::uint64_t generation);
 
     /**
      * @brief 读取该点当前的控制状态。
@@ -178,24 +128,7 @@ public:
      * 只返回固定值：generation/action/armed/closed/entered/in_flight，没有
      * 连接、帧或业务对象引用。未知 point 返回 InvalidArgument。
      */
-    result<HookSnapshot> Snapshot(HookPoint point) const {
-        const auto index = IndexOf(point);
-        if (index == kHookPointCount) {
-            return result<HookSnapshot>::err(
-                MakeError(ErrorCode::InvalidArgument,
-                          "rpc hook: unknown hook point"));
-        }
-        std::lock_guard<std::mutex> lock(m_mu);
-        const auto& state = m_points[index];
-        HookSnapshot out;
-        out.generation = state.generation;
-        out.action = state.action;
-        out.armed = state.armed;
-        out.closed = m_closed;
-        out.entered = state.entered;
-        out.in_flight = state.in_flight;
-        return result<HookSnapshot>::ok(out);
-    }
+    result<HookSnapshot> Snapshot(HookPoint point) const;
 
 private:
     friend class detail::SessionHookAccess;
@@ -208,29 +141,34 @@ private:
     static constexpr std::chrono::milliseconds kPauseSlice{10};
 
     struct PointState {
-        std::uint64_t            generation{0};
-        HookAction               action{HookAction::Pause};
+        std::uint64_t generation{0};
+        HookAction action{HookAction::Pause};
         bbt::coroutine::Deadline expires_at{bbt::coroutine::Deadline::max()};
-        bool                     armed{false};
-        std::uint64_t            entered{0};
-        std::uint64_t            in_flight{0};
+        bool armed{false};
+        std::uint64_t entered{0};
+        std::uint64_t in_flight{0};
     };
 
     SessionHooks() = default;
 
-    static constexpr std::size_t IndexOf(HookPoint point) noexcept {
+    static constexpr std::size_t IndexOf(HookPoint point) noexcept
+    {
         switch (point) {
-            case HookPoint::BeforeWrite:             return 0;
-            case HookPoint::OutboundBeforeHandshake: return 1;
-            case HookPoint::InboundBeforeHandshake:  return 2;
-            case HookPoint::InboundBeforePublish:    return 3;
+        case HookPoint::BeforeWrite:
+            return 0;
+        case HookPoint::OutboundBeforeHandshake:
+            return 1;
+        case HookPoint::InboundBeforeHandshake:
+            return 2;
+        case HookPoint::InboundBeforePublish:
+            return 3;
         }
         return kHookPointCount;
     }
 
     mutable std::mutex m_mu;
-    PointState         m_points[kHookPointCount];
-    bool               m_closed{false};
+    PointState m_points[kHookPointCount];
+    bool m_closed{false};
 };
 
 } // namespace bbt::infra::rpc

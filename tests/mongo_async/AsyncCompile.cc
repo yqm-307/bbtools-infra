@@ -9,17 +9,17 @@
 
 using namespace bbt::infra;
 
-void Consume(mongo::CoMongoColl& coll, const mongo::MongoDocument& doc,
-             const CallOptions& options) {
+void Consume(mongo::CoMongoColl& coll, const mongo::MongoDocument& doc, const CallOptions& options)
+{
 #ifdef BBT_NEGATIVE_ASYNC
     // 漏写 bbt_co_await：AsyncReturn 没有 result 的 value()，必须编译失败。
     auto pending = coll.FindOne(doc, options);
     pending.value();
 #else
-    auto found    = bbt_co_await coll.FindOne(doc, options);
+    auto found = bbt_co_await coll.FindOne(doc, options);
     auto inserted = bbt_co_await coll.InsertOne(doc, options);
-    auto updated  = bbt_co_await coll.UpdateOne(doc, doc, options);
-    auto removed  = bbt_co_await coll.DeleteOne(doc, options);
+    auto updated = bbt_co_await coll.UpdateOne(doc, doc, options);
+    auto removed = bbt_co_await coll.DeleteOne(doc, options);
     (void)found;
     (void)inserted;
     (void)updated;
@@ -29,10 +29,10 @@ void Consume(mongo::CoMongoColl& coll, const mongo::MongoDocument& doc,
     fo.limit = 10;
     const std::vector<mongo::MongoDocument> batch{doc};
     auto inserted_many = bbt_co_await coll.InsertMany(batch, options);
-    auto page          = bbt_co_await coll.Find(doc, fo, options);
-    auto updated_many  = bbt_co_await coll.UpdateMany(doc, doc, options);
-    auto removed_many  = bbt_co_await coll.DeleteMany(doc, options);
-    auto counted       = bbt_co_await coll.CountDocuments(doc, options);
+    auto page = bbt_co_await coll.Find(doc, fo, options);
+    auto updated_many = bbt_co_await coll.UpdateMany(doc, doc, options);
+    auto removed_many = bbt_co_await coll.DeleteMany(doc, options);
+    auto counted = bbt_co_await coll.CountDocuments(doc, options);
     (void)inserted_many;
     (void)page;
     (void)updated_many;

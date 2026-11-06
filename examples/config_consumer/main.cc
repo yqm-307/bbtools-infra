@@ -21,24 +21,28 @@ using bbt::infra::ErrorCode;
 
 namespace {
 
-std::string MakeTempDir() {
+std::string MakeTempDir()
+{
     const char* t = std::getenv("TMPDIR");
     std::string dir = (t && *t) ? t : ".";
     std::string tmpl = dir + "/consumer_dir_XXXXXX";
     std::vector<char> buf(tmpl.begin(), tmpl.end());
     buf.push_back('\0');
-    if (::mkdtemp(buf.data()) == nullptr) return {};
+    if (::mkdtemp(buf.data()) == nullptr)
+        return {};
     return std::string(buf.data());
 }
 
-std::string MakeTempFile(const char* name, const std::string& content) {
+std::string MakeTempFile(const char* name, const std::string& content)
+{
     const char* t = std::getenv("TMPDIR");
     std::string dir = (t && *t) ? t : ".";
     std::string tmpl = dir + "/" + name + "_XXXXXX";
     std::vector<char> buf(tmpl.begin(), tmpl.end());
     buf.push_back('\0');
     const int fd = ::mkstemp(buf.data());
-    if (fd < 0) return {};
+    if (fd < 0)
+        return {};
     ::close(fd);
     std::ofstream f(buf.data(), std::ios::trunc);
     f << content;
@@ -48,11 +52,13 @@ std::string MakeTempFile(const char* name, const std::string& content) {
 
 } // namespace
 
-int main() {
+int main()
+{
     int failures = 0;
     auto check = [&failures](bool ok, const char* what) {
         std::printf("  [%s] %s\n", ok ? "ok" : "FAIL", what);
-        if (!ok) ++failures;
+        if (!ok)
+            ++failures;
     };
 
     std::printf("== 内存源 ==\n");
@@ -66,8 +72,7 @@ int main() {
     check(!s1.value.GetInt64("missing"), "缺失键返回错误，不返回 0");
 
     std::printf("== 本地文件源 ==\n");
-    const std::string path = MakeTempFile(
-        "consumer_cfg", "version = 3\nserver.host = 127.0.0.1\nserver.port = 9090\n");
+    const std::string path = MakeTempFile("consumer_cfg", "version = 3\nserver.host = 127.0.0.1\nserver.port = 9090\n");
     check(!path.empty(), "临时文件创建");
     auto fsrc = FileSource::Create(path, "app", "server");
     check(static_cast<bool>(fsrc), "FileSource::Create");
@@ -84,9 +89,8 @@ int main() {
     std::ofstream(path, std::ios::trunc) << "version = abc\n";
     auto bad = fsrc.value()->Read();
     check(!bad, "格式错误不发布伪成功快照");
-    check(static_cast<bool>(bad) == false &&
-              static_cast<int>(bad.error().code) ==
-                  static_cast<int>(ErrorCode::ProtocolError),
+    check(static_cast<bool>(bad) == false
+              && static_cast<int>(bad.error().code) == static_cast<int>(ErrorCode::ProtocolError),
           "格式错误映射 ProtocolError");
 
     // 目录路径：读取失败，不得发布伪成功空快照

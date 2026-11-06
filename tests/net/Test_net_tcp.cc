@@ -54,18 +54,21 @@
 using namespace bbt::infra::net;
 using namespace std::chrono_literals;
 
-static void Check(bool value, const char* expression, int line) {
+static void Check(bool value, const char* expression, int line)
+{
     if (!value) {
         throw std::runtime_error("line " + std::to_string(line) + ": " + expression);
     }
 }
 #define CHECK(expression) Check(static_cast<bool>(expression), #expression, __LINE__)
 
-static bbt::coroutine::WaitOptions Until(std::chrono::milliseconds duration) {
+static bbt::coroutine::WaitOptions Until(std::chrono::milliseconds duration)
+{
     return {std::chrono::steady_clock::now() + duration};
 }
 
-static bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds timeout) {
+static bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds timeout)
+{
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
         if (predicate()) {
@@ -76,38 +79,45 @@ static bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milli
     return predicate();
 }
 
-static std::size_t CountTasks() {
-    return static_cast<std::size_t>(std::distance(
-        std::filesystem::directory_iterator("/proc/self/task"),
-        std::filesystem::directory_iterator{}));
+static std::size_t CountTasks()
+{
+    return static_cast<std::size_t>(
+        std::distance(std::filesystem::directory_iterator("/proc/self/task"), std::filesystem::directory_iterator{}));
 }
 
-static void StartRuntime(std::size_t workers) {
+static void StartRuntime(std::size_t workers)
+{
     g_bbt_coroutine_config->m_cfg_static_thread_num = workers;
     g_bbt_coroutine_config->m_cfg_stack_size = 65536;
     g_scheduler->Start();
 }
 
-static std::future<void> Task(std::function<void()> callback) {
+static std::future<void> Task(std::function<void()> callback)
+{
     auto promise = std::make_shared<std::promise<void>>();
     auto future = promise->get_future();
-    g_scheduler->RegistCoroutineTask(65536, [promise, callback] {
-        try {
-            callback();
-            promise->set_value();
-        } catch (...) {
-            promise->set_exception(std::current_exception());
-        }
-    }, "net.tcp");
+    g_scheduler->RegistCoroutineTask(
+        65536,
+        [promise, callback] {
+            try {
+                callback();
+                promise->set_value();
+            } catch (...) {
+                promise->set_exception(std::current_exception());
+            }
+        },
+        "net.tcp");
     return future;
 }
 
-static void Get(std::future<void>& future) {
+static void Get(std::future<void>& future)
+{
     CHECK(future.wait_for(5s) == std::future_status::ready);
     future.get();
 }
 
-static Address Loopback(int port) {
+static Address Loopback(int port)
+{
     std::error_code error;
     Address address = Address::Ip("127.0.0.1", port, error);
     CHECK(!error);
@@ -119,52 +129,60 @@ struct EngineRunner {
     std::error_code error;
     std::thread thread;
 
-    EngineRunner(Engine& target, EngineConfig config) : engine(target) {
+    EngineRunner(Engine& target, EngineConfig config) : engine(target)
+    {
         thread = std::thread([this, config]() mutable { error = engine.Run(config); });
     }
-    void CloseAndJoin() {
+    void CloseAndJoin()
+    {
         engine.RequestClose();
         if (thread.joinable()) {
             thread.join();
         }
     }
-    ~EngineRunner() { CloseAndJoin(); }
+    ~EngineRunner()
+    {
+        CloseAndJoin();
+    }
 };
 
-static NativeSocket ConnectClient(const Address& address) {
+static NativeSocket ConnectClient(const Address& address)
+{
     std::error_code error;
     NativeSocket client = NativeSocket::Open(AddressFamily::IPv4, SocketType::Stream, error);
     CHECK(!error);
     const auto connect_error = client.Connect(address);
-    CHECK(!connect_error || connect_error.value() == EINPROGRESS
-          || connect_error.value() == EWOULDBLOCK);
+    CHECK(!connect_error || connect_error.value() == EINPROGRESS || connect_error.value() == EWOULDBLOCK);
     pollfd descriptor{client.Fd(), POLLOUT, 0};
     CHECK(::poll(&descriptor, 1, 3000) > 0);
     CHECK(!client.PendingError());
     return client;
 }
 
-static bool Roundtrip(NativeSocket& client, const std::string& payload,
-                      std::chrono::milliseconds timeout) {
+static bool Roundtrip(NativeSocket& client, const std::string& payload, std::chrono::milliseconds timeout)
+{
     if (client.Send(payload.data(), payload.size()).bytes != payload.size()) {
         return false;
     }
     std::string echoed;
     char buffer[1024];
-    return WaitUntil([&] {
-        for (;;) {
-            const auto result = client.Receive(buffer, sizeof(buffer));
-            if (result.bytes > 0) {
-                echoed.append(buffer, result.bytes);
-                if (echoed.size() >= payload.size()) {
-                    return true;
-                }
-                continue;
-            }
-            break;
-        }
-        return echoed.size() >= payload.size();
-    }, timeout) && echoed == payload;
+    return WaitUntil(
+               [&] {
+                   for (;;) {
+                       const auto result = client.Receive(buffer, sizeof(buffer));
+                       if (result.bytes > 0) {
+                           echoed.append(buffer, result.bytes);
+                           if (echoed.size() >= payload.size()) {
+                               return true;
+                           }
+                           continue;
+                       }
+                       break;
+                   }
+                   return echoed.size() >= payload.size();
+               },
+               timeout)
+           && echoed == payload;
 }
 
 struct EchoHandler : RawHandler {
@@ -179,7 +197,8 @@ struct EchoHandler : RawHandler {
     std::mutex mutex;
     std::shared_ptr<Connection> stored;
 
-    void OnAccept(Connection connection) override {
+    void OnAccept(Connection connection) override
+    {
         accepted.fetch_add(1);
         if (auto processer = bbt::coroutine::detail::Processer::TryGetLocalProcesser()) {
             accept_owner.store(processer->GetId());
@@ -189,7 +208,8 @@ struct EchoHandler : RawHandler {
         stored = std::make_shared<Connection>(connection);
     }
 
-    void OnRead(Connection connection) override {
+    void OnRead(Connection connection) override
+    {
         reads.fetch_add(1);
         if (auto processer = bbt::coroutine::detail::Processer::TryGetLocalProcesser()) {
             read_owner.store(processer->GetId());
@@ -202,11 +222,15 @@ struct EchoHandler : RawHandler {
         }
     }
 
-    void OnWrite(Connection, WriteResult result) override {
+    void OnWrite(Connection, WriteResult result) override
+    {
         writes.fetch_add(1);
         write_bytes.fetch_add(result.sent);
     }
-    void OnClose(Connection, std::error_code) override { closed.fetch_add(1); }
+    void OnClose(Connection, std::error_code) override
+    {
+        closed.fetch_add(1);
+    }
 };
 
 struct NullHandler : RawHandler {};
@@ -216,15 +240,20 @@ struct StoreHandler : RawHandler {
     std::atomic<int> reads{0};
     std::mutex mutex;
     std::shared_ptr<Connection> stored;
-    void OnAccept(Connection connection) override {
+    void OnAccept(Connection connection) override
+    {
         accepted.fetch_add(1);
         std::lock_guard<std::mutex> lock(mutex);
         stored = std::make_shared<Connection>(connection);
     }
-    void OnRead(Connection) override { reads.fetch_add(1); }
+    void OnRead(Connection) override
+    {
+        reads.fetch_add(1);
+    }
 };
 
-static EngineConfig ServerConfig(const std::vector<Address>& listen, std::size_t subs = 1) {
+static EngineConfig ServerConfig(const std::vector<Address>& listen, std::size_t subs = 1)
+{
     EngineConfig config;
     config.listen_addresses = listen;
     config.runtime_progress = RuntimeProgress::Independent;
@@ -232,14 +261,14 @@ static EngineConfig ServerConfig(const std::vector<Address>& listen, std::size_t
     return config;
 }
 
-static EngineConfig ServerConfig(const Address& listen, std::size_t subs = 1) {
+static EngineConfig ServerConfig(const Address& listen, std::size_t subs = 1)
+{
     return ServerConfig(std::vector<Address>{listen}, subs);
 }
 
-
 // 极小同机 ping-pong 基线：返回 ops/sec，p99 单向往返纳秒。
-static double PingPong(const Address& address, int iterations, long long& p99_ns,
-                       int& timeouts) {
+static double PingPong(const Address& address, int iterations, long long& p99_ns, int& timeouts)
+{
     timeouts = 0;
     auto client = ConnectClient(address);
     const std::string payload(256, 'p');
@@ -289,8 +318,8 @@ static double PingPong(const Address& address, int iterations, long long& p99_ns
             }
             break;
         }
-        latency.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - begin).count());
+        latency.push_back(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count());
     }
     const auto elapsed = std::chrono::steady_clock::now() - start;
     (void)client.Close();
@@ -300,8 +329,8 @@ static double PingPong(const Address& address, int iterations, long long& p99_ns
 }
 
 // 单元测试用：AcceptWrite 输出记录 -> WriteOperation 句柄。
-static std::error_code TryAccept(ConnectionState& state, std::string data,
-                                 WriteOperation& out) {
+static std::error_code TryAccept(ConnectionState& state, std::string data, WriteOperation& out)
+{
     std::shared_ptr<WriteOpRecord> record;
     const auto error = state.AcceptWrite(std::move(data), record);
     if (!error) {
@@ -312,7 +341,8 @@ static std::error_code TryAccept(ConnectionState& state, std::string data,
 
 // ---------------- cases ----------------
 
-static void RawRoundtrip() {
+static void RawRoundtrip()
+{
     StartRuntime(3);
     const auto tasks_before = CountTasks();
     auto handler = std::make_shared<EchoHandler>();
@@ -337,14 +367,15 @@ static void RawRoundtrip() {
     CHECK(handler->accept_coroutine.load() == 0);
     CHECK(handler->accept_owner.load() == handler->read_owner.load());
     CHECK(handler->accept_owner.load() != main_owners[0]);
-    CHECK(std::find(sub_owners.begin(), sub_owners.end(), handler->accept_owner.load())
-          != sub_owners.end());
+    CHECK(std::find(sub_owners.begin(), sub_owners.end(), handler->accept_owner.load()) != sub_owners.end());
 
     CHECK(!client.Close());
-    CHECK(WaitUntil([&] {
-        std::lock_guard<std::mutex> lock(handler->mutex);
-        return handler->stored && handler->stored->ReadEof();
-    }, 3000ms));
+    CHECK(WaitUntil(
+        [&] {
+            std::lock_guard<std::mutex> lock(handler->mutex);
+            return handler->stored && handler->stored->ReadEof();
+        },
+        3000ms));
     {
         std::lock_guard<std::mutex> lock(handler->mutex);
         handler->stored->RequestClose();
@@ -354,12 +385,12 @@ static void RawRoundtrip() {
     CHECK(!runner.error);
     CHECK(engine.Phase() == EnginePhase::Stopped);
     CHECK(CountTasks() == tasks_before);
-    std::cout << "raw_roundtrip threads=" << tasks_before << " sub_owner="
-              << handler->accept_owner.load() << " main_owner=" << main_owners[0]
-              << " bytes=" << handler->write_bytes.load() << " run=0\n";
+    std::cout << "raw_roundtrip threads=" << tasks_before << " sub_owner=" << handler->accept_owner.load()
+              << " main_owner=" << main_owners[0] << " bytes=" << handler->write_bytes.load() << " run=0\n";
 }
 
-static void CoAcceptReadWrite() {
+static void CoAcceptReadWrite()
+{
     StartRuntime(2);
     auto handler = std::make_shared<NullHandler>();
     Engine engine(handler);
@@ -372,13 +403,20 @@ static void CoAcceptReadWrite() {
     std::atomic<int> result{-1};
     auto task = Task([&] {
         auto res = engine.CoAccept(Until(3000ms));
-        if (res.error) { result.store(1); return; }
+        if (res.error) {
+            result.store(1);
+            return;
+        }
         CoTcpConnection connection = res.connection;
         auto [read_data, read_error] = connection.Read(Until(3000ms));
-        if (bool(read_error)) { result.store(2); return; }
+        if (bool(read_error)) {
+            result.store(2);
+            return;
+        }
         auto report = connection.Write(read_data.CopyTo(), Until(3000ms));
         if (report.wait_error || report.outcome.phase != WritePhase::Done) {
-            result.store(3); return;
+            result.store(3);
+            return;
         }
         connection.RequestClose();
         result.store(0);
@@ -393,7 +431,8 @@ static void CoAcceptReadWrite() {
     std::cout << "co_accept_read_write write=Done closed=ok\n";
 }
 
-static void CoDial() {
+static void CoDial()
+{
     StartRuntime(4);
     auto handler = std::make_shared<EchoHandler>();
     Engine server(handler);
@@ -402,7 +441,7 @@ static void CoDial() {
     std::vector<Address> addresses;
     CHECK(!server.LocalAddresses(addresses));
 
-    Engine client{std::shared_ptr<RawHandler>()};  // Co-only：超时可回收未交付 fd
+    Engine client{std::shared_ptr<RawHandler>()}; // Co-only：超时可回收未交付 fd
     EngineConfig client_config;
     client_config.runtime_progress = RuntimeProgress::Independent;
     client_config.options.num_event_loop = 1;
@@ -412,15 +451,20 @@ static void CoDial() {
     std::atomic<int> result{-1};
     auto task = Task([&] {
         auto res = client.CoDial(addresses[0], Until(3000ms));
-        if (res.error) { result.store(1); return; }
+        if (res.error) {
+            result.store(1);
+            return;
+        }
         CoTcpConnection connection = res.connection;
         auto report = connection.Write("dial", Until(3000ms));
         if (report.wait_error || report.outcome.phase != WritePhase::Done) {
-            result.store(2); return;
+            result.store(2);
+            return;
         }
         auto [read_data, read_error] = connection.Read(Until(3000ms));
         if (bool(read_error) || read_data.CopyTo() != "dial") {
-            result.store(3); return;
+            result.store(3);
+            return;
         }
         connection.RequestClose();
         result.store(0);
@@ -433,7 +477,8 @@ static void CoDial() {
     std::cout << "co_dial echoed=dial run=0\n";
 }
 
-static void CloseRetained() {
+static void CloseRetained()
+{
     StartRuntime(2);
     auto handler = std::make_shared<StoreHandler>();
     Engine engine(handler);
@@ -444,15 +489,19 @@ static void CloseRetained() {
 
     auto client = ConnectClient(addresses[0]);
     CHECK(client.Send("tail", 4).bytes == 4);
-    CHECK(WaitUntil([&] {
-        std::lock_guard<std::mutex> lock(handler->mutex);
-        return handler->reads.load() >= 1 && handler->stored != nullptr;
-    }, 3000ms));
+    CHECK(WaitUntil(
+        [&] {
+            std::lock_guard<std::mutex> lock(handler->mutex);
+            return handler->reads.load() >= 1 && handler->stored != nullptr;
+        },
+        3000ms));
     CHECK(!client.Close());
-    CHECK(WaitUntil([&] {
-        std::lock_guard<std::mutex> lock(handler->mutex);
-        return handler->stored && handler->stored->ReadEof();
-    }, 3000ms));
+    CHECK(WaitUntil(
+        [&] {
+            std::lock_guard<std::mutex> lock(handler->mutex);
+            return handler->stored && handler->stored->ReadEof();
+        },
+        3000ms));
     runner.CloseAndJoin();
     CHECK(!runner.error);
     std::shared_ptr<Connection> retained;
@@ -468,7 +517,8 @@ static void CloseRetained() {
     std::cout << "close_retained tail=" << tail << " eof=ok\n";
 }
 
-static void WriteBackpressure() {
+static void WriteBackpressure()
+{
     StartRuntime(2);
     auto handler = std::make_shared<EchoHandler>();
     Engine engine(handler);
@@ -477,10 +527,12 @@ static void WriteBackpressure() {
     std::vector<Address> addresses;
     CHECK(!engine.LocalAddresses(addresses));
     auto client = ConnectClient(addresses[0]);
-    CHECK(WaitUntil([&] {
-        std::lock_guard<std::mutex> lock(handler->mutex);
-        return handler->stored != nullptr;
-    }, 3000ms));
+    CHECK(WaitUntil(
+        [&] {
+            std::lock_guard<std::mutex> lock(handler->mutex);
+            return handler->stored != nullptr;
+        },
+        3000ms));
     std::shared_ptr<Connection> connection;
     {
         std::lock_guard<std::mutex> lock(handler->mutex);
@@ -493,7 +545,10 @@ static void WriteBackpressure() {
     for (int i = 0; i < 400; ++i) {
         WriteOperation operation;
         const auto error = connection->AsyncWrite(chunk, operation);
-        if (error) { capacity_error = error; break; }
+        if (error) {
+            capacity_error = error;
+            break;
+        }
         ++accepted;
     }
     CHECK(capacity_error == std::make_error_code(std::errc::no_buffer_space));
@@ -504,7 +559,8 @@ static void WriteBackpressure() {
     std::cout << "write_backpressure accepted=" << accepted << " capacity=no_buffer_space\n";
 }
 
-static void WriteTimeout() {
+static void WriteTimeout()
+{
     StartRuntime(1);
     {
         auto state = std::make_shared<ConnectionState>(1, 4096, 128, 4, nullptr);
@@ -513,15 +569,13 @@ static void WriteTimeout() {
         CHECK(!connection.AsyncWrite(std::string(64, 'a'), warm));
         CHECK(!connection.AsyncWrite(std::string(64, 'b'), warm));
         WriteOperation rejected;
-        CHECK(connection.AsyncWrite(std::string(1, 'c'), rejected)
-              == std::make_error_code(std::errc::no_buffer_space));
+        CHECK(connection.AsyncWrite(std::string(1, 'c'), rejected) == std::make_error_code(std::errc::no_buffer_space));
         std::atomic<int> result{-1};
         auto task = Task([&] {
             CoTcpConnection co_conn{connection};
             const auto report = co_conn.Write(std::string(1, 'c'), Until(30ms));
             if (report.wait_error == std::make_error_code(std::errc::timed_out)
-                && report.outcome.phase == WritePhase::Rejected
-                && !report.operation.Valid()) {
+                && report.outcome.phase == WritePhase::Rejected && !report.operation.Valid()) {
                 result.store(0);
             }
         });
@@ -538,8 +592,7 @@ static void WriteTimeout() {
             const auto report = co_conn.Write(std::string(8, 'd'), Until(30ms));
             *operation_holder = report.operation;
             if (report.wait_error == std::make_error_code(std::errc::timed_out)
-                && report.outcome.phase == WritePhase::InFlight
-                && operation_holder->Valid()) {
+                && report.outcome.phase == WritePhase::InFlight && operation_holder->Valid()) {
                 result.store(0);
             }
         });
@@ -551,7 +604,8 @@ static void WriteTimeout() {
     std::cout << "write_timeout capacity=unsubmitted completion=inflight queryable=ok\n";
 }
 
-static void MultiListener() {
+static void MultiListener()
+{
     StartRuntime(3);
     auto handler = std::make_shared<EchoHandler>();
     Engine engine(handler);
@@ -574,7 +628,8 @@ static void MultiListener() {
               << " accepted=" << handler->accepted.load() << "\n";
 }
 
-static void CloseWaitersSettle() {
+static void CloseWaitersSettle()
+{
     StartRuntime(2);
     auto handler = std::make_shared<NullHandler>();
     Engine engine(handler);
@@ -599,10 +654,8 @@ static void CloseWaitersSettle() {
     std::atomic<int> write_result{-1};
     auto write_task = Task([&] {
         CoTcpConnection co_conn{connection};
-        const auto report = co_conn.Write(std::string(8, 'y'),
-                                          bbt::coroutine::WaitOptions{});
-        if (report.wait_error == make_error_code(NetErrc::Closed)
-            && report.outcome.phase == WritePhase::Rejected) {
+        const auto report = co_conn.Write(std::string(8, 'y'), bbt::coroutine::WaitOptions{});
+        if (report.wait_error == make_error_code(NetErrc::Closed) && report.outcome.phase == WritePhase::Rejected) {
             write_result.store(0);
         }
     });
@@ -613,12 +666,13 @@ static void CloseWaitersSettle() {
     std::cout << "close_waiters_settle accept=canceled write=closed\n";
 }
 
-static void RingCombined() {
+static void RingCombined()
+{
     // 公共守卫（bbt::infra::net::ReadAccess）语义：同一保护的 Peek+Consume、
     // Busy 零消费、释放后另一读者可继续。
     auto state = std::make_shared<ConnectionState>(1, 64, 64, 4, nullptr);
     Connection connection = ConnectionTestAccess::Make(state);
-    Connection peer = ConnectionTestAccess::Make(state);  // 同一 ring 的第二句柄
+    Connection peer = ConnectionTestAccess::Make(state); // 同一 ring 的第二句柄
     CHECK(state->ring.TryAppend("abcdef").status == ReadStatus::Ok);
     {
         auto access = connection.TryAccess();
@@ -648,7 +702,8 @@ static void RingCombined() {
     std::cout << "ring_combined peek_consume=ok busy_zero_consume=ok release=ok\n";
 }
 
-static void WriteFifoPrefix() {
+static void WriteFifoPrefix()
+{
     {
         ConnectionState state(1, 4096, 1024, 4, nullptr);
         WriteOperation first;
@@ -656,8 +711,7 @@ static void WriteFifoPrefix() {
         CHECK(!TryAccept(state, "AAAA", first));
         CHECK(!TryAccept(state, "BB", second));
         int calls = 0;
-        auto sink = [&calls](const std::string_view* views, std::size_t count,
-                             std::size_t budget) -> ssize_t {
+        auto sink = [&calls](const std::string_view* views, std::size_t count, std::size_t budget) -> ssize_t {
             (void)views;
             (void)count;
             (void)budget;
@@ -700,10 +754,8 @@ static void WriteFifoPrefix() {
         };
         state.PumpWrites(8, 4096, sink);
         const auto reset = std::error_code(ECONNRESET, std::system_category());
-        CHECK(first.Query().phase == WritePhase::Done && first.Query().sent == 2
-              && first.Query().error == reset);
-        CHECK(second.Query().phase == WritePhase::Done && second.Query().sent == 0
-              && second.Query().error == reset);
+        CHECK(first.Query().phase == WritePhase::Done && first.Query().sent == 2 && first.Query().error == reset);
+        CHECK(second.Query().phase == WritePhase::Done && second.Query().sent == 0 && second.Query().error == reset);
         CHECK(state.LastWriteError() == reset);
         CHECK(state.Acceptance() == AcceptanceState::Open);
         WriteOperation fresh;
@@ -716,7 +768,8 @@ static void WriteFifoPrefix() {
     std::cout << "write_fifo_prefix partial/FIFO/error/Settling/close=ok\n";
 }
 
-static void CoReadTimeout() {
+static void CoReadTimeout()
+{
     StartRuntime(1);
     auto state = std::make_shared<ConnectionState>(1, 4096, 1024, 4, nullptr);
     Connection connection = ConnectionTestAccess::Make(state);
@@ -725,9 +778,8 @@ static void CoReadTimeout() {
     auto task = Task([&] {
         CoTcpConnection co_conn{connection};
         auto [read_data, read_error] = co_conn.Read(Until(30ms));
-        if (bool(read_error)
-            && read_error == std::make_error_code(std::errc::timed_out)
-            && read_data.Empty() && out->empty()) {
+        if (bool(read_error) && read_error == std::make_error_code(std::errc::timed_out) && read_data.Empty()
+            && out->empty()) {
             result.store(0);
         }
     });
@@ -736,7 +788,8 @@ static void CoReadTimeout() {
     std::cout << "co_read_timeout out_unchanged=ok\n";
 }
 
-static void BufferTransferLifetime() {
+static void BufferTransferLifetime()
+{
     StartRuntime(2);
     // 先证明竞争/终态都不改已有输出，且容量在移交后立即释放。
     auto state = std::make_shared<ConnectionState>(1, 8, 8, 4, nullptr);
@@ -746,9 +799,7 @@ static void BufferTransferLifetime() {
     CHECK(state->ring.TryAppend("abcdefgh").status == ReadStatus::Ok);
     {
         auto guard = raw.TryAccess();
-        auto busy = std::async(std::launch::async, [&] {
-            return raw.TryRead(held);
-        });
+        auto busy = std::async(std::launch::async, [&] { return raw.TryRead(held); });
         CHECK(busy.get() == make_error_code(NetErrc::Busy));
         CHECK(held.Empty());
         CHECK(guard.Peek().size() == 8);
@@ -775,7 +826,9 @@ static void BufferTransferLifetime() {
         for (const auto& entry : std::filesystem::directory_iterator("/proc/self/fd")) {
             std::error_code error;
             const auto target = std::filesystem::read_symlink(entry.path(), error).string();
-            if (!error && target.rfind("socket:[", 0) == 0) { ++count; }
+            if (!error && target.rfind("socket:[", 0) == 0) {
+                ++count;
+            }
         }
         return count;
     };
@@ -790,12 +843,16 @@ static void BufferTransferLifetime() {
     CHECK(!engine.LocalAddresses(addresses));
     auto client = ConnectClient(addresses[0]);
     Connection connection;
-    CHECK(WaitUntil([&] {
-        std::lock_guard<std::mutex> lock(handler->mutex);
-        if (!handler->stored) { return false; }
-        connection = *handler->stored;
-        return true;
-    }, 3000ms));
+    CHECK(WaitUntil(
+        [&] {
+            std::lock_guard<std::mutex> lock(handler->mutex);
+            if (!handler->stored) {
+                return false;
+            }
+            connection = *handler->stored;
+            return true;
+        },
+        3000ms));
     const std::string first(4096, 'a');
     CHECK(client.Send(first.data(), first.size()).bytes == first.size());
     CHECK(WaitUntil([&] { return connection.ReadableBytes() == first.size(); }, 3000ms));
@@ -838,7 +895,8 @@ static void BufferTransferLifetime() {
     std::cout << "buffer_transfer_lifetime retained=8192 released=1 sockets_restored=1\n";
 }
 
-static void ReadOverloadContract() {
+static void ReadOverloadContract()
+{
     StartRuntime(2);
     auto state = std::make_shared<ConnectionState>(1, 64, 1024, 4, nullptr);
     auto raw = ConnectionTestAccess::Make(state);
@@ -943,7 +1001,8 @@ static void ReadOverloadContract() {
     std::cout << "read_overload_contract four_overloads busy eof timeout cancel out_unchanged=ok\n";
 }
 
-static void PerfBaseline() {
+static void PerfBaseline()
+{
     StartRuntime(3);
     const int iterations = 500;
     long long raw_p99 = 0;
@@ -961,15 +1020,14 @@ static void PerfBaseline() {
     CHECK(raw_timeouts == 0);
     // Co 路径正确性由 net.r2_co_* / net.b4_co_read_* 覆盖；Co 短基线本轮未测
     // （存在间歇性 coroutine 未恢复，见 b5-fix-ledger，不用统计容忍掩盖）。
-    std::cout << "perf raw_ops_per_sec=" << static_cast<long long>(raw_ops)
-              << " raw_p99_us=" << raw_p99 / 1000
-              << " raw_timeouts=" << raw_timeouts << " n=" << iterations
-              << " co_baseline=not_measured\n";
+    std::cout << "perf raw_ops_per_sec=" << static_cast<long long>(raw_ops) << " raw_p99_us=" << raw_p99 / 1000
+              << " raw_timeouts=" << raw_timeouts << " n=" << iterations << " co_baseline=not_measured\n";
 }
 
 #include "ProcessRuntimeTestMain.hpp"
 
-static void DumpBacktrace(int signal_number) {
+static void DumpBacktrace(int signal_number)
+{
     void* frames[64];
     const int count = backtrace(frames, 64);
     std::cerr << "caught signal " << signal_number << '\n';
@@ -977,25 +1035,42 @@ static void DumpBacktrace(int signal_number) {
     std::_Exit(139);
 }
 
-static int RunCases(int argc, char** argv) {
+static int RunCases(int argc, char** argv)
+{
     try {
         CHECK(argc == 2);
         const std::string test = argv[1];
-        if (test == "raw_roundtrip") { RawRoundtrip(); }
-        else if (test == "co_accept_read_write") { CoAcceptReadWrite(); }
-        else if (test == "co_dial") { CoDial(); }
-        else if (test == "close_retained") { CloseRetained(); }
-        else if (test == "write_backpressure") { WriteBackpressure(); }
-        else if (test == "write_timeout") { WriteTimeout(); }
-        else if (test == "multi_listener") { MultiListener(); }
-        else if (test == "close_waiters_settle") { CloseWaitersSettle(); }
-        else if (test == "ring_combined") { RingCombined(); }
-        else if (test == "write_fifo_prefix") { WriteFifoPrefix(); }
-        else if (test == "co_read_timeout") { CoReadTimeout(); }
-        else if (test == "read_overload_contract") { ReadOverloadContract(); }
-        else if (test == "buffer_transfer_lifetime") { BufferTransferLifetime(); }
-        else if (test == "perf_baseline") { PerfBaseline(); }
-        else { throw std::runtime_error("unknown test: " + test); }
+        if (test == "raw_roundtrip") {
+            RawRoundtrip();
+        } else if (test == "co_accept_read_write") {
+            CoAcceptReadWrite();
+        } else if (test == "co_dial") {
+            CoDial();
+        } else if (test == "close_retained") {
+            CloseRetained();
+        } else if (test == "write_backpressure") {
+            WriteBackpressure();
+        } else if (test == "write_timeout") {
+            WriteTimeout();
+        } else if (test == "multi_listener") {
+            MultiListener();
+        } else if (test == "close_waiters_settle") {
+            CloseWaitersSettle();
+        } else if (test == "ring_combined") {
+            RingCombined();
+        } else if (test == "write_fifo_prefix") {
+            WriteFifoPrefix();
+        } else if (test == "co_read_timeout") {
+            CoReadTimeout();
+        } else if (test == "read_overload_contract") {
+            ReadOverloadContract();
+        } else if (test == "buffer_transfer_lifetime") {
+            BufferTransferLifetime();
+        } else if (test == "perf_baseline") {
+            PerfBaseline();
+        } else {
+            throw std::runtime_error("unknown test: " + test);
+        }
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
@@ -1003,7 +1078,8 @@ static int RunCases(int argc, char** argv) {
     }
 }
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv)
+{
     signal(SIGSEGV, DumpBacktrace);
     signal(SIGABRT, DumpBacktrace);
     return bbt_net_test::RunTestProcessExit([&] { return RunCases(argc, argv); });

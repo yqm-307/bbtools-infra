@@ -42,19 +42,21 @@ using namespace std::chrono_literals;
 
 namespace {
 
-void Check(bool value, const char* expression, int line) {
+void Check(bool value, const char* expression, int line)
+{
     if (!value) {
         throw std::runtime_error("line " + std::to_string(line) + ": " + expression);
     }
 }
 #define CHECK(expression) Check(static_cast<bool>(expression), #expression, __LINE__)
 
-static bbt::coroutine::WaitOptions Until(std::chrono::milliseconds duration) {
+static bbt::coroutine::WaitOptions Until(std::chrono::milliseconds duration)
+{
     return {std::chrono::steady_clock::now() + duration};
 }
 
-static bool WaitUntil(const std::function<bool()>& predicate,
-                      std::chrono::milliseconds timeout) {
+static bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds timeout)
+{
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
         if (predicate()) {
@@ -65,32 +67,39 @@ static bool WaitUntil(const std::function<bool()>& predicate,
     return predicate();
 }
 
-void StartRuntime(std::size_t workers) {
+void StartRuntime(std::size_t workers)
+{
     g_bbt_coroutine_config->m_cfg_static_thread_num = workers;
     g_bbt_coroutine_config->m_cfg_stack_size = 65536;
     g_scheduler->Start();
 }
 
-static std::future<void> Task(std::function<void()> callback) {
+static std::future<void> Task(std::function<void()> callback)
+{
     auto promise = std::make_shared<std::promise<void>>();
     auto future = promise->get_future();
-    g_scheduler->RegistCoroutineTask(65536, [promise, callback] {
-        try {
-            callback();
-            promise->set_value();
-        } catch (...) {
-            promise->set_exception(std::current_exception());
-        }
-    }, "net.stop");
+    g_scheduler->RegistCoroutineTask(
+        65536,
+        [promise, callback] {
+            try {
+                callback();
+                promise->set_value();
+            } catch (...) {
+                promise->set_exception(std::current_exception());
+            }
+        },
+        "net.stop");
     return future;
 }
 
-static void Get(std::future<void>& future) {
+static void Get(std::future<void>& future)
+{
     CHECK(future.wait_for(5s) == std::future_status::ready);
     future.get();
 }
 
-static Address Loopback(int port) {
+static Address Loopback(int port)
+{
     std::error_code error;
     Address address = Address::Ip("127.0.0.1", port, error);
     CHECK(!error);
@@ -98,10 +107,10 @@ static Address Loopback(int port) {
 }
 
 // 临时绑定后关闭，探得当前空闲端口（仅用于确定端口，不作为监听资源）。
-static Address BindTempPort() {
+static Address BindTempPort()
+{
     std::error_code error;
-    NativeSocket listener = NativeSocket::Open(AddressFamily::IPv4, SocketType::Stream,
-                                               error);
+    NativeSocket listener = NativeSocket::Open(AddressFamily::IPv4, SocketType::Stream, error);
     CHECK(!error);
     CHECK(!listener.Bind(Loopback(0)));
     CHECK(!listener.Listen(8));
@@ -117,29 +126,33 @@ struct EngineRunner {
     std::atomic<bool> returned{false};
     std::thread thread;
 
-    EngineRunner(Engine& target, EngineConfig config) : engine(target) {
+    EngineRunner(Engine& target, EngineConfig config) : engine(target)
+    {
         thread = std::thread([this, config]() mutable {
             error = engine.Run(config);
             returned.store(true);
         });
     }
-    void CloseAndJoin() {
+    void CloseAndJoin()
+    {
         engine.RequestClose();
         if (thread.joinable()) {
             thread.join();
         }
     }
-    ~EngineRunner() { CloseAndJoin(); }
+    ~EngineRunner()
+    {
+        CloseAndJoin();
+    }
 };
 
-static NativeSocket ConnectClient(const Address& address) {
+static NativeSocket ConnectClient(const Address& address)
+{
     std::error_code error;
-    NativeSocket client =
-        NativeSocket::Open(AddressFamily::IPv4, SocketType::Stream, error);
+    NativeSocket client = NativeSocket::Open(AddressFamily::IPv4, SocketType::Stream, error);
     CHECK(!error);
     const auto connect_error = client.Connect(address);
-    CHECK(!connect_error || connect_error.value() == EINPROGRESS ||
-          connect_error.value() == EWOULDBLOCK);
+    CHECK(!connect_error || connect_error.value() == EINPROGRESS || connect_error.value() == EWOULDBLOCK);
     pollfd descriptor{client.Fd(), POLLOUT, 0};
     CHECK(::poll(&descriptor, 1, 3000) > 0);
     CHECK(!client.PendingError());
@@ -147,10 +160,10 @@ static NativeSocket ConnectClient(const Address& address) {
 }
 
 // 监听已物理关闭：新连接被拒绝（ECONNREFUSED），而非可建立。
-static bool PortRefused(const Address& address) {
+static bool PortRefused(const Address& address)
+{
     std::error_code error;
-    NativeSocket sock = NativeSocket::Open(AddressFamily::IPv4, SocketType::Stream,
-                                           error);
+    NativeSocket sock = NativeSocket::Open(AddressFamily::IPv4, SocketType::Stream, error);
     if (error) {
         return false;
     }
@@ -163,8 +176,7 @@ static bool PortRefused(const Address& address) {
         sock.Close();
         return true;
     }
-    if (connect_error.value() != EINPROGRESS &&
-        connect_error.value() != EWOULDBLOCK) {
+    if (connect_error.value() != EINPROGRESS && connect_error.value() != EWOULDBLOCK) {
         sock.Close();
         return false;
     }
@@ -178,7 +190,8 @@ static bool PortRefused(const Address& address) {
     return refused;
 }
 
-static EngineConfig ServerConfig(const Address& listen) {
+static EngineConfig ServerConfig(const Address& listen)
+{
     EngineConfig config;
     config.listen_addresses = {listen};
     config.runtime_progress = RuntimeProgress::Independent;
@@ -186,7 +199,8 @@ static EngineConfig ServerConfig(const Address& listen) {
     return config;
 }
 
-static EngineConfig ClientConfig() {
+static EngineConfig ClientConfig()
+{
     EngineConfig config;
     config.runtime_progress = RuntimeProgress::Independent;
     config.options.num_event_loop = 1;
@@ -196,7 +210,8 @@ static EngineConfig ClientConfig() {
 struct NullHandler : RawHandler {};
 
 struct EchoHandler : RawHandler {
-    void OnRead(Connection connection) override {
+    void OnRead(Connection connection) override
+    {
         std::string data;
         auto result = connection.TryRead(data);
         if (result.status == ReadStatus::Ok && !data.empty()) {
@@ -208,7 +223,8 @@ struct EchoHandler : RawHandler {
 
 // ---------------- cases ----------------
 
-void StopRunningDeliveredConnRW() {
+void StopRunningDeliveredConnRW()
+{
     StartRuntime(2);
     const Address address = BindTempPort();
     auto handler = std::make_shared<NullHandler>();
@@ -275,13 +291,15 @@ void StopRunningDeliveredConnRW() {
     CHECK(rw_result.load() == 0);
     std::string echoed;
     char buffer[16];
-    CHECK(WaitUntil([&] {
-        const auto result = client.Receive(buffer, sizeof(buffer));
-        if (result.bytes > 0) {
-            echoed.append(buffer, result.bytes);
-        }
-        return echoed == "ping";
-    }, 3000ms));
+    CHECK(WaitUntil(
+        [&] {
+            const auto result = client.Receive(buffer, sizeof(buffer));
+            if (result.bytes > 0) {
+                echoed.append(buffer, result.bytes);
+            }
+            return echoed == "ping";
+        },
+        3000ms));
 
     accepted_connection->RequestClose();
     CHECK(!client.Close());
@@ -292,7 +310,8 @@ void StopRunningDeliveredConnRW() {
     std::cout << "stop_running_delivered_conn_rw ok" << std::endl;
 }
 
-void StopWakesCoAcceptWaiters() {
+void StopWakesCoAcceptWaiters()
+{
     StartRuntime(2);
     const Address address = BindTempPort();
     auto handler = std::make_shared<NullHandler>();
@@ -319,9 +338,8 @@ void StopWakesCoAcceptWaiters() {
     CHECK(WaitUntil([&] { return waiter_registered.load(); }, 3000ms));
     engine.RequestStopAccepting();
     Get(task);
-    CHECK(result.load() ==
-          static_cast<int>(std::errc::operation_canceled));
-    CHECK(!out.Valid());  // out 未被覆盖
+    CHECK(result.load() == static_cast<int>(std::errc::operation_canceled));
+    CHECK(!out.Valid()); // out 未被覆盖
     CHECK(WaitUntil([&] { return engine.AcceptingStopped(); }, 5000ms));
     CHECK(PortRefused(addresses[0]));
     runner.CloseAndJoin();
@@ -330,7 +348,8 @@ void StopWakesCoAcceptWaiters() {
     std::cout << "stop_wakes_coaccept_waiters ok" << std::endl;
 }
 
-void StopLateCoAcceptRejected() {
+void StopLateCoAcceptRejected()
+{
     StartRuntime(2);
 
     // A: Run 前（Idle）停止：CoAccept 返回 operation_not_permitted，out 不变；
@@ -352,21 +371,17 @@ void StopLateCoAcceptRejected() {
             }
         });
         Get(task);
-        CHECK(co_result.load() ==
-              static_cast<int>(std::errc::operation_not_permitted));
+        CHECK(co_result.load() == static_cast<int>(std::errc::operation_not_permitted));
         CHECK(!co_out.Valid());
         EngineRunner runner(idle, ServerConfig(address));
-        CHECK(WaitUntil([&] { return runner.returned.load(); },
-                        5000ms));
+        CHECK(WaitUntil([&] { return runner.returned.load(); }, 5000ms));
         runner.CloseAndJoin();
-        CHECK(runner.error ==
-              std::make_error_code(std::errc::operation_canceled));
+        CHECK(runner.error == std::make_error_code(std::errc::operation_canceled));
         CHECK(idle.Phase() == EnginePhase::Stopped);
         CHECK(idle.AcceptingStopped());
         CHECK(PortRefused(address));
         std::vector<Address> snap;
-        CHECK(idle.LocalAddresses(snap) ==
-              std::make_error_code(std::errc::operation_not_permitted));
+        CHECK(idle.LocalAddresses(snap) == std::make_error_code(std::errc::operation_not_permitted));
     }
 
     // B: Running 中停止后，晚到的 CoAccept 直接 operation_canceled，out 不变。
@@ -376,8 +391,7 @@ void StopLateCoAcceptRejected() {
         Engine engine(handler);
         CHECK(!engine.EnableAcceptHandoff(4));
         EngineRunner runner(engine, ServerConfig(address));
-        CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; },
-                        3000ms));
+        CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
         std::vector<Address> addresses;
         CHECK(!engine.LocalAddresses(addresses));
         engine.RequestStopAccepting();
@@ -392,8 +406,7 @@ void StopLateCoAcceptRejected() {
             }
         });
         Get(task);
-        CHECK(co_result.load() ==
-              static_cast<int>(std::errc::operation_canceled));
+        CHECK(co_result.load() == static_cast<int>(std::errc::operation_canceled));
         CHECK(!co_out.Valid());
         runner.CloseAndJoin();
         CHECK(!runner.error);
@@ -403,7 +416,8 @@ void StopLateCoAcceptRejected() {
     std::cout << "stop_late_coaccept_rejected ok" << std::endl;
 }
 
-void StopBeforeRunNoListener() {
+void StopBeforeRunNoListener()
+{
     // 无 runtime 亦可停止：本代无 listener，停止即生效；随后 Run 不开监听。
     const Address address = BindTempPort();
     Engine engine(std::make_shared<NullHandler>());
@@ -419,12 +433,12 @@ void StopBeforeRunNoListener() {
     CHECK(engine.AcceptingStopped());
     CHECK(PortRefused(address));
     std::vector<Address> snap;
-    CHECK(engine.LocalAddresses(snap) ==
-          std::make_error_code(std::errc::operation_not_permitted));
+    CHECK(engine.LocalAddresses(snap) == std::make_error_code(std::errc::operation_not_permitted));
     std::cout << "stop_before_run_no_listener ok" << std::endl;
 }
 
-void StopClientOnlyDialContinues(bool before_run = false) {
+void StopClientOnlyDialContinues(bool before_run = false)
+{
     StartRuntime(2);
     std::error_code error;
     auto listener = NativeSocket::Open(AddressFamily::IPv4, SocketType::Stream, error);
@@ -434,7 +448,10 @@ void StopClientOnlyDialContinues(bool before_run = false) {
     CHECK(!error);
 
     Engine client{std::shared_ptr<RawHandler>()};
-    if (before_run) { client.RequestStopAccepting(); CHECK(client.AcceptingStopped()); }
+    if (before_run) {
+        client.RequestStopAccepting();
+        CHECK(client.AcceptingStopped());
+    }
     EngineRunner runner(client, ClientConfig());
     CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
     client.RequestStopAccepting();
@@ -445,7 +462,9 @@ void StopClientOnlyDialContinues(bool before_run = false) {
     auto task = Task([&] {
         auto res = client.CoDial(address, Until(3000ms));
         dial_result.store(res.error ? res.error.value() : 0);
-        if (res.error) { return; }
+        if (res.error) {
+            return;
+        }
         connection = res.connection.Raw();
         CoTcpConnection co_conn{connection};
         auto report = co_conn.Write("ping", Until(3000ms));
@@ -468,25 +487,33 @@ void StopClientOnlyDialContinues(bool before_run = false) {
     // native 对端由控制线程推进，不引入第二个 Engine/额外线程。
     // 每个阶段都先观察真实 accept/请求字节，再回复。
     NativeSocket peer;
-    CHECK(WaitUntil([&] {
-        Address remote;
-        peer = listener.Accept(remote, error);
-        return !error && peer.Fd() >= 0;
-    }, 3000ms));
+    CHECK(WaitUntil(
+        [&] {
+            Address remote;
+            peer = listener.Accept(remote, error);
+            return !error && peer.Fd() >= 0;
+        },
+        3000ms));
     std::string request;
-    CHECK(WaitUntil([&] {
-        char buffer[16];
-        const auto read = peer.Receive(buffer, sizeof(buffer));
-        if (read.bytes > 0) { request.append(buffer, read.bytes); }
-        return request.size() >= 4;
-    }, 3000ms));
+    CHECK(WaitUntil(
+        [&] {
+            char buffer[16];
+            const auto read = peer.Receive(buffer, sizeof(buffer));
+            if (read.bytes > 0) {
+                request.append(buffer, read.bytes);
+            }
+            return request.size() >= 4;
+        },
+        3000ms));
     CHECK(request == "ping");
     std::size_t sent = 0;
-    CHECK(WaitUntil([&] {
-        const auto write = peer.Send("pong" + sent, 4 - sent);
-        sent += write.bytes;
-        return sent == 4;
-    }, 3000ms));
+    CHECK(WaitUntil(
+        [&] {
+            const auto write = peer.Send("pong" + sent, 4 - sent);
+            sent += write.bytes;
+            return sent == 4;
+        },
+        3000ms));
     Get(task);
     CHECK(dial_result.load() == 0 && exchange_result.load() == 0);
     connection.RequestClose();
@@ -496,7 +523,8 @@ void StopClientOnlyDialContinues(bool before_run = false) {
     std::cout << "stop_client_only_dial_continues ok" << std::endl;
 }
 
-void StopPostFailureRetry() {
+void StopPostFailureRetry()
+{
     StartRuntime(2);
     Engine engine(std::make_shared<NullHandler>());
     CHECK(!engine.EnableAcceptHandoff(4));
@@ -523,15 +551,15 @@ void StopPostFailureRetry() {
     std::cout << "stop_post_failure_retry refusal_not_physical=1 owner_retry_closed_listener=1\n";
 }
 
-void StopRepeatAndConcurrent() {
+void StopRepeatAndConcurrent()
+{
     StartRuntime(2);
     const Address address = BindTempPort();
     auto handler = std::make_shared<NullHandler>();
     Engine engine(handler);
     CHECK(!engine.EnableAcceptHandoff(4));
     EngineRunner runner(engine, ServerConfig(address));
-    CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; },
-                    3000ms));
+    CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
     std::vector<Address> addresses;
     CHECK(!engine.LocalAddresses(addresses));
     CHECK(!addresses.empty());
@@ -539,7 +567,10 @@ void StopRepeatAndConcurrent() {
     std::atomic<int> calls{0};
     std::vector<std::thread> threads;
     for (int i = 0; i < 8; ++i) {
-        threads.emplace_back([&] { engine.RequestStopAccepting(); calls.fetch_add(1); });
+        threads.emplace_back([&] {
+            engine.RequestStopAccepting();
+            calls.fetch_add(1);
+        });
     }
     for (auto& t : threads) {
         t.join();
@@ -557,7 +588,8 @@ void StopRepeatAndConcurrent() {
     std::cout << "stop_repeat_and_concurrent ok" << std::endl;
 }
 
-void StopDuringStartingRace() {
+void StopDuringStartingRace()
+{
     StartRuntime(2);
     const Address address = BindTempPort();
     Engine engine(std::make_shared<NullHandler>());
@@ -577,21 +609,20 @@ void StopDuringStartingRace() {
     std::cout << "stop_during_starting_race ok" << std::endl;
 }
 
-void StopWithDriverFailed() {
+void StopWithDriverFailed()
+{
     StartRuntime(2);
     const Address address = BindTempPort();
     auto handler = std::make_shared<NullHandler>();
     Engine engine(handler);
     CHECK(!engine.EnableAcceptHandoff(4));
     EngineRunner runner(engine, ServerConfig(address));
-    CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; },
-                    3000ms));
+    CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
     engine.RequestStopAccepting();
     CHECK(!EngineTestAccess::InjectDriverFailure(engine));
-    CHECK(WaitUntil([&] { return engine.Phase() != EnginePhase::Running; },
-                    10000ms));
+    CHECK(WaitUntil([&] { return engine.Phase() != EnginePhase::Running; }, 10000ms));
     runner.CloseAndJoin();
-    CHECK(runner.error);  // 经真实 Failed 错误出口返回
+    CHECK(runner.error); // 经真实 Failed 错误出口返回
     CHECK(engine.Phase() == EnginePhase::Stopped);
     // Failed 同代同步解绑后的控制域：全部本代 listener 已物理关。
     CHECK(engine.AcceptingStopped());
@@ -601,27 +632,23 @@ void StopWithDriverFailed() {
     std::cout << "stop_with_driver_failed ok" << std::endl;
 }
 
-void StopUndeliveredHandoffReclaimed() {
+void StopUndeliveredHandoffReclaimed()
+{
     StartRuntime(2);
     const Address address = BindTempPort();
     auto handler = std::make_shared<NullHandler>();
     Engine engine(handler);
     CHECK(!engine.EnableAcceptHandoff(4));
     EngineRunner runner(engine, ServerConfig(address));
-    CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; },
-                    3000ms));
+    CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
     std::vector<Address> addresses;
     CHECK(!engine.LocalAddresses(addresses));
     // 真实建连并进入 handoff，但不由 CoAccept 领取：未交付连接。
     auto client = ConnectClient(addresses[0]);
-    CHECK(WaitUntil([&] {
-        return EngineTestAccess::ConnectionCount(engine) == 1;
-    }, 3000ms));
+    CHECK(WaitUntil([&] { return EngineTestAccess::ConnectionCount(engine) == 1; }, 3000ms));
     engine.RequestStopAccepting();
     // 门后未交付 handoff 连接被退役并物理关闭。
-    CHECK(WaitUntil([&] {
-        return EngineTestAccess::ConnectionCount(engine) == 0;
-    }, 5000ms));
+    CHECK(WaitUntil([&] { return EngineTestAccess::ConnectionCount(engine) == 0; }, 5000ms));
     CHECK(EngineTestAccess::FirstConnectionFd(engine) == -1);
     CHECK(engine.AcceptingStopped());
     CHECK(PortRefused(addresses[0]));
@@ -634,7 +661,8 @@ void StopUndeliveredHandoffReclaimed() {
     std::cout << "stop_undelivered_handoff_reclaimed ok" << std::endl;
 }
 
-int RunCases(int argc, char** argv) {
+int RunCases(int argc, char** argv)
+{
     try {
         CHECK(argc == 2);
         const std::string test = argv[1];
@@ -673,7 +701,8 @@ int RunCases(int argc, char** argv) {
 
 } // namespace
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv)
+{
     std::signal(SIGSEGV, [](int) { std::_Exit(139); });
     std::signal(SIGABRT, [](int) { std::_Exit(134); });
     return bbt_net_test::RunTestProcessExit([&] { return RunCases(argc, argv); });

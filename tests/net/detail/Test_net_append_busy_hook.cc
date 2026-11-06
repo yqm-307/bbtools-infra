@@ -53,32 +53,36 @@ namespace {
 using namespace bbt::infra::net;
 using namespace std::chrono_literals;
 
-constexpr std::size_t kSeg = 16384;   // = Engine.cc 的 kReadChunk：一段对应一次完整 recv
+constexpr std::size_t kSeg = 16384; // = Engine.cc 的 kReadChunk：一段对应一次完整 recv
 
-bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds timeout) {
+bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds timeout)
+{
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
         if (predicate()) {
             return true;
         }
-        std::this_thread::yield();   // 不用 sleep_for：见文件头线程约定
+        std::this_thread::yield(); // 不用 sleep_for：见文件头线程约定
     }
     return predicate();
 }
 
-void StartRuntime(std::size_t workers) {
+void StartRuntime(std::size_t workers)
+{
     g_bbt_coroutine_config->m_cfg_static_thread_num = workers;
     g_bbt_coroutine_config->m_cfg_stack_size = 65536;
     g_scheduler->Start();
 }
 
-Address Loopback(int port) {
+Address Loopback(int port)
+{
     std::error_code error;
     Address address = Address::Ip("127.0.0.1", port, error);
     return address;
 }
 
-EngineConfig ServerConfig(const Address& listen) {
+EngineConfig ServerConfig(const Address& listen)
+{
     EngineConfig config;
     config.listen_addresses = {listen};
     config.runtime_progress = RuntimeProgress::Independent;
@@ -90,7 +94,8 @@ EngineConfig ServerConfig(const Address& listen) {
 // ReadLowWater = max_inbound_bytes / 2。选 49152*2 使低水位 = 49152，
 // 与 A+B+C 总量相等 —— 这是「消费者读完仍不低于低水位」的最不利边界，
 // 用来验证 pending 导致的暂停能否真正解除（而不是永久卡住读泵）。
-EngineConfig TightServerConfig(const Address& listen) {
+EngineConfig TightServerConfig(const Address& listen)
+{
     EngineConfig config = ServerConfig(listen);
     config.options.max_inbound_bytes = 49152 * 2;
     return config;
@@ -101,19 +106,25 @@ struct EngineRunner {
     std::error_code error;
     std::thread thread;
 
-    EngineRunner(Engine& target, EngineConfig config) : engine(target) {
+    EngineRunner(Engine& target, EngineConfig config) : engine(target)
+    {
         thread = std::thread([this, config]() mutable { error = engine.Run(config); });
     }
-    void CloseAndJoin() {
+    void CloseAndJoin()
+    {
         engine.RequestClose();
         if (thread.joinable()) {
             thread.join();
         }
     }
-    ~EngineRunner() { CloseAndJoin(); }
+    ~EngineRunner()
+    {
+        CloseAndJoin();
+    }
 };
 
-NativeSocket ConnectClient(const Address& address, bool& ok) {
+NativeSocket ConnectClient(const Address& address, bool& ok)
+{
     ok = false;
     std::error_code error;
     NativeSocket client = NativeSocket::Open(AddressFamily::IPv4, SocketType::Stream, error);
@@ -121,8 +132,7 @@ NativeSocket ConnectClient(const Address& address, bool& ok) {
         return client;
     }
     const auto connect_error = client.Connect(address);
-    if (connect_error && connect_error.value() != EINPROGRESS
-        && connect_error.value() != EWOULDBLOCK) {
+    if (connect_error && connect_error.value() != EINPROGRESS && connect_error.value() != EWOULDBLOCK) {
         return client;
     }
     pollfd descriptor{client.Fd(), POLLOUT, 0};
@@ -137,8 +147,8 @@ NativeSocket ConnectClient(const Address& address, bool& ok) {
     return client;
 }
 
-bool SendAll(NativeSocket& client, const std::string& payload,
-             std::chrono::milliseconds timeout) {
+bool SendAll(NativeSocket& client, const std::string& payload, std::chrono::milliseconds timeout)
+{
     std::size_t sent = 0;
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (sent < payload.size()) {
@@ -165,17 +175,23 @@ struct StoreHandler : RawHandler {
     std::mutex mutex;
     std::shared_ptr<Connection> stored;
 
-    void OnAccept(Connection connection) override {
+    void OnAccept(Connection connection) override
+    {
         accepted.fetch_add(1);
         std::lock_guard<std::mutex> lock(mutex);
         stored = std::make_shared<Connection>(connection);
     }
-    void OnRead(Connection) override {}
-    void OnClose(Connection, std::error_code) override {}
+    void OnRead(Connection) override
+    {
+    }
+    void OnClose(Connection, std::error_code) override
+    {
+    }
 };
 
 // 段内容：整段填同一标记，段首/段尾带可识别标签。
-std::string MakeSeg(char tag) {
+std::string MakeSeg(char tag)
+{
     std::string segment(kSeg, tag);
     const std::string head = std::string("SEG=") + tag + ";BEGIN;";
     const std::string tail = std::string(";END=") + tag + ";";
@@ -188,15 +204,15 @@ std::string MakeSeg(char tag) {
 struct Gate {
     std::shared_ptr<ConnectionState> state;
     bool expect_c{true};
-    std::atomic<int> read_hook_calls{0};    // B 的 recv、C 的 recv 各一次
-    std::atomic<int> busy_hook_calls{0};    // 每次 TryAppend 观测到 Busy 记一次
+    std::atomic<int> read_hook_calls{0}; // B 的 recv、C 的 recv 各一次
+    std::atomic<int> busy_hook_calls{0}; // 每次 TryAppend 观测到 Busy 记一次
     std::atomic<bool> take_lock{false};
     std::atomic<bool> lock_held{false};
     std::atomic<bool> c_sent{false};
-    std::atomic<bool> c_recv_seen{false};   // C 的 recv 已发生（append 紧随其后）
+    std::atomic<bool> c_recv_seen{false}; // C 的 recv 已发生（append 紧随其后）
     std::atomic<bool> release{false};
     std::atomic<bool> released{false};
-    std::atomic<bool> seam_observed{false};     // Busy 接缝首次在「仍持锁」时触发
+    std::atomic<bool> seam_observed{false}; // Busy 接缝首次在「仍持锁」时触发
     std::atomic<bool> aux_error{false};
     std::atomic<std::size_t> pending_observed{0};
 };
@@ -205,7 +221,8 @@ struct Gate {
 // #1 = B 的 recv 之后（既有 read-append 接缝）：让 aux 取得真实数据锁并确认持有，
 // 这同时把 owner 挡在 append 之前，构成「此时才能发 C」的门。
 // docs/decisions/0002-co-network-contract.md = C 的 recv 之后：置位 c_recv_seen，让主线程知道 append 即将发生。
-std::function<void()> MakeReadAppendHook(const std::shared_ptr<Gate>& gate) {
+std::function<void()> MakeReadAppendHook(const std::shared_ptr<Gate>& gate)
+{
     return [gate] {
         const int calls = gate->read_hook_calls.fetch_add(1);
         if (calls == 0) {
@@ -223,7 +240,8 @@ std::function<void()> MakeReadAppendHook(const std::shared_ptr<Gate>& gate) {
 
 // Busy 接缝：只在「TryAppend 观测 Busy、deferred 尚未提交」时被调用。
 // 首次 = B；若 C 也 Busy，则第二次出现，说明本次没构造出「C 直接入 ring」的窗口。
-std::function<void()> MakeAppendBusyHook(const std::shared_ptr<Gate>& gate) {
+std::function<void()> MakeAppendBusyHook(const std::shared_ptr<Gate>& gate)
+{
     return [gate] {
         const int calls = gate->busy_hook_calls.fetch_add(1);
         if (calls == 0) {
@@ -232,8 +250,7 @@ std::function<void()> MakeAppendBusyHook(const std::shared_ptr<Gate>& gate) {
             } else {
                 gate->aux_error.store(true);
             }
-            if (gate->expect_c
-                && !WaitUntil([&] { return gate->c_sent.load(); }, 6000ms)) {
+            if (gate->expect_c && !WaitUntil([&] { return gate->c_sent.load(); }, 6000ms)) {
                 gate->aux_error.store(true);
             }
             gate->release.store(true);
@@ -244,7 +261,8 @@ std::function<void()> MakeAppendBusyHook(const std::shared_ptr<Gate>& gate) {
     };
 }
 
-void AuxThread(std::shared_ptr<Gate> gate) {
+void AuxThread(std::shared_ptr<Gate> gate)
+{
     if (!WaitUntil([&] { return gate->take_lock.load(); }, 6000ms)) {
         gate->aux_error.store(true);
         return;
@@ -277,7 +295,8 @@ void AuxThread(std::shared_ptr<Gate> gate) {
     }
 }
 
-void DrainOnce(Connection& connection, Engine& engine, std::string& out) {
+void DrainOnce(Connection& connection, Engine& engine, std::string& out)
+{
     ReadAccess access = connection.TryAccess();
     if (access && access.Size() != 0) {
         (void)access.ConsumeInto(out);
@@ -286,8 +305,8 @@ void DrainOnce(Connection& connection, Engine& engine, std::string& out) {
     EngineTestAccess::KickOwner(engine);
 }
 
-std::string ReadBounded(Connection& connection, Engine& engine, std::size_t expected,
-                        std::chrono::milliseconds budget) {
+std::string ReadBounded(Connection& connection, Engine& engine, std::size_t expected, std::chrono::milliseconds budget)
+{
     std::string out;
     const auto deadline = std::chrono::steady_clock::now() + budget;
     while (out.size() < expected && std::chrono::steady_clock::now() < deadline) {
@@ -299,7 +318,8 @@ std::string ReadBounded(Connection& connection, Engine& engine, std::size_t expe
     return out;
 }
 
-std::string BlockOrder(const std::string& out) {
+std::string BlockOrder(const std::string& out)
+{
     std::string order;
     for (std::size_t offset = 0; offset + kSeg <= out.size(); offset += kSeg) {
         if (!order.empty()) {
@@ -310,7 +330,8 @@ std::string BlockOrder(const std::string& out) {
     return order;
 }
 
-std::size_t FirstDiff(const std::string& actual, const std::string& expected) {
+std::size_t FirstDiff(const std::string& actual, const std::string& expected)
+{
     const std::size_t common = std::min(actual.size(), expected.size());
     std::size_t index = 0;
     while (index < common && actual[index] == expected[index]) {
@@ -329,7 +350,8 @@ struct Outcome {
     std::string out;
 };
 
-Outcome RunInterleave(bool send_c, bool tight = false) {
+Outcome RunInterleave(bool send_c, bool tight = false)
+{
     Outcome result;
     StartRuntime(2);
 
@@ -341,8 +363,7 @@ Outcome RunInterleave(bool send_c, bool tight = false) {
 
     auto handler = std::make_shared<StoreHandler>();
     Engine engine(handler);
-    EngineRunner runner(engine, tight ? TightServerConfig(Loopback(0))
-                                      : ServerConfig(Loopback(0)));
+    EngineRunner runner(engine, tight ? TightServerConfig(Loopback(0)) : ServerConfig(Loopback(0)));
     BOOST_REQUIRE(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
     std::vector<Address> addresses;
     BOOST_REQUIRE(!engine.LocalAddresses(addresses));
@@ -394,24 +415,24 @@ Outcome RunInterleave(bool send_c, bool tight = false) {
     // window_ok=1：C 在 pending 仍在时被 recv（旧行为下即 A+C+B 的成因）
     // window_ok=0：owner 在 pending 存在时停止了 recv（修复后的正确行为）
     // 把 window_ok 当前置条件会把「已修好」误判成「前提未成立」——这是判据错误。
-    const bool window_ok = WaitUntil([&] {
-        return gate->read_hook_calls.load() >= 2
-            && gate->busy_hook_calls.load() == 1
-            && state->ring.PendingSize() == b.size();
-    }, 6000ms);
+    const bool window_ok = WaitUntil(
+        [&] {
+            return gate->read_hook_calls.load() >= 2 && gate->busy_hook_calls.load() == 1
+                   && state->ring.PendingSize() == b.size();
+        },
+        6000ms);
 
     // 步骤 6：读回全部字节。
     const std::size_t expected_size = send_c ? abc.size() : (a.size() + b.size());
     result.out = ReadBounded(*conn, engine, expected_size, 8000ms);
 
     BOOST_TEST_MESSAGE("READ_HOOK_CALLS=" << gate->read_hook_calls.load()
-                       << " BUSY_HOOK_CALLS=" << gate->busy_hook_calls.load()
-                       << " SEAM_OBSERVED=" << (gate->seam_observed.load() ? 1 : 0)
-                       << " WINDOW_OK=" << (window_ok ? 1 : 0)
-                       << " PENDING_OBSERVED=" << gate->pending_observed.load());
-    BOOST_TEST_MESSAGE("BLOCK_ORDER=" << BlockOrder(result.out)
-                       << " ACTUAL_SIZE=" << result.out.size()
-                       << " EXPECTED_SIZE=" << expected_size);
+                                          << " BUSY_HOOK_CALLS=" << gate->busy_hook_calls.load()
+                                          << " SEAM_OBSERVED=" << (gate->seam_observed.load() ? 1 : 0)
+                                          << " WINDOW_OK=" << (window_ok ? 1 : 0)
+                                          << " PENDING_OBSERVED=" << gate->pending_observed.load());
+    BOOST_TEST_MESSAGE("BLOCK_ORDER=" << BlockOrder(result.out) << " ACTUAL_SIZE=" << result.out.size()
+                                      << " EXPECTED_SIZE=" << expected_size);
 
     EngineTestAccess::SetReadAppendHook(engine, std::function<void()>());
     EngineTestAccess::SetAppendBusyHook(engine, std::function<void()>());
@@ -432,24 +453,25 @@ Outcome RunInterleave(bool send_c, bool tight = false) {
     return result;
 }
 
-}  // namespace
+} // namespace
 
 BOOST_AUTO_TEST_SUITE(net_append_busy_hook)
 
 // 核心用例：pending 存在期间继续 recv 的数据不得越过 pending。
 // 未修产品上应观测到 A+C+B（本用例失败）；修复后必须 A+B+C。
-BOOST_AUTO_TEST_CASE(pending_not_flushed_before_next_recv) {
+BOOST_AUTO_TEST_CASE(pending_not_flushed_before_next_recv)
+{
     const Outcome outcome = RunInterleave(true);
     BOOST_REQUIRE_MESSAGE(outcome.precondition_ok, "交错前提未成立（接缝/持锁/释放/deferred 落位）");
     BOOST_TEST_MESSAGE("out == A+C+B ? " << (outcome.reordered ? "yes" : "no"));
-    BOOST_CHECK_MESSAGE(!outcome.reordered,
-                        "观测到 A+C+B：pending 未合入前的 recv 越过了它（FIFO 被破坏）");
+    BOOST_CHECK_MESSAGE(!outcome.reordered, "观测到 A+C+B：pending 未合入前的 recv 越过了它（FIFO 被破坏）");
     BOOST_CHECK(outcome.fifo_ok);
 }
 
 // 对照：B 走 deferred 但不继续 recv，读回必须是 A+B。
 // 用来把变量隔离到「pending 未合入前的下一次 recv」，而不是「存在 pending」。
-BOOST_AUTO_TEST_CASE(pending_without_next_recv_is_ordered) {
+BOOST_AUTO_TEST_CASE(pending_without_next_recv_is_ordered)
+{
     const Outcome outcome = RunInterleave(false);
     BOOST_REQUIRE_MESSAGE(outcome.precondition_ok, "交错前提未成立");
     BOOST_CHECK(outcome.fifo_ok);
@@ -459,23 +481,24 @@ BOOST_AUTO_TEST_CASE(pending_without_next_recv_is_ordered) {
 // 49152。消费者读完全部数据后 ring.Size 才降到低水位，是「暂停能否解除」的
 // 最不利情况。若该场景下仍能读全 A+B+C，说明 m_read_paused 恢复路径有效，
 // 不会因 pending 暂停而永久卡住读泵。
-BOOST_AUTO_TEST_CASE(pending_pause_recovers_at_low_water) {
+BOOST_AUTO_TEST_CASE(pending_pause_recovers_at_low_water)
+{
     const Outcome outcome = RunInterleave(true, /*tight=*/true);
     BOOST_REQUIRE_MESSAGE(outcome.precondition_ok, "交错前提未成立");
-    BOOST_TEST_MESSAGE("BLOCK_ORDER=" << BlockOrder(outcome.out)
-                       << " ACTUAL_SIZE=" << outcome.out.size());
-    BOOST_CHECK_MESSAGE(outcome.fifo_ok,
-                        "低水位边界下未读全全部字节：暂停恢复路径可能卡死读泵");
+    BOOST_TEST_MESSAGE("BLOCK_ORDER=" << BlockOrder(outcome.out) << " ACTUAL_SIZE=" << outcome.out.size());
+    BOOST_CHECK_MESSAGE(outcome.fifo_ok, "低水位边界下未读全全部字节：暂停恢复路径可能卡死读泵");
 }
 
 BOOST_AUTO_TEST_SUITE_END()
 
 // 替代 Boost.Test 自动 main：保留 net 测试的 _Exit 退出边界。
-bool init_unit_test() {
+bool init_unit_test()
+{
     return true;
 }
 
-int main(int argc, char* argv[]) {
+int main(int argc, char* argv[])
+{
     const int code = boost::unit_test::unit_test_main(&init_unit_test, argc, argv);
     std::cout.flush();
     std::cerr.flush();
@@ -485,5 +508,5 @@ int main(int argc, char* argv[]) {
             final_code = 1;
         }
     }
-    std::_Exit(final_code);   // 跳过静态析构/atexit 窗口
+    std::_Exit(final_code); // 跳过静态析构/atexit 窗口
 }

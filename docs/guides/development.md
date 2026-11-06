@@ -69,7 +69,7 @@ ctest --test-dir <private-build> -j1 -R '<affected-tests>' --output-on-failure -
 
 同机多个 agent 时，构建、测试、profile 与 perf 复用宿主既有队列 `/tmp/bbt-build.lock`（`flock` 持锁执行），不各建锁或队列；找不到入口先查清，不直接并行启动重任务。确需本地全量同样走该锁，一次一个构建，并仍限 `--parallel 2`；这是例外，不把每次交付变成本地全量。队列只保证互斥，不提供内存硬隔离。
 
-重任务启动前检查可用内存与既有任务；一次只运行一个重任务，内存不足则等待或报告阻塞，不靠反复重试、增加 swap 或清空缓存推进。纯文档修改做 `git diff --check`、链接/事实核对和适用审查，无需为文档重跑产品测试。上述代码块为参数模板，未作为一条完整命令执行。
+重任务启动前检查可用内存与既有任务；一次只运行一个重任务，内存不足则等待或报告阻塞，不靠反复重试、增加 swap 或清空缓存推进。纯文档修改做 `git diff --check`、链接/事实核对和适用审查，无需为文档重跑产品测试。API 文档导出用 `DOCS_OUT=<repo>/build/docs bash scripts/docs/build_docs.sh`（`DOCS_OUT` 必须在 `build/` 或 `build-*/` 下，脚本会先清空它）；格式检查 `bash scripts/ci/check_format.sh`（只读，固定 clang-format 23.1.3）。上述代码块为参数模板，未作为一条完整命令执行。
 
 新增目标或测试须核对 **构建选项 → 实际构建目标 → CTest 注册集合 → 实跑结果 → CI 执行路径**。注册、执行和预期范围须一致，跳过或缺项按验收条件处理并明确列出。没有进入 workflow 的路径，即使已有 CI 全绿也仍是未覆盖；CI 接线变更另行确认，不在文档中宣称已完成。
 

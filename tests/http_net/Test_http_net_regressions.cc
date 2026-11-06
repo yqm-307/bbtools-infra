@@ -15,7 +15,8 @@ struct Fixture {
     std::shared_ptr<http::Client> client;
     std::size_t baseline{SocketCount()};
 
-    explicit Fixture(http::ClientOptions options = {}, unsigned maximum = 1) {
+    explicit Fixture(http::ClientOptions options = {}, unsigned maximum = 1)
+    {
         options.base_url = peer.base_url();
         options.limits.max_connections = maximum;
         options.limits.max_keepalive_connections = 1;
@@ -24,10 +25,12 @@ struct Fixture {
         CHECK(made);
         client = made.value();
     }
-    auto GetPath(const std::string& path = "/test") {
+    auto GetPath(const std::string& path = "/test")
+    {
         return host.Call([&] { return bbt_co_await client->Get(path, {}, Until()); });
     }
-    void Finish() {
+    void Finish()
+    {
         client->Close();
         peer.Stop();
         host.Finish();
@@ -35,7 +38,8 @@ struct Fixture {
     }
 };
 
-void Protocol(const std::string& mode) {
+void Protocol(const std::string& mode)
+{
     Fixture f;
     if (mode == "fragment_header" || mode == "fragment_body") {
         std::promise<void> release;
@@ -44,8 +48,8 @@ void Protocol(const std::string& mode) {
         f.peer.PushConnectionHook([&, ready](int fd) {
             CHECK(HttpPeer::ReadRequestForHook(fd));
             const bool header = mode == "fragment_header";
-            CHECK(HttpPeer::SendForHook(fd, header ? "HTTP/1.1 200 O"
-                : "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nAB"));
+            CHECK(HttpPeer::SendForHook(fd,
+                                        header ? "HTTP/1.1 200 O" : "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nAB"));
             first_sent = true;
             ready.wait();
             CHECK(HttpPeer::SendForHook(fd, header ? "K\r\nContent-Length: 4\r\n\r\nABCD" : "CD"));
@@ -61,7 +65,9 @@ void Protocol(const std::string& mode) {
     } else if (mode == "chunked") {
         f.peer.set_canned([](const HttpPeer::Recorded&) {
             std::string bytes = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
-            for (unsigned i = 0; i != 64; ++i) { bytes += "1\r\nx\r\n"; }
+            for (unsigned i = 0; i != 64; ++i) {
+                bytes += "1\r\nx\r\n";
+            }
             return bytes + "0\r\nX-Trailer: yes\r\n\r\n";
         });
         for (unsigned i = 0; i != 2; ++i) {
@@ -74,8 +80,8 @@ void Protocol(const std::string& mode) {
             if (request.method == "HEAD") {
                 return std::string("HTTP/1.1 200 OK\r\nContent-Length: 123\r\n\r\n");
             }
-            return "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\n\r\n" +
-                HttpPeer::HttpResponse(200, "OK", request.target);
+            return "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\n\r\n"
+                   + HttpPeer::HttpResponse(200, "OK", request.target);
         });
         auto head = f.host.Call([&] { return bbt_co_await f.client->Request("HEAD", "/head", {}, Until()); });
         CHECK(head && head.value().status_code == 200 && head.value().body.empty());
@@ -87,15 +93,13 @@ void Protocol(const std::string& mode) {
     } else if (mode == "eof_truncated") {
         f.peer.PushConnectionHook([](int fd) {
             CHECK(HttpPeer::ReadRequestForHook(fd));
-            CHECK(HttpPeer::SendForHook(fd,
-                "HTTP/1.0 200 OK\r\nConnection: close\r\n\r\nEOF-BODY"));
+            CHECK(HttpPeer::SendForHook(fd, "HTTP/1.0 200 OK\r\nConnection: close\r\n\r\nEOF-BODY"));
         });
         auto eof = f.GetPath();
         CHECK(eof && eof.value().body == "EOF-BODY");
         f.peer.PushConnectionHook([](int fd) {
             CHECK(HttpPeer::ReadRequestForHook(fd));
-            CHECK(HttpPeer::SendForHook(fd,
-                "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nshort"));
+            CHECK(HttpPeer::SendForHook(fd, "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nshort"));
         });
         auto partial = f.GetPath();
         ExpectCode(partial, ErrorCode::OutcomeUnknown);
@@ -115,11 +119,14 @@ void Protocol(const std::string& mode) {
         auto good = f.host.Call([&] { return bbt_co_await small.value()->Get("/small", {}, Until()); });
         CHECK(good && good.value().body == "ok");
         small.value()->Close();
-    } else { CHECK(false); }
+    } else {
+        CHECK(false);
+    }
     f.Finish();
 }
 
-void InputBoundary() {
+void InputBoundary()
+{
     Fixture f;
     http::ClientOptions bad_defaults;
     bad_defaults.headers = {{"X-Test", "safe\r\nInjected: yes"}};
@@ -129,10 +136,8 @@ void InputBoundary() {
     CHECK(!f.client->BuildRequest("GET", "/with space", {}));
     CHECK(!f.client->BuildRequest("GET", "https://127.0.0.1/", {}));
     const std::vector<http::Headers> invalid{
-        {{"X-Test", "safe\r\nInjected: yes"}}, {{"Bad Name", "value"}},
-        {{"X-Nul", std::string("a\0b", 3)}}, {{"X-Huge", std::string(70000, 'x')}},
-        {{"Content-Length", "100"}}, {{"Transfer-Encoding", "chunked"}}
-    };
+        {{"X-Test", "safe\r\nInjected: yes"}}, {{"Bad Name", "value"}},     {{"X-Nul", std::string("a\0b", 3)}},
+        {{"X-Huge", std::string(70000, 'x')}}, {{"Content-Length", "100"}}, {{"Transfer-Encoding", "chunked"}}};
     for (const auto& headers : invalid) {
         http::RequestOptions options;
         options.headers = headers;
@@ -148,9 +153,8 @@ void InputBoundary() {
     changed.value().target_for_wire = "/bad\r\nInjected: yes";
     ExpectCode(f.host.Call([&] { return bbt_co_await f.client->Send(changed.value(), Until()); }),
                ErrorCode::InvalidArgument);
-    auto bad_type = f.host.Call([&] {
-        return bbt_co_await f.client->Post("/bad", {"body", "x\r\nInjected: yes"}, {}, Until());
-    });
+    auto bad_type =
+        f.host.Call([&] { return bbt_co_await f.client->Post("/bad", {"body", "x\r\nInjected: yes"}, {}, Until()); });
     ExpectCode(bad_type, ErrorCode::InvalidArgument);
     CHECK(f.client->Stats().budget == 0 && f.peer.accept_total() == 0);
     CHECK(f.GetPath());
@@ -160,7 +164,8 @@ void InputBoundary() {
     f.Finish();
 }
 
-void Quotas() {
+void Quotas()
+{
     Fixture f;
     http::ClientOptions options;
     options.base_url = f.peer.base_url();
@@ -170,9 +175,7 @@ void Quotas() {
     auto prepared = bounded.value()->BuildRequest("POST", "/quota", {});
     CHECK(prepared);
     prepared.value().body = "1234";
-    auto rejected = f.host.Call([&] {
-        return bbt_co_await bounded.value()->Send(prepared.value(), Until());
-    });
+    auto rejected = f.host.Call([&] { return bbt_co_await bounded.value()->Send(prepared.value(), Until()); });
     ExpectCode(rejected, ErrorCode::InvalidArgument);
     CHECK(f.peer.accept_total() == 0);
     CHECK(bounded.value()->Stats().budget == 0);
@@ -182,19 +185,14 @@ void Quotas() {
     auto header_bounded = http::Client::Create(f.host.engine, options);
     CHECK(header_bounded);
     f.peer.set_canned([](const HttpPeer::Recorded&) {
-        return std::string("HTTP/1.1 200 OK\r\nX-Large: ") + std::string(80, 'x') +
-               "\r\nContent-Length: 2\r\n\r\nok";
+        return std::string("HTTP/1.1 200 OK\r\nX-Large: ") + std::string(80, 'x') + "\r\nContent-Length: 2\r\n\r\nok";
     });
-    auto header_rejected = f.host.Call([&] {
-        return bbt_co_await header_bounded.value()->Get("/header-quota", {}, Until());
-    });
+    auto header_rejected =
+        f.host.Call([&] { return bbt_co_await header_bounded.value()->Get("/header-quota", {}, Until()); });
     ExpectCode(header_rejected, ErrorCode::ProtocolError);
-    f.peer.set_canned([](const HttpPeer::Recorded&) {
-        return HttpPeer::HttpResponse(200, "OK", "ok");
-    });
-    auto healthy = f.host.Call([&] {
-        return bbt_co_await header_bounded.value()->Get("/after-header-quota", {}, Until());
-    });
+    f.peer.set_canned([](const HttpPeer::Recorded&) { return HttpPeer::HttpResponse(200, "OK", "ok"); });
+    auto healthy =
+        f.host.Call([&] { return bbt_co_await header_bounded.value()->Get("/after-header-quota", {}, Until()); });
     CHECK(healthy && healthy.value().body == "ok");
     CHECK(header_bounded.value()->Stats().active == 0);
 
@@ -211,11 +209,14 @@ void Quotas() {
     f.Finish();
 }
 
-void PreexpiredCancelled() {
+void PreexpiredCancelled()
+{
     Fixture f;
     auto reject = [&](bool cancel) {
         return f.host.Call([&] {
-            if (cancel) { g_bbt_tls_coroutine_co->RequestCancel(); }
+            if (cancel) {
+                g_bbt_tls_coroutine_co->RequestCancel();
+            }
             const auto call = cancel ? Until() : CallOptions{std::chrono::steady_clock::now() - 1s};
             return bbt_co_await f.client->Post("/must-not-send", {"side-effect", ""}, {}, call);
         });
@@ -229,11 +230,14 @@ void PreexpiredCancelled() {
     ExpectCode(reject(true), ErrorCode::Cancelled);
     CHECK(f.GetPath("/after-rejections"));
     CHECK(f.peer.accept_total() == 1 && f.peer.requests_total() == 2);
-    for (const auto& request : f.peer.requests()) { CHECK(request.method == "GET"); }
+    for (const auto& request : f.peer.requests()) {
+        CHECK(request.method == "GET");
+    }
     f.Finish();
 }
 
-void PhaseTimeouts() {
+void PhaseTimeouts()
+{
     Fixture f;
     std::promise<void> release;
     auto ready = release.get_future().share();
@@ -263,7 +267,8 @@ void PhaseTimeouts() {
     f.Finish();
 }
 
-void PerReadAndTotal() {
+void PerReadAndTotal()
+{
     Fixture f;
     std::atomic<bool> request_seen{false};
     f.peer.PushConnectionHook([&](int fd) {
@@ -292,9 +297,7 @@ void PerReadAndTotal() {
         committed = true;
         ready.wait();
     });
-    auto total = f.host.Submit([&] {
-        return bbt_co_await f.client->Post("/total", {"effect", ""}, {}, Until(150ms));
-    });
+    auto total = f.host.Submit([&] { return bbt_co_await f.client->Post("/total", {"effect", ""}, {}, Until(150ms)); });
     CHECK(WaitUntil([&] { return committed.load(); }));
     auto expired = Get(total);
     ExpectCode(expired, ErrorCode::OutcomeUnknown);
@@ -303,7 +306,8 @@ void PerReadAndTotal() {
     f.Finish();
 }
 
-void CrossOrigin() {
+void CrossOrigin()
+{
     Fixture f;
     {
         HttpPeer other;
@@ -318,7 +322,8 @@ void CrossOrigin() {
     f.Finish();
 }
 
-void HandoffConcurrency() {
+void HandoffConcurrency()
+{
     Fixture f;
     std::promise<void> release;
     auto ready = release.get_future().share();
@@ -342,13 +347,17 @@ void HandoffConcurrency() {
     CHECK(WaitUntil([&] { return f.client->Stats().waiting == waiting.size(); }));
     release.set_value();
     CHECK(Get(first));
-    for (auto& future : waiting) { auto value = Get(future); CHECK(value && value.value().body == "ok"); }
+    for (auto& future : waiting) {
+        auto value = Get(future);
+        CHECK(value && value.value().body == "ok");
+    }
     CHECK(f.peer.accept_total() == 1);
     CHECK(f.client->Stats().active == 0 && f.client->Stats().waiting == 0);
     f.Finish();
 }
 
-void PhysicalBudget(unsigned maximum) {
+void PhysicalBudget(unsigned maximum)
+{
     Fixture f({}, maximum);
     Access::SetConnectDeliveryDelay(*f.host.engine, 400ms);
     http::RequestOptions options;
@@ -375,7 +384,8 @@ void PhysicalBudget(unsigned maximum) {
     f.Finish();
 }
 
-void PhysicalCancel() {
+void PhysicalCancel()
+{
     Fixture f;
     Access::SetConnectDeliveryDelay(*f.host.engine, 400ms);
     // 已提交且真实对端已 accept，才在同一协程置取消；不是入口预取消。
@@ -394,7 +404,8 @@ void PhysicalCancel() {
     f.Finish();
 }
 
-int Run(int argc, char** argv) {
+int Run(int argc, char** argv)
+{
     Watchdog watchdog;
     try {
         CHECK(argc == 2);
@@ -403,21 +414,38 @@ int Run(int argc, char** argv) {
         g_bbt_coroutine_config->m_cfg_processer_auto_scale = false;
         g_scheduler->Start();
         // 复用既有运行时暖机，使 fd 基线不含一次性初始化抖动。
-        { Host warm; CHECK(warm.Call([] { return true; })); warm.Finish(); }
+        {
+            Host warm;
+            CHECK(warm.Call([] { return true; }));
+            warm.Finish();
+        }
         const std::string mode = argv[1];
-        if (mode == "fragment_header" || mode == "fragment_body" || mode == "chunked" ||
-            mode == "head_interim" || mode == "eof_truncated" || mode == "body_limit") { Protocol(mode); }
-        else if (mode == "quotas") { Quotas(); }
-        else if (mode == "input_boundary") { InputBoundary(); }
-        else if (mode == "preexpired_cancelled") { PreexpiredCancelled(); }
-        else if (mode == "phase_timeouts") { PhaseTimeouts(); }
-        else if (mode == "per_read_total") { PerReadAndTotal(); }
-        else if (mode == "cross_origin") { CrossOrigin(); }
-        else if (mode == "handoff_concurrency") { HandoffConcurrency(); }
-        else if (mode == "physical_budget") { PhysicalBudget(1); }
-        else if (mode == "physical_budget_two") { PhysicalBudget(2); }
-        else if (mode == "physical_cancel") { PhysicalCancel(); }
-        else { CHECK(false); }
+        if (mode == "fragment_header" || mode == "fragment_body" || mode == "chunked" || mode == "head_interim"
+            || mode == "eof_truncated" || mode == "body_limit") {
+            Protocol(mode);
+        } else if (mode == "quotas") {
+            Quotas();
+        } else if (mode == "input_boundary") {
+            InputBoundary();
+        } else if (mode == "preexpired_cancelled") {
+            PreexpiredCancelled();
+        } else if (mode == "phase_timeouts") {
+            PhaseTimeouts();
+        } else if (mode == "per_read_total") {
+            PerReadAndTotal();
+        } else if (mode == "cross_origin") {
+            CrossOrigin();
+        } else if (mode == "handoff_concurrency") {
+            HandoffConcurrency();
+        } else if (mode == "physical_budget") {
+            PhysicalBudget(1);
+        } else if (mode == "physical_budget_two") {
+            PhysicalBudget(2);
+        } else if (mode == "physical_cancel") {
+            PhysicalCancel();
+        } else {
+            CHECK(false);
+        }
         std::cout << "http regression " << mode << " PASS\n";
         return 0;
     } catch (const std::exception& error) {
@@ -428,6 +456,7 @@ int Run(int argc, char** argv) {
 
 } // namespace
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv)
+{
     return bbt_net_test::RunTestProcessExit([&] { return Run(argc, argv); });
 }

@@ -15,7 +15,8 @@ struct ServerHost {
     std::error_code run_error;
     net::Address address;
     ServerHost(http::ServerHandler handler, http::ServerOptions options = {}, bool start = true,
-               std::int64_t outbound = 1024 * 1024, unsigned loops = 1) {
+               std::int64_t outbound = 1024 * 1024, unsigned loops = 1)
+    {
         auto made = http::Server::Create(engine, std::move(handler), options);
         CHECK(made);
         server = std::move(made).value();
@@ -33,15 +34,24 @@ struct ServerHost {
         std::vector<net::Address> addresses;
         CHECK(!engine->LocalAddresses(addresses) && addresses.size() == 1);
         address = addresses[0];
-        if (start) { CHECK(server->Start()); }
+        if (start) {
+            CHECK(server->Start());
+        }
     }
-    ~ServerHost() {
+    ~ServerHost()
+    {
         server->Close();
         engine->RequestClose();
-        if (runner.joinable()) { runner.join(); }
+        if (runner.joinable()) {
+            runner.join();
+        }
     }
-    std::string Url() const { return "http://127.0.0.1:" + std::to_string(address.Port()); }
-    void Finish() {
+    std::string Url() const
+    {
+        return "http://127.0.0.1:" + std::to_string(address.Port());
+    }
+    void Finish()
+    {
         // 已 Close 时 Drain 会如实返回关闭原因，不能再当收口前奏；直接用
         // Shutdown（未 Close 时）→ Close → WaitStopped 的收口序列。
         if (!server->CloseReason().has_value()) {
@@ -57,14 +67,16 @@ struct ServerHost {
         runner.join();
         CHECK(!run_error && engine->Phase() == net::EnginePhase::Stopped);
         CHECK(engine->CountConnections() == 0 && Access::FirstConnectionFd(*engine) == -1);
-        std::cout << "server receipt http_tasks=0 sessions=0 inflight=0 listener_stopped=1 run_joined=1 connections=0\n";
+        std::cout
+            << "server receipt http_tasks=0 sessions=0 inflight=0 listener_stopped=1 run_joined=1 connections=0\n";
     }
 };
 
 struct Peer {
     int fd{-1};
     std::string pending;
-    explicit Peer(const net::Address& address, bool small_receive = false) {
+    explicit Peer(const net::Address& address, bool small_receive = false)
+    {
         fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
         CHECK(fd >= 0);
         timeval timeout{5, 0};
@@ -80,9 +92,18 @@ struct Peer {
         target.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         CHECK(::connect(fd, reinterpret_cast<sockaddr*>(&target), sizeof(target)) == 0);
     }
-    ~Peer() { if (fd >= 0) { ::close(fd); } }
-    void Send(const std::string& bytes) { CHECK(HttpPeer::SendForHook(fd, bytes)); }
-    http::Response Read(bool head = false) {
+    ~Peer()
+    {
+        if (fd >= 0) {
+            ::close(fd);
+        }
+    }
+    void Send(const std::string& bytes)
+    {
+        CHECK(HttpPeer::SendForHook(fd, bytes));
+    }
+    http::Response Read(bool head = false)
+    {
         wire::response_parser<wire::string_body> parser;
         parser.body_limit(16 * 1024 * 1024);
         parser.eager(true);
@@ -93,8 +114,12 @@ struct Peer {
                 const auto consumed = parser.put(boost::asio::buffer(pending), error);
                 pending.erase(0, consumed);
                 CHECK(!error || error == wire::error::need_more);
-                if (parser.is_done()) { break; }
-                if (consumed) { continue; }
+                if (parser.is_done()) {
+                    break;
+                }
+                if (consumed) {
+                    continue;
+                }
             }
             char bytes[32768];
             auto size = ::recv(fd, bytes, sizeof(bytes), 0);
@@ -103,10 +128,13 @@ struct Peer {
         }
         const auto& message = parser.get();
         http::Response out{static_cast<int>(message.result_int()), {}, message.body()};
-        for (auto& field : message) { out.headers.emplace_back(std::string(field.name_string()), std::string(field.value())); }
+        for (auto& field : message) {
+            out.headers.emplace_back(std::string(field.name_string()), std::string(field.value()));
+        }
         return out;
     }
-    bool Eof() {
+    bool Eof()
+    {
         char bytes[64];
         const auto n = ::recv(fd, bytes, sizeof(bytes), 0);
         return n == 0 || (n < 0 && errno == ECONNRESET);
@@ -120,28 +148,41 @@ struct NativeGate {
     std::shared_future<void> released{release.get_future().share()};
     std::atomic<bool> claimed{false};
     std::atomic<bool> opened{false};
-    void PauseOnce() {
-        if (claimed.exchange(true)) { return; }
+    void PauseOnce()
+    {
+        if (claimed.exchange(true)) {
+            return;
+        }
         ready.set_value();
         released.wait();
     }
-    void Open() { if (!opened.exchange(true)) { release.set_value(); } }
+    void Open()
+    {
+        if (!opened.exchange(true)) {
+            release.set_value();
+        }
+    }
 };
 struct OpenOnExit {
     NativeGate& gate;
-    ~OpenOnExit() { gate.Open(); }
+    ~OpenOnExit()
+    {
+        gate.Open();
+    }
 };
 
-http::ServerHandler Echo() {
+http::ServerHandler Echo()
+{
     return [](IncomingCallContext ctx, http::IncomingRequest request) {
         CHECK(ctx.peer_principal.empty());
         CHECK(ctx.deadline > std::chrono::steady_clock::now());
-        return result<http::Response>::ok({request.target == "/missing" ? 404 : 200, {},
-                                           request.method == "POST" ? request.body : request.target});
+        return result<http::Response>::ok(
+            {request.target == "/missing" ? 404 : 200, {}, request.method == "POST" ? request.body : request.target});
     };
 }
 
-void WireCases() {
+void WireCases()
+{
     std::atomic<unsigned> calls{0};
     ServerHost host([&](IncomingCallContext, http::IncomingRequest request) {
         ++calls;
@@ -170,7 +211,8 @@ void WireCases() {
     host.Finish();
 }
 
-void StopAuthorization() {
+void StopAuthorization()
+{
     Gate gate;
     std::atomic<unsigned> calls{0};
     std::shared_ptr<http::Server> server;
@@ -202,14 +244,17 @@ void StopAuthorization() {
     host.Finish();
 }
 
-void ReplyDrain() {
+void ReplyDrain()
+{
     const std::string large(2 * 1024 * 1024, 'R');
     std::atomic<bool> returned{false};
     NativeGate gate;
-    ServerHost host([&](IncomingCallContext, http::IncomingRequest) {
-        returned = true;
-        return result<http::Response>::ok({200, {}, large});
-    }, {}, true, 8192); // 大响应显式超过 net 单次接纳上限，必须分块
+    ServerHost host(
+        [&](IncomingCallContext, http::IncomingRequest) {
+            returned = true;
+            return result<http::Response>::ok({200, {}, large});
+        },
+        {}, true, 8192); // 大响应显式超过 net 单次接纳上限，必须分块
     OpenOnExit cleanup{gate};
     Access::SetWriteReadyBarrierOnce(*host.engine, [&] { gate.PauseOnce(); });
     Peer peer(host.address);
@@ -226,7 +271,8 @@ void ReplyDrain() {
     host.Finish();
 }
 
-void CloseTimeout() {
+void CloseTimeout()
+{
     Gate gate;
     ServerHost host([&](IncomingCallContext, http::IncomingRequest) {
         gate.Pause();
@@ -252,7 +298,8 @@ void CloseTimeout() {
 // Shutdown：封口 + 等已授权 handler/reply 真实排空。有限预算内 inflight>0
 // 诚实 TimedOut 且保持封口（不隐式转 Close、不发布关闭原因）；handler 放行后
 // 再等待即成功。
-void ShutdownDrain() {
+void ShutdownDrain()
+{
     Gate gate;
     ServerHost host([&](IncomingCallContext, http::IncomingRequest) {
         gate.Pause();
@@ -277,7 +324,8 @@ void ShutdownDrain() {
 }
 
 // Shutdown 超时后仍拒新：同连接后续请求不再授权，且服务保持封口直到显式 Close。
-void ShutdownTimeout() {
+void ShutdownTimeout()
+{
     Gate gate;
     std::atomic<unsigned> calls{0};
     ServerHost host([&](IncomingCallContext, http::IncomingRequest) {
@@ -293,13 +341,14 @@ void ShutdownTimeout() {
     CHECK(calls == 1);
     gate.Release();
     CHECK(peer.Read().body == "late");
-    CHECK(peer.Eof());   // 封口后回复 keep_alive=false
+    CHECK(peer.Eof()); // 封口后回复 keep_alive=false
     host.Finish();
 }
 
 // Close 打断正在等待的 Shutdown：以「Shutdown 返回时 handler 仍在 inflight」
 // 证明等待被打断，并返回真实（自定义）关闭原因。
-void ShutdownInterruptedByClose() {
+void ShutdownInterruptedByClose()
+{
     Gate gate;
     ServerHost host([&](IncomingCallContext, http::IncomingRequest) {
         gate.Pause();
@@ -310,9 +359,7 @@ void ShutdownInterruptedByClose() {
     CHECK(WaitUntil([&] { return gate.entered.load(); }));
 
     std::optional<result<void>> shutdown_result;
-    std::thread waiter([&] {
-        shutdown_result.emplace(host.server->Shutdown(bbt::coroutine::Deadline::max()));
-    });
+    std::thread waiter([&] { shutdown_result.emplace(host.server->Shutdown(bbt::coroutine::Deadline::max())); });
     // 屏障：Shutdown 已封口（Drain 的不再是「未 StopAccepting」InvalidArgument）。
     CHECK(WaitUntil([&] {
         auto r = host.server->Drain(std::chrono::steady_clock::now());
@@ -327,31 +374,45 @@ void ShutdownInterruptedByClose() {
         CHECK(shutdown_result->error().code == ErrorCode::Unavailable);
         CHECK(shutdown_result->error().message == "owner abort");
     }
-    CHECK(host.server->Stats().inflight == 1);   // handler 仍阻塞：确为 Close 打断
+    CHECK(host.server->Stats().inflight == 1); // handler 仍阻塞：确为 Close 打断
     gate.Release();
     host.Finish();
 }
 
-void Security() {
+void Security()
+{
     std::atomic<unsigned> calls{0};
     http::ServerOptions options;
     options.limits.max_header_bytes = 512;
     options.max_target_bytes = 64;
     options.limits.max_body_bytes = 32;
     options.limits.incoming_timeout = 300ms;
-    ServerHost host([&](IncomingCallContext, http::IncomingRequest request) -> result<http::Response> {
-        ++calls;
-        unsigned hosts = 0;
-        for (const auto& field : request.headers) {
-            if (boost::beast::iequals(field.first, "Host")) { ++hosts; CHECK(field.second == "a"); }
-        }
-        CHECK(hosts == 1);
-        if (request.target == "/throw") { throw std::runtime_error("isolated"); }
-        if (request.target == "/bad-status") { return result<http::Response>::ok({101, {}, {}}); }
-        if (request.target == "/bad-header") { return result<http::Response>::ok({200, {{"X", "a\r\nb"}}, {}}); }
-        if (request.target == "/bad-frame") { return result<http::Response>::ok({200, {{"Content-Length", "1"}}, "x"}); }
-        return result<http::Response>::ok({200, {}, "ok"});
-    }, options);
+    ServerHost host(
+        [&](IncomingCallContext, http::IncomingRequest request) -> result<http::Response> {
+            ++calls;
+            unsigned hosts = 0;
+            for (const auto& field : request.headers) {
+                if (boost::beast::iequals(field.first, "Host")) {
+                    ++hosts;
+                    CHECK(field.second == "a");
+                }
+            }
+            CHECK(hosts == 1);
+            if (request.target == "/throw") {
+                throw std::runtime_error("isolated");
+            }
+            if (request.target == "/bad-status") {
+                return result<http::Response>::ok({101, {}, {}});
+            }
+            if (request.target == "/bad-header") {
+                return result<http::Response>::ok({200, {{"X", "a\r\nb"}}, {}});
+            }
+            if (request.target == "/bad-frame") {
+                return result<http::Response>::ok({200, {{"Content-Length", "1"}}, "x"});
+            }
+            return result<http::Response>::ok({200, {}, "ok"});
+        },
+        options);
     const std::vector<std::string> invalid{
         "GET / HTTP/1.1\r\n\r\n",
         "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n",
@@ -365,13 +426,14 @@ void Security() {
         "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 33\r\n\r\n",
         "GET /" + std::string(65, 'a') + " HTTP/1.1\r\nHost: a\r\n\r\n",
         "GET / HTTP/1.1\r\nHost: a\r\nX: " + std::string(513, 'h') + "\r\n\r\n",
-        "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n"
-    };
+        "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n"};
     for (const auto& request : invalid) {
         Peer peer(host.address);
         peer.Send(request);
         const bool rejected = peer.Eof();
-        if (!rejected) { std::cerr << "unexpected acceptance: " << request << '\n'; }
+        if (!rejected) {
+            std::cerr << "unexpected acceptance: " << request << '\n';
+        }
         CHECK(rejected);
     }
     CHECK(calls == 0);
@@ -399,17 +461,20 @@ void Security() {
     host.Finish();
 }
 
-void IncomingDeadline() {
+void IncomingDeadline()
+{
     Gate gate;
     std::promise<bbt::coroutine::Deadline> deadline;
     auto future = deadline.get_future();
     http::ServerOptions options;
     options.limits.incoming_timeout = 80ms;
-    ServerHost host([&](IncomingCallContext ctx, http::IncomingRequest) {
-        deadline.set_value(ctx.deadline);
-        gate.Pause();
-        return result<http::Response>::ok({200, {}, "late"});
-    }, options);
+    ServerHost host(
+        [&](IncomingCallContext ctx, http::IncomingRequest) {
+            deadline.set_value(ctx.deadline);
+            gate.Pause();
+            return result<http::Response>::ok({200, {}, "late"});
+        },
+        options);
     {
         Peer partial(host.address);
         partial.Send("POST /slow HTTP/1.1\r\nHost: a\r\nContent-Length: 8\r\n\r\npart");
@@ -427,7 +492,8 @@ void IncomingDeadline() {
     host.Finish();
 }
 
-void StartAndCapacity() {
+void StartAndCapacity()
+{
     {
         auto engine = net::Engine::Create(std::shared_ptr<net::RawHandler>{});
         auto made = http::Server::Create(engine, Echo());
@@ -465,7 +531,8 @@ void StartAndCapacity() {
     }
 }
 
-void PhysicalCapacity() {
+void PhysicalCapacity()
+{
     NativeGate gate;
     http::ServerOptions options;
     options.limits.max_connections = 1;
@@ -494,16 +561,19 @@ void PhysicalCapacity() {
     host.Finish();
 }
 
-void InflightLimit() {
+void InflightLimit()
+{
     Gate gate;
     std::atomic<unsigned> calls{0};
     http::ServerOptions options;
     options.limits.max_inflight = 1;
-    ServerHost host([&](IncomingCallContext, http::IncomingRequest request) {
-        ++calls;
-        gate.Pause();
-        return result<http::Response>::ok({200, {}, request.target});
-    }, options);
+    ServerHost host(
+        [&](IncomingCallContext, http::IncomingRequest request) {
+            ++calls;
+            gate.Pause();
+            return result<http::Response>::ok({200, {}, request.target});
+        },
+        options);
     Peer first(host.address);
     first.Send("GET /active HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
     CHECK(WaitUntil([&] { return gate.entered.load(); }));
@@ -516,7 +586,8 @@ void InflightLimit() {
     host.Finish();
 }
 
-int Run(int argc, char** argv) {
+int Run(int argc, char** argv)
+{
     Watchdog watchdog;
     try {
         CHECK(argc == 2);
@@ -526,19 +597,33 @@ int Run(int argc, char** argv) {
         g_scheduler->Start();
         const auto baseline = SocketCount();
         const std::string name = argv[1];
-        if (name == "server_wire") { WireCases(); }
-        else if (name == "server_stop_authorization") { StopAuthorization(); }
-        else if (name == "server_reply_drain") { ReplyDrain(); }
-        else if (name == "server_close_timeout") { CloseTimeout(); }
-        else if (name == "server_shutdown_drain") { ShutdownDrain(); }
-        else if (name == "server_shutdown_timeout") { ShutdownTimeout(); }
-        else if (name == "server_shutdown_interrupted_by_close") { ShutdownInterruptedByClose(); }
-        else if (name == "server_security") { Security(); }
-        else if (name == "server_incoming_deadline") { IncomingDeadline(); }
-        else if (name == "server_start_capacity") { StartAndCapacity(); }
-        else if (name == "server_physical_capacity") { PhysicalCapacity(); }
-        else if (name == "server_inflight_limit") { InflightLimit(); }
-        else { CHECK(false); }
+        if (name == "server_wire") {
+            WireCases();
+        } else if (name == "server_stop_authorization") {
+            StopAuthorization();
+        } else if (name == "server_reply_drain") {
+            ReplyDrain();
+        } else if (name == "server_close_timeout") {
+            CloseTimeout();
+        } else if (name == "server_shutdown_drain") {
+            ShutdownDrain();
+        } else if (name == "server_shutdown_timeout") {
+            ShutdownTimeout();
+        } else if (name == "server_shutdown_interrupted_by_close") {
+            ShutdownInterruptedByClose();
+        } else if (name == "server_security") {
+            Security();
+        } else if (name == "server_incoming_deadline") {
+            IncomingDeadline();
+        } else if (name == "server_start_capacity") {
+            StartAndCapacity();
+        } else if (name == "server_physical_capacity") {
+            PhysicalCapacity();
+        } else if (name == "server_inflight_limit") {
+            InflightLimit();
+        } else {
+            CHECK(false);
+        }
         CHECK(WaitUntil([&] { return SocketCount() == baseline; }));
         std::cout << "PASS " << name << " socket_baseline=" << baseline << " restored=1\n";
         return 0;
@@ -548,6 +633,7 @@ int Run(int argc, char** argv) {
     }
 }
 } // namespace
-int main(int argc, char** argv) {
+int main(int argc, char** argv)
+{
     return bbt_net_test::RunTestProcessExit([&] { return Run(argc, argv); });
 }

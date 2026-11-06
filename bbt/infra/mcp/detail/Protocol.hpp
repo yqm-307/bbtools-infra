@@ -21,20 +21,17 @@ namespace bbt::infra::mcp {
 // modern `_meta` 的规范命名空间键（2026-07-28 RequestMetaObject）。
 // 规范只定义这三处命名空间键，不存在裸 protocolVersion/clientCapabilities。
 // 协议版本与客户端能力为必需；clientInfo 为可选（SHOULD）。
-inline constexpr std::string_view kMetaKeyProtocolVersion =
-    "io.modelcontextprotocol/protocolVersion";
-inline constexpr std::string_view kMetaKeyClientCapabilities =
-    "io.modelcontextprotocol/clientCapabilities";
-inline constexpr std::string_view kMetaKeyClientInfo =
-    "io.modelcontextprotocol/clientInfo";
+inline constexpr std::string_view kMetaKeyProtocolVersion = "io.modelcontextprotocol/protocolVersion";
+inline constexpr std::string_view kMetaKeyClientCapabilities = "io.modelcontextprotocol/clientCapabilities";
+inline constexpr std::string_view kMetaKeyClientInfo = "io.modelcontextprotocol/clientInfo";
 
 // 已校验的 JSON-RPC 2.0 请求帧。
 struct JsonRpcRequest {
-    bool notification = false;      // 无 id 成员：不回 JSON-RPC 响应
-    RequestId id;                   // notification 时为默认值，无 wire 含义
+    bool notification = false; // 无 id 成员：不回 JSON-RPC 响应
+    RequestId id;              // notification 时为默认值，无 wire 含义
     std::string method;
-    std::optional<JsonValue> params;  // 仅在 object/array 时保留
-    std::optional<JsonValue> meta;    // params._meta（存在且为 object 时）
+    std::optional<JsonValue> params; // 仅在 object/array 时保留
+    std::optional<JsonValue> meta;   // params._meta（存在且为 object 时）
 };
 
 // 解析并校验单一 JSON-RPC 2.0 请求帧（不做方法分派）。
@@ -65,7 +62,7 @@ ProtocolFailure ToProtocolFailure(const Error& error);
 // modern 每请求独立校验结果（无跨请求状态）。
 struct ModernMeta {
     std::string protocol_version;
-    JsonValue client_capabilities;  // owned object copy
+    JsonValue client_capabilities; // owned object copy
 };
 
 // 校验 modern 请求 params._meta 的两项必需命名空间键：
@@ -82,9 +79,8 @@ struct ModernMeta {
 // 与 modern acceptance 是两件事，不得复用后者做现代校验。
 // 失败分支需要结构化 data，而本仓 Error.details 只有 string 键值对，无法忠实承载
 // supported 数组，故用 variant 表达「二择一」而不是伪造第二个通用错误类型。
-std::variant<ModernMeta, ProtocolFailure> ValidateModernMeta(
-    const std::optional<JsonValue>& params,
-    const std::vector<std::string>& advertised_versions);
+std::variant<ModernMeta, ProtocolFailure> ValidateModernMeta(const std::optional<JsonValue>& params,
+                                                             const std::vector<std::string>& advertised_versions);
 
 // 客户端 capabilities 声明所依据的 revision（决定校验用的「已知 shape」集合）。
 // 两套 shape 来自各自 revision 的固定 schema：modern 2026-07-28 与 legacy
@@ -107,8 +103,8 @@ enum class CapabilitiesRevision {
 //   - 已知 object 内的未知扩展键原样保留（不因未知而拒）；
 //   - 成功返回 owned object 副本（raw，不做规范化）；失败返回 -32602，message 为
 //     固定诊断、不回显任何输入值。
-std::variant<JsonValue, ProtocolFailure> ValidateClientCapabilities(
-    const JsonValue& capabilities, CapabilitiesRevision revision);
+std::variant<JsonValue, ProtocolFailure> ValidateClientCapabilities(const JsonValue& capabilities,
+                                                                    CapabilitiesRevision revision);
 
 // modern 成功结果由库写 resultType=complete（业务不可覆盖）。
 result<void> ApplyModernResultType(JsonValue& result);
@@ -139,8 +135,7 @@ struct SubscriptionFilter {
 
 // 解析过滤器：非 object / 布尔键非 boolean / resourceSubscriptions 非 string 数组
 // → -32602（固定文本，不回显输入）。
-std::variant<SubscriptionFilter, ProtocolFailure> ParseSubscriptionFilter(
-    const JsonValue& notifications);
+std::variant<SubscriptionFilter, ProtocolFailure> ParseSubscriptionFilter(const JsonValue& notifications);
 
 // accepted 子集 → wire 过滤器 object：只写为真的布尔键与非空 uri 数组
 //（规范「unsupported types are omitted」；空支持子集 → 空 object）。
@@ -159,14 +154,14 @@ result<JsonValue> MakeInputRequiredResult(const InputRequired& input_required);
 //   sampling/createMessage→sampling、elicitation/create→elicitation、roots/list→roots。
 // 必需键缺失或非 object → -32021，data.requiredCapabilities={<缺失能力>: {}}；
 // 未知 method → -32602（服务端缺陷面，不回显输入）。
-std::optional<ProtocolFailure> CheckInputRequestCapabilities(
-    const JsonValue& client_capabilities,
-    const std::map<std::string, ClientInputRequest>& input_requests);
+std::optional<ProtocolFailure>
+CheckInputRequestCapabilities(const JsonValue& client_capabilities,
+                              const std::map<std::string, ClientInputRequest>& input_requests);
 
 // MRTR 重试请求的 owned 输入（RequestContext 用；legacy 恒空）。
 struct MrtrRetryInputs {
-    std::map<std::string, JsonValue> input_responses;  // id-keyed，每项必须为 object
-    std::optional<std::string> request_state;          // opaque string 原值
+    std::map<std::string, JsonValue> input_responses; // id-keyed，每项必须为 object
+    std::optional<std::string> request_state;         // opaque string 原值
 };
 
 // 从重试请求 params 提取 inputResponses/requestState：两者皆缺 → 空输入（首次请求
@@ -178,8 +173,7 @@ std::variant<MrtrRetryInputs, ProtocolFailure> ParseMrtrRetryInputs(const JsonVa
 // server/discover 结果（库内建，无需业务注册）：
 // supportedVersions（实参） + capabilities（实参；未实现的能力不得传入） +
 // 可选 instructions + resultType=complete + ttlMs=0 + cacheScope=private。
-result<JsonValue> MakeDiscoverResult(const std::vector<std::string>& supported_versions,
-                                     JsonValue capabilities,
+result<JsonValue> MakeDiscoverResult(const std::vector<std::string>& supported_versions, JsonValue capabilities,
                                      const std::optional<std::string>& instructions);
 
 } // namespace bbt::infra::mcp

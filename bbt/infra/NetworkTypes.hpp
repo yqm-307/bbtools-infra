@@ -1,6 +1,9 @@
+/** @file NetworkTypes.hpp
+ * @brief 调用选项、网络装配值类型与协议消息形态。
+ *
+ * 签名契约见 docs/decisions/0002-co-network-contract.md。
+ */
 #pragma once
-// co-network/v1：调用选项、装配值类型与协议消息形态。
-// 签名冻结见 docs/decisions/0002-co-network-contract.md。
 
 #include <chrono>
 #include <cstddef>
@@ -15,116 +18,135 @@
 
 namespace bbt::infra {
 
-// 调用选项只携带单调时钟绝对期限。业务取消不由 infra 令牌表达：等待中的
-// 取消来自协程级 RequestCancel（WaitStatus::Cancelled），业务级取消由上层
-// 经带载荷 Notify（CoEventValue）表达，再把 Completed 解释成业务终态。
+/**
+ * @brief 调用选项，只携带单调时钟的绝对期限。
+ *
+ * 业务取消不由 infra 令牌表达：等待中的取消来自协程级 RequestCancel（WaitStatus::Cancelled），
+ * 业务级取消由上层经带载荷的 Notify（CoEventValue）表达，再把 Completed 解释为业务终态。
+ */
 struct CallOptions {
-    bbt::coroutine::Deadline          deadline;
+    bbt::coroutine::Deadline deadline; ///< 绝对截止时刻（单调时钟）。
 };
 
-// 各项必须显式、大于零且不超过下列上限；incoming_timeout 必须有限。
+/// @brief 最大连接数上限。
 inline constexpr std::size_t kNetworkLimitsMaxConnections = 1000000;
-inline constexpr std::size_t kNetworkLimitsMaxInflight    = 1000000;
+/// @brief 最大在途请求数上限。
+inline constexpr std::size_t kNetworkLimitsMaxInflight = 1000000;
+/// @brief 报文头上限（字节）的上限。
 inline constexpr std::size_t kNetworkLimitsMaxHeaderBytes = 16 * 1024 * 1024;
-inline constexpr std::size_t kNetworkLimitsMaxBodyBytes   = 1024 * 1024 * 1024;
-inline constexpr std::chrono::milliseconds kNetworkLimitsMaxIncomingTimeout{
-    std::chrono::hours{24}};
+/// @brief 报文体上限（字节）的上限。
+inline constexpr std::size_t kNetworkLimitsMaxBodyBytes = 1024 * 1024 * 1024;
+/// @brief 入站请求超时上限（24 小时）。
+inline constexpr std::chrono::milliseconds kNetworkLimitsMaxIncomingTimeout{std::chrono::hours{24}};
 
+/**
+ * @brief 网络层装配上限，由 ValidateNetworkLimits 校验。
+ *
+ * 各项须显式给出、大于零且不超过对应上限；incoming_timeout 另须不超过 24 小时。
+ */
 struct NetworkLimits {
-    std::size_t               max_connections;
-    std::size_t               max_inflight;
-    std::size_t               max_header_bytes;
-    std::size_t               max_body_bytes;
-    std::chrono::milliseconds incoming_timeout;
+    std::size_t max_connections;                ///< 最大连接数，范围 (0, kNetworkLimitsMaxConnections]。
+    std::size_t max_inflight;                   ///< 最大在途请求数，范围 (0, kNetworkLimitsMaxInflight]。
+    std::size_t max_header_bytes;               ///< 报文头上限（字节），范围 (0, kNetworkLimitsMaxHeaderBytes]。
+    std::size_t max_body_bytes;                 ///< 报文体上限（字节），范围 (0, kNetworkLimitsMaxBodyBytes]。
+    std::chrono::milliseconds incoming_timeout; ///< 入站请求超时，范围 (0, kNetworkLimitsMaxIncomingTimeout]。
 };
 
+/** @brief 监听地址：主机名或地址与端口。 */
 struct ListenAddress {
-    std::string   host;
-    std::uint16_t port;
+    std::string host;   ///< 监听主机。
+    std::uint16_t port; ///< 监听端口。
 };
 
+/** @brief 入站调用的上下文：绝对截止时刻与对端主体。 */
 struct IncomingCallContext {
-    bbt::coroutine::Deadline          deadline;
-    std::string                       peer_principal;
+    bbt::coroutine::Deadline deadline; ///< 入站调用的绝对截止时刻。
+    std::string peer_principal;        ///< 对端主体，由可信传输提供；trusted-network 模式下恒为空。
 };
 
+/** @brief HTTP 请求的协议消息形态。 */
 struct HttpRequest {
-    std::string method;
-    std::string url;
-    std::vector<std::pair<std::string, std::string>> headers;
-    std::string body;
+    std::string method;                                       ///< 请求方法，如 GET、POST。
+    std::string url;                                          ///< 请求 URL。
+    std::vector<std::pair<std::string, std::string>> headers; ///< 请求头键值对。
+    std::string body;                                         ///< 请求体。
 };
 
+/** @brief HTTP 响应的协议消息形态。 */
 struct HttpResponse {
-    unsigned status;
-    std::vector<std::pair<std::string, std::string>> headers;
-    std::string body;
+    unsigned status;                                          ///< HTTP 状态码。
+    std::vector<std::pair<std::string, std::string>> headers; ///< 响应头键值对。
+    std::string body;                                         ///< 响应体。
 };
 
+/** @brief RPC 端点地址：传输名与端点。 */
 struct RpcAddress {
-    std::string transport;
-    std::string endpoint;
+    std::string transport; ///< 传输名。
+    std::string endpoint;  ///< 端点，格式由所选传输解释。
 };
 
-// co-io-adapter/v1 冻结面：非拥有缓冲视图与传输结果值类型。
-struct MutableBytes { void* data; std::size_t size; };
-struct ConstBytes { const void* data; std::size_t size; };
+/** @brief 非拥有的可写缓冲视图：不持有内存，使用期间由调用方保证数据有效。 */
+struct MutableBytes {
+    void* data;       ///< 缓冲区首地址。
+    std::size_t size; ///< 字节数。
+};
+/** @brief 非拥有的只读缓冲视图：不持有内存，使用期间由调用方保证数据有效。 */
+struct ConstBytes {
+    const void* data; ///< 缓冲区首地址。
+    std::size_t size; ///< 字节数。
+};
+/** @brief TCP 端点：主机与端口。 */
 struct TcpEndpoint {
-    std::string   host;   // 数值 IP 或主机名；主机名经 transport 接管解析
-    std::uint16_t port = 0;
+    std::string host;       ///< 数值 IP 或主机名。
+    std::uint16_t port = 0; ///< 端口号。
 };
+/** @brief 已解析的套接字地址：数值 IP 与端口。 */
 struct SocketAddress {
-    std::string ip;
-    std::uint16_t port = 0;
+    std::string ip;         ///< 数值 IP 地址。
+    std::uint16_t port = 0; ///< 端口号。
 };
+/**
+ * @brief 单次 I/O 的状态：Ok 表示有进展，WouldBlock 表示需等待就绪，Eof 表示对端已结束。
+ */
 enum class IoState { Ok, WouldBlock, Eof };
-struct IoProgress { IoState state; std::size_t bytes; };
+/** @brief 单次 I/O 的进展：状态与本次传输字节数。 */
+struct IoProgress {
+    IoState state;     ///< 本次 I/O 的状态。
+    std::size_t bytes; ///< 本次传输的字节数。
+};
+/// @brief 单次 I/O 的结果：成功为 IoProgress，失败为 Error。
 using IoResult = result<IoProgress>;
+/** @brief 数据报读取的结果：状态、字节数、来源地址与截断标记。 */
 struct DatagramRead {
-    IoState state;
-    std::size_t bytes = 0;
-    SocketAddress peer;
-    bool truncated = false;
+    IoState state;          ///< I/O 状态。
+    std::size_t bytes = 0;  ///< 拷贝进缓冲区的字节数，不计被截断的部分。
+    SocketAddress peer;     ///< 数据报来源地址。
+    bool truncated = false; ///< 数据报超过缓冲区被截断时为 true。
 };
 
+/** @brief RPC 调用的消息信封：服务与方法、请求标识、载荷模式、载荷与元数据。 */
 struct RpcEnvelope {
-    std::string service;
-    std::string method;
-    std::string request_id;
-    std::string request_schema;
-    std::string response_schema;
-    std::vector<std::uint8_t> payload;
-    std::vector<std::pair<std::string, std::string>> metadata;
+    std::string service;                                       ///< 服务名。
+    std::string method;                                        ///< 方法名。
+    std::string request_id;                                    ///< 请求标识。
+    std::string request_schema;                                ///< 请求载荷的 schema ID（见 Codec::SchemaId）。
+    std::string response_schema;                               ///< 响应载荷的 schema ID。
+    std::vector<std::uint8_t> payload;                         ///< 编码后的载荷字节。
+    std::vector<std::pair<std::string, std::string>> metadata; ///< 附加元数据键值对。
 };
 
-using HttpHandler = std::function<result<HttpResponse>(
-    IncomingCallContext, HttpRequest)>;
-using RpcHandler = std::function<result<RpcEnvelope>(
-    IncomingCallContext, RpcEnvelope)>;
+/// @brief HTTP 入站处理函数：接收调用上下文与请求，返回响应或错误。
+using HttpHandler = std::function<result<HttpResponse>(IncomingCallContext, HttpRequest)>;
+/// @brief RPC 入站处理函数：接收调用上下文与信封，返回响应信封或错误。
+using RpcHandler = std::function<result<RpcEnvelope>(IncomingCallContext, RpcEnvelope)>;
 
-// NetworkLimits 装配校验：各项 >0 且不超上限，违规返回 InvalidArgument。
-inline result<void> ValidateNetworkLimits(const NetworkLimits& limits) {
-    if (limits.max_connections == 0 ||
-        limits.max_connections > kNetworkLimitsMaxConnections)
-        return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "max_connections out of range"));
-    if (limits.max_inflight == 0 ||
-        limits.max_inflight > kNetworkLimitsMaxInflight)
-        return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "max_inflight out of range"));
-    if (limits.max_header_bytes == 0 ||
-        limits.max_header_bytes > kNetworkLimitsMaxHeaderBytes)
-        return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "max_header_bytes out of range"));
-    if (limits.max_body_bytes == 0 ||
-        limits.max_body_bytes > kNetworkLimitsMaxBodyBytes)
-        return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "max_body_bytes out of range"));
-    if (limits.incoming_timeout <= std::chrono::milliseconds{0} ||
-        limits.incoming_timeout > kNetworkLimitsMaxIncomingTimeout)
-        return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-            "incoming_timeout out of range"));
-    return result<void>::ok();
-}
+/**
+ * @brief 校验 NetworkLimits 装配值：各项须大于零且不超过对应上限。
+ * @param limits 待校验的装配值。
+ * @return 通过返回 ok；违规返回 InvalidArgument。
+ */
+inline result<void> ValidateNetworkLimits(const NetworkLimits& limits);
 
 } // namespace bbt::infra
+
+#include <bbt/infra/impl/NetworkTypesImpl.hpp>

@@ -29,7 +29,8 @@ namespace bbt::infra::mcp {
 namespace {
 
 // 固定错误构造：domain_code 机器可读，message 不回显任何输入字节。
-Error MakeJsonError(ErrorCode code, const char* domain_code, const char* message) {
+Error MakeJsonError(ErrorCode code, const char* domain_code, const char* message)
+{
     Error e;
     e.code = code;
     e.domain_code = domain_code;
@@ -37,8 +38,8 @@ Error MakeJsonError(ErrorCode code, const char* domain_code, const char* message
     return e;
 }
 
-template <class T>
-result<T> JsonErr(ErrorCode code, const char* domain_code, const char* message) {
+template <class T> result<T> JsonErr(ErrorCode code, const char* domain_code, const char* message)
+{
     return result<T>::err(MakeJsonError(code, domain_code, message));
 }
 
@@ -46,12 +47,16 @@ result<T> JsonErr(ErrorCode code, const char* domain_code, const char* message) 
 // Boost 的解析器把能装进 int64/uint64 的整数交给 on_int64/on_uint64；一个纯整数
 // 词法落到 on_double，只可能是它已超出 int64/uint64 可表示范围（见 Boost
 // basic_parser_impl 的整数溢出分支 goto finish_dub）。据此拒绝，不静默降级为 double。
-bool IsIntegerLexeme(boost::json::string_view raw) noexcept {
-    if (raw.empty()) return false;
+bool IsIntegerLexeme(boost::json::string_view raw) noexcept
+{
+    if (raw.empty())
+        return false;
     for (std::size_t i = 0; i < raw.size(); ++i) {
         const char c = raw[i];
-        if (i == 0 && c == '-') continue;
-        if (c < '0' || c > '9') return false;
+        if (i == 0 && c == '-')
+            continue;
+        if (c < '0' || c > '9')
+            return false;
     }
     return true;
 }
@@ -67,34 +72,48 @@ public:
     static constexpr std::size_t max_key_size = boost::json::string::max_size();
     static constexpr std::size_t max_string_size = boost::json::string::max_size();
 
-    bool on_document_begin(boost::system::error_code&) { return true; }
-    bool on_document_end(boost::system::error_code&) { return true; }
+    bool on_document_begin(boost::system::error_code&)
+    {
+        return true;
+    }
+    bool on_document_end(boost::system::error_code&)
+    {
+        return true;
+    }
 
-    bool on_object_begin(boost::system::error_code&) {
+    bool on_object_begin(boost::system::error_code&)
+    {
         frames_.emplace_back(true);
         return true;
     }
-    bool on_object_end(std::size_t n, boost::system::error_code&) {
-        if (!frames_.empty()) frames_.pop_back();
+    bool on_object_end(std::size_t n, boost::system::error_code&)
+    {
+        if (!frames_.empty())
+            frames_.pop_back();
         stack_.push_object(n);
         return true;
     }
-    bool on_array_begin(boost::system::error_code&) {
+    bool on_array_begin(boost::system::error_code&)
+    {
         frames_.emplace_back(false);
         return true;
     }
-    bool on_array_end(std::size_t n, boost::system::error_code&) {
-        if (!frames_.empty()) frames_.pop_back();
+    bool on_array_end(std::size_t n, boost::system::error_code&)
+    {
+        if (!frames_.empty())
+            frames_.pop_back();
         stack_.push_array(n);
         return true;
     }
 
-    bool on_key_part(boost::json::string_view s, std::size_t, boost::system::error_code&) {
+    bool on_key_part(boost::json::string_view s, std::size_t, boost::system::error_code&)
+    {
         key_.append(s.data(), s.size());
         stack_.push_chars(s);
         return true;
     }
-    bool on_key(boost::json::string_view s, std::size_t, boost::system::error_code& ec) {
+    bool on_key(boost::json::string_view s, std::size_t, boost::system::error_code& ec)
+    {
         key_.append(s.data(), s.size());
         if (!frames_.empty() && frames_.back().is_object) {
             if (!frames_.back().keys.insert(key_).second) {
@@ -108,27 +127,40 @@ public:
         return true;
     }
 
-    bool on_string_part(boost::json::string_view s, std::size_t, boost::system::error_code&) {
+    bool on_string_part(boost::json::string_view s, std::size_t, boost::system::error_code&)
+    {
         stack_.push_chars(s);
         return true;
     }
-    bool on_string(boost::json::string_view s, std::size_t, boost::system::error_code&) {
+    bool on_string(boost::json::string_view s, std::size_t, boost::system::error_code&)
+    {
         stack_.push_string(s);
         return true;
     }
 
-    bool on_number_part(boost::json::string_view, boost::system::error_code&) { return true; }
+    bool on_number_part(boost::json::string_view, boost::system::error_code&)
+    {
+        return true;
+    }
 
     // 注释扩展默认关闭（allow_comments=false），此回调不会被触发；为满足
     // Boost 的 handler 契约（编译期必须存在）而与 detail::handler 同构保留。
-    bool on_comment_part(boost::json::string_view, boost::system::error_code&) { return true; }
-    bool on_comment(boost::json::string_view, boost::system::error_code&) { return true; }
+    bool on_comment_part(boost::json::string_view, boost::system::error_code&)
+    {
+        return true;
+    }
+    bool on_comment(boost::json::string_view, boost::system::error_code&)
+    {
+        return true;
+    }
 
-    bool on_int64(std::int64_t i, boost::json::string_view, boost::system::error_code&) {
+    bool on_int64(std::int64_t i, boost::json::string_view, boost::system::error_code&)
+    {
         stack_.push_int64(i);
         return true;
     }
-    bool on_uint64(std::uint64_t u, boost::json::string_view, boost::system::error_code&) {
+    bool on_uint64(std::uint64_t u, boost::json::string_view, boost::system::error_code&)
+    {
         stack_.push_uint64(u);
         return true;
     }
@@ -137,7 +169,8 @@ public:
     // on_int64/on_uint64）——不得静默降级为 double。raw 是 Boost 解析器交付的
     // 原始数字词法（单次 write_some 下即完整字面量），本处只做形态判断，
     // 不手写 JSON 词法扫描。
-    bool on_double(double d, boost::json::string_view raw, boost::system::error_code& ec) {
+    bool on_double(double d, boost::json::string_view raw, boost::system::error_code& ec)
+    {
         if (!std::isfinite(d) || IsIntegerLexeme(raw)) {
             number_error_ = true;
             ec = boost::json::error::syntax;
@@ -146,22 +179,35 @@ public:
         stack_.push_double(d);
         return true;
     }
-    bool on_bool(bool b, boost::system::error_code&) {
+    bool on_bool(bool b, boost::system::error_code&)
+    {
         stack_.push_bool(b);
         return true;
     }
-    bool on_null(boost::system::error_code&) {
+    bool on_null(boost::system::error_code&)
+    {
         stack_.push_null();
         return true;
     }
 
-    bool duplicate_key() const noexcept { return duplicate_key_; }
-    bool number_error() const noexcept { return number_error_; }
-    boost::json::value Release() noexcept { return stack_.release(); }
+    bool duplicate_key() const noexcept
+    {
+        return duplicate_key_;
+    }
+    bool number_error() const noexcept
+    {
+        return number_error_;
+    }
+    boost::json::value Release() noexcept
+    {
+        return stack_.release();
+    }
 
 private:
     struct Frame {
-        explicit Frame(bool object) : is_object(object) {}
+        explicit Frame(bool object) : is_object(object)
+        {
+        }
         bool is_object;
         std::set<std::string> keys;
     };
@@ -180,63 +226,88 @@ constexpr std::uint64_t kExactDoubleLimit = 1ULL << 53;
 
 // 实现细节：类内嵌套（namespace 深度 ≤ 3），定义在本 TU。
 struct JsonValue::Impl {
-    explicit Impl(boost::json::value v) : value(std::move(v)) {}
+    explicit Impl(boost::json::value v) : value(std::move(v))
+    {
+    }
     boost::json::value value;
 };
 
-JsonValue::JsonValue(std::unique_ptr<Impl> impl) noexcept
-    : m_impl(std::move(impl)) {}
+JsonValue::JsonValue(std::unique_ptr<Impl> impl) noexcept : m_impl(std::move(impl))
+{
+}
 
 JsonValue::JsonValue() noexcept = default;
-JsonValue::JsonValue(std::nullptr_t) noexcept {}
+JsonValue::JsonValue(std::nullptr_t) noexcept
+{
+}
 JsonValue::JsonValue(JsonValue&& other) noexcept = default;
 JsonValue& JsonValue::operator=(JsonValue&& other) noexcept = default;
 JsonValue::~JsonValue() = default;
 
-JsonValue::JsonValue(bool value) : m_impl(std::make_unique<Impl>(boost::json::value(value))) {}
-JsonValue::JsonValue(int value) : m_impl(std::make_unique<Impl>(boost::json::value(std::int64_t(value)))) {}
-JsonValue::JsonValue(std::int64_t value) : m_impl(std::make_unique<Impl>(boost::json::value(value))) {}
-JsonValue::JsonValue(std::uint64_t value) : m_impl(std::make_unique<Impl>(boost::json::value(value))) {}
+JsonValue::JsonValue(bool value) : m_impl(std::make_unique<Impl>(boost::json::value(value)))
+{
+}
+JsonValue::JsonValue(int value) : m_impl(std::make_unique<Impl>(boost::json::value(std::int64_t(value))))
+{
+}
+JsonValue::JsonValue(std::int64_t value) : m_impl(std::make_unique<Impl>(boost::json::value(value)))
+{
+}
+JsonValue::JsonValue(std::uint64_t value) : m_impl(std::make_unique<Impl>(boost::json::value(value)))
+{
+}
 
-JsonValue::JsonValue(double value) {
+JsonValue::JsonValue(double value)
+{
     if (!std::isfinite(value))
         throw std::invalid_argument("bbt::infra::mcp::JsonValue: double must be finite");
     m_impl = std::make_unique<Impl>(boost::json::value(value));
 }
 
-JsonValue::JsonValue(std::string_view value) {
+JsonValue::JsonValue(std::string_view value)
+{
     if (!bbt::infra::detail::IsValidUtf8(value))
         throw std::invalid_argument("bbt::infra::mcp::JsonValue: string must be valid UTF-8");
     m_impl = std::make_unique<Impl>(boost::json::value(boost::json::string(value)));
 }
 
-JsonValue::JsonValue(const char* value)
-    : JsonValue(value == nullptr ? std::string_view() : std::string_view(value)) {}
-
-JsonValue::JsonValue(const JsonValue& other) {
-    if (other.m_impl) m_impl = std::make_unique<Impl>(other.m_impl->value);
+JsonValue::JsonValue(const char* value) : JsonValue(value == nullptr ? std::string_view() : std::string_view(value))
+{
 }
 
-JsonValue& JsonValue::operator=(const JsonValue& other) {
-    if (this == &other) return *this;
+JsonValue::JsonValue(const JsonValue& other)
+{
+    if (other.m_impl)
+        m_impl = std::make_unique<Impl>(other.m_impl->value);
+}
+
+JsonValue& JsonValue::operator=(const JsonValue& other)
+{
+    if (this == &other)
+        return *this;
     // 深复制：先构造新值再替换，失败时本对象保持原值（基本保证）。
     std::unique_ptr<Impl> copy;
-    if (other.m_impl) copy = std::make_unique<Impl>(other.m_impl->value);
+    if (other.m_impl)
+        copy = std::make_unique<Impl>(other.m_impl->value);
     m_impl = std::move(copy);
     return *this;
 }
 
-JsonValue JsonValue::Object() { return JsonValue(std::make_unique<Impl>(boost::json::value(boost::json::object()))); }
-JsonValue JsonValue::Array()  { return JsonValue(std::make_unique<Impl>(boost::json::value(boost::json::array()))); }
+JsonValue JsonValue::Object()
+{
+    return JsonValue(std::make_unique<Impl>(boost::json::value(boost::json::object())));
+}
+JsonValue JsonValue::Array()
+{
+    return JsonValue(std::make_unique<Impl>(boost::json::value(boost::json::array())));
+}
 
-result<JsonValue> JsonValue::Parse(std::string_view text, std::size_t max_bytes,
-                                   std::size_t max_depth) {
+result<JsonValue> JsonValue::Parse(std::string_view text, std::size_t max_bytes, std::size_t max_depth)
+{
     if (max_bytes == 0 || max_depth == 0)
-        return JsonErr<JsonValue>(ErrorCode::InvalidArgument, "mcp.json.bound",
-                                  "json parse bound must be positive");
+        return JsonErr<JsonValue>(ErrorCode::InvalidArgument, "mcp.json.bound", "json parse bound must be positive");
     if (text.size() > max_bytes)
-        return JsonErr<JsonValue>(ErrorCode::ProtocolError, "mcp.json.max_bytes",
-                                  "json input exceeds max bytes");
+        return JsonErr<JsonValue>(ErrorCode::ProtocolError, "mcp.json.max_bytes", "json input exceeds max bytes");
 
     boost::json::parse_options options;
     options.max_depth = max_depth;
@@ -249,16 +320,13 @@ result<JsonValue> JsonValue::Parse(std::string_view text, std::size_t max_bytes,
     const std::size_t parsed_bytes = parser.write_some(false, text.data(), text.size(), ec);
 
     if (parser.handler().duplicate_key())
-        return JsonErr<JsonValue>(ErrorCode::ProtocolError, "mcp.json.duplicate_key",
-                                  "json object has duplicate key");
+        return JsonErr<JsonValue>(ErrorCode::ProtocolError, "mcp.json.duplicate_key", "json object has duplicate key");
     // 不可表示数值：非有限或超范围整数（on_double 已拒绝，不留 DOM）。
     if (parser.handler().number_error())
-        return JsonErr<JsonValue>(ErrorCode::ProtocolError, "mcp.json.number",
-                                  "json number is not representable");
+        return JsonErr<JsonValue>(ErrorCode::ProtocolError, "mcp.json.number", "json number is not representable");
     if (ec) {
         if (ec == boost::json::error::too_deep)
-            return JsonErr<JsonValue>(ErrorCode::ProtocolError, "mcp.json.max_depth",
-                                      "json input exceeds max depth");
+            return JsonErr<JsonValue>(ErrorCode::ProtocolError, "mcp.json.max_depth", "json input exceeds max depth");
         return JsonErr<JsonValue>(ErrorCode::ProtocolError, "mcp.json.syntax",
                                   "json input is not a single valid document");
     }
@@ -270,61 +338,98 @@ result<JsonValue> JsonValue::Parse(std::string_view text, std::size_t max_bytes,
     return result<JsonValue>::ok(JsonValue(std::make_unique<Impl>(parser.handler().Release())));
 }
 
-JsonKind JsonValue::Kind() const noexcept {
-    if (!m_impl) return JsonKind::Null;
+JsonKind JsonValue::Kind() const noexcept
+{
+    if (!m_impl)
+        return JsonKind::Null;
     switch (m_impl->value.kind()) {
-        case boost::json::kind::bool_:   return JsonKind::Bool;
-        case boost::json::kind::int64:   return JsonKind::Int64;
-        case boost::json::kind::uint64:  return JsonKind::UInt64;
-        case boost::json::kind::double_: return JsonKind::Double;
-        case boost::json::kind::string:  return JsonKind::String;
-        case boost::json::kind::array:   return JsonKind::Array;
-        case boost::json::kind::object:  return JsonKind::Object;
-        case boost::json::kind::null:    return JsonKind::Null;
+    case boost::json::kind::bool_:
+        return JsonKind::Bool;
+    case boost::json::kind::int64:
+        return JsonKind::Int64;
+    case boost::json::kind::uint64:
+        return JsonKind::UInt64;
+    case boost::json::kind::double_:
+        return JsonKind::Double;
+    case boost::json::kind::string:
+        return JsonKind::String;
+    case boost::json::kind::array:
+        return JsonKind::Array;
+    case boost::json::kind::object:
+        return JsonKind::Object;
+    case boost::json::kind::null:
+        return JsonKind::Null;
     }
     return JsonKind::Null;
 }
 
-bool JsonValue::IsNull() const noexcept   { return Kind() == JsonKind::Null; }
-bool JsonValue::IsBool() const noexcept   { return Kind() == JsonKind::Bool; }
-bool JsonValue::IsInt64() const noexcept  { return Kind() == JsonKind::Int64; }
-bool JsonValue::IsUInt64() const noexcept { return Kind() == JsonKind::UInt64; }
-bool JsonValue::IsDouble() const noexcept { return Kind() == JsonKind::Double; }
-bool JsonValue::IsString() const noexcept { return Kind() == JsonKind::String; }
-bool JsonValue::IsArray() const noexcept  { return Kind() == JsonKind::Array; }
-bool JsonValue::IsObject() const noexcept { return Kind() == JsonKind::Object; }
+bool JsonValue::IsNull() const noexcept
+{
+    return Kind() == JsonKind::Null;
+}
+bool JsonValue::IsBool() const noexcept
+{
+    return Kind() == JsonKind::Bool;
+}
+bool JsonValue::IsInt64() const noexcept
+{
+    return Kind() == JsonKind::Int64;
+}
+bool JsonValue::IsUInt64() const noexcept
+{
+    return Kind() == JsonKind::UInt64;
+}
+bool JsonValue::IsDouble() const noexcept
+{
+    return Kind() == JsonKind::Double;
+}
+bool JsonValue::IsString() const noexcept
+{
+    return Kind() == JsonKind::String;
+}
+bool JsonValue::IsArray() const noexcept
+{
+    return Kind() == JsonKind::Array;
+}
+bool JsonValue::IsObject() const noexcept
+{
+    return Kind() == JsonKind::Object;
+}
 
-std::size_t JsonValue::Size() const noexcept {
-    if (!m_impl) return 0;
-    if (m_impl->value.is_object()) return m_impl->value.as_object().size();
-    if (m_impl->value.is_array())  return m_impl->value.as_array().size();
+std::size_t JsonValue::Size() const noexcept
+{
+    if (!m_impl)
+        return 0;
+    if (m_impl->value.is_object())
+        return m_impl->value.as_object().size();
+    if (m_impl->value.is_array())
+        return m_impl->value.as_array().size();
     return 0;
 }
 
-result<JsonValue> JsonValue::Find(std::string_view key) const {
+result<JsonValue> JsonValue::Find(std::string_view key) const
+{
     if (!m_impl || !m_impl->value.is_object())
-        return JsonErr<JsonValue>(ErrorCode::InvalidArgument, "mcp.json.not_object",
-                                  "json value is not an object");
+        return JsonErr<JsonValue>(ErrorCode::InvalidArgument, "mcp.json.not_object", "json value is not an object");
     const boost::json::object& object = m_impl->value.as_object();
     const auto it = object.find(key);
     if (it == object.end())
-        return JsonErr<JsonValue>(ErrorCode::NotFound, "mcp.json.key_missing",
-                                  "json object key not found");
+        return JsonErr<JsonValue>(ErrorCode::NotFound, "mcp.json.key_missing", "json object key not found");
     return result<JsonValue>::ok(JsonValue(std::make_unique<Impl>(it->value())));
 }
 
-result<JsonValue> JsonValue::At(std::size_t index) const {
+result<JsonValue> JsonValue::At(std::size_t index) const
+{
     if (!m_impl || !m_impl->value.is_array())
-        return JsonErr<JsonValue>(ErrorCode::InvalidArgument, "mcp.json.not_array",
-                                  "json value is not an array");
+        return JsonErr<JsonValue>(ErrorCode::InvalidArgument, "mcp.json.not_array", "json value is not an array");
     const boost::json::array& array = m_impl->value.as_array();
     if (index >= array.size())
-        return JsonErr<JsonValue>(ErrorCode::NotFound, "mcp.json.index_out_of_range",
-                                  "json array index out of range");
+        return JsonErr<JsonValue>(ErrorCode::NotFound, "mcp.json.index_out_of_range", "json array index out of range");
     return result<JsonValue>::ok(JsonValue(std::make_unique<Impl>(array[index])));
 }
 
-result<std::vector<std::string>> JsonValue::Keys() const {
+result<std::vector<std::string>> JsonValue::Keys() const
+{
     if (!m_impl || !m_impl->value.is_object())
         return JsonErr<std::vector<std::string>>(ErrorCode::InvalidArgument, "mcp.json.not_object",
                                                  "json value is not an object");
@@ -337,87 +442,91 @@ result<std::vector<std::string>> JsonValue::Keys() const {
     return result<std::vector<std::string>>::ok(std::move(keys));
 }
 
-result<void> JsonValue::Set(std::string_view key, JsonValue value) {
+result<void> JsonValue::Set(std::string_view key, JsonValue value)
+{
     if (!m_impl || !m_impl->value.is_object())
-        return JsonErr<void>(ErrorCode::InvalidArgument, "mcp.json.not_object",
-                             "json value is not an object");
+        return JsonErr<void>(ErrorCode::InvalidArgument, "mcp.json.not_object", "json value is not an object");
     if (!bbt::infra::detail::IsValidUtf8(key))
-        return JsonErr<void>(ErrorCode::InvalidArgument, "mcp.json.utf8",
-                             "json object key must be valid UTF-8");
+        return JsonErr<void>(ErrorCode::InvalidArgument, "mcp.json.utf8", "json object key must be valid UTF-8");
     // 校验全部通过后才写入：不存在半份修改。
-    m_impl->value.as_object()[key] =
-        value.m_impl ? std::move(value.m_impl->value) : boost::json::value();
+    m_impl->value.as_object()[key] = value.m_impl ? std::move(value.m_impl->value) : boost::json::value();
     return result<void>::ok();
 }
 
-result<void> JsonValue::Push(JsonValue value) {
+result<void> JsonValue::Push(JsonValue value)
+{
     if (!m_impl || !m_impl->value.is_array())
-        return JsonErr<void>(ErrorCode::InvalidArgument, "mcp.json.not_array",
-                             "json value is not an array");
-    m_impl->value.as_array().push_back(value.m_impl ? std::move(value.m_impl->value)
-                                                    : boost::json::value());
+        return JsonErr<void>(ErrorCode::InvalidArgument, "mcp.json.not_array", "json value is not an array");
+    m_impl->value.as_array().push_back(value.m_impl ? std::move(value.m_impl->value) : boost::json::value());
     return result<void>::ok();
 }
 
-result<bool> JsonValue::AsBool() const {
+result<bool> JsonValue::AsBool() const
+{
     if (!m_impl || !m_impl->value.is_bool())
-        return JsonErr<bool>(ErrorCode::TypeMismatch, "mcp.json.type",
-                             "json value type mismatch");
+        return JsonErr<bool>(ErrorCode::TypeMismatch, "mcp.json.type", "json value type mismatch");
     return result<bool>::ok(m_impl->value.as_bool());
 }
 
-result<std::int64_t> JsonValue::AsInt64() const {
-    if (!m_impl) return JsonErr<std::int64_t>(ErrorCode::TypeMismatch, "mcp.json.type",
-                                              "json value type mismatch");
-    if (m_impl->value.is_int64()) return result<std::int64_t>::ok(m_impl->value.as_int64());
+result<std::int64_t> JsonValue::AsInt64() const
+{
+    if (!m_impl)
+        return JsonErr<std::int64_t>(ErrorCode::TypeMismatch, "mcp.json.type", "json value type mismatch");
+    if (m_impl->value.is_int64())
+        return result<std::int64_t>::ok(m_impl->value.as_int64());
     if (m_impl->value.is_uint64()) {
         const std::uint64_t u = m_impl->value.as_uint64();
         if (u <= static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
             return result<std::int64_t>::ok(static_cast<std::int64_t>(u));
     }
-    return JsonErr<std::int64_t>(ErrorCode::TypeMismatch, "mcp.json.type",
-                                 "json value type mismatch");
+    return JsonErr<std::int64_t>(ErrorCode::TypeMismatch, "mcp.json.type", "json value type mismatch");
 }
 
-result<std::uint64_t> JsonValue::AsUInt64() const {
-    if (!m_impl) return JsonErr<std::uint64_t>(ErrorCode::TypeMismatch, "mcp.json.type",
-                                               "json value type mismatch");
-    if (m_impl->value.is_uint64()) return result<std::uint64_t>::ok(m_impl->value.as_uint64());
+result<std::uint64_t> JsonValue::AsUInt64() const
+{
+    if (!m_impl)
+        return JsonErr<std::uint64_t>(ErrorCode::TypeMismatch, "mcp.json.type", "json value type mismatch");
+    if (m_impl->value.is_uint64())
+        return result<std::uint64_t>::ok(m_impl->value.as_uint64());
     if (m_impl->value.is_int64()) {
         const std::int64_t i = m_impl->value.as_int64();
-        if (i >= 0) return result<std::uint64_t>::ok(static_cast<std::uint64_t>(i));
+        if (i >= 0)
+            return result<std::uint64_t>::ok(static_cast<std::uint64_t>(i));
     }
-    return JsonErr<std::uint64_t>(ErrorCode::TypeMismatch, "mcp.json.type",
-                                  "json value type mismatch");
+    return JsonErr<std::uint64_t>(ErrorCode::TypeMismatch, "mcp.json.type", "json value type mismatch");
 }
 
-result<double> JsonValue::AsDouble() const {
-    if (!m_impl) return JsonErr<double>(ErrorCode::TypeMismatch, "mcp.json.type",
-                                        "json value type mismatch");
-    if (m_impl->value.is_double()) return result<double>::ok(m_impl->value.as_double());
+result<double> JsonValue::AsDouble() const
+{
+    if (!m_impl)
+        return JsonErr<double>(ErrorCode::TypeMismatch, "mcp.json.type", "json value type mismatch");
+    if (m_impl->value.is_double())
+        return result<double>::ok(m_impl->value.as_double());
     if (m_impl->value.is_int64()) {
         const std::int64_t i = m_impl->value.as_int64();
-        if (i >= -static_cast<std::int64_t>(kExactDoubleLimit) &&
-            i <= static_cast<std::int64_t>(kExactDoubleLimit))
+        if (i >= -static_cast<std::int64_t>(kExactDoubleLimit) && i <= static_cast<std::int64_t>(kExactDoubleLimit))
             return result<double>::ok(static_cast<double>(i));
     } else if (m_impl->value.is_uint64()) {
         const std::uint64_t u = m_impl->value.as_uint64();
-        if (u <= kExactDoubleLimit) return result<double>::ok(static_cast<double>(u));
+        if (u <= kExactDoubleLimit)
+            return result<double>::ok(static_cast<double>(u));
     }
     return JsonErr<double>(ErrorCode::TypeMismatch, "mcp.json.precision",
                            "json integer not exactly representable as double");
 }
 
-result<std::string> JsonValue::AsString() const {
+result<std::string> JsonValue::AsString() const
+{
     if (!m_impl || !m_impl->value.is_string())
-        return JsonErr<std::string>(ErrorCode::TypeMismatch, "mcp.json.type",
-                                    "json value type mismatch");
+        return JsonErr<std::string>(ErrorCode::TypeMismatch, "mcp.json.type", "json value type mismatch");
     const boost::json::string& s = m_impl->value.as_string();
     return result<std::string>::ok(std::string(s.data(), s.size()));
 }
 
-std::string JsonValue::Serialize() const {
-    if (!m_impl) return "null";
+std::string JsonValue::Serialize() const
+{
+    if (!m_impl)
+        return "null";
     return boost::json::serialize(m_impl->value);
 }
 

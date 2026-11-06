@@ -54,39 +54,41 @@ namespace {
 using bbt::coroutine::sync::CoWaiter;
 using bbt::coroutine::sync::CombinedWaitOptions;
 using bbt::coroutine::sync::CombinedWaitStatus;
-using bbt::coroutine::Deadline;  // WaitTypes.hpp：Deadline 在 bbt::coroutine（sync 之外）
+using bbt::coroutine::Deadline; // WaitTypes.hpp：Deadline 在 bbt::coroutine（sync 之外）
 
-constexpr std::size_t kReadChunkBytes = 64U << 10;  // 读缓冲（堆上自有，不借 Asio）
-constexpr int kStderrDropDiagLimit = 10;            // 满队丢弃诊断条数上限
+constexpr std::size_t kReadChunkBytes = 64U << 10; // 读缓冲（堆上自有，不借 Asio）
+constexpr int kStderrDropDiagLimit = 10;           // 满队丢弃诊断条数上限
 
-Deadline DeadlineAfter(std::chrono::milliseconds delta) noexcept {
+Deadline DeadlineAfter(std::chrono::milliseconds delta) noexcept
+{
     return std::chrono::steady_clock::now() + delta;
 }
 
 } // namespace
 
 struct McpStdioTransport::Impl {
-    Impl(std::shared_ptr<McpServer> server, StdioOptions options)
-        : m_server(std::move(server)), m_options(options) {}
+    Impl(std::shared_ptr<McpServer> server, StdioOptions options) : m_server(std::move(server)), m_options(options)
+    {
+    }
 
     // ---- 状态 -------------------------------------------------------------------
-    std::shared_ptr<McpServer> m_server;      // transport 持 core 强引用
-    std::shared_ptr<McpSession> m_session;    // 单通道会话（stdio = 单 channel）
+    std::shared_ptr<McpServer> m_server;   // transport 持 core 强引用
+    std::shared_ptr<McpSession> m_session; // 单通道会话（stdio = 单 channel）
     StdioOptions m_options;
     int m_in_fd = 0;
     int m_out_fd = 1;
-    int m_saved_in_flags = -1;                // Start 置 O_NONBLOCK 前的标志（Close 还原）
+    int m_saved_in_flags = -1; // Start 置 O_NONBLOCK 前的标志（Close 还原）
     int m_saved_out_flags = -1;
 
-    mutable std::mutex m_mtx;                 // 队列/标志域（锁序：m_mtx → m_life_mtx）
-    std::deque<std::string> m_queue;          // 已含 '\n' 结尾的完整帧
+    mutable std::mutex m_mtx;        // 队列/标志域（锁序：m_mtx → m_life_mtx）
+    std::deque<std::string> m_queue; // 已含 '\n' 结尾的完整帧
     std::size_t m_queue_bytes = 0;
     std::size_t m_peak_queue_bytes = 0;
     std::size_t m_dropped_frames = 0;
     std::size_t m_abandoned_frames = 0;
     int m_drop_diag_sent = 0;
-    bool m_input_sealed = false;              // 停读 + 写协程排空后退出
-    bool m_output_sealed = false;             // 拒绝一切入队
+    bool m_input_sealed = false;  // 停读 + 写协程排空后退出
+    bool m_output_sealed = false; // 拒绝一切入队
     bool m_eof = false;
     bool m_read_failed = false;
     bool m_write_failed = false;
@@ -99,21 +101,23 @@ struct McpStdioTransport::Impl {
     std::vector<CoWaiter::SPtr> m_space_waiters; // 满队出队等待（写进度/封口唤醒）
     std::vector<CoWaiter::SPtr> m_data_waiters;  // 空队写等待（入队/封口唤醒）
 
-    std::condition_variable m_host_cv;        // host 线程等待协程退出（Close 汇合）
-    std::condition_variable m_life_cv;        // host 线程等待 closed_done（首次收口落定）
-    std::mutex m_life_mtx;                    // 收口生命周期域
+    std::condition_variable m_host_cv; // host 线程等待协程退出（Close 汇合）
+    std::condition_variable m_life_cv; // host 线程等待 closed_done（首次收口落定）
+    std::mutex m_life_mtx;             // 收口生命周期域
     bool m_teardown_started = false;
     bool m_closed_done = false;
-    StdioCloseEvidence m_evidence;            // Close 落定当刻快照
+    StdioCloseEvidence m_evidence; // Close 落定当刻快照
 
     // ---- 队列信号等待（纯信号 + Deadline 兜底）--------------------------------------
     // Completed=被唤醒 / TimedOut=预算到 / Cancelled=封口 /
     // InvalidContext=非协程上下文（调用方据此立即丢弃）。
-    CombinedWaitStatus WaitSpace(std::chrono::milliseconds budget) {
+    CombinedWaitStatus WaitSpace(std::chrono::milliseconds budget)
+    {
         auto waiter = CoWaiter::Create();
         {
             std::lock_guard<std::mutex> lock(m_mtx);
-            if (m_output_sealed) return CombinedWaitStatus::Cancelled;
+            if (m_output_sealed)
+                return CombinedWaitStatus::Cancelled;
             m_space_waiters.push_back(waiter);
         }
         CombinedWaitOptions wait;
@@ -123,11 +127,13 @@ struct McpStdioTransport::Impl {
         return status;
     }
 
-    CombinedWaitStatus WaitData() {
+    CombinedWaitStatus WaitData()
+    {
         auto waiter = CoWaiter::Create();
         {
             std::lock_guard<std::mutex> lock(m_mtx);
-            if (m_output_sealed || m_input_sealed) return CombinedWaitStatus::Cancelled;
+            if (m_output_sealed || m_input_sealed)
+                return CombinedWaitStatus::Cancelled;
             m_data_waiters.push_back(waiter);
         }
         CombinedWaitOptions wait;
@@ -137,8 +143,8 @@ struct McpStdioTransport::Impl {
         return status;
     }
 
-    void ForgetWaiter(std::vector<CoWaiter::SPtr>& registry,
-                      const CoWaiter::SPtr& waiter) {
+    void ForgetWaiter(std::vector<CoWaiter::SPtr>& registry, const CoWaiter::SPtr& waiter)
+    {
         std::lock_guard<std::mutex> lock(m_mtx);
         for (auto it = registry.begin(); it != registry.end(); ++it) {
             if (*it == waiter) {
@@ -149,18 +155,27 @@ struct McpStdioTransport::Impl {
     }
 
     // 锁内 swap、锁外 Notify（PENDING 路径不丢唤醒；晚到 Notify 无副作用）。
-    void Wake(std::vector<CoWaiter::SPtr>& registry) {
+    void Wake(std::vector<CoWaiter::SPtr>& registry)
+    {
         std::vector<CoWaiter::SPtr> woken;
         {
             std::lock_guard<std::mutex> lock(m_mtx);
             woken.swap(registry);
         }
-        for (auto& waiter : woken) waiter->Notify();
+        for (auto& waiter : woken)
+            waiter->Notify();
     }
-    void WakeSpaceWaiters() { Wake(m_space_waiters); }
-    void WakeDataWaiters() { Wake(m_data_waiters); }
+    void WakeSpaceWaiters()
+    {
+        Wake(m_space_waiters);
+    }
+    void WakeDataWaiters()
+    {
+        Wake(m_data_waiters);
+    }
 
-    void NoteDropLocked(const char* reason) {
+    void NoteDropLocked(const char* reason)
+    {
         ++m_dropped_frames;
         if (m_drop_diag_sent++ < kStderrDropDiagLimit)
             std::fprintf(stderr, "bbt.mcp.stdio: output frame dropped (%s)\n", reason);
@@ -168,11 +183,13 @@ struct McpStdioTransport::Impl {
 
     // fd 就绪等待（登记先于 syscall 的 EAGAIN：数据边沿不会丢失）；deadline 为
     // 封口兜底轮询粒度，封口唤醒经 m_fd_waiters 的 PENDING Notify。
-    CombinedWaitStatus WaitFd(int fd, bool writeable) {
+    CombinedWaitStatus WaitFd(int fd, bool writeable)
+    {
         auto waiter = CoWaiter::Create();
         {
             std::lock_guard<std::mutex> lock(m_mtx);
-            if (m_input_sealed || m_output_sealed) return CombinedWaitStatus::Cancelled;
+            if (m_input_sealed || m_output_sealed)
+                return CombinedWaitStatus::Cancelled;
             m_fd_waiters.push_back(waiter);
         }
         CombinedWaitOptions wait;
@@ -184,13 +201,17 @@ struct McpStdioTransport::Impl {
         ForgetWaiter(m_fd_waiters, waiter);
         return status;
     }
-    void WakeFdWaiters() { Wake(m_fd_waiters); }
+    void WakeFdWaiters()
+    {
+        Wake(m_fd_waiters);
+    }
 
     // ---- 有界入队 -----------------------------------------------------------------
     // 满队时：协程上下文内以 write_deadline 为预算等待排空，超限丢弃；
     // 非协程上下文（业务线程经 sink 等）：Wait 拒绝挂起（InvalidContext）→
     // 立即丢弃 + 计数 + stderr 诊断，绝不阻塞调用方。
-    bool Enqueue(std::string frame) {
+    bool Enqueue(std::string frame)
+    {
         const auto deadline = DeadlineAfter(m_options.write_deadline);
         for (;;) {
             bool pushed = false;
@@ -212,11 +233,12 @@ struct McpStdioTransport::Impl {
             }
             // Notify 一律在锁外（Wake 内部取 m_mtx，锁内调用即自死锁）。
             if (pushed) {
-                if (need_wake_data) WakeDataWaiters();
+                if (need_wake_data)
+                    WakeDataWaiters();
                 return true;
             }
-            auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-                deadline - std::chrono::steady_clock::now());
+            auto remaining =
+                std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
             if (remaining <= std::chrono::milliseconds{0}) {
                 std::lock_guard<std::mutex> lock(m_mtx);
                 if (m_output_sealed) {
@@ -238,21 +260,21 @@ struct McpStdioTransport::Impl {
 
     // ---- 分派（受管协程内串行）------------------------------------------------------
     // 返回 false = 分派面结束（EOF/读错/核心 Closed），读循环应退出并收口。
-    bool DispatchLine(const std::string& raw, bool oversized) {
+    bool DispatchLine(const std::string& raw, bool oversized)
+    {
         std::size_t begin = 0, end = raw.size();
-        while (begin < end &&
-               (raw[begin] == ' ' || raw[begin] == '\t' || raw[begin] == '\r'))
+        while (begin < end && (raw[begin] == ' ' || raw[begin] == '\t' || raw[begin] == '\r'))
             ++begin;
-        while (end > begin &&
-               (raw[end - 1] == ' ' || raw[end - 1] == '\t' || raw[end - 1] == '\r'))
+        while (end > begin && (raw[end - 1] == ' ' || raw[end - 1] == '\t' || raw[end - 1] == '\r'))
             --end;
-        if (begin == end && !oversized) return true; // 空白行不是帧（含自唤醒字节）
+        if (begin == end && !oversized)
+            return true; // 空白行不是帧（含自唤醒字节）
 
-        auto outcome = m_session->HandleFrame(
-            oversized ? std::string_view(raw).substr(0, m_options.max_line_bytes)
-                      : std::string_view(raw).substr(begin, end - begin));
+        auto outcome = m_session->HandleFrame(oversized ? std::string_view(raw).substr(0, m_options.max_line_bytes)
+                                                        : std::string_view(raw).substr(begin, end - begin));
         if (outcome) {
-            if (outcome.value().has_response) Enqueue(outcome.value().response + "\n");
+            if (outcome.value().has_response)
+                Enqueue(outcome.value().response + "\n");
             return true;
         }
         // 核心拒绝（未 Start/超在途等）：wire 映射为库一致的错误帧（id 未知 → null；
@@ -272,7 +294,8 @@ struct McpStdioTransport::Impl {
     // ::read 被运行时 hook 全局替换（Hook_Read 会在协程内自行挂起、无视本层的
     // 封口协作），故这里用 syscall(SYS_read) 直连内核：O_NONBLOCK + EAGAIN →
     // CoWaiter fd 兴趣等待（就绪等待复用共享运行时，挂起协程而非线程）。
-    void ReaderLoop() {
+    void ReaderLoop()
+    {
         std::string line;
         line.reserve(4096);
         bool oversized = false;
@@ -283,7 +306,8 @@ struct McpStdioTransport::Impl {
         while (!dispatch_closed) {
             {
                 std::lock_guard<std::mutex> lock(m_mtx);
-                if (m_input_sealed) break;
+                if (m_input_sealed)
+                    break;
             }
             const ssize_t n = ::syscall(SYS_read, m_in_fd, buffer.data(), buffer.size());
             if (n > 0) {
@@ -309,7 +333,8 @@ struct McpStdioTransport::Impl {
                 m_eof = true;
                 break;
             }
-            if (errno == EINTR) continue;
+            if (errno == EINTR)
+                continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 WaitFd(m_in_fd, /*writeable=*/false);
                 continue; // 复查 sealed 后再试 read（登记先于 EAGAIN，无边丢失）
@@ -333,7 +358,8 @@ struct McpStdioTransport::Impl {
     }
 
     // ---- 写循环（Hook_Write 挂起等待可写；有界排空）------------------------------------
-    void WriterLoop() {
+    void WriterLoop()
+    {
         for (;;) {
             std::string frame;
             bool exit_now = false;
@@ -347,7 +373,8 @@ struct McpStdioTransport::Impl {
                     exit_now = true; // 无新帧可来（EOF/封队）且队列已排空
                 }
             }
-            if (exit_now) break;
+            if (exit_now)
+                break;
             if (frame.empty()) {
                 WaitData();
                 continue;
@@ -360,14 +387,15 @@ struct McpStdioTransport::Impl {
             ::sigaddset(&block, SIGPIPE);
             const bool mask_ok = ::pthread_sigmask(SIG_BLOCK, &block, &old) == 0;
             while (offset < frame.size()) {
-                const ssize_t n = ::syscall(SYS_write, m_out_fd, frame.data() + offset,
-                                            frame.size() - offset);
+                const ssize_t n = ::syscall(SYS_write, m_out_fd, frame.data() + offset, frame.size() - offset);
                 if (n > 0) {
                     offset += static_cast<std::size_t>(n);
-                    if (offset >= frame.size()) WakeSpaceWaiters(); // 有空位（锁外）
+                    if (offset >= frame.size())
+                        WakeSpaceWaiters(); // 有空位（锁外）
                     continue;
                 }
-                if (n < 0 && errno == EINTR) continue;
+                if (n < 0 && errno == EINTR)
+                    continue;
                 if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                     if (WaitFd(m_out_fd, /*writeable=*/true) == CombinedWaitStatus::Cancelled) {
                         // 封口放弃在途帧计入 abandoned（与写错误路径、封队清队
@@ -383,13 +411,14 @@ struct McpStdioTransport::Impl {
                     m_write_failed = true;
                     ++m_abandoned_frames; // 当前帧无法完成
                 }
-                std::fprintf(stderr, "bbt.mcp.stdio: stdout write error (errno=%d)\n",
-                             errno);
+                std::fprintf(stderr, "bbt.mcp.stdio: stdout write error (errno=%d)\n", errno);
                 failed = true;
                 break;
             }
-            if (mask_ok) ::pthread_sigmask(SIG_SETMASK, &old, nullptr);
-            if (failed) break;
+            if (mask_ok)
+                ::pthread_sigmask(SIG_SETMASK, &old, nullptr);
+            if (failed)
+                break;
         }
         {
             std::lock_guard<std::mutex> lock(m_mtx);
@@ -408,10 +437,12 @@ struct McpStdioTransport::Impl {
     // 入队，写协程可在两步之间看到「空队+已封」提前退出，结束帧被丢进无人排空的
     // 队列（ intermittent：Close 有界排空后读端拿不到流结束帧）。先入队再封：
     // 结束帧落在写协程排空路径上必然被写出，之后空队+已封才触发退出。
-    bool BeginTeardown() {
+    bool BeginTeardown()
+    {
         {
             std::lock_guard<std::mutex> life_lock(m_life_mtx);
-            if (m_teardown_started) return false;
+            if (m_teardown_started)
+                return false;
             m_teardown_started = true;
         }
         // 订阅流结束帧经 sink 入队；满队行为按调用上下文分口径：host Close 路径
@@ -419,7 +450,8 @@ struct McpStdioTransport::Impl {
         // 满队按 write_deadline 预算等待排空（此刻队列未封、写协程仍会排空，等待
         // 有界且不悬置）。条目移除后核心订阅表不再引用本会话（Server.hpp C1 契约：
         // transport 须先结束订阅再析构会话）。
-        if (m_session) m_session->EndAllSubscriptions();
+        if (m_session)
+            m_session->EndAllSubscriptions();
         {
             std::lock_guard<std::mutex> lock(m_mtx);
             m_input_sealed = true;
@@ -432,16 +464,17 @@ struct McpStdioTransport::Impl {
 
     // 第二步：封队 + 卸载 sink + 当刻快照。blocking=true（host 线程）先有界等待
     // 协程汇合；协程侧不做阻塞等待，只由「双协程均已退出」时收尾。
-    void TryFinishTeardown(bool blocking) {
+    void TryFinishTeardown(bool blocking)
+    {
         {
             std::lock_guard<std::mutex> life_lock(m_life_mtx);
-            if (m_closed_done) return; // 首次收口已落定（并发/重复调用幂等）
+            if (m_closed_done)
+                return; // 首次收口已落定（并发/重复调用幂等）
         }
         if (blocking) {
             const auto deadline = DeadlineAfter(m_options.close_drain_timeout);
             std::unique_lock<std::mutex> lock(m_mtx);
-            m_host_cv.wait_until(lock, deadline,
-                                 [this] { return m_reader_exited && m_writer_exited; });
+            m_host_cv.wait_until(lock, deadline, [this] { return m_reader_exited && m_writer_exited; });
         } else {
             std::lock_guard<std::mutex> lock(m_mtx);
             if (!(m_reader_exited && m_writer_exited))
@@ -457,7 +490,8 @@ struct McpStdioTransport::Impl {
         }
         WakeDataWaiters();
         WakeSpaceWaiters();
-        if (m_session) m_session->SetNotificationSink(McpSession::NotificationSink{});
+        if (m_session)
+            m_session->SetNotificationSink(McpSession::NotificationSink{});
 
         // O_NONBLOCK 还原（协程已退出/确认退出，fd 已无在途使用者）。
         bool nonblock_restored = false;
@@ -469,8 +503,7 @@ struct McpStdioTransport::Impl {
 
         // 当刻快照（S21 stdio 形态：收口末尾一次性拷贝，不是事后间接描述）。
         McpSession::NotificationSink sink_probe;
-        const bool sink_mounted =
-            m_session ? m_session->CopyNotificationSink(sink_probe) : false;
+        const bool sink_mounted = m_session ? m_session->CopyNotificationSink(sink_probe) : false;
         StdioCloseEvidence snapshot;
         {
             std::lock_guard<std::mutex> lock(m_mtx);
@@ -479,8 +512,7 @@ struct McpStdioTransport::Impl {
             snapshot.input_sealed = m_input_sealed;
             snapshot.output_sealed = m_output_sealed;
             snapshot.sink_mounted = sink_mounted;
-            snapshot.waiters_empty = m_fd_waiters.empty() && m_space_waiters.empty() &&
-                                     m_data_waiters.empty();
+            snapshot.waiters_empty = m_fd_waiters.empty() && m_space_waiters.empty() && m_data_waiters.empty();
             snapshot.eof = m_eof;
             snapshot.write_failed = m_write_failed;
             snapshot.core_closed = m_core_closed;
@@ -502,8 +534,10 @@ struct McpStdioTransport::Impl {
     }
 
     // Close（host 线程路径）：并发/重复 Close 均等首次真实落定。
-    void CloseAndWait() noexcept {
-        if (BeginTeardown()) TryFinishTeardown(/*blocking=*/true);
+    void CloseAndWait() noexcept
+    {
+        if (BeginTeardown())
+            TryFinishTeardown(/*blocking=*/true);
         std::unique_lock<std::mutex> lock(m_life_mtx);
         m_life_cv.wait(lock, [this] { return m_closed_done; });
     }
@@ -511,8 +545,9 @@ struct McpStdioTransport::Impl {
 
 // ---- 公共 API ---------------------------------------------------------------------------
 
-result<std::shared_ptr<McpStdioTransport>> McpStdioTransport::Start(
-    std::shared_ptr<McpServer> server, StdioOptions options) {
+result<std::shared_ptr<McpStdioTransport>> McpStdioTransport::Start(std::shared_ptr<McpServer> server,
+                                                                    StdioOptions options)
+{
     if (!server)
         return result<std::shared_ptr<McpStdioTransport>>::err(
             MakeError(ErrorCode::InvalidArgument, "mcp.stdio.null_server"));
@@ -522,10 +557,10 @@ result<std::shared_ptr<McpStdioTransport>> McpStdioTransport::Start(
     if (options.stdin_fd < 0 || options.stdout_fd < 0)
         return result<std::shared_ptr<McpStdioTransport>>::err(
             MakeError(ErrorCode::InvalidArgument, "mcp.stdio.bad_fd"));
-    if (options.max_pending_bytes == 0 || options.max_line_bytes == 0 ||
-        options.write_deadline <= std::chrono::milliseconds{0} ||
-        options.wait_granularity <= std::chrono::milliseconds{0} ||
-        options.close_drain_timeout <= std::chrono::milliseconds{0})
+    if (options.max_pending_bytes == 0 || options.max_line_bytes == 0
+        || options.write_deadline <= std::chrono::milliseconds{0}
+        || options.wait_granularity <= std::chrono::milliseconds{0}
+        || options.close_drain_timeout <= std::chrono::milliseconds{0})
         return result<std::shared_ptr<McpStdioTransport>>::err(
             MakeError(ErrorCode::InvalidArgument, "mcp.stdio.bad_options"));
     if (!bbt::coroutine::detail::Scheduler::GetInstance()->IsInitialized())
@@ -533,10 +568,10 @@ result<std::shared_ptr<McpStdioTransport>> McpStdioTransport::Start(
             MakeError(ErrorCode::RuntimeUnavailable, "mcp.stdio.runtime_not_running"));
 
     // 独占非 socket pipe 前提校验（R8；Start 拒绝非 FIFO）。
-    struct stat in_st {};
-    struct stat out_st {};
-    if (::fstat(options.stdin_fd, &in_st) != 0 || ::fstat(options.stdout_fd, &out_st) != 0 ||
-        !S_ISFIFO(in_st.st_mode) || !S_ISFIFO(out_st.st_mode))
+    struct stat in_st{};
+    struct stat out_st{};
+    if (::fstat(options.stdin_fd, &in_st) != 0 || ::fstat(options.stdout_fd, &out_st) != 0 || !S_ISFIFO(in_st.st_mode)
+        || !S_ISFIFO(out_st.st_mode))
         return result<std::shared_ptr<McpStdioTransport>>::err(
             MakeError(ErrorCode::InvalidArgument, "mcp.stdio.not_exclusive_pipe"));
 
@@ -552,8 +587,8 @@ result<std::shared_ptr<McpStdioTransport>> McpStdioTransport::Start(
     if (impl->m_saved_in_flags < 0 || impl->m_saved_out_flags < 0)
         return result<std::shared_ptr<McpStdioTransport>>::err(
             MakeError(ErrorCode::InternalError, "mcp.stdio.fcntl_failed"));
-    if (::fcntl(impl->m_in_fd, F_SETFL, impl->m_saved_in_flags | O_NONBLOCK) != 0 ||
-        ::fcntl(impl->m_out_fd, F_SETFL, impl->m_saved_out_flags | O_NONBLOCK) != 0)
+    if (::fcntl(impl->m_in_fd, F_SETFL, impl->m_saved_in_flags | O_NONBLOCK) != 0
+        || ::fcntl(impl->m_out_fd, F_SETFL, impl->m_saved_out_flags | O_NONBLOCK) != 0)
         return result<std::shared_ptr<McpStdioTransport>>::err(
             MakeError(ErrorCode::InternalError, "mcp.stdio.nonblock_failed"));
 
@@ -562,24 +597,27 @@ result<std::shared_ptr<McpStdioTransport>> McpStdioTransport::Start(
     std::weak_ptr<McpStdioTransport::Impl> weak = impl;
     impl->m_session->SetNotificationSink([weak](const std::string& frame) {
         auto self = weak.lock();
-        if (!self) return;
+        if (!self)
+            return;
         self->Enqueue(frame + "\n");
     });
 
     // 受管协程 dispatch：读/写各一协程任务（共享 scheduler 线程，无新增 I/O 线程）。
     bool reader_started = false;
     bool writer_started = false;
-    bbt::coroutine::detail::Scheduler::GetInstance()->RegistCoroutineTask(
-        [impl] { impl->ReaderLoop(); }, reader_started);
-    bbt::coroutine::detail::Scheduler::GetInstance()->RegistCoroutineTask(
-        [impl] { impl->WriterLoop(); }, writer_started);
+    bbt::coroutine::detail::Scheduler::GetInstance()->RegistCoroutineTask([impl] { impl->ReaderLoop(); },
+                                                                          reader_started);
+    bbt::coroutine::detail::Scheduler::GetInstance()->RegistCoroutineTask([impl] { impl->WriterLoop(); },
+                                                                          writer_started);
     if (!reader_started || !writer_started) {
         // 半启动清理：封两向（未启动协程按已退出记账），收尾路径与正常 Close 一致。
         {
             std::lock_guard<std::mutex> lock(impl->m_mtx);
             impl->m_input_sealed = true;
-            if (!reader_started) impl->m_reader_exited = true;
-            if (!writer_started) impl->m_writer_exited = true;
+            if (!reader_started)
+                impl->m_reader_exited = true;
+            if (!writer_started)
+                impl->m_writer_exited = true;
         }
         impl->WakeDataWaiters();
         impl->TryFinishTeardown(/*blocking=*/true);
@@ -591,33 +629,42 @@ result<std::shared_ptr<McpStdioTransport>> McpStdioTransport::Start(
         std::shared_ptr<McpStdioTransport>(new McpStdioTransport(std::move(impl))));
 }
 
-McpStdioTransport::McpStdioTransport(std::shared_ptr<Impl> impl) noexcept
-    : m_impl(std::move(impl)) {}
-
-McpStdioTransport::~McpStdioTransport() {
-    if (m_impl) m_impl->CloseAndWait();
+McpStdioTransport::McpStdioTransport(std::shared_ptr<Impl> impl) noexcept : m_impl(std::move(impl))
+{
 }
 
-void McpStdioTransport::Close() noexcept {
-    if (m_impl) m_impl->CloseAndWait();
+McpStdioTransport::~McpStdioTransport()
+{
+    if (m_impl)
+        m_impl->CloseAndWait();
 }
 
-bool McpStdioTransport::IsClosed() const noexcept {
+void McpStdioTransport::Close() noexcept
+{
+    if (m_impl)
+        m_impl->CloseAndWait();
+}
+
+bool McpStdioTransport::IsClosed() const noexcept
+{
     std::lock_guard<std::mutex> lock(m_impl->m_life_mtx);
     return m_impl->m_closed_done;
 }
 
-std::size_t McpStdioTransport::PendingOutputBytes() const noexcept {
+std::size_t McpStdioTransport::PendingOutputBytes() const noexcept
+{
     std::lock_guard<std::mutex> lock(m_impl->m_mtx);
     return m_impl->m_queue_bytes;
 }
 
-std::size_t McpStdioTransport::DroppedOutputFrames() const noexcept {
+std::size_t McpStdioTransport::DroppedOutputFrames() const noexcept
+{
     std::lock_guard<std::mutex> lock(m_impl->m_mtx);
     return m_impl->m_dropped_frames;
 }
 
-StdioCloseEvidence McpStdioTransport::LastCloseEvidence() const noexcept {
+StdioCloseEvidence McpStdioTransport::LastCloseEvidence() const noexcept
+{
     // 与 IsClosed() 同一锁域取值快照：m_evidence 的写入持 m_life_mtx
     // （TryFinishTeardown），无锁返回引用会与并发 Close 构成 data race。
     std::lock_guard<std::mutex> lock(m_impl->m_life_mtx);

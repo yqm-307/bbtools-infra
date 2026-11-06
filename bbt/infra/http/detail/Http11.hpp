@@ -35,24 +35,12 @@ namespace detail {
 // std::string，避免引入真实 socket 类型。
 class StringSink {
 public:
-    explicit StringSink(std::string& out) noexcept : m_out(out) {}
-    template<class ConstBufferSequence>
-    std::size_t write_some(const ConstBufferSequence& buffers) {
-        std::size_t total = 0;
-        for (auto it = boost::asio::buffer_sequence_begin(buffers);
-             it != boost::asio::buffer_sequence_end(buffers); ++it) {
-            const boost::asio::const_buffer& buffer = *it;  // 迭代器可能无 operator->
-            m_out.append(static_cast<const char*>(buffer.data()), buffer.size());
-            total += buffer.size();
-        }
-        return total;
+    explicit StringSink(std::string& out) noexcept : m_out(out)
+    {
     }
-    template<class ConstBufferSequence>
-    std::size_t write_some(const ConstBufferSequence& buffers,
-                           boost::system::error_code& ec) {
-        ec = {};
-        return write_some(buffers);
-    }
+    template <class ConstBufferSequence> std::size_t write_some(const ConstBufferSequence& buffers);
+    template <class ConstBufferSequence>
+    std::size_t write_some(const ConstBufferSequence& buffers, boost::system::error_code& ec);
 
 private:
     std::string& m_out;
@@ -65,11 +53,9 @@ struct PhaseDeadlines {
     bbt::coroutine::Deadline pool;
 };
 
-bbt::coroutine::Deadline StageDeadline(const PhaseTimeout& phase,
-                                      bbt::coroutine::Deadline total);
+bbt::coroutine::Deadline StageDeadline(const PhaseTimeout& phase, bbt::coroutine::Deadline total);
 std::error_code CheckCall(bbt::coroutine::Deadline deadline);
-PhaseDeadlines ResolveDeadlines(const Timeout& effective,
-                                bbt::coroutine::Deadline total_deadline,
+PhaseDeadlines ResolveDeadlines(const Timeout& effective, bbt::coroutine::Deadline total_deadline,
                                 std::chrono::steady_clock::time_point now);
 
 // 序列化必须在借用连接前完成：输入异常不占用池名额。
@@ -79,24 +65,25 @@ class Http11Connection {
 public:
     Http11Connection(net::Connection connection, std::uint64_t max_body_bytes,
                      std::optional<std::uint64_t> max_header_bytes) noexcept
-        : m_connection(std::move(connection)), m_max_body_bytes(max_body_bytes),
-          m_max_header_bytes(max_header_bytes) {}
+        : m_connection(std::move(connection)), m_max_body_bytes(max_body_bytes), m_max_header_bytes(max_header_bytes)
+    {
+    }
 
     struct ExchangeResult {
         Response response;
         bool keep_alive{false};
     };
-    bbt_co_async(result<ExchangeResult>) Exchange(const PreparedRequest& request,
-                                                  const std::string& serialized,
-                                                  const PhaseDeadlines& deadlines);
+    bbt_co_async(result<ExchangeResult>)
+        Exchange(const PreparedRequest& request, const std::string& serialized, const PhaseDeadlines& deadlines);
 
-    net::Connection& Net() noexcept { return m_connection; }
+    net::Connection& Net() noexcept
+    {
+        return m_connection;
+    }
 
 private:
-    result<void> WriteRequest(const std::string& bytes,
-                              bbt::coroutine::Deadline write_deadline);
-    result<ExchangeResult> ReadResponse(const PreparedRequest& request,
-                                        const PhaseDeadlines& deadlines);
+    result<void> WriteRequest(const std::string& bytes, bbt::coroutine::Deadline write_deadline);
+    result<ExchangeResult> ReadResponse(const PreparedRequest& request, const PhaseDeadlines& deadlines);
 
     net::Connection m_connection;
     std::uint64_t m_max_body_bytes;
@@ -105,3 +92,5 @@ private:
 
 } // namespace detail
 } // namespace bbt::infra::http
+
+#include <bbt/infra/http/detail/impl/Http11Impl.hpp>

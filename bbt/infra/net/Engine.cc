@@ -56,14 +56,16 @@ constexpr std::size_t kWriteByteBudget = 64 * 1024;
 constexpr std::size_t kPumpBudget = 32;
 constexpr std::size_t kMaxConnectOps = 1024;
 
-std::error_code FromBoost(const boost::system::error_code& error) {
+std::error_code FromBoost(const boost::system::error_code& error)
+{
     if (!error) {
         return {};
     }
     return std::error_code(error.value(), std::system_category());
 }
 
-int GetSocketError(int fd) {
+int GetSocketError(int fd)
+{
     int value = 0;
     socklen_t length = sizeof(value);
     if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &value, &length) != 0) {
@@ -73,14 +75,15 @@ int GetSocketError(int fd) {
 }
 
 // 建连责任收口：仅在各真实 close 点（或确认无 fd 创建）之后调用；幂等。
-void MarkReclaimReleased(const std::shared_ptr<ReclaimRecord>& record) {
+void MarkReclaimReleased(const std::shared_ptr<ReclaimRecord>& record)
+{
     if (record) {
         record->released.store(true, std::memory_order_release);
     }
 }
 
-ssize_t SendViewsRaw(int fd, const std::string_view* views, std::size_t count,
-                     std::size_t budget) {
+ssize_t SendViewsRaw(int fd, const std::string_view* views, std::size_t count, std::size_t budget)
+{
     struct iovec iov[ConnectionState::kMaxViews];
     std::size_t used = 0;
     std::size_t remaining = budget;
@@ -106,16 +109,23 @@ ssize_t SendViewsRaw(int fd, const std::string_view* views, std::size_t count,
 class FdHandle {
 public:
     FdHandle() = default;
-    explicit FdHandle(int fd) : m_fd(fd) {}
-    ~FdHandle() {
+    explicit FdHandle(int fd) : m_fd(fd)
+    {
+    }
+    ~FdHandle()
+    {
         if (m_fd >= 0) {
             ::close(m_fd);
         }
     }
     FdHandle(const FdHandle&) = delete;
     FdHandle& operator=(const FdHandle&) = delete;
-    FdHandle(FdHandle&& other) noexcept : m_fd(other.m_fd) { other.m_fd = -1; }
-    FdHandle& operator=(FdHandle&& other) noexcept {
+    FdHandle(FdHandle&& other) noexcept : m_fd(other.m_fd)
+    {
+        other.m_fd = -1;
+    }
+    FdHandle& operator=(FdHandle&& other) noexcept
+    {
         if (this != &other) {
             if (m_fd >= 0) {
                 ::close(m_fd);
@@ -125,14 +135,19 @@ public:
         }
         return *this;
     }
-    int Get() const noexcept { return m_fd; }
-    int Release() noexcept {
+    int Get() const noexcept
+    {
+        return m_fd;
+    }
+    int Release() noexcept
+    {
         const int fd = m_fd;
         m_fd = -1;
         return fd;
     }
     // 显式物理 close 点：责任转移/失败收口前调用，使「记录释放」晚于真实关闭。
-    void Close() noexcept {
+    void Close() noexcept
+    {
         if (m_fd >= 0) {
             ::close(m_fd);
             m_fd = -1;
@@ -143,7 +158,8 @@ private:
     int m_fd{-1};
 };
 
-std::error_code ApplyStreamOptions(int fd, const NormalizedOptions& options) {
+std::error_code ApplyStreamOptions(int fd, const NormalizedOptions& options)
+{
     std::error_code first;
     auto note = [&first](std::error_code error) {
         if (error && !first) {
@@ -157,15 +173,15 @@ std::error_code ApplyStreamOptions(int fd, const NormalizedOptions& options) {
         }
     }
     if (options.socket_recv_buffer != 0) {
-        int value = static_cast<int>(std::min<std::size_t>(options.socket_recv_buffer,
-                                                           static_cast<std::size_t>(INT_MAX)));
+        int value =
+            static_cast<int>(std::min<std::size_t>(options.socket_recv_buffer, static_cast<std::size_t>(INT_MAX)));
         if (::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &value, sizeof(value)) != 0) {
             note(std::error_code(errno, std::system_category()));
         }
     }
     if (options.socket_send_buffer != 0) {
-        int value = static_cast<int>(std::min<std::size_t>(options.socket_send_buffer,
-                                                           static_cast<std::size_t>(INT_MAX)));
+        int value =
+            static_cast<int>(std::min<std::size_t>(options.socket_send_buffer, static_cast<std::size_t>(INT_MAX)));
         if (::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &value, sizeof(value)) != 0) {
             note(std::error_code(errno, std::system_category()));
         }
@@ -184,8 +200,7 @@ std::error_code ApplyStreamOptions(int fd, const NormalizedOptions& options) {
         if (::setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval)) != 0) {
             note(std::error_code(errno, std::system_category()));
         }
-        int count = static_cast<int>(std::min<std::size_t>(options.tcp_keep_count,
-                                                          static_cast<std::size_t>(INT_MAX)));
+        int count = static_cast<int>(std::min<std::size_t>(options.tcp_keep_count, static_cast<std::size_t>(INT_MAX)));
         if (count > 0 && ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count)) != 0) {
             note(std::error_code(errno, std::system_category()));
         }
@@ -193,7 +208,8 @@ std::error_code ApplyStreamOptions(int fd, const NormalizedOptions& options) {
     return first;
 }
 
-std::error_code ApplyListenerOptions(NativeSocket& socket, const NormalizedOptions& options) {
+std::error_code ApplyListenerOptions(NativeSocket& socket, const NormalizedOptions& options)
+{
     std::error_code first;
     auto note = [&first](std::error_code error) {
         if (error && !first) {
@@ -207,12 +223,12 @@ std::error_code ApplyListenerOptions(NativeSocket& socket, const NormalizedOptio
         note(socket.SetReusePort(true));
     }
     if (options.socket_recv_buffer != 0) {
-        note(socket.SetReadBuffer(static_cast<int>(
-            std::min<std::size_t>(options.socket_recv_buffer, static_cast<std::size_t>(INT_MAX)))));
+        note(socket.SetReadBuffer(
+            static_cast<int>(std::min<std::size_t>(options.socket_recv_buffer, static_cast<std::size_t>(INT_MAX)))));
     }
     if (options.socket_send_buffer != 0) {
-        note(socket.SetWriteBuffer(static_cast<int>(
-            std::min<std::size_t>(options.socket_send_buffer, static_cast<std::size_t>(INT_MAX)))));
+        note(socket.SetWriteBuffer(
+            static_cast<int>(std::min<std::size_t>(options.socket_send_buffer, static_cast<std::size_t>(INT_MAX)))));
     }
     return first;
 }
@@ -236,16 +252,17 @@ public:
 
     // 端点租约：外部提交只经 TryPost 安全获取当前 driver；解绑后返回 false。
     // 定义在 EngineImpl 完整之后（需要 IsSealed 的门禁）。
-    template <class Handler>
-    bool TryPost(Handler&& handler);
+    template <class Handler> bool TryPost(Handler&& handler);
     // 内部收口命令：允许在 service_sealed 之后由控制域投递（仅 Run 使用）。
-    template <class Handler>
-    bool TryPostInternal(Handler&& handler);
+    template <class Handler> bool TryPostInternal(Handler&& handler);
 
     // owner 安装：设置 tick 钩子 + 创建/挂 listener。
     std::error_code InstallOnOwner(const std::vector<Address>& addresses);
     std::vector<Address> LocalAddresses() const;
-    bool HasListener() const { return !m_listeners.empty(); }
+    bool HasListener() const
+    {
+        return !m_listeners.empty();
+    }
 
     // owner 封服务 / 控制域冻结 / 解绑后释放 driver。
     void SealServiceOnOwner(std::function<void()> on_done = {});
@@ -259,8 +276,7 @@ public:
     // owner：从 native fd 接管（handoff / connect 完成）。reclaim 是带句柄
     // CoDial 的本次责任记录（accept/raw 路径为空，采用时另建活跃记录）。
     void AdoptFdOnOwner(FdHandle fd, bool is_connect, std::uint64_t connect_id,
-                        std::shared_ptr<HandoffReservation> reservation,
-                        bool delayed_delivery = false,
+                        std::shared_ptr<HandoffReservation> reservation, bool delayed_delivery = false,
                         const std::shared_ptr<ReclaimRecord>& reclaim = {});
     void BeginConnectOnOwner(const Address& address, std::uint64_t connect_id,
                              const std::shared_ptr<ReclaimRecord>& reclaim = {});
@@ -269,19 +285,23 @@ public:
     void CancelAllRequestedOnOwner();
 
     void MarkDirty(const std::shared_ptr<ConnCore>& core);
-    void SetDirtyBarrier(std::function<void()> barrier) {
+    void SetDirtyBarrier(std::function<void()> barrier)
+    {
         std::lock_guard<std::mutex> lock(m_barrier_mutex);
         m_dirty_barrier = std::move(barrier);
     }
-    void SetShutdownBarrier(std::function<void()> barrier) {
+    void SetShutdownBarrier(std::function<void()> barrier)
+    {
         std::lock_guard<std::mutex> lock(m_shutdown_barrier_mutex);
         m_shutdown_barrier = std::move(barrier);
     }
-    void SetWriteReadyBarrier(std::function<void()> barrier) {
+    void SetWriteReadyBarrier(std::function<void()> barrier)
+    {
         std::lock_guard<std::mutex> lock(m_write_ready_barrier_mutex);
         m_write_ready_barrier = std::move(barrier);
     }
-    void InvokeWriteReadyBarrier() {
+    void InvokeWriteReadyBarrier()
+    {
         std::function<void()> barrier;
         {
             std::lock_guard<std::mutex> lock(m_write_ready_barrier_mutex);
@@ -292,7 +312,8 @@ public:
             barrier();
         }
     }
-    void InvokeShutdownBarrier() {
+    void InvokeShutdownBarrier()
+    {
         std::function<void()> barrier;
         {
             std::lock_guard<std::mutex> lock(m_shutdown_barrier_mutex);
@@ -303,11 +324,13 @@ public:
             barrier();
         }
     }
-    void SetRemoveBarrier(std::function<void()> barrier) {
+    void SetRemoveBarrier(std::function<void()> barrier)
+    {
         std::lock_guard<std::mutex> lock(m_remove_barrier_mutex);
         m_remove_barrier = std::move(barrier);
     }
-    void InvokeRemoveBarrier() {
+    void InvokeRemoveBarrier()
+    {
         std::function<void()> barrier;
         {
             std::lock_guard<std::mutex> lock(m_remove_barrier_mutex);
@@ -318,16 +341,19 @@ public:
             barrier();
         }
     }
-    void SetPreAuthBarrier(std::function<void()> barrier) {
+    void SetPreAuthBarrier(std::function<void()> barrier)
+    {
         std::lock_guard<std::mutex> lock(m_auth_barrier_mutex);
         m_pre_auth_barrier = std::move(barrier);
     }
-    void SetConnectStartBarrier(std::function<void()> barrier) {
+    void SetConnectStartBarrier(std::function<void()> barrier)
+    {
         std::lock_guard<std::mutex> lock(m_connect_start_barrier_mutex);
         m_connect_start_barrier = std::move(barrier);
     }
     // owner 已占用本次 pending connect 回调预算、尚未做起点封口检查时调用。
-    void InvokeConnectStartBarrier() {
+    void InvokeConnectStartBarrier()
+    {
         std::function<void()> barrier;
         {
             std::lock_guard<std::mutex> lock(m_connect_start_barrier_mutex);
@@ -338,11 +364,13 @@ public:
             barrier();
         }
     }
-    void SetPostAuthBarrier(std::function<void()> barrier) {
+    void SetPostAuthBarrier(std::function<void()> barrier)
+    {
         std::lock_guard<std::mutex> lock(m_auth_barrier_mutex);
         m_post_auth_barrier = std::move(barrier);
     }
-    void InvokePreAuthBarrier() {
+    void InvokePreAuthBarrier()
+    {
         std::function<void()> barrier;
         {
             std::lock_guard<std::mutex> lock(m_auth_barrier_mutex);
@@ -353,7 +381,8 @@ public:
             barrier();
         }
     }
-    void InvokePostAuthBarrier() {
+    void InvokePostAuthBarrier()
+    {
         std::function<void()> barrier;
         {
             std::lock_guard<std::mutex> lock(m_auth_barrier_mutex);
@@ -364,11 +393,13 @@ public:
             barrier();
         }
     }
-    void SetSubmitBarrier(std::function<void()> barrier) {
+    void SetSubmitBarrier(std::function<void()> barrier)
+    {
         std::lock_guard<std::mutex> lock(m_submit_barrier_mutex);
         m_submit_barrier = std::move(barrier);
     }
-    void KickPumpOwner() {
+    void KickPumpOwner()
+    {
         auto self = shared_from_this();
         (void)TryPostInternal([self] { self->PumpAllConnsOwner(); });
     }
@@ -378,27 +409,31 @@ public:
     std::size_t RecvHoldBytes();
     int FirstConnFd();
     // 私有 test 屏障：owner recv 后、ring append 前调用（正常为空）。
-    void SetReadAppendHook(std::function<void()> hook) {
+    void SetReadAppendHook(std::function<void()> hook)
+    {
         m_read_append_hook = std::move(hook);
     }
-    void InvokeReadAppendHook() {
+    void InvokeReadAppendHook()
+    {
         if (m_read_append_hook) {
             m_read_append_hook();
         }
     }
     // 私有 test 接缝：TryAppend 观测 Busy 之后、AppendDeferred 之前调用（正常为空）。
     // 用于确定性制造「Busy 已发生 → 读者释放 → deferred 成功」的交错；产品路径为空时无差异。
-    void SetAppendBusyHook(std::function<void()> hook) {
+    void SetAppendBusyHook(std::function<void()> hook)
+    {
         m_append_busy_hook = std::move(hook);
     }
-    void InvokeAppendBusyHook() {
+    void InvokeAppendBusyHook()
+    {
         if (m_append_busy_hook) {
             m_append_busy_hook();
         }
     }
     // 不构造 std::function（避免回调派发前的分配/抛出）；用户异常仍隔离。
-    template <class Callback>
-    void SafeHandler(Callback&& callback) {
+    template <class Callback> void SafeHandler(Callback&& callback)
+    {
         try {
             callback();
         } catch (...) {
@@ -412,12 +447,17 @@ public:
     bool ImplSealed() const;
     std::size_t ReadLowWater() const;
     std::size_t ConnCount();
-    EngineImpl* Impl() { return m_impl; }
+    EngineImpl* Impl()
+    {
+        return m_impl;
+    }
 
 private:
-    asio::io_context& Ctx() { return m_driver->Context(); }  // owner 内部使用
-    void DoAccept(const std::shared_ptr<Listener>& listener,
-                  std::shared_ptr<HandoffReservation> reservation);
+    asio::io_context& Ctx()
+    {
+        return m_driver->Context();
+    } // owner 内部使用
+    void DoAccept(const std::shared_ptr<Listener>& listener, std::shared_ptr<HandoffReservation> reservation);
     void RemoveConn(const std::shared_ptr<ConnCore>& core);
     void PumpOwner();
     void PumpAllConnsOwner();
@@ -429,7 +469,7 @@ private:
     std::atomic<bool> m_installed{false};
     std::atomic<bool> m_sealed{false};
     std::vector<std::shared_ptr<Listener>> m_listeners;
-    std::vector<std::shared_ptr<ConnectPending>> m_pending_connects;  // owner-only
+    std::vector<std::shared_ptr<ConnectPending>> m_pending_connects; // owner-only
     // 已建连、交付定时器仍捕获的 fd；正常由 owner 消费，解绑后由控制域显式关。
     // 不能靠 driver/context 最后一个强引用析构来证明物理关闭。
     std::vector<std::shared_ptr<FdHandle>> m_delivery_fds;
@@ -438,25 +478,25 @@ private:
     std::mutex m_dirty_mutex;
     ConnCore* m_dirty_head{nullptr};
     ConnCore* m_dirty_tail{nullptr};
-    std::size_t m_pending_connect_callbacks{0};  // owner-only
+    std::size_t m_pending_connect_callbacks{0}; // owner-only
     std::function<void()> m_on_pending_zero;
     std::mutex m_barrier_mutex;
-    std::function<void()> m_dirty_barrier;  // 私有 test 屏障（一次性）
+    std::function<void()> m_dirty_barrier; // 私有 test 屏障（一次性）
     std::mutex m_remove_barrier_mutex;
-    std::function<void()> m_remove_barrier;  // 撤链后/擦表前（一次性）
+    std::function<void()> m_remove_barrier; // 撤链后/擦表前（一次性）
     std::mutex m_shutdown_barrier_mutex;
-    std::function<void()> m_shutdown_barrier;  // Shutdown stage 前（一次性）
+    std::function<void()> m_shutdown_barrier; // Shutdown stage 前（一次性）
     std::mutex m_write_ready_barrier_mutex;
-    std::function<void()> m_write_ready_barrier;  // 写泵持锁前（一次性）
+    std::function<void()> m_write_ready_barrier; // 写泵持锁前（一次性）
     std::mutex m_submit_barrier_mutex;
-    std::function<void()> m_submit_barrier;  // 私有 test 屏障（一次性）
+    std::function<void()> m_submit_barrier; // 私有 test 屏障（一次性）
     std::mutex m_connect_start_barrier_mutex;
-    std::function<void()> m_connect_start_barrier;  // 建连起点/封口检查前（一次性）
+    std::function<void()> m_connect_start_barrier; // 建连起点/封口检查前（一次性）
     std::mutex m_auth_barrier_mutex;
     std::function<void()> m_pre_auth_barrier;
     std::function<void()> m_post_auth_barrier;
     std::function<void()> m_read_append_hook;
-    std::function<void()> m_append_busy_hook;  // 私有 test：TryAppend Busy 后/deferred 前（正常为空）
+    std::function<void()> m_append_busy_hook; // 私有 test：TryAppend Busy 后/deferred 前（正常为空）
 };
 
 // owner 侧连接核心：唯一 fd、读/写泵与原始回调派发。
@@ -464,12 +504,12 @@ class ConnCore : public std::enable_shared_from_this<ConnCore> {
 public:
     ConnCore(std::shared_ptr<ConnectionState> state, TcpWait descriptor, Reactor* owner,
              std::shared_ptr<RawHandler> handler)
-        : m_state(std::move(state)),
-          m_desc(std::move(descriptor)),
-          m_owner(owner),
-          m_handler(std::move(handler)) {}
+        : m_state(std::move(state)), m_desc(std::move(descriptor)), m_owner(owner), m_handler(std::move(handler))
+    {
+    }
 
-    ~ConnCore() {
+    ~ConnCore()
+    {
         // 兜底收口：正常路径 ShutdownOwner/CancelControl 已关闭 backend 并标记
         // 释放；若核心仍带未关 fd 被析构（异常/收口竞态），这里显式关闭并标记，
         // 不把「released」留给 native 对象析构的隐式时序。
@@ -482,15 +522,28 @@ public:
         m_state->MarkOwnerReleased();
     }
 
-    const std::shared_ptr<ConnectionState>& State() const { return m_state; }
-    std::size_t RecvHold() const { return m_recv_hold.load(std::memory_order_acquire); }
-    bool Closed() const { return m_closed; }
-    int Fd() { return m_desc.native_handle(); }
+    const std::shared_ptr<ConnectionState>& State() const
+    {
+        return m_state;
+    }
+    std::size_t RecvHold() const
+    {
+        return m_recv_hold.load(std::memory_order_acquire);
+    }
+    bool Closed() const
+    {
+        return m_closed;
+    }
+    int Fd()
+    {
+        return m_desc.native_handle();
+    }
     std::atomic<bool> m_dirty_queued{false};
     ConnCore* m_dirty_next{nullptr};
     bool m_dirty_linked{false};
 
-    void StartOwner() {
+    void StartOwner()
+    {
         // recv/延迟追加都在读取前预留好存储，取走内核字节后不再首次分配。
         try {
             m_recv_buf = std::make_unique<char[]>(kReadChunk);
@@ -505,7 +558,8 @@ public:
         PumpOwner();
     }
 
-    void PumpOwner() {
+    void PumpOwner()
+    {
         if (m_closed) {
             return;
         }
@@ -536,13 +590,13 @@ public:
 
     // 关闭前把 m_recv_hold 以不取 ring 数据锁的方式转入 state 寿命的 detached；
     // 失败则保留 hold 并返回 false（调用者本次不关闭，等下一次推进重试）。
-    bool StageHoldToRing() {
+    bool StageHoldToRing()
+    {
         const std::size_t held = m_recv_hold.load(std::memory_order_acquire);
         if (held == 0) {
             return true;
         }
-        if (!m_state->ring.StageDetached(
-                std::string_view(m_recv_buf.get(), held))) {
+        if (!m_state->ring.StageDetached(std::string_view(m_recv_buf.get(), held))) {
             return false;
         }
         m_recv_hold.store(0, std::memory_order_release);
@@ -552,14 +606,15 @@ public:
     // owner：正常收口。分阶段幂等：stage hold → 关 backend → 发布读终态/结算写
     // → 逐项 OnWrite → 唯一 OnClose。中途异常可由下次进入从失败阶段继续，不因
     // 先标 closed/先擦表丢责任。
-    void ShutdownOwner(std::error_code reason) {
+    void ShutdownOwner(std::error_code reason)
+    {
         if (m_closed) {
             return;
         }
-        m_owner->InvokeShutdownBarrier();  // 测试：stage 之前
+        m_owner->InvokeShutdownBarrier(); // 测试：stage 之前
         if (!m_backend_closed) {
             if (!StageHoldToRing()) {
-                return;  // 不丢已 recv 字节；下次 owner 推进重试
+                return; // 不丢已 recv 字节；下次 owner 推进重试
             }
             boost::system::error_code ignored;
             m_desc.cancel(ignored);
@@ -567,16 +622,14 @@ public:
             m_backend_closed = true;
         }
         if (!m_ring_closed) {
-            m_state->MarkClosed(reason);  // hold 已在真源后才发布 EOF/结算写
+            m_state->MarkClosed(reason); // hold 已在真源后才发布 EOF/结算写
             m_ring_closed = true;
         }
         reason = m_state->CloseReason();
         DeliverTerminalOwner();
         if (m_handler && !m_onclose_done) {
             Connection connection(m_state);
-            m_owner->SafeHandler([this, connection, reason] {
-                m_handler->OnClose(connection, reason);
-            });
+            m_owner->SafeHandler([this, connection, reason] { m_handler->OnClose(connection, reason); });
             m_onclose_done = true;
         }
         m_closed = true;
@@ -586,13 +639,14 @@ public:
     }
 
     // 控制域（解绑后）：关闭 fd、冻结状态、唤醒内部等待者，不调用户回调。
-    void CancelControl() {
+    void CancelControl()
+    {
         if (m_closed) {
             return;
         }
         if (!m_backend_closed) {
             if (!StageHoldToRing()) {
-                return;  // 控制域失败也保留已 recv 字节，不静默丢
+                return; // 控制域失败也保留已 recv 字节，不静默丢
             }
             boost::system::error_code ignored;
             m_desc.cancel(ignored);
@@ -609,61 +663,62 @@ public:
     }
 
 private:
-    void ArmReadOwner() {
+    void ArmReadOwner()
+    {
         if (m_read_waiting || m_read_stopped || m_closed) {
             return;
         }
         m_read_waiting = true;
         auto self = shared_from_this();
-        m_desc.async_wait(TcpWait::wait_read,
-            [self](const boost::system::error_code& error) {
-                self->m_read_waiting = false;
-                if (self->m_closed) {
+        m_desc.async_wait(TcpWait::wait_read, [self](const boost::system::error_code& error) {
+            self->m_read_waiting = false;
+            if (self->m_closed) {
+                return;
+            }
+            if (error) {
+                if (error == asio::error::operation_aborted) {
                     return;
                 }
-                if (error) {
-                    if (error == asio::error::operation_aborted) {
-                        return;
-                    }
-                    self->m_read_stopped = true;
-                    self->m_state->ring.MarkError(FromBoost(error));
-                    self->NotifyReadOwner();
-                    return;
-                }
-                self->DoReadsOwner();
-                if (!self->m_read_paused && !self->m_read_stopped) {
-                    self->ArmReadOwner();
-                }
-            });
+                self->m_read_stopped = true;
+                self->m_state->ring.MarkError(FromBoost(error));
+                self->NotifyReadOwner();
+                return;
+            }
+            self->DoReadsOwner();
+            if (!self->m_read_paused && !self->m_read_stopped) {
+                self->ArmReadOwner();
+            }
+        });
     }
 
-    void ArmWriteOwner() {
+    void ArmWriteOwner()
+    {
         if (m_write_waiting || m_closed) {
             return;
         }
         m_write_waiting = true;
         auto self = shared_from_this();
-        m_desc.async_wait(TcpWait::wait_write,
-            [self](const boost::system::error_code& error) {
-                self->m_write_waiting = false;
-                if (self->m_closed) {
+        m_desc.async_wait(TcpWait::wait_write, [self](const boost::system::error_code& error) {
+            self->m_write_waiting = false;
+            if (self->m_closed) {
+                return;
+            }
+            if (error) {
+                if (error == asio::error::operation_aborted) {
                     return;
                 }
-                if (error) {
-                    if (error == asio::error::operation_aborted) {
-                        return;
-                    }
-                    self->ShutdownOwner(FromBoost(error));
-                    return;
-                }
-                self->m_owner->InvokeWriteReadyBarrier();  // 测试：readiness 写泵持锁之前
-                self->PumpWritesOwner();
-            });
+                self->ShutdownOwner(FromBoost(error));
+                return;
+            }
+            self->m_owner->InvokeWriteReadyBarrier(); // 测试：readiness 写泵持锁之前
+            self->PumpWritesOwner();
+        });
     }
 
     // 提交已取内核字节：TryAppend，Busy 走 AppendDeferred；均失败则保留在
     // m_recv_buf（m_recv_hold），下次 owner 推进重试，绝不再 recv 覆盖。
-    bool SubmitReceivedOwner(const char* data, std::size_t size) {
+    bool SubmitReceivedOwner(const char* data, std::size_t size)
+    {
         const std::string_view received(data, size);
         // TryAppend 在 grant→pop→append 交错下可能重新分配 backing；分配失败
         // 抛 bad_alloc 而非返回 error——异常必须与错误返回同责登记 m_recv_hold，
@@ -676,7 +731,7 @@ private:
             return false;
         }
         if (appended.status == ReadStatus::Busy) {
-            m_owner->InvokeAppendBusyHook();  // 测试：Busy 后/deferred 前（正常为空）
+            m_owner->InvokeAppendBusyHook(); // 测试：Busy 后/deferred 前（正常为空）
             if (!m_state->ring.AppendDeferred(received)) {
                 m_recv_hold.store(size, std::memory_order_release);
                 return false;
@@ -689,7 +744,8 @@ private:
         return true;
     }
 
-    void DoReadsOwner() {
+    void DoReadsOwner()
+    {
         if (m_closed || m_read_paused || m_read_stopped || !m_recv_buf) {
             return;
         }
@@ -697,7 +753,7 @@ private:
         const std::size_t held = m_recv_hold.load(std::memory_order_acquire);
         if (held > 0) {
             if (!SubmitReceivedOwner(m_recv_buf.get(), held)) {
-                return;  // 保护/容量仍不可用：字节仍可达，等下次推进
+                return; // 保护/容量仍不可用：字节仍可达，等下次推进
             }
             notified = true;
         }
@@ -710,10 +766,10 @@ private:
         }
         for (int i = 0; i < kReadBudget; ++i) {
             const std::size_t max_bytes = m_state->ring.MaxBytes();
-            const std::size_t used = m_state->ring.Size();  // 含 pending
+            const std::size_t used = m_state->ring.Size(); // 含 pending
             const std::size_t available = max_bytes > used ? max_bytes - used : 0;
             if (available == 0) {
-                m_read_paused = true;  // ring 满：消费释放后由 data 通知恢复
+                m_read_paused = true; // ring 满：消费释放后由 data 通知恢复
                 break;
             }
             const std::size_t want = std::min(kReadChunk, available);
@@ -725,16 +781,15 @@ private:
                 m_read_paused = true;
                 break;
             }
-            const ssize_t bytes = ::recv(m_desc.native_handle(), m_recv_buf.get(),
-                                         grant.granted, MSG_DONTWAIT);
+            const ssize_t bytes = ::recv(m_desc.native_handle(), m_recv_buf.get(), grant.granted, MSG_DONTWAIT);
             if (bytes > 0) {
-                m_owner->InvokeReadAppendHook();  // 测试：在 append 前取得保护
+                m_owner->InvokeReadAppendHook(); // 测试：在 append 前取得保护
                 if (!SubmitReceivedOwner(m_recv_buf.get(), static_cast<std::size_t>(bytes))) {
                     notified = true;
-                    break;  // 字节保留在 m_recv_buf，等保护/容量恢复后再提交
+                    break; // 字节保留在 m_recv_buf，等保护/容量恢复后再提交
                 }
                 notified = true;
-                // 本轮可能刚把字节放进 pending（append 时 Busy）。pending 是更早
+                // 可能刚把字节放进 pending（append 时 Busy）。pending 是更早
                 // 收到的数据，必须等消费者先合入，否则下一次 recv 的新字节会
                 // 落在它前面，读序被破坏。入口的同类检查只在循环外，够不着这里。
                 //
@@ -770,27 +825,28 @@ private:
         }
     }
 
-    void NotifyReadOwner() {
+    void NotifyReadOwner()
+    {
         if (!m_handler) {
             return;
         }
-        m_owner->InvokePreAuthBarrier();   // 测试：授权点之前
+        m_owner->InvokePreAuthBarrier(); // 测试：授权点之前
         // 普通用户回调开始授权点：与封口共同线性化的同一原子检查。返回 true
         // 即视为在途，短回调必须完成；此点之后不再有可撤销的无限推迟。
         if (m_owner->ImplSealed()) {
             return;
         }
-        m_owner->InvokePostAuthBarrier();  // 测试：已授权
+        m_owner->InvokePostAuthBarrier(); // 测试：已授权
         Connection connection(m_state);
         m_owner->SafeHandler([this, connection] { m_handler->OnRead(connection); });
     }
 
-    void PumpWritesOwner() {
+    void PumpWritesOwner()
+    {
         if (m_closed) {
             return;
         }
-        auto sink = [this](const std::string_view* views, std::size_t count,
-                           std::size_t budget) -> ssize_t {
+        auto sink = [this](const std::string_view* views, std::size_t count, std::size_t budget) -> ssize_t {
             return SendViewsRaw(m_desc.native_handle(), views, count, budget);
         };
         const auto result = m_state->PumpWrites(kWriteRounds, kWriteByteBudget, sink);
@@ -806,7 +862,8 @@ private:
         }
     }
 
-    void DeliverTerminalOwner() {
+    void DeliverTerminalOwner()
+    {
         // 逐项无分配弹出；每项独立隔离用户异常，不吞后续终态/OnClose。
         CompletedWrite item;
         while (m_state->TryPopTerminal(item)) {
@@ -828,7 +885,7 @@ private:
     bool m_write_waiting{false};
     bool m_read_paused{false};
     bool m_read_stopped{false};
-    bool m_closed{false};  // terminal done：OnWrite/OnClose 已兑现
+    bool m_closed{false}; // terminal done：OnWrite/OnClose 已兑现
     bool m_backend_closed{false};
     bool m_ring_closed{false};
     bool m_onclose_done{false};
@@ -837,7 +894,9 @@ private:
 };
 
 struct Listener {
-    explicit Listener(asio::io_context& context) : desc(context) {}
+    explicit Listener(asio::io_context& context) : desc(context)
+    {
+    }
     TcpWait desc;
     Address local;
     std::atomic<bool> armed{false};
@@ -856,13 +915,17 @@ struct HandoffReservation {
     bool counted{false};
     bool committed{false};
     ~HandoffReservation();
-    void Commit() { committed = true; }
+    void Commit()
+    {
+        committed = true;
+    }
 };
 
 struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
     explicit EngineImpl(std::shared_ptr<RawHandler> raw_handler)
-        : handler(std::move(raw_handler)),
-          service_sealed(std::make_shared<std::atomic<bool>>(false)) {}
+        : handler(std::move(raw_handler)), service_sealed(std::make_shared<std::atomic<bool>>(false))
+    {
+    }
 
     std::shared_ptr<RawHandler> handler;
     mutable std::mutex mutex;
@@ -876,7 +939,7 @@ struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
     std::exception_ptr control_failure;
 
     std::vector<DriverSlot> slots;
-    std::vector<DriverSlot> residual_slots;  // 解绑失败保留的责任
+    std::vector<DriverSlot> residual_slots; // 解绑失败保留的责任
     std::vector<std::shared_ptr<Reactor>> reactors;
     std::shared_ptr<Reactor> main_reactor;
     std::vector<std::shared_ptr<Reactor>> subs;
@@ -905,17 +968,17 @@ struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
     std::atomic<std::int64_t> connect_delivery_delay_ms{0};
     std::atomic<std::int64_t> connect_start_delay_ms{0};
     std::atomic<bool> cancel_retry_needed{false};
-    std::atomic<bool> cancel_post_fail_once{false};  // 私有 test 故障注入
+    std::atomic<bool> cancel_post_fail_once{false};   // 私有 test 故障注入
     std::atomic<bool> connect_post_fail_once{false};  // 私有 test：本 Engine 下一次 connect 提交不投递
     std::atomic<int> connect_wait_status_once{-1};    // 私有 test：下一次领取的等待返回值（-1 未武装）
     std::mutex connect_submit_barrier_mutex;          // 私有 test 屏障（一次性）
     std::function<void()> connect_submit_barrier;     // post 成功、写 out_id 之前
-    std::atomic<std::int64_t> seal_delay_ms{0};      // 私有 test 延迟
-    std::atomic<bool> seal_post_fail_once{false};  // 私有 test 故障注入
-    std::atomic<bool> seal_throw_once{false};      // 私有 test：seal handler 抛一次
-    std::atomic<bool> seal_error{false};           // seal handler 捕获到异常
-    std::atomic<bool> test_wait_driver_failed{false};  // 私有 test：等待期真实 Failed 谓词
-    std::atomic<std::int64_t> install_delay_ms{0}; // 私有 test：install owner 延迟
+    std::atomic<std::int64_t> seal_delay_ms{0};       // 私有 test 延迟
+    std::atomic<bool> seal_post_fail_once{false};     // 私有 test 故障注入
+    std::atomic<bool> seal_throw_once{false};         // 私有 test：seal handler 抛一次
+    std::atomic<bool> seal_error{false};              // seal handler 捕获到异常
+    std::atomic<bool> test_wait_driver_failed{false}; // 私有 test：等待期真实 Failed 谓词
+    std::atomic<std::int64_t> install_delay_ms{0};    // 私有 test：install owner 延迟
 
     std::mutex handoff_mutex;
     std::deque<Connection> handoff;
@@ -932,10 +995,10 @@ struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
         bool done{false};
         bool abandoned{false};
         bool waiter_attached{false};
-        bool raw_delivered{false};  // raw handler 已真实交付（不得再由 WaitConnect 领取）
-        bool receiver_claimed{false};  // 每个 op 只允许一个 WaitConnect 接收者
+        bool raw_delivered{false};    // raw handler 已真实交付（不得再由 WaitConnect 领取）
+        bool receiver_claimed{false}; // 每个 op 只允许一个 WaitConnect 接收者
         std::atomic<bool> cancel_requested{false};
-        bool owner_delivering{false};  // owner 已进入授权交付段（seal 不得抢先终态）
+        bool owner_delivering{false}; // owner 已进入授权交付段（seal 不得抢先终态）
         std::shared_ptr<Reactor> reactor;
         // 控制域兜底句柄：主标记沿 owner 捕获链在各真实 close 点置位；此处
         // 副本仅供 Run 收口/析构兜底在 owner 链路未执行时补标记（幂等）。
@@ -950,7 +1013,8 @@ struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
     std::atomic<std::size_t> handler_errors{0};
 
     // ---- service seal ----
-    void SealService() {
+    void SealService()
+    {
         if (service_sealed) {
             service_sealed->store(true, std::memory_order_release);
         }
@@ -958,7 +1022,7 @@ struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
         {
             std::lock_guard<std::mutex> lock(handoff_mutex);
             handoff_closed = true;
-            handoff_reserved = 0;  // 关闭对 queue 与 inflight 共同封口
+            handoff_reserved = 0; // 关闭对 queue 与 inflight 共同封口
             undelivered.swap(handoff);
         }
         for (auto& connection : undelivered) {
@@ -986,10 +1050,11 @@ struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
     }
 
     // ---- handoff reservation ----
-    std::shared_ptr<HandoffReservation> TryReserveHandoff() {
+    std::shared_ptr<HandoffReservation> TryReserveHandoff()
+    {
         std::lock_guard<std::mutex> lock(handoff_mutex);
         if (handoff_closed || IsSealed()) {
-            return nullptr;  // RequestClose/Seal 与 accept 共门
+            return nullptr; // RequestClose/Seal 与 accept 共门
         }
         if (!handoff_enabled) {
             auto reservation = std::make_shared<HandoffReservation>();
@@ -1006,7 +1071,8 @@ struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
         reservation->counted = true;
         return reservation;
     }
-    void ReleaseHandoffReservation() {
+    void ReleaseHandoffReservation()
+    {
         {
             std::lock_guard<std::mutex> lock(handoff_mutex);
             if (handoff_closed) {
@@ -1018,14 +1084,15 @@ struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
         }
         ResumeAcceptIfFree();
     }
-    bool CommitHandoff(Connection connection, const std::shared_ptr<HandoffReservation>& reservation) {
+    bool CommitHandoff(Connection connection, const std::shared_ptr<HandoffReservation>& reservation)
+    {
         {
             std::lock_guard<std::mutex> lock(handoff_mutex);
             if (!handoff_enabled || handoff_closed) {
                 return false;
             }
             if (reservation) {
-                reservation->committed = true;  // 只扣减一次
+                reservation->committed = true; // 只扣减一次
             }
             if (handoff_reserved > 0) {
                 --handoff_reserved;
@@ -1035,7 +1102,8 @@ struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
         accept_hub.NotifyAll();
         return true;
     }
-    void ResumeAcceptIfFree() {
+    void ResumeAcceptIfFree()
+    {
         std::shared_ptr<Reactor> main;
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -1055,14 +1123,16 @@ struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
         }
     }
 
-    std::shared_ptr<ConnectOp> FindConnect(std::uint64_t id) {
+    std::shared_ptr<ConnectOp> FindConnect(std::uint64_t id)
+    {
         std::lock_guard<std::mutex> lock(connect_mutex);
         const auto it = connects.find(id);
         return it == connects.end() ? nullptr : it->second;
     }
 
     // 同一 op 锁内仲裁「交付 / 回收」。返回是否已交付（raw 或等待者）。
-    bool ResolveConnect(std::uint64_t id, Connection connection, std::error_code error) {
+    bool ResolveConnect(std::uint64_t id, Connection connection, std::error_code error)
+    {
         auto op = FindConnect(id);
         if (!op) {
             if (connection.Valid()) {
@@ -1075,7 +1145,7 @@ struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
         {
             std::lock_guard<std::mutex> lock(op->mutex);
             if (op->done) {
-                // 等待者已超时/取消赢，本轮完成的连接无主 → 回收已交付 fd。
+                // 等待者已超时或已取消，本次完成的连接无人接收 → 回收已交付的 fd。
                 recycle = connection.Valid();
             } else if (op->abandoned && !op->waiter_attached && handler == nullptr) {
                 op->done = true;
@@ -1102,14 +1172,15 @@ struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
         return delivered;
     }
 
-    void MaybeEraseConnect(std::uint64_t id, const std::shared_ptr<ConnectOp>& op) {
+    void MaybeEraseConnect(std::uint64_t id, const std::shared_ptr<ConnectOp>& op)
+    {
         bool erase = false;
         {
             std::lock_guard<std::mutex> lock(op->mutex);
             // 未转移且未释放的记录必须留在表内，等控制域收尾兜底补标记；
             // 否则「lambda 未执行的提交」会随擦表丢失唯一可达的记录句柄。
             erase = op->done && !op->waiter_attached
-                && (!op->reclaim || op->reclaim->released.load(std::memory_order_acquire));
+                    && (!op->reclaim || op->reclaim->released.load(std::memory_order_acquire));
         }
         if (!erase) {
             return;
@@ -1117,7 +1188,7 @@ struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
         std::lock_guard<std::mutex> lock(connect_mutex);
         const auto it = connects.find(id);
         if (it != connects.end() && it->second == op) {
-            connects.erase(it);  // 完成且无人等待：释放活动登记
+            connects.erase(it); // 完成且无人等待：释放活动登记
         }
     }
 
@@ -1126,7 +1197,8 @@ struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
     // delivery holder 和连接 backend，不依赖异步捕获或 context 的最终析构。
     // 因此未转移的建连记录此刻已无真实 fd，才可补标记为释放；
     // 已完结且无人等待的表项随后正常擦除，保持活动登记语义不变。
-    void SettleAbandonedConnectReclaim() {
+    void SettleAbandonedConnectReclaim()
+    {
         std::lock_guard<std::mutex> lock(connect_mutex);
         for (auto it = connects.begin(); it != connects.end();) {
             auto& op = it->second;
@@ -1143,7 +1215,8 @@ struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
         }
     }
 
-    void RecordError(std::error_code error) {
+    void RecordError(std::error_code error)
+    {
         if (!error) {
             return;
         }
@@ -1152,30 +1225,36 @@ struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
             last_error = error;
         }
     }
-    void NoteHandlerError() {
+    void NoteHandlerError()
+    {
         // 用户原始回调异常：隔离并计数，不升级为 engine/ driver 故障，
         // 不影响其它终态/关闭回调兑现。
         handler_errors.fetch_add(1, std::memory_order_relaxed);
     }
-    std::size_t HandlerErrorCount() const {
+    std::size_t HandlerErrorCount() const
+    {
         return handler_errors.load(std::memory_order_relaxed);
     }
-    std::error_code LastError() const {
+    std::error_code LastError() const
+    {
         std::lock_guard<std::mutex> lock(error_mutex);
         return last_error;
     }
-    void RecordControlFailure(std::exception_ptr failure) {
+    void RecordControlFailure(std::exception_ptr failure)
+    {
         std::lock_guard<std::mutex> lock(error_mutex);
         if (!control_failure) {
             control_failure = std::move(failure);
         }
     }
-    std::exception_ptr LastFailure() const {
+    std::exception_ptr LastFailure() const
+    {
         std::lock_guard<std::mutex> lock(error_mutex);
         return control_failure;
     }
 
-    std::shared_ptr<Reactor> PickSub(const Address& peer) {
+    std::shared_ptr<Reactor> PickSub(const Address& peer)
+    {
         std::vector<std::shared_ptr<Reactor>> snapshot;
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -1199,42 +1278,51 @@ struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
         }
         return snapshot[next_conn_id.load() % snapshot.size()];
     }
-    bool IsSealed() const {
+    bool IsSealed() const
+    {
         return service_sealed && service_sealed->load(std::memory_order_acquire);
     }
 
     // 仅在 owner 物理关闭全部本代 listener，或控制域同代同步解绑后确认无
     // listener 时置位；幂等、可重入，并唤醒 AcceptingStopped 观测者。
-    void TryPostAcceptStop(const std::shared_ptr<Reactor>& main) {
-        if (accept_stop_done.load(std::memory_order_acquire) ||
-            accept_stop_posted.exchange(true, std::memory_order_acq_rel)) { return; }
+    void TryPostAcceptStop(const std::shared_ptr<Reactor>& main)
+    {
+        if (accept_stop_done.load(std::memory_order_acquire)
+            || accept_stop_posted.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
         const bool inject_failure = accept_stop_post_fail_once.exchange(false);
         if (inject_failure || !main->TryPostInternal([main] { main->StopAcceptingOnOwner(); })) {
-            if (inject_failure && accept_stop_failure_hook) { accept_stop_failure_hook(); }
+            if (inject_failure && accept_stop_failure_hook) {
+                accept_stop_failure_hook();
+            }
             // post 拒绝不等于 fd 已关闭；保留持久请求，由控制循环再交。
             accept_stop_posted.store(false, std::memory_order_release);
         }
     }
 
-    void MarkAcceptStopDone() {
+    void MarkAcceptStopDone()
+    {
         accept_stop_done.store(true, std::memory_order_release);
         std::lock_guard<std::mutex> lock(mutex);
         control_cv.notify_all();
     }
 };
 
-void DetailNoteHandlerError(EngineImpl* impl) {
+void DetailNoteHandlerError(EngineImpl* impl)
+{
     impl->NoteHandlerError();
 }
 
-HandoffReservation::~HandoffReservation() {
+HandoffReservation::~HandoffReservation()
+{
     if (impl != nullptr && counted && !committed) {
         impl->ReleaseHandoffReservation();
     }
 }
 
-template <class Handler>
-bool Reactor::TryPostInternal(Handler&& handler) {
+template <class Handler> bool Reactor::TryPostInternal(Handler&& handler)
+{
     // 提交资格与 driver 租约同一窄门：持锁跨 post，ReleaseDriver 只能在
     // post 完成后 reset，已接纳命令必进入封口前的 context 队列。
     std::lock_guard<std::mutex> lock(m_driver_mutex);
@@ -1249,15 +1337,15 @@ bool Reactor::TryPostInternal(Handler&& handler) {
     }
 }
 
-template <class Handler>
-bool Reactor::TryPost(Handler&& handler) {
+template <class Handler> bool Reactor::TryPost(Handler&& handler)
+{
     // 提交门：持 driver 租约跨 sealed 检查与 post，使「资格→入队」与
     // ReleaseDriver 的 reset 线性化。hold 只覆盖一次短 post（Asio do_run_one
     // 在 complete 前解锁，不构成 scheduler 反序死锁），
     // 不会跨同步解绑：ReleaseDriver 等该锁，post 返回即释放。
     std::lock_guard<std::mutex> lock(m_driver_mutex);
     if (m_sealed.load() || m_impl->IsSealed() || !m_driver) {
-        return false;  // 封口后/已解绑：零接纳
+        return false; // 封口后/已解绑：零接纳
     }
     {
         std::function<void()> barrier;
@@ -1267,7 +1355,7 @@ bool Reactor::TryPost(Handler&& handler) {
             m_submit_barrier = {};
         }
         if (barrier) {
-            barrier();  // 测试屏障：已取得提交资格、尚未 post（仍持 driver 锁）
+            barrier(); // 测试屏障：已取得提交资格、尚未 post（仍持 driver 锁）
         }
     }
     try {
@@ -1281,18 +1369,28 @@ bool Reactor::TryPost(Handler&& handler) {
 // ---- Reactor definitions ----
 
 Reactor::Reactor(EngineImpl* impl, std::size_t index, std::shared_ptr<ReactorDriver> driver)
-    : m_impl(impl), m_index(index), m_driver(std::move(driver)) {}
+    : m_impl(impl), m_index(index), m_driver(std::move(driver))
+{
+}
 
 Reactor::~Reactor() = default;
 
-bool Reactor::ImplSealed() const { return m_impl->IsSealed(); }
-std::size_t Reactor::ConnCount() {
+bool Reactor::ImplSealed() const
+{
+    return m_impl->IsSealed();
+}
+std::size_t Reactor::ConnCount()
+{
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_conns.size();
 }
-std::size_t Reactor::ReadLowWater() const { return m_impl->max_inbound_bytes / 2; }
+std::size_t Reactor::ReadLowWater() const
+{
+    return m_impl->max_inbound_bytes / 2;
+}
 
-std::error_code Reactor::InstallOnOwner(const std::vector<Address>& addresses) {
+std::error_code Reactor::InstallOnOwner(const std::vector<Address>& addresses)
+{
     const auto install_delay = m_impl->install_delay_ms.load();
     if (install_delay > 0) {
         timespec ts{};
@@ -1366,9 +1464,10 @@ std::error_code Reactor::InstallOnOwner(const std::vector<Address>& addresses) {
     }
     ArmAcceptAll();
     return {};
-    }
+}
 
-std::vector<Address> Reactor::LocalAddresses() const {
+std::vector<Address> Reactor::LocalAddresses() const
+{
     std::vector<Address> out;
     out.reserve(m_listeners.size());
     for (const auto& listener : m_listeners) {
@@ -1377,20 +1476,22 @@ std::vector<Address> Reactor::LocalAddresses() const {
     return out;
 }
 
-void Reactor::ArmAcceptAll() {
+void Reactor::ArmAcceptAll()
+{
     if (!m_installed.load() || m_sealed.load() || m_impl->IsSealed()
         || m_impl->accept_stop_requested.load(std::memory_order_acquire)) {
-        return;  // 接收域已独立封口：不再重挂监听
+        return; // 接收域已独立封口：不再重挂监听
     }
     for (auto& listener : m_listeners) {
         ArmAccept(listener);
     }
 }
 
-void Reactor::ArmAccept(const std::shared_ptr<Listener>& listener) {
+void Reactor::ArmAccept(const std::shared_ptr<Listener>& listener)
+{
     if (!m_installed.load() || m_sealed.load() || m_impl->IsSealed()
         || m_impl->accept_stop_requested.load(std::memory_order_acquire)) {
-        return;  // 封口后不再 arm，释放的预留由 Reservation 析构回收
+        return; // 封口后不再 arm，释放的预留由 Reservation 析构回收
     }
     bool expected = false;
     if (!listener->armed.compare_exchange_strong(expected, true)) {
@@ -1404,32 +1505,32 @@ void Reactor::ArmAccept(const std::shared_ptr<Listener>& listener) {
     }
     auto self = shared_from_this();
     listener->desc.async_wait(TcpWait::wait_read,
-        [self, listener, reservation](const boost::system::error_code& error) mutable {
-            listener->armed.store(false);
-            if (error) {
-                if (error != asio::error::operation_aborted) {
-                    self->RecordAcceptError(FromBoost(error));
-                }
-                return;
-            }
-            self->DoAccept(listener, std::move(reservation));
-        });
+                              [self, listener, reservation](const boost::system::error_code& error) mutable {
+                                  listener->armed.store(false);
+                                  if (error) {
+                                      if (error != asio::error::operation_aborted) {
+                                          self->RecordAcceptError(FromBoost(error));
+                                      }
+                                      return;
+                                  }
+                                  self->DoAccept(listener, std::move(reservation));
+                              });
 }
 
-void Reactor::DoAccept(const std::shared_ptr<Listener>& listener,
-                       std::shared_ptr<HandoffReservation> reservation) {
+void Reactor::DoAccept(const std::shared_ptr<Listener>& listener, std::shared_ptr<HandoffReservation> reservation)
+{
     if (m_sealed.load() || !m_installed.load() || m_impl->IsSealed()) {
         return;
     }
     sockaddr_storage storage{};
     socklen_t length = sizeof(storage);
     // 每次只接纳一个：等 sub 完成登记后再重挂 main（LB 看到真实活跃数）。
-    const int fd = static_cast<int>(::syscall(SYS_accept4, listener->desc.native_handle(),
-                                              reinterpret_cast<sockaddr*>(&storage), &length,
-                                              SOCK_NONBLOCK | SOCK_CLOEXEC));
+    const int fd =
+        static_cast<int>(::syscall(SYS_accept4, listener->desc.native_handle(), reinterpret_cast<sockaddr*>(&storage),
+                                   &length, SOCK_NONBLOCK | SOCK_CLOEXEC));
     if (fd < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            ArmAccept(listener);  // 虚假就绪：释放预留后重挂（封口后 ArmAccept 不再重挂）
+            ArmAccept(listener); // 虚假就绪：释放预留后重挂（封口后 ArmAccept 不再重挂）
             return;
         }
         if (errno == EINTR) {
@@ -1454,19 +1555,20 @@ void Reactor::DoAccept(const std::shared_ptr<Listener>& listener,
             target->AdoptFdOnOwner(std::move(handle), /*is_connect=*/false, 0, reservation);
         })) {
         m_impl->RecordError(std::make_error_code(std::errc::not_enough_memory));
-        ResumeMainAccept();  // post 失败：本次未移交，立即恢复接纳
+        ResumeMainAccept(); // post 失败：本次未移交，立即恢复接纳
     }
     // 成功路径由 sub 在 ConnCount 更新后 ResumeMainAccept() 重挂（串行化）。
 }
 
-void Reactor::RecordAcceptError(std::error_code error) {
+void Reactor::RecordAcceptError(std::error_code error)
+{
     m_impl->RecordError(error);
 }
 
 void Reactor::AdoptFdOnOwner(FdHandle fd, bool is_connect, std::uint64_t connect_id,
-                             std::shared_ptr<HandoffReservation> reservation,
-                             bool delayed_delivery,
-                             const std::shared_ptr<ReclaimRecord>& reclaim) {
+                             std::shared_ptr<HandoffReservation> reservation, bool delayed_delivery,
+                             const std::shared_ptr<ReclaimRecord>& reclaim)
+{
     if (m_sealed.load() || m_impl->IsSealed() || fd.Get() < 0) {
         if (is_connect) {
             const auto error = std::make_error_code(std::errc::operation_canceled);
@@ -1475,16 +1577,14 @@ void Reactor::AdoptFdOnOwner(FdHandle fd, bool is_connect, std::uint64_t connect
             fd.Close();
             MarkReclaimReleased(reclaim);
             if (m_impl->handler) {
-                SafeHandler([this, connect_id, error] {
-                    m_impl->handler->OnConnect(Connection(), error, connect_id);
-                });
+                SafeHandler([this, connect_id, error] { m_impl->handler->OnConnect(Connection(), error, connect_id); });
             }
             m_impl->ResolveConnect(connect_id, Connection(), error);
             FinishConnectCallback();
         } else {
             ResumeMainAccept();
         }
-        return;  // fd 已显式关闭或从未持有；reservation 析构释放
+        return; // fd 已显式关闭或从未持有；reservation 析构释放
     }
     if (is_connect && !delayed_delivery) {
         const auto delay_ms = m_impl->connect_delivery_delay_ms.load();
@@ -1494,11 +1594,9 @@ void Reactor::AdoptFdOnOwner(FdHandle fd, bool is_connect, std::uint64_t connect
             // holder 同行，取消/失败关闭 fd 后仍可标记释放（不依赖 op 查表）。
             auto holder = std::make_shared<FdHandle>(std::move(fd));
             m_delivery_fds.push_back(holder);
-            auto timer = std::make_shared<asio::steady_timer>(
-                Ctx(), std::chrono::milliseconds(delay_ms));
+            auto timer = std::make_shared<asio::steady_timer>(Ctx(), std::chrono::milliseconds(delay_ms));
             auto self = shared_from_this();
-            timer->async_wait([self, timer, holder, connect_id, reclaim](
-                                  const boost::system::error_code& error) {
+            timer->async_wait([self, timer, holder, connect_id, reclaim](const boost::system::error_code& error) {
                 auto& held = self->m_delivery_fds;
                 held.erase(std::remove(held.begin(), held.end(), holder), held.end());
                 if (error) {
@@ -1536,7 +1634,7 @@ void Reactor::AdoptFdOnOwner(FdHandle fd, bool is_connect, std::uint64_t connect
     descriptor.non_blocking(true, boost_error);
     if (boost_error) {
         boost::system::error_code close_ignored;
-        descriptor.close(close_ignored);  // 真实 close 点；RecordError 仍用原错误
+        descriptor.close(close_ignored); // 真实 close 点；RecordError 仍用原错误
         m_impl->RecordError(FromBoost(boost_error));
         if (is_connect) {
             MarkReclaimReleased(reclaim);
@@ -1556,12 +1654,9 @@ void Reactor::AdoptFdOnOwner(FdHandle fd, bool is_connect, std::uint64_t connect
     const std::uint64_t id = m_impl->next_conn_id.fetch_add(1, std::memory_order_relaxed);
     // 责任转交：带句柄 CoDial 的记录原样随连接转入 owner 责任（不提前标释放）；
     // accept/raw 连接另建活跃记录供 Connection::Released() 观察。
-    auto owner_record = reclaim ? reclaim
-                                : std::make_shared<ReclaimRecord>(false);
-    auto state = std::make_shared<ConnectionState>(id, m_impl->max_inbound_bytes,
-                                                   m_impl->max_outbound_bytes,
-                                                   m_impl->max_ops, m_impl->service_sealed,
-                                                   std::move(owner_record));
+    auto owner_record = reclaim ? reclaim : std::make_shared<ReclaimRecord>(false);
+    auto state = std::make_shared<ConnectionState>(id, m_impl->max_inbound_bytes, m_impl->max_outbound_bytes,
+                                                   m_impl->max_ops, m_impl->service_sealed, std::move(owner_record));
     auto core = std::make_shared<ConnCore>(state, std::move(descriptor), this, m_impl->handler);
     std::weak_ptr<Reactor> weak_self = weak_from_this();
     std::weak_ptr<ConnCore> weak_core = core;
@@ -1573,7 +1668,7 @@ void Reactor::AdoptFdOnOwner(FdHandle fd, bool is_connect, std::uint64_t connect
         }
     };
     state->owner_dirty = mark_dirty;
-    state->ring.SetOwnerWake(mark_dirty);  // 消费释放容量/终态也唤醒 owner 恢复读
+    state->ring.SetOwnerWake(mark_dirty); // 消费释放容量/终态也唤醒 owner 恢复读
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_conns.emplace(id, core);
@@ -1584,7 +1679,7 @@ void Reactor::AdoptFdOnOwner(FdHandle fd, bool is_connect, std::uint64_t connect
     if (is_connect) {
         if (auto pending_op = m_impl->FindConnect(connect_id)) {
             std::lock_guard<std::mutex> lock(pending_op->mutex);
-            pending_op->owner_delivering = true;  // 授权交付段开始，seal 让位
+            pending_op->owner_delivering = true; // 授权交付段开始，seal 让位
             // 责任已随连接转入 state（released 由连接收口标记）：清除 op 侧
             // 兜底副本，让 op 按既有条件正常擦表，不影响连接期观察。
             pending_op->reclaim = nullptr;
@@ -1594,9 +1689,8 @@ void Reactor::AdoptFdOnOwner(FdHandle fd, bool is_connect, std::uint64_t connect
         if (m_impl->IsSealed()) {
             const auto canceled = std::make_error_code(std::errc::operation_canceled);
             if (m_impl->handler) {
-                SafeHandler([this, connect_id, canceled] {
-                    m_impl->handler->OnConnect(Connection(), canceled, connect_id);
-                });
+                SafeHandler(
+                    [this, connect_id, canceled] { m_impl->handler->OnConnect(Connection(), canceled, connect_id); });
             }
             m_impl->ResolveConnect(connect_id, Connection(), canceled);
             core->CancelControl();
@@ -1611,9 +1705,7 @@ void Reactor::AdoptFdOnOwner(FdHandle fd, bool is_connect, std::uint64_t connect
             return;
         }
         if (m_impl->handler) {
-            SafeHandler([this, connection, connect_id] {
-                m_impl->handler->OnConnect(connection, {}, connect_id);
-            });
+            SafeHandler([this, connection, connect_id] { m_impl->handler->OnConnect(connection, {}, connect_id); });
         }
         FinishConnectCallback();
     } else {
@@ -1651,18 +1743,18 @@ void Reactor::AdoptFdOnOwner(FdHandle fd, bool is_connect, std::uint64_t connect
 }
 
 void Reactor::BeginConnectOnOwner(const Address& address, std::uint64_t connect_id,
-                                  const std::shared_ptr<ReclaimRecord>& reclaim) {
+                                  const std::shared_ptr<ReclaimRecord>& reclaim)
+{
     if (m_sealed.load() || m_impl->IsSealed()) {
         // 尚未创建任何 fd：本次责任即时收口。
         MarkReclaimReleased(reclaim);
         if (m_impl->handler) {
             SafeHandler([this, connect_id] {
-                m_impl->handler->OnConnect(Connection(),
-                    std::make_error_code(std::errc::operation_canceled), connect_id);
+                m_impl->handler->OnConnect(Connection(), std::make_error_code(std::errc::operation_canceled),
+                                           connect_id);
             });
         }
-        m_impl->ResolveConnect(connect_id, Connection(),
-                               std::make_error_code(std::errc::operation_canceled));
+        m_impl->ResolveConnect(connect_id, Connection(), std::make_error_code(std::errc::operation_canceled));
         return;
     }
     const auto start_delay = m_impl->connect_start_delay_ms.load();
@@ -1670,14 +1762,12 @@ void Reactor::BeginConnectOnOwner(const Address& address, std::uint64_t connect_
         // 私有 test 屏障：占位 pending（尚未建 socket），取消/封口可及时撤销。
         auto pending = std::make_shared<ConnectPending>();
         pending->connect_id = connect_id;
-        auto timer = std::make_shared<asio::steady_timer>(
-            Ctx(), std::chrono::milliseconds(start_delay));
+        auto timer = std::make_shared<asio::steady_timer>(Ctx(), std::chrono::milliseconds(start_delay));
         pending->start_timer = timer;
         m_pending_connects.push_back(pending);
         auto self = shared_from_this();
         ++m_pending_connect_callbacks;
-        timer->async_wait([self, pending, connect_id, address, reclaim](
-                              const boost::system::error_code& error) {
+        timer->async_wait([self, pending, connect_id, address, reclaim](const boost::system::error_code& error) {
             auto& list = self->m_pending_connects;
             list.erase(std::remove(list.begin(), list.end(), pending), list.end());
             if (error && error != asio::error::operation_aborted) {
@@ -1715,19 +1805,19 @@ void Reactor::BeginConnectOnOwner(const Address& address, std::uint64_t connect_
 }
 
 void Reactor::StartConnectSocketOnOwner(const Address& address, std::uint64_t connect_id,
-                                        const std::shared_ptr<ReclaimRecord>& reclaim) {
-    InvokeConnectStartBarrier();  // 测试：已在起点、尚未做最终封口检查
+                                        const std::shared_ptr<ReclaimRecord>& reclaim)
+{
+    InvokeConnectStartBarrier(); // 测试：已在起点、尚未做最终封口检查
     if (m_sealed.load() || m_impl->IsSealed()) {
         // 未创建 fd：责任即时收口。
         MarkReclaimReleased(reclaim);
         if (m_impl->handler) {
             SafeHandler([this, connect_id] {
-                m_impl->handler->OnConnect(Connection(),
-                    std::make_error_code(std::errc::operation_canceled), connect_id);
+                m_impl->handler->OnConnect(Connection(), std::make_error_code(std::errc::operation_canceled),
+                                           connect_id);
             });
         }
-        m_impl->ResolveConnect(connect_id, Connection(),
-                               std::make_error_code(std::errc::operation_canceled));
+        m_impl->ResolveConnect(connect_id, Connection(), std::make_error_code(std::errc::operation_canceled));
         // 两个调用方（定时器路径与直通路径）都已先占用一次 pending connect
         // 回调预算；本路径从未登记 pending 描述符，seal 只能等预算归零，
         // 因此必须在此归还，否则 SealServiceOnOwner 永久 defer、Run 收口
@@ -1754,9 +1844,7 @@ void Reactor::StartConnectSocketOnOwner(const Address& address, std::uint64_t co
         (void)socket.Close();
         MarkReclaimReleased(reclaim);
         if (m_impl->handler) {
-            SafeHandler([this, connect_id, error] {
-                m_impl->handler->OnConnect(Connection(), error, connect_id);
-            });
+            SafeHandler([this, connect_id, error] { m_impl->handler->OnConnect(Connection(), error, connect_id); });
         }
         m_impl->ResolveConnect(connect_id, Connection(), error);
         FinishConnectCallback();
@@ -1767,7 +1855,7 @@ void Reactor::StartConnectSocketOnOwner(const Address& address, std::uint64_t co
     boost::system::error_code boost_error;
     descriptor->assign(fd, boost_error);
     if (boost_error) {
-        ::close(fd);  // assign 失败：descriptor 未取得所有权，此处是真实 close 点
+        ::close(fd); // assign 失败：descriptor 未取得所有权，此处是真实 close 点
         MarkReclaimReleased(reclaim);
         if (m_impl->handler) {
             SafeHandler([this, connect_id, boost_error] {
@@ -1785,8 +1873,8 @@ void Reactor::StartConnectSocketOnOwner(const Address& address, std::uint64_t co
     m_pending_connects.push_back(pending);
     auto self = shared_from_this();
     try {
-        descriptor->async_wait(TcpWait::wait_write,
-        [self, descriptor, pending, connect_id, reclaim](const boost::system::error_code& wait_error) {
+        descriptor->async_wait(TcpWait::wait_write, [self, descriptor, pending, connect_id,
+                                                     reclaim](const boost::system::error_code& wait_error) {
             // 从 pending 列表移除。
             auto& list = self->m_pending_connects;
             list.erase(std::remove(list.begin(), list.end(), pending), list.end());
@@ -1798,8 +1886,8 @@ void Reactor::StartConnectSocketOnOwner(const Address& address, std::uint64_t co
                 MarkReclaimReleased(reclaim);
                 if (self->m_impl->handler) {
                     self->SafeHandler([self, connect_id] {
-                        self->m_impl->handler->OnConnect(Connection(),
-                            std::make_error_code(std::errc::operation_canceled), connect_id);
+                        self->m_impl->handler->OnConnect(
+                            Connection(), std::make_error_code(std::errc::operation_canceled), connect_id);
                     });
                 }
                 self->m_impl->ResolveConnect(connect_id, Connection(),
@@ -1851,15 +1939,14 @@ void Reactor::StartConnectSocketOnOwner(const Address& address, std::uint64_t co
         FinishConnectCallback();
         const auto error = std::make_error_code(std::errc::not_enough_memory);
         if (m_impl->handler) {
-            SafeHandler([this, connect_id, error] {
-                m_impl->handler->OnConnect(Connection(), error, connect_id);
-            });
+            SafeHandler([this, connect_id, error] { m_impl->handler->OnConnect(Connection(), error, connect_id); });
         }
         m_impl->ResolveConnect(connect_id, Connection(), error);
     }
 }
 
-void Reactor::MarkDirty(const std::shared_ptr<ConnCore>& core) {
+void Reactor::MarkDirty(const std::shared_ptr<ConnCore>& core)
+{
     if (!core || m_sealed.load() || m_impl->IsSealed()) {
         return;
     }
@@ -1875,7 +1962,7 @@ void Reactor::MarkDirty(const std::shared_ptr<ConnCore>& core) {
             m_dirty_barrier = {};
         }
         if (barrier) {
-            barrier();  // 测试屏障：weak-lock 之后、登记/入链之前
+            barrier(); // 测试屏障：weak-lock 之后、登记/入链之前
         }
     }
     {
@@ -1891,7 +1978,7 @@ void Reactor::MarkDirty(const std::shared_ptr<ConnCore>& core) {
             std::lock_guard<std::mutex> reg_lock(m_mutex);
             if (m_conns.find(core->State()->m_id) == m_conns.end()) {
                 core->m_dirty_queued.store(false);
-                return;  // 已撤销登记：明确拒绝晚 Wake
+                return; // 已撤销登记：明确拒绝晚 Wake
             }
             core->m_dirty_next = nullptr;
             if (m_dirty_tail != nullptr) {
@@ -1911,7 +1998,8 @@ void Reactor::MarkDirty(const std::shared_ptr<ConnCore>& core) {
     }
 }
 
-void Reactor::PumpOwner() {
+void Reactor::PumpOwner()
+{
     if (!m_installed.load()) {
         return;
     }
@@ -1956,7 +2044,8 @@ void Reactor::PumpOwner() {
     }
 }
 
-void Reactor::PumpAllConnsOwner() {
+void Reactor::PumpAllConnsOwner()
+{
     std::vector<std::shared_ptr<ConnCore>> conns;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -1972,7 +2061,8 @@ void Reactor::PumpAllConnsOwner() {
     }
 }
 
-void Reactor::RemoveConn(const std::shared_ptr<ConnCore>& core) {
+void Reactor::RemoveConn(const std::shared_ptr<ConnCore>& core)
+{
     if (!core) {
         return;
     }
@@ -2005,7 +2095,7 @@ void Reactor::RemoveConn(const std::shared_ptr<ConnCore>& core) {
         }
         core->m_dirty_queued.store(false);
         std::lock_guard<std::mutex> reg_lock(m_mutex);
-        InvokeRemoveBarrier();  // 测试：撤链后、擦表前（仍持 dirty+registry）
+        InvokeRemoveBarrier(); // 测试：撤链后、擦表前（仍持 dirty+registry）
         removed = m_conns.erase(id) != 0;
     }
     if (removed && m_impl->conn_count.load() > 0) {
@@ -2013,7 +2103,8 @@ void Reactor::RemoveConn(const std::shared_ptr<ConnCore>& core) {
     }
 }
 
-void Reactor::FinishConnectCallback() {
+void Reactor::FinishConnectCallback()
+{
     if (m_pending_connect_callbacks == 0) {
         return;
     }
@@ -2021,11 +2112,12 @@ void Reactor::FinishConnectCallback() {
     if (m_pending_connect_callbacks == 0 && m_on_pending_zero) {
         auto done = std::move(m_on_pending_zero);
         m_on_pending_zero = nullptr;
-        done();  // 最后一个 pending connect 终态已在原 owner 兑现
+        done(); // 最后一个 pending connect 终态已在原 owner 兑现
     }
 }
 
-void Reactor::SealServiceOnOwner(std::function<void()> on_done) {
+void Reactor::SealServiceOnOwner(std::function<void()> on_done)
+{
     const auto seal_delay = m_impl->seal_delay_ms.load();
     if (seal_delay > 0) {
         // owner 线程在 coroutine hook 覆盖下，用原始 nanosleep 避免 hook 断言。
@@ -2078,7 +2170,7 @@ void Reactor::SealServiceOnOwner(std::function<void()> on_done) {
         }
         core->ShutdownOwner(std::make_error_code(std::errc::operation_canceled));
         if (!core->Closed()) {
-            break;  // 责任未完成：保留 registry，下次 seal 重试
+            break; // 责任未完成：保留 registry，下次 seal 重试
         }
         {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -2102,7 +2194,8 @@ void Reactor::SealServiceOnOwner(std::function<void()> on_done) {
     }
 }
 
-void Reactor::StopAcceptingOnOwner() {
+void Reactor::StopAcceptingOnOwner()
+{
     // 接收域独立封口：撤该 owner 的全部 listener 并物理关闭 fd。cancel 先让
     // pending async_wait 以 operation_aborted 返回（arm 时已复位 armed，不再
     // 重挂），close 即物理停用；失败不抛，fd 关闭责任在此兑现。
@@ -2118,7 +2211,8 @@ void Reactor::StopAcceptingOnOwner() {
     m_impl->MarkAcceptStopDone();
 }
 
-void Reactor::FinalizeControl() {
+void Reactor::FinalizeControl()
+{
     {
         // 先解除 dirty 链（不分配），再关闭/清空 conns，避免裸链节点悬空。
         std::lock_guard<std::mutex> lock(m_dirty_mutex);
@@ -2146,10 +2240,14 @@ void Reactor::FinalizeControl() {
     for (auto& pending : m_pending_connects) {
         pending->canceled = true;
         // start_timer 此时尚无 fd；owner 已解绑，不靠其取消或析构证明回收。
-        if (pending->desc) { pending->desc->close(ignored); }
+        if (pending->desc) {
+            pending->desc->close(ignored);
+        }
     }
     m_pending_connects.clear();
-    for (auto& holder : m_delivery_fds) { holder->Close(); }
+    for (auto& holder : m_delivery_fds) {
+        holder->Close();
+    }
     m_delivery_fds.clear();
     std::vector<std::shared_ptr<ConnCore>> snapshot;
     {
@@ -2165,14 +2263,15 @@ void Reactor::FinalizeControl() {
     m_impl->conn_count.store(0);
 }
 
-void Reactor::ReleaseDriver() {
+void Reactor::ReleaseDriver()
+{
     // 必须在 FinalizeControl 之后、解绑成功之后调用；此后不再访问 context。
     std::lock_guard<std::mutex> lock(m_driver_mutex);
     m_driver.reset();
 }
 
-
-void Reactor::CancelConnectOnOwner(std::uint64_t connect_id) {
+void Reactor::CancelConnectOnOwner(std::uint64_t connect_id)
+{
     for (auto& pending : m_pending_connects) {
         if (pending->connect_id == connect_id) {
             pending->canceled = true;
@@ -2188,7 +2287,8 @@ void Reactor::CancelConnectOnOwner(std::uint64_t connect_id) {
     }
 }
 
-void Reactor::CancelAllRequestedOnOwner() {
+void Reactor::CancelAllRequestedOnOwner()
+{
     for (auto& pending : m_pending_connects) {
         auto op = m_impl->FindConnect(pending->connect_id);
         if (!op || !op->cancel_requested.load()) {
@@ -2205,7 +2305,8 @@ void Reactor::CancelAllRequestedOnOwner() {
     }
 }
 
-void Reactor::ResumeMainAccept() {
+void Reactor::ResumeMainAccept()
+{
     std::shared_ptr<Reactor> main;
     {
         std::lock_guard<std::mutex> lock(m_impl->mutex);
@@ -2216,7 +2317,8 @@ void Reactor::ResumeMainAccept() {
     }
 }
 
-std::size_t Reactor::RecvHoldBytes() {
+std::size_t Reactor::RecvHoldBytes()
+{
     std::lock_guard<std::mutex> lock(m_mutex);
     std::size_t total = 0;
     for (auto& entry : m_conns) {
@@ -2225,7 +2327,8 @@ std::size_t Reactor::RecvHoldBytes() {
     return total;
 }
 
-std::size_t Reactor::DirtyCount() {
+std::size_t Reactor::DirtyCount()
+{
     std::lock_guard<std::mutex> lock(m_dirty_mutex);
     std::size_t count = 0;
     for (ConnCore* node = m_dirty_head; node != nullptr; node = node->m_dirty_next) {
@@ -2234,7 +2337,8 @@ std::size_t Reactor::DirtyCount() {
     return count;
 }
 
-int Reactor::FirstConnFd() {
+int Reactor::FirstConnFd()
+{
     std::lock_guard<std::mutex> lock(m_mutex);
     for (auto& entry : m_conns) {
         return entry.second->Fd();
@@ -2242,13 +2346,14 @@ int Reactor::FirstConnFd() {
     return -1;
 }
 
-
 // ---- Engine ----
 
-Engine::Engine(std::shared_ptr<RawHandler> handler)
-    : m_impl(std::make_shared<EngineImpl>(std::move(handler))) {}
+Engine::Engine(std::shared_ptr<RawHandler> handler) : m_impl(std::make_shared<EngineImpl>(std::move(handler)))
+{
+}
 
-Engine::~Engine() {
+Engine::~Engine()
+{
     // 合法控制域上的最后兜底：Run 因解绑失败保留 Closing 时，析构前再尝试
     // 同代同步解绑 + 冻结收口；成功才释放责任，失败则无 reaper 可再保证。
     auto impl = m_impl;
@@ -2298,7 +2403,8 @@ Engine::~Engine() {
     }
 }
 
-void Engine::RequestClose() noexcept {
+void Engine::RequestClose() noexcept
+{
     auto impl = m_impl;
     if (!impl) {
         return;
@@ -2314,7 +2420,8 @@ void Engine::RequestClose() noexcept {
     }
 }
 
-void Engine::RequestStopAccepting() noexcept {
+void Engine::RequestStopAccepting() noexcept
+{
     auto impl = m_impl;
     if (!impl) {
         return;
@@ -2335,7 +2442,9 @@ void Engine::RequestStopAccepting() noexcept {
             Connection connection;
             {
                 std::lock_guard<std::mutex> lock(impl->handoff_mutex);
-                if (impl->handoff.empty()) { break; }
+                if (impl->handoff.empty()) {
+                    break;
+                }
                 connection = std::move(impl->handoff.front());
                 impl->handoff.pop_front();
             }
@@ -2352,8 +2461,7 @@ void Engine::RequestStopAccepting() noexcept {
         }
         if (main) {
             impl->TryPostAcceptStop(main);
-        } else if (phase == EnginePhase::Idle || phase == EnginePhase::Running ||
-                   phase == EnginePhase::Stopped) {
+        } else if (phase == EnginePhase::Idle || phase == EnginePhase::Running || phase == EnginePhase::Stopped) {
             impl->MarkAcceptStopDone();
         }
         // Starting/Closing 尚未发布或已移走 owner 时，必须等安装回滚/解绑收口。
@@ -2362,29 +2470,34 @@ void Engine::RequestStopAccepting() noexcept {
     }
 }
 
-bool Engine::AcceptingStopped() const noexcept {
+bool Engine::AcceptingStopped() const noexcept
+{
     auto impl = m_impl;
     if (!impl) {
         return false;
     }
     return impl->accept_stop_requested.load(std::memory_order_acquire)
-        && impl->accept_stop_done.load(std::memory_order_acquire);
+           && impl->accept_stop_done.load(std::memory_order_acquire);
 }
 
-EnginePhase Engine::Phase() const noexcept {
+EnginePhase Engine::Phase() const noexcept
+{
     std::lock_guard<std::mutex> lock(m_impl->mutex);
     return m_impl->phase;
 }
 
-std::error_code Engine::LastError() const {
+std::error_code Engine::LastError() const
+{
     return m_impl->LastError();
 }
 
-std::exception_ptr Engine::LastFailure() const {
+std::exception_ptr Engine::LastFailure() const
+{
     return m_impl->LastFailure();
 }
 
-std::error_code Engine::EnableAcceptHandoff(std::size_t capacity) {
+std::error_code Engine::EnableAcceptHandoff(std::size_t capacity)
+{
     if (capacity == 0) {
         return std::make_error_code(std::errc::invalid_argument);
     }
@@ -2397,7 +2510,8 @@ std::error_code Engine::EnableAcceptHandoff(std::size_t capacity) {
     return {};
 }
 
-std::error_code Engine::Run(const EngineConfig& config) {
+std::error_code Engine::Run(const EngineConfig& config)
+{
     auto impl = m_impl;
     // 前置域检查在 Starting/绑定/socket 任何副作用之前。
     if (bbt::coroutine::GetLocalCoroutineId() != 0
@@ -2407,9 +2521,8 @@ std::error_code Engine::Run(const EngineConfig& config) {
     {
         std::lock_guard<std::mutex> lock(impl->mutex);
         if (impl->phase != EnginePhase::Idle) {
-            return impl->phase == EnginePhase::Stopped
-                ? std::make_error_code(std::errc::operation_canceled)
-                : std::make_error_code(std::errc::device_or_resource_busy);
+            return impl->phase == EnginePhase::Stopped ? std::make_error_code(std::errc::operation_canceled)
+                                                       : std::make_error_code(std::errc::device_or_resource_busy);
         }
         impl->phase = EnginePhase::Starting;
     }
@@ -2525,8 +2638,7 @@ std::error_code Engine::Run(const EngineConfig& config) {
         impl->max_outbound_bytes = normalized.max_outbound_bytes;
         impl->max_ops = normalized.max_pending_events;
         for (std::size_t i = 0; i < impl->slots.size(); ++i) {
-            impl->reactors.push_back(
-                std::make_shared<Reactor>(impl.get(), i, impl->slots[i].driver));
+            impl->reactors.push_back(std::make_shared<Reactor>(impl.get(), i, impl->slots[i].driver));
         }
         if (server) {
             impl->main_reactor = impl->reactors.front();
@@ -2548,9 +2660,8 @@ std::error_code Engine::Run(const EngineConfig& config) {
         if (server && reactor == main_reactor) {
             addresses = config.listen_addresses;
         }
-        if (!reactor->TryPost([reactor, addresses, promise] {
-                promise->set_value(reactor->InstallOnOwner(addresses));
-            })) {
+        if (!reactor->TryPost(
+                [reactor, addresses, promise] { promise->set_value(reactor->InstallOnOwner(addresses)); })) {
             promise->set_value(std::make_error_code(std::errc::operation_canceled));
         }
     }
@@ -2567,8 +2678,7 @@ std::error_code Engine::Run(const EngineConfig& config) {
             std::lock_guard<std::mutex> lock(impl->mutex);
             for (auto& slot : impl->slots) {
                 bbt::coroutine::detail::ProcesserDriverSnapshot snapshot;
-                const auto status =
-                    scheduler->QueryProcesserDriver(slot.processer_id, snapshot);
+                const auto status = scheduler->QueryProcesserDriver(slot.processer_id, snapshot);
                 if (status != bbt::coroutine::detail::ProcesserDriverStatus::Ok) {
                     control_error = std::make_error_code(std::errc::io_error);
                     break;
@@ -2577,8 +2687,7 @@ std::error_code Engine::Run(const EngineConfig& config) {
                     control_error = std::make_error_code(std::errc::operation_canceled);
                     break;
                 }
-                if (snapshot.m_state
-                    == bbt::coroutine::detail::ProcesserDriverState::Failed) {
+                if (snapshot.m_state == bbt::coroutine::detail::ProcesserDriverState::Failed) {
                     control_failure = snapshot.m_exception;
                     control_error = std::make_error_code(std::errc::io_error);
                     break;
@@ -2647,8 +2756,7 @@ std::error_code Engine::Run(const EngineConfig& config) {
         bool close = false;
         {
             std::unique_lock<std::mutex> lock(impl->mutex);
-            impl->control_cv.wait_for(lock, std::chrono::milliseconds(50),
-                                      [&] { return impl->close_requested; });
+            impl->control_cv.wait_for(lock, std::chrono::milliseconds(50), [&] { return impl->close_requested; });
             close = impl->close_requested;
         }
         if (close) {
@@ -2660,9 +2768,7 @@ std::error_code Engine::Run(const EngineConfig& config) {
         if (impl->cancel_retry_needed.exchange(false)) {
             // 一次性取消投递失败后的持久重试：控制循环补交，不等网络无限终态。
             for (auto& reactor : reactors) {
-                if (!reactor->TryPostInternal([reactor] {
-                        reactor->CancelAllRequestedOnOwner();
-                    })) {
+                if (!reactor->TryPostInternal([reactor] { reactor->CancelAllRequestedOnOwner(); })) {
                     impl->cancel_retry_needed.store(true);
                 }
             }
@@ -2695,7 +2801,7 @@ std::error_code Engine::Run(const EngineConfig& config) {
             }
         }
         if (failed || control_error) {
-            failed = true;  // 诚实收口，不无限只记录后继续等
+            failed = true; // 诚实收口，不无限只记录后继续等
             break;
         }
     }
@@ -2726,20 +2832,15 @@ std::error_code Engine::Run(const EngineConfig& config) {
                             if (impl->seal_throw_once.exchange(false)) {
                                 throw std::runtime_error("seal-throw-test");
                             }
-                            reactor->SealServiceOnOwner([promise] {
-                                promise->set_value(std::error_code{});
-                            });
+                            reactor->SealServiceOnOwner([promise] { promise->set_value(std::error_code{}); });
                         } catch (...) {
                             // 本地可恢复异常：保留首错，但先重试完成正常 owner
                             // 收口（OnClose/OnWrite/OnConnect），不得用冻结替代。
                             impl->seal_error.store(true);
                             try {
-                                reactor->SealServiceOnOwner([promise] {
-                                    promise->set_value(std::error_code{});
-                                });
+                                reactor->SealServiceOnOwner([promise] { promise->set_value(std::error_code{}); });
                             } catch (...) {
-                                promise->set_value(
-                                    std::make_error_code(std::errc::not_enough_memory));
+                                promise->set_value(std::make_error_code(std::errc::not_enough_memory));
                             }
                         }
                     })) {
@@ -2749,14 +2850,12 @@ std::error_code Engine::Run(const EngineConfig& config) {
             }
         }
         for (auto& future : seals) {
-            while (future.wait_for(std::chrono::milliseconds(5))
-                   != std::future_status::ready) {
+            while (future.wait_for(std::chrono::milliseconds(5)) != std::future_status::ready) {
                 if (driver_failed()) {
-                    break;  // driver 真实 Failed：不再等一个不会执行的 handler
+                    break; // driver 真实 Failed：不再等一个不会执行的 handler
                 }
             }
-            if (future.wait_for(std::chrono::milliseconds(0))
-                != std::future_status::ready) {
+            if (future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
                 owner_seal_complete = false;
                 final_error = std::make_error_code(std::errc::operation_canceled);
             } else if (const auto seal_result = future.get()) {
@@ -2791,8 +2890,7 @@ std::error_code Engine::Run(const EngineConfig& config) {
     if (unbind_error || !to_unbind.empty()) {
         std::lock_guard<std::mutex> lock(impl->mutex);
         impl->slots = std::move(to_unbind);
-        impl->RecordError(unbind_error ? unbind_error
-                                       : std::make_error_code(std::errc::io_error));
+        impl->RecordError(unbind_error ? unbind_error : std::make_error_code(std::errc::io_error));
         impl->phase = EnginePhase::Closing;
         return LastError();
     }
@@ -2817,7 +2915,8 @@ std::error_code Engine::Run(const EngineConfig& config) {
     return final_error ? final_error : LastError();
 }
 
-std::error_code Engine::LocalAddresses(std::vector<Address>& out) const {
+std::error_code Engine::LocalAddresses(std::vector<Address>& out) const
+{
     std::lock_guard<std::mutex> lock(m_impl->mutex);
     if (m_impl->phase == EnginePhase::Idle || m_impl->phase == EnginePhase::Stopped) {
         return std::make_error_code(std::errc::operation_not_permitted);
@@ -2826,16 +2925,19 @@ std::error_code Engine::LocalAddresses(std::vector<Address>& out) const {
     return {};
 }
 
-std::size_t Engine::HandlerErrorCount() const {
+std::size_t Engine::HandlerErrorCount() const
+{
     return m_impl->HandlerErrorCount();
 }
 
-std::size_t Engine::CountConnections() const {
+std::size_t Engine::CountConnections() const
+{
     return m_impl->conn_count.load();
 }
 
 std::error_code Engine::ReactorOwnerIds(std::vector<std::uint64_t>& main_owners,
-                                        std::vector<std::uint64_t>& sub_owners) const {
+                                        std::vector<std::uint64_t>& sub_owners) const
+{
     std::lock_guard<std::mutex> lock(m_impl->mutex);
     main_owners.clear();
     sub_owners.clear();
@@ -2853,13 +2955,12 @@ std::error_code Engine::ReactorOwnerIds(std::vector<std::uint64_t>& main_owners,
     return {};
 }
 
-
 namespace {
 
-std::error_code StartConnectImpl(const std::shared_ptr<EngineImpl>& impl,
-                                 const Address& address, std::uint64_t& out_connect_id,
-                                 bool awaitable,
-                                 const std::shared_ptr<ReclaimRecord>& reclaim = {}) {
+std::error_code StartConnectImpl(const std::shared_ptr<EngineImpl>& impl, const Address& address,
+                                 std::uint64_t& out_connect_id, bool awaitable,
+                                 const std::shared_ptr<ReclaimRecord>& reclaim = {})
+{
     // awaitable=true 是 CoDial 的提交步骤：要求无 raw handler（raw 配置下
     // OnConnect 是唯一交付，Co 不得提交一个无法领取的 op）。
     // awaitable=false 是公共 raw 提交：要求有 handler。
@@ -2890,8 +2991,7 @@ std::error_code StartConnectImpl(const std::shared_ptr<EngineImpl>& impl,
                 std::lock_guard<std::mutex> op_lock(it->second->mutex);
                 // 与 MaybeEraseConnect 同条件：未转移且未释放的记录留在表内兜底。
                 removable = it->second->done && !it->second->waiter_attached
-                    && (!it->second->reclaim
-                        || it->second->reclaim->released.load(std::memory_order_acquire));
+                            && (!it->second->reclaim || it->second->reclaim->released.load(std::memory_order_acquire));
             }
             if (removable) {
                 it = impl->connects.erase(it);
@@ -2905,17 +3005,16 @@ std::error_code StartConnectImpl(const std::shared_ptr<EngineImpl>& impl,
         auto op = std::make_shared<EngineImpl::ConnectOp>();
         op->reactor = reactor;
         op->reclaim = reclaim;
-        op->waiter_attached = awaitable;  // Co 提交即登记接收意图，完成早到不丢
+        op->waiter_attached = awaitable; // Co 提交即登记接收意图，完成早到不丢
         impl->connects[id] = std::move(op);
     }
     // 私有 test：一次性"零接纳"投递失败注入。与真实失败走同一段回滚（清
     // receiver 意图、ResolveConnect 取消、清表项、out_id 不变、零回调），
     // 不构造假网络响应；未武装时行为与产品完全一致。
     const bool force_post_failure = impl->connect_post_fail_once.exchange(false);
-    if (force_post_failure
-        || !reactor->TryPost([impl, reactor, address, id, reclaim] {
-               reactor->BeginConnectOnOwner(address, id, reclaim);
-           })) {
+    if (force_post_failure || !reactor->TryPost([impl, reactor, address, id, reclaim] {
+            reactor->BeginConnectOnOwner(address, id, reclaim);
+        })) {
         // 投递失败回滚：owner 从未执行，本次从未创建 fd，责任即时收口。
         MarkReclaimReleased(reclaim);
         {
@@ -2926,8 +3025,7 @@ std::error_code StartConnectImpl(const std::shared_ptr<EngineImpl>& impl,
                 it->second->waiter_attached = false;
             }
         }
-        impl->ResolveConnect(id, Connection(),
-                             std::make_error_code(std::errc::operation_canceled));
+        impl->ResolveConnect(id, Connection(), std::make_error_code(std::errc::operation_canceled));
         return std::make_error_code(std::errc::operation_canceled);
     }
     {
@@ -2949,32 +3047,36 @@ std::error_code StartConnectImpl(const std::shared_ptr<EngineImpl>& impl,
 
 } // namespace
 
-std::error_code Engine::AsyncConnect(const Address& address, std::uint64_t& out_connect_id) {
+std::error_code Engine::AsyncConnect(const Address& address, std::uint64_t& out_connect_id)
+{
     // 只用于 raw 配置：OnConnect 是唯一交付，成功/失败恰一次且 operation 等于
     // 本次 out_connect_id；任何拒绝路径都不改 out_connect_id、不产生本次回调。
     return StartConnectImpl(m_impl, address, out_connect_id, /*awaitable=*/false);
 }
 
-std::error_code Engine::CoSubmitConnect(const Address& address, std::uint64_t& out_connect_id) {
+std::error_code Engine::CoSubmitConnect(const Address& address, std::uint64_t& out_connect_id)
+{
     // CoDial 的提交步骤：登记接收意图，完成早到也保留结果供领取。
     return StartConnectImpl(m_impl, address, out_connect_id, /*awaitable=*/true);
 }
 
 std::error_code Engine::CoSubmitConnect(const Address& address, std::uint64_t& out_connect_id,
-                                        const std::shared_ptr<ReclaimRecord>& reclaim) {
+                                        const std::shared_ptr<ReclaimRecord>& reclaim)
+{
     // 带责任记录的提交：记录随 post 捕获流经 owner 各真实 close/转交点。
     return StartConnectImpl(m_impl, address, out_connect_id, /*awaitable=*/true, reclaim);
 }
 
 // ---- Co 成员入口（docs/decisions/0012-icoconn-member-interface.md）：薄转发到既有私有步骤，不新增第二路径。----
-// 判定优先级/语义与旧 CoAccept/CoDial 自由函数一致（gate → 终态 → 配置）。
+// 判定优先级依次为门禁、终态、配置。
 // 成员形态返回 ConnectionResult{error, conn, reclaim}：失败不覆盖 conn，
 // reclaim 按提交阶段描述本次 socket 责任（提交前拒绝=无效，提交接纳后=
 // 有效且 Released() 与连接同终态）。
 
-ConnectionResult Engine::CoAccept(const bbt::coroutine::WaitOptions& options) {
+ConnectionResult Engine::CoAccept(const bbt::coroutine::WaitOptions& options)
+{
     ConnectionResult result;
-    // gate 先于一切状态判定（与旧 CoAccept 自由函数同契约）：非法域即使
+    // 门禁先于一切状态判定：非法域即使
     // handoff 已有连接也返回 operation_not_permitted。
     if (const auto gate = RequireCoroutineContext()) {
         result.error = gate;
@@ -2994,10 +3096,10 @@ ConnectionResult Engine::CoAccept(const bbt::coroutine::WaitOptions& options) {
     return result;
 }
 
-ConnectionResult Engine::CoDial(const Address& address,
-                                const bbt::coroutine::WaitOptions& options) {
+ConnectionResult Engine::CoDial(const Address& address, const bbt::coroutine::WaitOptions& options)
+{
     ConnectionResult result;
-    // gate 先于提交（与旧 CoDial 自由函数同契约）：非法域不创建责任记录、
+    // gate 先于提交：非法域不创建责任记录、
     // 不产生任何提交副作用，reclaim 保持无效（Released()=true，无责任）。
     if (const auto gate = RequireCoroutineContext()) {
         result.error = gate;
@@ -3010,11 +3112,11 @@ ConnectionResult Engine::CoDial(const Address& address,
     if (const auto error = CoSubmitConnect(address, id, record)) {
         record->released.store(true, std::memory_order_release);
         result.error = error;
-        result.reclaim = ReclaimReceipt{};  // 提交前拒绝：无已提交责任
+        result.reclaim = ReclaimReceipt{}; // 提交前拒绝：无已提交责任
         return result;
     }
     if (auto& barrier = DialBarrierForTest()) {
-        barrier();  // 测试：强制 owner 完成早于领取 attach
+        barrier(); // 测试：强制 owner 完成早于领取 attach
     }
     Connection conn;
     result.error = CoWaitConnect(id, conn, options);
@@ -3027,7 +3129,8 @@ ConnectionResult Engine::CoDial(const Address& address,
 
 // ---- EngineTestAccess（私有测试接缝，非产品 API）----
 
-std::error_code EngineTestAccess::InjectDriverFailure(Engine& engine) {
+std::error_code EngineTestAccess::InjectDriverFailure(Engine& engine)
+{
     auto impl = engine.m_impl;
     std::lock_guard<std::mutex> lock(impl->mutex);
     if (impl->phase != EnginePhase::Running || impl->slots.empty()) {
@@ -3037,19 +3140,21 @@ std::error_code EngineTestAccess::InjectDriverFailure(Engine& engine) {
     return {};
 }
 
-void EngineTestAccess::SetConnectLimit(Engine& engine, std::size_t limit) {
+void EngineTestAccess::SetConnectLimit(Engine& engine, std::size_t limit)
+{
     auto impl = engine.m_impl;
     std::lock_guard<std::mutex> lock(impl->mutex);
     impl->connect_limit = limit == 0 ? 1 : limit;
 }
 
-std::size_t EngineTestAccess::ConnectTableSize(Engine& engine) {
+std::size_t EngineTestAccess::ConnectTableSize(Engine& engine)
+{
     std::lock_guard<std::mutex> lock(engine.m_impl->connect_mutex);
     return engine.m_impl->connects.size();
 }
 
-void EngineTestAccess::SetConnectStartBarrierOnce(Engine& engine,
-                                                  std::function<void()> barrier) {
+void EngineTestAccess::SetConnectStartBarrierOnce(Engine& engine, std::function<void()> barrier)
+{
     auto impl = engine.m_impl;
     std::vector<std::shared_ptr<Reactor>> reactors;
     {
@@ -3061,7 +3166,8 @@ void EngineTestAccess::SetConnectStartBarrierOnce(Engine& engine,
     }
 }
 
-std::size_t EngineTestAccess::PendingConnectCount(Engine& engine) {
+std::size_t EngineTestAccess::PendingConnectCount(Engine& engine)
+{
     auto impl = engine.m_impl;
     std::lock_guard<std::mutex> lock(impl->connect_mutex);
     std::size_t pending = 0;
@@ -3074,12 +3180,13 @@ std::size_t EngineTestAccess::PendingConnectCount(Engine& engine) {
     return pending;
 }
 
-void EngineTestAccess::SetConnectDeliveryDelay(Engine& engine,
-                                               std::chrono::milliseconds delay) {
+void EngineTestAccess::SetConnectDeliveryDelay(Engine& engine, std::chrono::milliseconds delay)
+{
     engine.m_impl->connect_delivery_delay_ms.store(delay.count());
 }
 
-std::size_t EngineTestAccess::DirtyCount(Engine& engine) {
+std::size_t EngineTestAccess::DirtyCount(Engine& engine)
+{
     auto impl = engine.m_impl;
     std::vector<std::shared_ptr<Reactor>> reactors;
     {
@@ -3093,7 +3200,8 @@ std::size_t EngineTestAccess::DirtyCount(Engine& engine) {
     return total;
 }
 
-std::size_t EngineTestAccess::ConnectionCount(Engine& engine) {
+std::size_t EngineTestAccess::ConnectionCount(Engine& engine)
+{
     auto impl = engine.m_impl;
     std::vector<std::shared_ptr<Reactor>> reactors;
     {
@@ -3107,7 +3215,8 @@ std::size_t EngineTestAccess::ConnectionCount(Engine& engine) {
     return total;
 }
 
-void EngineTestAccess::SetSubmitBarrierOnce(Engine& engine, std::function<void()> barrier) {
+void EngineTestAccess::SetSubmitBarrierOnce(Engine& engine, std::function<void()> barrier)
+{
     auto impl = engine.m_impl;
     std::vector<std::shared_ptr<Reactor>> reactors;
     {
@@ -3119,21 +3228,25 @@ void EngineTestAccess::SetSubmitBarrierOnce(Engine& engine, std::function<void()
     }
 }
 
-void EngineTestAccess::SetConnectSubmitBarrierOnce(Engine& engine, std::function<void()> barrier) {
+void EngineTestAccess::SetConnectSubmitBarrierOnce(Engine& engine, std::function<void()> barrier)
+{
     auto impl = engine.m_impl;
     std::lock_guard<std::mutex> lock(impl->connect_submit_barrier_mutex);
     impl->connect_submit_barrier = std::move(barrier);
 }
 
-void EngineTestAccess::SetConnectPostFailureOnce(Engine& engine) {
+void EngineTestAccess::SetConnectPostFailureOnce(Engine& engine)
+{
     engine.m_impl->connect_post_fail_once.store(true);
 }
 
-void EngineTestAccess::SetConnectWaitStatusOnce(Engine& engine, int status) {
+void EngineTestAccess::SetConnectWaitStatusOnce(Engine& engine, int status)
+{
     engine.m_impl->connect_wait_status_once.store(status < 0 ? -1 : status);
 }
 
-void EngineTestAccess::ClearConnectInjection(Engine& engine) {
+void EngineTestAccess::ClearConnectInjection(Engine& engine)
+{
     auto impl = engine.m_impl;
     impl->connect_post_fail_once.store(false);
     impl->connect_wait_status_once.store(-1);
@@ -3141,7 +3254,8 @@ void EngineTestAccess::ClearConnectInjection(Engine& engine) {
     impl->connect_submit_barrier = {};
 }
 
-void EngineTestAccess::KickOwner(Engine& engine) {
+void EngineTestAccess::KickOwner(Engine& engine)
+{
     auto impl = engine.m_impl;
     std::vector<std::shared_ptr<Reactor>> reactors;
     {
@@ -3153,12 +3267,13 @@ void EngineTestAccess::KickOwner(Engine& engine) {
     }
 }
 
-void EngineTestAccess::SetSealDelay(Engine& engine, std::chrono::milliseconds delay) {
+void EngineTestAccess::SetSealDelay(Engine& engine, std::chrono::milliseconds delay)
+{
     engine.m_impl->seal_delay_ms.store(delay.count());
 }
 
-void EngineTestAccess::SetAuthBarriers(Engine& engine, std::function<void()> pre_auth,
-                                       std::function<void()> post_auth) {
+void EngineTestAccess::SetAuthBarriers(Engine& engine, std::function<void()> pre_auth, std::function<void()> post_auth)
+{
     auto impl = engine.m_impl;
     std::vector<std::shared_ptr<Reactor>> reactors;
     {
@@ -3171,10 +3286,8 @@ void EngineTestAccess::SetAuthBarriers(Engine& engine, std::function<void()> pre
     }
 }
 
-
-
-
-bool EngineTestAccess::ConnectReceiverClaimed(Engine& engine, std::uint64_t id) {
+bool EngineTestAccess::ConnectReceiverClaimed(Engine& engine, std::uint64_t id)
+{
     auto op = engine.m_impl->FindConnect(id);
     if (!op) {
         return false;
@@ -3183,7 +3296,8 @@ bool EngineTestAccess::ConnectReceiverClaimed(Engine& engine, std::uint64_t id) 
     return op->receiver_claimed;
 }
 
-std::size_t EngineTestAccess::RecvHoldBytes(Engine& engine) {
+std::size_t EngineTestAccess::RecvHoldBytes(Engine& engine)
+{
     auto impl = engine.m_impl;
     std::vector<std::shared_ptr<Reactor>> reactors;
     {
@@ -3197,9 +3311,9 @@ std::size_t EngineTestAccess::RecvHoldBytes(Engine& engine) {
     return total;
 }
 
-std::size_t EngineTestAccess::FillConnectHub(
-    Engine& engine, std::uint64_t id,
-    std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>>& keep) {
+std::size_t EngineTestAccess::FillConnectHub(Engine& engine, std::uint64_t id,
+                                             std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>>& keep)
+{
     auto op = engine.m_impl->FindConnect(id);
     if (!op) {
         return 0;
@@ -3216,7 +3330,8 @@ std::size_t EngineTestAccess::FillConnectHub(
     return added;
 }
 
-void EngineTestAccess::SetWriteReadyBarrierOnce(Engine& engine, std::function<void()> barrier) {
+void EngineTestAccess::SetWriteReadyBarrierOnce(Engine& engine, std::function<void()> barrier)
+{
     auto impl = engine.m_impl;
     std::vector<std::shared_ptr<Reactor>> reactors;
     {
@@ -3228,15 +3343,18 @@ void EngineTestAccess::SetWriteReadyBarrierOnce(Engine& engine, std::function<vo
     }
 }
 
-void EngineTestAccess::SetConnectStartDelay(Engine& engine, std::chrono::milliseconds delay) {
+void EngineTestAccess::SetConnectStartDelay(Engine& engine, std::chrono::milliseconds delay)
+{
     engine.m_impl->connect_start_delay_ms.store(delay.count());
 }
 
-void EngineTestAccess::SetCancelPostFailureOnce(Engine& engine) {
+void EngineTestAccess::SetCancelPostFailureOnce(Engine& engine)
+{
     engine.m_impl->cancel_post_fail_once.store(true);
 }
 
-void EngineTestAccess::SetShutdownBarrierOnce(Engine& engine, std::function<void()> barrier) {
+void EngineTestAccess::SetShutdownBarrierOnce(Engine& engine, std::function<void()> barrier)
+{
     auto impl = engine.m_impl;
     std::vector<std::shared_ptr<Reactor>> reactors;
     {
@@ -3248,7 +3366,8 @@ void EngineTestAccess::SetShutdownBarrierOnce(Engine& engine, std::function<void
     }
 }
 
-void EngineTestAccess::SetRemoveBarrierOnce(Engine& engine, std::function<void()> barrier) {
+void EngineTestAccess::SetRemoveBarrierOnce(Engine& engine, std::function<void()> barrier)
+{
     auto impl = engine.m_impl;
     std::vector<std::shared_ptr<Reactor>> reactors;
     {
@@ -3260,7 +3379,8 @@ void EngineTestAccess::SetRemoveBarrierOnce(Engine& engine, std::function<void()
     }
 }
 
-void EngineTestAccess::SetDirtyBarrierOnce(Engine& engine, std::function<void()> barrier) {
+void EngineTestAccess::SetDirtyBarrierOnce(Engine& engine, std::function<void()> barrier)
+{
     auto impl = engine.m_impl;
     std::vector<std::shared_ptr<Reactor>> reactors;
     {
@@ -3272,37 +3392,45 @@ void EngineTestAccess::SetDirtyBarrierOnce(Engine& engine, std::function<void()>
     }
 }
 
-void EngineTestAccess::FailNextConnectWaiterCreateOnce(Engine& engine) {
+void EngineTestAccess::FailNextConnectWaiterCreateOnce(Engine& engine)
+{
     (void)engine;
     WakeHub::SetCreateFaultOnceForTest();
 }
 
-void EngineTestAccess::SetWaitDriverFailedOnce(Engine& engine) {
+void EngineTestAccess::SetWaitDriverFailedOnce(Engine& engine)
+{
     engine.m_impl->test_wait_driver_failed.store(true);
 }
 
-void EngineTestAccess::SetSealThrowOnce(Engine& engine) {
+void EngineTestAccess::SetSealThrowOnce(Engine& engine)
+{
     engine.m_impl->seal_throw_once.store(true);
 }
 
-void EngineTestAccess::SetAcceptWaiterHook(Engine& engine, std::function<void()> registered) {
+void EngineTestAccess::SetAcceptWaiterHook(Engine& engine, std::function<void()> registered)
+{
     engine.m_impl->accept_waiter_hook = std::move(registered);
 }
 
-void EngineTestAccess::SetAcceptStopPostFailureOnce(Engine& engine, std::function<void()> after_failure) {
+void EngineTestAccess::SetAcceptStopPostFailureOnce(Engine& engine, std::function<void()> after_failure)
+{
     engine.m_impl->accept_stop_failure_hook = std::move(after_failure);
     engine.m_impl->accept_stop_post_fail_once.store(true);
 }
 
-void EngineTestAccess::SetInstallDelay(Engine& engine, std::chrono::milliseconds delay) {
+void EngineTestAccess::SetInstallDelay(Engine& engine, std::chrono::milliseconds delay)
+{
     engine.m_impl->install_delay_ms.store(delay.count());
 }
 
-void EngineTestAccess::SetSealPostFailureOnce(Engine& engine) {
+void EngineTestAccess::SetSealPostFailureOnce(Engine& engine)
+{
     engine.m_impl->seal_post_fail_once.store(true);
 }
 
-void EngineTestAccess::SetReadAppendHook(Engine& engine, std::function<void()> hook) {
+void EngineTestAccess::SetReadAppendHook(Engine& engine, std::function<void()> hook)
+{
     auto impl = engine.m_impl;
     std::vector<std::shared_ptr<Reactor>> reactors;
     {
@@ -3314,7 +3442,8 @@ void EngineTestAccess::SetReadAppendHook(Engine& engine, std::function<void()> h
     }
 }
 
-void EngineTestAccess::SetAppendBusyHook(Engine& engine, std::function<void()> hook) {
+void EngineTestAccess::SetAppendBusyHook(Engine& engine, std::function<void()> hook)
+{
     auto impl = engine.m_impl;
     std::vector<std::shared_ptr<Reactor>> reactors;
     {
@@ -3326,7 +3455,8 @@ void EngineTestAccess::SetAppendBusyHook(Engine& engine, std::function<void()> h
     }
 }
 
-int EngineTestAccess::FirstConnectionFd(Engine& engine) {
+int EngineTestAccess::FirstConnectionFd(Engine& engine)
+{
     auto impl = engine.m_impl;
     std::vector<std::shared_ptr<Reactor>> reactors;
     {
@@ -3345,7 +3475,8 @@ int EngineTestAccess::FirstConnectionFd(Engine& engine) {
 // CoDial 的领取步骤（内部）：成功才写 out；任何未交付失败都归还 claim 并让
 // owner 回收 fd。有 handler 的 Engine 在写任何等待/取消状态之前拒绝。
 std::error_code Engine::CoWaitConnect(std::uint64_t connect_id, Connection& out,
-                                      const bbt::coroutine::WaitOptions& options) {
+                                      const bbt::coroutine::WaitOptions& options)
+{
     auto impl = m_impl;
     if (impl->handler) {
         // raw-only：不得在任何等待/取消状态写入之前改变 raw 建连责任。
@@ -3360,7 +3491,7 @@ std::error_code Engine::CoWaitConnect(std::uint64_t connect_id, Connection& out,
         if (op->receiver_claimed) {
             return std::make_error_code(std::errc::device_or_resource_busy);
         }
-        op->receiver_claimed = true;  // 单接收者；超时/取消后不自动释放
+        op->receiver_claimed = true; // 单接收者；超时/取消后不自动释放
     }
     // 离开 CoDial 且未交付的唯一归还点：清 claim/attach、登记放弃意图；需要
     // 中断真实连接尝试时同时持久化取消（post 失败由控制循环重试）。owner 在
@@ -3396,9 +3527,7 @@ std::error_code Engine::CoWaitConnect(std::uint64_t connect_id, Connection& out,
         }
         if (reactor) {
             if (impl->cancel_post_fail_once.exchange(false)
-                || !reactor->TryPost([reactor, connect_id] {
-                       reactor->CancelConnectOnOwner(connect_id);
-                   })) {
+                || !reactor->TryPost([reactor, connect_id] { reactor->CancelConnectOnOwner(connect_id); })) {
                 impl->cancel_retry_needed.store(true);
             }
         } else {
@@ -3432,7 +3561,7 @@ std::error_code Engine::CoWaitConnect(std::uint64_t connect_id, Connection& out,
             std::lock_guard<std::mutex> lock(op->mutex);
             if (op->done) {
                 if (op->raw_delivered) {
-                    raw_conflict = true;  // 已由 raw handler 唯一交付，不重复领取
+                    raw_conflict = true; // 已由 raw handler 唯一交付，不重复领取
                 } else {
                     delivered = op->connection;
                     done_error = op->error;
@@ -3464,7 +3593,7 @@ std::error_code Engine::CoWaitConnect(std::uint64_t connect_id, Connection& out,
         // 原地重试；夹带 Completed 的调用退化为真实等待，避免测试写出死循环。
         const int injected_wait_status = impl->connect_wait_status_once.exchange(-1);
         const bool inject_wait = injected_wait_status >= 0
-            && injected_wait_status != static_cast<int>(bbt::coroutine::WaitStatus::Completed);
+                                 && injected_wait_status != static_cast<int>(bbt::coroutine::WaitStatus::Completed);
         if (inject_wait) {
             status = static_cast<bbt::coroutine::WaitStatus>(injected_wait_status);
         } else {
@@ -3472,7 +3601,7 @@ std::error_code Engine::CoWaitConnect(std::uint64_t connect_id, Connection& out,
                 auto waiter = op->hub.Create();
                 status = waiter->WaitWithCallback(options, [&] {
                     if (!op->hub.Add(waiter)) {
-                        add_failed = true;  // 满额：有界拒绝，不自激重试
+                        add_failed = true; // 满额：有界拒绝，不自激重试
                         waiter->Notify();
                         return true;
                     }
@@ -3482,7 +3611,7 @@ std::error_code Engine::CoWaitConnect(std::uint64_t connect_id, Connection& out,
                         done = op->done;
                     }
                     if (done) {
-                        waiter->Notify();  // 锁外 Notify
+                        waiter->Notify(); // 锁外 Notify
                     }
                     return true;
                 });
@@ -3524,7 +3653,7 @@ std::error_code Engine::CoWaitConnect(std::uint64_t connect_id, Connection& out,
             return std::make_error_code(std::errc::no_buffer_space);
         }
         if (status == bbt::coroutine::WaitStatus::Completed) {
-            continue;  // 被通知：回到顶部按真实结果复查
+            continue; // 被通知：回到顶部按真实结果复查
         }
         // 其余 WaitStatus 全部终结本次领取，且一律归还责任后再返回。
         bool done = false;
@@ -3554,8 +3683,8 @@ std::error_code Engine::CoWaitConnect(std::uint64_t connect_id, Connection& out,
     }
 }
 
-std::error_code Engine::CoWaitAccepted(Connection& out,
-                                       const bbt::coroutine::WaitOptions& options) {
+std::error_code Engine::CoWaitAccepted(Connection& out, const bbt::coroutine::WaitOptions& options)
+{
     auto impl = m_impl;
     // 配置与生命周期错误立即返回，不等一个永远不会来的 listener。
     // 判定优先级是契约（见 CoConnection.hpp）：终态先于配置/布局判定。Stopped 时
@@ -3572,8 +3701,7 @@ std::error_code Engine::CoWaitAccepted(Connection& out,
         // 接受已停止（RequestStopAccepting 且本代 listener 已物理关）：仅在
         // Running 时作为接收域终态报 canceled；Idle/Starting 保持
         // operation_not_permitted（尚未建立 accept 生产者）。
-        if (impl->accept_stop_requested.load(std::memory_order_acquire) &&
-            phase == EnginePhase::Running) {
+        if (impl->accept_stop_requested.load(std::memory_order_acquire) && phase == EnginePhase::Running) {
             return std::make_error_code(std::errc::operation_canceled);
         }
         if (phase == EnginePhase::Idle || phase == EnginePhase::Starting) {
@@ -3598,11 +3726,10 @@ std::error_code Engine::CoWaitAccepted(Connection& out,
                 popped = impl->handoff.front();
                 impl->handoff.pop_front();
             } else {
-                sealed = impl->IsSealed()
-                    || impl->accept_stop_requested.load(std::memory_order_acquire);
+                sealed = impl->IsSealed() || impl->accept_stop_requested.load(std::memory_order_acquire);
             }
         }
-        // 用本轮实际弹出的连接判断成功；调用者原有 out 有效不算。
+        // 以本次实际弹出的连接判断成功；调用者原有的 out 有效不算。
         if (popped.Valid()) {
             out = popped;
             impl->ResumeAcceptIfFree();
@@ -3622,15 +3749,17 @@ std::error_code Engine::CoWaitAccepted(Connection& out,
                 waiter->Notify();
                 return true;
             }
-            if (impl->accept_waiter_hook) { impl->accept_waiter_hook(); }
+            if (impl->accept_waiter_hook) {
+                impl->accept_waiter_hook();
+            }
             bool ready = false;
             {
                 std::lock_guard<std::mutex> lock(impl->handoff_mutex);
                 ready = !impl->handoff.empty() || impl->IsSealed()
-                    || impl->accept_stop_requested.load(std::memory_order_acquire);
+                        || impl->accept_stop_requested.load(std::memory_order_acquire);
             }
             if (ready) {
-                waiter->Notify();  // 锁外 Notify
+                waiter->Notify(); // 锁外 Notify
             }
             return true;
         });

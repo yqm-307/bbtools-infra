@@ -46,30 +46,36 @@ namespace net = bbt::infra::net;
 namespace wire = boost::beast::http;
 using namespace std::chrono_literals;
 
-inline void Check(bool value, const char* expression, int line) {
+inline void Check(bool value, const char* expression, int line)
+{
     if (!value) {
         throw std::runtime_error("line " + std::to_string(line) + ": " + expression);
     }
 }
 #define CHECK(expression) ::rpc_net_test::Check(static_cast<bool>(expression), #expression, __LINE__)
 
-inline CallOptions Until(std::chrono::milliseconds duration = 3s) {
+inline CallOptions Until(std::chrono::milliseconds duration = 3s)
+{
     return {std::chrono::steady_clock::now() + duration};
 }
-inline bool WaitUntil(const std::function<bool()>& predicate,
-                      std::chrono::milliseconds timeout = 3s) {
+inline bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds timeout = 3s)
+{
     const auto end = std::chrono::steady_clock::now() + timeout;
     while (!predicate()) {
-        if (std::chrono::steady_clock::now() >= end) { return false; }
+        if (std::chrono::steady_clock::now() >= end) {
+            return false;
+        }
         std::this_thread::sleep_for(1ms);
     }
     return true;
 }
-template<class T> T Get(std::future<T>& future) {
+template <class T> T Get(std::future<T>& future)
+{
     CHECK(future.wait_for(5s) == std::future_status::ready);
     return future.get();
 }
-template<class T> void ExpectCode(const result<T>& value, ErrorCode code) {
+template <class T> void ExpectCode(const result<T>& value, ErrorCode code)
+{
     CHECK(!value);
     CHECK(value.error().code == code);
 }
@@ -77,18 +83,26 @@ template<class T> void ExpectCode(const result<T>& value, ErrorCode code) {
 // 测试进程 watchdog：超时仍为失败；不把强制退出当资源清理成功。
 class Watchdog {
 public:
-    Watchdog() : m_thread([this] {
-        std::unique_lock<std::mutex> lock(m_mutex);
-        if (!m_cv.wait_for(lock, 30s, [this] { return m_done; })) {
-            std::cerr << "FAIL watchdog: bounded test did not finish\n" << std::flush;
-            std::_Exit(3);
+    Watchdog()
+        : m_thread([this] {
+              std::unique_lock<std::mutex> lock(m_mutex);
+              if (!m_cv.wait_for(lock, 30s, [this] { return m_done; })) {
+                  std::cerr << "FAIL watchdog: bounded test did not finish\n" << std::flush;
+                  std::_Exit(3);
+              }
+          })
+    {
+    }
+    ~Watchdog()
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_done = true;
         }
-    }) {}
-    ~Watchdog() {
-        { std::lock_guard<std::mutex> lock(m_mutex); m_done = true; }
         m_cv.notify_one();
         m_thread.join();
     }
+
 private:
     mutable std::mutex m_mutex;
     std::condition_variable m_cv;
@@ -100,17 +114,26 @@ private:
 struct Gate {
     std::atomic<bool> entered{false};
     std::shared_ptr<bbt::coroutine::sync::CoWaiter> waiter;
-    Gate() : waiter(bbt::coroutine::sync::CoWaiter::Create()) { CHECK(waiter); }
-    void Pause() {
-        const auto status = waiter->WaitWithCallback(
-            {std::chrono::steady_clock::now() + 10s}, [this] {
-                entered.store(true);
-                return true;
-            });
+    Gate() : waiter(bbt::coroutine::sync::CoWaiter::Create())
+    {
+        CHECK(waiter);
+    }
+    void Pause()
+    {
+        const auto status = waiter->WaitWithCallback({std::chrono::steady_clock::now() + 10s}, [this] {
+            entered.store(true);
+            return true;
+        });
         CHECK(status == bbt::coroutine::WaitStatus::Completed);
     }
-    void Release() { waiter->Notify(); }
-    ~Gate() { Release(); }
+    void Release()
+    {
+        waiter->Notify();
+    }
+    ~Gate()
+    {
+        Release();
+    }
 };
 
 // client-only Engine 宿主：Run 线程 + 协程任务提交 + 完整收口凭据。
@@ -118,22 +141,28 @@ class Host {
 public:
     std::shared_ptr<net::Engine> engine;
     std::error_code run_error;
-    Host() : engine(net::Engine::Create(std::shared_ptr<net::RawHandler>{})) {
+    Host() : engine(net::Engine::Create(std::shared_ptr<net::RawHandler>{}))
+    {
         net::EngineConfig config;
         config.runtime_progress = net::RuntimeProgress::Independent;
         config.options.num_event_loop = 1;
         m_thread = std::thread([this, config] { run_error = engine->Run(config); });
         CHECK(WaitUntil([&] { return engine->Phase() == net::EnginePhase::Running; }));
     }
-    ~Host() { Stop(); }
+    ~Host()
+    {
+        Stop();
+    }
 
-    template<class F> auto Submit(F fn) -> std::future<decltype(fn())> {
+    template <class F> auto Submit(F fn) -> std::future<decltype(fn())>
+    {
         using T = decltype(fn());
         auto promise = std::make_shared<std::promise<T>>();
         auto future = promise->get_future();
         std::function<T()> callback = std::move(fn);
         bool registered = false;
-        g_scheduler->RegistCoroutineTask(256 * 1024,
+        g_scheduler->RegistCoroutineTask(
+            256 * 1024,
             [promise, callback = std::move(callback)]() mutable {
                 try {
                     if constexpr (std::is_void_v<T>) {
@@ -142,23 +171,30 @@ public:
                     } else {
                         promise->set_value(callback());
                     }
-                } catch (...) { promise->set_exception(std::current_exception()); }
-            }, registered);
+                } catch (...) {
+                    promise->set_exception(std::current_exception());
+                }
+            },
+            registered);
         if (!registered) {
-            promise->set_exception(
-                std::make_exception_ptr(std::runtime_error("task registration failed")));
+            promise->set_exception(std::make_exception_ptr(std::runtime_error("task registration failed")));
         }
         return future;
     }
-    template<class F> auto Call(F fn) -> decltype(fn()) {
+    template <class F> auto Call(F fn) -> decltype(fn())
+    {
         auto future = Submit(std::move(fn));
         return Get(future);
     }
-    void Stop() {
-        if (!m_thread.joinable()) { return; }
+    void Stop()
+    {
+        if (!m_thread.joinable()) {
+            return;
+        }
         engine->RequestClose();
         m_thread.join();
     }
+
 private:
     std::thread m_thread;
 };
@@ -166,21 +202,19 @@ private:
 // server-side Engine + rpc::Server 宿主：真实监听动态端口，收口走 RPC Server
 // 的 StopAccepting → Drain → Close → WaitStopped 序列。
 struct ServerHost {
-    std::shared_ptr<net::Engine> engine{
-        net::Engine::Create(std::shared_ptr<net::RawHandler>{})};
+    std::shared_ptr<net::Engine> engine{net::Engine::Create(std::shared_ptr<net::RawHandler>{})};
     std::shared_ptr<rpc::Server> server;
     std::thread runner;
     std::error_code run_error;
     net::Address address;
     std::atomic<unsigned> handled{0};
 
-    explicit ServerHost(bbt::infra::RpcHandler handler, http::ServerOptions options = {},
-                        bool start = true) {
+    explicit ServerHost(bbt::infra::RpcHandler handler, http::ServerOptions options = {}, bool start = true)
+    {
         auto inbound = rpc::HttpRpcInboundTransport::Create(engine, options);
         CHECK(inbound);
-        auto made = rpc::Server::Create(
-            std::shared_ptr<rpc::IRpcInboundTransport>(std::move(inbound).value()),
-            std::move(handler));
+        auto made = rpc::Server::Create(std::shared_ptr<rpc::IRpcInboundTransport>(std::move(inbound).value()),
+                                        std::move(handler));
         CHECK(made);
         server = std::move(made).value();
         CHECK(engine->Phase() == net::EnginePhase::Idle);
@@ -195,20 +229,30 @@ struct ServerHost {
         std::vector<net::Address> addresses;
         CHECK(!engine->LocalAddresses(addresses) && addresses.size() == 1);
         address = addresses[0];
-        if (start) { CHECK(server->Start()); }
+        if (start) {
+            CHECK(server->Start());
+        }
     }
-    ~ServerHost() {
+    ~ServerHost()
+    {
         server->Close();
         engine->RequestClose();
-        if (runner.joinable()) { runner.join(); }
+        if (runner.joinable()) {
+            runner.join();
+        }
     }
-    std::string Base() const {
+    std::string Base() const
+    {
         return "http://127.0.0.1:" + std::to_string(address.Port());
     }
-    RpcAddress Endpoint() const { return {"http", "127.0.0.1:" + std::to_string(address.Port())}; }
+    RpcAddress Endpoint() const
+    {
+        return {"http", "127.0.0.1:" + std::to_string(address.Port())};
+    }
 
     // 正常收口凭据：listener 停止、任务/连接清账、Run join、Engine Stopped。
-    void Finish() {
+    void Finish()
+    {
         server->StopAccepting();
         CHECK(server->Drain(std::chrono::steady_clock::now() + 3s));
         server->Close();
@@ -225,14 +269,14 @@ struct ServerHost {
 // server-side Engine + http::Server 宿主（脚本化 HTTP 层应答）：给错误映射与
 // 畸形回复用例注入任意 ServerHandler；收口责任与 ServerHost 相同。
 struct HttpServerHost {
-    std::shared_ptr<net::Engine> engine{
-        net::Engine::Create(std::shared_ptr<net::RawHandler>{})};
+    std::shared_ptr<net::Engine> engine{net::Engine::Create(std::shared_ptr<net::RawHandler>{})};
     std::shared_ptr<http::Server> server;
     std::thread runner;
     std::error_code run_error;
     net::Address address;
 
-    explicit HttpServerHost(http::ServerHandler handler) {
+    explicit HttpServerHost(http::ServerHandler handler)
+    {
         auto made = http::Server::Create(engine, std::move(handler));
         CHECK(made);
         server = std::move(made).value();
@@ -249,16 +293,24 @@ struct HttpServerHost {
         address = addresses[0];
         CHECK(server->Start());
     }
-    ~HttpServerHost() {
+    ~HttpServerHost()
+    {
         server->Close();
         engine->RequestClose();
-        if (runner.joinable()) { runner.join(); }
+        if (runner.joinable()) {
+            runner.join();
+        }
     }
-    std::string Base() const {
+    std::string Base() const
+    {
         return "http://127.0.0.1:" + std::to_string(address.Port());
     }
-    RpcAddress Endpoint() const { return {"http", "127.0.0.1:" + std::to_string(address.Port())}; }
-    void Finish() {
+    RpcAddress Endpoint() const
+    {
+        return {"http", "127.0.0.1:" + std::to_string(address.Port())};
+    }
+    void Finish()
+    {
         server->StopAccepting();
         CHECK(server->Drain(std::chrono::steady_clock::now() + 3s));
         server->Close();
@@ -277,28 +329,28 @@ struct ClientFixture {
     Host host;
     std::shared_ptr<http::Client> http_client;
     std::shared_ptr<rpc::Client> client;
-    explicit ClientFixture(
-        const std::string& base_url,
-        const std::function<void(http::ClientOptions&)>& tune = {}) {
+    explicit ClientFixture(const std::string& base_url, const std::function<void(http::ClientOptions&)>& tune = {})
+    {
         http::ClientOptions options;
         options.base_url = base_url;
-        if (tune) { tune(options); }
+        if (tune) {
+            tune(options);
+        }
         auto made = http::Client::Create(host.engine, options);
         CHECK(made);
         http_client = std::move(made).value();
         auto transport = rpc::HttpRpcTransport::Create(http_client);
         CHECK(transport);
-        auto wrapped = rpc::Client::Create(
-            std::shared_ptr<rpc::IRpcTransport>(std::move(transport).value()));
+        auto wrapped = rpc::Client::Create(std::shared_ptr<rpc::IRpcTransport>(std::move(transport).value()));
         CHECK(wrapped);
         client = std::move(wrapped).value();
     }
 };
 
 // 标准测试 envelope：位置参数 payload（复用 rpc::EncodeTuple）+ 关联字段。
-inline RpcEnvelope MakeEnvelope(const std::string& service, const std::string& method,
-                                const std::string& request_id,
-                                std::vector<std::uint8_t> payload = {}) {
+inline RpcEnvelope MakeEnvelope(const std::string& service, const std::string& method, const std::string& request_id,
+                                std::vector<std::uint8_t> payload = {})
+{
     RpcEnvelope env;
     env.service = service;
     env.method = method;
@@ -308,30 +360,30 @@ inline RpcEnvelope MakeEnvelope(const std::string& service, const std::string& m
     env.payload = std::move(payload);
     return env;
 }
-inline std::vector<std::uint8_t> Pack(const std::string& text, std::int64_t number) {
-    auto encoded = rpc::EncodeTuple(std::make_tuple(text, number),
-                                    std::make_index_sequence<2>{});
+inline std::vector<std::uint8_t> Pack(const std::string& text, std::int64_t number)
+{
+    auto encoded = rpc::EncodeTuple(std::make_tuple(text, number), std::make_index_sequence<2>{});
     CHECK(encoded);
     return std::move(encoded).value();
 }
-inline std::tuple<std::string, std::int64_t> Unpack(
-    const std::vector<std::uint8_t>& bytes) {
-    auto decoded = rpc::DecodeTuple<std::string, std::int64_t>(
-        bytes, std::make_index_sequence<2>{});
+inline std::tuple<std::string, std::int64_t> Unpack(const std::vector<std::uint8_t>& bytes)
+{
+    auto decoded = rpc::DecodeTuple<std::string, std::int64_t>(bytes, std::make_index_sequence<2>{});
     CHECK(decoded);
     return std::move(decoded).value();
 }
 
 // 标准回声 handler：payload (string,int64) 原样回传，metadata 透传。
-inline bbt::infra::RpcHandler EchoHandler(std::atomic<unsigned>* counter = nullptr) {
-    return [counter](IncomingCallContext context, RpcEnvelope request)
-               -> result<RpcEnvelope> {
-        if (counter) { counter->fetch_add(1); }
-        if (context.deadline <= std::chrono::steady_clock::now()) {
-            return result<RpcEnvelope>::err(
-                MakeError(ErrorCode::TimedOut, "handler entered past deadline"));
+inline bbt::infra::RpcHandler EchoHandler(std::atomic<unsigned>* counter = nullptr)
+{
+    return [counter](IncomingCallContext context, RpcEnvelope request) -> result<RpcEnvelope> {
+        if (counter) {
+            counter->fetch_add(1);
         }
-        return result<RpcEnvelope>::ok(std::move(request));  // 原样回传（含 metadata/关联字段）
+        if (context.deadline <= std::chrono::steady_clock::now()) {
+            return result<RpcEnvelope>::err(MakeError(ErrorCode::TimedOut, "handler entered past deadline"));
+        }
+        return result<RpcEnvelope>::ok(std::move(request)); // 原样回传（含 metadata/关联字段）
     };
 }
 
@@ -339,7 +391,8 @@ inline bbt::infra::RpcHandler EchoHandler(std::atomic<unsigned>* counter = nullp
 // canned 应答；用 Beast 解析响应供断言。
 class RawPeer {
 public:
-    explicit RawPeer(const net::Address& address) {
+    explicit RawPeer(const net::Address& address)
+    {
         fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
         CHECK(fd >= 0);
         timeval timeout{8, 0};
@@ -353,9 +406,15 @@ public:
         target.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         CHECK(::connect(fd, reinterpret_cast<sockaddr*>(&target), sizeof(target)) == 0);
     }
-    ~RawPeer() { if (fd >= 0) { ::close(fd); } }
+    ~RawPeer()
+    {
+        if (fd >= 0) {
+            ::close(fd);
+        }
+    }
 
-    void Send(const std::string& bytes) {
+    void Send(const std::string& bytes)
+    {
         std::size_t offset = 0;
         while (offset < bytes.size()) {
             const auto n = ::send(fd, bytes.data() + offset, bytes.size() - offset, MSG_NOSIGNAL);
@@ -364,13 +423,18 @@ public:
         }
     }
     // 半开关闭：发完 FIN 后保留读端等待响应（shutdown(SHUT_WR)）。
-    void HalfClose() { ::shutdown(fd, SHUT_WR); }
-    bool Eof() {
+    void HalfClose()
+    {
+        ::shutdown(fd, SHUT_WR);
+    }
+    bool Eof()
+    {
         char bytes[64];
         const auto n = ::recv(fd, bytes, sizeof(bytes), 0);
         return n == 0 || (n < 0 && errno == ECONNRESET);
     }
-    http::Response ReadResponse() {
+    http::Response ReadResponse()
+    {
         wire::response_parser<wire::string_body> parser;
         parser.body_limit(16 * 1024 * 1024);
         parser.eager(true);
@@ -380,8 +444,12 @@ public:
                 const auto consumed = parser.put(boost::asio::buffer(pending), error);
                 pending.erase(0, consumed);
                 CHECK(!error || error == wire::error::need_more);
-                if (parser.is_done()) { break; }
-                if (consumed) { continue; }
+                if (parser.is_done()) {
+                    break;
+                }
+                if (consumed) {
+                    continue;
+                }
             }
             char bytes[32768];
             const auto size = ::recv(fd, bytes, sizeof(bytes), 0);
@@ -391,28 +459,31 @@ public:
         const auto& message = parser.get();
         http::Response out{static_cast<int>(message.result_int()), {}, message.body()};
         for (auto& field : message) {
-            out.headers.emplace_back(std::string(field.name_string()),
-                                     std::string(field.value()));
+            out.headers.emplace_back(std::string(field.name_string()), std::string(field.value()));
         }
         return out;
     }
+
 private:
     int fd{-1};
     std::string pending;
 };
 
 // 现成 wire 字节工具：请求/响应信封 → HTTP body 字节（测试脚本化用）。
-inline std::string RequestBody(const rpc::RpcWireEnvelope& env) {
+inline std::string RequestBody(const rpc::RpcWireEnvelope& env)
+{
     auto bytes = rpc::EncodeRpcWireEnvelope(env, /*is_response=*/false);
     CHECK(bytes);
     return {bytes.value().begin(), bytes.value().end()};
 }
-inline std::string ResponseBody(const rpc::RpcWireEnvelope& env) {
+inline std::string ResponseBody(const rpc::RpcWireEnvelope& env)
+{
     auto bytes = rpc::EncodeRpcWireEnvelope(env, /*is_response=*/true);
     CHECK(bytes);
     return {bytes.value().begin(), bytes.value().end()};
 }
-inline rpc::RpcWireEnvelope ParseReply(const http::Response& response) {
+inline rpc::RpcWireEnvelope ParseReply(const http::Response& response)
+{
     auto decoded = rpc::ParseRpcWireHttpResponse(response);
     CHECK(decoded);
     return std::move(decoded).value();
@@ -421,7 +492,8 @@ inline rpc::RpcWireEnvelope ParseReply(const http::Response& response) {
 // ---- TCP framing 测试支持（u32be payload_length | payload） -------------------
 
 // 前缀编码/解码（与 adapter 帧格式一致；测试侧独立实现防同源错误）。
-inline std::string TcpPrefix(std::uint32_t payload_bytes) {
+inline std::string TcpPrefix(std::uint32_t payload_bytes)
+{
     std::string out(4, '\0');
     out[0] = static_cast<char>((payload_bytes >> 24) & 0xff);
     out[1] = static_cast<char>((payload_bytes >> 16) & 0xff);
@@ -429,17 +501,20 @@ inline std::string TcpPrefix(std::uint32_t payload_bytes) {
     out[3] = static_cast<char>(payload_bytes & 0xff);
     return out;
 }
-inline std::uint32_t TcpReadPrefix(const char in[4]) {
-    return (static_cast<std::uint32_t>(static_cast<unsigned char>(in[0])) << 24) |
-           (static_cast<std::uint32_t>(static_cast<unsigned char>(in[1])) << 16) |
-           (static_cast<std::uint32_t>(static_cast<unsigned char>(in[2])) << 8) |
-           (static_cast<std::uint32_t>(static_cast<unsigned char>(in[3])));
+inline std::uint32_t TcpReadPrefix(const char in[4])
+{
+    return (static_cast<std::uint32_t>(static_cast<unsigned char>(in[0])) << 24)
+           | (static_cast<std::uint32_t>(static_cast<unsigned char>(in[1])) << 16)
+           | (static_cast<std::uint32_t>(static_cast<unsigned char>(in[2])) << 8)
+           | (static_cast<std::uint32_t>(static_cast<unsigned char>(in[3])));
 }
-inline std::string TcpRequestFrame(const rpc::RpcWireEnvelope& env) {
+inline std::string TcpRequestFrame(const rpc::RpcWireEnvelope& env)
+{
     const auto body = RequestBody(env);
     return TcpPrefix(static_cast<std::uint32_t>(body.size())) + body;
 }
-inline std::string TcpReplyFrame(const rpc::RpcWireEnvelope& env) {
+inline std::string TcpReplyFrame(const rpc::RpcWireEnvelope& env)
+{
     const auto body = ResponseBody(env);
     return TcpPrefix(static_cast<std::uint32_t>(body.size())) + body;
 }
@@ -447,8 +522,7 @@ inline std::string TcpReplyFrame(const rpc::RpcWireEnvelope& env) {
 // server-side Engine + TcpRpcInboundTransport + rpc::Server 宿主：真实监听
 // 动态端口；TCP 路径没有 HTTP 兼容面，收口序列与 ServerHost 相同。
 struct TcpServerHost {
-    std::shared_ptr<net::Engine> engine{
-        net::Engine::Create(std::shared_ptr<net::RawHandler>{})};
+    std::shared_ptr<net::Engine> engine{net::Engine::Create(std::shared_ptr<net::RawHandler>{})};
     std::shared_ptr<rpc::Server> server;
     std::shared_ptr<rpc::TcpRpcInboundTransport> inbound;
     std::thread runner;
@@ -456,15 +530,12 @@ struct TcpServerHost {
     net::Address address;
     std::atomic<unsigned> handled{0};
 
-    explicit TcpServerHost(bbt::infra::RpcHandler handler,
-                           rpc::TcpRpcServerOptions options = {},
-                           bool start = true) {
+    explicit TcpServerHost(bbt::infra::RpcHandler handler, rpc::TcpRpcServerOptions options = {}, bool start = true)
+    {
         auto made_inbound = rpc::TcpRpcInboundTransport::Create(engine, options);
         CHECK(made_inbound);
         inbound = std::move(made_inbound).value();
-        auto made = rpc::Server::Create(
-            std::shared_ptr<rpc::IRpcInboundTransport>(inbound),
-            std::move(handler));
+        auto made = rpc::Server::Create(std::shared_ptr<rpc::IRpcInboundTransport>(inbound), std::move(handler));
         CHECK(made);
         server = std::move(made).value();
         CHECK(engine->Phase() == net::EnginePhase::Idle);
@@ -479,17 +550,24 @@ struct TcpServerHost {
         std::vector<net::Address> addresses;
         CHECK(!engine->LocalAddresses(addresses) && addresses.size() == 1);
         address = addresses[0];
-        if (start) { CHECK(server->Start()); }
+        if (start) {
+            CHECK(server->Start());
+        }
     }
-    ~TcpServerHost() {
+    ~TcpServerHost()
+    {
         server->Close();
         engine->RequestClose();
-        if (runner.joinable()) { runner.join(); }
+        if (runner.joinable()) {
+            runner.join();
+        }
     }
-    RpcAddress Endpoint() const {
+    RpcAddress Endpoint() const
+    {
         return {"tcp", "127.0.0.1:" + std::to_string(address.Port())};
     }
-    void Finish() {
+    void Finish()
+    {
         server->StopAccepting();
         CHECK(server->Drain(std::chrono::steady_clock::now() + 3s));
         server->Close();
@@ -509,12 +587,12 @@ struct TcpClientFixture {
     Host host;
     std::shared_ptr<rpc::TcpRpcTransport> transport;
     std::shared_ptr<rpc::Client> client;
-    explicit TcpClientFixture(rpc::TcpRpcOptions options = {}) {
+    explicit TcpClientFixture(rpc::TcpRpcOptions options = {})
+    {
         auto made = rpc::TcpRpcTransport::Create(host.engine, options);
         CHECK(made);
         transport = std::move(made).value();
-        auto wrapped = rpc::Client::Create(
-            std::shared_ptr<rpc::IRpcTransport>(transport));
+        auto wrapped = rpc::Client::Create(std::shared_ptr<rpc::IRpcTransport>(transport));
         CHECK(wrapped);
         client = std::move(wrapped).value();
     }
@@ -524,7 +602,8 @@ struct TcpClientFixture {
 // 协议字节由测试脚本化（不 mock adapter）。
 class RawTcpPeer {
 public:
-    explicit RawTcpPeer(const net::Address& address) {
+    explicit RawTcpPeer(const net::Address& address)
+    {
         fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
         CHECK(fd >= 0);
         timeval timeout{8, 0};
@@ -538,43 +617,54 @@ public:
         target.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         CHECK(::connect(fd, reinterpret_cast<sockaddr*>(&target), sizeof(target)) == 0);
     }
-    ~RawTcpPeer() { if (fd >= 0) { ::close(fd); } }
+    ~RawTcpPeer()
+    {
+        if (fd >= 0) {
+            ::close(fd);
+        }
+    }
 
-    void Send(const std::string& bytes) {
+    void Send(const std::string& bytes)
+    {
         std::size_t offset = 0;
         while (offset < bytes.size()) {
-            const auto n = ::send(fd, bytes.data() + offset,
-                                  bytes.size() - offset, MSG_NOSIGNAL);
+            const auto n = ::send(fd, bytes.data() + offset, bytes.size() - offset, MSG_NOSIGNAL);
             CHECK(n > 0);
             offset += static_cast<std::size_t>(n);
         }
     }
     // 逐片发送：prefix/body 任意分片（含 1 字节片）。
-    void SendFragmented(const std::string& bytes, std::size_t chunk) {
+    void SendFragmented(const std::string& bytes, std::size_t chunk)
+    {
         for (std::size_t offset = 0; offset < bytes.size(); offset += chunk) {
             Send(bytes.substr(offset, std::min(chunk, bytes.size() - offset)));
         }
     }
-    void HalfClose() { ::shutdown(fd, SHUT_WR); }
-    bool Eof() {
+    void HalfClose()
+    {
+        ::shutdown(fd, SHUT_WR);
+    }
+    bool Eof()
+    {
         char bytes[64];
         const auto n = ::recv(fd, bytes, sizeof(bytes), 0);
         return n == 0 || (n < 0 && errno == ECONNRESET);
     }
     // 读恰好 n 字节（测试响应帧前缀/body）。
-    std::string ReadExact(std::size_t n) {
+    std::string ReadExact(std::size_t n)
+    {
         std::string out;
         while (out.size() < n) {
             char bytes[32768];
-            const auto got = ::recv(fd, bytes,
-                std::min(sizeof(bytes), n - out.size()), 0);
+            const auto got = ::recv(fd, bytes, std::min(sizeof(bytes), n - out.size()), 0);
             CHECK(got > 0);
             out.append(bytes, static_cast<std::size_t>(got));
         }
         return out;
     }
     // 读一条完整响应帧并解出信封。
-    rpc::RpcWireEnvelope ReadReply() {
+    rpc::RpcWireEnvelope ReadReply()
+    {
         const auto prefix = ReadExact(4);
         const auto length = TcpReadPrefix(prefix.data());
         CHECK(length > 0 && length <= 8 * 1024 * 1024);
@@ -584,6 +674,7 @@ public:
         CHECK(decoded);
         return std::move(decoded).value();
     }
+
 private:
     int fd{-1};
 };

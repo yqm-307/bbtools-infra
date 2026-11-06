@@ -5,9 +5,8 @@
 namespace bbt::infra::net {
 
 ReactorDriver::ReactorDriver(std::size_t tick_budget, std::chrono::microseconds tick_time_budget)
-    : m_tick_budget(tick_budget),
-      m_tick_time_budget(tick_time_budget),
-      m_guard(boost::asio::make_work_guard(m_context)) {
+    : m_tick_budget(tick_budget), m_tick_time_budget(tick_time_budget), m_guard(boost::asio::make_work_guard(m_context))
+{
     if (tick_budget == 0) {
         throw std::invalid_argument("ReactorDriver tick budget must be positive");
     }
@@ -16,12 +15,14 @@ ReactorDriver::ReactorDriver(std::size_t tick_budget, std::chrono::microseconds 
     }
 }
 
-ReactorDriver::~ReactorDriver() {
+ReactorDriver::~ReactorDriver()
+{
     // 析构前该 driver 必须已同代解绑（Engine 负责）；此处只保证不再有阻塞 run。
     m_context.stop();
 }
 
-void ReactorDriver::RecordUnhandledFailure(std::exception_ptr error) {
+void ReactorDriver::RecordUnhandledFailure(std::exception_ptr error)
+{
     m_unhandled_failures.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(m_observe_mutex);
     if (!m_last_failure) {
@@ -29,8 +30,9 @@ void ReactorDriver::RecordUnhandledFailure(std::exception_ptr error) {
     }
 }
 
-bbt::coroutine::detail::ProcesserDriverResult ReactorDriver::RunBounded(
-    bool can_block, std::chrono::steady_clock::duration budget) {
+bbt::coroutine::detail::ProcesserDriverResult ReactorDriver::RunBounded(bool can_block,
+                                                                        std::chrono::steady_clock::duration budget)
+{
     if (m_context.stopped()) {
         m_context.restart();
     }
@@ -71,7 +73,7 @@ bbt::coroutine::detail::ProcesserDriverResult ReactorDriver::RunBounded(
             return bbt::coroutine::detail::ProcesserDriverResult::Failed;
         }
         if (executed == 0) {
-            break;  // 预算内无可运行 handler（block 分支为 timeout 到点）
+            break; // 预算内无可运行 handler（block 分支为 timeout 到点）
         }
         ++ran;
         // handler 内新入队的 owner 工作（写泵/关闭）立即推进，不等 Wait 超时。
@@ -89,15 +91,19 @@ bbt::coroutine::detail::ProcesserDriverResult ReactorDriver::RunBounded(
 namespace {
 struct OwnerCallGuard {
     std::atomic<int>* depth;
-    explicit OwnerCallGuard(std::atomic<int>* d) : depth(d) {
+    explicit OwnerCallGuard(std::atomic<int>* d) : depth(d)
+    {
         depth->fetch_add(1, std::memory_order_acq_rel);
     }
-    ~OwnerCallGuard() { depth->fetch_sub(1, std::memory_order_acq_rel); }
+    ~OwnerCallGuard()
+    {
+        depth->fetch_sub(1, std::memory_order_acq_rel);
+    }
 };
 } // namespace
 
-bbt::coroutine::detail::ProcesserDriverResult ReactorDriver::OnTick(
-    bbt::coroutine::detail::ProcesserDriverPhase phase) {
+bbt::coroutine::detail::ProcesserDriverResult ReactorDriver::OnTick(bbt::coroutine::detail::ProcesserDriverPhase phase)
+{
     OwnerCallGuard owner_guard{&m_owner_call_depth};
     if (m_inject_tick_failure.exchange(false, std::memory_order_acq_rel)) {
         throw std::runtime_error("ReactorDriver injected tick failure");
@@ -125,15 +131,16 @@ bbt::coroutine::detail::ProcesserDriverResult ReactorDriver::OnTick(
     return RunBounded(/*can_block=*/false, std::chrono::steady_clock::duration::zero());
 }
 
-bbt::coroutine::detail::ProcesserDriverResult ReactorDriver::Wait(std::chrono::microseconds timeout) {
+bbt::coroutine::detail::ProcesserDriverResult ReactorDriver::Wait(std::chrono::microseconds timeout)
+{
     OwnerCallGuard owner_guard{&m_owner_call_depth};
     m_waits.fetch_add(1, std::memory_order_relaxed);
-    const auto budget =
-        std::chrono::duration_cast<std::chrono::steady_clock::duration>(timeout);
+    const auto budget = std::chrono::duration_cast<std::chrono::steady_clock::duration>(timeout);
     return RunBounded(/*can_block=*/true, budget);
 }
 
-void ReactorDriver::Wake() noexcept {
+void ReactorDriver::Wake() noexcept
+{
     m_wakes.fetch_add(1, std::memory_order_relaxed);
     // 持久 latch 保证早到；stop 保证阻塞中的 run 及时返回。stop 不丢弃
     // 已登记 handler，restart（RunBounded 开头）后继续兑现。
@@ -141,8 +148,7 @@ void ReactorDriver::Wake() noexcept {
     // stop 已发生（或正被并发线程执行），此处跳过重复的幂等 stop，只保留
     // latch。RunBounded 在每次入睡前都先 exchange(false) 清位检查，因此
     // "置位未消费" 与 "丢唤醒" 不可能同时成立——latch 才是唤醒载体。
-    const bool already_pending =
-        m_wake_latch.exchange(true, std::memory_order_acq_rel);
+    const bool already_pending = m_wake_latch.exchange(true, std::memory_order_acq_rel);
     if (already_pending) {
         return;
     }
@@ -151,6 +157,22 @@ void ReactorDriver::Wake() noexcept {
     } catch (...) {
         // 有界且 noexcept：stop 的异常不外溢。
     }
+}
+
+} // namespace bbt::infra::net
+
+namespace bbt::infra::net {
+
+std::exception_ptr ReactorDriver::LastFailure() const
+{
+    std::lock_guard<std::mutex> lock(m_observe_mutex);
+    return m_last_failure;
+}
+
+std::thread::id ReactorDriver::LastTickThread() const
+{
+    std::lock_guard<std::mutex> lock(m_observe_mutex);
+    return m_last_tick_thread;
 }
 
 } // namespace bbt::infra::net
