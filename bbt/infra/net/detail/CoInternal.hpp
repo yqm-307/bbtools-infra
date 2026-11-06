@@ -21,6 +21,7 @@
 namespace bbt::infra::net {
 
 class ConnectionState;
+class Buffer;
 class Engine;
 struct ReclaimRecord;  // detail：物理回收共享释放记录
 
@@ -41,9 +42,9 @@ std::error_code WaitStatusError(bbt::coroutine::WaitStatus status);
 // 返回的 function 正常为空（无屏障）。
 std::function<void()>& DialBarrierForTest();
 
-// Engine 私有 Co 步骤与连接内部状态的门面：CoConnection.cc 与 Engine.cc
-// 是唯一调用方。两段式建连（提交 → 领取）在此收口，公共面只留
-// Engine::CoDial/CoAccept。
+// Engine 私有 Co 步骤与连接内部状态的门面；owning 读取将非等待移交和
+// 协程等待分开，两者不各自构造 Buffer。两段式建连（提交 → 领取）
+// 在此收口，公共面只留 Engine::CoDial/CoAccept。
 struct CoAccess {
     // 返回连接内部状态的强引用：Co 等待必须在挂起期间保活 ring/hub。
     static std::shared_ptr<ConnectionState> StateOf(const Connection& connection);

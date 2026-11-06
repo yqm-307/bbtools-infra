@@ -153,9 +153,9 @@ result<Http11Connection::ExchangeResult> Http11Connection::ReadResponse(
                 return R::err(CallError(gate, "response read rejected", true));
             }
             net::CoTcpConnection connection{m_connection};
-            const auto read = connection.Read(
+            auto [read_data, read_error] = connection.Read(
                 {StageDeadline(deadlines.timeout.read, deadlines.total)});
-            if (read.state == net::ReadState::Eof) {
+            if (read_error == bbt::infra::net::make_error_code(bbt::infra::net::NetErrc::Eof)) {
                 // Beast put_eof 前置 got_some()：对端一个响应字节都没发就断开
                 // 时不能喂空 parser（会 abort）。请求已完整写出，回复丢失，按
                 // 未知结果交付（请求可能已生效）。
@@ -170,10 +170,10 @@ result<Http11Connection::ExchangeResult> Http11Connection::ReadResponse(
                 }
                 break;
             }
-            if (read.state == net::ReadState::Error) {
-                return R::err(CallError(read.error, "response read failed", true));
+            if (bool(read_error)) {
+                return R::err(CallError(read_error, "response read failed", true));
             }
-            read.data.AppendTo(pending);
+            read_data.AppendTo(pending);
         }
         const auto status = parser.get().result_int();
         if (status == 101) { return R::err(ProtocolError("protocol upgrade unsupported")); }

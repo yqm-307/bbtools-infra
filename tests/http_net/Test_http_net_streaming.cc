@@ -26,8 +26,15 @@ struct ServerHost {
     ServerHost(http::StreamingServerHandler handler, http::ServerOptions options = {},
                http::StreamingOptions streaming = {}, bool start = true,
                std::int64_t outbound = 1024 * 1024, unsigned loops = 1,
-               int send_buffer = 4096) {
-        auto made = http::Server::CreateStreaming(engine, std::move(handler), options, streaming);
+               int send_buffer = 4096, bool ordinary = false) {
+        auto made = ordinary
+            ? http::Server::Create(engine,
+                [handler = std::move(handler)](IncomingCallContext context, http::IncomingRequest request) {
+                    auto reply = handler(std::move(context), std::move(request));
+                    if (!reply) { return result<http::Response>::err(reply.error()); }
+                    return result<http::Response>::ok(std::get<http::Response>(std::move(reply).value()));
+                }, options)
+            : http::Server::CreateStreaming(engine, std::move(handler), options, streaming);
         CHECK(made);
         server = std::move(made).value();
         CHECK(engine->Phase() == net::EnginePhase::Idle);
@@ -551,6 +558,89 @@ void CloseDuringHandler() {
     host.Finish();
 }
 
+// 同表输入实际经过两种工厂与两种编码，非法头必须在任何字节提交前被拒绝。
+void ResponseHeaderParity() {
+    struct Case {
+        http::Headers headers;
+        bool accepted;
+    };
+    std::vector<Case> cases{
+        {{}, true},
+        {{{"X-Token!#$%&'*+-.^_`|~", "a\tb"}, {"X-Empty", ""},
+          {"X-Repeat", "first"}, {"X-Repeat", "second"},
+          {"X-Obs", std::string(1, static_cast<char>(0x80))}}, true},
+        {{{"X-Pad", std::string(503, 'x')}}, true}, // 5 + 503 + 4 = 512
+        {{{"X-Pad", std::string(504, 'x')}}, false},
+        {{{"X-A", std::string(249, 'x')}, {"X-B", std::string(249, 'y')}}, true},
+        {{{"X-A", std::string(249, 'x')}, {"X-B", std::string(250, 'y')}}, false},
+        {{{"", "value"}}, false},
+        {{{"Bad Name", "value"}}, false},
+        {{{"Bad:Name", "value"}}, false},
+        {{{"Bad\r\nName", "value"}}, false},
+        {{{std::string("Bad\0Name", 8), "value"}}, false},
+        {{{std::string(1, static_cast<char>(0x80)), "value"}}, false}
+    };
+    for (const std::string name : {"Content-Length", "cOnTeNt-LeNgTh", "Transfer-Encoding",
+                                   "tRaNsFeR-eNcOdInG", "Connection", "cOnNeCtIoN",
+                                   "Upgrade", "uPgRaDe", "Trailer", "tRaIlEr"}) {
+        cases.push_back({{{name, "x"}}, false});
+    }
+    for (const unsigned char c : {0, 1, 8, 10, 13, 31, 127}) {
+        cases.push_back({{{"X-Value", std::string("a") + static_cast<char>(c) + "b"}}, false});
+    }
+    http::ServerOptions options;
+    options.limits.max_header_bytes = 512;
+    options.max_target_bytes = 64;
+    // 普通工厂、流式工厂直接 Response、Start Buffered、Start Chunked。
+    for (int path = 0; path != 4; ++path) {
+        std::atomic<unsigned> calls{0};
+        std::vector<std::shared_ptr<ListBody>> bodies(cases.size());
+        ServerHost host(Route([&](IncomingCallContext, http::IncomingRequest request) {
+            ++calls;
+            const auto index = static_cast<std::size_t>(std::stoul(request.target.substr(1)));
+            CHECK(index < cases.size());
+            if (path < 2) { return Buffered(200, "ok", cases[index].headers); }
+            auto body = ListBody::Make({path == 2 ? http::StreamStart::Mode::Buffered
+                                                : http::StreamStart::Mode::Chunked,
+                                        200, cases[index].headers, "ok", "ok"}, {Eof()});
+            bodies[index] = body;
+            return Stream(body);
+        }), options, {}, true, 1024 * 1024, 1, 4096, path == 0);
+        for (std::size_t index = 0; index != cases.size(); ++index) {
+            Peer peer(host.address);
+            peer.Send("GET /" + std::to_string(index) +
+                      " HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+            const auto bytes = peer.Drain();
+            CHECK(peer.Eof());
+            if (!cases[index].accepted) {
+                CHECK(bytes.empty());
+            } else {
+                CHECK(bytes.find("HTTP/1.1 200") == 0);
+                for (const auto& field : cases[index].headers) {
+                    CHECK(bytes.find(field.first + ": " + field.second + "\r\n") != std::string::npos);
+                }
+                const auto boundary = bytes.find("\r\n\r\n");
+                CHECK(boundary != std::string::npos);
+                CHECK(bytes.substr(boundary + 4) == (path == 3 ? "2\r\nok\r\n0\r\n\r\n" : "ok"));
+                CHECK((bytes.find("Transfer-Encoding: chunked\r\n") != std::string::npos) == (path == 3));
+                CHECK((bytes.find("Content-Length: 2\r\n") != std::string::npos) == (path != 3));
+            }
+        }
+        CHECK(calls == cases.size());
+        // Drain/WaitStopped 同时为源调用计数提供完成边界。
+        host.Finish();
+        if (path >= 2) {
+            for (std::size_t index = 0; index != cases.size(); ++index) {
+                CHECK(bodies[index]);
+                CHECK(bodies[index]->starts == 1);
+                CHECK(bodies[index]->nexts == (cases[index].accepted && path == 3 ? 1u : 0u));
+                CHECK(bodies[index]->cancels == (cases[index].accepted ? 0u : 1u));
+            }
+        }
+        std::cout << "header parity path=" << path << " cases=" << cases.size() << '\n';
+    }
+}
+
 int Run(int argc, char** argv) {
     Watchdog watchdog;
     try {
@@ -562,6 +652,7 @@ int Run(int argc, char** argv) {
         const auto baseline = SocketCount();
         const std::string name = argv[1];
         if (name == "stream_wire") { ChunkedWire(); }
+        else if (name == "response_header_parity") { ResponseHeaderParity(); }
         else if (name == "stream_variant_buffered") { VariantBuffered(); }
         else if (name == "stream_disallowed") { ChunkedDisallowed(); }
         else if (name == "stream_commit_boundary") { CommitBoundary(); }

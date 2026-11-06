@@ -158,10 +158,10 @@ struct SessionCore final : std::enable_shared_from_this<SessionCore> {
     };
     mutable std::mutex              out_mu;
     std::deque<OutItem>             out_q[kLaneCount];
-    std::uint64_t                   out_bytes[kLaneCount] = {0, 0, 0};
+
     std::shared_ptr<CoWaiter>       out_signal = CoWaiter::Create();
     bool                            out_sealed{false};
-    // 出站 lane 统计（queued/dequeued/dropped/bytes_queued 与 out_q/out_bytes
+    // 出站 lane 统计（queued/dequeued/dropped/bytes_queued 与 out_q
     // 同享 out_mu——读写同锁，stats 面不再有第二把锁的竞态）。
     TrafficStats                    out_lanes[kLaneCount];
     // 写侧 inflight/finished/dropped 计数（与出站真源同锁；RPC inflight
@@ -221,6 +221,8 @@ struct SessionCore final : std::enable_shared_from_this<SessionCore> {
     // 归还（幂等）。持 owner->mu 调用。
     bool DriveReleaseLocked() { return ReleasedLocked(); }
     result<void> Enqueue(OutItem item);
+    // 持 out_mu 且 lane 非空；移出队列的唯一记账点，写责任随返回值交接。
+    OutItem TakeQueuedLocked(std::size_t lane);
     // 单条 OutItem 唯一结算点：发布 settle 终态（若有凭据）+ 写责任计数
     // 归零观察；outcome 是该条目的真实终态。
     void NoteWriteSettled(OutItem& item, result<void> outcome);
@@ -647,11 +649,6 @@ std::size_t LaneCap(const ClientOptions& options, TrafficClass traffic) {
     return options.ServiceQueueBytes();
 }
 
-void BumpGauge(TrafficStats& stats, std::uint64_t TrafficStats::* field,
-               long delta) {
-    auto& value = stats.*field;
-    value = static_cast<std::uint64_t>(static_cast<long>(value) + delta);
-}
 
 } // namespace
 
@@ -686,23 +683,30 @@ result<void> SessionCore::Enqueue(OutItem item) {
         auto& stats = out_lanes[lane];
         const auto cap = LaneCap(owner->options, item.lane);
         const auto bytes = item.bytes.size();
-        if (out_bytes[lane] + bytes > cap) {
+        if (stats.bytes_queued + bytes > cap) {
             ++stats.dropped;
             // 满队列隔离：只拒本 lane 本条，不阻其他 lane。
             return ErrV(ErrorCode::Overloaded, "lane queue full");
         }
-        ++stats.queued;
-        BumpGauge(stats, &TrafficStats::bytes_queued,
-                  static_cast<long>(bytes));
-        out_bytes[lane] += bytes;
-        writes_outstanding.fetch_add(1);
         out_q[lane].push_back(std::move(item));
+        ++stats.queued;
+        stats.bytes_queued += bytes;
+        writes_outstanding.fetch_add(1);
     }
     if (out_signal) { out_signal->Notify(); }
     return result<void>::ok();
 }
 
-// 一条 OutItem 到达真实写终态（写出/写失败/被 Kill 丢弃/等待取消）后的唯一
+SessionCore::OutItem SessionCore::TakeQueuedLocked(std::size_t lane) {
+    auto item = std::move(out_q[lane].front());
+    out_q[lane].pop_front();
+    auto& stats = out_lanes[lane];
+    --stats.queued;
+    stats.bytes_queued -= item.bytes.size();
+    return item;
+}
+
+// 一条 OutItem 到达真实写终态（写出/写失败/被 Kill 丢弃）后的唯一
 // 结算点：向回复凭据发布 outcome（settled 保证唯一），writes_outstanding
 // 恰好 -1，归零时唤醒 server 收口观察。
 void SessionCore::NoteWriteSettled(OutItem& item, result<void> outcome) {
@@ -749,14 +753,8 @@ bool SessionCore::Dequeue(OutItem& out) {
     // 调度顺序：System 保留容量优先；Service/Actor 按权重轮询。
     auto pop = [&](std::size_t lane) -> bool {
         if (out_q[lane].empty()) { return false; }
-        out = std::move(out_q[lane].front());
-        out_q[lane].pop_front();
-        out_bytes[lane] -= out.bytes.size();
-        auto& stats = out_lanes[lane];
-        --stats.queued;
-        ++stats.dequeued;
-        BumpGauge(stats, &TrafficStats::bytes_queued,
-                  -static_cast<long>(out.bytes.size()));
+        out = TakeQueuedLocked(lane);
+        ++out_lanes[lane].dequeued;
         return true;
     };
     if (pop(0)) { return true; }
@@ -845,19 +843,15 @@ void SessionCore::WriterLoop() {
                 : Err(ErrorCode::InternalError,
                       "write path threw before commit");
         }
+        // 请求关联只在失败时结束；写成功仍须等可信回复。无论成功或失败，
+        // writer 持有项都在同一处交还写责任，Kill 只负责队列中其余条目。
+        if (failure) { FailItemPending(item, *failure); }
+        NoteWriteSettled(item, failure ? result<void>::err(*failure)
+                                      : result<void>::ok());
         if (failure) {
-            // 写失败/提交前失败：向等待本帧的回复凭据发布真实失败终态，把
-            // 对应 pending 结算成同一错误，随后整 link 退役、其余 pending
-            // 同样结算；本条写责任唯一 -1 由 NoteWriteSettled 完成，不得
-            // 泄漏给收口观察。
-            FailItemPending(item, *failure);
-            NoteWriteSettled(item, result<void>::err(*failure));
             Kill(std::make_error_code(std::errc::io_error));
             return;
         }
-        // committed：写成功，关联 pending 保持 committed（上面已置位）。
-        NoteWriteSettled(item, result<void>::ok());
-        continue;
     }
 }
 
@@ -918,12 +912,9 @@ void SessionCore::Kill(std::error_code reason) {
         std::lock_guard<std::mutex> lock(out_mu);
         out_sealed = true;
         for (std::size_t lane = 0; lane != kLaneCount; ++lane) {
-            auto& stats = out_lanes[lane];
-            stats.dropped += stats.queued;
-            stats.queued = 0;
-            stats.bytes_queued = 0;
-            out_bytes[lane] = 0;
-            for (auto& item : out_q[lane]) {
+            while (!out_q[lane].empty()) {
+                auto item = TakeQueuedLocked(lane);
+                ++out_lanes[lane].dropped;
                 // 队列项被 Kill 丢弃：发布 Closed 终态（未写出不能保留
                 // 「成功终态已发布」的假象）并结算本条写责任。writer 手中
                 // 在写的那条不在队列内，由 WriterLoop 终态路径正常结算。
@@ -931,7 +922,7 @@ void SessionCore::Kill(std::error_code reason) {
                     Err(ErrorCode::Closed,
                         "session killed before reply write")));
             }
-            out_q[lane].clear();
+
         }
     }
     if (out_signal) { out_signal->Notify(); }
@@ -1278,9 +1269,9 @@ void SessionCore::ReaderLoop() {
             DispatchInbound(*next.value());
             if (dead.load()) { return; }
         }
-        const auto read = conn.Read({Clock::time_point::max()});
-        if (read.state == net::ReadState::Data) {
-            for (const auto& seg : read.data.Segments()) {
+        auto [read_data, read_error] = conn.Read({Clock::time_point::max()});
+        if (!read_error) {
+            for (const auto& seg : read_data.Segments()) {
                 const auto fed = decoder.Feed(
                     reinterpret_cast<const std::uint8_t*>(seg.data),
                     seg.size);
@@ -1291,10 +1282,10 @@ void SessionCore::ReaderLoop() {
             }
             continue;
         }
-        if (read.state == net::ReadState::Eof) {
+        if (read_error == bbt::infra::net::make_error_code(bbt::infra::net::NetErrc::Eof)) {
             Kill(std::make_error_code(std::errc::connection_reset));
         } else {
-            Kill(read.error);
+            Kill(read_error);
         }
         return;
     }
@@ -1884,15 +1875,15 @@ result<SessionFrame> ReadHandshakeFrame(net::ICoConnection& conn,
                 return accept(std::move(nxt.value().value()));
             }
         }
-        const auto read = conn.Read({deadline});
-        if (read.state == net::ReadState::Data) {
+        auto [read_data, read_error] = conn.Read({deadline});
+        if (!read_error) {
             // 同一 Read 批不整批先按 hello_phase Feed——分段内按
             // kHandshakeFeedChunk 块补喂，每块后尝试解帧；解出首个握手帧即
             // 停喂，本批未喂字节排在 decoder 余量之后移交 stash（由调用方
             // 在边界验证后按数据态补喂）。decoder 缓冲在两次 Next 之间只
             // 容纳不完整的单帧（≤64KiB+4），单块补喂不会触达握手 pending
             // 界；合法最终 HelloAck+大首数据帧合包因此不被误拒。
-            const auto& segments = read.data.Segments();
+            const auto& segments = read_data.Segments();
             for (std::size_t si = 0; si < segments.size(); ++si) {
                 const auto* base = reinterpret_cast<const std::uint8_t*>(
                     segments[si].data);
@@ -1933,12 +1924,12 @@ result<SessionFrame> ReadHandshakeFrame(net::ICoConnection& conn,
             }
             continue;
         }
-        if (read.state == net::ReadState::Eof) {
+        if (read_error == bbt::infra::net::make_error_code(bbt::infra::net::NetErrc::Eof)) {
             return result<SessionFrame>::err(Err(
                 ErrorCode::Unavailable, "peer closed during handshake"));
         }
         return result<SessionFrame>::err(
-            CallError(read.error, "handshake read failed", false));
+            CallError(read_error, "handshake read failed", false));
     }
 }
 

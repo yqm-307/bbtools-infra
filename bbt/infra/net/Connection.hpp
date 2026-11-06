@@ -20,6 +20,9 @@
 #include <string>
 #include <system_error>
 #include <utility>
+#include <tuple>
+
+#include <bbt/infra/net/Buffer.hpp>
 
 #include <bbt/infra/net/ReadAccess.hpp>
 #include <bbt/infra/net/Types.hpp>
@@ -67,7 +70,11 @@ public:
     // 成功时写入本次新身份。
     std::error_code AsyncWrite(std::string data, WriteOperation& out_operation);
 
-    // 竞争 Busy（零消费）；空且无终态 WouldBlock；Ok 已复制并消费。
+    // owning 交付：成功非空；失败 out 不变、零消费。
+    std::error_code TryRead(Buffer& out);
+    std::tuple<Buffer, std::error_code> TryRead();
+
+    // 兼容复制入口：竞争 Busy（零消费）；空且无终态 WouldBlock。
     ReadResult TryRead(std::string& out);
 
     // 组合 Peek+Consume 守卫（见 ReadAccess.hpp 的寿命与有效期约束）。

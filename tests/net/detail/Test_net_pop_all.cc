@@ -300,9 +300,9 @@ BOOST_AUTO_TEST_CASE(read_gate_rejects_non_coroutine) {
     auto conn = ConnectionTestAccess::Make(state);
     CoTcpConnection ico(conn);
     BOOST_REQUIRE(state->ring.TryAppend("data").status == ReadStatus::Ok);
-    const auto outcome = ico.Read(Until(100ms));
-    BOOST_CHECK(outcome.state == ReadState::Error);
-    BOOST_CHECK(outcome.error == std::make_error_code(std::errc::operation_not_permitted));
+    auto [outcome_data, outcome_error] = ico.Read(Until(100ms));
+    BOOST_CHECK(bool(outcome_error));
+    BOOST_CHECK(outcome_error == std::make_error_code(std::errc::operation_not_permitted));
     BOOST_CHECK_EQUAL(state->ring.Size(), 4);  // 未消费
 }
 
@@ -313,10 +313,10 @@ BOOST_AUTO_TEST_CASE(read_waits_and_delivers_across_wakeup) {
     StartRuntime(2);
     std::atomic<int> result{-1};
     auto task = Task([&] {
-        ReadOutcome outcome = ico.Read(Until(3000ms));
-        if (outcome.state == ReadState::Data && JoinBuffer(outcome.data) == "wakeup") {
+        auto [outcome_data, outcome_error] = ico.Read(Until(3000ms));
+        if (!outcome_error && JoinBuffer(outcome_data) == "wakeup") {
             result.store(0);
-        } else if (outcome.state == ReadState::Data) {
+        } else if (!outcome_error) {
             result.store(2);
         } else {
             result.store(1);
@@ -338,10 +338,10 @@ BOOST_AUTO_TEST_CASE(read_timeout_does_not_consume) {
     StartRuntime(1);
     std::atomic<int> result{-1};
     auto task = Task([&] {
-        ReadOutcome outcome = ico.Read(Until(30ms));
-        if (outcome.state == ReadState::Error
-            && outcome.error == std::make_error_code(std::errc::timed_out)
-            && outcome.data.Empty()) {
+        auto [outcome_data, outcome_error] = ico.Read(Until(30ms));
+        if (bool(outcome_error)
+            && outcome_error == std::make_error_code(std::errc::timed_out)
+            && outcome_data.Empty()) {
             result.store(0);
         }
     });
@@ -360,13 +360,13 @@ BOOST_AUTO_TEST_CASE(read_buffer_identity_and_eof_drain) {
     StartRuntime(1);
     std::atomic<int> result{-1};
     auto task = Task([&] {
-        ReadOutcome first = ico.Read(Until(1000ms));
-        if (first.state != ReadState::Data) { result.store(1); return; }
+        auto [first_data, first_error] = ico.Read(Until(1000ms));
+        if (bool(first_error)) { result.store(1); return; }
         // backing 非空且段指针可用——BufferTestAccess 核 backing 身份。
-        if (BufferTestAccess::Backing(first.data) == nullptr) { result.store(3); return; }
-        if (JoinBuffer(first.data) != "rest") { result.store(2); return; }
-        ReadOutcome second = ico.Read(Until(1000ms));
-        if (second.state == ReadState::Eof && second.data.Empty()) {
+        if (BufferTestAccess::Backing(first_data) == nullptr) { result.store(3); return; }
+        if (JoinBuffer(first_data) != "rest") { result.store(2); return; }
+        auto [second_data, second_error] = ico.Read(Until(1000ms));
+        if (second_error == bbt::infra::net::make_error_code(bbt::infra::net::NetErrc::Eof) && second_data.Empty()) {
             result.store(0);
         } else {
             result.store(4);
@@ -377,7 +377,7 @@ BOOST_AUTO_TEST_CASE(read_buffer_identity_and_eof_drain) {
     BOOST_CHECK_EQUAL(result.load(), 0);
     // 无效句柄。
     CoTcpConnection bad;
-    BOOST_CHECK(bad.Read(Until(1ms)).state == ReadState::Error);
+    BOOST_CHECK(bool(std::get<1>(bad.Read(Until(1ms)))));
 }
 
 BOOST_AUTO_TEST_CASE(multi_reader_linearizes) {

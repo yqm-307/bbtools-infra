@@ -121,6 +121,21 @@ bool ValidRequestHead(const wire::request<wire::string_body>& request, std::size
     return true;
 }
 
+result<void> ValidateResponseHeaders(const Headers& headers, std::size_t max_header_bytes) {
+    std::size_t header_bytes = 0;
+    for (const auto& field : headers) {
+        header_bytes += field.first.size() + field.second.size() + 4;
+        if (header_bytes > max_header_bytes || !Token(field.first) || !FieldValue(field.second) ||
+            boost::beast::iequals(field.first, "Content-Length") ||
+            boost::beast::iequals(field.first, "Transfer-Encoding") ||
+            boost::beast::iequals(field.first, "Connection") ||
+            boost::beast::iequals(field.first, "Upgrade") || boost::beast::iequals(field.first, "Trailer")) {
+            return Failure(ErrorCode::InvalidArgument, "invalid server response header");
+        }
+    }
+    return result<void>::ok();
+}
+
 result<std::string> SerializeResponse(Response response, bool head, bool keep_alive,
                                       const ServerOptions& options) {
     if (response.status_code < 200 || response.status_code > 599 ||
@@ -128,18 +143,9 @@ result<std::string> SerializeResponse(Response response, bool head, bool keep_al
         return result<std::string>::err(MakeError(ErrorCode::InvalidArgument, "invalid server response"));
     }
     wire::response<wire::string_body> message{static_cast<wire::status>(response.status_code), 11};
-    std::size_t header_bytes = 0;
-    for (const auto& field : response.headers) {
-        header_bytes += field.first.size() + field.second.size() + 4;
-        if (header_bytes > options.limits.max_header_bytes || !Token(field.first) || !FieldValue(field.second) ||
-            boost::beast::iequals(field.first, "Content-Length") ||
-            boost::beast::iequals(field.first, "Transfer-Encoding") ||
-            boost::beast::iequals(field.first, "Connection") ||
-            boost::beast::iequals(field.first, "Upgrade") || boost::beast::iequals(field.first, "Trailer")) {
-            return result<std::string>::err(MakeError(ErrorCode::InvalidArgument, "invalid server response header"));
-        }
-        message.insert(field.first, field.second);
-    }
+    const auto valid = ValidateResponseHeaders(response.headers, options.limits.max_header_bytes);
+    if (!valid) { return result<std::string>::err(valid.error()); }
+    for (const auto& field : response.headers) { message.insert(field.first, field.second); }
     message.keep_alive(keep_alive);
     const bool no_content = response.status_code == 204 || response.status_code == 304;
     if (!no_content) {
@@ -168,18 +174,9 @@ result<std::string> SerializeResponseHead(int status_code, const Headers& header
         return result<std::string>::err(MakeError(ErrorCode::InvalidArgument, "chunked reply disallowed"));
     }
     wire::response<wire::empty_body> message{static_cast<wire::status>(status_code), 11};
-    std::size_t header_bytes = 0;
-    for (const auto& field : headers) {
-        header_bytes += field.first.size() + field.second.size() + 4;
-        if (header_bytes > options.limits.max_header_bytes || !Token(field.first) || !FieldValue(field.second) ||
-            boost::beast::iequals(field.first, "Content-Length") ||
-            boost::beast::iequals(field.first, "Transfer-Encoding") ||
-            boost::beast::iequals(field.first, "Connection") ||
-            boost::beast::iequals(field.first, "Upgrade") || boost::beast::iequals(field.first, "Trailer")) {
-            return result<std::string>::err(MakeError(ErrorCode::InvalidArgument, "invalid server response header"));
-        }
-        message.insert(field.first, field.second);
-    }
+    const auto valid = ValidateResponseHeaders(headers, options.limits.max_header_bytes);
+    if (!valid) { return result<std::string>::err(valid.error()); }
+    for (const auto& field : headers) { message.insert(field.first, field.second); }
     message.keep_alive(keep_alive);
     if (chunked) { message.chunked(true); }
     else if (status_code != 204 && status_code != 304) { message.content_length(0); }
@@ -423,12 +420,12 @@ struct Server::State : std::enable_shared_from_this<Server::State> {
                     if (consumed) { bbtco_yield; continue; }
                 }
                 net::CoTcpConnection connection{session->connection};
-                const auto read = connection.Read({deadline});
-                if (read.state != net::ReadState::Data) {
+                auto [read_data, read_error] = connection.Read({deadline});
+                if (bool(read_error)) {
                     // EOF 前的完整请求已在上面交付；半包 EOF/错误明确放弃。
                     return;
                 }
-                read.data.AppendTo(pending);
+                read_data.AppendTo(pending);
                 bbtco_yield;
             }
             if (!ValidRequestHead(parser.get(), options.max_target_bytes)) { return; }

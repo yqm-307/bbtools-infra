@@ -315,3 +315,5 @@ Engine 通常贯穿进程寿命，关闭只承诺停止服务及后续操作安�
 - Apache-2.0 主体与 ring 文件 MIT 适用声明、版权和后续逐文件移植规则见 [gnet 移植出处](../dependencies/gnet-2.10.0.provenance.md)。本包不移植 ring 算法。
 
 </details>
+
+读取结果的 ReadOutcome/ReadState 承诺由 [0016：owning 读取重载](0016-owning-read-overloads.md) 取代；旧 raw 复制/借用兼容面仍保留。

@@ -10,7 +10,7 @@
 //     RequestClose → WaitClosed → Status 采样。
 //
 // 每个成员形态均有真实调用断言：
-//   - Read → ReadOutcome{state=Data, data=owning Buffer}，Buffer.CopyTo
+//   - Read → tuple<owning Buffer, error_code>，Buffer.CopyTo
 //     得到真实回显字节；
 //   - Write → WriteReport{wait_error 空, outcome=Done+sent, operation 有效}；
 //   - WaitClosed → RequestClose 后观察到逻辑 closed 终态；
@@ -123,9 +123,9 @@ int main() {
             return;
         }
         // Read → owning Buffer（真零拷贝移交）。
-        auto read = conn.Read(Until(5000ms));
-        if (read.state == net::ReadState::Data && !read.error && read.data.Size() > 0) {
-            const std::string payload = read.data.CopyTo();
+        auto [read_data, read_error] = conn.Read(Until(5000ms));
+        if (!read_error && read_data.Size() > 0) {
+            const std::string payload = read_data.CopyTo();
             if (payload == "hello") {
                 server_read_ok.store(1);
                 // Write → WriteReport。
@@ -141,14 +141,13 @@ int main() {
                 }
             }
         } else {
-            std::cerr << "server Read: state=" << static_cast<int>(read.state)
-                      << " error=" << read.error.message() << '\n';
+            std::cerr << "server Read: " << " error=" << read_error.message() << '\n';
         }
         // 客户端 RequestClose 后本端 Read 会见到 EOF/关闭；主动收口才等
         // WaitClosed。这里先排空尾部直到 EOF/终态，再 RequestClose。
         while (true) {
-            auto drain = conn.Read(Until(3000ms));
-            if (drain.state != net::ReadState::Data) {
+            auto [drain_data, drain_error] = conn.Read(Until(3000ms));
+            if (bool(drain_error)) {
                 break;  // Eof 或 Error 终态
             }
         }
@@ -196,14 +195,13 @@ int main() {
                       << " phase=" << static_cast<int>(sent.outcome.phase) << '\n';
         }
 
-        // Read → ReadOutcome{state, owning Buffer, error}。
-        auto echoed = conn.Read(Until(5000ms));
-        if (echoed.state == net::ReadState::Data && !echoed.error
-            && echoed.data.CopyTo() == "hello") {
+        // Read → tuple<owning Buffer, error_code>。
+        auto [echoed_data, echoed_error] = conn.Read(Until(5000ms));
+        if (!echoed_error
+            && echoed_data.CopyTo() == "hello") {
             client_read_ok.store(1);
         } else {
-            std::cerr << "client Read: state=" << static_cast<int>(echoed.state)
-                      << " error=" << echoed.error.message() << '\n';
+            std::cerr << "client Read: " << " error=" << echoed_error.message() << '\n';
         }
 
         // 逻辑封口请求 → WaitClosed 等 closed 终态 → Status 采样。

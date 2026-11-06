@@ -67,6 +67,29 @@ v2 会话 owner（`rpc::Client::Create(engine, ClientOptions)`）的
 `Client::Shutdown` 如实返回 `UnsupportedRoute`（能力边界，不伪装成功）；
 inbound adapter 的默认 `Shutdown` 是 `StopAccepting()` + `Drain()`。
 
+## 会话回复构造
+
+会话 admission 交付的 Request 可直接生成关联完整的回复：
+
+```cpp
+auto response = rpc::Response::FromRequest(item.request);
+response.SetPayload(item.request.Payload());
+// 在受管协程中提交，并等待实际写终态。
+auto completed = bbt_co_await item.reply->Complete(std::move(response));
+```
+
+`FromRequest` 返回独立值，只复制 `RequestId`、`Service`、`Method`、`RequestSchema`、`ResponseSchema`；payload 与 metadata 初始为空，由业务显式设置。不保留请求、上下文、会话或 socket，不改变默认/payload 构造和既有 setter；字符串复制可能分配，不承诺 `noexcept`。稳定取舍见 [ADR 0017](../decisions/0017-rpc-response-from-request.md)。
+
+值层只负责初始化，`ReplyCompletion` 继续校验五字段并承担回复提交边界；创建后改错关联字段仍返回 `ProtocolError`，不能用此入口绕过校验或代替写终态。`rpc.net.response_from_request` 验证值独立性；`rpc.net.v2s_reply_corr_mismatch` 验证误改后的真实错误回程。
+
+会话发送队列以 `out_mu` 保护的 lane `bytes_queued` 作为容量与统计的同一真源。
+Enqueue 成功才接纳写责任；Dequeue 和关闭丢弃共用取出队列项的记账入口。
+Dequeue 后责任交给唯一 writer，Kill 只结算仍排队的条目；两条路径最终都由
+`NoteWriteSettled` 发布回复写终态并归还写责任。等待取消或超时不代替底层写结算。
+pending 关联表独立保留请求语义：写成功不等于收到可信回复，已提交后失联仍为
+`OutcomeUnknown` / `RequestCommitted`。`rpc.net.write_terminal_once` 用真实 TCP 和
+写前受控检查点验证 writer 持有项与排队项同时关闭、等待唤醒及资源收口。
+
 ## 错误与关联契约
 
 - **固定 profile 收敛**：共享 http transport 的默认配置（base_url/headers/

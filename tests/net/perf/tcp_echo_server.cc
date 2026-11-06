@@ -389,25 +389,25 @@ void CoServeConnection(Connection connection) {
         bbt::coroutine::WaitOptions opts;
         opts.deadline = std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(g_read_timeout_ms);
-        const auto read = co_conn.Read(opts);
-        if (read.state == ReadState::Error &&
-            read.error == std::make_error_code(std::errc::timed_out)) {
+        auto [read_data, read_error] = co_conn.Read(opts);
+        if (bool(read_error) &&
+            read_error == std::make_error_code(std::errc::timed_out)) {
             continue;
         }
-        if (read.state == ReadState::Eof ||
-            (read.state == ReadState::Error &&
-             read.error == make_error_code(NetErrc::Closed))) {
+        if (read_error == bbt::infra::net::make_error_code(bbt::infra::net::NetErrc::Eof) ||
+            (bool(read_error) &&
+             read_error == make_error_code(NetErrc::Closed))) {
             // 产品契约：EOF 不关闭写侧——本协程的顺序 Write 在读到 EOF 前
             // 已全部终态，此处 RequestClose 是连接释放的唯一发起方。
             connection.RequestClose();
             return;
         }
-        if (read.state == ReadState::Error) {
+        if (bool(read_error)) {
             g_metrics.errors.fetch_add(1);
             connection.RequestClose();
             return;
         }
-        read.data.AppendTo(data);
+        read_data.AppendTo(data);
         g_metrics.bytes_in.fetch_add(data.size());
         if (!parser.Feed(data.data(), data.size())) {
             g_metrics.frames_bad.fetch_add(1);

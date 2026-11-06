@@ -39,7 +39,11 @@ public:
     ~CoTcpConnection() override = default; // 不隐式 RequestClose，不等物理回收
 
     // 以下每个 override 完整继承 ICoConnection 的域/挂起/所有权/错误契约。
-    ReadOutcome Read(const bbt::coroutine::WaitOptions& options = {}) override;
+    using ICoConnection::Read;
+    using ICoConnection::TryRead;
+    std::error_code TryRead(Buffer& out) override { return m_conn.TryRead(out); }
+    std::error_code Read(Buffer& out,
+                         const bbt::coroutine::WaitOptions& options = {}) override;
     WriteOperation AsyncWrite(std::string data) override;
     WriteReport Write(std::string data,
                       const bbt::coroutine::WaitOptions& options = {}) override;

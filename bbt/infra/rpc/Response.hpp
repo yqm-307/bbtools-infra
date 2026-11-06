@@ -2,7 +2,7 @@
 // bbtools-infra v2：RPC 值层 Response。
 // 契约来源：docs/decisions/0014-app-session.md §2.1/§2.4。
 //
-// 业务用默认构造 + setter 生成回复；Response 构造不提供 socket/session/业务
+// 业务用 FromRequest 复制关联字段，再用 setter 填充回复；Response 不持有 socket/session/业务
 // 上下文。关联字段（request_id/service/method/request_schema/response_schema）
 // 必须与 Request 一致——由 Server 在 ReplyCompletion 边界校验，不一致返回
 // ProtocolError（值层不做跨对象相等校验，只承载字段）。
@@ -23,6 +23,17 @@ public:
     Response() = default;
     explicit Response(std::vector<std::uint8_t> payload)
         : m_payload(std::move(payload)) {}
+
+    /** @brief 复制请求的五个关联字段；回复 payload 与 metadata 初始为空，不保留请求引用。 */
+    static Response FromRequest(const Request& request) {
+        Response response;
+        response.SetRequestId(request.RequestId())
+            .SetService(request.Service())
+            .SetMethod(request.Method())
+            .SetRequestSchema(request.RequestSchema())
+            .SetResponseSchema(request.ResponseSchema());
+        return response;
+    }
 
     const std::string& RequestId() const noexcept      { return m_request_id; }
     const std::string& Service() const noexcept        { return m_service; }

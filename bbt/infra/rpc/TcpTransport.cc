@@ -101,16 +101,16 @@ result<std::error_code> FillUpTo(net::ICoConnection& connection,
         if (const auto gate = CheckCall(deadline)) {
             return result<std::error_code>::ok(gate);
         }
-        const auto read = connection.Read({deadline});
-        if (read.state == net::ReadState::Data) {
-            read.data.AppendTo(pending);
+        auto [read_data, read_error] = connection.Read({deadline});
+        if (!read_error) {
+            read_data.AppendTo(pending);
             continue;
         }
-        if (read.state == net::ReadState::Eof) {
+        if (read_error == bbt::infra::net::make_error_code(bbt::infra::net::NetErrc::Eof)) {
             return result<std::error_code>::ok(
                 net::make_error_code(net::NetErrc::Eof));
         }
-        return result<std::error_code>::ok(read.error);
+        return result<std::error_code>::ok(read_error);
     }
     return result<std::error_code>::ok(std::error_code{});
 }
@@ -328,8 +328,8 @@ bbt_co_async(result<WireReply>) TcpRpcTransport::Exchange(
             // 不再等待更多字节。
             (void)gate;
         } else {
-            const auto trailing = connection.Read({options.deadline});
-            if (trailing.state == net::ReadState::Data) {
+            auto [trailing_data, trailing_error] = connection.Read({options.deadline});
+            if (!trailing_error) {
                 return result<WireReply>::err(detail::TcpProtocolError(
                     "response frame has trailing bytes", true));
             }

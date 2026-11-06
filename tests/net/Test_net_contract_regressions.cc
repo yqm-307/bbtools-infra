@@ -323,8 +323,8 @@ static void RingReleaseNotify() {
     std::atomic<int> result{-1};
     auto task = Task([&] {
         CoTcpConnection conn{connection};
-        const auto read = conn.Read(Until(500ms));
-        if (read.state == ReadState::Data && read.data.CopyTo() == "release!") {
+        auto [read_data, read_error] = conn.Read(Until(500ms));
+        if (!read_error && read_data.CopyTo() == "release!") {
             result.store(0);
         }
     });
@@ -735,9 +735,9 @@ static void CoReadAppendFaultNonEmptyOut() {
         CoTcpConnection conn{connection};
         g_fail_alloc = true;
         try {
-            const auto read = conn.Read(Until(500ms));
+            auto [read_data, read_error] = conn.Read(Until(500ms));
             g_fail_alloc = false;
-            if (read.state == ReadState::Error) {
+            if (bool(read_error)) {
                 result.store(0);
             }
         } catch (const std::bad_alloc&) {
@@ -754,9 +754,9 @@ static void CoReadAppendFaultNonEmptyOut() {
     std::atomic<int> retry_result{-1};
     auto retry_task = Task([&] {
         CoTcpConnection conn{connection};
-        const auto read = conn.Read(Until(500ms));
-        if (read.state == ReadState::Data) {
-            read.data.AppendTo(*retry_out);
+        auto [read_data, read_error] = conn.Read(Until(500ms));
+        if (!read_error) {
+            read_data.AppendTo(*retry_out);
             retry_result.store(0);
         }
     });
@@ -774,8 +774,8 @@ static void CoReadIdleNoSpin() {
     const auto before = state->ring.AccessGeneration();
     auto task = Task([&] {
         CoTcpConnection conn{connection};
-        const auto read = conn.Read(bbt::coroutine::WaitOptions{});
-        if (read.state == ReadState::Data && read.data.CopyTo() == "x") {
+        auto [read_data, read_error] = conn.Read(bbt::coroutine::WaitOptions{});
+        if (!read_error && read_data.CopyTo() == "x") {
             result.store(0);
         }
     });
@@ -1066,12 +1066,12 @@ static void CoReadRapid() {
     auto task = Task([&] {
         CoTcpConnection conn{connection};
         for (;;) {
-            const auto read = conn.Read(Until(5000ms));
-            if (read.state != ReadState::Data) {
-                result.store(read.error.value());
+            auto [read_data, read_error] = conn.Read(Until(5000ms));
+            if (bool(read_error)) {
+                result.store(read_error.value());
                 break;
             }
-            const auto size = static_cast<int>(read.data.Size());
+            const auto size = static_cast<int>(read_data.Size());
             if (total.fetch_add(size) + size >= kCount) {
                 result.store(0);
                 break;
@@ -1529,9 +1529,9 @@ static void CoBusyReleasePhases() {
         std::atomic<int> read_result{-1};
         auto read_task = Task([&] {
             CoTcpConnection conn{connection};
-            const auto read = conn.Read(Until(1000ms));
-            if (read.state == ReadState::Data) {
-                read.data.AppendTo(*shared_out);
+            auto [read_data, read_error] = conn.Read(Until(1000ms));
+            if (!read_error) {
+                read_data.AppendTo(*shared_out);
                 read_result.store(0);
             }
         });
@@ -1558,8 +1558,8 @@ static void CoBusyReleasePhases() {
         std::atomic<int> result{-1};
         auto task = Task([&] {
             CoTcpConnection conn{connection};
-            const auto read = conn.Read(Until(2000ms));
-            if (read.state == ReadState::Data && read.data.Size() == 256) {
+            auto [read_data, read_error] = conn.Read(Until(2000ms));
+            if (!read_error && read_data.Size() == 256) {
                 result.store(0);
             }
         });
@@ -1581,8 +1581,8 @@ static void CoBusyReleasePhases() {
         std::atomic<int> result{-1};
         auto task = Task([&] {
             CoTcpConnection conn{connection};
-            const auto read = conn.Read(Until(2000ms));
-            if (read.state == ReadState::Data && read.data.Size() == 256) {
+            auto [read_data, read_error] = conn.Read(Until(2000ms));
+            if (!read_error && read_data.Size() == 256) {
                 result.store(0);
             }
         });
@@ -1611,10 +1611,10 @@ static void CoWouldBlockClosedRace() {
     std::atomic<int> result{-1};
     auto task = Task([&] {
         CoTcpConnection conn{connection};
-        const auto read = conn.Read(Until(2000ms));
-        if (read.state == ReadState::Eof
-            || (read.state == ReadState::Error
-                && read.error == make_error_code(NetErrc::Closed))) {
+        auto [read_data, read_error] = conn.Read(Until(2000ms));
+        if (read_error == bbt::infra::net::make_error_code(bbt::infra::net::NetErrc::Eof)
+            || (bool(read_error)
+                && read_error == make_error_code(NetErrc::Closed))) {
             result.store(0);
         }
     });
@@ -1653,9 +1653,9 @@ static void CoPingpongStrict() {
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
             std::string data;
             while (data.size() < kPayload) {
-                const auto read = conn.Read(At(deadline));
-                if (read.state != ReadState::Data) { server_error.store(2); return; }
-                read.data.AppendTo(data);
+                auto [read_data, read_error] = conn.Read(At(deadline));
+                if (bool(read_error)) { server_error.store(2); return; }
+                read_data.AppendTo(data);
             }
             const auto report = conn.Write(data, At(deadline));
             if (report.wait_error || report.outcome.phase != WritePhase::Done) {
@@ -1683,9 +1683,9 @@ static void CoPingpongStrict() {
             }
             std::string echoed;
             while (echoed.size() < kPayload) {
-                const auto read = conn.Read(At(deadline));
-                if (read.state != ReadState::Data) { client_error.store(3); return; }
-                read.data.AppendTo(echoed);
+                auto [read_data, read_error] = conn.Read(At(deadline));
+                if (bool(read_error)) { client_error.store(3); return; }
+                read_data.AppendTo(echoed);
             }
             client_rounds.fetch_add(1);
         }
@@ -1904,8 +1904,8 @@ static void CoReadHubFullBounded() {
     // 无 deadline：若满额被实现成库内自激重试，此 Get 会一直不返回。
     auto task = Task([&] {
         CoTcpConnection conn{connection};
-        const auto read = conn.Read(bbt::coroutine::WaitOptions{});
-        result.store(read.error.value());
+        auto [read_data, read_error] = conn.Read(bbt::coroutine::WaitOptions{});
+        result.store(read_error.value());
     });
     Get(task);
     CHECK(result.load() == std::make_error_code(std::errc::no_buffer_space).value());
@@ -1915,9 +1915,9 @@ static void CoReadHubFullBounded() {
     std::atomic<int> cleanup_result{-1};
     auto cleanup_task = Task([&] {
         CoTcpConnection conn{connection};
-        const auto read = conn.Read(Until(500ms));
-        if (read.state == ReadState::Data) {
-            read.data.AppendTo(*cleanup_out);
+        auto [read_data, read_error] = conn.Read(Until(500ms));
+        if (!read_error) {
+            read_data.AppendTo(*cleanup_out);
             cleanup_result.store(0);
         }
     });

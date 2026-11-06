@@ -5,6 +5,7 @@
 #include "../net/ProcessRuntimeTestMain.hpp"
 
 #include <bbt/coroutine/detail/Coroutine.hpp>
+#include <bbt/infra/http/detail/Pool.hpp>
 
 #include <cctype>
 
@@ -617,6 +618,139 @@ void KeepaliveExpiry() {
     std::cout << "keepalive_expiry immediate=1 dials=2\n";
 }
 
+// 直接驱动真实池租借，检查责任移动、重复归还、早退/异常及池句柄先销毁。
+void LeaseOwnership() {
+    using Pool = http::detail::ConnectionPool;
+    using Lease = Pool::Lease;
+    static_assert(!std::is_copy_constructible_v<Lease>);
+    static_assert(!std::is_copy_assignable_v<Lease>);
+    static_assert(std::is_nothrow_move_constructible_v<Lease>);
+    static_assert(std::is_nothrow_move_assignable_v<Lease>);
+    static_assert(std::is_nothrow_destructible_v<Lease>);
+
+    Watchdog watchdog;
+    HttpPeer peer;
+    Host host;
+    const auto sockets_base = SocketCount();
+    http::PoolLimits limits;
+    limits.max_connections = 2;
+    limits.max_keepalive_connections = 2;
+    Pool pool(host.engine, limits, 1024 * 1024, std::nullopt);
+    const http::detail::Origin origin{"http", "127.0.0.1",
+                                     static_cast<std::uint16_t>(peer.port())};
+    const auto acquire = [&](Pool& owner) {
+        return host.Call([&] {
+            return bbt_co_await owner.Acquire(origin, peer.address(), http::detail::ResolveDeadlines(
+                http::Timeout{}, Until().deadline, std::chrono::steady_clock::now()));
+        });
+    };
+    const auto empty = [&] {
+        return WaitUntil([&] { return pool.Stats().budget == 0; });
+    };
+
+    Lease moved;
+    {
+        auto acquired = acquire(pool);
+        CHECK(acquired);
+        Lease source(std::move(acquired).value());
+        moved = std::move(source);
+        CHECK(!source.connection);
+        source.Release(true);
+    }
+    CHECK(pool.Stats().active == 1);
+    CHECK(!moved.connection->Net().Closed());
+    const auto reused_id = moved.connection->Net().Id();
+    // 完整 HTTP 回程后确认可复用；移动源销毁没有关闭目标持有的连接。
+    auto builder = http::Client::Create(host.engine, ClientOptionsFor(peer, limits));
+    CHECK(builder);
+    auto request = builder.value()->BuildRequest("GET", "/lease", http::RequestOptions{});
+    CHECK(request);
+    auto serialized = http::detail::SerializeRequest(request.value());
+    CHECK(serialized);
+    CHECK(host.Call([&] {
+        auto exchanged = bbt_co_await moved.connection->Exchange(request.value(), serialized.value(),
+            http::detail::ResolveDeadlines(request.value().timeout, Until().deadline,
+                                          std::chrono::steady_clock::now()));
+        CHECK(exchanged);
+        CHECK(exchanged.value().response.body == "peer-default");
+        CHECK(exchanged.value().keep_alive);
+        return true;
+    }));
+    moved.Release(true);
+    moved.Release(false);
+    CHECK(!moved.connection);
+    CHECK(pool.Stats().idle == 1);
+    CHECK(pool.Stats().active == 0);
+    CHECK(peer.requests_total() == 1);
+    CHECK(peer.accept_total() == 1);
+
+    // 覆盖已有责任的移动赋值必须先退役旧租借，不能误退役新租借。
+    auto first = acquire(pool);
+    CHECK(first);
+    CHECK(first.value().connection->Net().Id() == reused_id);
+    auto old_connection = first.value().connection->Net();
+    auto second = acquire(pool);
+    CHECK(second);
+    auto new_connection = second.value().connection->Net();
+    first.value() = std::move(second).value();
+    CHECK(WaitUntil([&] { return old_connection.Closed(); }));
+    CHECK(!new_connection.Closed());
+    CHECK(!second.value().connection);
+    first.value().Release(false);
+    CHECK(WaitUntil([&] { return new_connection.Closed(); }));
+    CHECK(empty());
+
+    // 未确认健康时，正常早退和异常展开都保守退役且无需协程析构。
+    auto early = host.Call([&] {
+        auto acquired = bbt_co_await pool.Acquire(origin, peer.address(), http::detail::ResolveDeadlines(
+            http::Timeout{}, Until().deadline, std::chrono::steady_clock::now()));
+        CHECK(acquired);
+        return acquired.value().connection->Net();
+    });
+    CHECK(WaitUntil([&] { return early.Closed(); }));
+    CHECK(empty());
+    net::Connection exceptional;
+    bool caught = false;
+    try {
+        host.Call([&] {
+            auto acquired = bbt_co_await pool.Acquire(origin, peer.address(), http::detail::ResolveDeadlines(
+                http::Timeout{}, Until().deadline, std::chrono::steady_clock::now()));
+            CHECK(acquired);
+            exceptional = acquired.value().connection->Net();
+            throw std::runtime_error("lease unwind");
+        });
+    } catch (const std::runtime_error& error) {
+        CHECK(std::string(error.what()) == "lease unwind");
+        caught = true;
+    }
+    CHECK(caught);
+    CHECK(WaitUntil([&] { return exceptional.Closed(); }));
+    CHECK(empty());
+
+    // 重复归还/移动源析构不能多减 inflight：仍持有一份时必须拒绝排空成功。
+    auto held = acquire(pool);
+    CHECK(held);
+    moved.Release(true);
+    ExpectCode(pool.Shutdown(std::chrono::steady_clock::now() + 10ms), ErrorCode::TimedOut);
+    held.value().Release(false);
+    CHECK(pool.Shutdown(std::chrono::steady_clock::now() + 1s));
+    CHECK(empty());
+
+    auto owner = std::make_unique<Pool>(host.engine, limits, 1024 * 1024, std::nullopt);
+    auto survivor = acquire(*owner);
+    CHECK(survivor);
+    auto surviving_connection = survivor.value().connection->Net();
+    owner.reset();
+    survivor.value().Release(false);
+    CHECK(WaitUntil([&] { return surviving_connection.Released(); }));
+
+    builder.value()->Close();
+    pool.Close(MakeError(ErrorCode::Closed, "test complete"));
+    peer.Stop();
+    host.Finish();
+    CHECK(WaitUntil([&] { return SocketCount() <= sockets_base; }));
+}
+
 int Run(int argc, char** argv) {
     Watchdog watchdog;
     try {
@@ -639,6 +773,7 @@ int Run(int argc, char** argv) {
         }
         const std::string test_case = argv[1];
         if (test_case == "get_post_reuse") { GetPostReuse(); }
+        else if (test_case == "lease_ownership") { LeaseOwnership(); }
         else if (test_case == "pool_queue_timeout") { PoolQueueTimeout(); }
         else if (test_case == "close_cancel_race") { CloseCancelRace(); }
         else if (test_case == "client_close_reason") { ClientCloseReason(); }

@@ -3,6 +3,7 @@
 #include <utility>
 
 #include <bbt/infra/net/Error.hpp>
+#include <bbt/infra/net/detail/CoInternal.hpp>
 #include <bbt/infra/net/detail/ConnectionState.hpp>
 #include <bbt/infra/net/detail/ReclaimRecord.hpp>
 #include <bbt/infra/net/detail/ReceiveRing.hpp>
@@ -72,6 +73,31 @@ ReadResult Connection::TryRead(std::string& out) {
         return {ReadStatus::Error, 0, make_error_code(NetErrc::Closed)};
     }
     return m_state->ring.TryRead(out);
+}
+
+std::error_code Connection::TryRead(Buffer& out) {
+    if (!m_state) {
+        return make_error_code(NetErrc::Closed);
+    }
+    auto attempt = m_state->ring.TryPopAll();
+    if (attempt.status != ReadStatus::Ok) {
+        switch (attempt.status) {
+        case ReadStatus::WouldBlock: return make_error_code(NetErrc::WouldBlock);
+        case ReadStatus::Busy: return make_error_code(NetErrc::Busy);
+        case ReadStatus::Eof: return make_error_code(NetErrc::Eof);
+        default: return attempt.error;
+        }
+    }
+    // 段表在 pop 提交前已准备好；提交后仅无抛移动，不丢已消费字节。
+    auto segments = std::move(attempt.takeout->segments);
+    out = Buffer(std::move(attempt.takeout), std::move(segments));
+    return {};
+}
+
+std::tuple<Buffer, std::error_code> Connection::TryRead() {
+    Buffer out;
+    auto error = TryRead(out);
+    return {std::move(out), error};
 }
 
 ReadAccess Connection::TryAccess() {

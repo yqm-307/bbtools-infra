@@ -28,6 +28,8 @@
 #include <cstdint>
 #include <string>
 #include <system_error>
+#include <tuple>
+#include <utility>
 
 #include <bbt/coroutine/sync/CoWaiter.hpp>
 
@@ -52,16 +54,6 @@ struct ConnectionStatus {
     bool released{true};                  // fd 已关且 owner 本连接责任清理
 };
 
-enum class ReadState { Data, Eof, Error };
-
-struct ReadOutcome {
-    ReadState state{ReadState::Error};
-    Buffer data;
-    std::error_code error;
-    // Data: data.Size() > 0 && !error；Eof: 空 data && !error；
-    // Error: 空 data && error。失败零消费；没有「空 Data」或裸空 Buffer 表 EOF。
-};
-
 class ICoConnection {
 public:
     virtual ~ICoConnection() = default;
@@ -71,7 +63,22 @@ public:
     // 等到有数据时，原子取走线性化点上所有已发布可读字节并移交 backing。
     // Busy/WouldBlock 内部等待；先交尾部，耗尽后才 Eof/Error。
     // options 只约束等待；超时/取消/OOM 不消费，不改为自动 RequestClose。
-    virtual ReadOutcome Read(const bbt::coroutine::WaitOptions& options = {}) = 0;
+    virtual std::error_code Read(Buffer& out,
+                                 const bbt::coroutine::WaitOptions& options = {}) = 0;
+    std::tuple<Buffer, std::error_code> Read(
+        const bbt::coroutine::WaitOptions& options = {}) {
+        Buffer out;
+        auto error = Read(out, options);
+        return {std::move(out), error};
+    }
+
+    // 任意合法调用域；不等待、不校验协程上下文。
+    virtual std::error_code TryRead(Buffer& out) = 0;
+    std::tuple<Buffer, std::error_code> TryRead() {
+        Buffer out;
+        auto error = TryRead(out);
+        return {std::move(out), error};
+    }
 
     // ---- 写：非挂起提交 + 协程组合等待 ----
     // 任意合法调用域，非挂起；全量接纳或零接纳，不等容量/发送完成。

@@ -69,6 +69,16 @@ foreach(_case raw_roundtrip co_accept_read_write co_dial close_retained
         WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/runtime")
 endforeach()
 
+# owning 移交与真实 TCP 物理回收，保留 Buffer 跨挂起和关闭。
+add_test(NAME net.read_overload_contract COMMAND Test_net_tcp read_overload_contract)
+set_tests_properties(net.read_overload_contract PROPERTIES TIMEOUT 60
+    LABELS "unit"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/runtime")
+add_test(NAME net.buffer_transfer_lifetime COMMAND Test_net_tcp buffer_transfer_lifetime)
+set_tests_properties(net.buffer_transfer_lifetime PROPERTIES TIMEOUT 60
+    LABELS "unit"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/runtime")
+
 # API 冻结契约：公共面守卫寿命、执行域 gate、Options 契约、
 # 输出归属、建连单一交付与未交付回收、accept 配置与共存。
 # 编译期冻结（公共头不含 State/内部构造/测试屏障/旧等待 API）由

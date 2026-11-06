@@ -23,6 +23,7 @@
 
 #include <bbt/coroutine/coroutine.hpp>
 #include <bbt/infra/net/CoTcpConnection.hpp>
+#include <bbt/infra/net/Error.hpp>
 #include <bbt/infra/net/Engine.hpp>
 #include <bbt/infra/net/ICoConnection.hpp>
 #include <bbt/infra/net/NativeSocket.hpp>
@@ -82,7 +83,7 @@ int main() {
     check(!engine.LocalAddresses(addresses) && addresses.size() == 1, "local addresses");
 
     std::atomic<int> echo_ok{0};
-    std::atomic<int> echo_drained{0};   // 尾部读空后的守卫状态断言
+    std::atomic<int> echo_drained{0};   // 尾部读空后的非等待状态断言
     auto server_task = [&] {
         auto accepted = engine.CoAccept(Until(3000ms));
         if (accepted.error) {
@@ -90,11 +91,11 @@ int main() {
         }
         net::Connection connection = accepted.connection.Raw();
         net::CoTcpConnection conn{connection};
-        auto read = conn.Read(Until(3000ms));
-        if (read.state != net::ReadState::Data) {
+        auto [read_data, read_error] = conn.Read(Until(3000ms));
+        if (bool(read_error)) {
             return;
         }
-        const auto data = read.data.CopyTo();
+        const auto data = read_data.CopyTo();
         const auto report = conn.Write(data, Until(3000ms));
         if (report.wait_error) {
             return;
@@ -104,10 +105,9 @@ int main() {
             data == "hello") {
             echo_ok.store(1);
         }
-        // 公开读取守卫：读空后立即再取一次保护应得到 WouldBlock（不是 Busy）；
-        // 守卫持连接状态强引用，释放 connection 之后仍可安全 Size/析构。
-        auto drained = connection.TryAccess();
-        if (!drained) {
+        // 非等待读取同样移交 owning Buffer；读空后明确返回 WouldBlock。
+        auto [drained, error] = connection.TryRead();
+        if (error == net::make_error_code(net::NetErrc::WouldBlock) && drained.Empty()) {
             echo_drained.store(1);
         }
         conn.RequestClose();
@@ -150,7 +150,7 @@ int main() {
 
     check(echo_drained.load() == 1, "read guard would_block after drain");
     std::cout << "co_net_service echo=" << (echo_ok.load() ? "ok" : "bad")
-              << " guard_wouldblock_after_drain=" << (echo_drained.load() ? "ok" : "bad")
+              << " owning_wouldblock_after_drain=" << (echo_drained.load() ? "ok" : "bad")
               << " failures=" << failures.load() << '\n';
     const bool clean = failures.load() == 0;
     std::cout.flush();

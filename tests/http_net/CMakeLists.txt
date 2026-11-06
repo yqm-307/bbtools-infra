@@ -5,7 +5,7 @@ target_link_libraries(Test_http_net_contract PRIVATE bbt::infra_http_net)
 target_compile_options(Test_http_net_contract PRIVATE -Wall -Wextra -Wpedantic)
 foreach(_case get_post_reuse pool_queue_timeout close_cancel_race bad_stream_retire
         keepalive_expiry omitted_call_options client_close_reason client_shutdown_drain
-        client_shutdown_interrupted_by_close)
+        client_shutdown_interrupted_by_close lease_ownership)
     add_test(NAME http.net.${_case} COMMAND Test_http_net_contract ${_case})
     set_tests_properties(http.net.${_case} PROPERTIES TIMEOUT 30 LABELS "unit")
 endforeach()
@@ -35,7 +35,7 @@ target_link_libraries(Test_http_net_streaming PRIVATE bbt::infra_http_net)
 target_compile_options(Test_http_net_streaming PRIVATE -Wall -Wextra -Wpedantic)
 foreach(_case stream_wire stream_variant_buffered stream_disallowed stream_commit_boundary
         stream_peer_abort stream_slow_reader stream_lifecycle stream_lifetime stream_start_deadline
-        stream_close_in_handler)
+        stream_close_in_handler response_header_parity)
     add_test(NAME http.net.${_case} COMMAND Test_http_net_streaming ${_case})
     set_tests_properties(http.net.${_case} PROPERTIES TIMEOUT 30 LABELS "unit")
 endforeach()

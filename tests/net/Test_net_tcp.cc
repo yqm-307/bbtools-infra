@@ -13,6 +13,7 @@
 // write_fifo_prefix OutboundQueue 部分写 FIFO/真实前缀/错误结算/Settling/Close
 // co_read_timeout CoRead 超时不消费
 
+#include <bbt/coroutine/detail/Coroutine.hpp>
 #include <bbt/infra/net/Connection.hpp>
 #include <bbt/infra/net/ConnectionResult.hpp>
 #include <bbt/infra/net/CoTcpConnection.hpp>
@@ -22,6 +23,7 @@
 #include <bbt/infra/net/NativeSocket.hpp>
 #include <bbt/infra/net/RawHandler.hpp>
 #include <bbt/infra/net/detail/ConnectionState.hpp>
+#include <bbt/infra/net/detail/CoInternal.hpp>
 #include <bbt/infra/net/detail/ReceiveRing.hpp>
 #include <bbt/infra/net/detail/TestAccess.hpp>
 
@@ -372,9 +374,9 @@ static void CoAcceptReadWrite() {
         auto res = engine.CoAccept(Until(3000ms));
         if (res.error) { result.store(1); return; }
         CoTcpConnection connection = res.connection;
-        auto read = connection.Read(Until(3000ms));
-        if (read.state != ReadState::Data) { result.store(2); return; }
-        auto report = connection.Write(read.data.CopyTo(), Until(3000ms));
+        auto [read_data, read_error] = connection.Read(Until(3000ms));
+        if (bool(read_error)) { result.store(2); return; }
+        auto report = connection.Write(read_data.CopyTo(), Until(3000ms));
         if (report.wait_error || report.outcome.phase != WritePhase::Done) {
             result.store(3); return;
         }
@@ -416,8 +418,8 @@ static void CoDial() {
         if (report.wait_error || report.outcome.phase != WritePhase::Done) {
             result.store(2); return;
         }
-        auto read = connection.Read(Until(3000ms));
-        if (read.state != ReadState::Data || read.data.CopyTo() != "dial") {
+        auto [read_data, read_error] = connection.Read(Until(3000ms));
+        if (bool(read_error) || read_data.CopyTo() != "dial") {
             result.store(3); return;
         }
         connection.RequestClose();
@@ -722,16 +724,223 @@ static void CoReadTimeout() {
     auto out = std::make_shared<std::string>();
     auto task = Task([&] {
         CoTcpConnection co_conn{connection};
-        const auto read = co_conn.Read(Until(30ms));
-        if (read.state == ReadState::Error
-            && read.error == std::make_error_code(std::errc::timed_out)
-            && read.data.Empty() && out->empty()) {
+        auto [read_data, read_error] = co_conn.Read(Until(30ms));
+        if (bool(read_error)
+            && read_error == std::make_error_code(std::errc::timed_out)
+            && read_data.Empty() && out->empty()) {
             result.store(0);
         }
     });
     Get(task);
     CHECK(result.load() == 0);
     std::cout << "co_read_timeout out_unchanged=ok\n";
+}
+
+static void BufferTransferLifetime() {
+    StartRuntime(2);
+    // 先证明竞争/终态都不改已有输出，且容量在移交后立即释放。
+    auto state = std::make_shared<ConnectionState>(1, 8, 8, 4, nullptr);
+    auto raw = ConnectionTestAccess::Make(state);
+    Buffer held;
+    CHECK(raw.TryRead(held) == make_error_code(NetErrc::WouldBlock));
+    CHECK(state->ring.TryAppend("abcdefgh").status == ReadStatus::Ok);
+    {
+        auto guard = raw.TryAccess();
+        auto busy = std::async(std::launch::async, [&] {
+            return raw.TryRead(held);
+        });
+        CHECK(busy.get() == make_error_code(NetErrc::Busy));
+        CHECK(held.Empty());
+        CHECK(guard.Peek().size() == 8);
+    }
+    CHECK(!raw.TryRead(held));
+    CHECK(held.CopyTo() == "abcdefgh");
+    CHECK(raw.ReadableBytes() == 0);
+    CHECK(raw.TryRead(held) == make_error_code(NetErrc::WouldBlock));
+    CHECK(held.CopyTo() == "abcdefgh");
+    CHECK(Connection{}.TryRead(held) == make_error_code(NetErrc::Closed));
+    CHECK(held.CopyTo() == "abcdefgh");
+    CHECK(state->ring.TryAppend("ijklmnop").status == ReadStatus::Ok);
+    auto second = Task([&] {
+        CoTcpConnection co{raw};
+        auto [read_data, read_error] = co.Read(Until(1000ms));
+        CHECK(!read_error);
+        CHECK(read_data.CopyTo() == "ijklmnop");
+    });
+    Get(second);
+    CHECK(held.CopyTo() == "abcdefgh");
+
+    const auto sockets = [] {
+        std::size_t count = 0;
+        for (const auto& entry : std::filesystem::directory_iterator("/proc/self/fd")) {
+            std::error_code error;
+            const auto target = std::filesystem::read_symlink(entry.path(), error).string();
+            if (!error && target.rfind("socket:[", 0) == 0) { ++count; }
+        }
+        return count;
+    };
+    const auto baseline = sockets();
+    auto handler = std::make_shared<StoreHandler>();
+    Engine engine(handler);
+    auto config = ServerConfig(Loopback(0));
+    config.options.max_inbound_bytes = 4096;
+    EngineRunner runner(engine, config);
+    CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
+    std::vector<Address> addresses;
+    CHECK(!engine.LocalAddresses(addresses));
+    auto client = ConnectClient(addresses[0]);
+    Connection connection;
+    CHECK(WaitUntil([&] {
+        std::lock_guard<std::mutex> lock(handler->mutex);
+        if (!handler->stored) { return false; }
+        connection = *handler->stored;
+        return true;
+    }, 3000ms));
+    const std::string first(4096, 'a');
+    CHECK(client.Send(first.data(), first.size()).bytes == first.size());
+    CHECK(WaitUntil([&] { return connection.ReadableBytes() == first.size(); }, 3000ms));
+    Buffer transferred;
+    const auto taken = connection.TryRead(transferred);
+    CHECK(!taken);
+    CHECK(transferred.CopyTo() == first);
+    CHECK(connection.ReadableBytes() == 0);
+
+    // 读等待已注册后再发送；首个 Buffer 跨实际挂起和下一批容量复用保留。
+    auto live_state = CoAccess::StateOf(connection);
+    std::atomic<bool> waiting{false};
+    live_state->ring.SetAfterAddHookForTest([&] { waiting.store(true); });
+    Buffer co_buffer;
+    auto reader = Task([&] {
+        CoTcpConnection co{connection};
+        auto [read_data, read_error] = co.Read(Until(3000ms));
+        CHECK(!read_error);
+        co_buffer = std::move(read_data);
+        CHECK(transferred.CopyTo() == first);
+    });
+    CHECK(WaitUntil([&] { return waiting.load(); }, 3000ms));
+    const std::string next(4096, 'b');
+    CHECK(client.Send(next.data(), next.size()).bytes == next.size());
+    Get(reader);
+    live_state->ring.SetAfterAddHookForTest({});
+    CHECK(co_buffer.CopyTo() == next);
+    CHECK(transferred.CopyTo() == first);
+    connection.RequestClose();
+    CHECK(WaitUntil([&] { return connection.Released(); }, 3000ms));
+    char byte;
+    CHECK(WaitUntil([&] { return client.Receive(&byte, 1).eof; }, 3000ms));
+    CHECK(!client.Close());
+    runner.CloseAndJoin();
+    CHECK(!runner.error);
+    CHECK(sockets() == baseline);
+    CHECK(connection.TryRead(transferred) == make_error_code(NetErrc::Eof));
+    CHECK(transferred.CopyTo() == first);
+    CHECK(co_buffer.CopyTo() == next);
+    std::cout << "buffer_transfer_lifetime retained=8192 released=1 sockets_restored=1\n";
+}
+
+static void ReadOverloadContract() {
+    StartRuntime(2);
+    auto state = std::make_shared<ConnectionState>(1, 64, 1024, 4, nullptr);
+    auto raw = ConnectionTestAccess::Make(state);
+    CoTcpConnection co{raw};
+    ICoConnection& iface = co;
+    Buffer out;
+    CHECK(state->ring.TryAppend("retained").status == ReadStatus::Ok);
+    CHECK(!raw.TryRead(out));
+    const auto* original = out.Segments().front().data;
+    const auto unchanged = [&] {
+        CHECK(out.CopyTo() == "retained");
+        CHECK(out.Segments().front().data == original);
+    };
+    const auto would_block = make_error_code(NetErrc::WouldBlock);
+    const auto busy = make_error_code(NetErrc::Busy);
+    const auto eof = make_error_code(NetErrc::Eof);
+    CHECK(raw.TryRead(out) == would_block);
+    unchanged();
+    auto [empty, blocked] = raw.TryRead();
+    CHECK(blocked == would_block && empty.Empty());
+    CHECK(iface.TryRead(out) == would_block);
+    unchanged();
+    auto [co_empty, co_blocked] = co.TryRead();
+    CHECK(co_blocked == would_block && co_empty.Empty());
+
+    // Read 的执行域门先于可用数据；失败不触及已有 out。
+    CHECK(state->ring.TryAppend("queued").status == ReadStatus::Ok);
+    CHECK(co.Read(out) == std::make_error_code(std::errc::operation_not_permitted));
+    unchanged();
+    CHECK(state->ring.Size() == 6);
+    {
+        auto guard = raw.TryAccess();
+        auto contender = std::async(std::launch::async, [&] {
+            CHECK(co.TryRead(out) == busy);
+            unchanged();
+            auto [data, error] = raw.TryRead();
+            CHECK(error == busy && data.Empty());
+        });
+        Get(contender);
+        CHECK(guard.Peek() == "queued");
+    }
+    auto [queued, ok] = raw.TryRead();
+    CHECK(!ok && queued.CopyTo() == "queued");
+    unchanged();
+
+    auto timeout = Task([&] {
+        CHECK(iface.Read(out, Until(20ms)) == std::make_error_code(std::errc::timed_out));
+        unchanged();
+        auto [data, error] = co.Read(Until(20ms));
+        CHECK(error == std::make_error_code(std::errc::timed_out) && data.Empty());
+    });
+    Get(timeout);
+    CHECK(state->ring.Size() == 0);
+
+    // 证明等待已登记后再取消，校验原错误及已有 Buffer 的 backing 不变。
+    std::atomic<bool> registered{false};
+    state->ring.SetAfterAddHookForTest([&] { registered.store(true); });
+    std::promise<bbt::coroutine::detail::Coroutine*> self;
+    auto self_future = self.get_future();
+    auto cancelled = Task([&] {
+        self.set_value(g_bbt_tls_coroutine_co);
+        CHECK(co.Read(out) == std::make_error_code(std::errc::operation_canceled));
+        unchanged();
+        auto [data, error] = iface.Read();
+        CHECK(error == std::make_error_code(std::errc::operation_canceled) && data.Empty());
+    });
+    CHECK(WaitUntil([&] { return registered.load(); }, 3000ms));
+    self_future.get()->RequestCancel();
+    Get(cancelled);
+    state->ring.SetAfterAddHookForTest({});
+    CHECK(state->ring.Size() == 0);
+
+    // 相同真源，两种 Read 重载先交尾部再报 EOF，且 EOF 不等同 Closed。
+    CHECK(state->ring.TryAppend("first").status == ReadStatus::Ok);
+    auto reads = Task([&] {
+        CHECK(!iface.Read(out));
+        CHECK(out.CopyTo() == "first");
+        CHECK(state->ring.TryAppend("tail").status == ReadStatus::Ok);
+        state->ring.MarkEof();
+        auto [tail, error] = co.Read();
+        CHECK(!error && tail.CopyTo() == "tail");
+        CHECK(co.Read(out) == eof && out.CopyTo() == "first");
+        auto [data, ended] = iface.Read();
+        CHECK(ended == eof && data.Empty());
+    });
+    Get(reads);
+    CHECK(!raw.Closed());
+    CHECK(raw.TryRead(out) == eof && out.CopyTo() == "first");
+    auto [data, ended] = co.TryRead();
+    CHECK(ended == eof && data.Empty());
+
+    auto faulty = std::make_shared<ConnectionState>(2, 64, 1024, 4, nullptr);
+    auto error_raw = ConnectionTestAccess::Make(faulty);
+    // 接收真源保存 OS 错误的 system_category（与真实 socket 错误一致）。
+    const auto fault = std::error_code(ECONNRESET, std::system_category());
+    CHECK(faulty->ring.TryAppend("before-error").status == ReadStatus::Ok);
+    faulty->ring.MarkError(fault);
+    CHECK(!error_raw.TryRead(out) && out.CopyTo() == "before-error");
+    CHECK(error_raw.TryRead(out) == fault && out.CopyTo() == "before-error");
+    auto [failed, error] = error_raw.TryRead();
+    CHECK(error == fault && failed.Empty());
+    std::cout << "read_overload_contract four_overloads busy eof timeout cancel out_unchanged=ok\n";
 }
 
 static void PerfBaseline() {
@@ -783,6 +992,8 @@ static int RunCases(int argc, char** argv) {
         else if (test == "ring_combined") { RingCombined(); }
         else if (test == "write_fifo_prefix") { WriteFifoPrefix(); }
         else if (test == "co_read_timeout") { CoReadTimeout(); }
+        else if (test == "read_overload_contract") { ReadOverloadContract(); }
+        else if (test == "buffer_transfer_lifetime") { BufferTransferLifetime(); }
         else if (test == "perf_baseline") { PerfBaseline(); }
         else { throw std::runtime_error("unknown test: " + test); }
         return 0;
