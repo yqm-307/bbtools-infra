@@ -71,15 +71,7 @@ public:
         Lease(const Lease&) = delete;
         Lease& operator=(const Lease&) = delete;
         Lease(Lease&&) noexcept = default;
-        Lease& operator=(Lease&& other) noexcept
-        {
-            if (this != &other) {
-                Release(false);
-                connection = std::move(other.connection);
-                m_state = std::move(other.m_state);
-            }
-            return *this;
-        }
+        Lease& operator=(Lease&& other) noexcept;
         ~Lease() noexcept
         {
             Release(false);

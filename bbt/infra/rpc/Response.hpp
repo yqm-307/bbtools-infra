@@ -38,16 +38,7 @@ public:
     }
 
     /** @brief 复制请求的五个关联字段；回复 payload 与 metadata 初始为空，不保留请求引用。 */
-    static Response FromRequest(const Request& request)
-    {
-        Response response;
-        response.SetRequestId(request.RequestId())
-            .SetService(request.Service())
-            .SetMethod(request.Method())
-            .SetRequestSchema(request.RequestSchema())
-            .SetResponseSchema(request.ResponseSchema());
-        return response;
-    }
+    static Response FromRequest(const Request& request);
 
     /// 回指的请求 id。
     const std::string& RequestId() const noexcept
@@ -139,3 +130,5 @@ private:
 };
 
 } // namespace bbt::infra::rpc
+
+#include <bbt/infra/rpc/impl/ResponseImpl.hpp>

@@ -76,21 +76,24 @@ public:
      * 也不会自动 RequestClose。
      */
     virtual std::error_code Read(Buffer& out, const bbt::coroutine::WaitOptions& options = {}) = 0;
-    std::tuple<Buffer, std::error_code> Read(const bbt::coroutine::WaitOptions& options = {})
-    {
-        Buffer out;
-        auto error = Read(out, options);
-        return {std::move(out), error};
-    }
+    /**
+     * @brief 等待读取并以 tuple 返回缓冲区和结果。
+     *
+     * 失败时不交付缓冲区，也不消费数据。
+     *
+     * @param options 本次等待的选项；deadline 只约束本次等待。
+     * @return 包含读取缓冲区和错误码的 tuple；失败时缓冲区为空。
+     */
+    std::tuple<Buffer, std::error_code> Read(const bbt::coroutine::WaitOptions& options = {});
 
     /// @brief 任意合法调用域；不等待、不校验协程上下文。
     virtual std::error_code TryRead(Buffer& out) = 0;
-    std::tuple<Buffer, std::error_code> TryRead()
-    {
-        Buffer out;
-        auto error = TryRead(out);
-        return {std::move(out), error};
-    }
+    /**
+     * @brief 非等待读取并以 tuple 返回缓冲区和结果。
+     *
+     * @return 包含读取缓冲区和错误码的 tuple；失败时缓冲区为空。
+     */
+    std::tuple<Buffer, std::error_code> TryRead();
 
     // ---- 写：非挂起提交 ----
     /**
@@ -157,3 +160,5 @@ public:
 };
 
 } // namespace bbt::infra::net
+
+#include <bbt/infra/net/impl/ICoConnectionImpl.hpp>

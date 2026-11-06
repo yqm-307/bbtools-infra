@@ -92,6 +92,13 @@ public:
 
     /// @brief owning 交付：成功非空；失败 out 不变、零消费。
     std::error_code TryRead(Buffer& out);
+    /**
+     * @brief 非挂起读取并以 tuple 返回缓冲区和结果。
+     *
+     * 委托给 TryRead(Buffer&)；失败时不消费数据，返回的 Buffer 为空。
+     *
+     * @return 包含读取缓冲区和错误码的 tuple；成功时错误码为空。
+     */
     std::tuple<Buffer, std::error_code> TryRead();
 
     /// @brief 兼容复制入口：竞争 Busy（零消费）；空且无终态 WouldBlock。

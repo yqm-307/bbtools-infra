@@ -9,12 +9,11 @@
  * 的同一真源。拷贝本对象只是再持一份同一连接的视图，销毁视图不影响连接寿命；关闭经 RequestClose
  * 发起，由 owner 完成物理收口。
  *
- * 构造责任：只有 Engine::CoAccept/CoDial 与测试接缝以 Connection 构造本对象；消费方不能凭裸状态
- * 构造。Connection 的私有构造约束原样继承。
+ * 构造责任：持有合法 Connection 值句柄的消费方可构造本对象，但不能凭裸状态伪造连接。
+ * Connection 的私有构造约束原样继承。
  *
- * 实现位置：Read、Write、WaitClosed、AsyncWrite 与 Status 的函数体在 CoTcpConnection.cc，
- * 等待逻辑依赖 ConnectionState 与 detail 部件，不进入公共头。RequestClose 与 Raw 为纯转发，
- * 留在头内。
+ * 实现位置：Read、Write、WaitClosed、AsyncWrite、RequestClose 与 Status 的函数体在 CoTcpConnection.cc，
+ * 等待逻辑依赖 ConnectionState 与 detail 部件，不进入公共头。Raw 保留头内的纯转发。
  */
 
 #include <cstdint>
@@ -45,7 +44,18 @@ public:
     ~CoTcpConnection() override = default;
 
     // 以下每个 override 完整继承 ICoConnection 的域/挂起/所有权/错误契约。
+    /**
+     * @brief 暴露 ICoConnection 的 tuple 等待读取重载。
+     *
+     * @param options 本次等待的选项；deadline 只约束本次等待。
+     * @return 包含读取缓冲区和错误码的 tuple；失败时缓冲区为空。
+     */
     using ICoConnection::Read;
+    /**
+     * @brief 暴露 ICoConnection 的 tuple 非等待读取重载。
+     *
+     * @return 包含读取缓冲区和错误码的 tuple；失败时缓冲区为空。
+     */
     using ICoConnection::TryRead;
     /// @brief 非等待 owning 读取；契约见 ICoConnection::TryRead。
     std::error_code TryRead(Buffer& out) override

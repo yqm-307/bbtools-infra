@@ -3,6 +3,16 @@
 namespace bbt::infra::http {
 namespace detail {
 
+inline ConnectionPool::Lease& ConnectionPool::Lease::operator=(Lease&& other) noexcept
+{
+    if (this != &other) {
+        Release(false);
+        connection = std::move(other.connection);
+        m_state = std::move(other.m_state);
+    }
+    return *this;
+}
+
 inline ConnectionPool::ConnectionPool(std::shared_ptr<net::Engine> engine, PoolLimits limits,
                                       std::uint64_t max_body_bytes, std::optional<std::uint64_t> max_header_bytes)
     : m_state(std::make_shared<State>(std::move(engine), limits, max_body_bytes, max_header_bytes))
