@@ -73,14 +73,7 @@ public:
      * 它与 ring 的语义 Size 来源不同：ring 的已读额度在移交时已释放，本值只反映本 Buffer
      * 持有的字节数。
      */
-    std::size_t Size() const noexcept
-    {
-        std::size_t total = 0;
-        for (const auto& seg : m_segments) {
-            total += seg.size;
-        }
-        return total;
-    }
+    std::size_t Size() const noexcept;
 
     /// @brief 段数。1 表示连续存储；2 表示绕环的两段，即首段尾部与回绕段。
     std::size_t SegmentCount() const noexcept
@@ -99,23 +92,10 @@ public:
      *
      * Buffer 本身不消费。需要连续视图且不想逐段处理时使用；零拷贝路径不需要调用本函数。
      */
-    std::string CopyTo() const
-    {
-        std::string out;
-        out.reserve(Size());
-        for (const auto& seg : m_segments) {
-            out.append(seg.data, seg.size);
-        }
-        return out;
-    }
+    std::string CopyTo() const;
 
     /// @brief 将数据追加复制到已有的 out 末尾，不清空 out。
-    void AppendTo(std::string& out) const
-    {
-        for (const auto& seg : m_segments) {
-            out.append(seg.data, seg.size);
-        }
-    }
+    void AppendTo(std::string& out) const;
 
 private:
     // owning backing 句柄：实现由 Connection 的非等待移交原语从
@@ -124,10 +104,7 @@ private:
     // private 构造责任：只有移交路径（Connection::TryRead）与测试接缝
     // 可凭 backing+段构造非空 Buffer；消费者不能伪造「段来自 backing」的
     // owning 不变量。
-    explicit Buffer(std::shared_ptr<void> backing, std::vector<BufferSegment> segments)
-        : m_backing(std::move(backing)), m_segments(std::move(segments))
-    {
-    }
+    explicit Buffer(std::shared_ptr<void> backing, std::vector<BufferSegment> segments);
 
     friend class Connection;
     friend struct BufferTestAccess;

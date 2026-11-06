@@ -145,20 +145,8 @@ using RpcHandler = std::function<result<RpcEnvelope>(IncomingCallContext, RpcEnv
  * @param limits 待校验的装配值。
  * @return 通过返回 ok；违规返回 InvalidArgument。
  */
-inline result<void> ValidateNetworkLimits(const NetworkLimits& limits)
-{
-    if (limits.max_connections == 0 || limits.max_connections > kNetworkLimitsMaxConnections)
-        return result<void>::err(MakeError(ErrorCode::InvalidArgument, "max_connections out of range"));
-    if (limits.max_inflight == 0 || limits.max_inflight > kNetworkLimitsMaxInflight)
-        return result<void>::err(MakeError(ErrorCode::InvalidArgument, "max_inflight out of range"));
-    if (limits.max_header_bytes == 0 || limits.max_header_bytes > kNetworkLimitsMaxHeaderBytes)
-        return result<void>::err(MakeError(ErrorCode::InvalidArgument, "max_header_bytes out of range"));
-    if (limits.max_body_bytes == 0 || limits.max_body_bytes > kNetworkLimitsMaxBodyBytes)
-        return result<void>::err(MakeError(ErrorCode::InvalidArgument, "max_body_bytes out of range"));
-    if (limits.incoming_timeout <= std::chrono::milliseconds{0}
-        || limits.incoming_timeout > kNetworkLimitsMaxIncomingTimeout)
-        return result<void>::err(MakeError(ErrorCode::InvalidArgument, "incoming_timeout out of range"));
-    return result<void>::ok();
-}
+inline result<void> ValidateNetworkLimits(const NetworkLimits& limits);
 
 } // namespace bbt::infra
+
+#include <bbt/infra/impl/NetworkTypesImpl.hpp>

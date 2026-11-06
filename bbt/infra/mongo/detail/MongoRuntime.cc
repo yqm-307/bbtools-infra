@@ -1108,3 +1108,201 @@ result<std::shared_ptr<CoMongoDb>> CoMongoDb::Create(MongoRuntimeConfig config)
 
 } // namespace mongo
 } // namespace bbt::infra
+
+namespace bbt::infra::mongo_detail {
+
+MongoOp::MongoOp(std::shared_ptr<MongoRuntime> rt, std::shared_ptr<MongoCollImpl> h, Kind k, MongoDocument d,
+                 MongoDocument u)
+    : runtime(std::move(rt)), handle(std::move(h)), kind(k), doc(std::move(d)), update(std::move(u))
+{
+}
+
+void MongoOp::Finish(result<MongoOpOutcome> r) noexcept
+{
+    if (finished.exchange(true)) {
+        MaybeUnregister();
+        return;
+    }
+    outcome = std::move(r);
+    MaybeUnregister();
+    // 结果先落地、再唤醒：等待者恢复后直接读 outcome，不依赖载荷。
+    // Notify 跨线程安全；等待者尚未 park 时走 CoPollEvent PENDING 兑现。
+    sig->Notify();
+}
+
+MongoRuntime::MongoRuntime(mongo::MongoRuntimeConfig config, bbt::coroutine::CoObjectInfo info)
+    : m_config(std::move(config)), m_info(std::move(info))
+{
+}
+
+bbt::coroutine::CoObjectInfo MongoRuntime::GetObjectInfo() const
+{
+    return m_info;
+}
+
+bool MongoRuntime::RegisterOp(const std::shared_ptr<MongoOp>& op)
+{
+    std::lock_guard<std::mutex> lk(m_ops_mtx);
+    if (m_io_dead)
+        return false;
+    m_ops.insert(op);
+    return true;
+}
+
+void MongoRuntime::UnregisterOp(const std::shared_ptr<MongoOp>& op)
+{
+    bool drained = false;
+    {
+        std::lock_guard<std::mutex> lk(m_ops_mtx);
+        m_ops.erase(op);
+        drained = m_io_dead && m_ops.empty() && m_live_workers.load() == 0;
+    }
+    // 只唤醒排空等待者；终态发布归唯一 finalizer（join 之后），
+    // 不在此处提前 MarkClosed。
+    if (drained)
+        m_drain_cv.notify_all();
+}
+
+std::size_t MongoRuntime::QueuedOpsForTest() const noexcept
+{
+    std::lock_guard<std::mutex> lk(m_queue_mtx);
+    return m_queue.size();
+}
+
+std::size_t MongoRuntime::DriverCallsInFlightForTest() const noexcept
+{
+    std::lock_guard<std::mutex> lk(m_ops_mtx);
+    std::size_t n = 0;
+    for (const auto& op : m_ops)
+        if (op->phase.load() == MongoOp::Phase::kRunning)
+            ++n;
+    return n;
+}
+
+bool MongoRuntime::IoDeadForTest() const noexcept
+{
+    std::lock_guard<std::mutex> lk(m_ops_mtx);
+    return m_io_dead;
+}
+
+MongoCollImpl::MongoCollImpl(std::shared_ptr<MongoRuntime> runtime, mongo::MongoTarget target,
+                             bbt::coroutine::CoObjectInfo info)
+    : m_runtime(std::move(runtime)), m_target(std::move(target)), m_info(std::move(info))
+{
+}
+
+MongoCollImpl::~MongoCollImpl()
+{
+    Close();
+}
+
+void MongoCollImpl::Close() noexcept
+{
+    m_close.BeginClose();
+    m_close.MarkClosed();
+}
+
+bbt::coroutine::CoObjectInfo MongoCollImpl::GetObjectInfo() const
+{
+    return m_info;
+}
+
+CoMongoCliImpl::CoMongoCliImpl(MongoClientConfig config, bbt::coroutine::CoObjectInfo info)
+    : m_config(std::move(config)), m_info(std::move(info))
+{
+}
+
+CoMongoCliImpl::~CoMongoCliImpl()
+{
+    Close();
+}
+
+bool CoMongoCliImpl::IsClosed() const noexcept
+{
+    const auto rt = RuntimeSnapshot();
+    return rt ? rt->IsClosed() : m_close.IsClosed();
+}
+
+bbt::coroutine::CoObjectInfo CoMongoCliImpl::GetObjectInfo() const
+{
+    return m_info;
+}
+
+std::size_t CoMongoCliImpl::LiveWorkersForTest() const noexcept
+{
+    const auto rt = RuntimeSnapshot();
+    return rt ? rt->LiveWorkersForTest() : 0;
+}
+
+std::size_t CoMongoCliImpl::QueuedOpsForTest() const noexcept
+{
+    const auto rt = RuntimeSnapshot();
+    return rt ? rt->QueuedOpsForTest() : 0;
+}
+
+std::size_t CoMongoCliImpl::DriverCallsInFlightForTest() const noexcept
+{
+    const auto rt = RuntimeSnapshot();
+    return rt ? rt->DriverCallsInFlightForTest() : 0;
+}
+
+std::shared_ptr<MongoCollImpl> CoMongoCliImpl::CollSnapshot() const noexcept
+{
+    std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
+    return m_coll;
+}
+
+std::shared_ptr<MongoRuntime> CoMongoCliImpl::RuntimeSnapshot() const noexcept
+{
+    std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
+    return m_runtime;
+}
+
+void CoMongoCliImpl::FinishStarting() noexcept
+{
+    {
+        std::lock_guard<std::mutex> lk(m_lifecycle_mtx);
+        m_starting = false;
+    }
+    m_lifecycle_cv.notify_all();
+}
+
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+std::size_t CoMongoCliImpl::RunningDriverCallsForTest() const noexcept
+{
+    const auto rt = RuntimeSnapshot();
+    return rt ? rt->RunningDriverCallsForTest() : 0;
+}
+#endif
+
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+std::size_t CoMongoCliImpl::PeakDriverCallsForTest() const noexcept
+{
+    const auto rt = RuntimeSnapshot();
+    return rt ? rt->PeakDriverCallsForTest() : 0;
+}
+#endif
+
+void MongoOp::MaybeUnregister()
+{
+    if (finished && phase.load() == Phase::kDone)
+        runtime->UnregisterOp(shared_from_this());
+}
+
+} // namespace bbt::infra::mongo_detail
+
+namespace bbt::infra::mongo_detail {
+#ifdef BBT_INFRA_STRINGENT_DEBUG
+std::optional<bbt::infra::debug::MongoThreadEvidence> MongoRuntime::LastDriverThreadEvidenceForTest() const
+{
+    return m_obs.LastEvidence();
+}
+#endif
+}
+
+namespace bbt::infra::mongo_detail {
+CoMongoCliImpl::StartingScope::~StartingScope() noexcept
+{
+    cli->FinishStarting();
+}
+}

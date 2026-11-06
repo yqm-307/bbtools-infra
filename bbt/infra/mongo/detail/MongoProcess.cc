@@ -61,3 +61,12 @@ result<std::shared_ptr<MongoPoolLease>> AcquireMongoPool(const std::string& effe
 }
 
 } // namespace bbt::infra::mongo_detail
+
+namespace bbt::infra::mongo_detail {
+
+MongoPoolLease::MongoPoolLease(std::shared_ptr<mongocxx::v1::instance> inst, mongocxx::v1::uri u)
+    : instance(std::move(inst)), pool(std::move(u))
+{
+}
+
+} // namespace bbt::infra::mongo_detail

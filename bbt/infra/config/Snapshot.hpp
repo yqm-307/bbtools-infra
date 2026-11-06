@@ -29,10 +29,7 @@ struct Snapshot {
     Value value;                                         ///< 配置值。
 
     /// @brief 组合键，仅用于标识，不作语义分隔保证。
-    std::string FullKey() const
-    {
-        return ns + "/" + key;
-    }
+    std::string FullKey() const;
 
     /**
      * @brief 版本身份：(version, revision) 都相同时视为重复版本。

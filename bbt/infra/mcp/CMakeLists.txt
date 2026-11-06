@@ -23,7 +23,8 @@ add_library(bbt_infra_mcp_core STATIC
     JsonValue.cc
     McpTypes.cc
     Protocol.cc
-    Registry.cc)
+    Registry.cc
+    detail/Server.cc)
 add_library(bbt::infra_mcp_core ALIAS bbt_infra_mcp_core)
 target_include_directories(bbt_infra_mcp_core
     PUBLIC  "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>"

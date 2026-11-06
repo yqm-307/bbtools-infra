@@ -88,16 +88,8 @@ public:
     {
         return m_unhandled_failures.load(std::memory_order_relaxed);
     }
-    std::exception_ptr LastFailure() const
-    {
-        std::lock_guard<std::mutex> lock(m_observe_mutex);
-        return m_last_failure;
-    }
-    std::thread::id LastTickThread() const
-    {
-        std::lock_guard<std::mutex> lock(m_observe_mutex);
-        return m_last_tick_thread;
-    }
+    std::exception_ptr LastFailure() const;
+    std::thread::id LastTickThread() const;
     // OnTick 执行时当前 worker 的 ProcesserId；未命中的登记槽为 0。
     std::uint64_t LastTickProcesserId() const noexcept
     {

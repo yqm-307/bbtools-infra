@@ -59,10 +59,7 @@ struct BufferTestAccess {
     }
     // 凭移交原语构造 Buffer 的唯一测试接缝：等价于 CoTcpConnection::Read
     // 内部的移交构造；公共面不可达。
-    static Buffer Make(std::shared_ptr<void> backing, std::vector<BufferSegment> segments)
-    {
-        return Buffer(std::move(backing), std::move(segments));
-    }
+    static Buffer Make(std::shared_ptr<void> backing, std::vector<BufferSegment> segments);
 };
 
 } // namespace bbt::infra::net

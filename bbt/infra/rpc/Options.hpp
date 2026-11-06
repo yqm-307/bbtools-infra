@@ -168,22 +168,7 @@ public:
     /// 各项须为有限正数且不超上限；local_identity 非空、UTF-8、≤256 字节
     /// （wire peer_identity 约束，Codec.hpp 同源）。
     /// @return 违规返回 InvalidArgument（message 指明首个越界字段）。
-    result<void> Validate() const
-    {
-        if (m_local_identity.empty() || m_local_identity.size() > 256 || !infra::detail::IsValidUtf8(m_local_identity))
-            return result<void>::err(MakeError(ErrorCode::InvalidArgument, "local_identity empty/too long/not UTF-8"));
-        if (m_max_sessions == 0 || m_max_sessions > kMaxMaxSessions)
-            return result<void>::err(MakeError(ErrorCode::InvalidArgument, "max_sessions out of range"));
-        if (m_max_frame_bytes < kMinFrameBytes || m_max_frame_bytes > kMaxFrameBytes)
-            return result<void>::err(MakeError(ErrorCode::InvalidArgument, "max_frame_bytes out of range"));
-        if (m_system_queue_bytes == 0 || m_system_queue_bytes > kMaxQueueBytes || m_service_queue_bytes == 0
-            || m_service_queue_bytes > kMaxQueueBytes || m_actor_queue_bytes == 0
-            || m_actor_queue_bytes > kMaxQueueBytes)
-            return result<void>::err(MakeError(ErrorCode::InvalidArgument, "queue bytes out of range"));
-        if (m_service_weight == 0 || m_actor_weight == 0)
-            return result<void>::err(MakeError(ErrorCode::InvalidArgument, "lane weight must be non-zero"));
-        return result<void>::ok();
-    }
+    result<void> Validate() const;
 
 private:
     std::string m_local_identity;
@@ -235,13 +220,7 @@ public:
     ///
     /// 拒绝 epoch/已过期/远期 max 的 deadline，不让调用进入无界等待。
     /// @return 违规返回 InvalidArgument。
-    result<void> Validate() const
-    {
-        if (m_deadline == bbt::coroutine::Deadline::max() || m_deadline <= std::chrono::steady_clock::now())
-            return result<void>::err(
-                MakeError(ErrorCode::InvalidArgument, "deadline must be finite and in the future"));
-        return result<void>::ok();
-    }
+    result<void> Validate() const;
 
 private:
     bbt::coroutine::Deadline m_deadline{bbt::coroutine::Deadline::max()};
@@ -330,22 +309,7 @@ public:
     /// 各项须为有限正数且不超 NetworkLimits 硬上限；incoming_timeout 须有限
     /// 且 ≤24h；listen_address 须 Valid()。
     /// @return 违规返回 InvalidArgument（message 指明首个越界字段）。
-    result<void> Validate() const
-    {
-        if (!m_listen_address.Valid())
-            return result<void>::err(MakeError(ErrorCode::InvalidArgument, "listen_address invalid"));
-        if (m_max_frame_bytes < kMinFrameBytes || m_max_frame_bytes > kMaxFrameBytes)
-            return result<void>::err(MakeError(ErrorCode::InvalidArgument, "max_frame_bytes out of range"));
-        if (m_max_connections == 0 || m_max_connections > kNetworkLimitsMaxConnections)
-            return result<void>::err(MakeError(ErrorCode::InvalidArgument, "max_connections out of range"));
-        if (m_max_inflight == 0 || m_max_inflight > kNetworkLimitsMaxInflight)
-            return result<void>::err(MakeError(ErrorCode::InvalidArgument, "max_inflight out of range"));
-        if (m_max_handler_bytes == 0 || m_max_handler_bytes > kNetworkLimitsMaxBodyBytes)
-            return result<void>::err(MakeError(ErrorCode::InvalidArgument, "max_handler_bytes out of range"));
-        if (m_incoming_timeout <= std::chrono::milliseconds{0} || m_incoming_timeout > kNetworkLimitsMaxIncomingTimeout)
-            return result<void>::err(MakeError(ErrorCode::InvalidArgument, "incoming_timeout out of range"));
-        return result<void>::ok();
-    }
+    result<void> Validate() const;
 
 private:
     bbt::infra::net::Address m_listen_address;

@@ -81,13 +81,7 @@ public:
         return m_kind == Kind::Disabled;
     }
     /// 有限值档的取值；Inherit/Disabled 返回 nullopt。
-    std::optional<std::chrono::milliseconds> Finite() const noexcept
-    {
-        if (m_kind != Kind::Finite) {
-            return std::nullopt;
-        }
-        return m_value;
-    }
+    std::optional<std::chrono::milliseconds> Finite() const noexcept;
 
 private:
     enum class Kind { Inherit, Finite, Disabled };
@@ -111,15 +105,7 @@ struct Timeout {
     PhaseTimeout pool{PhaseTimeout::Milliseconds(std::chrono::milliseconds{5000})};    ///< 等池内可用连接
 
     /// 四档取同一个 PhaseTimeout 值。
-    static Timeout Uniform(PhaseTimeout phase) noexcept
-    {
-        Timeout value;
-        value.connect = phase;
-        value.read = phase;
-        value.write = phase;
-        value.pool = phase;
-        return value;
-    }
+    static Timeout Uniform(PhaseTimeout phase) noexcept;
 };
 
 /**

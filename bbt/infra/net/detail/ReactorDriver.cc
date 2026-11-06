@@ -160,3 +160,19 @@ void ReactorDriver::Wake() noexcept
 }
 
 } // namespace bbt::infra::net
+
+namespace bbt::infra::net {
+
+std::exception_ptr ReactorDriver::LastFailure() const
+{
+    std::lock_guard<std::mutex> lock(m_observe_mutex);
+    return m_last_failure;
+}
+
+std::thread::id ReactorDriver::LastTickThread() const
+{
+    std::lock_guard<std::mutex> lock(m_observe_mutex);
+    return m_last_tick_thread;
+}
+
+} // namespace bbt::infra::net

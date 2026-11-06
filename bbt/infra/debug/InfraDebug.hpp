@@ -45,18 +45,12 @@ struct MongoRuntimeObservation {
     mutable std::mutex evidence_mtx;
     std::optional<MongoThreadEvidence> last_evidence;
 
-    void Record(MongoThreadEvidence evidence)
-    {
-        std::lock_guard<std::mutex> lk(evidence_mtx);
-        last_evidence = std::move(evidence);
-    }
-    std::optional<MongoThreadEvidence> LastEvidence() const
-    {
-        std::lock_guard<std::mutex> lk(evidence_mtx);
-        return last_evidence;
-    }
+    void Record(MongoThreadEvidence evidence);
+    std::optional<MongoThreadEvidence> LastEvidence() const;
 };
 
 } // namespace bbt::infra::debug
+
+#include <bbt/infra/debug/impl/InfraDebugImpl.hpp>
 
 #endif // BBT_INFRA_STRINGENT_DEBUG

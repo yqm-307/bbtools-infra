@@ -16,7 +16,12 @@ add_library(bbt_infra_rpc_core STATIC
     Codec.cc
     Session.cc
     Client.cc
-    Server.cc)
+    Server.cc
+    Hooks.cc
+    Options.cc
+    Transport.cc
+    detail/Core.cc
+    detail/Tcp.cc)
 add_library(bbt::infra_rpc_core ALIAS bbt_infra_rpc_core)
 target_include_directories(bbt_infra_rpc_core
     PUBLIC "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>")

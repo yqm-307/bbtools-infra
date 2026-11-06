@@ -143,3 +143,39 @@ result<InputRequired> InputRequired::Create(std::map<std::string, ClientInputReq
 }
 
 } // namespace bbt::infra::mcp
+
+namespace bbt::infra::mcp {
+
+bool CancellationView::Cancelled() const noexcept
+{
+    return m_flag && m_flag->load(std::memory_order_acquire);
+}
+
+RequestContext::RequestContext(RequestId id, std::string protocol_version, JsonValue client_capabilities)
+    : RequestContext(std::move(id), std::move(protocol_version), std::move(client_capabilities), CancellationView{}, {},
+                     {})
+{
+}
+
+RequestContext::RequestContext(RequestId id, std::string protocol_version, JsonValue client_capabilities,
+                               CancellationView cancellation)
+    : RequestContext(std::move(id), std::move(protocol_version), std::move(client_capabilities),
+                     std::move(cancellation), {}, {})
+{
+}
+
+RequestContext::RequestContext(RequestId id, std::string protocol_version, JsonValue client_capabilities,
+                               CancellationView cancellation, std::map<std::string, JsonValue> input_responses,
+                               std::optional<std::string> request_state, std::chrono::steady_clock::time_point deadline)
+    : m_id(std::move(id)), m_protocol_version(std::move(protocol_version)),
+      m_client_capabilities(std::move(client_capabilities)), m_cancellation(std::move(cancellation)),
+      m_input_responses(std::move(input_responses)), m_request_state(std::move(request_state)), m_deadline(deadline)
+{
+}
+
+bool RequestContext::DeadlineExceeded() const noexcept
+{
+    return HasDeadline() && std::chrono::steady_clock::now() >= m_deadline;
+}
+
+} // namespace bbt::infra::mcp

@@ -29,6 +29,7 @@
  */
 
 #include <cstddef>
+#include <utility>
 #include <exception>
 #include <cstdint>
 #include <memory>
@@ -96,11 +97,7 @@ public:
      * 统计在工厂提交后才记账。Engine 是 native 域对象，原生线程可直接调用，不要求协程上下文。
      * 构造或登记失败沿工厂的异常路径传播，且不提交计数。
      */
-    template <class... Args> static std::shared_ptr<Engine> Create(Args&&... args)
-    {
-        return bbt::coroutine::MakeCoObject<Engine>(
-            "infra.net.Engine", "", [&] { return std::shared_ptr<Engine>(new Engine(std::forward<Args>(args)...)); });
-    }
+    template <class... Args> static std::shared_ptr<Engine> Create(Args&&... args);
 
     /**
      * @brief 直接构造。生产代码应使用 `Create()`，以便身份初始化与统计进入统一观测。
@@ -266,3 +263,5 @@ private:
 };
 
 } // namespace bbt::infra::net
+
+#include <bbt/infra/net/impl/EngineImpl.hpp>

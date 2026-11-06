@@ -350,10 +350,7 @@ public:
     }
 
     /// 库是否已发出关闭信号。
-    bool Cancelled() const noexcept
-    {
-        return m_flag && m_flag->load(std::memory_order_acquire);
-    }
+    bool Cancelled() const noexcept;
 
 private:
     std::shared_ptr<const std::atomic<bool>> m_flag;
@@ -454,20 +451,10 @@ template <typename Complete> class HandlerResult {
 public:
     /// 以完成值构造。
     /// @param value 完成值
-    static HandlerResult Completed(Complete value)
-    {
-        HandlerResult out;
-        out.m_value = std::move(value);
-        return out;
-    }
+    static HandlerResult Completed(Complete value);
     /// 以 input_required 构造（modern MRTR）。
     /// @param required 待客户端补全的输入请求
-    static HandlerResult Deferred(InputRequired required)
-    {
-        HandlerResult out;
-        out.m_value = std::move(required);
-        return out;
-    }
+    static HandlerResult Deferred(InputRequired required);
     /// 是否携带完成值。
     bool IsCompleted() const noexcept
     {
@@ -508,22 +495,14 @@ public:
     /// @param id 本次请求 id
     /// @param protocol_version 协商/声明的协议版本
     /// @param client_capabilities 客户端 capabilities
-    RequestContext(RequestId id, std::string protocol_version, JsonValue client_capabilities)
-        : RequestContext(std::move(id), std::move(protocol_version), std::move(client_capabilities), CancellationView{},
-                         {}, {})
-    {
-    }
+    RequestContext(RequestId id, std::string protocol_version, JsonValue client_capabilities);
     /// 同上，附带服务端关闭域视图。
     /// @param id 本次请求 id
     /// @param protocol_version 协商/声明的协议版本
     /// @param client_capabilities 客户端 capabilities
     /// @param cancellation 关闭域只读视图
     RequestContext(RequestId id, std::string protocol_version, JsonValue client_capabilities,
-                   CancellationView cancellation)
-        : RequestContext(std::move(id), std::move(protocol_version), std::move(client_capabilities),
-                         std::move(cancellation), {}, {})
-    {
-    }
+                   CancellationView cancellation);
     /// 完整构造：附带 modern MRTR 重试输入与期限。
     ///
     /// id-keyed inputResponses 的每项为 object 载荷；requestState 为 opaque
@@ -537,12 +516,7 @@ public:
     /// @param deadline 本请求期限；epoch 表示无期限
     RequestContext(RequestId id, std::string protocol_version, JsonValue client_capabilities,
                    CancellationView cancellation, std::map<std::string, JsonValue> input_responses,
-                   std::optional<std::string> request_state, std::chrono::steady_clock::time_point deadline = {})
-        : m_id(std::move(id)), m_protocol_version(std::move(protocol_version)),
-          m_client_capabilities(std::move(client_capabilities)), m_cancellation(std::move(cancellation)),
-          m_input_responses(std::move(input_responses)), m_request_state(std::move(request_state)), m_deadline(deadline)
-    {
-    }
+                   std::optional<std::string> request_state, std::chrono::steady_clock::time_point deadline = {});
 
     /// 本次请求 id。
     const RequestId& Id() const noexcept
@@ -576,10 +550,7 @@ public:
         return m_deadline;
     }
     /// 期限已过（handler 协作式退出观察点之一；终态落定仍在 owner/提交门）。
-    bool DeadlineExceeded() const noexcept
-    {
-        return HasDeadline() && std::chrono::steady_clock::now() >= m_deadline;
-    }
+    bool DeadlineExceeded() const noexcept;
     /// MRTR 重试输入（未携带时为空 map）。仅 modern 路径填充。
     const std::map<std::string, JsonValue>& InputResponses() const noexcept
     {
@@ -606,3 +577,5 @@ private:
 using ToolHandler = std::function<result<HandlerResult<ToolResult>>(const RequestContext&, JsonValue arguments)>;
 
 } // namespace bbt::infra::mcp
+
+#include <bbt/infra/mcp/impl/McpTypesImpl.hpp>

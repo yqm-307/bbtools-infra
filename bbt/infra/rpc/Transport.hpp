@@ -76,20 +76,11 @@ public:
     /// @brief 带关闭原因的 Close：默认丢弃原因并转发到 Close()，保持既有 adapter 源兼容。
     ///
     /// 需要把原因传到底座（HTTP 池）的 adapter 覆盖。
-    virtual void Close(Error reason) noexcept
-    {
-        (void)reason;
-        Close();
-    }
+    virtual void Close(Error reason) noexcept;
     /// @brief 封口并等待已接纳调用真实归还责任。
     ///
     /// 默认实现诚实报告本 adapter 未提供排空谓词（能力边界，不伪装成功）；HTTP adapter 覆盖为底座排空。
-    virtual result<void> Shutdown(bbt::coroutine::Deadline deadline)
-    {
-        (void)deadline;
-        return result<void>::err(
-            MakeError(ErrorCode::UnsupportedRoute, "rpc transport: Shutdown not implemented by this adapter"));
-    }
+    virtual result<void> Shutdown(bbt::coroutine::Deadline deadline);
 };
 
 /**
@@ -117,19 +108,11 @@ public:
     virtual bool IsClosed() const noexcept = 0;
 
     /// @brief 带关闭原因的 Close：默认丢弃原因并转发到 Close()，既有 adapter 源兼容。
-    virtual void Close(Error reason) noexcept
-    {
-        (void)reason;
-        Close();
-    }
+    virtual void Close(Error reason) noexcept;
     /// @brief 单入口封口 + 排空：默认复用既有两段（StopAccepting → Drain）。
     ///
     /// 有更真实排空谓词的 adapter 覆盖。
-    virtual result<void> Shutdown(bbt::coroutine::Deadline deadline)
-    {
-        StopAccepting();
-        return Drain(deadline);
-    }
+    virtual result<void> Shutdown(bbt::coroutine::Deadline deadline);
 };
 
 } // namespace bbt::infra::rpc

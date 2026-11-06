@@ -12,7 +12,8 @@ STRIP_FROM_PATH        = .
 FILE_PATTERNS          = *.hpp *.h
 RECURSIVE              = YES
 # Udp.hpp 是显式 #include 即 #error 的编译期拒绝入口，不声明任何 API，不能被文档当作接口。
-EXCLUDE_PATTERNS       = */detail/* */debug/* */net/Udp.hpp
+# impl/ 是实现头（模板/内联实现），只由父头末尾包含，不是公共入口，不进文档。
+EXCLUDE_PATTERNS       = */detail/* */debug/* */impl/* */net/Udp.hpp
 
 EXTRACT_ALL            = NO
 EXTRACT_PRIVATE        = NO

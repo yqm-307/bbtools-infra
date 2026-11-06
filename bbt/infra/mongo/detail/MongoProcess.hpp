@@ -29,10 +29,7 @@ struct MongoPoolLease {
     std::shared_ptr<mongocxx::v1::instance> instance;
     mongocxx::v1::pool pool;
 
-    MongoPoolLease(std::shared_ptr<mongocxx::v1::instance> inst, mongocxx::v1::uri u)
-        : instance(std::move(inst)), pool(std::move(u))
-    {
-    }
+    MongoPoolLease(std::shared_ptr<mongocxx::v1::instance> inst, mongocxx::v1::uri u);
 };
 
 // 取生效 URI 对应的进程级共享 pool：首个 client 建立 instance+pool，

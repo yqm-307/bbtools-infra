@@ -30,17 +30,9 @@ public:
         return "bbt.void/v1";
     }
     /// @brief 编码：返回空载荷。
-    static result<std::vector<std::uint8_t>> Encode()
-    {
-        return result<std::vector<std::uint8_t>>::ok({});
-    }
+    static result<std::vector<std::uint8_t>> Encode();
     /// @brief 解码：载荷必须为空，否则返回 ProtocolError。
-    static result<void> Decode(const std::vector<std::uint8_t>& payload)
-    {
-        if (!payload.empty())
-            return result<void>::err(MakeError(ErrorCode::ProtocolError, "Codec<void>: payload must be empty"));
-        return result<void>::ok();
-    }
+    static result<void> Decode(const std::vector<std::uint8_t>& payload);
 };
 
 /**
@@ -54,21 +46,11 @@ public:
         return "bbt.string.utf8/v1";
     }
     /// @brief 编码：先校验 UTF-8，非法返回 ProtocolError。
-    static result<std::vector<std::uint8_t>> Encode(const std::string& value)
-    {
-        if (!detail::IsValidUtf8(value))
-            return result<std::vector<std::uint8_t>>::err(
-                MakeError(ErrorCode::ProtocolError, "Codec<string>: invalid UTF-8"));
-        return result<std::vector<std::uint8_t>>::ok(std::vector<std::uint8_t>(value.begin(), value.end()));
-    }
+    static result<std::vector<std::uint8_t>> Encode(const std::string& value);
     /// @brief 解码：先按 UTF-8 校验载荷，非法返回 ProtocolError。
-    static result<std::string> Decode(const std::vector<std::uint8_t>& payload)
-    {
-        std::string value(payload.begin(), payload.end());
-        if (!detail::IsValidUtf8(value))
-            return result<std::string>::err(MakeError(ErrorCode::ProtocolError, "Codec<string>: invalid UTF-8"));
-        return result<std::string>::ok(std::move(value));
-    }
+    static result<std::string> Decode(const std::vector<std::uint8_t>& payload);
 };
 
 } // namespace bbt::infra
+
+#include <bbt/infra/impl/CodecImpl.hpp>

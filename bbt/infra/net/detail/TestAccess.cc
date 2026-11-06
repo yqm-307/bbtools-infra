@@ -41,4 +41,9 @@ void ConnectionTestAccess::Reset(ReadAccess& access)
     access = ReadAccess();
 }
 
+Buffer BufferTestAccess::Make(std::shared_ptr<void> backing, std::vector<BufferSegment> segments)
+{
+    return Buffer(std::move(backing), std::move(segments));
+}
+
 } // namespace bbt::infra::net

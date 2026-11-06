@@ -29,32 +29,10 @@ public:
     {
         s_create_fault_once.store(true);
     }
-    std::shared_ptr<bbt::coroutine::sync::CoWaiter> Create()
-    {
-        if (s_create_fault_once.exchange(false)) {
-            throw std::bad_alloc(); // 私有 test：等待对象建立单次失败
-        }
-        return std::make_shared<bbt::coroutine::sync::CoWaiter>();
-    }
-    bool Add(const std::shared_ptr<bbt::coroutine::sync::CoWaiter>& waiter)
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        PruneLocked();
-        if (m_waiters.size() >= kMaxWaiters) {
-            return false;
-        }
-        m_waiters.push_back(waiter);
-        return true;
-    }
+    std::shared_ptr<bbt::coroutine::sync::CoWaiter> Create();
+    bool Add(const std::shared_ptr<bbt::coroutine::sync::CoWaiter>& waiter);
     // 兼容便捷入口（外部调用者若在等待前 Register，仍需 on_registered 复查）。
-    std::shared_ptr<bbt::coroutine::sync::CoWaiter> Register()
-    {
-        auto waiter = Create();
-        if (!Add(waiter)) {
-            return nullptr;
-        }
-        return waiter;
-    }
+    std::shared_ptr<bbt::coroutine::sync::CoWaiter> Register();
 
     // 必须在调用者外层锁之外调用。
     //
@@ -69,44 +47,10 @@ public:
     //
     // 有界栈 snapshot + hub 锁下复制、锁外 Notify：不持锁跨 Notify，也不在
     // Notify 路径分配（Add 上限 = 数组容量）。
-    void NotifyAll()
-    {
-        std::unique_lock<std::mutex> lock(m_mutex);
-        if (m_waiters.empty()) {
-            return; // 登记后复查谓词；空 hub 不需要构造 snapshot 或再次加锁。
-        }
-        std::array<std::shared_ptr<bbt::coroutine::sync::CoWaiter>, kMaxWaiters> snapshot;
-        std::size_t count = 0;
-        for (auto& weak : m_waiters) {
-            if (count >= kMaxWaiters) {
-                break;
-            }
-            if (auto waiter = weak.lock()) {
-                snapshot[count++] = std::move(waiter);
-            }
-        }
-        lock.unlock();
-        for (std::size_t i = 0; i < count; ++i) {
-            (void)snapshot[i]->Notify();
-        }
-        std::lock_guard<std::mutex> prune_lock(m_mutex);
-        PruneLocked();
-    }
+    void NotifyAll();
 
 private:
-    void PruneLocked()
-    {
-        std::size_t write = 0;
-        for (std::size_t read = 0; read < m_waiters.size(); ++read) {
-            if (!m_waiters[read].expired()) {
-                if (write != read) {
-                    m_waiters[write] = std::move(m_waiters[read]);
-                }
-                ++write;
-            }
-        }
-        m_waiters.resize(write);
-    }
+    void PruneLocked();
 
     mutable std::mutex m_mutex;
     std::vector<std::weak_ptr<bbt::coroutine::sync::CoWaiter>> m_waiters;
@@ -114,3 +58,5 @@ private:
 };
 
 } // namespace bbt::infra::net
+
+#include <bbt/infra/net/detail/impl/WakeHubImpl.hpp>

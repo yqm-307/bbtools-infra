@@ -117,61 +117,12 @@ struct Error {
  * @param message 面向人的说明，按值移入。
  * @return 新构造的 Error。
  */
-inline Error MakeError(ErrorCode code, std::string message)
-{
-    Error e;
-    e.code = code;
-    e.message = std::move(message);
-    return e;
-}
+inline Error MakeError(ErrorCode code, std::string message);
 
 namespace detail {
 
 /// @brief 严格 UTF-8 良构检查：拒绝截断序列、过长编码、代理区与 >U+10FFFF 码点。
-inline bool IsValidUtf8(std::string_view s) noexcept
-{
-    const auto* bytes = reinterpret_cast<const unsigned char*>(s.data());
-    const std::size_t n = s.size();
-    std::size_t i = 0;
-    while (i < n) {
-        const unsigned char c = bytes[i];
-        if (c < 0x80) {
-            ++i;
-            continue;
-        }
-        std::size_t cont;
-        std::uint32_t code;
-        std::uint32_t lowest;
-        if ((c & 0xE0) == 0xC0) {
-            cont = 1;
-            code = c & 0x1F;
-            lowest = 0x80;
-        } else if ((c & 0xF0) == 0xE0) {
-            cont = 2;
-            code = c & 0x0F;
-            lowest = 0x800;
-        } else if ((c & 0xF8) == 0xF0) {
-            cont = 3;
-            code = c & 0x07;
-            lowest = 0x10000;
-        } else
-            return false;
-        if (i + cont >= n)
-            return false;
-        for (std::size_t j = 1; j <= cont; ++j) {
-            const unsigned char t = bytes[i + j];
-            if ((t & 0xC0) != 0x80)
-                return false;
-            code = (code << 6) | (t & 0x3F);
-        }
-        if (code < lowest || code > 0x10FFFF)
-            return false;
-        if (code >= 0xD800 && code <= 0xDFFF)
-            return false;
-        i += cont + 1;
-    }
-    return true;
-}
+inline bool IsValidUtf8(std::string_view s) noexcept;
 
 } // namespace detail
 
@@ -198,15 +149,9 @@ inline result<void> ValidateErrorDetails(const Error& error);
 template <class T> class result {
 public:
     /// @brief 构造成功结果。
-    static result ok(T value)
-    {
-        return result(OkTag{}, std::move(value));
-    }
+    static result ok(T value);
     /// @brief 构造错误结果；error 按值移入。
-    static result err(Error error)
-    {
-        return result(ErrTag{}, std::move(error));
-    }
+    static result err(Error error);
 
     /// @brief 成功时为 true。
     explicit operator bool() const noexcept
@@ -215,57 +160,25 @@ public:
     }
 
     /// @brief 取成功值的左值引用；在错误分支调用会抛出 std::logic_error。
-    T& value() &
-    {
-        RequireOk();
-        return std::get<0>(m_data);
-    }
+    T& value() &;
     /// @brief 取成功值的 const 左值引用；在错误分支调用会抛出 std::logic_error。
-    const T& value() const&
-    {
-        RequireOk();
-        return std::get<0>(m_data);
-    }
+    const T& value() const&;
     /// @brief 取出成功值（移动语义）；在错误分支调用会抛出 std::logic_error。
-    T&& value() &&
-    {
-        RequireOk();
-        return std::move(std::get<0>(m_data));
-    }
+    T&& value() &&;
 
     /// @brief 取错误体的引用；在成功分支调用会抛出 std::logic_error。
-    Error& error() &
-    {
-        RequireErr();
-        return std::get<1>(m_data);
-    }
+    Error& error() &;
     /// @brief 取错误体的 const 引用；在成功分支调用会抛出 std::logic_error。
-    const Error& error() const&
-    {
-        RequireErr();
-        return std::get<1>(m_data);
-    }
+    const Error& error() const&;
 
 private:
     struct OkTag {};
     struct ErrTag {};
-    result(OkTag, T value) : m_data(std::in_place_index<0>, std::move(value))
-    {
-    }
-    result(ErrTag, Error error) : m_data(std::in_place_index<1>, std::move(error))
-    {
-    }
+    result(OkTag, T value);
+    result(ErrTag, Error error);
 
-    void RequireOk() const
-    {
-        if (m_data.index() != 0)
-            throw std::logic_error("bbt::infra::result: value() on error result");
-    }
-    void RequireErr() const
-    {
-        if (m_data.index() != 1)
-            throw std::logic_error("bbt::infra::result: error() on ok result");
-    }
+    void RequireOk() const;
+    void RequireErr() const;
 
     std::variant<T, Error> m_data;
 };
@@ -278,15 +191,9 @@ private:
 template <> class result<void> {
 public:
     /// @brief 构造无值的成功结果。
-    static result ok()
-    {
-        return result();
-    }
+    static result ok();
     /// @brief 构造错误结果；error 按值移入。
-    static result err(Error error)
-    {
-        return result(std::move(error));
-    }
+    static result err(Error error);
 
     /// @brief 成功时为 true。
     explicit operator bool() const noexcept
@@ -295,54 +202,19 @@ public:
     }
 
     /// @brief 取错误体的引用；在成功分支调用会抛出 std::logic_error。
-    Error& error() &
-    {
-        RequireErr();
-        return *m_error;
-    }
+    Error& error() &;
     /// @brief 取错误体的 const 引用；在成功分支调用会抛出 std::logic_error。
-    const Error& error() const&
-    {
-        RequireErr();
-        return *m_error;
-    }
+    const Error& error() const&;
 
 private:
     result() = default;
-    explicit result(Error error) : m_error(std::move(error))
-    {
-    }
+    explicit result(Error error);
 
-    void RequireErr() const
-    {
-        if (!m_error.has_value())
-            throw std::logic_error("bbt::infra::result: error() on ok result");
-    }
+    void RequireErr() const;
 
     std::optional<Error> m_error;
 };
 
-inline result<void> ValidateErrorDetails(const Error& error)
-{
-    const ErrorDetails& details = error.details;
-    if (details.size() > kMaxErrorDetails)
-        return result<void>::err(MakeError(ErrorCode::ProtocolError, "error.details exceeds max item count"));
-    for (std::size_t i = 0; i < details.size(); ++i) {
-        const std::string& key = details[i].first;
-        const std::string& val = details[i].second;
-        if (key.size() > kMaxKeyBytes)
-            return result<void>::err(MakeError(ErrorCode::ProtocolError, "error.details key exceeds max bytes"));
-        if (val.size() > kMaxValueBytes)
-            return result<void>::err(MakeError(ErrorCode::ProtocolError, "error.details value exceeds max bytes"));
-        if (!detail::IsValidUtf8(key) || !detail::IsValidUtf8(val))
-            return result<void>::err(MakeError(ErrorCode::ProtocolError, "error.details not valid UTF-8"));
-        for (std::size_t j = 0; j < i; ++j)
-            if (details[j].first == key)
-                return result<void>::err(MakeError(ErrorCode::ProtocolError, "error.details duplicate key"));
-    }
-    // 上层域的保留键归属与格式由上层边界校验；infra 通用层只保证本函数的结构规则，
-    // 契约见 docs/decisions/0002-co-network-contract.md。
-    return result<void>::ok();
-}
-
 } // namespace bbt::infra
+
+#include <bbt/infra/impl/ResultImpl.hpp>

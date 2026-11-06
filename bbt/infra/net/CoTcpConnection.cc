@@ -230,4 +230,9 @@ std::error_code CoTcpConnection::WaitClosed(const bbt::coroutine::WaitOptions& o
     }
 }
 
+void CoTcpConnection::RequestClose(std::error_code reason)
+{
+    m_conn.RequestClose(reason);
+}
+
 } // namespace bbt::infra::net

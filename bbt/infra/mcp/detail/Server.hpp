@@ -78,70 +78,18 @@ struct RequestOwner {
     std::shared_ptr<std::atomic<bool>> abort =        // 协作式退出观察位（cancel/期限/Close
         std::make_shared<std::atomic<bool>>(false);   //  任一终态触发时置位）
 
-    explicit RequestOwner(RequestId id) : request_id(std::move(id))
-    {
-    }
+    explicit RequestOwner(RequestId id);
 
-    bool TryFinish(Terminal kind) noexcept
-    {
-        int expected = static_cast<int>(Terminal::kNone);
-        if (!terminal.compare_exchange_strong(expected, static_cast<int>(kind), std::memory_order_acq_rel,
-                                              std::memory_order_acquire))
-            return false; // 已有终态：本触发源竞争失败，只消费空壳
-        abort->store(true, std::memory_order_release);
-        // 仅内测计数（非公共面）：恰好一次终态的直接观测（S21）；生产开销为每请求
-        // 一次原子自增，聚合的是「终态总数 = 落定请求数」这一进程级不变项。
-        switch (kind) {
-        case Terminal::kCompleted:
-            s_test_completed.fetch_add(1, std::memory_order_relaxed);
-            break;
-        case Terminal::kCancelled:
-            s_test_cancelled.fetch_add(1, std::memory_order_relaxed);
-            break;
-        case Terminal::kTimedOut:
-            s_test_timed_out.fetch_add(1, std::memory_order_relaxed);
-            break;
-        case Terminal::kClosed:
-            s_test_closed.fetch_add(1, std::memory_order_relaxed);
-            break;
-        case Terminal::kNone:
-            break;
-        }
-        return true;
-    }
-    bool DeadlinePassed() const noexcept
-    {
-        return deadline.time_since_epoch().count() != 0 && std::chrono::steady_clock::now() >= deadline;
-    }
+    bool TryFinish(Terminal kind) noexcept;
+    bool DeadlinePassed() const noexcept;
     Terminal TerminalNow() const noexcept
     {
         return static_cast<Terminal>(terminal.load(std::memory_order_acquire));
     }
 
     // 仅内测（internal 面，公共头不出现）：终态计数。
-    static long TestCount(Terminal kind) noexcept
-    {
-        switch (kind) {
-        case Terminal::kCompleted:
-            return s_test_completed.load(std::memory_order_relaxed);
-        case Terminal::kCancelled:
-            return s_test_cancelled.load(std::memory_order_relaxed);
-        case Terminal::kTimedOut:
-            return s_test_timed_out.load(std::memory_order_relaxed);
-        case Terminal::kClosed:
-            return s_test_closed.load(std::memory_order_relaxed);
-        case Terminal::kNone:
-            return 0;
-        }
-        return 0;
-    }
-    static void TestResetCounters() noexcept
-    {
-        s_test_completed.store(0, std::memory_order_relaxed);
-        s_test_cancelled.store(0, std::memory_order_relaxed);
-        s_test_timed_out.store(0, std::memory_order_relaxed);
-        s_test_closed.store(0, std::memory_order_relaxed);
-    }
+    static long TestCount(Terminal kind) noexcept;
+    static void TestResetCounters() noexcept;
 
 private:
     std::atomic<int> terminal{static_cast<int>(Terminal::kNone)};
@@ -191,18 +139,11 @@ struct McpServer::Impl {
         explicit Admission(Impl& server) noexcept : m_server(&server)
         {
         }
-        Admission(Admission&& other) noexcept : m_server(other.m_server)
-        {
-            other.m_server = nullptr;
-        }
+        Admission(Admission&& other) noexcept;
         Admission(const Admission&) = delete;
         Admission& operator=(const Admission&) = delete;
         Admission& operator=(Admission&&) = delete;
-        ~Admission()
-        {
-            if (m_server)
-                m_server->Release();
-        }
+        ~Admission();
 
     private:
         Impl* m_server;
@@ -351,32 +292,14 @@ public:
     // 2-5 内部面（transport seam，不属公共契约）：订阅 ack/事件/流结束帧出口。
     // sink 未挂载时帧丢弃（计数照常）。锁只护拷贝，绝不持锁调用 sink。
     using NotificationSink = std::function<void(const std::string& frame)>;
-    void SetNotificationSink(NotificationSink sink)
-    {
-        std::lock_guard<std::mutex> lock(m_sink_mutex);
-        m_sink = std::move(sink);
-    }
+    void SetNotificationSink(NotificationSink sink);
     // 3-1 内部面（transport teardown seam）：结束本会话全部在册订阅并经 sink 投递
     // 流结束帧（与 EndSubscription 同 wire 形状）。条目移除在 m_subscriptions_mutex
     // 内完成，sink 调用在锁外。transport 收口（Close/EOF）须先调用本方法、再析构
     // 会话（「表内条目不悬挂会话指针」C1 契约的 teardown 半边）。
     void EndAllSubscriptions();
-    bool CopyNotificationSink(NotificationSink& out) const
-    {
-        std::lock_guard<std::mutex> lock(m_sink_mutex);
-        out = m_sink;
-        return static_cast<bool>(out);
-    }
-    void EmitNotificationFrame(const std::string& frame)
-    {
-        NotificationSink sink;
-        {
-            std::lock_guard<std::mutex> lock(m_sink_mutex);
-            sink = m_sink;
-        }
-        if (sink)
-            sink(frame);
-    }
+    bool CopyNotificationSink(NotificationSink& out) const;
+    void EmitNotificationFrame(const std::string& frame);
 
     // legacy 生命周期状态（只读；供定向测试与后续 transport 门禁消费）。
     //
@@ -384,27 +307,11 @@ public:
     // 工作线程池驱动同一 channel 的 pipelined 帧）。下列字段及其**全部**读写由
     // m_state_mutex 保护；getter 在锁内取 owned copy，各自线性化（多次 getter 调用
     // 不是一个联合快照）。锁只覆盖字段读写，绝不覆盖 Dispatch/业务 handler。
-    bool InitializeAccepted() const noexcept
-    {
-        std::lock_guard<std::mutex> lock(m_state_mutex);
-        return m_initialize_accepted;
-    }
-    bool Initialized() const noexcept
-    {
-        std::lock_guard<std::mutex> lock(m_state_mutex);
-        return m_initialized;
-    }
-    std::optional<std::string> NegotiatedVersion() const
-    {
-        std::lock_guard<std::mutex> lock(m_state_mutex);
-        return m_negotiated_version;
-    }
+    bool InitializeAccepted() const noexcept;
+    bool Initialized() const noexcept;
+    std::optional<std::string> NegotiatedVersion() const;
     // initialize 的 owned capabilities 副本（未握手 → 空 object）。
-    JsonValue ClientCapabilities() const
-    {
-        std::lock_guard<std::mutex> lock(m_state_mutex);
-        return m_client_capabilities;
-    }
+    JsonValue ClientCapabilities() const;
 
     // 内部面（HTTP legacy 无 session profile 专用 transport seam，不属公共契约；
     // 规格设计 R9/S23 显式选择 legacy HTTP 无 session）。受支持 legacy revision
@@ -414,14 +321,7 @@ public:
     // 不回填 clientCapabilities（不伪造任何身份）、不触发 initialized、不碰
     // modern 逐请求 `_meta` 校验、stdio 每会话 InitializeAccepted 握手语义不变；
     // 真实 initialize 已落定时不覆盖既有 negotiated 版本。
-    void AdoptLegacyHeaderGate(std::string negotiated_version)
-    {
-        std::lock_guard<std::mutex> lock(m_state_mutex);
-        if (m_initialize_accepted)
-            return;
-        m_initialize_accepted = true;
-        m_negotiated_version = std::move(negotiated_version);
-    }
+    void AdoptLegacyHeaderGate(std::string negotiated_version);
 
 private:
     friend class McpServer;

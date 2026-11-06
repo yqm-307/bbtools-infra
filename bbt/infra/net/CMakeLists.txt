@@ -2,7 +2,8 @@ add_library(bbt_infra_net STATIC
     CoObject.cc Address.cc NativeSocket.cc LoadBalancing.cc
     Connection.cc ReadAccess.cc CoConnection.cc CoTcpConnection.cc
     Engine.cc detail/ReactorDriver.cc detail/DriverBinder.cc detail/OptionsNormalize.cc
-    detail/TestAccess.cc)
+    detail/TestAccess.cc
+    Buffer.cc Error.cc detail/SourceAddrHash.cc)
 add_library(bbt::infra_net ALIAS bbt_infra_net)
 target_include_directories(bbt_infra_net PUBLIC
     "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>")

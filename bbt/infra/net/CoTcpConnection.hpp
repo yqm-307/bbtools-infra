@@ -61,10 +61,7 @@ public:
     /// @brief 等待逻辑关闭终态；契约见 ICoConnection::WaitClosed。
     std::error_code WaitClosed(const bbt::coroutine::WaitOptions& options = {}) override;
     /// @brief 转发到底层 Connection::RequestClose。
-    void RequestClose(std::error_code reason = {}) override
-    {
-        m_conn.RequestClose(reason);
-    }
+    void RequestClose(std::error_code reason = {}) override;
     /// @brief 返回状态投影副本；契约见 ICoConnection::Status。
     ConnectionStatus Status() const override;
 

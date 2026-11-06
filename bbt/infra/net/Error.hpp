@@ -33,40 +33,10 @@ enum class NetErrc {
  *
  * 未知枚举值的 message 为 "unknown net error"，不抛异常。
  */
-inline const std::error_category& NetErrorCategory()
-{
-    static const struct Category final : std::error_category {
-        const char* name() const noexcept override
-        {
-            return "bbt.net";
-        }
-        std::string message(int value) const override
-        {
-            switch (static_cast<NetErrc>(value)) {
-            case NetErrc::Eof:
-                return "eof";
-            case NetErrc::WouldBlock:
-                return "would block";
-            case NetErrc::Busy:
-                return "ring busy";
-            case NetErrc::WriteSettling:
-                return "write settling";
-            case NetErrc::Rejected:
-                return "rejected (not submitted)";
-            case NetErrc::Closed:
-                return "closed";
-            }
-            return "unknown net error";
-        }
-    } category;
-    return category;
-}
+const std::error_category& NetErrorCategory();
 
 /** @brief 把 NetErrc 转为 std::error_code，供 ADL 与 std::error_code 构造使用。 */
-inline std::error_code make_error_code(NetErrc value) noexcept
-{
-    return {static_cast<int>(value), NetErrorCategory()};
-}
+std::error_code make_error_code(NetErrc value) noexcept;
 
 } // namespace bbt::infra::net
 

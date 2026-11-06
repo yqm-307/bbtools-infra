@@ -16,11 +16,6 @@
 
 namespace bbt::infra::net {
 
-inline std::uint32_t Crc32Checksum(std::string_view bytes) noexcept
-{
-    boost::crc_32_type crc;
-    crc.process_bytes(bytes.data(), bytes.size());
-    return crc.checksum();
-}
+std::uint32_t Crc32Checksum(std::string_view bytes) noexcept;
 
 } // namespace bbt::infra::net

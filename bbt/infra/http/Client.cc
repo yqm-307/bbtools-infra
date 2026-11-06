@@ -594,3 +594,25 @@ PoolStats Client::Stats() const noexcept
 }
 
 } // namespace bbt::infra::http
+
+namespace bbt::infra::http {
+
+std::optional<std::chrono::milliseconds> PhaseTimeout::Finite() const noexcept
+{
+    if (m_kind != Kind::Finite) {
+        return std::nullopt;
+    }
+    return m_value;
+}
+
+Timeout Timeout::Uniform(PhaseTimeout phase) noexcept
+{
+    Timeout value;
+    value.connect = phase;
+    value.read = phase;
+    value.write = phase;
+    value.pool = phase;
+    return value;
+}
+
+} // namespace bbt::infra::http
