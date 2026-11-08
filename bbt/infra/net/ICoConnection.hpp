@@ -35,6 +35,7 @@
 
 #include <bbt/infra/net/Buffer.hpp>
 #include <bbt/infra/net/Connection.hpp>
+#include <bbt/infra/net/ReadView.hpp>
 #include <bbt/infra/net/Types.hpp>
 #include <bbt/infra/net/WriteOperation.hpp>
 
@@ -66,12 +67,12 @@ class ICoConnection {
 public:
     virtual ~ICoConnection() = default;
 
-    // ---- 读：零拷贝移交 ----
+    // ---- 读：等待后复制消费，或短时只读查看 ----
     /**
-     * @brief 取走全部已发布的可读字节，零拷贝移交 backing。
+     * @brief 等待并复制全部已发布的可读字节到调用方 Buffer，然后消费连接数据。
      *
      * 仅业务协程可调用，可挂起。先执行门禁，再访问数据或快路径。有数据时，原子取走线性化点上
-     * 所有已发布的可读字节，并移交 backing。Busy 或 WouldBlock 由内部等待处理。先交付尾部数据，
+     * 所有已发布的可读字节，复制到 out 后消费连接数据。Busy 或 WouldBlock 由内部等待处理。先交付尾部数据，
      * 耗尽后才返回 Eof 或 Error。options 只约束等待；超时、取消或内存不足都不消费数据，
      * 也不会自动 RequestClose。
      */
@@ -79,7 +80,7 @@ public:
     /**
      * @brief 等待读取并以 tuple 返回缓冲区和结果。
      *
-     * 失败时不交付缓冲区，也不消费数据。
+     * 失败时不写入 out，也不消费连接数据。
      *
      * @param options 本次等待的选项；deadline 只约束本次等待。
      * @return 包含读取缓冲区和错误码的 tuple；失败时缓冲区为空。
@@ -95,14 +96,19 @@ public:
      */
     std::tuple<Buffer, std::error_code> TryRead();
 
+    /// @brief 非等待只读查看；不消费，不拥有底层存储，视图不可跨下一次 I/O 使用。
+    virtual ReadView View() = 0;
+
     // ---- 写：非挂起提交 ----
     /**
      * @brief 全量接纳或零接纳，不等待容量或发送完成。
      *
-     * 任意合法调用域可用，不挂起。按值取得字符串，接纳后库拥有发送数据。拒绝原因只通过返回票的
-     * Query 表达。调用方通过 move 传入数据后，即使被拒绝，也不得依赖原字符串内容保持不变。
+     * 任意合法调用域可用，不挂起。空错误只表示库已接纳，后续由 owner 发送；
+     * 队列满、连接关闭等接纳错误直接返回，不返回可等待票据、不自动重试。
+     * 需要等待容量与本地发送完成时使用 Write。后续发送错误由 raw OnWrite/LastWriteError 观察。
+     * 按值取得字符串，move 后即使被拒绝，也不保证调用方原字符串内容保留。
      */
-    virtual WriteOperation AsyncWrite(std::string data) = 0;
+    virtual std::error_code AsyncWrite(std::string data) = 0;
 
     // ---- 写：协程组合等待 ----
     /**
@@ -160,5 +166,3 @@ public:
 };
 
 } // namespace bbt::infra::net
-
-#include <bbt/infra/net/impl/ICoConnectionImpl.hpp>

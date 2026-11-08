@@ -3,14 +3,6 @@
 namespace bbt::infra::rpc {
 namespace detail {
 
-void TcpFrameWritePrefix(char out[kTcpFramePrefixBytes], std::uint32_t payload_bytes) noexcept
-{
-    out[0] = static_cast<char>((payload_bytes >> 24) & 0xff);
-    out[1] = static_cast<char>((payload_bytes >> 16) & 0xff);
-    out[2] = static_cast<char>((payload_bytes >> 8) & 0xff);
-    out[3] = static_cast<char>(payload_bytes & 0xff);
-}
-
 result<void> ParseTcpEndpoint(const std::string& endpoint, std::string& out_host, std::uint16_t& out_port)
 {
     const auto invalid =
@@ -79,15 +71,6 @@ Error TcpCallError(std::error_code cause, const char* message, bool committed)
     return error;
 }
 
-Error TcpProtocolError(const std::string& message, bool committed)
-{
-    auto error = MakeError(ErrorCode::ProtocolError, "rpc tcp: " + message);
-    if (committed) {
-        error.request_phase = RequestPhase::RequestCommitted;
-    }
-    return error;
-}
-
 result<void> TcpSettleWrite(const net::WriteReport& report, const char* message)
 {
     const auto& outcome = report.outcome;
@@ -104,17 +87,6 @@ result<void> TcpSettleWrite(const net::WriteReport& report, const char* message)
         error.code = ErrorCode::OutcomeUnknown;
     }
     return result<void>::err(std::move(error));
-}
-
-bool TcpTake(std::string& pending, std::size_t need, std::vector<std::uint8_t>& out)
-{
-    if (pending.size() < need) {
-        return false;
-    }
-    out.assign(reinterpret_cast<const std::uint8_t*>(pending.data()),
-               reinterpret_cast<const std::uint8_t*>(pending.data()) + need);
-    pending.erase(0, need);
-    return true;
 }
 
 } // namespace detail

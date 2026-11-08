@@ -29,9 +29,8 @@ ReclaimReceipt::ReclaimReceipt(std::shared_ptr<ReclaimRecord> record) : m_record
 {
 }
 
-WriteOperation::WriteOperation(std::shared_ptr<WriteOpRecord> record, std::weak_ptr<ConnectionState> state,
-                               std::error_code rejection)
-    : m_record(std::move(record)), m_state(std::move(state)), m_rejection(rejection)
+WriteOperation::WriteOperation(std::shared_ptr<WriteOpRecord> record, std::weak_ptr<ConnectionState> state)
+    : m_record(std::move(record)), m_state(std::move(state))
 {
 }
 
@@ -47,9 +46,6 @@ std::uint64_t WriteOperation::Id() const noexcept
 
 WriteOutcome WriteOperation::Query() const
 {
-    if (m_rejection) {
-        return WriteOutcome{WritePhase::Rejected, 0, m_rejection}; // 拒绝票：已落定
-    }
     if (!m_record) {
         return {};
     }
@@ -74,18 +70,14 @@ std::uint64_t Connection::Id() const noexcept
     return m_state ? m_state->m_id : 0;
 }
 
-std::error_code Connection::AsyncWrite(std::string data, WriteOperation& out_operation)
+std::error_code Connection::AsyncWrite(std::string data)
 {
-    out_operation = WriteOperation(); // 拒绝时保持无效，不泄露上次结果
     if (!m_state) {
         return make_error_code(NetErrc::Closed);
     }
+    // 记录只供 owner 做 FIFO/部分发送及 OnWrite 结算，不创建等待者或交付票据。
     std::shared_ptr<WriteOpRecord> record;
-    const auto error = m_state->AcceptWrite(std::move(data), record);
-    if (!error) {
-        out_operation = WriteOperation(std::move(record), m_state);
-    }
-    return error;
+    return m_state->AcceptWrite(std::move(data), record);
 }
 
 ReadResult Connection::TryRead(std::string& out)
@@ -101,9 +93,9 @@ std::error_code Connection::TryRead(Buffer& out)
     if (!m_state) {
         return make_error_code(NetErrc::Closed);
     }
-    auto attempt = m_state->ring.TryPopAll();
-    if (attempt.status != ReadStatus::Ok) {
-        switch (attempt.status) {
+    const auto result = m_state->ring.TryCopyConsume(out);
+    if (result.status != ReadStatus::Ok) {
+        switch (result.status) {
         case ReadStatus::WouldBlock:
             return make_error_code(NetErrc::WouldBlock);
         case ReadStatus::Busy:
@@ -111,12 +103,9 @@ std::error_code Connection::TryRead(Buffer& out)
         case ReadStatus::Eof:
             return make_error_code(NetErrc::Eof);
         default:
-            return attempt.error;
+            return result.error;
         }
     }
-    // 段表在 pop 提交前已准备好；提交后仅无抛移动，不丢已消费字节。
-    auto segments = std::move(attempt.takeout->segments);
-    out = Buffer(std::move(attempt.takeout), std::move(segments));
     return {};
 }
 
@@ -127,13 +116,12 @@ std::tuple<Buffer, std::error_code> Connection::TryRead()
     return {std::move(out), error};
 }
 
-ReadAccess Connection::TryAccess()
+ReadView Connection::View()
 {
     if (!m_state) {
-        return {};
+        return ReadView(ReadStatus::Error, {}, make_error_code(NetErrc::Closed));
     }
-    auto attempt = m_state->ring.TryAccessAttempt();
-    return ReadAccess(m_state, std::move(attempt.lock), attempt.status, attempt.error);
+    return m_state->ring.TryView();
 }
 
 std::size_t Connection::ReadableBytes()

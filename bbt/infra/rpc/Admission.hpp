@@ -37,7 +37,7 @@
 namespace bbt::infra::rpc {
 
 namespace detail {
-// 不透明实现：只有 infra 的 Session TU 有定义，业务拿不到有效对象。
+// 不透明实现：定义在 detail/RpcSessionState.hpp，业务不能直接构造有效对象。
 struct ReplyCompletionImpl;
 struct AdmissionLeaseImpl;
 struct AdmissionQueueImpl;
@@ -167,7 +167,7 @@ public:
     /// @brief 是否已封口（观测事实）。
     bool IsClosed() const noexcept;
 
-    // 观察面：计数读都在队列自己的锁内完成。ServerV2Stats/Drain 只经这里拿
+    // 观察面：计数读都在队列自己的锁内完成。ServerV2Stats/Close 只经这里拿
     // 快照，不直读 impl 字段——server 台账锁与队列锁因此保持单向顺序。
     // per-lane 重载供分 lane 快照使用，lane 越界按 0 计。
     /// @brief 当前队列条目总数（gauge，单次取锁）。

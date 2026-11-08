@@ -29,8 +29,8 @@ target_link_libraries(bbt_infra_redis_net
     PRIVATE hiredis::hiredis)
 target_compile_options(bbt_infra_redis_net PRIVATE -Wall -Wextra -Wpedantic)
 
-# 公开头自给编译自检：两个公开头各自单独成 TU。
-set(_redis_net_headers CoRedisCli.hpp CoRedisPool.hpp)
+# 公开头自给编译自检：接口、公共值与实现头各自单独成 TU。
+set(_redis_net_headers interface/IRedisCli.hpp RedisTypes.hpp CoRedisCli.hpp CoRedisPool.hpp)
 set(_redis_net_selfcheck_srcs "")
 foreach(_hdr IN LISTS _redis_net_headers)
     set(_tu "${CMAKE_CURRENT_BINARY_DIR}/header_selfcheck/${_hdr}.cc")

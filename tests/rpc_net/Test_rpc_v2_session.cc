@@ -1,15 +1,16 @@
 // rpc v2 AppSession 契约测试：真实 loopback TCP、Hello/HelloAck 握手与
 // epoch、Client-owned 双向会话、单 FIFO admission、lane 有界隔离、
-// Call/Send/SendAccepted、Close(deadline)/Drain、Stats。真实双端：
+// Call/Send/SendAccepted、Close(Immediate/Timeout/Graceful)/Shutdown、Stats。真实双端：
 // 每进程一 Engine + Client(owner) + Server(同 owner)（ADR §3.1）。
 
 #include "TestSupport.hpp"
 
 #include <bbt/infra/rpc/Admission.hpp>
-#include <bbt/infra/rpc/Codec.hpp>
+#include <bbt/infra/rpc/SessionCodec.hpp>
 #include <bbt/infra/rpc/Options.hpp>
 #include <bbt/infra/rpc/Stats.hpp>
 #include <bbt/infra/rpc/detail/Session.hpp>
+#include <bbt/infra/rpc/detail/RpcChannel.hpp>
 #include <bbt/infra/net/detail/TestAccess.hpp>
 #include <bbt/infra/net/Error.hpp>
 
@@ -61,12 +62,24 @@ template <class F> auto CallCo(F fn) -> decltype(fn())
     return Get(future);
 }
 
+// Close 是唯一关闭入口且为 bbt_co_async：原生测试线程经受管协程消费。
+result<void> CloseServer(const std::shared_ptr<rpc::CoRpcServer>& server, rpc::CloseFlag flag,
+                         std::int64_t timeout_ms = 0, bbt::infra::Error reason = {})
+{
+    return CallCo([&] { return bbt_co_await server->Close(flag, timeout_ms, std::move(reason)); });
+}
+result<void> CloseClient(const std::shared_ptr<rpc::CoRpcClient>& client, rpc::CloseFlag flag,
+                         std::int64_t timeout_ms = 0, bbt::infra::Error reason = {})
+{
+    return CallCo([&] { return bbt_co_await client->Close(flag, timeout_ms, std::move(reason)); });
+}
+
 // v2 进程装配（ADR §3.1）：自有 Engine(listener+handoff) + Client(owner)
 // + Server(同 owner)。admission handler 默认记录并转移 owning item。
 struct AppHost {
     std::shared_ptr<net::Engine> engine{net::Engine::Create(std::shared_ptr<net::RawHandler>{})};
-    std::shared_ptr<rpc::Client> client;
-    std::shared_ptr<rpc::Server> server;
+    std::shared_ptr<rpc::CoRpcClient> client;
+    std::shared_ptr<rpc::CoRpcServer> server;
     net::Address address;
     std::thread runner;
     std::error_code run_error;
@@ -84,7 +97,7 @@ struct AppHost {
     {
         rpc::ClientOptions co = client_options;
         co.SetLocalIdentity(identity).SetTrustedNetworkPlaintext(true);
-        auto made_client = rpc::Client::Create(engine, co);
+        auto made_client = rpc::CoRpcClient::Create(engine, co);
         CHECK(made_client);
         client = std::move(made_client).value();
 
@@ -109,7 +122,7 @@ struct AppHost {
         std::error_code error;
         so.SetListenAddress(net::Address::Ip("127.0.0.1", 0, error));
         CHECK(!error);
-        auto made = rpc::Server::Create(engine, client, handler, so);
+        auto made = rpc::CoRpcServer::Create(engine, client, handler, so);
         CHECK(made);
         server = std::move(made).value();
 
@@ -144,9 +157,12 @@ struct AppHost {
     ~AppHost()
     {
         if (server) {
-            (void)server->Shutdown(Clock::now() + 3s);
-            server->Close();
-            (void)server->WaitStopped(Clock::now() + 3s);
+            // Shutdown 是宿主侧同步强制关闭（不挂起、幂等），析构不再等
+            // 物理回收——Engine 收口是物理释放的唯一责任方。
+            server->Shutdown();
+        }
+        if (client) {
+            client->Shutdown();
         }
         engine->RequestClose();
         if (runner.joinable()) {
@@ -242,6 +258,35 @@ rpc::Response Echo(const rpc::Request& request)
     auto response = rpc::Response::FromRequest(request);
     response.SetPayload(request.Payload());
     return response;
+}
+
+void RegisteredRoute()
+{
+    AppHost client("route-client");
+    AppHost server("route-server");
+    std::atomic<bool> entered{false};
+    rpc::CoRpcServer::RpcHandler handler = [&entered](rpc::Request request) -> bbt_co_async(result<rpc::Response>) {
+        entered.store(true);
+        return result<rpc::Response>::ok(Echo(request));
+    };
+    rpc::CoRpcServer::RouteOptions limit;
+    limit.burst_tokens = 1;
+    limit.refill_per_second = 0.1;
+    CHECK(server.server->RegisterRpc("svc/M", std::move(handler), limit));
+
+    const auto first = CallCo(
+        [&] { return bbt_co_await client.client->Call(server.Target(), MakeCall("route-1", 1, "route"), UntilMs()); });
+    CHECK(first);
+    CHECK(first.value().Payload() == MakeCall("route-1", 1, "route").Payload());
+    CHECK(entered.load());
+
+    const auto limited = CallCo(
+        [&] { return bbt_co_await client.client->Call(server.Target(), MakeCall("route-2", 2, "route"), UntilMs()); });
+    ExpectCode(limited, ErrorCode::Overloaded);
+
+    CHECK(server.server->UnregisterRpc("svc/M"));
+    CHECK(server.server->UnregisterRpc("svc/M").error().code == ErrorCode::NotFound);
+    std::cout << "v2 registered route: handler=ok rate_limit=overloaded unregister=ok\n";
 }
 
 // ---- 1. 基本 Call（握手 + RequestContext 注入 + Stats） ----------------------
@@ -371,6 +416,141 @@ void Ordering()
     std::cout << "v2 ordering call1/send2/call3 preserved\n";
 }
 
+// ---- 4b. 入站顺序台账：重复/逆序/缺口按协议违规退役 link ---------------------
+// 首个有序帧即 per-key 台账基值，此后必须连续递增。缺口与重复帧不进入
+// admission，违规按 RejectProtocol 退役当前 link；新拨号开新 session 台账。
+void OrderingLedger()
+{
+    AppHost a("app-a"), b("app-b");
+    auto g1 = SubmitCo([&] { return bbt_co_await a.client->Call(b.Target(), MakeCall("g1", 1, "gap"), UntilMs()); });
+    CHECK(WaitUntil([&] { return b.calls.load() == 1; }));
+    b.ProcessAdmitted(Echo);
+    CHECK(Get(g1));
+
+    // 缺口：同 key seq=3 跳过 seq=2——按协议违规退役 link，不进入 admission。
+    const auto accepted_before = b.server->Stats().accepted_connections;
+    const auto gap =
+        CallCo([&] { return bbt_co_await a.client->Call(b.Target(), MakeCall("g3", 3, "gap"), UntilMs()); });
+    CHECK(!gap);
+    CHECK(gap.error().code == ErrorCode::OutcomeUnknown);
+
+    // link 退役后新拨号开新 session（台账重置），空 key/seq=0 不受顺序约束。
+    auto probe = SubmitCo([&] {
+        rpc::Request plain("svc", "M");
+        plain.SetRequestId("p1")
+            .SetReply(rpc::ReplyMode::Required)
+            .SetTraffic(rpc::TrafficClass::Service)
+            .SetRequestSchema("req")
+            .SetResponseSchema("resp");
+        return bbt_co_await a.client->Call(b.Target(), std::move(plain), UntilMs());
+    });
+    CHECK(WaitUntil([&] { return b.server->Stats().accepted_connections > accepted_before; }));
+    CHECK(WaitUntil([&] { return b.calls.load() == 2; }));
+    b.ProcessAdmitted(Echo);
+    CHECK(Get(probe));
+    auto unordered = SubmitCo([&] {
+        rpc::Request plain("svc", "M");
+        plain.SetRequestId("u1")
+            .SetReply(rpc::ReplyMode::Required)
+            .SetTraffic(rpc::TrafficClass::Service)
+            .SetRequestSchema("req")
+            .SetResponseSchema("resp");
+        return bbt_co_await a.client->Call(b.Target(), std::move(plain), UntilMs());
+    });
+    CHECK(WaitUntil([&] { return b.calls.load() == 3; }));
+    b.ProcessAdmitted(Echo);
+    CHECK(Get(unordered));
+    {
+        std::lock_guard<std::mutex> lock(b.mu);
+        CHECK(b.by_key["gap"].size() == 1 && b.by_key["gap"][0] == "g1");
+        CHECK(b.by_key[""].size() == 2);
+    }
+
+    // 重复：同 key 同一 sequence 第二帧按协议违规退役 link。
+    auto d1 = SubmitCo([&] { return bbt_co_await a.client->Call(b.Target(), MakeCall("d1", 1, "dup"), UntilMs()); });
+    CHECK(WaitUntil([&] { return b.calls.load() == 4; }));
+    b.ProcessAdmitted(Echo);
+    CHECK(Get(d1));
+    const auto dup =
+        CallCo([&] { return bbt_co_await a.client->Call(b.Target(), MakeCall("d2", 1, "dup"), UntilMs()); });
+    CHECK(!dup);
+    CHECK(dup.error().code == ErrorCode::OutcomeUnknown);
+    // 逆序：同 key seq=2 后到达的 seq=1 按违规退役（新 session 先收进 2）。
+    auto r2 = SubmitCo([&] { return bbt_co_await a.client->Call(b.Target(), MakeCall("r2", 2, "rev"), UntilMs()); });
+    CHECK(WaitUntil([&] { return b.calls.load() == 5; }));
+    b.ProcessAdmitted(Echo);
+    CHECK(Get(r2));
+    const auto rev =
+        CallCo([&] { return bbt_co_await a.client->Call(b.Target(), MakeCall("r1", 1, "rev"), UntilMs()); });
+    CHECK(!rev);
+    {
+        std::lock_guard<std::mutex> lock(b.mu);
+        CHECK(b.by_key["dup"].size() == 1);
+        CHECK(b.by_key["rev"].size() == 1);
+    }
+    std::cout << "v2 ordering ledger: gap/duplicate/reversed reject protocol ok\n";
+}
+
+// ---- 4c. Close 负 timeout 与 Server 跨 Engine 装配边界 ---------------------
+void CloseNegativeTimeout()
+{
+    AppHost a("app-a");
+    // 负 timeout 只有 Close(Graceful, -1) 合法；其他负值一律 InvalidArgument，
+    // 不启动等待、不发布关闭原因、不改变关闭状态。
+    auto r = CloseClient(a.client, rpc::CloseFlag::Immediate, -1);
+    CHECK(!r && r.error().code == ErrorCode::InvalidArgument);
+    r = CloseClient(a.client, rpc::CloseFlag::Timeout, -1);
+    CHECK(!r && r.error().code == ErrorCode::InvalidArgument);
+    r = CloseClient(a.client, rpc::CloseFlag::Timeout, -2);
+    CHECK(!r && r.error().code == ErrorCode::InvalidArgument);
+    r = CloseClient(a.client, rpc::CloseFlag::Graceful, -5);
+    CHECK(!r && r.error().code == ErrorCode::InvalidArgument);
+    CHECK(!a.client->IsClosed());
+    CHECK(!a.client->CloseReason().has_value());
+
+    r = CloseServer(a.server, rpc::CloseFlag::Immediate, -1);
+    CHECK(!r && r.error().code == ErrorCode::InvalidArgument);
+    r = CloseServer(a.server, rpc::CloseFlag::Timeout, -7);
+    CHECK(!r && r.error().code == ErrorCode::InvalidArgument);
+    r = CloseServer(a.server, rpc::CloseFlag::Graceful, -2);
+    CHECK(!r && r.error().code == ErrorCode::InvalidArgument);
+    CHECK(!a.server->IsClosed());
+    CHECK(!a.server->CloseReason().has_value());
+    std::cout << "v2 close negative timeout rejected ok\n";
+}
+
+// CoRpcServer::Create 要求注入的 session_owner 与 Server 使用同一 net::Engine。
+void ServerCrossEngine()
+{
+    auto engine_a = net::Engine::Create(std::shared_ptr<net::RawHandler>{});
+    auto engine_b = net::Engine::Create(std::shared_ptr<net::RawHandler>{});
+    rpc::ClientOptions co;
+    co.SetLocalIdentity("cross-a").SetTrustedNetworkPlaintext(true);
+    auto made_client = rpc::CoRpcClient::Create(engine_a, co);
+    CHECK(made_client);
+    auto client = std::move(made_client).value();
+    rpc::AdmissionHandler handler = [](rpc::AdmissionItem&&) {
+        return bbt::infra::result<void>::ok();
+    };
+
+    std::error_code error;
+    rpc::ServerOptions so;
+    so.SetListenAddress(net::Address::Ip("127.0.0.1", 0, error));
+    CHECK(!error);
+    auto wrong = rpc::CoRpcServer::Create(engine_b, client, handler, so);
+    CHECK(!wrong);
+    CHECK(wrong.error().code == ErrorCode::InvalidArgument);
+
+    auto same = rpc::CoRpcServer::Create(engine_a, client, handler, so);
+    CHECK(same);
+    // Engine 未 Run：显式收口对象，engine 由本用例归应用侧 RequestClose。
+    same.value()->Shutdown();
+    client->Shutdown();
+    engine_a->RequestClose();
+    engine_b->RequestClose();
+    std::cout << "v2 server cross-engine create rejected ok\n";
+}
+
 // ---- 5. lane 满队列隔离 ---------------------------------------------------------
 void Overload()
 {
@@ -408,9 +588,10 @@ void Overload()
         }
     }
     CHECK(ok == 0 && overloaded == 4);
-    // Service lane 独立可用（满 actor 不阻塞）。
+    // Service lane 独立可用（满 actor 不阻塞）。同 key 连续 seq——入站
+    // 顺序台账对缺口按协议违规退役 link，测试须遵守递增契约。
     auto svc = SubmitCo([&] {
-        return bbt_co_await a.client->Call(b.Target(), MakeCall("svc-ok", 100, "k", rpc::TrafficClass::Service),
+        return bbt_co_await a.client->Call(b.Target(), MakeCall("svc-ok", 2, "k", rpc::TrafficClass::Service),
                                            UntilMs());
     });
     CHECK(WaitUntil([&] { return b.calls.load() == 2; }));
@@ -438,13 +619,15 @@ void LaneFairness()
     // 同协程顺序发出：6 条 Service Send + 2 条 Actor Send（Send 本地接纳即
     // 返回，不等写终态——队列在单协程内已排好出场序）。若 Actor 被 Service
     // 饿死，stats.actor.dequeued 停在 0；公平轮询下 Actor 与 Service 都推进。
+    // 两 lane 用不同 ordering_key：同一 key 的 wire 到达序受入站顺序台账
+    // 约束，跨 lane 交叉同一 key 反而是顺序违规场景，不属于本用例的公平性。
     CallCo([&] {
         for (unsigned i = 0; i != 6; ++i) {
             rpc::Request svc_msg("svc", "Tell");
             svc_msg.SetMessageId("svc" + std::to_string(i))
                 .SetReply(rpc::ReplyMode::None)
                 .SetTraffic(rpc::TrafficClass::Service)
-                .SetOrderingKey("k")
+                .SetOrderingKey("svc-k")
                 .SetSequence(i + 1)
                 .SetRequestSchema("req")
                 .SetResponseSchema("resp");
@@ -456,8 +639,8 @@ void LaneFairness()
             act_msg.SetMessageId("act" + std::to_string(i))
                 .SetReply(rpc::ReplyMode::None)
                 .SetTraffic(rpc::TrafficClass::Actor)
-                .SetOrderingKey("k")
-                .SetSequence(100 + i)
+                .SetOrderingKey("act-k")
+                .SetSequence(i + 1)
                 .SetRequestSchema("req")
                 .SetResponseSchema("resp");
             auto sent = bbt_co_await a.client->Send(b.Target(), std::move(act_msg), SendUntil(3s, false));
@@ -521,7 +704,26 @@ void Deadline()
     rpc::SendOptions no_deadline;
     auto rejected = CallCo([&] { return bbt_co_await a.client->Send(b.Target(), MakeSend("x", 1, "k"), no_deadline); });
     CHECK(!rejected && rejected.error().code == ErrorCode::InvalidArgument);
-    std::cout << "v2 deadline expired + invalid-args rejected\n";
+    // 入站预算按本地时钟换算（V1 budget_local_min 的通用断言）：80ms 剩余
+    // 预算被接纳时，Request::Context().deadline 不晚于进入时刻 +100ms，
+    // 不是远端绝对时间也不是无限期。
+    auto short_budget =
+        SubmitCo([&] { return bbt_co_await a.client->Call(b.Target(), MakeCall("budget", 2, "k"), UntilMs(80ms)); });
+    CHECK(WaitUntil([&] { return b.calls.load() == 1; }));
+    const auto entered = Clock::now();
+    {
+        std::lock_guard<std::mutex> lock(b.mu);
+        const auto inbound_deadline = b.admitted.front().request.Context().deadline;
+        CHECK(inbound_deadline <= entered + 100ms);
+        CHECK(inbound_deadline > entered - 1s);
+    }
+    b.ProcessAdmitted(Echo);
+    const auto settled = Get(short_budget); // 预算已尽：成功或 TimedOut 都是真实终态
+    if (!settled) {
+        CHECK(settled.error().code == ErrorCode::TimedOut || settled.error().code == ErrorCode::OutcomeUnknown
+              || settled.error().code == ErrorCode::Closed);
+    }
+    std::cout << "v2 deadline expired + invalid-args rejected + inbound budget local-min\n";
 }
 
 // ---- 8. raw peer 握手 + epoch 注入 ------------------------------------------------
@@ -804,7 +1006,7 @@ public:
         buffer = std::move(out);
         return {};
     }
-    net::WriteOperation AsyncWrite(std::string) override
+    std::error_code AsyncWrite(std::string) override
     {
         return {};
     }
@@ -822,6 +1024,10 @@ public:
     void RequestClose(std::error_code = {}) override
     {
     }
+    net::ReadView View() override
+    {
+        return {};
+    }
     std::error_code WaitClosed(const bbt::coroutine::WaitOptions&) override
     {
         return {};
@@ -830,6 +1036,55 @@ public:
     {
         return {};
     }
+};
+
+// 让脚本化连接经新的无状态 Channel 接缝进入握手：只转发字节与物理关闭，
+// 不改变 fake 的脚本/读写计数语义，也不在测试里复制协议状态。
+class ScriptedChannel final : public rpc::detail::ICoChannel {
+public:
+    explicit ScriptedChannel(ScriptedCoConnection& conn) noexcept : m_conn(conn)
+    {
+    }
+    ~ScriptedChannel() override = default;
+    ScriptedChannel(const ScriptedChannel&) = delete;
+    ScriptedChannel& operator=(const ScriptedChannel&) = delete;
+
+    using rpc::detail::ICoChannel::ReadBytes;
+    std::error_code ReadBytes(net::Buffer& out, const bbt::coroutine::WaitOptions& options = {}) override
+    {
+        return m_conn.Read(out, options);
+    }
+    std::error_code TryReadBytes(net::Buffer& out) override
+    {
+        return m_conn.TryRead(out);
+    }
+    std::error_code WriteBytes(std::string bytes) override
+    {
+        return m_conn.AsyncWrite(std::move(bytes));
+    }
+    net::WriteReport WriteBytes(std::string bytes, const bbt::coroutine::WaitOptions& options) override
+    {
+        return m_conn.Write(std::move(bytes), options);
+    }
+    void RequestClose(std::error_code reason = {}) override
+    {
+        m_conn.RequestClose(reason);
+    }
+    bool IsClosed() const override
+    {
+        return false;
+    }
+    bool IsReleased() const override
+    {
+        return false;
+    }
+    bool Valid() const override
+    {
+        return true;
+    }
+
+private:
+    ScriptedCoConnection& m_conn;
 };
 
 // 单次移交形态的 owning Buffer：一段装整批字节（BufferTestAccess 接缝）。
@@ -868,10 +1123,11 @@ void HandshakeCoalescedBigPinned()
     // selected epoch 与 server nonce 才能构造合法 echo——握手互锁决定
     // 第二帧输入不能预编，只能「先读回写再投递」，而投递天然单批。
     rpc::SessionFrameDecoder decoder(8 * 1024 * 1024);
+    ScriptedChannel channel(conn);
     auto future = SubmitCo([&]() -> bbt::infra::result<std::uint64_t> {
         std::string peer_identity;
-        return rpc::detail::InboundHandshakeOnConnection(conn, options, /*proposal=*/11, /*nonce=*/0x1234,
-                                                         peer_identity, decoder, Clock::now() + 10s);
+        return rpc::detail::InboundHandshakeOnChannel(channel, options, /*proposal=*/11, /*nonce=*/0x1234,
+                                                      peer_identity, decoder, Clock::now() + 10s);
     });
     // 等「server 已写 Hello+HelloAck 且握手协程已进入第二次 Read」。
     CHECK(WaitUntil([&] { return conn.writes.load() >= 2 && conn.reads.load() >= 2; }, 3s));
@@ -974,10 +1230,11 @@ void HandshakeStashTailPreserved()
     conn.Enqueue(OneShotBuffer(batch));
 
     rpc::SessionFrameDecoder decoder(8 * 1024 * 1024);
+    ScriptedChannel channel(conn);
     auto future = SubmitCo([&]() -> bbt::infra::result<std::uint64_t> {
         std::string peer_identity;
-        return rpc::detail::InboundHandshakeOnConnection(conn, options, /*proposal=*/11, /*nonce=*/0x1234,
-                                                         peer_identity, decoder, Clock::now() + 10s);
+        return rpc::detail::InboundHandshakeOnChannel(channel, options, /*proposal=*/11, /*nonce=*/0x1234,
+                                                      peer_identity, decoder, Clock::now() + 10s);
     });
 
     const auto result = Get(future);
@@ -1036,22 +1293,35 @@ void CloseDrain()
     b->ProcessAdmitted(Echo);
     CHECK(Get(boot));
 
-    CHECK(b->server->Drain(Clock::now() + 3s));
-    CHECK(b->server->Shutdown(Clock::now() + 3s));
-    b->server->Close(); // 物理收口需要先封口（杀 link），再等 Released
-    CHECK(b->server->WaitStopped(Clock::now() + 3s));
+    // 留一条已接纳未归还的调用：Graceful 必须拒新并等它真实归还后才封口。
+    auto held =
+        SubmitCo([&] { return bbt_co_await a->client->Call(b->Target(), MakeCall("held", 2, "k"), UntilMs(5s)); });
+    CHECK(WaitUntil([&] { return b->calls.load() == 2; }));
+    auto graceful = SubmitCo([&] { return bbt_co_await b->server->Close(rpc::CloseFlag::Graceful, 5000); });
+    // 已接纳责任未结：Graceful 不得早成功。
+    CHECK(graceful.wait_for(200ms) != std::future_status::ready);
+    // Draining 期间新调用立即收终态，而非等本地 deadline。
+    const auto rejected =
+        CallCo([&] { return bbt_co_await a->client->Call(b->Target(), MakeCall("late", 3, "k"), UntilMs(800ms)); });
+    CHECK(!rejected);
+    CHECK(rejected.error().code != ErrorCode::TimedOut);
+    b->ProcessAdmitted(Echo);
+    CHECK(Get(held));
+    CHECK(Get(graceful));
     CHECK(b->server->IsClosed());
+    CHECK(b->server->CloseReason().has_value());
+    // Timeout：封口后有界等待 listener/握手/session/写责任物理收口。
+    CHECK(CloseServer(b->server, rpc::CloseFlag::Timeout, 3000));
     CHECK(WaitUntil([&] { return b->engine->CountConnections() == 0; }, 3s));
 
     auto after =
-        CallCo([&] { return bbt_co_await a->client->Call(b->Target(), MakeCall("late", 2, "k"), UntilMs(800ms)); });
+        CallCo([&] { return bbt_co_await a->client->Call(b->Target(), MakeCall("after", 4, "k"), UntilMs(800ms)); });
     CHECK(!after);
-    std::cout << "v2 close drain + physical release ok\n";
+    std::cout << "v2 close graceful drain + timeout physical release ok\n";
 }
 
-// Close(reason)/Shutdown：Server 空 façade 的真实语义——Shutdown 封口 +
-// 等已接纳 item 归还（超时诚实 TimedOut、不隐式 Close）；Close 发布首个原因，
-// 拒绝后续并保留可观察的原因。
+// Close(Immediate)：立即逻辑封口并发布首个关闭原因；重复 Close/Shutdown
+// 不覆盖首个原因，新调用按该原因拒绝，已提交在途调用保持 OutcomeUnknown。
 void CloseReason()
 {
     auto a = std::make_unique<AppHost>("app-a");
@@ -1060,17 +1330,8 @@ void CloseReason()
         SubmitCo([&] { return bbt_co_await a->client->Call(b->Target(), MakeCall("hold", 1, "k"), UntilMs()); });
     CHECK(WaitUntil([&] { return b->calls.load() == 1; }));
 
-    // 已接纳 item 未释放：Shutdown 必须等它，不谎报排空。
-    ExpectCode(b->server->Shutdown(Clock::now() + 50ms), ErrorCode::TimedOut);
-    CHECK(!b->server->IsClosed());
-    CHECK(!b->server->CloseReason().has_value());
-
-    b->ProcessAdmitted(Echo);
-    CHECK(Get(held));
-    CHECK(b->server->Shutdown(Clock::now() + 3s));
-
     const auto reason = MakeError(ErrorCode::Unavailable, "owner close");
-    b->server->Close(reason);
+    CHECK(CloseServer(b->server, rpc::CloseFlag::Immediate, 0, reason));
     CHECK(b->server->IsClosed());
     auto observed = b->server->CloseReason();
     CHECK(observed.has_value());
@@ -1078,12 +1339,25 @@ void CloseReason()
         CHECK(observed->code == ErrorCode::Unavailable);
         CHECK(observed->message == "owner close");
     }
-    // 重复 Close 不覆盖首个原因。
-    b->server->Close(MakeError(ErrorCode::TimedOut, "later"));
+    // 重复 Close/Shutdown 不覆盖首个原因。
+    CHECK(CloseServer(b->server, rpc::CloseFlag::Immediate, 0, MakeError(ErrorCode::TimedOut, "later")));
+    b->server->Shutdown(MakeError(ErrorCode::Unavailable, "shutdown later"));
     auto again = b->server->CloseReason();
     CHECK(again.has_value() && again->message == "owner close");
-    CHECK(b->server->WaitStopped(Clock::now() + 3s));
-    std::cout << "v2 shutdown drain/timeout + close reason ok\n";
+
+    // 已提交在途调用按 OutcomeUnknown 收场（不追改成成功）。
+    const auto held_result = Get(held);
+    CHECK(!held_result);
+    CHECK(held_result.error().code == ErrorCode::OutcomeUnknown);
+    // 封口后新调用立即终态。
+    const auto late =
+        CallCo([&] { return bbt_co_await a->client->Call(b->Target(), MakeCall("late", 2, "k"), UntilMs(800ms)); });
+    CHECK(!late);
+    CHECK(late.error().code != ErrorCode::TimedOut);
+    // 归还已接纳项（写已不可能成功）：物理收口需要 inflight/写责任归零。
+    b->ProcessAdmitted(Echo);
+    CHECK(CloseServer(b->server, rpc::CloseFlag::Timeout, 3000));
+    std::cout << "v2 close immediate publishes first reason + idempotent ok\n";
 }
 
 // Close(custom)：v2 已提交在途 Call 保留 OutcomeUnknown/request_phase，并在
@@ -1097,7 +1371,7 @@ void CloseReasonPending()
     // 请求已被对端接纳 = 请求字节已完整写出，属于已提交。
     CHECK(WaitUntil([&] { return b->calls.load() == 1; }));
 
-    a->client->Close(MakeError(ErrorCode::Unavailable, "owner close"));
+    CHECK(CloseClient(a->client, rpc::CloseFlag::Immediate, 0, MakeError(ErrorCode::Unavailable, "owner close")));
     const auto result = Get(held);
     CHECK(!result);
     CHECK(result.error().code == ErrorCode::OutcomeUnknown);
@@ -1125,7 +1399,7 @@ void CloseReasonPending()
 
     // 归还 b 侧已接纳项，避免测试自身留下未终结 handler。
     b->ProcessAdmitted(Echo);
-    CHECK(b->server->Drain(Clock::now() + 3s));
+    CHECK(CloseServer(b->server, rpc::CloseFlag::Graceful, 3000));
     std::cout << "v2 close reason attached to committed pending call\n";
 }
 
@@ -1158,7 +1432,7 @@ void AdmissionInflight()
     std::cout << "v2 admission inflight cap immediate-overload + recover ok\n";
 }
 
-// ---- 10. F3/F4：handler 拒绝 → 唯一错误终态 + inflight 不欠账、Drain 收口 ----
+// ---- 10. F3/F4：handler 拒绝 → 唯一错误终态 + inflight 不欠账、Graceful 收口 ----
 // handler 对 "bad" 返回错误：调用方立即收非 timeout 错误终态；server
 // inflight 回零且 finished/dropped 各记一次——Lease 单次结算。
 void AdmissionReject()
@@ -1187,9 +1461,9 @@ void AdmissionReject()
         const auto stats = b.server->Stats();
         return stats.service.inflight == 0 && stats.service.dropped >= 1 && stats.service.finished >= 2;
     }));
-    // inflight 干净回零：Drain 立即成功（若双扣下溢则假超时）。
-    CHECK(b.server->Drain(Clock::now() + 1500ms));
-    std::cout << "v2 admission handler-reject unique-terminal drain ok\n";
+    // inflight 干净回零：Graceful 立即成功（若双扣下溢则假超时）。
+    CHECK(CloseServer(b.server, rpc::CloseFlag::Graceful, 1500));
+    std::cout << "v2 admission handler-reject unique-terminal graceful close ok\n";
 }
 
 // ---- 11. F10-bytes：owning metadata/request 字段计入 admission 字节 --------
@@ -1223,7 +1497,7 @@ void AdmissionBytes()
     std::cout << "v2 admission owning-bytes charged + small admitted\n";
 }
 
-// ---- 12. F3-封口：StopAccepting 后 Call 立即收终态而非等 deadline ------------
+// ---- 12. F3-封口：Shutdown 后 Call 立即收终态而非等 deadline -----------------
 void AdmissionSealed()
 {
     AppHost a("app-a"), b("app-b");
@@ -1232,7 +1506,8 @@ void AdmissionSealed()
     b.ProcessAdmitted(Echo);
     CHECK(Get(boot));
 
-    b.server->StopAccepting();
+    // Shutdown 是宿主侧同步强制关闭：立即停止接纳并封口 admission。
+    b.server->Shutdown();
     CHECK(WaitUntil([&] { return b.server->Stats().accepted_connections >= 1; }));
     auto sealed =
         CallCo([&] { return bbt_co_await a.client->Call(b.Target(), MakeCall("sealed", 2, "k"), UntilMs(3s)); });
@@ -1317,7 +1592,7 @@ std::shared_ptr<HookGate> MakeWriterGate(AppHost& first, AppHost& second)
     return gate;
 }
 
-// 13a. 回复已入队/在写未终态：Complete 不早成功、Drain 不早成功，
+// 13a. 回复已入队/在写未终态：Complete 不早成功、Graceful Close 不早成功，
 //      写终态后唯一结算（计数只扣一次）。
 void ReplyWriteDeferred()
 {
@@ -1353,8 +1628,8 @@ void ReplyWriteDeferred()
     CHECK(Get(held1)); // 调用方收到 Response
     CHECK(WaitUntil([&] { return rpc::detail::ServerV2LedgerForTest(*b.server).writes_outstanding == 0; }, 2s));
 
-    // 阶段二：Drain 不早成功——Drain 自带 StopAccepting 副作用（accept 错误
-    // 令 AcceptLoop 执行 Seal → link 退役），在写项的真实终态随后唯一结算。
+    // 阶段二：Graceful Close 不早成功——已接纳写责任未结算时关闭必须挂起，
+    // 在写项的真实终态随后唯一结算。
     auto held2 =
         SubmitCo([&] { return bbt_co_await a.client->Call(b.Target(), MakeCall("held2", 3, "k"), UntilMs(5s)); });
     CHECK(WaitUntil([&] { return b.calls.load() == 3; }));
@@ -1371,18 +1646,18 @@ void ReplyWriteDeferred()
     CHECK(WaitUntil([&] { return gate2->Entered(HookPoint::BeforeWrite); }, 3s));
     CHECK(rpc::detail::ServerV2LedgerForTest(*b.server).writes_outstanding >= 1);
     CHECK(done2.wait_for(0ms) != std::future_status::ready);
-    // Drain 不早成功：诊断 Pause 中的在写项仍是未结算写责任——Drain 诚实
-    // 超时，不靠杀 link 提前收口（优雅排空，封口只置 Draining 不 Close）。
-    const auto drained_early = b.server->Drain(Clock::now() + 200ms);
-    CHECK(!drained_early);
-    CHECK(drained_early.error().code == ErrorCode::TimedOut);
+    // Graceful 不早成功：诊断 Pause 中的在写项仍是未结算写责任——关闭挂起
+    // 在已接纳责任上，不靠杀 link 提前收口。
+    auto graceful = SubmitCo([&] { return bbt_co_await b.server->Close(rpc::CloseFlag::Graceful, 5000); });
+    CHECK(graceful.wait_for(200ms) != std::future_status::ready);
     // 放行后写真实完成：Complete/调用方按真实终态返回，写责任唯一结算。
     gate2->Release();
     CHECK(Get(done2));
     CHECK(Get(held2));
     CHECK(WaitUntil([&] { return rpc::detail::ServerV2LedgerForTest(*b.server).writes_outstanding == 0; }, 2s));
-    CHECK(b.server->Drain(Clock::now() + 3s));
-    std::cout << "v2 reply write deferred: no early complete/drain ok\n";
+    CHECK(Get(graceful));
+    CHECK(b.server->IsClosed());
+    std::cout << "v2 reply write deferred: no early complete/graceful close ok\n";
 }
 
 // 13b. 写前关闭 link：Complete 返回真实写失败而非 ok；写责任唯一结算。
@@ -1416,7 +1691,7 @@ void ReplyWriteFailClose()
     CHECK(rpc::detail::ServerV2LedgerForTest(*b->server).writes_outstanding >= 1);
     // 在写未终态时 v2 立即封口：Kill 对在写项保留责任（不属排队丢弃），
     // 真实终态由 WriterLoop 的失败路径唯一结算。
-    b->server->Close();
+    b->server->Shutdown();
     CHECK(WaitUntil([&] { return gate->InFlight() == 0; }));
     const auto result = Get(done);
     CHECK(!result); // 不得伪报写成功
@@ -1425,7 +1700,7 @@ void ReplyWriteFailClose()
     CHECK(WaitUntil([&] { return rpc::detail::ServerV2LedgerForTest(*b->server).writes_outstanding == 0; }, 2s));
     const auto held_result = Get(held);
     CHECK(!held_result); // link 退役：提交后失联
-    CHECK(b->server->WaitStopped(Clock::now() + 3s));
+    CHECK(CloseServer(b->server, rpc::CloseFlag::Timeout, 3000));
     std::cout << "v2 reply write fail-close: real failure returned\n";
 }
 
@@ -1484,8 +1759,8 @@ void WriteTerminalOnce()
     for (auto& write : writes) {
         CHECK(write.wait_for(0ms) != std::future_status::ready);
     }
-    b.server->Close();
-    b.server->Close(); // 重复封口不再拥有任何队列/写结算责任。
+    b.server->Shutdown();
+    b.server->Shutdown(); // 重复封口不再拥有任何队列/写结算责任。
     for (auto& write : writes) {
         const auto result = Get(write);
         CHECK(!result);
@@ -1503,15 +1778,15 @@ void WriteTerminalOnce()
         const auto duplicate = CallCo([&, i] { return bbt_co_await replies[i]->Complete(Echo(requests[i])); });
         CHECK(!duplicate && duplicate.error().code == ErrorCode::InvalidArgument);
     }
-    CHECK(b.server->WaitStopped(Clock::now() + 3s));
+    CHECK(CloseServer(b.server, rpc::CloseFlag::Timeout, 3000));
     const auto ledger = rpc::detail::ServerV2LedgerForTest(*b.server);
     CHECK(ledger.writes_outstanding == 0);
     CHECK(ledger.links == 0 && ledger.handshakes == 0);
     CHECK(b.client->Stats().service.queued == 0);
     CHECK(b.client->Stats().service.bytes_queued == 0);
     CHECK(b.server->Stats().service.inflight == 0);
-    a.server->Close();
-    CHECK(a.server->WaitStopped(Clock::now() + 3s));
+    a.server->Shutdown();
+    CHECK(CloseServer(a.server, rpc::CloseFlag::Timeout, 3000));
     CHECK(WaitUntil([&] { return a.engine->CountConnections() == 0 && b.engine->CountConnections() == 0; }));
     CHECK(completed.load() == 3);
     std::cout << "write terminal once: writer + queued close, all waiters and resources settled\n";
@@ -1603,7 +1878,7 @@ void ReplyCorrelationMismatch()
     CHECK(!held_result);
     CHECK(held_result.error().code == ErrorCode::ProtocolError);
     CHECK(WaitUntil([&] { return rpc::detail::ServerV2LedgerForTest(*b.server).writes_outstanding == 0; }, 2s));
-    CHECK(b.server->Drain(Clock::now() + 2s));
+    CHECK(CloseServer(b.server, rpc::CloseFlag::Graceful, 2000));
     std::cout << "v2 reply correlation mismatch: ProtocolError + write accounted\n";
 }
 
@@ -1660,9 +1935,8 @@ void CloseReleased()
     CHECK(done.wait_for(5s) == std::future_status::ready);
     (void)Get(done);
     (void)Get(held);
-    CHECK(b->server->Shutdown(Clock::now() + 3s));
-    b->server->Close();
-    CHECK(b->server->WaitStopped(Clock::now() + 3s));
+    // Timeout：封口 + 有界等待物理收口（listener/握手/session/写责任）。
+    CHECK(CloseServer(b->server, rpc::CloseFlag::Timeout, 3000));
     CHECK(b->server->IsClosed());
     CHECK(WaitUntil([&] { return b->engine->CountConnections() == 0; }, 3s));
     CHECK(WaitUntil([&] { return rpc::detail::ServerV2LedgerForTest(*b->server).writes_outstanding == 0; }, 2s));
@@ -1678,9 +1952,9 @@ void CloseHandshake()
     CHECK(WaitUntil([&] { return gate->Entered(HookPoint::InboundBeforeHandshake) == 1; }, 3s));
     CHECK(rpc::detail::ServerV2LedgerForTest(*b->server).handshakes >= 1);
     CHECK(gate->InFlight() == 1);
-    b->server->Close(); // 立即封口：取消握手 Pause，不等待物理收口
+    b->server->Shutdown(); // 立即封口：取消握手 Pause，不等待物理收口
     CHECK(b->server->IsClosed());
-    CHECK(b->server->WaitStopped(Clock::now() + 3s));
+    CHECK(CloseServer(b->server, rpc::CloseFlag::Timeout, 3000));
     CHECK(WaitUntil([&] { return gate->InFlight() == 0; }));
     CHECK(!HookState(b->client->Hooks(), HookPoint::InboundBeforeHandshake).closed);
     CHECK(WaitUntil(
@@ -1735,7 +2009,7 @@ void CloseSealedNoPublish()
 
     // 第二挂点：握手完成、安装前——此时 Close 封口。
     CHECK(WaitUntil([&] { return gate->Entered(HookPoint::InboundBeforePublish) == 1; }, 3s));
-    b->server->Close(); // 立即封口（不等待）
+    b->server->Shutdown(); // 立即封口（不等待）
     CHECK(WaitUntil([&] { return gate->InFlight() == 0; }));
     CHECK(WaitUntil(
         [&] {
@@ -1743,7 +2017,7 @@ void CloseSealedNoPublish()
             return ledger.links == 0 && ledger.handshakes == 0;
         },
         3s));
-    CHECK(b->server->WaitStopped(Clock::now() + 3s));
+    CHECK(CloseServer(b->server, rpc::CloseFlag::Timeout, 3000));
     CHECK(b->server->Stats().accepted_connections == 0);
     CHECK(WaitUntil([&] { return b->engine->CountConnections() == 0; }));
     CHECK(WaitUntil([&] { return peer.Eof(); }));
@@ -2140,43 +2414,41 @@ void QuotaReleaseRetry()
     std::cout << "v2 quota release then admit: shared record + retry ok\n";
 }
 
-// ---- P1-5/P2-2/P2-3：未 Start 直接 Drain/Close 幂等不虚假等待；queue-full
-// + drain/wait + stats 并发不卡死、计数一致；IsClosed/LocalAddress 并发读
+// ---- P1-5/P2-2/P2-3：未 Start 直接 Close/Shutdown 幂等不虚假等待；queue-full
+// + close + stats 并发不卡死、计数一致；IsClosed/LocalAddress 并发读
 // 与 Start/Close 同锁 ------------------------------------------------------
 void NeverStartedDrainClose()
 {
     // 未 Start 的 v2 Server：Create 后 queue 为空、accept 任务未登记——
-    // Drain 不得解引用空 queue（P2-2 空指针），Close 不得在
+    // Close 不得解引用空 queue（P2-2 空指针），也不得在
     // accept_loop_exited 上虚假等待（无启动任务即视为已退出）。
     auto engine = net::Engine::Create(std::shared_ptr<net::RawHandler>{});
     rpc::ClientOptions co;
     co.SetLocalIdentity("never-started").SetTrustedNetworkPlaintext(true);
-    auto made_client = rpc::Client::Create(engine, co);
+    auto made_client = rpc::CoRpcClient::Create(engine, co);
     CHECK(made_client);
     auto client = std::move(made_client).value();
     std::error_code addr_error;
-    auto made_server = rpc::Server::Create(
+    auto made_server = rpc::CoRpcServer::Create(
         engine, client, [](rpc::AdmissionItem&&) { return bbt::infra::result<void>::ok(); },
         rpc::ServerOptions{}.SetListenAddress(net::Address::Ip("127.0.0.1", 0, addr_error)));
     CHECK(!addr_error);
     CHECK(made_server);
     auto server = std::move(made_server).value();
-    // 未 Start 的 Drain 立即完成（DrainedLocked 无 queue 也为真）。
-    const auto drained = server->Drain(Clock::now() + 1500ms);
-    CHECK(drained);
-    // 未 Start 的 Shutdown 立即完成——不得等 accept_loop_exited（无 accept
-    // 任务）；物理收口谓词同样空即真。
-    const auto closed = server->Shutdown(Clock::now() + 1500ms);
-    CHECK(closed);
-    server->Close();
-    CHECK(server->WaitStopped(Clock::now() + 1500ms));
+    // 未 Start 的 Graceful 立即完成（DrainedLocked 无 queue 也为真）并封口。
+    CHECK(CloseServer(server, rpc::CloseFlag::Graceful, 1500));
     CHECK(server->IsClosed());
-    // 已排空且无在途：Drain 幂等仍 ok；Shutdown 对已 Closed 如实返回首个
-    // 关闭原因（幂等、不覆盖）。
-    CHECK(server->Drain(Clock::now() + 500ms));
-    ExpectCode(server->Shutdown(Clock::now() + 500ms), ErrorCode::Closed);
-    // 并发 IsClosed/LocalAddress 与 Close（Start 未发生）同锁读取——
-    // 读侧与写侧同一把 v2->mu，不构成数据竞争（P2-3）。在 Close 前
+    // Timeout 对已封口对象幂等：不得等 accept_loop_exited（无 accept
+    // 任务），物理收口谓词同样空即真。
+    CHECK(CloseServer(server, rpc::CloseFlag::Timeout, 1500));
+    // 已封口：Immediate 幂等 ok；Graceful 如实返回首个关闭原因（不覆盖）。
+    CHECK(CloseServer(server, rpc::CloseFlag::Immediate));
+    ExpectCode(CloseServer(server, rpc::CloseFlag::Graceful, 500), ErrorCode::Closed);
+    const auto first_reason = server->CloseReason();
+    CHECK(first_reason.has_value() && first_reason->code == ErrorCode::Closed);
+    server->Shutdown(MakeError(ErrorCode::TimedOut, "later"));
+    // 并发 IsClosed/LocalAddress 与 Shutdown（Start 未发生）同锁读取——
+    // 读侧与写侧同一把 v2->mu，不构成数据竞争（P2-3）。在 Shutdown 前
     // 启动 reader 覆盖并发窗口；reads 计数在 stop 前推进即证明循环
     // 真实执行（Close 已幂等完成，reader 立即退出）。
     std::atomic<bool> stop{false};
@@ -2188,19 +2460,22 @@ void NeverStartedDrainClose()
             ++reads;
         }
     });
-    const auto closed3 = server->Shutdown(Clock::now() + 500ms);
-    CHECK(!closed3);
-    CHECK(closed3.error().code == ErrorCode::Closed);
+    server->Shutdown();
+    CHECK(server->IsClosed());
+    CHECK(server->CloseReason().has_value());
+    if (const auto observed = server->CloseReason(); observed) {
+        CHECK(observed->code == ErrorCode::Closed); // 首个原因不被覆盖
+    }
     CHECK(WaitUntil([&] { return reads.load() > 0; }, 1s));
     stop.store(true, std::memory_order_release);
     reader.join();
-    std::cout << "v2 never-started drain/close idempotent + concurrent reads ok\n";
+    std::cout << "v2 never-started close/shutdown idempotent + concurrent reads ok\n";
 }
 
 void QueueFullDrainStatsConcurrent()
 {
     // queue-full 下 Admit 的 dropped 记账不再在 impl->mu 内取 server->mu：
-    // 与 Drain（server->mu → queue->Queued(impl->mu)）不构成反向锁序闭环。
+    // 与 Close（server->mu → queue->Queued(impl->mu)）不构成反向锁序闭环。
     // 并发 Stats 同样只走 queue 观察面，不直读 impl 字段。
     rpc::ServerOptions opts;
     // MaxInflight 放大避免先触 cap；MaxHandlerBytes 收窄让字节计数在
@@ -2232,15 +2507,17 @@ void QueueFullDrainStatsConcurrent()
     // 8 条并发 Call（各自独立协程）：第 1 条在 handler 阻塞，中间条目
     // 积压在 queue（每条 ~110B），字节预算 256B 打满后触发 queue-full
     // 拒绝；各条 Overloaded/成功分布随 worker 时序，断言总量与类型。
+    // 并发同 key 的顺序号会乱序到达——本用例度量 queue-full，不度量顺序，
+    // 洪水请求不带 ordering_key/sequence（seq=0 不启用顺序台账）。
     std::vector<std::future<bbt::infra::result<rpc::Response>>> flood;
     for (unsigned i = 0; i != 8; ++i) {
         flood.push_back(SubmitCo([&a, &b, i] {
-            return bbt_co_await a.client->Call(b.Target(), MakeCall("f" + std::to_string(i), i + 1, "k"), UntilMs(6s));
+            return bbt_co_await a.client->Call(b.Target(), MakeCall("f" + std::to_string(i), 0, ""), UntilMs(6s));
         }));
     }
-    // 并发：Stats 轮询与 queue 积压/拒绝路径交错；Drain 在拒绝记账后
-    // 启动，与积压在途项的收口观察交错——drain 线程必须在时限内返回
-    //（无死锁；queue 积压与 inflight 未释放期间 Drain 合法超时也接受）。
+    // 并发：Stats 轮询与 queue 积压/拒绝路径交错；Graceful Close 在拒绝
+    // 记账后启动，与积压在途项的收口观察交错——关闭必须在时限内返回
+    //（无死锁；queue 积压与 inflight 未释放期间合法 TimedOut 也接受）。
     // 先汇合全部线程再断言，避免 CHECK 失败时 joinable thread 析构。
     std::atomic<bool> stop{false};
     std::thread stats_reader([&] {
@@ -2256,10 +2533,10 @@ void QueueFullDrainStatsConcurrent()
             return s.service.dropped >= 1;
         },
         3s);
-    // Drain 持 server->mu 等 DrainedLocked，经 queue 观察面读 impl->mu——
+    // Close 持 server->mu 等 DrainedLocked，经 queue 观察面读 impl->mu——
     // 反向序 Admit（impl->mu → server->mu）已消除，此处不得死锁。
-    auto drain_result = std::async(std::launch::async, [&] { return b.server->Drain(Clock::now() + 1200ms); });
-    const bool drain_done = drain_result.wait_for(std::chrono::seconds(4)) == std::future_status::ready;
+    auto close_result = SubmitCo([&] { return bbt_co_await b.server->Close(rpc::CloseFlag::Graceful, 1200); });
+    const bool close_done = close_result.wait_for(std::chrono::seconds(4)) == std::future_status::ready;
     // 先撤闸再放行：放行后 worker 立刻取下一条，若此时 armed 仍为真会再次
     // 进入无人释放的 Pause（直到其 10s 等待到期），责任无法在窗口内归零。
     armed.store(false, std::memory_order_release);
@@ -2267,11 +2544,11 @@ void QueueFullDrainStatsConcurrent()
     stop.store(true, std::memory_order_release);
     stats_reader.join();
     CHECK(dropped_seen);
-    CHECK(drain_done);
-    // 并发 Drain 的结果必须真实分类：在途 handler 责任未结时允许 TimedOut，
+    CHECK(close_done);
+    // 并发 Close 的结果必须真实分类：在途 handler 责任未结时允许 TimedOut，
     // 其他错误码是缺陷；不得以 (void) 丢弃返回值。
-    const auto drain_first = drain_result.get();
-    CHECK(drain_first || drain_first.error().code == ErrorCode::TimedOut);
+    const auto close_first = close_result.get();
+    CHECK(close_first || close_first.error().code == ErrorCode::TimedOut);
     // 责任真实归还：把 handler 已接纳的 item 逐个 Complete+Release，直到
     // admission 队列、inflight 与写责任全部归零——不以 boot 已满足的
     // calls>=1 当作「已消费」。
@@ -2298,8 +2575,8 @@ void QueueFullDrainStatsConcurrent()
         } else if (r.error().code == ErrorCode::Overloaded) {
             ++overloaded;
         } else if (r.error().code == ErrorCode::OutcomeUnknown || r.error().code == ErrorCode::Closed) {
-            // AcceptLoop 在 CoAccept 因 StopAccepting 返回 canceled 时
-            // Seal——既有 link 收口是 Drain 并发的合法终态。
+            // owner 封口（Close/Shutdown）令 CoAccept 返回 canceled 后
+            // Seal——既有 link 收口是并发关闭的合法终态。
             ++other;
         } else {
             ++other;
@@ -2309,14 +2586,9 @@ void QueueFullDrainStatsConcurrent()
     }
     CHECK(overloaded >= 1);
     CHECK(ok + overloaded + other == 8);
-    // 责任归零后 Drain 必须真实成功（不是「仍在途」的 TimedOut）。
-    const auto drained = b.server->Drain(Clock::now() + 5s);
-    CHECK(drained);
-    // Close 必须收口到真实终态：TimedOut 保留 owner 不是本用例可接受的
-    // 终点（ADR0014 §2.3/§5：超时后仍需继续驱动并观察最终收口）。
-    CHECK(b.server->Shutdown(Clock::now() + 10s));
-    b.server->Close();
-    CHECK(b.server->WaitStopped(Clock::now() + 10s));
+    // 责任归零后 Timeout Close 必须收口到真实终态：物理释放全部完成，
+    // 不以 TimedOut 作为本用例可接受的终点。
+    CHECK(CloseServer(b.server, rpc::CloseFlag::Timeout, 10000));
     CHECK(b.server->IsClosed());
     CHECK(WaitUntil([&] { return b.engine->CountConnections() == 0; }, 5s));
     // 最终责任统计：inflight/queue/写责任/link 台账全部归零。
@@ -2331,7 +2603,7 @@ void QueueFullDrainStatsConcurrent()
         5s));
     const auto final_stats = b.server->Stats();
     CHECK(final_stats.service.finished >= final_stats.service.dropped);
-    std::cout << "v2 queue-full drain/stats concurrent no deadlock"
+    std::cout << "v2 queue-full close/stats concurrent no deadlock"
               << " ok=" << ok << " overloaded=" << overloaded << " finished=" << final_stats.service.finished << "\n";
 }
 
@@ -2448,7 +2720,8 @@ void HookPauseCancelClose()
             return HookState(hooks, HookPoint::OutboundBeforeHandshake).entered == 1
                    && HookState(hooks, HookPoint::OutboundBeforeHandshake).in_flight == 1;
         }));
-        a->client->Close();
+        // 宿主侧同步强制关闭：不等、不挂起，封口即取消出站握手 Pause。
+        a->client->Shutdown();
         const auto result = Get(pending);
         CHECK(!result && result.error().code == ErrorCode::Closed);
         CHECK(WaitUntil([&] {
@@ -2525,14 +2798,13 @@ void HookWriteThrow()
     // 调用方按 OutcomeUnknown 收场，不得伪报提交前错误。
     CHECK(!held_result);
     CHECK(held_result.error().code == ErrorCode::OutcomeUnknown);
-    CHECK(b.server->Drain(Clock::now() + 3s));
+    CHECK(CloseServer(b.server, rpc::CloseFlag::Graceful, 3000));
     std::cout << "v2 BeforeWrite ThrowOnce: dequeued write settled once\n";
 }
 
-// close-simplify 契约用例 a：在途时 Shutdown 超时返回 TimedOut 且仍拒新
-// （Draining 不可重开）；已接纳调用照常完成后同态 ok；重复 Shutdown 在
-// 仍有在途时返回 Busy（Overloaded）。屏障：对端已接纳（b.calls==1）+
-// IsClosed()（Draining 即报封口）证明确实在途再触发。
+// close-simplify 契约用例 a：Shutdown 是宿主侧同步强制关闭——不等待、不
+// 挂起，立即封口并发布默认原因；新调用按该原因拒绝，已提交在途调用立即
+// OutcomeUnknown。屏障：对端已接纳（b.calls==1）证明确实在途再触发。
 void ShutdownTimeoutStaysDraining()
 {
     auto a = std::make_unique<AppHost>("app-a");
@@ -2541,66 +2813,66 @@ void ShutdownTimeoutStaysDraining()
         SubmitCo([&] { return bbt_co_await a->client->Call(b->Target(), MakeCall("held", 1, "k"), UntilMs(5s)); });
     CHECK(WaitUntil([&] { return b->calls.load() == 1; }));
 
-    ExpectCode(a->client->Shutdown(Clock::now() + 50ms), ErrorCode::TimedOut);
+    a->client->Shutdown();
     CHECK(a->client->IsClosed());
-    CHECK(!a->client->CloseReason().has_value()); // Shutdown 不发布原因
+    // Shutdown 发布默认关闭原因（不是「无原因」）。
+    auto published = a->client->CloseReason();
+    CHECK(published.has_value() && published->code == ErrorCode::Closed);
+
+    // 在途调用立即收终态，不等对端回复。
+    const auto held_result = Get(held);
+    CHECK(!held_result);
+    CHECK(held_result.error().code == ErrorCode::OutcomeUnknown);
 
     const auto rejected =
         CallCo([&] { return bbt_co_await a->client->Call(b->Target(), MakeCall("late", 2, "k"), UntilMs()); });
     CHECK(!rejected);
     CHECK(rejected.error().code == ErrorCode::Closed);
 
+    // 已接纳项归还走真实写失败路径，不拖死关闭状态。
     b->ProcessAdmitted(Echo);
-    CHECK(Get(held));                              // 在途完成不拖死
-    CHECK(a->client->Shutdown(Clock::now() + 3s)); // 已排空同态 ok
-
-    a->client->Close();
-    std::cout << "v2 shutdown timeout stays draining + rejects new\n";
+    // 幂等且不覆盖首个原因。
+    a->client->Shutdown(MakeError(ErrorCode::Unavailable, "later"));
+    CHECK(CloseClient(a->client, rpc::CloseFlag::Immediate));
+    auto again = a->client->CloseReason();
+    CHECK(again.has_value() && again->code == ErrorCode::Closed);
+    std::cout << "v2 shutdown sync seal + rejects new\n";
 }
 
-// close-simplify 契约用例 b：Shutdown 等待中被 Close 打断返回首个关闭
-// 原因；Close 在 Draining 下仍执行「失败在途」（未提交的 held 结算为
-// Closed + 原因详情）。屏障：writer 停在 BeforeWrite Pause（held 在途
-// 未提交）+ Shutdown 仍在阻塞（Shutdown 线程已置 Draining=IsClosed）。
+// close-simplify 契约用例 b：Graceful Close 等待中被 Shutdown 打断，返回
+// 首个关闭原因；已提交的在途调用保持 OutcomeUnknown 并带原因详情。屏障：
+// 对端已接纳（b.calls==1）而 handler 未归还，Graceful 挂起未发布原因。
 void ShutdownInterruptedByClose()
 {
     auto a = std::make_unique<AppHost>("app-a");
     auto b = std::make_unique<AppHost>("app-b");
-    auto gate = std::make_shared<HookGate>();
-    gate->Arm(*a, HookPoint::BeforeWrite); // 只挡 A 侧 writer
     auto held =
         SubmitCo([&] { return bbt_co_await a->client->Call(b->Target(), MakeCall("held", 1, "k"), UntilMs(10s)); });
-    CHECK(WaitUntil([&] { return gate->Entered(HookPoint::BeforeWrite) >= 1; }, 3s));
+    CHECK(WaitUntil([&] { return b->calls.load() == 1; }, 3s));
 
-    std::optional<bbt::infra::result<void>> shutdown_result;
-    std::thread waiter([&] { shutdown_result.emplace(a->client->Shutdown(bbt::coroutine::Deadline::max())); });
-    CHECK(WaitUntil([&] { return a->client->IsClosed(); }));
-    CHECK(!shutdown_result.has_value()); // 屏障：Shutdown 仍在等，非先排空
+    auto graceful = SubmitCo([&] { return bbt_co_await b->server->Close(rpc::CloseFlag::Graceful, -1); });
+    // 屏障：Graceful 仍在等已接纳责任归还，未发布关闭原因。
+    CHECK(graceful.wait_for(200ms) != std::future_status::ready);
+    CHECK(!b->server->CloseReason().has_value());
 
-    a->client->Close(MakeError(ErrorCode::Unavailable, "owner abort"));
-    waiter.join();
-    CHECK(shutdown_result.has_value());
-    CHECK(!*shutdown_result);
-    if (shutdown_result && !*shutdown_result) {
-        CHECK(shutdown_result->error().code == ErrorCode::Unavailable);
-        CHECK(shutdown_result->error().message == "owner abort");
-    }
-    // Close 幂等 + 首个原因固定：二次 Close 不覆盖。
-    a->client->Close(MakeError(ErrorCode::TimedOut, "later"));
-    auto observed = a->client->CloseReason();
+    b->server->Shutdown(MakeError(ErrorCode::Unavailable, "owner abort"));
+    const auto closed = Get(graceful);
+    CHECK(!closed);
+    CHECK(closed.error().code == ErrorCode::Unavailable);
+    CHECK(closed.error().message == "owner abort");
+    // 首个原因固定：二次 Close/Shutdown 不覆盖。
+    CHECK(CloseServer(b->server, rpc::CloseFlag::Immediate, 0, MakeError(ErrorCode::TimedOut, "later")));
+    b->server->Shutdown(MakeError(ErrorCode::Unavailable, "shutdown later"));
+    auto observed = b->server->CloseReason();
     CHECK(observed.has_value() && observed->message == "owner abort");
 
     const auto held_result = Get(held);
     CHECK(!held_result);
-    CHECK(held_result.error().code == ErrorCode::Closed);
-    bool has_reason = false;
-    for (const auto& detail : held_result.error().details) {
-        if (detail.first == "close_reason" && detail.second == "owner abort") {
-            has_reason = true;
-        }
-    }
-    CHECK(has_reason);
-    std::cout << "v2 shutdown interrupted by close returns first reason\n";
+    // 已提交且无可信终态：不得追改成已胜出的成功，也不伪造服务端关闭原因。
+    CHECK(held_result.error().code == ErrorCode::OutcomeUnknown);
+    CHECK(held_result.error().request_phase == bbt::infra::RequestPhase::RequestCommitted);
+    b->ProcessAdmitted(Echo);
+    std::cout << "v2 graceful close interrupted by shutdown returns first reason\n";
 }
 
 // close-simplify 契约用例 c：Close 时在途调用按分类如实收场并统一附加
@@ -2622,7 +2894,7 @@ void CloseInflightReason()
         SubmitCo([&] { return bbt_co_await a->client->Call(b->Target(), MakeCall("held2", 2, "k"), UntilMs(10s)); });
     CHECK(WaitUntil([&] { return gate->Entered(HookPoint::BeforeWrite) >= 1; }, 3s));
 
-    a->client->Close(MakeError(ErrorCode::Unavailable, "owner close"));
+    CHECK(CloseClient(a->client, rpc::CloseFlag::Immediate, 0, MakeError(ErrorCode::Unavailable, "owner close")));
 
     const auto r1 = Get(held1);
     CHECK(!r1);
@@ -2651,6 +2923,142 @@ void CloseInflightReason()
                  "uncommitted gets Closed, both carry reason\n";
 }
 
+// ---- 24. 客户端输入边界（V1 client_input 的通用断言迁移到 V2 入口） ---------
+// target 只接受 tcp://numeric-ip:port；Call 固定 Required、Send 固定 None；
+// 未设置/已过期 deadline 不发请求。全部拒绝发生在拨号前。
+void ClientInput()
+{
+    AppHost a("app-a");
+    for (const char* target : {"127.0.0.1:9", "http://127.0.0.1:9", "tcp://127.0.0.1:9/rpc", "tcp://user@127.0.0.1:9",
+                               "tcp://127.0.0.1:0", "tcp://127.0.0.1:9 ", "tcp://"}) {
+        const auto bad =
+            CallCo([&] { return bbt_co_await a.client->Call(target, MakeCall("in-1", 1, "k"), UntilMs()); });
+        ExpectCode(bad, ErrorCode::InvalidArgument);
+    }
+    { // Call 收到 ReplyNone 请求。
+        const auto bad = CallCo(
+            [&] { return bbt_co_await a.client->Call("tcp://127.0.0.1:9", MakeSend("in-2", 2, "k"), UntilMs()); });
+        ExpectCode(bad, ErrorCode::InvalidArgument);
+    }
+    { // Call 不允许 System lane。
+        const auto bad = CallCo([&] {
+            return bbt_co_await a.client->Call("tcp://127.0.0.1:9", MakeCall("in-3", 3, "k", rpc::TrafficClass::System),
+                                               UntilMs());
+        });
+        ExpectCode(bad, ErrorCode::InvalidArgument);
+    }
+    { // 未设置 deadline（默认已过期）→ 确定 TimedOut。
+        const auto bad = CallCo(
+            [&] { return bbt_co_await a.client->Call("tcp://127.0.0.1:9", MakeCall("in-4", 4, "k"), CallOptions{}); });
+        ExpectCode(bad, ErrorCode::TimedOut);
+    }
+    { // Send 收到 ReplyRequired 请求。
+        const auto bad = CallCo(
+            [&] { return bbt_co_await a.client->Send("tcp://127.0.0.1:9", MakeCall("in-5", 5, "k"), SendUntil()); });
+        ExpectCode(bad, ErrorCode::InvalidArgument);
+    }
+    { // Send 无 deadline。
+        rpc::SendOptions no_deadline;
+        const auto bad = CallCo(
+            [&] { return bbt_co_await a.client->Send("tcp://127.0.0.1:9", MakeSend("in-6", 6, "k"), no_deadline); });
+        ExpectCode(bad, ErrorCode::InvalidArgument);
+    }
+    // 拒绝全部发生在拨号前：没有 session/link/连接产生。
+    const auto stats = a.client->Stats();
+    CHECK(stats.sessions == 0 && stats.links == 0);
+    CHECK(a.engine->CountConnections() == 0);
+    std::cout << "v2 client input: target/request/send boundaries rejected before dial\n";
+}
+
+// ---- 25. 已提交后协程取消（V1 cancel_post_commit 迁移） ---------------------
+// 对端已接纳（请求字节完整写出=已提交）后取消：唯一终态 Cancelled +
+// RequestCommitted；晚到回复不得翻转终态，link 不被取消破坏。
+void CancelPostCommit()
+{
+    AppHost a("app-a"), b("app-b");
+    std::promise<bbt::coroutine::detail::Coroutine*> promise;
+    auto current = promise.get_future();
+    auto inflight = SubmitCo([&] {
+        promise.set_value(g_bbt_tls_coroutine_co);
+        return bbt_co_await a.client->Call(b.Target(), MakeCall("pc-1", 1, "k"), UntilMs(10s));
+    });
+    auto* coroutine = Get(current);
+    CHECK(coroutine != nullptr);
+    CHECK(WaitUntil([&] { return b.calls.load() == 1; })); // committed 已证明
+    coroutine->RequestCancel();
+    const auto outcome = Get(inflight);
+    CHECK(!outcome);
+    CHECK(outcome.error().code == ErrorCode::Cancelled);
+    CHECK(outcome.error().request_phase == bbt::infra::RequestPhase::RequestCommitted);
+    // 晚到回复：终态已发布且唯一，放行后不得翻转。
+    b.ProcessAdmitted(Echo);
+    CHECK(outcome.error().code == ErrorCode::Cancelled);
+    CHECK(a.client->Stats().links == 1);
+    std::cout << "v2 cancel post-commit: Cancelled + RequestCommitted, late reply dropped\n";
+}
+
+// ---- 26. 畸形回复（V1 malformed_reply 的通用断言迁移） ---------------------
+// (a) 可解码但关联不符 → ProtocolError + ReplyTerminal，link 保留；
+// (b) 帧层不可解码的回复 → 会话逻辑死亡，已提交调用 OutcomeUnknown +
+//     RequestCommitted，link 物理退役。对端行为由 raw 监听对端脚本化。
+void MalformedReply()
+{
+    {
+        RawTcpListener listener("zz-raw");
+        AppHost a("app-a");
+        auto pending = SubmitCo(
+            [&] { return bbt_co_await a.client->Call(listener.Target(), MakeCall("mr-1", 1, "k"), UntilMs(5s)); });
+        listener.Accept();
+        const auto epoch = listener.Handshake();
+        const auto call = listener.ReadFrame();
+        CHECK(call.kind == rpc::FrameKind::Call);
+        CHECK(call.request_id == "mr-1");
+        rpc::SessionFrame response;
+        response.kind = rpc::FrameKind::Response;
+        response.traffic = rpc::TrafficClass::Service;
+        response.reply = rpc::ReplyMode::Required;
+        response.session_epoch = epoch;
+        response.request_id = call.request_id;
+        response.service = call.service;
+        response.method = "spoofed"; // 关联字段被换
+        response.request_schema = call.request_schema;
+        response.response_schema = call.response_schema;
+        response.has_outcome = true;
+        response.success = true;
+        listener.SendFrame(response);
+        const auto outcome = Get(pending);
+        CHECK(!outcome);
+        CHECK(outcome.error().code == ErrorCode::ProtocolError);
+        CHECK(outcome.error().message == "rpc session: response correlation mismatch");
+        CHECK(outcome.error().request_phase == bbt::infra::RequestPhase::ReplyTerminal);
+        CHECK(a.client->Stats().links == 1);
+    }
+    {
+        RawTcpListener listener("zz-raw");
+        AppHost a("app-a");
+        auto pending = SubmitCo(
+            [&] { return bbt_co_await a.client->Call(listener.Target(), MakeCall("mr-2", 2, "k"), UntilMs(5s)); });
+        listener.Accept();
+        (void)listener.Handshake();
+        const auto call = listener.ReadFrame();
+        CHECK(call.request_id == "mr-2");
+        // 非法 wire type（7）的 protobuf 字节：帧层必拒。
+        const std::string garbage("\x0f\x0f\x0f\x0f", 4);
+        std::uint8_t prefix[4];
+        rpc::EncodeFramePrefix(static_cast<std::uint32_t>(garbage.size()), prefix);
+        listener.SendRaw(std::string(reinterpret_cast<const char*>(prefix), sizeof(prefix)) + garbage);
+        const auto outcome = Get(pending);
+        CHECK(!outcome);
+        CHECK(outcome.error().code == ErrorCode::OutcomeUnknown);
+        CHECK(outcome.error().request_phase == bbt::infra::RequestPhase::RequestCommitted);
+        // link 的额度归还由下一次取会话或 Close(Timeout) 重驱；这里断言物理
+        // 连接已退役（fd/engine 责任归零），不以懒驱动计数冒充资源状态。
+        CHECK(WaitUntil([&] { return a.engine->CountConnections() == 0; }, 3s));
+    }
+    std::cout << "v2 malformed reply: correlation mismatch=ProtocolError/ReplyTerminal, "
+                 "undecodable frame=OutcomeUnknown/RequestCommitted\n";
+}
+
 } // namespace
 
 int RunCase(const std::string& mode)
@@ -2661,12 +3069,20 @@ int RunCase(const std::string& mode)
     g_scheduler->Start();
     if (mode == "v2s_roundtrip") {
         Roundtrip();
+    } else if (mode == "v2s_registered_route") {
+        RegisteredRoute();
     } else if (mode == "v2s_bidirectional") {
         Bidirectional();
     } else if (mode == "v2s_send_acceptance") {
         SendAcceptance();
     } else if (mode == "v2s_ordering") {
         Ordering();
+    } else if (mode == "v2s_ordering_ledger") {
+        OrderingLedger();
+    } else if (mode == "v2s_close_negative_timeout") {
+        CloseNegativeTimeout();
+    } else if (mode == "v2s_server_cross_engine") {
+        ServerCrossEngine();
     } else if (mode == "v2s_overload") {
         Overload();
     } else if (mode == "v2s_lane_fairness") {
@@ -2747,6 +3163,12 @@ int RunCase(const std::string& mode)
         ShutdownInterruptedByClose();
     } else if (mode == "v2s_close_inflight_reason") {
         CloseInflightReason();
+    } else if (mode == "v2s_client_input") {
+        ClientInput();
+    } else if (mode == "v2s_cancel_post_commit") {
+        CancelPostCommit();
+    } else if (mode == "v2s_malformed_reply") {
+        MalformedReply();
     } else {
         CHECK(false);
     }

@@ -1,5 +1,5 @@
-# BBT_INFRA_RPC_NET=ON 时的接线：RPC core（wire + Client/Server）消费新
-# bbt::infra_http_net 与锁定 protobuf。本文件在 network-only 闭包内是 protobuf
+# BBT_INFRA_RPC_NET=ON 时的接线：双向 TCP 会话消费 net 与锁定 protobuf。
+# 本文件在 network-only 闭包内是 protobuf
 # 锁定与 wire target 的唯一真源：protoc 与 C++ runtime 必须同源精确版本；只允许
 # 经显式前缀接入，禁止把本机私有绝对路径写进默认值或提交内容。
 #
@@ -12,12 +12,6 @@
 # 锁定版本与来源见 docs/dependencies/protobuf-3.21.12.provenance.md：
 # 上游 google/protobuf v3.21.12 源码 SHA 与 Ubuntu 二进制包元数据均在文件固定；
 # 本文件只负责校验前缀内 protoc/runtime 与锁定值一致。
-
-if(NOT BBT_INFRA_HTTP_NET)
-    message(FATAL_ERROR
-        "BBT_INFRA_RPC_NET=ON 需要 BBT_INFRA_HTTP_NET=ON："
-        "RPC core 消费 bbt::infra_http_net，不单独构建。")
-endif()
 
 set(BBT_PROTOBUF_PREFIX "" CACHE PATH
     "protobuf 安装前缀（含 bin/protoc、include/google/protobuf 与 libprotobuf）")
@@ -169,27 +163,22 @@ message(STATUS
     "(pinned=${BBT_PROTOBUF_PINNED_VERSION}) prefix='${BBT_PROTOBUF_PREFIX}'")
 
 # 从 proto 真源生成 C++；生成物落在 build 目录，不进仓库、不污染源码树。
-set(BBT_RPC_PROTO "${PROJECT_SOURCE_DIR}/proto/bbt/infra/rpc/v1/rpc_envelope.proto")
 set(BBT_RPC_PROTO_V2 "${PROJECT_SOURCE_DIR}/proto/bbt/infra/rpc/v2/session_frame.proto")
 set(BBT_RPC_GEN_DIR "${CMAKE_BINARY_DIR}/generated/rpc_net")
 file(MAKE_DIRECTORY "${BBT_RPC_GEN_DIR}")
 add_custom_command(
-    OUTPUT "${BBT_RPC_GEN_DIR}/bbt/infra/rpc/v1/rpc_envelope.pb.cc"
-           "${BBT_RPC_GEN_DIR}/bbt/infra/rpc/v1/rpc_envelope.pb.h"
-           "${BBT_RPC_GEN_DIR}/bbt/infra/rpc/v2/session_frame.pb.cc"
+    OUTPUT "${BBT_RPC_GEN_DIR}/bbt/infra/rpc/v2/session_frame.pb.cc"
            "${BBT_RPC_GEN_DIR}/bbt/infra/rpc/v2/session_frame.pb.h"
     COMMAND "${CMAKE_COMMAND}" -E env
             "LD_LIBRARY_PATH=${BBT_PROTOBUF_LIB_DIR}"
             "${BBT_PROTOC_EXECUTABLE}"
             --proto_path "${PROJECT_SOURCE_DIR}/proto"
             --cpp_out "${BBT_RPC_GEN_DIR}"
-            "${BBT_RPC_PROTO}"
             "${BBT_RPC_PROTO_V2}"
-    DEPENDS "${BBT_RPC_PROTO}" "${BBT_RPC_PROTO_V2}" "${BBT_PROTOC_EXECUTABLE}"
-    COMMENT "protoc generate rpc v1/v2 .pb.{h,cc} (v${BBT_PROTOC_VERSION})"
+    DEPENDS "${BBT_RPC_PROTO_V2}" "${BBT_PROTOC_EXECUTABLE}"
+    COMMENT "protoc generate rpc session .pb.{h,cc} (v${BBT_PROTOC_VERSION})"
     VERBATIM)
 add_library(bbt_infra_rpc_proto STATIC
-    "${BBT_RPC_GEN_DIR}/bbt/infra/rpc/v1/rpc_envelope.pb.cc"
     "${BBT_RPC_GEN_DIR}/bbt/infra/rpc/v2/session_frame.pb.cc")
 target_include_directories(bbt_infra_rpc_proto PUBLIC
     "${BBT_RPC_GEN_DIR}" "${BBT_PROTOBUF_INCLUDE_DIR}")
@@ -199,5 +188,5 @@ target_compile_features(bbt_infra_rpc_proto PUBLIC cxx_std_17)
 set_target_properties(bbt_infra_rpc_proto PROPERTIES
     POSITION_INDEPENDENT_CODE ON)
 
-# RPC core 模块本体 + 测试/示例注册。
+# RPC 会话模块本体 + 测试/示例注册。
 add_subdirectory("${PROJECT_SOURCE_DIR}/bbt/infra/rpc" bbt_infra_rpc_net)

@@ -11,8 +11,8 @@
   - 拉起 client 子进程拨号 + Call/Send，校验退出码与客户端关键断言
     （单 session/link）；
   - 正常收口：关闭 server stdin（EOF）触发 server 协作退出（自身
-    StopAccept/Drain/Close），检查 server 退出码与 "SERVER CLOSED ok
-    admitted>=2" 收口输出（一次 Call + 一次 Send）；
+    Close(Graceful) → Close(Timeout)），检查 server 退出码与
+    "SERVER CLOSED ok admitted>=2" 收口输出（一次 Call + 一次 Send）；
   - try/finally 兜底 terminate→kill 仅用于异常/超时路径，不能替代正常
     关闭成为通过依据。
 
@@ -133,7 +133,7 @@ def main(argv):
             return 1
         print("client: %s" % client_out.strip().replace("\n", " | "))
 
-        # 正常协作收口：关闭 stdin → server EOF → 自身 StopAccept/Drain/Close。
+        # 正常协作收口：关闭 stdin → server EOF → 自身 Close(Graceful)→Close(Timeout)。
         if server.stdin is None:
             print("FAIL server stdin pipe unavailable", file=sys.stderr)
             return 1

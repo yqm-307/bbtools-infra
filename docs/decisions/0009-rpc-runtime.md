@@ -1,5 +1,7 @@
 # RPC Runtime v1：infra 通用能力与 framework 消费边界
 
+> 后续取代关系（2026-11-08）：V1 消费面已由 [ADR 0022](0022-rpc-single-protocol.md) 取代；RPC 入口、codec 文件布局和关闭接口以 [RPC 分层现状](../architecture/rpc-layered-protocol.md) 与 [现行指南](../guides/rpc-net.md) 为准。下文保留历史决策与证据，不作为旧头或兼容层仍存在的依据。
+
 > 状态：**已合入 main**（PR #79，合入提交 `3136d1de5031a2eec55475e770d5ebbadc3c32da`）。
 > **2026-10-28 分支状态注记**：本文记录的 `bbt::infra::RpcClient/RpcServer` 运行时
 > 壳（HTTP-backed 工厂、`NetworkRuntime::CreateRpcClient/ListenRpc`）已在
@@ -105,3 +107,7 @@ result<std::shared_ptr<RpcServer>> ListenRpc(
 - endpoint 边界改动未改协议/默认行为：RPC 调用签名、错误码、owner 收口、local-min 预算不变；仅把 `RpcBaseUrl` 从复用 `http_detail::ParseHttpUrl` 改为本地 authority 边界检查，host/port 完整性仍由公开 `HttpClient` 校验。
 
 以上是候选期 worktree 的证据，合入后由 PR CI 与 framework 集成验收接续。尚未覆盖：framework Service/Actor、跨语言 GetValue、真实 Service→Service 跨机器链路、预算跨 hop 与 20ms reserve 的组合验收、可选 `dual_service` 示例、全套 sanitizer 门禁。
+
+## 取代关系
+
+- 本文（RPC Runtime v1：`RpcClient`/`RpcServer`、`RpcEnvelope` wire profile 1、HTTP-backed 工厂）已被 [0022](0022-rpc-single-protocol.md) 整体取代；wire profile 2 见 [0014](0014-app-session.md)。本文仅作决策历史保留。

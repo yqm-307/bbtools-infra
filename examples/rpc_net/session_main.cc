@@ -9,9 +9,9 @@
 
 #include <bbt/coroutine/coroutine.hpp>
 #include <bbt/coroutine/syntax/Async.hpp>
-#include <bbt/infra/rpc/Client.hpp>
+#include <bbt/infra/rpc/CoRpcClient.hpp>
+#include <bbt/infra/rpc/CoRpcServer.hpp>
 #include <bbt/infra/rpc/Options.hpp>
-#include <bbt/infra/rpc/Server.hpp>
 #include <bbt/infra/net/Engine.hpp>
 
 #include <atomic>
@@ -62,8 +62,8 @@ template <class F> auto SubmitCo(F fn) -> std::future<decltype(fn())>
 
 struct Assembly {
     std::shared_ptr<net::Engine> engine{net::Engine::Create(std::shared_ptr<net::RawHandler>{})};
-    std::shared_ptr<rpc::Client> client;
-    std::shared_ptr<rpc::Server> server;
+    std::shared_ptr<rpc::CoRpcClient> client;
+    std::shared_ptr<rpc::CoRpcServer> server;
     std::thread runner;
     std::error_code run_error;
     net::Address address;
@@ -75,7 +75,7 @@ struct Assembly {
     {
         rpc::ClientOptions co;
         co.SetLocalIdentity(identity).SetTrustedNetworkPlaintext(true);
-        auto made_client = rpc::Client::Create(engine, co);
+        auto made_client = rpc::CoRpcClient::Create(engine, co);
         if (!made_client) {
             return false;
         }
@@ -87,7 +87,7 @@ struct Assembly {
         if (error) {
             return false;
         }
-        auto made = rpc::Server::Create(
+        auto made = rpc::CoRpcServer::Create(
             engine, client,
             [this](rpc::AdmissionItem&& item) -> bbt::infra::result<void> {
                 std::lock_guard<std::mutex> lock(mu);
@@ -129,7 +129,10 @@ struct Assembly {
     ~Assembly()
     {
         if (server) {
-            server->Close();
+            server->Shutdown();
+        }
+        if (client) {
+            client->Shutdown();
         }
         engine->RequestClose();
         if (runner.joinable()) {
@@ -199,17 +202,24 @@ int RunServer()
     stdin_watcher.join();
     const bool normal_stop = stop.load();
 
-    // 正常资源收口：排空已准入项（完成在途回复）后显式 Close/Drain，并打
-    // 印可核对的收口结果；析构内再次 Close 幂等。
+    // 正常资源收口：排空已准入项（完成在途回复）后走唯一关闭入口——
+    // Close(Graceful) 等已接纳责任归还后封口，Close(Timeout) 有界确认物理
+    // 收口；析构内 Shutdown 幂等。
     const auto drain_deadline = Clock::now() + 3s;
     while (app.HasPendingAdmissions() && Clock::now() < drain_deadline) {
         app.PumpOnce();
         std::this_thread::sleep_for(1ms);
     }
-    const auto drained = app.server->Shutdown(Clock::now() + 3s);
-    app.server->Close();
-    if (!drained) {
-        return Fail("server shutdown failed");
+    auto close_future = SubmitCo([&] { return bbt_co_await app.server->Close(rpc::CloseFlag::Graceful, 3000); });
+    if (close_future.wait_for(5s) != std::future_status::ready) {
+        return Fail("server graceful close hung");
+    }
+    if (!close_future.get()) {
+        return Fail("server graceful close failed");
+    }
+    auto settle_future = SubmitCo([&] { return bbt_co_await app.server->Close(rpc::CloseFlag::Timeout, 3000); });
+    if (settle_future.wait_for(5s) != std::future_status::ready || !settle_future.get()) {
+        return Fail("server close did not settle");
     }
     if (!app.server->IsClosed()) {
         return Fail("server not closed after close");

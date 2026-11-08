@@ -339,12 +339,10 @@ void TestInterfaces()
     CHECK(hr);
     if (hr)
         CHECK(hr.value().status == 200);
-
-    RpcHandler rh = [](IncomingCallContext, RpcEnvelope) {
-        return result<RpcEnvelope>::ok(RpcEnvelope{});
-    };
-    auto rr = rh(ctx, RpcEnvelope{});
-    CHECK(rr);
+    // RPC 旧 handler 别名（IncomingCallContext + RpcEnvelope 形状）已随 V1
+    // wire 删除：本件只链接 bbt::infra_common，不再引用该类型。V2 唯一
+    // handler 别名 rpc::CoRpcServer::RpcHandler 由 rpc.net.v2s_registered_route
+    // 真实注册验证，旧名不可编译由 rpc.net.v1_absent 负向门禁承担。
 }
 
 } // namespace

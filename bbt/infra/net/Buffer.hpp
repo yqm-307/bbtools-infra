@@ -2,115 +2,152 @@
 
 /**
  * @file Buffer.hpp
- * @brief 公共读缓冲：Read 交付的拥有式字节视图，实现真零拷贝移交。
+ * @brief 用户拥有的分段字节缓冲与二进制流；Read 会把接收数据复制到这里。
  *
- * Buffer 持有 owning 的 backing。它从接收 ring 取走的是真实存储，包括绕环的两段，不复制载荷。
- * backing 与 ring 共享同一块底层存储：ring 端按引用计数延后复用，Buffer 析构时才归还可复用的额度。
- * ring 的语义额度（已读字节上限）在移交成功的瞬间立即释放，不等 Buffer 析构。
+ * Buffer 不持连接、锁或 socket；它不代表连接内部接收存储的所有权。
+ * 整数按类型宽度使用大端字节序，bool 为 0/1 单字节，float/double 为 IEEE 754 位表示。
+ * 字符串编码为 uint32 大端字节长度加原始内容（含内嵌零）；裸字节使用 WriteBytes/ReadBytes。
+ * 线上字段应使用固定宽度类型，不直接序列化指针、size_t 或结构体内存布局。
  *
- * 分段：ring 回绕时，缓冲可能拆成多个段。本对象如实暴露段列表，不隐式拼接。
- * 需要连续视图时，调用 CopyTo 复制，或由消费方逐段处理。
- *
- * 值语义：只可移动，移动后源对象的 Segments() 为空。不提供拷贝，因为拷贝赋值在 backing 与段表分步
- * 更新、其中某步失败时会留下悬空段。Buffer 不是环形游标视图，不提供「读一部分后丢弃再 Peek」的游标。
- * 消费进度由调用方自行维护，按 Segment::size 推进。
+ * 只可移动；移动不复制载荷，来源变为空且可复用。不提供内部同步，包括 const 段视图缓存。
+ * 所有段视图都只借用存储，下一次非 const 操作或析构后不可继续使用。
+ * 单次提取失败不修改输出或消费位置；链式提取不是整条消息事务，先前成功的字段仍已消费。
+ * Error 保留首个校验错误，后续流操作无动作，ClearError 后可补数据重试；分配异常仍向外抛出。
  */
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <system_error>
+#include <type_traits>
 #include <vector>
 
 namespace bbt::infra::net {
 
-/**
- * @brief 单段连续可读视图。
- *
- * data 与 size 借自 backing，在所属 Buffer 存续期间有效。不得外借，不得跨 Buffer 析构使用。
- * 需要延长寿命时，用 CopyTo 复制成 std::string。
- */
+/** @brief 单段借用视图，不延长所属 Buffer 的寿命。 */
 struct BufferSegment {
-    const char* data{nullptr}; ///< 借用的段首地址，指向 backing 内部存储
-    std::size_t size{0};       ///< 段字节数
+    const char* data{nullptr}; ///< 连续区域首地址
+    std::size_t size{0};       ///< 区域字节数
 
-    /// @brief 以 string_view 返回本段，不做复制。
+    /// @brief 无复制查看本段。
     std::string_view View() const noexcept
     {
         return {data, size};
     }
 };
 
-/**
- * @brief 拥有式读缓冲，可拆成绕环的两段。
- *
- * 只能经移交路径构造非空对象（CoTcpConnection::Read），或由内部测试接缝构造。
- * 拷贝在 backing 已替换、段表分配失败时可能留下指向已释放存储的段，因此删除拷贝、
- * 只保留移动；owning 不变量（段来自 backing）只能经移交路径建立。
- */
+/** @brief 可构造、追加、消费的拥有式二进制缓冲，不持连接、锁或 socket。 */
 class Buffer {
 public:
-    Buffer() = default;
+    /// @brief 创建空缓冲，不预分配载荷存储。
+    Buffer() noexcept;
+    ~Buffer();
 
-    /// @brief 拷贝构造已删除：拷贝无法原子地同时更新 backing 与段表，可能留下悬空段。
     Buffer(const Buffer&) = delete;
-    /// @brief 拷贝赋值已删除，原因同拷贝构造。
     Buffer& operator=(const Buffer&) = delete;
-    /// @brief 移动构造：接管 backing 与段表，源对象变为空。
-    Buffer(Buffer&&) noexcept = default;
-    /// @brief 移动赋值：先释放自身 backing，再接管源对象，源对象变为空。
-    Buffer& operator=(Buffer&&) noexcept = default;
+    /// @brief 移交存储与错误状态，不复制载荷，来源恢复为空且无错误。
+    Buffer(Buffer&& other) noexcept;
+    /// @brief 释放自身旧数据并移交存储；自移动保持不变。
+    Buffer& operator=(Buffer&& other) noexcept;
 
-    /// @brief 是否没有任何段，即没有可读字节。
+    /// @brief 是否没有未消费字节；与流错误状态无关。
     bool Empty() const noexcept
     {
-        return m_segments.empty();
+        return Size() == 0;
     }
-
-    /**
-     * @brief 可读总字节，即各段之和。
-     *
-     * 它与 ring 的语义 Size 来源不同：ring 的已读额度在移交时已释放，本值只反映本 Buffer
-     * 持有的字节数。
-     */
+    /// @brief 未消费字节总量，常量时间查询。
     std::size_t Size() const noexcept;
+    /// @brief 当前连续可读区域数，不能假定固定段数。
+    std::size_t SegmentCount() const noexcept;
+    /// @brief 未消费段视图；混合接收与写入数据时可能分配段元数据，不拼接载荷。
+    const std::vector<BufferSegment>& Segments() const;
 
-    /// @brief 段数。1 表示连续存储；2 表示绕环的两段，即首段尾部与回绕段。
-    std::size_t SegmentCount() const noexcept
-    {
-        return m_segments.size();
-    }
-
-    /// @brief 段视图。仅在 Buffer 存续且未被移动时有效。
-    const std::vector<BufferSegment>& Segments() const noexcept
-    {
-        return m_segments;
-    }
-
-    /**
-     * @brief 复制全部数据到一个连续字符串并返回。
-     *
-     * Buffer 本身不消费。需要连续视图且不想逐段处理时使用；零拷贝路径不需要调用本函数。
-     */
+    /// @brief 无消费复制全部未读数据到新字符串。
     std::string CopyTo() const;
-
-    /// @brief 将数据追加复制到已有的 out 末尾，不清空 out。
+    /// @brief 无消费追加全部未读数据到 out。
     void AppendTo(std::string& out) const;
 
+    /// @brief 为后续追加预留 additionalBytes 字节；已有可读内容保持不变。
+    bool Reserve(std::size_t additionalBytes);
+    /// @brief 追加原始字节，不附加长度；支持输入借自本 Buffer 的可读段。
+    bool WriteBytes(std::string_view bytes);
+    /// @brief 读取并消费 count 字节；失败时输出与游标不变。out 必须指向独立可写区域。
+    bool ReadBytes(void* out, std::size_t count);
+    /// @brief 丢弃 count 个未读字节，越界不消费；已有错误时不执行。
+    bool Consume(std::size_t count) noexcept;
+    /// @brief 清空数据和错误，保留可写存储容量供复用。
+    void Clear() noexcept;
+
+    /// @brief 首个校验错误：不足/越界为 result_out_of_range，无效 bool 为 illegal_byte_sequence。
+    std::error_code Error() const noexcept
+    {
+        return m_error;
+    }
+    /// @brief 清除错误但不消费数据，允许补齐后重试。
+    void ClearError() noexcept
+    {
+        m_error.clear();
+    }
+    /// @brief 是否无校验错误，可用于 if (buffer >> value)，不是 Empty 的反义。
+    explicit operator bool() const noexcept
+    {
+        return !m_error;
+    }
+
+    /// @brief 按类型宽度追加大端整数，不支持 bool 以外的隐式结构体序列化。
+    template <class T, std::enable_if_t<std::is_integral_v<T> && !std::is_same_v<T, bool>, int> = 0>
+    Buffer& operator<<(T value);
+    /// @brief 跨段提取大端整数，成功才更新 value 并消费。
+    template <class T, std::enable_if_t<std::is_integral_v<T> && !std::is_same_v<T, bool>, int> = 0>
+    Buffer& operator>>(T& value);
+
+    /// @brief 以 uint32 字节长度前缀编码字符串，长度与正文一次提交。
+    Buffer& operator<<(std::string_view value);
+    /// @brief 编码零结尾字符串；空指针记 invalid_argument，不写入。
+    Buffer& operator<<(const char* value);
+    /// @brief 提取带长度的字符串；长度或正文不足时不消费，不分配正文。
+    Buffer& operator>>(std::string& value);
+    /// @brief 编码单字节 bool。
+    Buffer& operator<<(bool value);
+    /// @brief 只接受 0/1，非法值不消费。
+    Buffer& operator>>(bool& value);
+    /// @brief 编码 IEEE 754 binary32 的大端位表示。
+    Buffer& operator<<(float value);
+    /// @brief 提取 IEEE 754 binary32，不进行未对齐访问或类型双关。
+    Buffer& operator>>(float& value);
+    /// @brief 编码 IEEE 754 binary64 的大端位表示。
+    Buffer& operator<<(double value);
+    /// @brief 提取 IEEE 754 binary64。
+    Buffer& operator>>(double& value);
+
+    /// @brief 拒绝将普通指针隐式转成 bool 后序列化；字符指针仅按字符串处理。
+    template <class T, std::enable_if_t<!std::is_same_v<std::remove_cv_t<T>, char>, int> = 0>
+    Buffer& operator<<(T*) = delete;
+    Buffer& operator<<(std::nullptr_t) = delete;
+
 private:
-    // owning backing 句柄：实现由 Connection 的非等待移交原语从
-    // ReceiveRing::TryPopAll 的 PopAllTakeout 构造；布局不出公共契约。
-    // shared_ptr<void> 保证「分段共享同一移交存储」的引用计数成立。
-    // private 构造责任：只有移交路径（Connection::TryRead）与测试接缝
-    // 可凭 backing+段构造非空 Buffer；消费者不能伪造「段来自 backing」的
-    // owning 不变量。
+    struct WriteStorage;
     explicit Buffer(std::shared_ptr<void> backing, std::vector<BufferSegment> segments);
+    bool _Append(std::string_view prefix, std::string_view bytes);
+    bool _RequireReadable(std::size_t count) noexcept;
+    bool _Fail(std::errc error) noexcept;
+    void _CopyBytes(std::size_t offset, void* out, std::size_t count) const noexcept;
+    void _Consume(std::size_t count) noexcept;
 
     friend class Connection;
     friend struct BufferTestAccess;
 
+    // 原接收存储保持只读；写入区独立，避免破坏 owning 移交的不变量。
     std::shared_ptr<void> m_backing;
     std::vector<BufferSegment> m_segments;
+    std::size_t m_sourceBytes{0};
+    std::unique_ptr<WriteStorage> m_writeStorage;
+    mutable std::vector<BufferSegment> m_view;
+    std::error_code m_error;
 };
 
 } // namespace bbt::infra::net
+
+#include <bbt/infra/net/__TBuffer.hpp>

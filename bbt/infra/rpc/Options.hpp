@@ -7,7 +7,7 @@
  * 无物理栈泄漏，见 cmake 的 rpc_public_header_leak_check 白名单注释）。
  *
  * trusted-network 明文模式（ADR 0014 §3.2）：未显式 SetTrustedNetworkPlaintext(true)
- * 且当前没有 verifier API 时，Client::Create/Server::Start 返回
+ * 且当前没有 verifier API 时，CoRpcClient::Create/CoRpcServer::Start 返回
  * UnsupportedRoute；peer_principal 恒为空，identity 不用于授权。
  *
  * 契约来源：docs/decisions/0014-app-session.md §2.2/§2.3。
@@ -42,12 +42,29 @@ inline constexpr std::size_t kMaxQueueBytes = 256 * 1024 * 1024;    ///< lane �
 inline constexpr std::size_t kMaxHelloFrameBytes = 64 * 1024;
 
 /**
+ * @brief 统一 Close 入口的关闭模式。
+ *
+ * CoRpcClient/CoRpcServer 的 Close 只经本枚举表达语义，不再提供
+ * Drain/WaitStopped/StopAccepting 等独立生命周期阶段：
+ *   - Immediate：立即逻辑封口并发布原因；强制关闭 session/link，不等待。
+ *   - Timeout：先强制收口，再有界等待 RPC 自身资源物理收口；timeout_ms 为
+ *     毫秒预算。
+ *   - Graceful：先拒新，等已接纳业务责任真实归还后封口；timeout_ms=-1
+ *     表示无限等待（-1 只对 Graceful 有效）。
+ */
+enum class CloseFlag : std::uint8_t {
+    Immediate,
+    Timeout,
+    Graceful,
+};
+
+/**
  * @brief Client 出站配置。
  *
- * setter 只存值，不校验；调用 Validate() 或通过 Client::Create 边界时统一校验。
+ * setter 只存值，不校验；调用 Validate() 或通过 CoRpcClient::Create 边界时统一校验。
  * local_identity 须非空 UTF-8 且 ≤256 字节（wire peer_identity 约束）。
  * SetTrustedNetworkPlaintext(true) 是启用明文模式的唯一入口；未设置时
- * Client::Create 返回 UnsupportedRoute（ADR 0014 §3.2）。
+ * CoRpcClient::Create 返回 UnsupportedRoute（ADR 0014 §3.2）。
  */
 class ClientOptions {
 public:
@@ -166,7 +183,7 @@ public:
     /// @brief Create 边界校验。
     ///
     /// 各项须为有限正数且不超上限；local_identity 非空、UTF-8、≤256 字节
-    /// （wire peer_identity 约束，Codec.hpp 同源）。
+    /// （wire peer_identity 约束，SessionCodec.hpp 同源）。
     /// @return 违规返回 InvalidArgument（message 指明首个越界字段）。
     result<void> Validate() const;
 
@@ -230,7 +247,7 @@ private:
 /**
  * @brief Server 入站配置。
  *
- * setter 只存值，不校验；调用 Validate() 或通过 Server::Create 边界时统一校验。
+ * setter 只存值，不校验；调用 Validate() 或通过 CoRpcServer::Create 边界时统一校验。
  * listen_address 须 Valid()，incoming_timeout 须有限且 ≤24h；其余字段须有限
  * 正数且不超 NetworkLimits 硬上限。
  */

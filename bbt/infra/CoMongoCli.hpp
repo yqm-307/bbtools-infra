@@ -62,7 +62,7 @@ struct MongoClientConfig {
  * @param cfg 待校验的装配参数。
  * @return 通过返回 ok；违规返回 InvalidArgument。
  */
-inline result<void> ValidateMongoClientConfig(const MongoClientConfig& cfg);
+result<void> ValidateMongoClientConfig(const MongoClientConfig& cfg);
 
 /**
  * @brief 出站 MongoDB 组件：独占一个 mongo owner 与单个集合句柄。
@@ -134,5 +134,3 @@ public:
 };
 
 } // namespace bbt::infra
-
-#include <bbt/infra/impl/CoMongoCliImpl.hpp>

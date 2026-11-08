@@ -19,8 +19,8 @@ target_compile_options(Test_contract_basics PRIVATE -Wall -Wextra)
 add_test(NAME contract.basics COMMAND Test_contract_basics)
 set_tests_properties(contract.basics PROPERTIES TIMEOUT 60 LABELS "smoke;unit")
 
-# --- waypoint 3-3 前置：infra 通用位置参数 payload codec（纯 header-only）。-----
-# 只链接 bbt::infra_common（header-only payload codec，无 protobuf 依赖）。
+# --- waypoint 3-3 前置：infra 通用位置参数 payload codec。----------------------
+# 只链接 bbt::infra_common（模板实现随头提供，非模板实现由库目标提供）。
 # HTTP-only 闭包不注册 RPC 测试。
 if(NOT BBT_INFRA_HTTP_NET OR BBT_INFRA_RPC_NET)
     add_executable(Test_rpc_payload Test_rpc_payload.cc)

@@ -130,5 +130,3 @@ private:
 };
 
 } // namespace bbt::infra::rpc
-
-#include <bbt/infra/rpc/impl/ResponseImpl.hpp>

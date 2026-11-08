@@ -8,7 +8,7 @@
  *
  * 本头只承载值类型：标准库 + bbt::infra::Result + bbt::coroutine::Deadline；
  * 不引用 framework、HTTP/net transport 或 protobuf 生成物。
- * wire 编解码见 bbt/infra/rpc/Codec.hpp（SessionFrame profile 2）。
+ * wire 编解码见 bbt/infra/rpc/SessionCodec.hpp（SessionFrame profile 2）。
  *
  * 语义要点（ADR 0014 §2.1）：
  *   - Request::Traffic() 是 traffic_class 的唯一真源；SendOptions 不再重复
@@ -51,7 +51,7 @@ enum class ReplyMode : std::uint8_t {
     Required = 1,
 };
 
-/// envelope metadata：顺序保留；前缀白名单/条数/键值上限约束见 Codec.hpp。
+/// envelope metadata：顺序保留；前缀白名单/条数/键值上限约束见 SessionCodec.hpp。
 using Metadata = std::vector<std::pair<std::string, std::string>>;
 
 /**

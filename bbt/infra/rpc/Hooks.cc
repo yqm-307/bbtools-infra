@@ -1,5 +1,7 @@
 #include <bbt/infra/rpc/Hooks.hpp>
 
+#include <limits>
+
 namespace bbt::infra::rpc {
 
 result<std::uint64_t> SessionHooks::Arm(HookPoint point, HookAction action, bbt::coroutine::Deadline expires_at)

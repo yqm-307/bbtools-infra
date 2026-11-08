@@ -615,7 +615,7 @@ void PoolNewCommands()
     const int port = RequiredPort("BBT_REDIS_PORT");
     RealRedis backend;
     Host host;
-    auto pool = MakePoolWith(host, Loopback(port), 2, 4);
+    std::shared_ptr<redis::IRedisCli> pool = MakePoolWith(host, Loopback(port), 2, 4);
     CHECK(host.Call([&] { return bbt_co_await pool->Connect(Until()); }));
     const auto key = backend.Key("pool-new-key");
     const auto hash = backend.Key("pool-new-hash");
@@ -658,6 +658,7 @@ void PoolNewCommands()
     ExpectCode(host.Call([&] { return bbt_co_await pool->HDel(hash, {}, Until()); }), ErrorCode::InvalidArgument);
 
     pool->Close();
+    CHECK(pool->IsClosed());
     pool.reset();
     host.Finish();
     backend.Cleanup();

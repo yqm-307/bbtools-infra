@@ -578,4 +578,4 @@ using ToolHandler = std::function<result<HandlerResult<ToolResult>>(const Reques
 
 } // namespace bbt::infra::mcp
 
-#include <bbt/infra/mcp/impl/McpTypesImpl.hpp>
+#include <bbt/infra/mcp/__TMcpTypes.hpp>

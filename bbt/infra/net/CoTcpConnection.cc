@@ -4,7 +4,6 @@
 #include <system_error>
 #include <utility>
 
-#include <bbt/infra/net/CoConnection.hpp>
 #include <bbt/infra/net/Error.hpp>
 #include <bbt/infra/net/detail/CoInternal.hpp>
 #include <bbt/infra/net/detail/ConnectionState.hpp>
@@ -12,12 +11,29 @@
 // 实现放 .cc：Read/Write/WaitClosed 的等待路径要复用 ConnectionState/
 // ReceiveRing/close hub 与统一 gate；这些是 detail 部件，不进公共头。
 //
-// Read 走 ring 的 pop-all 移交：Busy/WouldBlock 的等待步骤与 ring 等待协议一致
-// （Busy 前先采 release 代次、waiter 在 on_registered 才入 hub、复查谓词），
-// 唯一差异是取数原语——TryPopAll 移交整段 backing（含绕环两段与
-// pending/detached 尾部），载荷零复制；额度在移交成功瞬间立即释放。
+// Read 复制到调用方 Buffer 后才消费接收数据；Busy/WouldBlock 仍使用
+// release 代次、on_registered 登记及谓词复查的原等待协议。
 
 namespace bbt::infra::net {
+
+CoTcpConnection::CoTcpConnection(Connection connection) noexcept : m_conn(std::move(connection))
+{
+}
+
+std::error_code CoTcpConnection::TryRead(Buffer& out)
+{
+    return m_conn.TryRead(out);
+}
+
+ReadView CoTcpConnection::View()
+{
+    return m_conn.View();
+}
+
+const Connection& CoTcpConnection::Raw() const noexcept
+{
+    return m_conn;
+}
 
 ConnectionStatus CoTcpConnection::Status() const
 {
@@ -91,21 +107,9 @@ std::error_code CoTcpConnection::Read(Buffer& out, const bbt::coroutine::WaitOpt
     }
 }
 
-WriteOperation CoTcpConnection::AsyncWrite(std::string data)
+std::error_code CoTcpConnection::AsyncWrite(std::string data)
 {
-    // 非挂起提交：全量接纳或零接纳。拒绝返回「拒绝票」——无效句柄
-    // （Valid()=false）但 Query() 给出 Rejected/0/具体原因，不分配
-    // 操作记录（docs/decisions/0012-icoconn-member-interface.md）。
-    const auto state = CoAccess::StateOf(m_conn);
-    if (!state) {
-        return WriteOperation(nullptr, {}, make_error_code(NetErrc::Closed));
-    }
-    std::shared_ptr<WriteOpRecord> record;
-    const auto error = state->AcceptWrite(std::move(data), record);
-    if (error) {
-        return WriteOperation(nullptr, state, error);
-    }
-    return WriteOperation(std::move(record), state);
+    return m_conn.AsyncWrite(std::move(data));
 }
 
 WriteReport CoTcpConnection::Write(std::string data, const bbt::coroutine::WaitOptions& options)

@@ -33,7 +33,7 @@ owner 主动调用的同步 `Close()`**。本文原「§事件、错误与关闭
 ## 模块与公共面
 
 - 公共头：`bbt/infra/config/{Value,Snapshot,Source,MemorySource,FileSource,Watch}.hpp`，
-  命名空间固定 `bbt::infra::config`（三层）；实现 `bbt/infra/config/{Value 为 header-only,MemorySource,FileSource,Watch}`。
+  命名空间固定 `bbt::infra::config`（三层）；实现 `bbt/infra/config/{Value 为模板/constexpr 头,MemorySource,FileSource,Watch}`。
 - 模块 target `bbt::infra_config`（STATIC），`PUBLIC` 只依赖 `bbt::infra_common`（即 bbtools-coroutine），
   无第三方新依赖、无隐藏 I/O 线程；公共头不出现 framework 类型或第三方类型。
 - 固定依赖 SHA：`bbtools-coroutine` = `7bcda3b078f975ff2978424be7f6ba38e04fb7f6`（main HEAD，

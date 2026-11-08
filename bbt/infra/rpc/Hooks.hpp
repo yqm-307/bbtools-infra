@@ -10,7 +10,7 @@
 // ForTest 私有接缝只会逼出第二套实现，测试也就无法证明生产路径。
 //
 // 作用域与寿命：配置挂在 owner 上，同一 owner 下的所有 link 共用一份，
-// 不同 owner 完全隔离。只经 Client::Hooks() 取得；handle 只持有有界的
+// 不同 owner 完全隔离。只经 CoRpcClient::Hooks() 取得；handle 只持有有界的
 // 控制状态，不延长 owner、Engine、连接或业务对象的寿命——owner 收口后
 // handle 仍可安全查询，只是永久 closed。
 //
@@ -42,7 +42,6 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <mutex>
 
 #include <bbt/coroutine/sync/WaitTypes.hpp>
@@ -96,7 +95,7 @@ struct HookSnapshot {
 /**
  * @brief 单个会话 owner 上的受控检查点控制器。
  *
- * 由 Client::Hooks() 取得；同一 owner 下的所有 link 共享，不同 owner 各自
+ * 由 CoRpcClient::Hooks() 取得；同一 owner 下的所有 link 共享，不同 owner 各自
  * 独立。构造与封口都是库内部能力，使用方只做 Arm/Clear/Snapshot。
  */
 class SessionHooks final {

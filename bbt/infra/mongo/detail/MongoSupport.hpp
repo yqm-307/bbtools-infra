@@ -142,4 +142,4 @@ result<bbt::coroutine::CoObjectInfo> NewObjectInfo(std::string kind);
 
 } // namespace bbt::infra::mongo_detail
 
-#include <bbt/infra/mongo/detail/impl/MongoSupportImpl.hpp>
+#include <bbt/infra/mongo/detail/__TMongoSupport.hpp>

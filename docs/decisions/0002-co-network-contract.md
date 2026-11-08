@@ -284,3 +284,7 @@ HTTP 切片已实现为「无专用 I/O 线程」模型，与早期草案中"inf
 - 串行化由 strand 承担：runtime/client/server 共享一份 `HttpIoEngine`，其 `TryPost` 经互斥封口后投递到 strand，等价于旧单 io 线程的执行域语义；`strand` 仅串行化调度，不新增线程。
 - 关闭链路不 `stop`/`restart` 共享 context：teardown 在 io 域内中止在途操作；各受管对象按 in-flight async 计数归零后才 `MarkClosed`，owner 调用的 `Close()` 同步完成封口 → 唤醒挂起等待者 → **transport owner 等待在途工厂与受管对象真实归零** → 物理释放（返回即后端不再访问）。不能证明物理归零的第三方 Binding 采用自己的 worker/有界策略，超时不得宣称 `Closed`。引擎 `SealOnIoDomain` 只封死 `TryPost`，不再用 strand marker 冒充 Asio 排空。runtime 在全部子对象 Closed 之后封口引擎并 `MarkClosed`。没有运行时代际与 `Scheduler::Stop()`，运行时随进程寿命存在。
 - executor 获取失败或运行时未初始化统一返回 `RuntimeUnavailable`；`Request` 与关闭路径的 InvalidContext、TimedOut、Cancelled、Closed、ProtocolError/InternalError 等既有映射不变。
+
+## 取代关系
+
+- 本文的 RPC 段（`RpcAddress`/`RpcEnvelope`/`RpcHandler` 及其 `Call`/`ListenRpc` 签名）已被 [0022](0022-rpc-single-protocol.md) 取代：RPC 公共面只保留 V2 `Request`/`Response` + `AdmissionHandler` + `tcp://` target。本文的 coroutine/HTTP 网络执行域结论继续有效。

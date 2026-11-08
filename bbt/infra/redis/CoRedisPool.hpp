@@ -6,6 +6,7 @@
 #pragma once
 
 #include <bbt/infra/redis/CoRedisCli.hpp>
+#include <bbt/infra/redis/interface/IRedisCli.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -36,7 +37,7 @@ namespace bbt::infra::redis {
  * Close 并发安全幂等不可重开：立即逻辑封口并唤醒等待者，关闭持有 client，不关共享 Engine，
  * 不假装物理排空；in-flight 命令按底层单连接语义保留 OutcomeUnknown。
  */
-class CoRedisPool final {
+class CoRedisPool final : public IRedisCli {
 private:
     friend struct PoolTestAccess;
     struct State;
@@ -91,7 +92,7 @@ public:
     static result<std::shared_ptr<CoRedisPool>> Create(std::shared_ptr<net::Engine> engine, net::Address address,
                                                        PoolOptions options);
     /// @brief 只调用 Close()，不等在途命令退出。
-    ~CoRedisPool() noexcept;
+    ~CoRedisPool() noexcept override;
     /// @brief 不可拷贝：句柄独占池槽位与等待者队列。
     CoRedisPool(const CoRedisPool&) = delete;
     /// @brief 不可拷贝赋值。
@@ -102,54 +103,58 @@ public:
      * slot 时幂等零动作。并发 Connect 竞争返回 Overloaded。
      * @param options 绝对期限选项，同时约束建连各步。
      */
-    bbt_co_async(result<void>) Connect(const CallOptions& options);
+    bbt_co_async(result<void>) Connect(const CallOptions& options) override;
 
     /**
      * @brief 命令方法：内部借连接执行归还，业务无需手动 Acquire；与单连接 CoRedisCli
      * 同命令方法，调用方用 bbt_co_await。语义与单连接一致，排队与借用期限共用同一 deadline。
      */
-    bbt_co_async(result<void>) Ping(const CallOptions& options);
+    bbt_co_async(result<void>) Ping(const CallOptions& options) override;
     /// @brief GET：键缺失返回 ok(nullopt)。
-    bbt_co_async(result<std::optional<std::string>>) Get(std::string_view key, const CallOptions& options);
+    bbt_co_async(result<std::optional<std::string>>) Get(std::string_view key, const CallOptions& options) override;
     /// @brief 无条件 SET：写入成功返回 ok。
-    bbt_co_async(result<void>) Set(std::string_view key, std::string_view value, const CallOptions& options);
+    bbt_co_async(result<void>) Set(std::string_view key, std::string_view value, const CallOptions& options) override;
     /// @brief 带选项的 SET：条件不满足（nil 回复）返回 ok(false)，不是错误。
-    bbt_co_async(result<bool>)
-        Set(std::string_view key, std::string_view value, const SetOptions& set_options, const CallOptions& options);
+    bbt_co_async(result<bool>) Set(std::string_view key, std::string_view value, const SetOptions& set_options,
+                                   const CallOptions& options) override;
     /// @brief EXISTS：键存在为 true。
-    bbt_co_async(result<bool>) Exists(std::string_view key, const CallOptions& options);
+    bbt_co_async(result<bool>) Exists(std::string_view key, const CallOptions& options) override;
     /// @brief DEL：返回服务端报告的实际删除数量。
-    bbt_co_async(result<std::uint64_t>) Delete(std::vector<std::string> keys, const CallOptions& options);
+    bbt_co_async(result<std::uint64_t>) Delete(std::vector<std::string> keys, const CallOptions& options) override;
     /// @brief PEXPIRE：ok(true) 已设置过期；key 不存在 ok(false)。
-    bbt_co_async(result<bool>) Expire(std::string_view key, std::chrono::milliseconds ttl, const CallOptions& options);
+    bbt_co_async(result<bool>)
+        Expire(std::string_view key, std::chrono::milliseconds ttl, const CallOptions& options) override;
     /// @brief PTTL：KeyMissing / NoExpiry / Expires 三态。
-    bbt_co_async(result<TtlResult>) Ttl(std::string_view key, const CallOptions& options);
+    bbt_co_async(result<TtlResult>) Ttl(std::string_view key, const CallOptions& options) override;
     /// @brief INCR：返回服务端整数值；错误语义同 CoRedisCli::Incr。
-    bbt_co_async(result<std::int64_t>) Incr(std::string_view key, const CallOptions& options);
+    bbt_co_async(result<std::int64_t>) Incr(std::string_view key, const CallOptions& options) override;
     /// @brief DECR 一步。
-    bbt_co_async(result<std::int64_t>) Decr(std::string_view key, const CallOptions& options);
+    bbt_co_async(result<std::int64_t>) Decr(std::string_view key, const CallOptions& options) override;
     /// @brief INCRBY 指定增量。
-    bbt_co_async(result<std::int64_t>) IncrBy(std::string_view key, std::int64_t delta, const CallOptions& options);
+    bbt_co_async(result<std::int64_t>)
+        IncrBy(std::string_view key, std::int64_t delta, const CallOptions& options) override;
     /// @brief DECRBY 指定减量。
-    bbt_co_async(result<std::int64_t>) DecrBy(std::string_view key, std::int64_t delta, const CallOptions& options);
+    bbt_co_async(result<std::int64_t>)
+        DecrBy(std::string_view key, std::int64_t delta, const CallOptions& options) override;
     /// @brief HSET：新建字段 ok(true)，覆盖已有字段 ok(false)。
     bbt_co_async(result<bool>)
-        HSet(std::string_view key, std::string_view field, std::string_view value, const CallOptions& options);
+        HSet(std::string_view key, std::string_view field, std::string_view value, const CallOptions& options) override;
     /// @brief HGET：字段缺失或 key 不存在为 ok(nullopt)。
     bbt_co_async(result<std::optional<std::string>>)
-        HGet(std::string_view key, std::string_view field, const CallOptions& options);
+        HGet(std::string_view key, std::string_view field, const CallOptions& options) override;
     /// @brief HDEL：返回删除的字段数量。
     bbt_co_async(result<std::uint64_t>)
-        HDel(std::string_view key, std::vector<std::string> fields, const CallOptions& options);
+        HDel(std::string_view key, std::vector<std::string> fields, const CallOptions& options) override;
     /// @brief HEXISTS：字段存在为 true。
-    bbt_co_async(result<bool>) HExists(std::string_view key, std::string_view field, const CallOptions& options);
+    bbt_co_async(result<bool>)
+        HExists(std::string_view key, std::string_view field, const CallOptions& options) override;
     /// @brief HGETALL：field/value 对按服务端顺序，协议异常时退役连接（见 CoRedisCli::HGetAll）。
-    bbt_co_async(result<HashEntries>) HGetAll(std::string_view key, const CallOptions& options);
+    bbt_co_async(result<HashEntries>) HGetAll(std::string_view key, const CallOptions& options) override;
 
     /// @brief 立即逻辑封口并唤醒全部等待者；幂等不可重开，不关共享 Engine。
-    void Close() noexcept;
+    void Close() noexcept override;
     /// @brief 只读查询逻辑封口：Close() 已生效为 true。
-    bool IsClosed() const noexcept;
+    bool IsClosed() const noexcept override;
 
 private:
     /// @brief 池内借出一条连接（快路径或 FIFO 等待 handoff），命令包装共用。

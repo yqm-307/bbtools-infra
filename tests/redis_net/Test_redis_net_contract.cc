@@ -124,8 +124,8 @@ void RealCommands()
 {
     RealRedis backend;
     Host host;
-    auto cli = host.Make();
-    host.Connect(cli);
+    std::shared_ptr<redis::IRedisCli> cli = host.Make();
+    CHECK(host.Call([&] { return bbt_co_await cli->Connect(Until()); }));
     CHECK(host.Call([&] { return bbt_co_await cli->Ping(Until()); }));
     const auto key = backend.Key(std::string("binary\0key", 10));
     const auto list = backend.Key("list");
@@ -162,6 +162,7 @@ void RealCommands()
     exists = host.Call([&] { return bbt_co_await cli->Exists(key, Until()); });
     CHECK(exists && !exists.value());
     cli->Close();
+    CHECK(cli->IsClosed());
     cli.reset();
     host.Finish();
     backend.Cleanup();

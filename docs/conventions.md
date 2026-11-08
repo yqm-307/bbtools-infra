@@ -25,9 +25,12 @@ cmake/                 CMake 模块
 ```
 
 - 根目录保留各仓入口文件（如 `AGENTS.md`、`README.md`、`CMakeLists.txt`、`.clang-format`、`.editorconfig`、`.gitignore`）。新目录按上表归类，不另建工具工作流或任务状态目录。
-- infra 代码统一位于 `bbt/infra/`，公共头与实现按模块并置，私有头放模块 `detail/`；已退役网络实现不保留兼容副本。coroutine 使用 `bbt/coroutine/`；framework 的 `framework/` 布局保持不变。
+- infra 代码统一位于 `bbt/infra/`，公共头与实现按模块并置，私有头放模块 `detail/`；`bbt/infra/<module>/` 下的文件不会因为路径位于模块根目录就自动成为公共 API，只有稳定的用户消费入口、值类型和明确导出的抽象才放在公共面，协议编解码、传输适配、会话支撑、测试接缝等内部实现放入 `detail/`。公开 target、头自检和最小消费示例必须共同证明公共边界；已退役网络实现不保留兼容副本。coroutine 使用 `bbt/coroutine/`；framework 的 `framework/` 布局保持不变。
 - 每个公开类原则上由独立 `.hpp` 声明；有非内联实现时配对 `.cc`。接口抽象放 `interface/` 子目录，纯虚基类使用 `I` 前缀；头文件用 `#pragma once`。目录层级与命名空间保持一致。
+- 公共类型按调用者可表达的职责命名：请求和回复分别使用 `Request`、`Response` 等角色名；`Envelope` 仅用于确实表示 wire framing 或封装层，不用作含义不明的通用业务对象。Mailbox、调度、业务上下文和服务执行编排属于 framework，不下沉到 infra 的传输或协议适配层。
 - include 顺序遵循仓库现有约定：对应/本文件所需头文件、标准库、项目公共头（如 `bbt/xxx`）、子模块头；避免无关 include。
+
+- 需要拆分实现时统一使用同目录三件套：`Xxx.hpp` 放类型定义和函数声明，`__TXxx.hpp` 放模板实现并由 `Xxx.hpp` 末尾包含，`Xxx.cc` 放非模板实现并注册到对应 CMake target；参考 coroutine 的 `Chan.hpp` / `__TChan.hpp`。混合实现按模板与非模板分别归位，不把普通实现头直接改成 `__T`；`constexpr`、inline 变量及模板实例化必须可见的定义保留在头中。
 
 ## 3. 语言、架构与依赖
 

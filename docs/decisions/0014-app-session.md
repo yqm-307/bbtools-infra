@@ -1,5 +1,7 @@
 # 0014：infra v2 AppSession 会话与 RPC 公共面
 
+> 后续取代关系（2026-11-08）：本文的 RPC 入口命名、codec 布局和生命周期接口已由 [RPC 分层现状](../architecture/rpc-layered-protocol.md) 与 [现行指南](../guides/rpc-net.md) 取代；下文保留原会话设计与历史证据，旧签名和文件路径不再是当前消费入口。
+
 - 状态：**目标契约草案（经父会话验收后冻结）**。本文冻结的是实现目标，不代表当前基线已经实现或通过验证。
 - 适用：`bbtools-infra` 的通用 RPC 会话适配，以及 `bbt-framework` 的 AppNetwork 适配。
 - 依赖方向：`bbt-framework → bbtools-infra → bbtools-coroutine`。

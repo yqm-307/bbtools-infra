@@ -27,7 +27,7 @@ cmake --build "$BUILD_DIR" --parallel "$JOBS" --target \
     Test_net_freeze_contract Test_net_append_busy_hook \
     net_foundation_consumer Example_co_net_service \
     Test_net_reclaim_receipt Test_net_accept_stop Test_net_accept_stop_fd \
-    Test_net_ico_write_close Test_net_pop_all Test_net_buffer_oom Test_net_co_lifecycle \
+    Test_net_ico_write_close Test_net_copy_consume Test_net_buffer_oom Test_net_co_lifecycle \
     Example_ico_connection
 
 ctest --test-dir "$BUILD_DIR" --show-only=json-v1 > "$BUILD_DIR/registered.json"

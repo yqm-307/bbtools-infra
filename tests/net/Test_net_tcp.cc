@@ -217,8 +217,7 @@ struct EchoHandler : RawHandler {
         std::string data;
         const auto result = connection.TryRead(data);
         if (result.status == ReadStatus::Ok && !data.empty()) {
-            WriteOperation operation;
-            connection.AsyncWrite(data, operation);
+            connection.AsyncWrite(data);
         }
     }
 
@@ -543,8 +542,7 @@ static void WriteBackpressure()
     std::error_code capacity_error;
     int accepted = 0;
     for (int i = 0; i < 400; ++i) {
-        WriteOperation operation;
-        const auto error = connection->AsyncWrite(chunk, operation);
+        const auto error = connection->AsyncWrite(chunk);
         if (error) {
             capacity_error = error;
             break;
@@ -565,11 +563,9 @@ static void WriteTimeout()
     {
         auto state = std::make_shared<ConnectionState>(1, 4096, 128, 4, nullptr);
         Connection connection = ConnectionTestAccess::Make(state);
-        WriteOperation warm;
-        CHECK(!connection.AsyncWrite(std::string(64, 'a'), warm));
-        CHECK(!connection.AsyncWrite(std::string(64, 'b'), warm));
-        WriteOperation rejected;
-        CHECK(connection.AsyncWrite(std::string(1, 'c'), rejected) == std::make_error_code(std::errc::no_buffer_space));
+        CHECK(!connection.AsyncWrite(std::string(64, 'a')));
+        CHECK(!connection.AsyncWrite(std::string(64, 'b')));
+        CHECK(connection.AsyncWrite(std::string(1, 'c')) == std::make_error_code(std::errc::no_buffer_space));
         std::atomic<int> result{-1};
         auto task = Task([&] {
             CoTcpConnection co_conn{connection};
@@ -649,8 +645,7 @@ static void CloseWaitersSettle()
 
     auto state = std::make_shared<ConnectionState>(9, 4096, 64, 4, nullptr);
     Connection connection = ConnectionTestAccess::Make(state);
-    WriteOperation warm;
-    CHECK(!connection.AsyncWrite(std::string(64, 'x'), warm));
+    CHECK(!connection.AsyncWrite(std::string(64, 'x')));
     std::atomic<int> write_result{-1};
     auto write_task = Task([&] {
         CoTcpConnection co_conn{connection};
@@ -668,38 +663,19 @@ static void CloseWaitersSettle()
 
 static void RingCombined()
 {
-    // 公共守卫（bbt::infra::net::ReadAccess）语义：同一保护的 Peek+Consume、
-    // Busy 零消费、释放后另一读者可继续。
+    // View 只读借用，不消费、不持有连接锁。
     auto state = std::make_shared<ConnectionState>(1, 64, 64, 4, nullptr);
     Connection connection = ConnectionTestAccess::Make(state);
     Connection peer = ConnectionTestAccess::Make(state); // 同一 ring 的第二句柄
     CHECK(state->ring.TryAppend("abcdef").status == ReadStatus::Ok);
-    {
-        auto access = connection.TryAccess();
-        CHECK(bool(access));
-        CHECK(access.Size() == 6);
-        CHECK(access.Peek() == "abcdef");
-        CHECK(!access.Consume(2));
-    }
+    const auto view = connection.View();
+    CHECK(view && view.Bytes() == "abcdef");
+    CHECK(peer.View().Bytes() == "abcdef");
     std::string out;
     CHECK(connection.TryRead(out).status == ReadStatus::Ok);
-    CHECK(out == "cdef");
-
-    CHECK(state->ring.TryAppend("xy").status == ReadStatus::Ok);
-    auto held = connection.TryAccess();
-    CHECK(bool(held));
-    std::promise<int> busy;
-    auto busy_future = busy.get_future();
-    std::thread other([&] {
-        auto probe = peer.TryAccess();
-        busy.set_value(probe.Busy() ? 1 : 0);
-    });
-    CHECK(busy_future.wait_for(2s) == std::future_status::ready);
-    CHECK(busy_future.get() == 1);
-    ConnectionTestAccess::Reset(held);
-    other.join();
+    CHECK(out == "abcdef");
     CHECK(!state->ring.HasReadError());
-    std::cout << "ring_combined peek_consume=ok busy_zero_consume=ok release=ok\n";
+    std::cout << "ring_combined readonly_view=ok read_consume=ok\n";
 }
 
 static void WriteFifoPrefix()
@@ -797,13 +773,6 @@ static void BufferTransferLifetime()
     Buffer held;
     CHECK(raw.TryRead(held) == make_error_code(NetErrc::WouldBlock));
     CHECK(state->ring.TryAppend("abcdefgh").status == ReadStatus::Ok);
-    {
-        auto guard = raw.TryAccess();
-        auto busy = std::async(std::launch::async, [&] { return raw.TryRead(held); });
-        CHECK(busy.get() == make_error_code(NetErrc::Busy));
-        CHECK(held.Empty());
-        CHECK(guard.Peek().size() == 8);
-    }
     CHECK(!raw.TryRead(held));
     CHECK(held.CopyTo() == "abcdefgh");
     CHECK(raw.ReadableBytes() == 0);
@@ -904,6 +873,7 @@ static void ReadOverloadContract()
     ICoConnection& iface = co;
     Buffer out;
     CHECK(state->ring.TryAppend("retained").status == ReadStatus::Ok);
+    CHECK(iface.View().Bytes() == "retained");
     CHECK(!raw.TryRead(out));
     const auto* original = out.Segments().front().data;
     const auto unchanged = [&] {
@@ -911,7 +881,7 @@ static void ReadOverloadContract()
         CHECK(out.Segments().front().data == original);
     };
     const auto would_block = make_error_code(NetErrc::WouldBlock);
-    const auto busy = make_error_code(NetErrc::Busy);
+
     const auto eof = make_error_code(NetErrc::Eof);
     CHECK(raw.TryRead(out) == would_block);
     unchanged();
@@ -927,17 +897,7 @@ static void ReadOverloadContract()
     CHECK(co.Read(out) == std::make_error_code(std::errc::operation_not_permitted));
     unchanged();
     CHECK(state->ring.Size() == 6);
-    {
-        auto guard = raw.TryAccess();
-        auto contender = std::async(std::launch::async, [&] {
-            CHECK(co.TryRead(out) == busy);
-            unchanged();
-            auto [data, error] = raw.TryRead();
-            CHECK(error == busy && data.Empty());
-        });
-        Get(contender);
-        CHECK(guard.Peek() == "queued");
-    }
+    CHECK(raw.View().Bytes() == "queued");
     auto [queued, ok] = raw.TryRead();
     CHECK(!ok && queued.CopyTo() == "queued");
     unchanged();
@@ -972,6 +932,7 @@ static void ReadOverloadContract()
     // 相同真源，两种 Read 重载先交尾部再报 EOF，且 EOF 不等同 Closed。
     CHECK(state->ring.TryAppend("first").status == ReadStatus::Ok);
     auto reads = Task([&] {
+        out.Clear();
         CHECK(!iface.Read(out));
         CHECK(out.CopyTo() == "first");
         CHECK(state->ring.TryAppend("tail").status == ReadStatus::Ok);
@@ -994,6 +955,7 @@ static void ReadOverloadContract()
     const auto fault = std::error_code(ECONNRESET, std::system_category());
     CHECK(faulty->ring.TryAppend("before-error").status == ReadStatus::Ok);
     faulty->ring.MarkError(fault);
+    out.Clear();
     CHECK(!error_raw.TryRead(out) && out.CopyTo() == "before-error");
     CHECK(error_raw.TryRead(out) == fault && out.CopyTo() == "before-error");
     auto [failed, error] = error_raw.TryRead();

@@ -13,7 +13,7 @@
 // blob 08d1c954553f625ef396e534d898d6a2697ac232
 // sha256 ae37d61fdcfe604f0c08ba518fffd3721a2d56f51202b471177ae19b071cf0d4
 //
-// 无第三方测试框架依赖；只链接 bbt::infra_common（纯 header-only codec）。
+// 无第三方测试框架依赖；只链接 bbt::infra_common。
 
 #include <cstdint>
 #include <cstdio>
@@ -24,7 +24,7 @@
 #include <vector>
 
 #include <bbt/infra/Result.hpp>
-#include <bbt/infra/rpc/RpcPayload.hpp>
+#include <bbt/infra/rpc/codec/PositionalCodec.hpp>
 
 namespace {
 

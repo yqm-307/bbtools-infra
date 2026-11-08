@@ -2,11 +2,13 @@
 // acceptance_requested presence、错误阶段、metadata/budget 上限、u32be 分帧
 // 上限与畸形报文拒绝（纯字节层验证，不连网络）。
 
-#include <bbt/infra/rpc/Codec.hpp>
+#include <bbt/infra/rpc/SessionCodec.hpp>
+#include <bbt/infra/rpc/detail/RpcFrameProtocol.hpp>
 #include <bbt/infra/rpc/Options.hpp>
 #include <bbt/infra/rpc/Response.hpp>
 #include <bbt/infra/rpc/Stats.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <iostream>
@@ -156,7 +158,7 @@ void Roundtrip()
         resp.error.domain = "framework.actor";
         resp.error.domain_code = "svc.x";
         resp.error.backend_category = "echo";
-        resp.error.backend_code = 7;
+        resp.error.backend_code = -7; // int32 two's-complement 编码须保留负值
         resp.error.transferred_bytes = 9;
         resp.error.details = {{"route.key", "a/b"}};
         resp.error.request_phase = RequestPhase::RequestCommitted;
@@ -167,7 +169,7 @@ void Roundtrip()
         const auto& e = back.value().error;
         CHECK(e.code == ErrorCode::NotFound && e.domain == "framework.actor");
         CHECK(e.domain_code == "svc.x" && e.message == "missing");
-        CHECK(e.backend_category == "echo" && e.backend_code == 7);
+        CHECK(e.backend_category == "echo" && e.backend_code == -7);
         CHECK(e.transferred_bytes == 9);
         CHECK(e.details.size() == 1 && e.details[0].first == "route.key");
         CHECK(e.request_phase.has_value() && *e.request_phase == RequestPhase::RequestCommitted);
@@ -921,6 +923,120 @@ void Values()
     }
 }
 
+// ---- 无状态帧协议接缝：单 reader 顺序 + 合包/拆包 + opaque payload ----------
+// 直接经 detail::RpcFrameProtocol（Validate/Encode/Decode/Feed/Next）驱动：
+// 协议层不持有拆包缓冲（缓冲属于调用方 SessionFrameDecoder），一帧字节任意
+// 切分或多帧合包到达时，单个 reader 必须按发送顺序完整取帧，payload 与
+// ordering key 原样不透明。
+void FrameProtocolSeam()
+{
+    using rpc::detail::RpcFrameProtocol;
+
+    const auto make = [](const char* id, std::uint64_t sequence, std::vector<std::uint8_t> payload) {
+        SessionFrame frame = ValidSend();
+        frame.message_id = id;
+        frame.sequence = sequence;
+        frame.payload = std::move(payload);
+        frame.ordering_key = std::string("k\0\xff", 3); // 不透明字节而非文本
+        return frame;
+    };
+    const std::vector<SessionFrame> frames = {
+        make("opaque-1", 1, {0x00, 0xFF, 0x80, 0x00}),
+        make("opaque-2", 2, {}),
+        make("opaque-3", 3, std::vector<std::uint8_t>(65536, 0xAB)),
+    };
+
+    // Encode/Decode 是纯函数：单帧 roundtrip 的 payload/ordering key 字节一致。
+    std::vector<std::uint8_t> stream;
+    for (const auto& frame : frames) {
+        CHECK(RpcFrameProtocol::Validate(frame));
+        auto encoded = RpcFrameProtocol::Encode(frame);
+        CHECK(encoded && encoded.value().size() > 4);
+        auto decoded = RpcFrameProtocol::Decode(encoded.value().data() + 4, encoded.value().size() - 4);
+        CHECK(decoded);
+        CHECK(decoded.value().payload == frame.payload);
+        CHECK(decoded.value().ordering_key == frame.ordering_key);
+        stream.insert(stream.end(), encoded.value().begin(), encoded.value().end());
+    }
+
+    // 单 reader 顺序：一次 Feed 合包三帧，Next 逐帧按发送顺序取净。
+    {
+        rpc::SessionFrameDecoder decoder;
+        decoder.SetHelloPhase(false); // 数据态：帧限统一，大 payload 不被 64KiB 握手门误拒
+        CHECK(RpcFrameProtocol::Feed(decoder, stream.data(), stream.size()));
+        for (const auto& frame : frames) {
+            auto next = RpcFrameProtocol::Next(decoder);
+            CHECK(next && next.value().has_value());
+            CHECK(next.value()->message_id == frame.message_id);
+            CHECK(next.value()->sequence == frame.sequence);
+            CHECK(next.value()->payload == frame.payload);
+        }
+        auto tail = RpcFrameProtocol::Next(decoder);
+        CHECK(tail && !tail.value().has_value()); // 无多余帧、无丢失
+    }
+
+    // 拆包：同一帧逐字节到达时只在读满后出帧，出帧字节完全一致。
+    {
+        auto encoded = RpcFrameProtocol::Encode(frames.back());
+        CHECK(encoded);
+        const auto& bytes = encoded.value();
+        rpc::SessionFrameDecoder decoder;
+        decoder.SetHelloPhase(false);
+        for (std::size_t i = 0; i != bytes.size(); ++i) {
+            CHECK(RpcFrameProtocol::Feed(decoder, &bytes[i], 1));
+            auto next = RpcFrameProtocol::Next(decoder);
+            CHECK(next);
+            if (i + 1 == bytes.size()) {
+                CHECK(next.value().has_value());
+                CHECK(next.value()->payload == frames.back().payload);
+            } else {
+                CHECK(!next.value().has_value()); // 未读满不早出帧
+            }
+        }
+    }
+
+    // 合包再分片：两帧合包后按 7 字节片喂入，仍按同一顺序出帧。
+    {
+        auto first = RpcFrameProtocol::Encode(frames[0]);
+        auto third = RpcFrameProtocol::Encode(frames[2]);
+        CHECK(first && third);
+        std::vector<std::uint8_t> mixed(first.value());
+        mixed.insert(mixed.end(), third.value().begin(), third.value().end());
+        rpc::SessionFrameDecoder decoder;
+        decoder.SetHelloPhase(false);
+        std::vector<std::string> order;
+        for (std::size_t offset = 0; offset < mixed.size();) {
+            const auto chunk = std::min<std::size_t>(7, mixed.size() - offset);
+            CHECK(RpcFrameProtocol::Feed(decoder, mixed.data() + offset, chunk));
+            offset += chunk;
+            for (;;) {
+                auto next = RpcFrameProtocol::Next(decoder);
+                CHECK(next);
+                if (!next.value().has_value()) {
+                    break;
+                }
+                order.push_back(next.value()->message_id);
+            }
+        }
+        CHECK(order.size() == 2 && order[0] == "opaque-1" && order[1] == "opaque-3");
+    }
+
+    // 无状态：两个独立 decoder 从同一字节流得到相同的首帧（协议层无共享状态）。
+    {
+        rpc::SessionFrameDecoder first;
+        rpc::SessionFrameDecoder second;
+        first.SetHelloPhase(false);
+        second.SetHelloPhase(false);
+        CHECK(RpcFrameProtocol::Feed(first, stream.data(), stream.size()));
+        CHECK(RpcFrameProtocol::Feed(second, stream.data(), stream.size()));
+        auto a = RpcFrameProtocol::Next(first);
+        auto b = RpcFrameProtocol::Next(second);
+        CHECK(a && b && a.value().has_value() && b.value().has_value());
+        CHECK(a.value()->message_id == b.value()->message_id);
+    }
+    std::cout << "v2 frame protocol seam: single-reader order, coalesced/split, opaque payload ok\n";
+}
+
 } // namespace
 
 int RunCase(const std::string& mode)
@@ -935,6 +1051,8 @@ int RunCase(const std::string& mode)
         Framing();
     } else if (mode == "v2_values") {
         Values();
+    } else if (mode == "v2_protocol_seam") {
+        FrameProtocolSeam();
     } else if (mode == "response_from_request") {
         ResponseFromRequest();
     } else {

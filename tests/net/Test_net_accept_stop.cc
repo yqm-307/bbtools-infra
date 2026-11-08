@@ -215,8 +215,7 @@ struct EchoHandler : RawHandler {
         std::string data;
         auto result = connection.TryRead(data);
         if (result.status == ReadStatus::Ok && !data.empty()) {
-            WriteOperation operation;
-            connection.AsyncWrite(data, operation);
+            connection.AsyncWrite(data);
         }
     }
 };

@@ -223,8 +223,10 @@ public:
     bool AcceptingStopped() const noexcept;
 
     // ---- Co 成员入口 ---------------------------------------------------------
-    // 协程消费面以成员函数的形式提供，判定优先级见 CoConnection.hpp：执行域 gate 先于
-    // 一切状态判定；终态（sealed/Closing/Stopped → operation_canceled）先于 Idle/Starting
+    // 协程消费面以成员函数的形式提供：执行域 gate 先于
+    // 一切状态判定，包括已就绪的快路径；非受管协程返回 operation_not_permitted，
+    // 不创建 CoObject/Processer，也不产生网络副作用。
+    // 终态（sealed/Closing/Stopped → operation_canceled）先于 Idle/Starting
     // 与 client-only；失败不覆盖 result.connection，reclaim 按提交阶段描述本次 socket 责任。
     // 实现落在 Engine.cc，经私有步骤 CoSubmitConnect/CoWaitConnect/CoWaitAccepted 完成。
 
@@ -255,7 +257,7 @@ private:
                                   const bbt::coroutine::WaitOptions& options);
 
     /// 从有界 handoff 队列取已接纳的连接。配置或生命周期错误立即返回，不等待。
-    /// 判定优先级见 CoConnection.hpp 中 CoAccept 的注释：终态（sealed/Closing/Stopped →
+    /// 判定优先级与 CoAccept 一致：终态（sealed/Closing/Stopped →
     /// operation_canceled）先于 Idle/Starting 与 client-only 的判定。
     std::error_code CoWaitAccepted(Connection& out, const bbt::coroutine::WaitOptions& options);
 
@@ -264,4 +266,4 @@ private:
 
 } // namespace bbt::infra::net
 
-#include <bbt/infra/net/impl/EngineImpl.hpp>
+#include <bbt/infra/net/__TEngine.hpp>

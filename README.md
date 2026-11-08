@@ -9,7 +9,7 @@ C++17 基础接入层：TCP 网络执行域、HTTP、Redis、RPC、Mongo 与基�
 | TCP 网络底座 | `bbt::infra_net` | Processer driver 推进；Engine + ICoConnection 的建连、收发、关闭与回收 |
 | HTTP Client / Server | `bbt::infra_http_net` | 唯一现役 HTTP 实现；连接池、HTTP/1.1、流式响应及服务端停止/排空；见 [HTTP 指南](docs/guides/http-net.md) |
 | Redis | `bbt::infra_redis_net` | 单连接与有界池，RESP2、KV/Hash、AUTH/SELECT；见 [Redis 指南](docs/guides/redis-net.md) |
-| RPC | `bbt::infra_rpc_net` | 消费 HTTP 与锁定 protobuf 3.21.12；见 [RPC 指南](docs/guides/rpc-net.md) |
+| RPC | `bbt::infra_rpc_net` | 唯一 V2 会话面（`SessionFrame` + u32be + Hello/HelloAck），锁定 protobuf 3.21.12；不依赖 HTTP 开关；见 [RPC 指南](docs/guides/rpc-net.md) |
 | Consul 注册发现 adapter | `bbt::infra_consul` | Consul agent HTTP API 的最小注册、注销与健康发现；复用 `bbt::infra_http_net`，无 Consul SDK；契约与真后端验证见 [Consul 指南](docs/guides/consul-registry.md) |
 | Mongo | `bbt::infra_mongo` | 保留 bounded worker bridge、BSON 与 owner/句柄；不依赖 TCP/HTTP adapter |
 | 动态配置 | `bbt::infra_config` | 内存源、本地文件源、watch；私有关闭支撑；见 [config 指南](docs/guides/config-watch.md) |

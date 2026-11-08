@@ -95,8 +95,14 @@ BOOST_AUTO_TEST_CASE(non_co_connection_ready_paths_do_not_consume)
     BOOST_CHECK(after.write == before.write);
     BOOST_CHECK(!after.closed);
 
-    // native 非挂起提交保持合法；已完成票仍不能绕过 Co 等待门禁。
-    auto operation = connection.AsyncWrite("");
+    // fire 提交可在 native 域调用；等待票只从协程 Write 取得，仍遵守等待门禁。
+    BOOST_REQUIRE(!connection.AsyncWrite(""));
+    net::WriteOperation operation;
+    OnCo([&] {
+        const auto report = connection.Write("");
+        BOOST_REQUIRE(!report.wait_error);
+        operation = report.operation;
+    });
     BOOST_REQUIRE(operation.Valid());
     BOOST_CHECK(operation.Wait({}, nullptr) == std::errc::operation_not_permitted);
     connection.RequestClose();
