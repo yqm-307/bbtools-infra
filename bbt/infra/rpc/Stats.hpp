@@ -3,7 +3,7 @@
 // 契约来源：docs/decisions/0014-app-session.md §2.1/§2.3。
 //
 // 取样语义（重要，不要按原子快照用）：
-//   Client::Stats()/Server::Stats() 按值返回一次「汇总取样」，不是同一时刻
+//   CoRpcClient::Stats()/CoRpcServer::Stats() 按值返回一次「汇总取样」，不是同一时刻
 //   的一致快照。实现分多把锁/多个 atomic 分步读取：
 //     * owner 级 gauge（sessions/links/acceptance_pending）各自独立 atomic；
 //     * Client lane 计数逐个 session 取 out_mu 后累加；
@@ -15,8 +15,7 @@
 //   lane 字段会在 session 退役后下降；当前字段是各自取样点的 gauge。
 //
 // 使用边界：只把这些数当趋势与容量观察。不要用单次取样的跨字段等式/不等式
-// 判定泄漏、收口或「队列为空」；需要确定性的收口判断时用 Drain/Close/
-// WaitStopped 的返回值，或用 detail::ServerV2Ledger 的台账快照。
+// 判定泄漏、收口或「队列为空」；需要确定性的收口判断时用 Close 各模式的返回值，或用 detail::ServerV2Ledger 的台账快照。
 //
 // queued/dequeued/inflight/finished 职责（ADR 0014 §2.3）：
 //   queued    — 有限队列尚未交付 dispatch/mailbox；
@@ -46,7 +45,7 @@ struct TrafficStats {
 };
 
 /**
- * @brief Client owner 观测值（`Client::Stats()` 按值返回）。
+ * @brief Client owner 观测值（`CoRpcClient::Stats()` 按值返回）。
  *
  * 一次汇总取样，不是同一时刻的一致快照：sessions/links/
  * remote_acceptance_pending 是三个独立 atomic，lane 计数是逐 session 取锁
@@ -64,7 +63,7 @@ struct ClientStats {
 };
 
 /**
- * @brief Server owner 观测值（`Server::Stats()` 按值返回）。
+ * @brief Server owner 观测值（`CoRpcServer::Stats()` 按值返回）。
  *
  * 一次汇总取样，不是同一时刻的一致快照：连接与 lane 累计在会话台账锁内取，
  * queue 的 queued/bytes_queued 逐个经 AdmissionQueue 自己的锁读，两者之间

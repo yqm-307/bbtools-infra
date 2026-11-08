@@ -1,25 +1,20 @@
 #pragma once
 
-// 有界弹性环形缓冲与事件快照：后续 Reader/Writer 要消费的内部部件
-// （detail 路径，namespace 不增第四层；不进公共头自检）。
-//
-// 语义依据：gnet v2.10.0 pkg/buffer/ring/ring_buffer.go（MIT，见
-// docs/dependencies/gnet-2.10.0.provenance.md）与 0010 决策「业务独占事件
-// 快照」。仅移植必要语义，不复制 gnet 的 pool/同步库。
-//
-// 与参考 ring 的差异：参考 ring 满时由上层覆盖/腾挪，本部件追加超限在
-// 任何修改之前拒绝（no_buffer_space），不覆盖最旧数据丢字节。
-//
-// 单 owner 使用，非线程安全；不内置任何锁（0010：无共享大锁）。
+// 有界分段接收缓冲与独立事件快照；保留内部类型名以隔离调用方。
+// Boost.Beast multi_buffer 管理存储与消费，包装负责超限拒绝和独立快照。
+// 单 owner 使用，非线程安全；同步仍由 ReceiveRing 负责。
 
+#include <algorithm>
 #include <cstddef>
 #include <functional>
-#include <memory>
-#include <boost/circular_buffer.hpp>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <utility>
+
+#include <boost/asio/buffer.hpp>
+#include <boost/beast/core/multi_buffer.hpp>
 
 namespace bbt::infra::net {
 
@@ -69,12 +64,9 @@ private:
     std::size_t cursor_{0};
 };
 
-// 单 owner 有界弹性环形缓冲。Boost 管理 head/size/绕环不变量；
-// 包装只预检总量并按需增长，永不收缩或覆盖。char 的 erase_begin 为 O(1)。
+// 单 owner 有界分段缓冲。消费可回收已读块，Capacity 表示当前免分配容量。
 class EventRingBuffer {
 public:
-    static constexpr std::size_t kInitialCapacity = 1024;
-
     // max_bytes == 0 时仅空操作合法；构造不预分配。
     explicit EventRingBuffer(std::size_t max_bytes) noexcept;
 
@@ -98,16 +90,15 @@ public:
     }
     bool Empty() const noexcept
     {
-        return storage_.empty();
+        return storage_.size() == 0;
     }
 
-    // 支持自身 Peek view/子串作为输入：修改前保存别名副本。超限拒绝或
-    // 分配失败时原缓冲不变；外部非别名输入不额外复制。
+    // 支持自身 Peek view/子串作为输入：prepare 保持可读段有效。
+    // 超限拒绝或分配失败时可读内容不变，不为别名额外复制载荷。
     std::error_code Append(std::string_view data);
 
     // 读前预留总容量（读侧消除不可回滚消费的最小原语）：total_capacity
-    // 超过 MaxBytes 拒绝且不变；只增长不收缩；容量已足时无操作。扩容
-    // 失败（bad_alloc）时内容与容量均保持不变（set_capacity 强异常保证）。
+    // 超过 MaxBytes 拒绝且不变；容量已足时无操作。扩容失败时可读内容不变。
     // 成功预留后，等量 Append 只做 char 提交，不再首次分配。
     std::error_code Reserve(std::size_t total_capacity);
 
@@ -121,13 +112,10 @@ public:
 
     EventSnapshot TakeSnapshot() const;
 
-    // pop-all 移交：把当前 storage（含绕环两段）整体移入共享 backing，
-    // 不复制载荷；返回的 const 对象不可再修改，array_one()/array_two()
-    // 指针在其寿命内保持有效。成功后本对象回到空、容量 0，下一次
-    // Append/Reserve 按需重新增长——额度（Size 语义）在移交成功瞬间释放，
-    // 不等 backing 析构。
-    // 失败（make_shared 分配失败）时本对象内容完全不变；move 构造不抛。
-    std::shared_ptr<const boost::circular_buffer<char>> TakeStorage();
+    boost::beast::multi_buffer::const_buffers_type Segments() const noexcept
+    {
+        return storage_.data();
+    }
 
     void Clear() noexcept
     {
@@ -135,13 +123,8 @@ public:
     }
 
 private:
-    // need <= max_bytes_；先判 max/2 再翻倍，无溢出。
-    std::size_t GrowTarget(std::size_t need) const noexcept;
-
-    boost::circular_buffer<char> storage_;
+    boost::beast::multi_buffer storage_;
     std::size_t max_bytes_;
 };
 
 } // namespace bbt::infra::net
-
-#include <bbt/infra/net/detail/impl/EventRingBufferImpl.hpp>

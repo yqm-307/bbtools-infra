@@ -11,7 +11,7 @@
 //     drain 计数、存活 worker/会话数、Redis 队列/槽/registered/finished 等）继续留
 //     在各自模块内，不搬到这里——否则会把真实状态误绑到 debug 开关上，Release
 //     语义随之改变。
-//   - header-only + C++17 inline 变量/函数：库与消费者共享唯一定义，无 ODR/ABI 混配。
+//   - 观测函数编译进内部 debug 库；库与消费者使用同一配置边界，无 ODR/ABI 混配。
 //     宏经构建面对消费者传播，全部 TU 取值一致；库与消费者不得分别开关该宏。
 #ifdef BBT_INFRA_STRINGENT_DEBUG
 
@@ -50,7 +50,5 @@ struct MongoRuntimeObservation {
 };
 
 } // namespace bbt::infra::debug
-
-#include <bbt/infra/debug/impl/InfraDebugImpl.hpp>
 
 #endif // BBT_INFRA_STRINGENT_DEBUG

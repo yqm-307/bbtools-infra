@@ -28,7 +28,7 @@
 
 #include <bbt/infra/net/Buffer.hpp>
 
-#include <bbt/infra/net/ReadAccess.hpp>
+#include <bbt/infra/net/ReadView.hpp>
 #include <bbt/infra/net/Types.hpp>
 #include <bbt/infra/net/WriteOperation.hpp>
 
@@ -85,12 +85,14 @@ public:
     /**
      * @brief 非挂起提交一次写，全量接纳或零接纳。
      *
-     * 成功后库取得数据所有权，观察句柄用于终态查询/等待。每次调用先将 out_operation 置为无效：
-     * 拒绝时保持无效，不泄露上次结果；成功时写入本次新身份。
+     * 返回空错误仅表示已接纳，由 owner 后续发送，不表示本地发送完成。
+     * 队列满或连接关闭等接纳错误立即返回；不等待、不返回操作票，不自动重试。
+     * 后续终态经 raw OnWrite/LastWriteError 观察；需要等待时使用 CoTcpConnection::Write。
+     * 按值接管输入，move 后即使被拒绝也不保证调用方原字符串内容保留。
      */
-    std::error_code AsyncWrite(std::string data, WriteOperation& out_operation);
+    std::error_code AsyncWrite(std::string data);
 
-    /// @brief owning 交付：成功非空；失败 out 不变、零消费。
+    /// @brief 复制并消费当前已发布数据到调用方自己的 Buffer；成功不移交内部存储。
     std::error_code TryRead(Buffer& out);
     /**
      * @brief 非挂起读取并以 tuple 返回缓冲区和结果。
@@ -104,12 +106,8 @@ public:
     /// @brief 兼容复制入口：竞争 Busy（零消费）；空且无终态 WouldBlock。
     ReadResult TryRead(std::string& out);
 
-    /**
-     * @brief 组合 Peek 与 Consume 的守卫，寿命与有效期约束见 ReadAccess.hpp。
-     *
-     * 守卫持有本连接状态的强引用，因此即使随后释放本句柄，守卫内的访问仍然安全。
-     */
-    ReadAccess TryAccess();
+    /// @brief 非等待只读查看；视图只在本次同步使用期间有效，不消费数据。
+    ReadView View();
 
     /// @brief 已发布、尚未交付的字节数采样；无效句柄为 0。
     std::size_t ReadableBytes();
@@ -159,7 +157,7 @@ private:
     friend struct CoAccess;
     friend class EngineTestAccess;
     friend class ConnectionTestAccess;
-    friend class ReadAccess;
+
     explicit Connection(std::shared_ptr<ConnectionState> state);
 
     std::shared_ptr<ConnectionState> m_state;

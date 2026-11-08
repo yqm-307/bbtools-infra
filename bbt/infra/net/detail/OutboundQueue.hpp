@@ -106,5 +106,3 @@ private:
 };
 
 } // namespace bbt::infra::net
-
-#include <bbt/infra/net/detail/impl/OutboundQueueImpl.hpp>

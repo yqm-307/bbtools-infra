@@ -37,9 +37,7 @@ public:
     CoTcpConnection() = default;
 
     /// @brief 以既有连接句柄构造视图，共享同一状态而不复制；explicit 防隐式转换。
-    explicit CoTcpConnection(Connection connection) noexcept : m_conn(std::move(connection))
-    {
-    }
+    explicit CoTcpConnection(Connection connection) noexcept;
     /// @brief 析构不隐式 RequestClose，也不等物理回收。
     ~CoTcpConnection() override = default;
 
@@ -57,15 +55,14 @@ public:
      * @return 包含读取缓冲区和错误码的 tuple；失败时缓冲区为空。
      */
     using ICoConnection::TryRead;
-    /// @brief 非等待 owning 读取；契约见 ICoConnection::TryRead。
-    std::error_code TryRead(Buffer& out) override
-    {
-        return m_conn.TryRead(out);
-    }
-    /// @brief 协程等待 owning 读取；契约见 ICoConnection::Read。
+    /// @brief 非等待复制读取；契约见 ICoConnection::TryRead。
+    std::error_code TryRead(Buffer& out) override;
+    /// @brief 协程等待复制读取；契约见 ICoConnection::Read。
     std::error_code Read(Buffer& out, const bbt::coroutine::WaitOptions& options = {}) override;
+    /// @brief 非等待只读查看；契约见 ICoConnection::View。
+    ReadView View() override;
     /// @brief 非挂起提交写；契约见 ICoConnection::AsyncWrite。
-    WriteOperation AsyncWrite(std::string data) override;
+    std::error_code AsyncWrite(std::string data) override;
     /// @brief 协程内组合等待写；契约见 ICoConnection::Write。
     WriteReport Write(std::string data, const bbt::coroutine::WaitOptions& options = {}) override;
     /// @brief 等待逻辑关闭终态；契约见 ICoConnection::WaitClosed。
@@ -79,12 +76,9 @@ public:
      * @brief 返回底层 Connection 的 const 引用，指向同一共享状态，不是副本。
      *
      * 它只能用于只读查询（例如 Valid、Id、Closed、Released）。要调用 AsyncWrite、TryRead、
-     * TryAccess 等非 const 方法，需要持有一个 Connection 副本。
+     * View/TryRead 等非 const 方法，需要持有一个 Connection 副本。
      */
-    const Connection& Raw() const noexcept
-    {
-        return m_conn;
-    }
+    const Connection& Raw() const noexcept;
 
 private:
     Connection m_conn; // 唯一的共享值句柄，没有第二数据队列或关闭槽

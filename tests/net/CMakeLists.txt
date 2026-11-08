@@ -18,8 +18,18 @@ foreach(_case buffer options load_balancing)
         WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/runtime")
 endforeach()
 
-# 独立失败注入可执行文件：纯头部件，不链接 coroutine/runtime。
-add_executable(Test_net_allocation Test_net_allocation.cc)
+# 二进制流：字节序、跨段消费、失败原子性及移动/预留的分配约束。
+add_executable(Test_net_buffer_stream Test_net_buffer_stream.cc)
+target_link_libraries(Test_net_buffer_stream PRIVATE bbt::infra_net Boost::headers)
+target_compile_options(Test_net_buffer_stream PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME net.buffer_stream COMMAND Test_net_buffer_stream)
+set_tests_properties(net.buffer_stream PROPERTIES TIMEOUT 30 LABELS "unit")
+
+# 独立失败注入进程直接编译被测生产实现，避免引入 coroutine/runtime。
+add_executable(Test_net_allocation
+    Test_net_allocation.cc
+    ${PROJECT_SOURCE_DIR}/bbt/infra/net/detail/EventRingBuffer.cc
+    ${PROJECT_SOURCE_DIR}/bbt/infra/net/detail/OutboundQueue.cc)
 target_include_directories(Test_net_allocation PRIVATE ${PROJECT_SOURCE_DIR})
 target_link_libraries(Test_net_allocation PRIVATE Boost::headers)
 target_compile_features(Test_net_allocation PRIVATE cxx_std_17)
@@ -91,7 +101,7 @@ target_link_libraries(Test_net_freeze_contract PRIVATE bbt::infra_net Boost::hea
 target_compile_options(Test_net_freeze_contract PRIVATE -Wall -Wextra -Wpedantic)
 target_link_options(Test_net_freeze_contract PRIVATE -rdynamic)
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/runtime")
-foreach(_case guard_lifetime co_context_gate options_contract write_output_reuse
+foreach(_case co_context_gate options_contract write_output_reuse
         output_preservation connect_delivery connect_failure_cleanup accept_configuration)
     add_test(NAME net.freeze_${_case} COMMAND Test_net_freeze_contract ${_case})
     set_tests_properties(net.freeze_${_case} PROPERTIES TIMEOUT 60
@@ -99,7 +109,7 @@ foreach(_case guard_lifetime co_context_gate options_contract write_output_reuse
         WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/runtime")
 endforeach()
 
-# 成员化 ICoConnection 写/关闭观察：AsyncWrite 拒绝票、成员 Write
+# 成员化 ICoConnection 写/关闭观察：AsyncWrite fire 提交、成员 Write
 # （等容量→接纳→等本地完成）、WriteOperation::Wait、WaitClosed close hub、
 # Status 投影、RequestClose 默认 reason 下未发完写非成功、facade 释放后 op
 # 可查、driver Failed 唤醒。所有等待挂起由 ConnectionState 的
@@ -108,7 +118,7 @@ add_executable(Test_net_ico_write_close Test_net_ico_write_close.cc)
 target_link_libraries(Test_net_ico_write_close PRIVATE bbt::infra_net Boost::headers)
 target_compile_options(Test_net_ico_write_close PRIVATE -Wall -Wextra -Wpedantic)
 target_link_options(Test_net_ico_write_close PRIVATE -rdynamic)
-foreach(_case member_write_done async_write_reject_ticket
+foreach(_case member_write_done async_write_fire
         write_unsubmitted_timeout write_accepted_timeout write_accepted_cancel
         op_wait_partial_error write_zero_len close_default_reason
         facade_released_op_queryable waitclosed_driver_failed
@@ -138,17 +148,17 @@ add_executable(Test_net_contract_regressions Test_net_contract_regressions.cc)
 target_link_libraries(Test_net_contract_regressions PRIVATE bbt::infra_net Boost::headers)
 target_compile_options(Test_net_contract_regressions PRIVATE -Wall -Wextra -Wpedantic)
 target_link_options(Test_net_contract_regressions PRIVATE -rdynamic -Wl,--wrap=sendmsg)
-foreach(_case ring_alloc_no_consume ring_release_notify hub_early_notify_retained
+foreach(_case        ring_alloc_no_consume hub_early_notify_retained
         write_total_ops_bound write_query_monotonic onwrite_throw_continues
         wait_accepted_existing_out run_preconditions engine_driver_failed
         invalid_options_rejected handoff_full_resume lb_subs fairness
-        ring_append_fault_shared_out co_read_append_fault_nonempty_out co_read_idle_no_spin
+        ring_append_fault_shared_out co_read_append_fault_nonempty_out buffer_copy_consume_fault co_read_idle_no_spin
         staged_close_tail connect_complete_before_wait connect_timeout_recycles_adopt
         connect_hard_cap connect_raw_completion_cleanup lb_least_connections
         socket_options_getsockopt install_failure_fd_baseline run_managed_domain_reject co_read_rapid write_terminal_no_alloc
         write_capacity_after_drain write_capacity_after_partial accept_after_close
         connect_cancel_late_callback fairness_one_sub staged_recv_busy_close
-        run_teardown_no_residue co_busy_release_phases co_wouldblock_closed_race
+        run_teardown_no_residue co_wouldblock_closed_race
         co_pingpong_strict ring_deferred_backing_reuse ring_deferred_nonblocking_try async_connect_public_fast_complete async_connect_raw_not_waitable waitconnect_add_failure_recycles accept_auth_barriers connect_auth_barriers seal_throw_error_exit install_delay_no_deadline dirty_remove_erase_joint raw_pending_wait_rejected codial_raw_rejected
         waitconnect_single_receiver staged_close_before_release install_wait_driver_failed_exit seal_wait_driver_failed_exit request_close_read_terminal_order
         stage_detached_notify_fault_no_duplicate seal_notify_fault_callbacks
@@ -226,40 +236,36 @@ foreach(_case pending_not_flushed_before_next_recv pending_without_next_recv_is_
         LABELS "unit")
 endforeach()
 
-# pop-all 移交契约（Boost.Test + detail 接缝）：
-# TryPopAll 的绕环/pending/detached 分段移交、Busy 零消费、额度即时释放、
-# 分配失败不变、尾先交尽再 Eof，以及 CoTcpConnection::Read 的 gate/挂起/
-# 超时/EOF 路径。自定义 operator new 仅本目标 thread_local 注入分配失败。
-add_executable(Test_net_pop_all detail/Test_net_pop_all.cc)
-target_link_libraries(Test_net_pop_all PRIVATE bbt::infra_net Boost::headers)
-target_include_directories(Test_net_pop_all PRIVATE ${PROJECT_SOURCE_DIR})
-target_compile_features(Test_net_pop_all PRIVATE cxx_std_17)
-target_compile_options(Test_net_pop_all PRIVATE -Wall -Wextra -Wpedantic)
-target_link_options(Test_net_pop_all PRIVATE -rdynamic)
-foreach(_case wrap_two_segments_one_backing pending_moves_as_own_segment
+# 复制读取契约：跨段/pending/detached FIFO、Busy 零消费、即时释放额度、
+# 分配失败不变、关闭后尾部及输出独立寿命；Co Read 的 gate/挂起/超时/EOF。
+add_executable(Test_net_copy_consume detail/Test_net_copy_consume.cc)
+target_link_libraries(Test_net_copy_consume PRIVATE bbt::infra_net Boost::headers)
+target_include_directories(Test_net_copy_consume PRIVATE ${PROJECT_SOURCE_DIR})
+target_compile_features(Test_net_copy_consume PRIVATE cxx_std_17)
+target_compile_options(Test_net_copy_consume PRIVATE -Wall -Wextra -Wpedantic)
+target_link_options(Test_net_copy_consume PRIVATE -rdynamic)
+foreach(_case multiple_segments_fifo pending_fifo
               detached_tail_after_pending busy_contention_zero_consume
               quota_releases_immediately alloc_failure_keeps_ring_and_quota
-              tail_delivered_before_eof no_pollute_after_pop
+              tail_delivered_before_eof output_survives_ring_reuse_and_destruction
               read_gate_rejects_non_coroutine read_waits_and_delivers_across_wakeup
-              read_timeout_does_not_consume read_buffer_identity_and_eof_drain
-              multi_reader_linearizes zero_payload_copy)
-    add_test(NAME net.pop_all_${_case}
-        COMMAND Test_net_pop_all --run_test=net_pop_all/${_case})
-    set_tests_properties(net.pop_all_${_case} PROPERTIES TIMEOUT 45
+              read_timeout_does_not_consume read_buffer_and_eof_drain
+              readers_consume_only_once)
+    add_test(NAME net.copy_consume_${_case}
+        COMMAND Test_net_copy_consume --run_test=net_copy_consume/${_case})
+    set_tests_properties(net.copy_consume_${_case} PROPERTIES TIMEOUT 45
         LABELS "unit")
 endforeach()
 
-# infra-ico-conn 独立审查 6 个 confirmed defect 的修复后契约断言（原
-# 「缺陷存在」断言已翻转）：post-pop OOM 不丢字节、append OOM 不抛出、
-# SSO 移交不复制、拷贝删除、公共构造收回、CoAccept reclaim 同事实源。
+# 复制读取及追加分配失败、暂存容量复用、Buffer 移动/构造约束与 reclaim 契约。
 add_executable(Test_net_buffer_oom detail/Test_net_buffer_oom.cc)
 target_link_libraries(Test_net_buffer_oom PRIVATE bbt::infra_net Boost::headers)
 target_include_directories(Test_net_buffer_oom PRIVATE ${PROJECT_SOURCE_DIR})
 target_compile_features(Test_net_buffer_oom PRIVATE cxx_std_17)
 target_compile_options(Test_net_buffer_oom PRIVATE -Wall -Wextra -Wpedantic)
 target_link_options(Test_net_buffer_oom PRIVATE -rdynamic)
-foreach(_case read_post_pop_oom_no_loss grant_pop_append_oom_no_throw
-              sso_payload_not_copied copy_assign_deleted
+foreach(_case read_copy_oom_no_loss grant_copy_append_oom_no_throw
+              staging_append_failure_keeps_bytes staging_reserved_capacity_reused copy_assign_deleted
               public_ctor_forge_denied coaccept_reclaim_valid_ticket)
     add_test(NAME net.buffer_oom_${_case}
         COMMAND Test_net_buffer_oom --run_test=net_buffer_oom/${_case})

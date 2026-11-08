@@ -283,8 +283,7 @@ struct EchoHandler : RawHandler {
     {
         std::string data;
         if (connection.TryRead(data).status == ReadStatus::Ok && !data.empty()) {
-            WriteOperation operation;
-            connection.AsyncWrite(data, operation);
+            connection.AsyncWrite(data);
         }
     }
     void OnWrite(Connection, WriteResult) override
@@ -471,10 +470,8 @@ static void OnWriteThrowContinues()
                 std::lock_guard<std::mutex> lock(mutex);
                 stored = std::make_shared<Connection>(connection);
             }
-            WriteOperation first;
-            WriteOperation second;
-            (void)connection.AsyncWrite("first", first);
-            (void)connection.AsyncWrite("second", second);
+            (void)connection.AsyncWrite("first");
+            (void)connection.AsyncWrite("second");
         }
         void OnWrite(Connection, WriteResult) override
         {
@@ -796,8 +793,7 @@ static void CoReadAppendFaultNonEmptyOut()
     CHECK(state->ring.TryAppend("co-payload").status == ReadStatus::Ok);
     auto out = std::make_shared<std::string>("existing");
     std::atomic<int> result{-1};
-    // 成员 Read 的分配点在 TryPopAll 的 takeout/segments 元数据：注入
-    // operator new 失败覆盖「分配失败零消费、不改 out」的同一契约。
+    // 成员 Read 的快照及输出 Buffer 分配失败时，接收数据仍可重试。
     auto task = Task([&] {
         CoTcpConnection conn{connection};
         g_fail_alloc = true;
@@ -831,6 +827,31 @@ static void CoReadAppendFaultNonEmptyOut()
     CHECK(retry_result.load() == 0);
     CHECK(*retry_out == "co-payload");
     std::cout << "co_read_append_fault_nonempty_out unchanged=ok\n";
+}
+
+static void BufferCopyConsumeFault()
+{
+    ReceiveRing ring(4096);
+    const std::string payload(4096, 'a');
+    CHECK(ring.TryAppend(payload).status == ReadStatus::Ok);
+    Buffer out;
+    CHECK(out.Reserve(6));
+    CHECK(out.WriteBytes("prefix"));
+    const auto original = out.CopyTo();
+
+    g_fail_alloc = true;
+    const auto failed = ring.TryCopyConsume(out);
+    g_fail_alloc = false;
+
+    CHECK(failed.status == ReadStatus::Error);
+    CHECK(failed.error == std::make_error_code(std::errc::not_enough_memory));
+    CHECK(ring.Size() == payload.size());
+    CHECK(out.CopyTo() == original);
+
+    CHECK(ring.TryCopyConsume(out).status == ReadStatus::Ok);
+    CHECK(ring.Size() == 0);
+    CHECK(out.CopyTo() == original + payload);
+    std::cout << "buffer_copy_consume_fault unchanged=ok retry=ok\n";
 }
 
 static void CoReadIdleNoSpin()
@@ -1606,7 +1627,7 @@ static void CoBusyReleasePhases()
         CHECK(state->ring.TryAppend(std::string(256, 'x')).status == ReadStatus::Ok);
         return state;
     };
-    // 1) 尝试前释放：TryAccess 直接可读。
+    // 1) 尝试前释放：Read 直接可读。
     {
         auto state = make_state();
         Connection connection = ConnectionTestAccess::Make(state);
@@ -1627,7 +1648,7 @@ static void CoBusyReleasePhases()
         CHECK(read_result.load() == 0);
         CHECK(shared_out->size() == 256);
     }
-    // 2) Busy 之后、waiter 创建之前释放：必须靠「TryAccess 之前采的旧代次」
+    // 2) Busy 之后、waiter 创建之前释放：必须靠 Read 之前采的旧代次
     // 在 on_registered 复查出差异；修复前采到已释放后的 G+1 → 超时。
     {
         auto state = make_state();
@@ -1959,8 +1980,7 @@ static void SealPostFailureRetries()
         conn = handler->conn;
     }
     CHECK(conn && conn->Valid());
-    WriteOperation pending;
-    CHECK(!conn->AsyncWrite("pending", pending));
+    CHECK(!conn->AsyncWrite("pending"));
 
     EngineTestAccess::SetSealPostFailureOnce(client); // 单次 seal post 失败
     client.RequestClose();
@@ -1970,7 +1990,7 @@ static void SealPostFailureRetries()
     CHECK(WaitUntil([&] { return handler->closes.load() == 1; }, 2000ms));
     {
         std::lock_guard<std::mutex> lock(handler->mutex);
-        CHECK(handler->writes.count(pending.Id()) == 1); // 待结算写唯一兑现
+        CHECK(handler->writes.size() == 1 && *handler->writes.begin() != 0); // 待结算写唯一兑现
     }
     CHECK(EngineTestAccess::ConnectTableSize(client) == 0);
     server_runner.CloseAndJoin();
@@ -2061,10 +2081,7 @@ static void DirtyLifetimeAcrossRemoveConn()
         }
     });
     // 外部线程：weak-lock core 后暂停在 MarkDirty 内；owner 正常关闭并 RemoveConn。
-    std::thread external([&] {
-        WriteOperation op;
-        (void)conn->AsyncWrite("x", op);
-    });
+    std::thread external([&] { (void)conn->AsyncWrite("x"); });
     struct JoinGuard {
         std::thread& thread;
         std::atomic<bool>& release;
@@ -2671,8 +2688,7 @@ static void DirtyRemoveEraseJoint()
         }
     });
     std::thread external([&] {
-        WriteOperation op;
-        (void)conn->AsyncWrite("x", op); // 触发 WakeOwner → MarkDirty，与撤销交错
+        (void)conn->AsyncWrite("x"); // 触发 WakeOwner → MarkDirty，与撤销交错
     });
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     conn->RequestClose();
@@ -3051,12 +3067,11 @@ static void RequestCloseWriteReadiness()
         }
         void OnWrite(Connection connection, WriteResult result) override
         {
-            WriteOperation rejected;
             // 内部状态断言经 TestAccess：公共句柄不再暴露 State。
             const auto state = ConnectionTestAccess::StateOf(connection);
             write_checked.store(result.error.value() == EPIPE && result.sent == 0 && state && state->CloseRequested()
                                 && !state->CanAcceptWrite(1)
-                                && connection.AsyncWrite("must-reject", rejected) == make_error_code(NetErrc::Closed));
+                                && connection.AsyncWrite("must-reject") == make_error_code(NetErrc::Closed));
             writes.fetch_add(1);
         }
         void OnClose(Connection connection, std::error_code reason) override
@@ -3089,8 +3104,7 @@ static void RequestCloseWriteReadiness()
         barrier_released.store(release.wait_for(5000ms) == std::future_status::ready);
     });
     g_eagain_sendmsg_fd.store(fd);
-    WriteOperation pending;
-    CHECK(!connection.AsyncWrite("pending", pending));
+    CHECK(!connection.AsyncWrite("pending"));
     CHECK(ready.wait_for(3000ms) == std::future_status::ready);
     CHECK(g_eagain_sendmsg_fd.load() == -1); // 真实 EAGAIN→ArmWrite→readiness
     connection.RequestClose();
@@ -3104,8 +3118,7 @@ static void RequestCloseWriteReadiness()
     CHECK(handler->write_checked.load());
     CHECK(handler->close_checked.load());
     CHECK(handler->writes.load() == 1);
-    const auto outcome = pending.Query();
-    CHECK(outcome.phase == WritePhase::Done && outcome.error.value() == EPIPE && outcome.sent == 0);
+    CHECK(connection.LastWriteError().value() == EPIPE);
     std::string tail;
     CHECK(connection.TryRead(tail).status == ReadStatus::Ok && tail == "tail");
     CHECK(connection.TryRead(tail).status == ReadStatus::Eof);
@@ -3114,7 +3127,7 @@ static void RequestCloseWriteReadiness()
     CHECK(connection.WriteAcceptance() == AcceptanceState::Closed);
     runner.CloseAndJoin();
     CHECK(!runner.error && handler->closes.load() == 1 && handler->writes.load() == 1);
-    CHECK(pending.Query().error == outcome.error);
+    CHECK(connection.LastWriteError().value() == EPIPE);
     std::cout << "request_close_write_readiness eagain=1 epipe=1 rejected=1 onwrite=1 onclose=1 tail_before_eof=1\n";
 }
 
@@ -3269,8 +3282,7 @@ static void SealCallbacksUniqueWithPendingWrite()
         conn = handler->conn;
     }
     CHECK(conn && conn->Valid());
-    WriteOperation pending;
-    CHECK(!conn->AsyncWrite("pending", pending));
+    CHECK(!conn->AsyncWrite("pending"));
     ReceiveRing::SetNotifyFaultOnceForTest(); // 关闭通知路径一次失败
     client.RequestClose();
     client_runner.CloseAndJoin();
@@ -3278,7 +3290,7 @@ static void SealCallbacksUniqueWithPendingWrite()
     CHECK(WaitUntil([&] { return handler->closes.load() == 1; }, 2000ms));
     {
         std::lock_guard<std::mutex> lock(handler->mutex);
-        CHECK(handler->writes.count(pending.Id()) == 1);
+        CHECK(handler->writes.size() == 1 && *handler->writes.begin() != 0);
     }
     server_runner.CloseAndJoin();
     CHECK(!server_runner.error);
@@ -3369,6 +3381,8 @@ static int RunCases(int argc, char** argv)
             RingAppendFaultSharedOut();
         } else if (test == "co_read_append_fault_nonempty_out") {
             CoReadAppendFaultNonEmptyOut();
+        } else if (test == "buffer_copy_consume_fault") {
+            BufferCopyConsumeFault();
         } else if (test == "co_read_idle_no_spin") {
             CoReadIdleNoSpin();
         } else if (test == "staged_close_tail") {

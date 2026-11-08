@@ -38,7 +38,7 @@ std::error_code RequireCoroutineContext();
 std::error_code WaitStatusError(bbt::coroutine::WaitStatus status);
 
 // 拨号私有 test 屏障的存储引用：Engine::CoDial 在提交后、领取 attach 前调用。
-// 定义在 CoConnection.cc；CoTestAccess::SetDialBarrier 是唯一写入者。
+// 定义在 CoInternal.cc；CoTestAccess::SetDialBarrier 是唯一写入者。
 // 返回的 function 正常为空（无屏障）。
 std::function<void()>& DialBarrierForTest();
 

@@ -3687,7 +3687,7 @@ std::error_code Engine::CoWaitAccepted(Connection& out, const bbt::coroutine::Wa
 {
     auto impl = m_impl;
     // 配置与生命周期错误立即返回，不等一个永远不会来的 listener。
-    // 判定优先级是契约（见 CoConnection.hpp）：终态先于配置/布局判定。Stopped 时
+    // 判定优先级是契约（见 Engine.hpp 的 Co 成员入口）：终态先于配置/布局判定。Stopped 时
     // main accept owner 已解绑，但那是收口带来的结果，不能据此把 Engine 判成
     // client-only（否则把"已结束"误报成"这类 Engine 不支持 accept"）。
     {

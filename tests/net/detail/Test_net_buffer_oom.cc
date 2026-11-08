@@ -1,24 +1,4 @@
-// infra-ico-conn 独立审查 6 个 Buffer/ring/Engine confirmed defect 的修复后
-// 契约断言（原「缺陷存在」断言已在修复后翻转）。
-//
-// 每个 case 对应审查报告（final-review-report.md）一条缺陷的修复方向，
-// 断言以「修复后契约成立」为真：
-// d1_read_post_pop_oom_no_loss 段元数据在 pop 事务内完成，
-// Read 不再做 post-pop 分配；注入任何序号都不会丢已提交字节。
-// d2_grant_pop_append_oom_no_throw TryAppend 的 OOM 折成
-// Error+not_enough_memory 返回而非抛出——SubmitReceivedOwner 的
-// m_recv_hold 登记分支可达，owner recv 字节不丢。
-// d3_sso_payload_not_copied pending/detached 保持可整体
-// 转移的堆 backing（SSO 内联缓冲在移交前已转出），段指针不落在
-// 目标 string 对象内联区间——移交不复制载荷。
-// d4_copy_assign_deleted 2a Buffer 拷贝构造/赋值已删除，
-// OOM 悬空段形态不可达。
-// d5_public_ctor_forge_denied 2b backing+segments 构造已收回
-// private——外部不可构造伪造 owning 不变量的 Buffer。
-// d6_coaccept_reclaim_valid_ticket CoAccept 交付的 reclaim 与连接
-// IsReleased 同一真源：成功时 reclaim 有效且未释放。
-//
-// 线程约定同 pop_all.cc：不用 sleep_for 依赖时序；等待一律有界轮询/yield。
+// 分配失败契约：复制读取不丢字节，追加失败不提交，预留容量可复用。
 #define BOOST_TEST_NO_MAIN
 #define BOOST_TEST_ALTERNATIVE_INIT_API
 #include <boost/test/included/unit_test.hpp>
@@ -173,176 +153,151 @@ bbt::coroutine::WaitOptions Until(std::chrono::milliseconds duration)
     return {std::chrono::steady_clock::now() + duration};
 }
 
-// 由 TryPopAll 结果按 CoTcpConnection::Read 相同方式构造 Buffer（复刻 Read
-// 的移交步骤，用于 d4/d5 的 Buffer 形态断言）。
-Buffer Convert(ReceiveRing::PopAllResult& popped)
-{
-    std::vector<BufferSegment> segments = std::move(popped.takeout->segments);
-    return BufferTestAccess::Make(std::move(popped.takeout), std::move(segments));
-}
-
 } // namespace
 
 BOOST_AUTO_TEST_SUITE(net_buffer_oom)
 
-// ---- （修复后契约）：Read 不做 post-pop 分配 ----
-// 注入逐序号扫描：TryPopAll 内部的可失败步骤仍允许出现（它们先于首个变更
-// 步骤，失败零消费可重试），但 Read 侧不再有第 4 次分配——任何序号下
-// bad_alloc 都不会逃出 Read，已提交字节不会随异常丢失。
-BOOST_AUTO_TEST_CASE(read_post_pop_oom_no_loss)
+// 逐序号注入覆盖快照与输出分配；失败保留已有输出、全部接收字节和重试能力。
+BOOST_AUTO_TEST_CASE(read_copy_oom_no_loss)
 {
     StartRuntime(1);
-    // 修复后断言：任何注入序号下 Read 要么成功交付、要么 Error+not_enough_memory
-    // 且零消费可重试；绝不抛出且绝不丢已提交字节。
     bool saw_error = false;
     bool saw_data = false;
+    const std::string prefix(512, 'P');
+    const std::string payload(64, 'X');
     for (int index = 1; index <= 6; ++index) {
         auto state = std::make_shared<ConnectionState>(1, 256, 1024, 4, nullptr);
-        BOOST_REQUIRE(state->ring.TryAppend(std::string(64, 'X')).status == ReadStatus::Ok);
-        state->ring.MarkEof(); // 交尽后重试应得 Eof——丢字节可观测
+        BOOST_REQUIRE(state->ring.TryAppend(payload).status == ReadStatus::Ok);
+        state->ring.MarkEof();
         CoTcpConnection conn(ConnectionTestAccess::Make(state));
-        std::atomic<int> threw{-1};
-        std::atomic<int> first_state{-1};
-        std::atomic<std::size_t> first_bytes{0};
-        std::atomic<int> retry_state{-1};
-        std::atomic<std::size_t> retry_bytes{0};
-        std::atomic<int> used_after{-1};
+        std::error_code first_error;
+        std::error_code retry_error;
+        std::string first_data;
+        std::string retry_data;
+        std::size_t used_after = 0;
+        bool threw = false;
         auto task = Task([&, index] {
-            Buffer outcome_data;
-            std::error_code outcome_error;
-            bool threw_local = false;
+            Buffer out;
+            out.WriteBytes(prefix);
             Arm(index);
             try {
-                outcome_error = conn.Read(outcome_data, Until(2000ms));
+                first_error = conn.Read(out, Until(2000ms));
             } catch (const std::bad_alloc&) {
-                threw_local = true;
+                threw = true;
             }
             Disarm();
-            threw.store(threw_local ? 1 : 0);
-            first_state.store(outcome_error.value());
-            first_bytes.store(outcome_data.Size());
-            used_after.store(static_cast<int>(state->ring.Size()));
-            auto [retry_data, retry_error] = conn.Read(Until(2000ms));
-            retry_state.store(retry_error.value());
-            retry_bytes.store(retry_data.Size());
+            first_data = out.CopyTo();
+            used_after = state->ring.Size();
+            auto retry = conn.Read(Until(2000ms));
+            retry_error = std::get<1>(retry);
+            retry_data = std::get<0>(retry).CopyTo();
         });
         BOOST_REQUIRE(task.wait_for(10s) == std::future_status::ready);
         task.get();
-        BOOST_TEST_MESSAGE("read_fail_at=" << index << " threw=" << threw.load() << " state=" << first_state.load()
-                                           << " bytes=" << first_bytes.load() << " used_after=" << used_after.load()
-                                           << " retry_state=" << retry_state.load()
-                                           << " retry_bytes=" << retry_bytes.load());
-        // 修复后契约：bad_alloc 不逃出 Read（post-pop 分配已消失，pop 内部
-        // 分配失败被 TryPopAll 折成 Error+ENOMEM）。
-        BOOST_CHECK_EQUAL(threw.load(), 0);
-        if (first_state.load() == 0) {
-            // 成功交付：字节完整取回。
+        BOOST_TEST_MESSAGE("read_fail_at=" << index << " threw=" << threw << " error=" << first_error.value()
+                                           << " used_after=" << used_after);
+        BOOST_CHECK(!threw);
+        if (!first_error) {
             saw_data = true;
-            BOOST_CHECK_EQUAL(first_bytes.load(), 64);
-            BOOST_CHECK_EQUAL(used_after.load(), 0);
+            BOOST_CHECK_EQUAL(first_data, prefix + payload);
+            BOOST_CHECK_EQUAL(used_after, 0);
+            BOOST_CHECK(retry_error == make_error_code(NetErrc::Eof));
+            BOOST_CHECK(retry_data.empty());
         } else {
-            // 失败路径：状态是 Error+ENOMEM 且零消费（ring 字节仍在），
-            // 重试取回全部 64 字节——失败零消费不变量成立。
             saw_error = true;
-            BOOST_CHECK(first_state.load() == std::make_error_code(std::errc::not_enough_memory).value());
-            BOOST_CHECK_EQUAL(used_after.load(), 64);
-            BOOST_CHECK(retry_state.load() == 0);
-            BOOST_CHECK_EQUAL(retry_bytes.load(), 64);
+            BOOST_CHECK(first_error == std::make_error_code(std::errc::not_enough_memory));
+            BOOST_CHECK_EQUAL(first_data, prefix);
+            BOOST_CHECK_EQUAL(used_after, payload.size());
+            BOOST_CHECK(!retry_error);
+            BOOST_CHECK_EQUAL(retry_data, payload);
         }
     }
-    // 扫描覆盖必须同时见到两类结果：成功交付与零消费失败——证明注入窗口
-    // 仍然存在（pop 内部分配）但不再能吞掉已提交字节。
-    BOOST_TEST_MESSAGE("d1 saw_data=" << saw_data << " saw_error=" << saw_error);
     BOOST_CHECK(saw_data);
     BOOST_CHECK(saw_error);
 }
 
-// ---- （修复后契约）：grant→pop→append OOM 返回错误而非抛出 ----
-// TryAppend 在「grant 后 pop 移走 backing」交错下需要重新分配；分配失败
-// 折成 Error+not_enough_memory 返回值，SubmitReceivedOwner 的 m_recv_hold
-// 登记分支可达，owner 已 recv 字节不再随异常丢失。
-BOOST_AUTO_TEST_CASE(grant_pop_append_oom_no_throw)
+// 复制消费不再移走 ring backing；预留仍可复用，但真正扩容的 OOM 仍须返回错误。
+BOOST_AUTO_TEST_CASE(grant_copy_append_oom_no_throw)
 {
-    ReceiveRing ring(256);
+    ReceiveRing ring(4096);
     BOOST_REQUIRE(ring.TryAppend("old").status == ReadStatus::Ok);
-    const auto grant = ring.TryReserveForAppend(64);
-    BOOST_REQUIRE(grant.status == ReadStatus::Ok);
-    BOOST_REQUIRE(grant.granted == 64);
-    // 并发读侧在 owner recv 完成、SubmitReceivedOwner 之前 pop 走全部存储。
-    auto popped = ring.TryPopAll();
-    BOOST_REQUIRE(popped.status == ReadStatus::Ok);
-    // ring 存储已移交：下次 append 必须重新分配。注入分配失败。
-    bool threw = false;
-    ReadResult appended;
+    BOOST_REQUIRE(ring.TryReserveForAppend(64).status == ReadStatus::Ok);
+    Buffer out;
+    BOOST_REQUIRE(ring.TryCopyConsume(out).status == ReadStatus::Ok);
+    const std::string payload(2048, 'R');
     Arm(1);
-    try {
-        appended = ring.TryAppend("recv-bytes");
-    } catch (const std::bad_alloc&) {
-        threw = true;
-    }
+    const auto appended = ring.TryAppend(payload);
     Disarm();
-    BOOST_TEST_MESSAGE("d2 grant_then_pop capacity_after_pop=0 append_threw="
-                       << threw << " appended_status=" << static_cast<int>(appended.status) << " appended_error="
-                       << appended.error.value() << " used_after=" << ring.Size() << " " << AllocTrace());
-    // 修复后契约：OOM 不抛出，以 Error+not_enough_memory 返回；
-    // SubmitReceivedOwner 据此登记 m_recv_hold，字节不丢（ring 未接纳）。
-    BOOST_CHECK(!threw);
-    BOOST_CHECK(appended.status == ReadStatus::WouldBlock || appended.status == ReadStatus::Error);
-    BOOST_CHECK(appended.error);
+    BOOST_TEST_MESSAGE("append OOM " << AllocTrace());
+    BOOST_CHECK(appended.status == ReadStatus::WouldBlock);
+    BOOST_CHECK(appended.error == std::make_error_code(std::errc::not_enough_memory));
+    BOOST_CHECK_EQUAL(appended.bytes, 0);
     BOOST_CHECK_EQUAL(ring.Size(), 0);
-    // 正对照：同一交错下不注入失败时 append 成功。
-    ReceiveRing ring2(256);
-    BOOST_REQUIRE(ring2.TryAppend("old").status == ReadStatus::Ok);
-    BOOST_REQUIRE(ring2.TryReserveForAppend(64).status == ReadStatus::Ok);
-    BOOST_REQUIRE(ring2.TryPopAll().status == ReadStatus::Ok);
-    const auto ok_append = ring2.TryAppend("recv-bytes");
-    BOOST_CHECK(ok_append.status == ReadStatus::Ok);
-    BOOST_CHECK_EQUAL(ok_append.error.value(), 0);
+    BOOST_CHECK_EQUAL(out.CopyTo(), "old");
+    BOOST_REQUIRE(ring.TryAppend(payload).status == ReadStatus::Ok);
+    Buffer retry;
+    BOOST_REQUIRE(ring.TryCopyConsume(retry).status == ReadStatus::Ok);
+    BOOST_CHECK_EQUAL(retry.CopyTo(), payload);
 }
 
-// ---- （修复后契约）：pending/detached 移交不复制载荷 ----
-// 短载荷仍可在移交后保持「段指针不落在 takeout string 对象内联区间」——
-// pending/detached 在移交前已确保持有堆 backing，move 即指针移交。
-BOOST_AUTO_TEST_CASE(sso_payload_not_copied)
+// 不强迫短串转堆；真正追加扩容失败时，原 pending/detached 数据和计数不变。
+BOOST_AUTO_TEST_CASE(staging_append_failure_keeps_bytes)
 {
-    auto ring = std::make_unique<ReceiveRing>(256);
-    BOOST_REQUIRE(ring->AppendDeferred("P"));
-    auto popped = ring->TryPopAll();
-    BOOST_REQUIRE(popped.status == ReadStatus::Ok);
-    BOOST_REQUIRE_EQUAL(popped.takeout->pending, "P");
-    // 移交后段指针不再落在 takeout->pending 对象的 SSO 内联区间：
-    // 短载荷也拥有独立堆 backing，移交不复制。
-    const auto* seg_ptr = reinterpret_cast<const unsigned char*>(popped.takeout->segments.front().data);
-    const auto* pending_obj = reinterpret_cast<const unsigned char*>(&popped.takeout->pending);
-    const bool seg_inside_object = seg_ptr >= pending_obj && seg_ptr < pending_obj + sizeof(popped.takeout->pending);
-    BOOST_TEST_MESSAGE("d3 sso seg_inside_takeout_object=" << seg_inside_object
-                                                           << " pending_size=" << popped.takeout->pending.size()
-                                                           << " pending_data_is_heap=" << (seg_ptr != nullptr));
-    BOOST_CHECK(!seg_inside_object);
-    BOOST_CHECK_EQUAL(popped.takeout->segments.front().size, 1);
-    BOOST_CHECK_EQUAL(*popped.takeout->segments.front().data, 'P');
-
-    // detached 同样：短尾部也走堆 backing。
-    auto ring_d = std::make_unique<ReceiveRing>(256);
-    BOOST_REQUIRE(ring_d->StageDetached("D"));
-    auto popped_d = ring_d->TryPopAll();
-    BOOST_REQUIRE(popped_d.status == ReadStatus::Ok);
-    BOOST_REQUIRE_EQUAL(popped_d.takeout->detached, "D");
-    const auto* dseg = reinterpret_cast<const unsigned char*>(popped_d.takeout->segments.front().data);
-    const auto* dobj = reinterpret_cast<const unsigned char*>(&popped_d.takeout->detached);
-    const bool dseg_inline = dseg >= dobj && dseg < dobj + sizeof(popped_d.takeout->detached);
-    BOOST_CHECK(!dseg_inline);
-
-    // 对照：长载荷（>SSO）依然真移动，指针同址。
-    auto big = std::make_unique<ReceiveRing>(4096);
     const std::string payload(2048, 'Q');
-    BOOST_REQUIRE(big->AppendDeferred(payload));
-    auto big_pop = big->TryPopAll();
-    BOOST_REQUIRE(big_pop.status == ReadStatus::Ok);
-    const auto* big_seg = reinterpret_cast<const unsigned char*>(big_pop.takeout->segments.front().data);
-    const auto* big_obj = reinterpret_cast<const unsigned char*>(&big_pop.takeout->pending);
-    const bool big_inline = big_seg >= big_obj && big_seg < big_obj + sizeof(big_pop.takeout->pending);
-    BOOST_CHECK(!big_inline);
+    for (bool detached : {false, true}) {
+        ReceiveRing ring(4096);
+        const auto append = [&](std::string_view bytes) {
+            return detached ? ring.StageDetached(bytes) : ring.AppendDeferred(bytes);
+        };
+        BOOST_REQUIRE(append("old"));
+        const auto pending_before = ring.PendingSize();
+        Arm(1);
+        const bool accepted = append(payload);
+        Disarm();
+        BOOST_CHECK(!accepted);
+        BOOST_CHECK_EQUAL(ring.Size(), 3);
+        BOOST_CHECK_EQUAL(ring.PendingSize(), pending_before);
+        BOOST_REQUIRE(append(payload));
+        Buffer out;
+        BOOST_REQUIRE(ring.TryCopyConsume(out).status == ReadStatus::Ok);
+        BOOST_CHECK_EQUAL(out.CopyTo(), "old" + payload);
+        BOOST_CHECK_EQUAL(ring.Size(), 0);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(staging_reserved_capacity_reused)
+{
+    const std::string payload(64, 'S');
+    for (bool detached : {false, true}) {
+        ReceiveRing ring(256);
+        if (detached) {
+            ring.ReserveDetached(payload.size());
+        } else {
+            ring.ReserveDeferred(payload.size());
+        }
+        for (int round = 0; round < 2; ++round) {
+            Arm(1);
+            const bool accepted = detached ? ring.StageDetached(payload) : ring.AppendDeferred(payload);
+            Disarm();
+            BOOST_REQUIRE(accepted);
+            BOOST_CHECK_EQUAL(g_calls, 0);
+            Buffer out;
+            BOOST_REQUIRE(ring.TryCopyConsume(out).status == ReadStatus::Ok);
+            BOOST_CHECK_EQUAL(out.CopyTo(), payload);
+        }
+    }
+    ReceiveRing ring(256);
+    BOOST_REQUIRE(ring.TryReserveForAppend(64).status == ReadStatus::Ok);
+    for (int round = 0; round < 2; ++round) {
+        Arm(1);
+        const auto appended = ring.TryAppend(payload);
+        Disarm();
+        BOOST_REQUIRE(appended.status == ReadStatus::Ok);
+        BOOST_CHECK_EQUAL(g_calls, 0);
+        Buffer out;
+        BOOST_REQUIRE(ring.TryCopyConsume(out).status == ReadStatus::Ok);
+        BOOST_CHECK_EQUAL(out.CopyTo(), payload);
+    }
 }
 
 // ---- （修复后契约）：Buffer 拷贝已删除，OOM 悬空段形态不可达 ----
@@ -355,9 +310,8 @@ BOOST_AUTO_TEST_CASE(copy_assign_deleted)
     // 移动语义仍可用：move 后来源为空、目标持有全部段。
     ReceiveRing one(256);
     BOOST_REQUIRE(one.TryAppend(std::string(64, 'A')).status == ReadStatus::Ok);
-    auto p1 = one.TryPopAll();
-    BOOST_REQUIRE(p1.status == ReadStatus::Ok);
-    Buffer dest = Convert(p1);
+    Buffer dest;
+    BOOST_REQUIRE(one.TryCopyConsume(dest).status == ReadStatus::Ok);
     Buffer moved = std::move(dest);
     BOOST_CHECK_EQUAL(moved.Size(), 64);
     BOOST_CHECK(dest.Segments().empty());
@@ -374,7 +328,7 @@ BOOST_AUTO_TEST_CASE(public_ctor_forge_denied)
 {
     static_assert(!std::is_constructible_v<Buffer, std::shared_ptr<void>, std::vector<BufferSegment>>,
                   "修复后契约：公共构造已收回，owning 不变量不可伪造");
-    // 内部接缝仍可构造（等价于 Read 移交路径）：BufferTestAccess::Make。
+    // 内部接缝仍可构造任意分段输入；不代表 Read 的复制路径。
     char backing_byte = 'B';
     auto backing = std::make_shared<char>(backing_byte);
     const char* seg_ptr = backing.get();

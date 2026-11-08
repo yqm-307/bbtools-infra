@@ -8,8 +8,7 @@
 #   bbt::infra_net            始终
 #   bbt::infra_redis_net      BBT_INFRA_REDIS_NET（需 BBT_HIREDIS_PREFIX）
 #   bbt::infra_http_net       BBT_INFRA_HTTP_NET
-#   bbt::infra_rpc_net        BBT_INFRA_RPC_NET（需 BBT_INFRA_HTTP_NET +
-#                             BBT_PROTOBUF_PREFIX）
+#   bbt::infra_rpc_net        BBT_INFRA_RPC_NET（需 BBT_PROTOBUF_PREFIX）
 
 include("${CMAKE_CURRENT_LIST_DIR}/NetBase.cmake")
 # 先确定测试开关：include(CTest) 定义 BUILD_TESTING。示例自身的 CTest 注册依赖它，

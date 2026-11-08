@@ -1,11 +1,3 @@
-add_executable(rpc_net_example main.cc)
-target_link_libraries(rpc_net_example PRIVATE bbt::infra_rpc_net)
-target_compile_options(rpc_net_example PRIVATE -Wall -Wextra -Wpedantic)
-if(BUILD_TESTING)
-    add_test(NAME example_rpc_net_consumer COMMAND rpc_net_example)
-    set_tests_properties(example_rpc_net_consumer PROPERTIES TIMEOUT 30 LABELS "integration")
-endif()
-
 # v2 AppSession 双进程 consumer：server 子进程绑定动态端口经 stdout 管道传
 # PORT 行，client 子进程拨号 + Call/Send 验证一条双向 TCP link。
 # session_consumer.py 是 CTest 前台受管父进程（对齐 tests/net +

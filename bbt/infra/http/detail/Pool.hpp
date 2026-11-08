@@ -206,5 +206,3 @@ private:
 
 } // namespace detail
 } // namespace bbt::infra::http
-
-#include <bbt/infra/http/detail/impl/PoolImpl.hpp>

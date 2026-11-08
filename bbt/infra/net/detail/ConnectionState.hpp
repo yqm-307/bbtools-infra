@@ -4,7 +4,7 @@
 // 记账（复用 OutboundQueue 的 FIFO/部分发送）+ 持久状态 + Co 等待订阅。
 //
 // 责任划分：
-//   - 任意线程：AcceptWrite（全量/零接纳）、TryRead/ReadAccess、状态查询、
+//   - 任意线程：AcceptWrite（全量/零接纳）、TryRead/View、状态查询、
 //     RequestClose。
 //   - owner 线程：PumpWrites 推真实发送、AttributeSent 归属前缀、FailCurrent
 //     结算、DrainTerminal 兑现 OnWrite 终态。
@@ -193,4 +193,4 @@ private:
 
 } // namespace bbt::infra::net
 
-#include <bbt/infra/net/detail/impl/ConnectionStateImpl.hpp>
+#include <bbt/infra/net/detail/__TConnectionState.hpp>

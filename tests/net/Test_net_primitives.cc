@@ -165,32 +165,31 @@ static void TestRingWrapAndGrowth()
     CHECK(growing.Size() == 1000);
     CheckRingMatchesModel(growing, grown_model);
 
-    // fix1 回归：真实跨越 1024→2048→4096→8192 的增长，且每次增长前先
-    // 绕环/partial，增长后逐字节对参考模型。
+    // 分块增长与部分消费交错；容量由 Boost 管理，逐字节核对 FIFO 和总界。
     {
         EventRingBuffer cross(8192);
         std::string model;
         CHECK(cross.Capacity() == 0); // 构造不预分配
         CHECK(!cross.Append(std::string(900, 'a')));
         model += std::string(900, 'a');
-        CHECK(cross.Capacity() == 1024); // 初始 1024
-        CHECK(!cross.Discard(800));      // head=800，绕环前置
+        CHECK(cross.Capacity() >= cross.Size() && cross.Capacity() <= cross.MaxBytes());
+        CHECK(!cross.Discard(800)); // head=800，绕环前置
         model.erase(0, 800);
-        CHECK(!cross.Append(std::string(700, 'b'))); // 跨绕环写，仍 1024
+        CHECK(!cross.Append(std::string(700, 'b'))); // 消费后再追加，跨存储块保序
         model += std::string(700, 'b');
-        CHECK(cross.Capacity() == 1024);
+        CHECK(cross.Capacity() >= cross.Size() && cross.Capacity() <= cross.MaxBytes());
         CheckRingMatchesModel(cross, model);
-        CHECK(!cross.Append(std::string(400, 'c'))); // 1200 → 增长 2048
+        CHECK(!cross.Append(std::string(400, 'c'))); // 可读字节增长到 1200
         model += std::string(400, 'c');
-        CHECK(cross.Capacity() == 2048);
+        CHECK(cross.Capacity() >= cross.Size() && cross.Capacity() <= cross.MaxBytes());
         CheckRingMatchesModel(cross, model);
-        CHECK(!cross.Append(std::string(1000, 'd'))); // 2200 → 增长 4096
+        CHECK(!cross.Append(std::string(1000, 'd'))); // 可读字节增长到 2200
         model += std::string(1000, 'd');
-        CHECK(cross.Capacity() == 4096);
+        CHECK(cross.Capacity() >= cross.Size() && cross.Capacity() <= cross.MaxBytes());
         CheckRingMatchesModel(cross, model);
-        CHECK(!cross.Append(std::string(2000, 'e'))); // 4200 → 增长 8192
+        CHECK(!cross.Append(std::string(2000, 'e'))); // 可读字节增长到 4200
         model += std::string(2000, 'e');
-        CHECK(cross.Capacity() == 8192);
+        CHECK(cross.Capacity() >= cross.Size() && cross.Capacity() <= cross.MaxBytes());
         CheckRingMatchesModel(cross, model);
         CHECK(!cross.Append(std::string(3992, 'f'))); // 到达 max
         model += std::string(3992, 'f');
@@ -198,11 +197,11 @@ static void TestRingWrapAndGrowth()
         CHECK(IsNoBufferSpace(cross.Append("g")));
         CheckRingMatchesModel(cross, model);
     }
-    // 非 2 次幂上限：2048 装不下时封顶到 3000（不落到 4096）。
+    // 非 2 次幂上限也不能越界，分配策略不绑定具体增长倍数。
     {
         EventRingBuffer capped(3000);
         CHECK(!capped.Append(std::string(2500, 'q')));
-        CHECK(capped.Capacity() == 3000);
+        CHECK(capped.Capacity() >= 2500 && capped.Capacity() <= 3000);
         CHECK(capped.Size() == 2500);
         CHECK(IsNoBufferSpace(capped.Append(std::string(501, 'r'))));
         CHECK(!capped.Append(std::string(500, 'r')));
@@ -218,13 +217,13 @@ static void TestRingAliasAppend()
     CHECK(!small.Append(small.Peek()));
     CheckRingMatchesModel(small, "abcdefabcdef");
 
-    // 真实增长：原1024存储被替换，输入必须先拥有独立副本。
+    // 追加自身视图触发分块增长，原可读地址仍须有效。
     EventRingBuffer growing(4096);
     const std::string payload(700, 'x');
     CHECK(!growing.Append(payload));
-    CHECK(growing.Capacity() == 1024);
+    CHECK(growing.Capacity() >= growing.Size() && growing.Capacity() <= growing.MaxBytes());
     CHECK(!growing.Append(growing.Peek()));
-    CHECK(growing.Capacity() == 2048);
+    CHECK(growing.Capacity() >= growing.Size() && growing.Capacity() <= growing.MaxBytes());
     CheckRingMatchesModel(growing, payload + payload);
 
     // 绕环后首段及子串，两次追加均保持逻辑顺序。

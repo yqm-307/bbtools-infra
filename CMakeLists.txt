@@ -26,8 +26,7 @@ else()
     set(_bbt_http_default ON)
 endif()
 option(BBT_INFRA_HTTP_NET "构建基于 net 的 HTTP 客户端与服务端" ${_bbt_http_default})
-option(BBT_INFRA_RPC_NET "构建消费新 HTTP 的 RPC core（wire + Client/Server）及其依赖闭包" OFF)
-option(BBT_INFRA_RPC_TCP "构建长度前缀 TCP 的 RPC adapter（bbt::infra_rpc_tcp）；依赖 net 基础，不需要第三方前缀" OFF)
+option(BBT_INFRA_RPC_NET "构建双向 TCP RPC 会话及其依赖闭包" OFF)
 option(BBT_INFRA_MCP "构建 MCP server 核心与 stdio（bbt::infra_mcp_core / bbt::infra_mcp_stdio）；核心不需要第三方前缀" OFF)
 option(BBT_INFRA_CONSUL "构建 Consul agent HTTP adapter（bbt::infra_consul）；需 BBT_INFRA_HTTP_NET 同开" OFF)
 option(BBT_INFRA_MCP_HTTP "构建 MCP Streamable HTTP transport（bbt::infra_mcp_http）；需 BBT_INFRA_MCP 与 BBT_INFRA_HTTP_NET 同开" OFF)
@@ -57,8 +56,8 @@ option(BBT_INFRA_MONGO "构建 Mongo 模块（需显式 driver 前缀）" ${_bbt
 if(BBT_INFRA_NETWORK_ONLY AND (BBT_INFRA_CONFIG OR BBT_INFRA_MONGO))
     message(FATAL_ERROR "NETWORK_ONLY 与 CONFIG/MONGO=ON 冲突；请关闭非网络模块")
 endif()
-if(BBT_INFRA_NETWORK_ONLY AND (BBT_INFRA_RPC_TCP OR BBT_INFRA_MCP OR BBT_INFRA_MCP_HTTP OR BBT_INFRA_MCP_SCHEMA))
-    message(FATAL_ERROR "NETWORK_ONLY 不接入 RPC TCP / MCP，请关闭这些开关")
+if(BBT_INFRA_NETWORK_ONLY AND (BBT_INFRA_MCP OR BBT_INFRA_MCP_HTTP OR BBT_INFRA_MCP_SCHEMA))
+    message(FATAL_ERROR "NETWORK_ONLY 不接入 MCP，请关闭这些开关")
 endif()
 include(cmake/Common.cmake)
 
@@ -157,7 +156,7 @@ add_subdirectory(bbt/infra)
 
 # CTest 必须先于模块，保证模块测试实际注册。
 include(CTest)
-if(BBT_INFRA_NET OR BBT_INFRA_REDIS_NET OR BBT_INFRA_HTTP_NET OR BBT_INFRA_RPC_NET OR BBT_INFRA_RPC_TCP)
+if(BBT_INFRA_NET OR BBT_INFRA_REDIS_NET OR BBT_INFRA_HTTP_NET OR BBT_INFRA_RPC_NET)
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/NetBase.cmake")
     if(BUILD_TESTING)
         add_subdirectory(tests/net)
@@ -174,9 +173,6 @@ if(BBT_INFRA_RPC_NET)
 endif()
 if(BBT_INFRA_CONSUL)
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/Consul.cmake")
-endif()
-if(BBT_INFRA_RPC_TCP)
-    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/RpcTcp.cmake")
 endif()
 # MCP schema 前缀门禁先于 MCP 核心接入（核心 add_subdirectory 时需已知 schema 开关）。
 if(BBT_INFRA_MCP_SCHEMA)
@@ -214,7 +210,7 @@ set(BBT_INFRA_PUBLIC_HEADERS
     config/MemorySource.hpp
     config/FileSource.hpp
     config/Watch.hpp
-    rpc/RpcPayload.hpp)
+    rpc/codec/PositionalCodec.hpp)
 
 set(_selfcheck_dir "${CMAKE_CURRENT_BINARY_DIR}/header_selfcheck")
 file(MAKE_DIRECTORY "${_selfcheck_dir}")

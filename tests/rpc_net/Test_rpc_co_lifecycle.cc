@@ -1,4 +1,6 @@
 // RPC Co 门禁、关闭回调及会话 wire 失效边界；不启动网络线程。
+// V2 单一会话面：Client 由 Engine + ClientOptions 装配，Server 由
+// Engine + 同一 Client owner + admission handler 装配。
 #define BOOST_TEST_MODULE rpc.co_lifecycle
 #include <boost/test/included/unit_test.hpp>
 
@@ -12,10 +14,11 @@
 #include <bbt/coroutine/coroutine.hpp>
 #include <bbt/coroutine/object/CoObject.hpp>
 #include <bbt/infra/net/Engine.hpp>
-#include <bbt/infra/rpc/Client.hpp>
-#include <bbt/infra/rpc/Codec.hpp>
+#include <bbt/infra/rpc/Admission.hpp>
+#include <bbt/infra/rpc/CoRpcClient.hpp>
 #include <bbt/infra/rpc/Options.hpp>
-#include <bbt/infra/rpc/Server.hpp>
+#include <bbt/infra/rpc/CoRpcServer.hpp>
+#include <bbt/infra/rpc/SessionCodec.hpp>
 
 namespace rpc = bbt::infra::rpc;
 namespace co = bbt::coroutine;
@@ -56,84 +59,20 @@ template <class T> void ExpectCode(const result<T>& value, ErrorCode code)
 {
     BOOST_CHECK(!value && value.error().code == code);
 }
-
-class Transport final : public rpc::IRpcTransport {
-public:
-    std::atomic<int> exchanges{0};
-    std::atomic<int> closed_callbacks{0};
-    std::atomic_bool closed{false};
-    bbt_co_async(result<rpc::WireReply>)
-        Exchange(const bbt::infra::RpcAddress&, rpc::WireRequest, const bbt::infra::CallOptions&) override
-    {
-        ++exchanges;
-        return result<rpc::WireReply>::err(
-            bbt::infra::MakeError(ErrorCode::Unavailable, "test transport must not be called"));
-    }
-    void Close() noexcept override
-    {
-        if (!closed.exchange(true))
-            ++closed_callbacks;
-    }
-    bool IsClosed() const noexcept override
-    {
-        return closed.load();
-    }
-};
-
-class Inbound final : public rpc::IRpcInboundTransport {
-public:
-    int closes = 0;
-    result<void> Start(rpc::WireInboundHandler) override
-    {
-        return result<void>::ok();
-    }
-    void StopAccepting() noexcept override
-    {
-    }
-    result<void> Drain(co::Deadline) override
-    {
-        return result<void>::ok();
-    }
-    void Close() noexcept override
-    {
-        ++closes;
-    }
-    result<void> WaitStopped(co::Deadline) override
-    {
-        return result<void>::ok();
-    }
-    bool IsClosed() const noexcept override
-    {
-        return closes != 0;
-    }
-};
 }
 
 BOOST_FIXTURE_TEST_SUITE(co_lifecycle, Runtime)
 
-BOOST_AUTO_TEST_CASE(non_co_legacy_call_rejected_even_when_closed)
-{
-    auto transport = std::make_shared<Transport>();
-    auto created = rpc::Client::Create(transport);
-    BOOST_REQUIRE(created);
-    auto client = std::move(created).value();
-    client->Close();
-    const bbt::infra::RpcAddress invalid{};
-    const bbt::infra::CallOptions expired{};
-    // P1-11：非协程线程——bbt_co_await 的前置协程上下文检查在被测 API
-    // 执行前抛 std::logic_error（既定协议），被测产品方法根本不会执行，
-    // 因此这里不能断言 product result gate，只验证 await 前置异常协议。
-    BOOST_CHECK_THROW((void)(bbt_co_await client->Call(invalid, {}, expired)), std::logic_error);
-    BOOST_CHECK_EQUAL(transport->exchanges.load(), 0);
-    BOOST_CHECK_EQUAL(transport->closed_callbacks.load(), 1);
-}
-
+// 非协程线程调用 Call/Send：bbt_co_await 前置协程上下文检查先于被测 API
+// 执行（既定协议），被测产品方法根本不执行、不产生 pending 工作；封口后
+// 同一入口仍只给出 await 前置异常。合并自旧 non_co_legacy_call_* 与
+// non_co_session_* 两条断言（旧 transport 已被删除，无 seam 可断言）。
 BOOST_AUTO_TEST_CASE(non_co_session_call_send_do_not_create_pending_work)
 {
     auto engine = bbt::infra::net::Engine::Create(nullptr);
     rpc::ClientOptions options;
     options.SetLocalIdentity("gate-test").SetTrustedNetworkPlaintext(true);
-    auto created = rpc::Client::Create(engine, options);
+    auto created = rpc::CoRpcClient::Create(engine, options);
     BOOST_REQUIRE(created);
     auto client = std::move(created).value();
     for (int closed = 0; closed != 2; ++closed) {
@@ -151,7 +90,7 @@ BOOST_AUTO_TEST_CASE(non_co_session_call_send_do_not_create_pending_work)
         BOOST_CHECK_EQUAL(stats.actor.inflight, 0U);
         BOOST_CHECK_EQUAL(engine->CountConnections(), 0U);
         BOOST_CHECK(engine->Phase() == bbt::infra::net::EnginePhase::Idle);
-        client->Close();
+        client->Shutdown();
     }
     OnCo([&] {
         rpc::Request request("echo", "call");
@@ -162,40 +101,60 @@ BOOST_AUTO_TEST_CASE(non_co_session_call_send_do_not_create_pending_work)
     });
 }
 
+// 统一关闭入口（Shutdown）幂等、IsClosed 只读、Co 对象观测不延长 Server
+// 寿命（弱引用与 created/destroyed 台账收口）。旧 inbound transport 的 close
+// 计数随该接口删除，收口凭据改为 Co 对象台账与弱引用。
 BOOST_AUTO_TEST_CASE(close_callback_once_and_observation_does_not_retain_server)
 {
-    const auto before = co::GetCoObjectStats("infra.rpc.Server");
-    auto inbound = std::make_shared<Inbound>();
-    auto created = rpc::Server::Create(inbound, [](bbt::infra::IncomingCallContext, bbt::infra::RpcEnvelope request) {
-        return result<bbt::infra::RpcEnvelope>::ok(std::move(request));
-    });
+    const auto before = co::GetCoObjectStats("infra.rpc.CoRpcServer");
+    auto engine = bbt::infra::net::Engine::Create(nullptr);
+    rpc::ClientOptions client_options;
+    client_options.SetLocalIdentity("close-observer").SetTrustedNetworkPlaintext(true);
+    auto made_client = rpc::CoRpcClient::Create(engine, client_options);
+    BOOST_REQUIRE(made_client);
+    auto client = std::move(made_client).value();
+
+    rpc::ServerOptions server_options;
+    std::error_code address_error;
+    server_options.SetListenAddress(bbt::infra::net::Address::Ip("127.0.0.1", 0, address_error));
+    BOOST_REQUIRE(!address_error);
+    rpc::AdmissionHandler handler = [](rpc::AdmissionItem&& item) {
+        (void)item;
+        return result<void>::err(bbt::infra::MakeError(ErrorCode::Unavailable, "not started"));
+    };
+    auto created = rpc::CoRpcServer::Create(engine, client, std::move(handler), server_options);
     BOOST_REQUIRE(created);
     auto server = std::move(created).value();
-    std::weak_ptr<rpc::Server> weak = server;
+    std::weak_ptr<rpc::CoRpcServer> weak = server;
     const auto identity = server->GetObjectInfo();
     BOOST_CHECK(identity.id != 0);
     BOOST_REQUIRE(co::GetCoObjectManager()->GetObjectInfo(identity.id));
-    server->Close();
-    server->Close();
+    server->Shutdown();
+    server->Shutdown();
     BOOST_CHECK(server->IsClosed());
-    BOOST_CHECK_EQUAL(inbound->closes, 1);
-    BOOST_CHECK_EQUAL(co::GetCoObjectStats("infra.rpc.Server").alive, before.alive + 1);
+    BOOST_CHECK_EQUAL(co::GetCoObjectStats("infra.rpc.CoRpcServer").alive, before.alive + 1);
     server.reset();
     BOOST_CHECK(weak.expired());
     BOOST_CHECK(!co::GetCoObjectManager()->GetObjectInfo(identity.id));
-    BOOST_CHECK_EQUAL(inbound->closes, 1);
-    const auto after = co::GetCoObjectStats("infra.rpc.Server");
+    const auto after = co::GetCoObjectStats("infra.rpc.CoRpcServer");
     BOOST_CHECK_EQUAL(after.alive, before.alive);
     BOOST_CHECK_EQUAL(after.created_total, before.created_total + 1);
     BOOST_CHECK_EQUAL(after.destroyed_total, before.destroyed_total + 1);
 }
 
+// Create 失败不得提交 Co 对象观测：V2 以 engine/handler 缺失与空 identity
+// 为拒绝面（旧 IRpcTransport 空 seam 已随接口删除）。
 BOOST_AUTO_TEST_CASE(failed_create_has_no_committed_observation)
 {
-    const auto before = co::GetCoObjectStats("infra.rpc.Client");
-    std::shared_ptr<rpc::IRpcTransport> missing;
-    ExpectCode(rpc::Client::Create(missing), ErrorCode::InvalidArgument);
-    const auto after = co::GetCoObjectStats("infra.rpc.Client");
+    const auto before = co::GetCoObjectStats("infra.rpc.CoRpcClient");
+    rpc::ClientOptions options;
+    options.SetLocalIdentity("create-gate").SetTrustedNetworkPlaintext(true);
+    ExpectCode(rpc::CoRpcClient::Create(nullptr, options), ErrorCode::InvalidArgument);
+    rpc::ClientOptions empty_identity;
+    empty_identity.SetTrustedNetworkPlaintext(true);
+    ExpectCode(rpc::CoRpcClient::Create(bbt::infra::net::Engine::Create(nullptr), empty_identity),
+               ErrorCode::InvalidArgument);
+    const auto after = co::GetCoObjectStats("infra.rpc.CoRpcClient");
     BOOST_CHECK_EQUAL(after.created_total, before.created_total);
     BOOST_CHECK_EQUAL(after.destroyed_total, before.destroyed_total);
     BOOST_CHECK_EQUAL(after.alive, before.alive);

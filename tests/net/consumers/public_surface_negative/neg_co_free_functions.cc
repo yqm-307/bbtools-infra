@@ -1,5 +1,4 @@
 // expect-error: CoRead
-#include <bbt/infra/net/CoConnection.hpp>
 #include <bbt/infra/net/CoTcpConnection.hpp>
 #include <bbt/infra/net/Connection.hpp>
 #include <bbt/infra/net/Engine.hpp>

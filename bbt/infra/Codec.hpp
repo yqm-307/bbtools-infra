@@ -4,6 +4,9 @@
  * Codec<T> 主模板只声明、不提供实现：业务在公开的业务协议头中给出显式特化，并且必须在
  * binder/call 实例化之前可见；不使用 ADL，也不使用动态注册表。
  * SchemaId 返回静态寿命、非空、显式版本化的稳定 ID。
+ *
+ * 本模板与 RPC session wire 编解码（bbt/infra/rpc/SessionCodec.hpp）无继承或
+ * 转发关系；通用值层不反向依赖 RPC。
  */
 #pragma once
 
@@ -52,5 +55,3 @@ public:
 };
 
 } // namespace bbt::infra
-
-#include <bbt/infra/impl/CodecImpl.hpp>

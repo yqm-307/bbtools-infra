@@ -26,6 +26,17 @@
 
 代码统一按模块组织在 `bbt/infra/<module>/`，公共头与实现并置，由公开 target 导出仓根 include 路径；模块私有头放 `detail/`。公共值类型保留在 `bbt/infra/`；config/Mongo 关闭支撑各自在模块 `detail/`，内部观测在 `bbt/infra/debug/`。构建支持在 `cmake/`，测试/示例/决策分别在 `tests/`、`examples/`、`docs/decisions/`。只有实现需要才建目录；公开/内部头及模块边界必须从构建目标核验，不能只靠命名。
 
+### 公共 API 重构审查
+
+公共接口重构先按调用者的最小真实用法画出依赖和生命周期，再决定类名、目录和抽象层。审查至少回答以下问题：
+
+- 哪些头是稳定用户入口，哪些只是协议、传输、会话或测试实现；公共目录下的文件不能仅凭路径被当成公开 API，内部头应放入 `detail/` 并从公开 target 中隔离。
+- 名称是否表达调用者的角色和动作；`Request`/`Response` 用于请求与回复，`Envelope` 只保留给确有 wire framing 语义的对象，Mailbox/调度/业务上下文是否错误地下沉到了 infra。
+- Server 是否只承担它拥有的监听和注册职责，Client 是否只承担调用职责；停止、排空、等待执行和业务回收是否被错误地塞进底层公共 API。
+- 上层是否只依赖 Channel 或等价的稳定通信抽象，而不需要知道 TCP、HTTP、连接池或长连接的具体实现；异步回调的对象寿命、关闭和取消责任是否明确写在契约中。
+
+RPC 的现行面见 [ADR 0022](../decisions/0022-rpc-single-protocol.md)（V2 会话唯一消费面，已落地）与 [RPC net 文档](rpc-net.md)：V1 wire、旧 adapter 与 `Channel` 目标抽象已按该记录删除/取代。文档不得再用目标接口描述现状。
+
 关闭语义按各模块契约判断，不统一改写为同步或异步。新 Redis 的逻辑封口、owner 回收和宿主最终排空见 [Redis net 文档](redis-net.md#关闭与宿主收尾)；旧同步资源不能直接接入新的非阻塞 Close。失败建连的返回也不自动证明资源已释放。
 
 ## 依赖接入与上游依据

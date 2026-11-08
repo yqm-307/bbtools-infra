@@ -1,15 +1,11 @@
 #pragma once
-// RPC TCP adapter 模块内部共享助手（bbt/infra/rpc 实现 TU 专用，非公开头）：
-// u32be 帧编解码、numeric-ip:port endpoint 解析、底层 error_code →
-// Error 的共享结算（A5 NetToError 基础分类 + adapter 阶段事实）。
-// TcpTransport.cc 是唯一消费者；不进入公开头面。
+// 双向 RPC 会话内部 TCP 助手，不进入公开头面。
+// 数值地址解析与写终态错误结算由会话握手、writer 和调用路径共用。
 
-#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <system_error>
 #include <utility>
-#include <vector>
 
 #include <bbt/infra/NetError.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
@@ -20,27 +16,6 @@
 
 namespace bbt::infra::rpc {
 namespace detail {
-
-inline constexpr std::size_t kTcpFramePrefixBytes = 4;
-
-// --- u32be 帧前缀 ---------------------------------------------------------------
-
-// 写路径长度边界（分配/拼接前）：payload==0 或超过 frame 上限拒绝。
-// 上限本身在 Create 已校验 (0, kNetworkLimitsMaxBodyBytes]。
-inline bool TcpFrameSizeValid(std::size_t payload_bytes, std::size_t max_frame_bytes) noexcept
-{
-    return payload_bytes > 0 && payload_bytes <= max_frame_bytes;
-}
-
-void TcpFrameWritePrefix(char out[kTcpFramePrefixBytes], std::uint32_t payload_bytes) noexcept;
-
-inline std::uint32_t TcpFrameReadPrefix(const char in[kTcpFramePrefixBytes]) noexcept
-{
-    return (static_cast<std::uint32_t>(static_cast<unsigned char>(in[0])) << 24)
-           | (static_cast<std::uint32_t>(static_cast<unsigned char>(in[1])) << 16)
-           | (static_cast<std::uint32_t>(static_cast<unsigned char>(in[2])) << 8)
-           | (static_cast<std::uint32_t>(static_cast<unsigned char>(in[3])));
-}
 
 // --- endpoint：numeric-ip:port（IPv6 bracketed），无 DNS ---------------------------
 
@@ -59,9 +34,6 @@ result<void> ParseTcpEndpoint(const std::string& endpoint, std::string& out_host
 // Cancelled（调用方主动放弃是确定判决），但 request_phase 事实始终结算。
 Error TcpCallError(std::error_code cause, const char* message, bool committed);
 
-// 完整帧字节已到达但对帧边界/长度是确定判决：ProtocolError 携带阶段事实。
-Error TcpProtocolError(const std::string& message, bool committed);
-
 // 写报告结算（ICoConnection::Write 三元组 → Error）：
 //   - wait_error 非空 + Rejected/无 operation = 零提交，确定失败；
 //   - InFlight（已接纳未终态）= 不能认定零发送 → OutcomeUnknown
@@ -69,10 +41,6 @@ Error TcpProtocolError(const std::string& message, bool committed);
 //   - Done+error / wait_error = 写路径失败（未全量 committed）；
 //   - Done 且无错 = 成功（committed 由调用方推进阶段）。
 result<void> TcpSettleWrite(const net::WriteReport& report, const char* message);
-
-// 从任意分片的字节流缓冲中消费恰好 need 字节到 out；不够返回 false
-// （pending 不动——调用方继续读）。帧体大小已在上层校验。
-bool TcpTake(std::string& pending, std::size_t need, std::vector<std::uint8_t>& out);
 
 } // namespace detail
 } // namespace bbt::infra::rpc

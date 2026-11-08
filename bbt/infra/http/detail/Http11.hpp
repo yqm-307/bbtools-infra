@@ -93,4 +93,4 @@ private:
 } // namespace detail
 } // namespace bbt::infra::http
 
-#include <bbt/infra/http/detail/impl/Http11Impl.hpp>
+#include <bbt/infra/http/detail/__THttp11.hpp>

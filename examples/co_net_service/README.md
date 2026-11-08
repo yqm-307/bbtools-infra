@@ -41,7 +41,7 @@ runtime 资源回收证据。
 
 > 示例源码只 include 公共头、只链接 `bbt::infra_net`。公共 API 收口已由
 > PR 合入（新增
-> `Types.hpp`/`ReadAccess.hpp`/`ICoConnection.hpp`/`CoTcpConnection.hpp`，删除
+> `Types.hpp`/`ReadView.hpp`/`ICoConnection.hpp`/`CoTcpConnection.hpp`，删除
 > `Connection::State()`、公开 `WaitConnect`/`WaitAccepted`/`AsyncConnectAwaitable`
 > 与 `CoRead`/`CoWrite`/`CoAccept`/`CoDial` 自由函数）；符号与迁移清单见
 > [决策 0010](../../docs/decisions/0010-gnet-network-foundation.md) 与

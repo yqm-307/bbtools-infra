@@ -1,181 +1,93 @@
-# RPC core：新 HTTP 栈上的 Client/Server（`bbt::infra_rpc_net`）
+# RPC core 指南（bbt::infra_rpc_net）
 
-> 状态：**已合入 main（PR #103，提交 `9dd4313`）**，现役 workflow 已接线；远端 CI 结论以 PR 与 main 的 workflow run 为准。本切片在 HTTP PR 基线
-> （`feat/httpx-style-client` 2e92660）上把 RPC 运行时迁移到
-> `bbt::infra::http::Client/Server`，删除旧 `RpcClient`/`RpcServer` 兼容壳。
-> 本文描述当前实现与边界，不是冻结契约；接口以
-> `bbt/infra/rpc/Client.hpp`、`Server.hpp`、`RpcWire.hpp` 为准。
+> 状态：**现行公共面（已落地）**。公共入口是 `bbt/infra/rpc/CoRpcClient.hpp` 与 `bbt/infra/rpc/CoRpcServer.hpp`，不保留旧路径转发头。分层、状态归属与线上格式见 [RPC 分层现状](../architecture/rpc-layered-protocol.md)。
 
-## 定位与复用
+## 职责
 
-- RPC core 只做四件事：版本化 Protobuf envelope 编解码、endpoint 局部边界检查、
-  请求/回复五字段关联校验、deadline local-min 预算换算。网络、连接池、阶段
-  超时、协议安全与资源配额全部归公开 `http::Client`/`http::Server` owner。
-- **wire profile 与 payload 复用不改**：`proto/bbt/infra/rpc/v1/rpc_envelope.proto`
-  字节规则逐位不变（POST `/rpc`、`application/x-protobuf`、`remaining_budget_ms`
-  1..24h、metadata 前缀白名单）；位置参数 payload codec 仍是
-  `bbt/infra/rpc/RpcPayload.hpp`（header-only，framework 消费面不变）。
-- 变化点只有一处：`RpcWire` 的 HTTP body 绑定从旧 `bbt::infra::HttpRequest/
-  HttpResponse` 改绑新 `http::IncomingRequest`/`http::Response`
-  （`ParseRpcWireHttpRequest` / `ParseRpcWireHttpResponse` /
-  `MakeRpcWireHttpResponse`）。旧 `MakeRpcWireHttpRequest`（旧 HTTP 类型）随之删除；
-  出站请求由 `rpc::Client` 经 `http::Client::BuildRequest` 合并共享 transport
-  默认配置后 `Send` 发出。
+- 提供 `tcp://` 长连接上的 Call/Send、单 FIFO 入站接纳、请求/回复关联、deadline 预算与会话 owner 生命周期。
+- 不负责业务路由、授权策略、业务 payload 语义、服务发现、DNS/TLS、重试与逐 peer 观测。
+- 只装配不联网：Engine 由应用 `Run` / `RequestClose`；`Close` 与 `Shutdown` 都不关闭共享 Engine。
 
-## 公共面
+## 公共接口
 
 ```cpp
-// bbt/infra/rpc/Client.hpp（namespace bbt::infra::rpc）
-static result<std::shared_ptr<Client>> Create(std::shared_ptr<http::Client> transport);
-bbt_co_async(result<RpcEnvelope>) Call(const RpcAddress& address,
-                                       RpcEnvelope request,
-                                       const CallOptions& options);
-void Close(Reason);             // 发布首个原因 + 转发 http::Client（幂等、不可重开）
-bool IsClosed() const noexcept; // 转发 http::Client
-std::optional<Error> CloseReason() const noexcept;
-result<void> Shutdown(bbt::coroutine::Deadline);  // 封口 + 等已接纳调用归还
+// bbt/infra/rpc/CoRpcClient.hpp
+static result<std::shared_ptr<CoRpcClient>> Create(std::shared_ptr<net::Engine> engine, ClientOptions options);
+bbt_co_async(result<Response>) Call(std::string_view target, Request request, const CallOptions& options);
+bbt_co_async(result<void>)     Send(std::string_view target, Request message, const SendOptions& options);
+bbt_co_async(result<void>)     Close(CloseFlag flag = CloseFlag::Immediate, std::int64_t timeout_ms = 0, Error reason = {});
+void Shutdown(Error reason = {}) noexcept;
 
-// bbt/infra/rpc/Server.hpp
-static result<std::shared_ptr<Server>> Create(std::shared_ptr<net::Engine> engine,
-                                              RpcHandler handler,
-                                              http::ServerOptions options = {});
-result<void> Start();                       // Engine Running 且有监听后，一次性
-void StopAccepting() noexcept;              // 只封新接纳，已授权 handler+回复继续
-result<void> Shutdown(bbt::coroutine::Deadline); // 单入口封口 + 排空（native 宿主）
-void Close(Reason);                         // 立即强制封口 + 发布原因（在途回复明确放弃）
-std::optional<Error> CloseReason() const noexcept;
-result<void> Drain(bbt::coroutine::Deadline);       // 两段工具：须先 StopAccepting
-result<void> WaitStopped(bbt::coroutine::Deadline); // listener 停 + callback 销毁 + 连接 Released
-bool IsClosed() const noexcept;             // Close 已调用（Shutdown 封口不算）
+// bbt/infra/rpc/CoRpcServer.hpp
+static result<std::shared_ptr<CoRpcServer>> Create(std::shared_ptr<net::Engine> engine,
+                                                   std::shared_ptr<CoRpcClient> session_owner,
+                                                   AdmissionHandler admission_handler, ServerOptions options);
+result<void> RegisterRpc(std::string rpc_name, RpcHandler handler);                        // 可选
+result<void> RegisterRpc(std::string rpc_name, RpcHandler handler, RouteOptions options);  // 只接 Required
+result<void> Start();                                                                      // Engine Running 且 scheduler 已启动
+bbt_co_async(result<void>) Close(CloseFlag flag = CloseFlag::Immediate, std::int64_t timeout_ms = 0, Error reason = {});
+void Shutdown(Error reason = {}) noexcept;
 ```
 
-生命周期语义完全沿用 HTTP（`Open → Draining → Closed`）：`Shutdown(deadline)` 置
-Draining 拒新，再等已接纳调用真实归还；有限期限超时 `TimedOut` 且保持拒新，
-等待中被 Close 且仍有在途返回其关闭原因，先排空先胜返回 ok；重复调用仍
-Draining 且有在途返回 `Overloaded`（Busy），已 Closed 返回首个原因。立即语义
-用 `Close(reason)`：不等待业务 handler，令在途回复明确放弃，「失败在途」
-恰好执行一次且与 Shutdown 不共用关闭位。物理收口另用
-`Close()` + `WaitStopped(deadline)`（`Shutdown` 成功不冒充连接已 `Released`）。
-Engine 由应用装配、Run 并最终 `RequestClose` 收口。监听地址经共享 Engine 的
-`LocalAddresses()` 查询，不在 RPC 面重复暴露 Stats/LocalAddress。
+其余查询接口（`IsClosed`、`CloseReason`、`Stats`、`LocalAddress`、`UnregisterRpc`、`Hooks` 等）见头文件。
 
-v2 会话 owner（`rpc::Client::Create(engine, ClientOptions)`）的
-`Shutdown(deadline)` 用 owner 自身「已接纳 Call/Send」（active_ops）计数等待真实归还，
-不依赖连接物理 Released；`Close(reason)` 立即封口并令在途调用以
-`OutcomeUnknown` + `request_phase` 结算，不谎报未执行。仅提供 envelope
-`Exchange` 的外来 transport（如独立 TCP adapter）未实现排空谓词时，
-`Client::Shutdown` 如实返回 `UnsupportedRoute`（能力边界，不伪装成功）；
-inbound adapter 的默认 `Shutdown` 是 `StopAccepting()` + `Drain()`。
+## 调用约定
 
-## 会话回复构造
-
-会话 admission 交付的 Request 可直接生成关联完整的回复：
+- `target` 只接受 `tcp://<numeric-ip>:<port>`（IPv6 用方括号）。无 DNS，不接受 scheme 之外的路径、查询或主机名。
+- `Call` 要求 `Request::Reply() == Required`，且 `Traffic` 为 Service/Actor；`Send` 要求 `Reply() == None`。
+- `request_id` 或 `message_id` 为空时由 session 生成。
+- 同 session 同 `ordering_key` 且 `sequence != 0` 的入站帧必须连续递增（首帧即台账基值）；重复、逆序或缺口按 `ProtocolError` 退役该 link。出站方保证同 key 按序入队。
+- 入站 `AdmissionHandler` 不得挂起，也不得运行业务。业务在协程中完成后回写回复，`Complete` 等到真实写终态：
 
 ```cpp
-auto response = rpc::Response::FromRequest(item.request);
+auto response = rpc::Response::FromRequest(item.request);  // 只复制关联字段
 response.SetPayload(item.request.Payload());
-// 在受管协程中提交，并等待实际写终态。
 auto completed = bbt_co_await item.reply->Complete(std::move(response));
 ```
 
-`FromRequest` 返回独立值，只复制 `RequestId`、`Service`、`Method`、`RequestSchema`、`ResponseSchema`；payload 与 metadata 初始为空，由业务显式设置。不保留请求、上下文、会话或 socket，不改变默认/payload 构造和既有 setter；字符串复制可能分配，不承诺 `noexcept`。稳定取舍见 [ADR 0017](../decisions/0017-rpc-response-from-request.md)。
+改错关联字段仍会被判 `ProtocolError`，`FromRequest` 不能用来绕过校验（见 [ADR 0017](../decisions/0017-rpc-response-from-request.md)）。
 
-值层只负责初始化，`ReplyCompletion` 继续校验五字段并承担回复提交边界；创建后改错关联字段仍返回 `ProtocolError`，不能用此入口绕过校验或代替写终态。`rpc.net.response_from_request` 验证值独立性；`rpc.net.v2s_reply_corr_mismatch` 验证误改后的真实错误回程。
+- payload 是不透明字节。需要位置参数编码时，直接包含 `bbt/infra/rpc/codec/PositionalCodec.hpp`。
+- 错误语义：
+  - 输入非法 → `InvalidArgument`；
+  - deadline 已过期 → `TimedOut`，不发请求；
+  - 传输、排队、取消错误原样透传（`TransportError` / `Overloaded` / `Closed` / `Cancelled`）；
+  - 请求已提交后失联或超时 → `OutcomeUnknown`，`Error.request_phase` 保留阶段事实。
+- RPC 不重发、不升级、不降级。
 
-会话发送队列以 `out_mu` 保护的 lane `bytes_queued` 作为容量与统计的同一真源。
-Enqueue 成功才接纳写责任；Dequeue 和关闭丢弃共用取出队列项的记账入口。
-Dequeue 后责任交给唯一 writer，Kill 只结算仍排队的条目；两条路径最终都由
-`NoteWriteSettled` 发布回复写终态并归还写责任。等待取消或超时不代替底层写结算。
-pending 关联表独立保留请求语义：写成功不等于收到可信回复，已提交后失联仍为
-`OutcomeUnknown` / `RequestCommitted`。`rpc.net.write_terminal_once` 用真实 TCP 和
-写前受控检查点验证 writer 持有项与排队项同时关闭、等待唤醒及资源收口。
+## 关闭
 
-## 错误与关联契约
+- 协程域使用 `Close(CloseFlag, timeout_ms, reason)`，三态为 `Immediate`、`Timeout`、`Graceful`。
+- 负 `timeout_ms` 只允许 `Close(Graceful, -1)`（无限等待）；其余负值返回 `InvalidArgument`。
+- `CoRpcServer::Create` 的 `engine` 必须与 `session_owner` 的 CoRpcClient 装配同一 `net::Engine` 实例。
+- 宿主 native 控制线程使用同步 `Shutdown(reason)`；协程 `Close` 不在该执行域内使用。
+- 三态的等待边界与结果见 [RPC 分层现状 §5](../architecture/rpc-layered-protocol.md)。
+- 等待只覆盖 RPC 自身责任，不承诺业务 handler 的优雅结束。物理回收以 Engine 收口为证。
 
-- **固定 profile 收敛**：共享 http transport 的默认配置（base_url/headers/
-  params/超时）经 `BuildRequest` 正常合并，但线上 wire 目标始终收敛为精确
-  `/rpc`、`Content-Type` 恰好一个 `application/x-protobuf`；其余默认头
-  （如授权头）不清除。`Send` 仍执行 `ValidatePrepared`，不一致显式拒绝；
-  `BuildRequest` 因非法配置失败则原样透传。
-- **调用输入**：`transport != "http"`、空 endpoint、endpoint 带
-  scheme/path/query/fragment/userinfo/控制字符 → `InvalidArgument`；deadline
-  已过期/未设置 → 确定 `TimedOut`（不发请求）；envelope 校验失败
-  （空 service/method/request_id、budget 0/越界、metadata 违规）→
-  `InvalidArgument`/`ProtocolError`。
-- **HTTP 状态**：非 200 → `Unavailable`，`backend_category="http"`、
-  `backend_code=状态码`；4xx/5xx 是有效 Response，不是传输异常。
-- **关联**：回复的 `request_id/service/method/request_schema/response_schema`
-  必须与请求同值，不一致 → `ProtocolError`（服务端 handler 改关联字段同样以
-  `ProtocolError` 错误信封返回，关联字段保留请求值）。
-- **透传不改写**：传输/排队/取消/未知结果错误原样透传 http::Client 错误——
-  建连失败 `TransportError`、排队满 `Overloaded`、封口 `Closed`、协程取消
-  `Cancelled`；请求字节完整写出后对端失联/读超时按 `OutcomeUnknown`
-  （`Error.request_phase=RequestCommitted`）交付，RPC 不重发、不升级、不降级。
-- **畸形报文**：服务端对非 POST、错 path（仅接受精确 `/rpc`）、错 Content-Type、
-  空 body、坏 protobuf 字节一律回 **200 + 错误信封**（解析失败时关联字段用
-  `unparsed`/`unknown` 占位），不 crash、不断言成功；客户端对错误形状
-  （非 200、错 Content-Type、空 body、坏字节）返回对应
-  `InvalidArgument`/`ProtocolError`，其中回复侧 Content-Type 缺失/不符按
-  malformed/mismatched content type 归 `ProtocolError`（§5.2）。
-- **deadline local-min**：服务端 handler 期限 =
-  `min(本请求期限, now + remaining_budget_ms)`；handler 返回时预算已尽 →
-  `TimedOut` 错误信封（不把超预算当成功）。
-
-## 构建与验证
+## 构建与配置
 
 ```bash
-# network-only 闭包：BBT_INFRA_RPC_NET 需要 BBT_INFRA_HTTP_NET 与锁定 protobuf
-cmake -S <infra 工作树> -B <私有 build 目录> \
-    -DBBT_INFRA_HTTP_NET=ON -DBBT_INFRA_RPC_NET=ON -DBUILD_TESTING=ON \
-    -DBBT_COROUTINE_SOURCE_DIR=<bbtools-coroutine 精确 pin 检出> \
-    -DBBT_PROTOBUF_PREFIX=<锁定 protobuf 3.21.12 前缀> \
-    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-cmake --build <build> --parallel 2 --target \
-    bbt_infra_rpc_net_header_selfcheck Test_rpc_net_wire Test_rpc_net_roundtrip \
-    Test_rpc_net_faults Test_rpc_net_lifetime rpc_net_example
-ctest --test-dir <build> -j1 -R '^rpc\.net\.' --output-on-failure
+flock /tmp/bbt-build.lock cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+  -DBBT_COROUTINE_SOURCE_DIR=<coroutine 源码目录> -DBBT_PROTOBUF_PREFIX=<protobuf 3.21.12 前缀> \
+  -DBBT_INFRA_RPC_NET=ON -DBUILD_TESTING=ON
+flock /tmp/bbt-build.lock cmake --build build --parallel 2 \
+  --target bbt_infra_rpc_net_header_selfcheck Test_rpc_v2_wire Test_rpc_v2_session Test_rpc_co_lifecycle rpc_v2_session_example
+ctest --test-dir build -j1 --output-on-failure -R '^rpc\.net\.'
 ```
 
-- 目标：`bbt::infra_rpc_net`（alias，STATIC：`RpcWire.cc`/`Client.cc`/`Server.cc`）；
-  公开头自检 `bbt_infra_rpc_net_header_selfcheck`；示例 `rpc_net_example`
-  （CTest 名 `example_rpc_net_consumer`）。
-- 依赖：`bbt::infra_http_net`（PUBLIC）+ `bbt_infra_rpc_proto`（PRIVATE，
-  protoc/runtime 同源 3.21.12 锁定与 SHA256/pkg-config 核验集中在
-  `cmake/RpcNet.cmake`，是 network-only 闭包内 protobuf 锁定的唯一真源）。
-  只链接 `bbt::infra_http_net` 的消费者不拉入 protobuf。
-- 开关：`BBT_INFRA_RPC_NET=ON` 且缺 `BBT_INFRA_HTTP_NET` 或缺
-  `BBT_PROTOBUF_PREFIX` → configure 直接 `FATAL_ERROR`（不静默跳过、不假成功）。
-- RPC 只通过本模块公开入口消费，wire 生成与依赖由 `BBT_INFRA_RPC_NET` 显式开启。
+- `BBT_INFRA_RPC_NET=ON` 时，`cmake/RpcNet.cmake` 要求显式 `BBT_PROTOBUF_PREFIX`。protoc 与 runtime 必须是锁定的 3.21.12，来源与 SHA256 核验见 `docs/dependencies/protobuf-3.21.12.provenance.md`。
+- RPC 不要求 `BBT_INFRA_HTTP_NET`，`rpc_net` 不链接 HTTP 栈。
+- 自检目标：`bbt_infra_rpc_net_header_selfcheck` 验证公开头可独立编译；`bbt_infra_rpc_public_header_leak_check` 要求 core 头不拉入 HTTP/net 物理栈或 protobuf。
 
-## 测试覆盖（`tests/rpc_net/`，CTest `rpc.net.*`）
+## 测试入口
 
-- `Test_rpc_net_wire`：profile 编解码往返（含 Error 分支字段与
-  `Error.request_phase` 全阶段往返）、值层拒绝（budget/metadata/outcome/
-  关联字段/非法阶段值）、畸形字节与 HTTP 绑定形状拒绝；缺 `request_phase`
-  字段解码回 `nullopt`（旧 peer 兼容），UNSPECIFIED/未识别值按
-  `ProtocolError` 拒绝；远端阶段只透传为远端事实，本地提交程度仍由本地
-  传输错误路径携带（不改写）。
-- `Test_rpc_net_roundtrip`：真实双端（双 Engine、真实 loopback TCP）成功回程、
-  位置参数 payload 编解码、metadata 透传、并发关联不串线、local-min 预算、
-  同连接复用（handler 计数 + 池 idle/budget）。
-- `Test_rpc_net_faults`：输入边界、连接拒绝 `TransportError`、HTTP 503 →
-  `Unavailable(503)`、错 Content-Type/垃圾 body/关联劫持/错误信封透传、
-  零字节断连 → `OutcomeUnknown`+`RequestCommitted`、协程取消 → `Cancelled`、
-  服务端畸形请求错误信封（raw POSIX 对端）。
-- `Test_rpc_net_lifetime`：client Close 幂等/拒绝/共享 owner、server
-  `StopAccepting→Drain→Close→WaitStopped` 收口凭据、停止授权下在途 handler
-  完成并真实送达、`Close` 丢弃在途回复（客户端非成功终态）、`IsClosed`、
-  HTTP inbound 无引用环（Close+释放后 weak\<Engine\> expired）、在途
-  handler 期间析构 Server（wire handler 共享计数保活、不悬空）。
+- 测试位于 `tests/rpc_net/`，CTest 名为 `rpc.net.*`。
+- 必选清单为 `scripts/ci/required_rpc_http_net.txt`（文件名沿用历史，内容是 `rpc.net.*` 注册名）。
+- 覆盖范围与最近一次运行结果见 [RPC 分层现状 §6](../architecture/rpc-layered-protocol.md)。
 
-## 边界与未覆盖
+## 边界
 
-- RPC/HTTP 定向门禁已接入现役 workflow：Release/Debug 的独立新闭包构建并执行 `rpc.net.*` 与 `http.net.*`，注册集与 JUnit 实跑集必须一致且零跳过；HTTP-only 闭包继续验证不引入 protobuf，缺少锁定 protobuf 前缀时 RPC configure 必须拒绝。远端 CI 结论以 main 的 workflow run 为准。
-- https/DNS/主机名、json/form、流式、重定向、HTTP/2、自动重试——均继承
-  `bbt::infra::http` 的未实现边界，本模块不暗示。
-- 双进程（跨进程）round-trip、framework Service/Actor 耦合、跨机器与压力
-  验证不在本切片；消费切换由 framework owner 另行授权。
-- 本轮顺带修复 `bbt/infra/http/detail/Http11.cc` 一个可达缺陷：对端未发送任何
-  响应字节即断开时，旧代码对空 parser 调 `put_eof` 触发 Beast 断言 abort；
-  现按「请求已提交、回复丢失」直接交付 `OutcomeUnknown`。`http.net.*` 31 项
-  回归全绿。
+- 无 DNS、TLS、代理、重定向、自动重试；`target` 只接受数值 IP。
+- 逐 peer/epoch 观测缺口见 [ADR 0014](../decisions/0014-app-session.md)；`Stats()` 只是 owner 汇总，不是完整 AppSession 监控。
+- 跨机器、压力与故障注入不在本模块门禁内。framework 真实服务调用与跨语言闭环见 bbt-framework 验证集。

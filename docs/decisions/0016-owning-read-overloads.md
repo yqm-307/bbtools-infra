@@ -21,4 +21,6 @@ Buffer 独占已交付载荷，与连接状态和 socket 寿命解耦。持有 B
 
 本决定取代 0010、0012 中 ReadOutcome/ReadState 的读取结果承诺。旧 ADR 正文保留，仅追加此取代关系。现有 HTTP/RPC/Redis 读取、直接测试和示例迁移到四重载。
 
-Connection::TryRead(std::string&)、TryAccess 和 ReadAccess 暂时保留：它们仍有 raw 回调、守卫竞争测试及冻结消费门禁。四重载签名授权不等于所有既有 raw 消费者及仓外消费者退役授权。因此本轮达到 owning 读取结果统一，尚未达到全部读取面简化。仓外仅列出只读影响，不在本仓迁移中代写；新增重载使无显式目标类型的方法取址需要消歧。
+本段记录当时的迁移边界：`Connection::TryRead(std::string&)`、`TryAccess` 和 `ReadAccess` 当时暂时保留。该边界随后由 0019 取代；当前公共面不再包含 `TryAccess`/`ReadAccess`，`Read`/`TryRead(Buffer&)` 复制消费，`View` 只读借用。
+
+本读取交付约定已由 [0019：读取面收敛为 Read 与只读 View](0019-read-view.md) 取代。

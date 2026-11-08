@@ -24,7 +24,7 @@ namespace bbt::infra::net {
  * sent 为该操作实际交给内核的字节数，即真实前缀。error 为该操作的真实错误，无错误表示本地完成。
  */
 struct WriteResult {
-    std::uint64_t operation{0}; ///< 写操作身份，与 AsyncWrite 返回的票对应
+    std::uint64_t operation{0}; ///< owner 分配的写操作身份，用于终态诊断；AsyncWrite 不返回票据
     std::size_t sent{0};        ///< 实际交给内核的字节前缀
     std::error_code error;      ///< 该操作的真实错误；空表示本地完成
 };

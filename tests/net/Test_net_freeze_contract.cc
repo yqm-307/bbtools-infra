@@ -23,7 +23,7 @@
 #include <bbt/infra/net/ICoConnection.hpp>
 #include <bbt/infra/net/NativeSocket.hpp>
 #include <bbt/infra/net/RawHandler.hpp>
-#include <bbt/infra/net/ReadAccess.hpp>
+
 #include <bbt/infra/net/Types.hpp>
 #include <bbt/infra/net/detail/CoInternal.hpp>
 #include <bbt/infra/net/detail/ConnectionState.hpp>
@@ -242,115 +242,6 @@ static NativeSocket ConnectClient(const Address& address)
 }
 
 struct NullHandler : RawHandler {};
-
-//
-// guard_lifetime
-//
-static void GuardLifetime()
-{
-    // 1) 保活：只在内部 state 上建立守卫，随后销毁唯一 Connection，守卫仍可读。
-    auto state = std::make_shared<ConnectionState>(1, 4096, 1024, 4, nullptr);
-    CHECK(state->ring.TryAppend("abcdef").status == ReadStatus::Ok);
-    Connection connection = ConnectionTestAccess::Make(state);
-    auto guard = connection.TryAccess();
-    CHECK(bool(guard));
-    CHECK(guard.Size() == 6);
-    connection = Connection();     // 释放唯一句柄：守卫必须保活数据
-    CHECK(state.use_count() == 2); // 局部 state + 守卫（唯一业务引用已释放）
-    CHECK(guard.Peek() == "abcdef");
-    std::string copied;
-    CHECK(!guard.CopyAll(copied)); // 不消费
-    CHECK(copied == "abcdef");
-    CHECK(guard.Size() == 6);
-    CHECK(!guard.Consume(6));
-    CHECK(guard.Size() == 0);
-
-    // 2) 关闭后尾部仍可读：先入队尾部（需先释放上段保护），再发布 MarkClosed，
-    // 然后由新守卫消费；空守卫在已关闭连接上应报 Eof 而不是 WouldBlock。
-    ConnectionTestAccess::Reset(guard); // 释放上段保护，否则 TryAppend 会 Busy
-    CHECK(state->ring.TryAppend("tail").status == ReadStatus::Ok);
-    state->MarkClosed(std::make_error_code(std::errc::operation_canceled));
-    {
-        // 原句柄已清空：空句柄的 TryAccess 只能是 WouldBlock，不得伪装 Eof。
-        auto empty_handle_guard = connection.TryAccess();
-        CHECK(empty_handle_guard.WouldBlock() && !empty_handle_guard.Eof());
-        CHECK(empty_handle_guard.Size() == 0);
-        // 关闭后的尾部属于 state 真源：新句柄经守卫仍能取走，之后才是 Eof。
-        Connection rebuilt = ConnectionTestAccess::Make(state);
-        auto closed_guard = rebuilt.TryAccess();
-        CHECK(bool(closed_guard));
-        copied.clear();
-        CHECK(!closed_guard.CopyAll(copied));
-        CHECK(copied == "tail");
-        CHECK(!closed_guard.ConsumeInto(copied));
-        CHECK(copied == "tailtail");
-        ConnectionTestAccess::Reset(closed_guard);
-        auto after_tail = rebuilt.TryAccess();
-        CHECK(!after_tail && after_tail.Eof());
-        CHECK(after_tail.Size() == 0);
-    }
-
-    // 3) 析构安全：已释放的守卫再访问必须安全（不重复解锁、不触碰 state）。
-    CHECK(!guard);
-    CHECK(guard.Size() == 0);
-    CHECK(guard.Peek().empty());
-    CHECK(guard.Consume(1) == std::make_error_code(std::errc::operation_not_permitted));
-    CHECK(state.use_count() == 1);
-
-    // 4) 移动构造：锁与通知责任转移，源变为空守卫；释放只推进一次代次。
-    {
-        auto move_state = std::make_shared<ConnectionState>(2, 4096, 1024, 4, nullptr);
-        CHECK(move_state->ring.TryAppend("mv").status == ReadStatus::Ok);
-        Connection owner = ConnectionTestAccess::Make(move_state);
-        auto source = owner.TryAccess();
-        CHECK(bool(source));
-        const auto before = move_state->ring.AccessGeneration();
-        ReadAccess moved(std::move(source));
-        CHECK(!source); // 源不再持锁/不再有通知责任
-        CHECK(source.Size() == 0);
-        CHECK(bool(moved) && moved.Size() == 2);
-        CHECK(move_state->ring.AccessGeneration() == before); // 移动不释放保护
-        ReadAccess sink;
-        sink = std::move(moved); // 移动赋值：先释放旧（空）守卫
-        CHECK(!moved);
-        CHECK(bool(sink) && sink.Size() == 2);
-        CHECK(move_state->ring.AccessGeneration() == before);
-        ConnectionTestAccess::Reset(sink); // 唯一一次真实释放
-        CHECK(move_state->ring.AccessGeneration() == before + 1);
-    }
-
-    // 5) 移动赋值释放旧守卫：旧守卫的 state 引用必须归还，且只推进一次代次。
-    {
-        auto first_state = std::make_shared<ConnectionState>(3, 4096, 1024, 4, nullptr);
-        auto second_state = std::make_shared<ConnectionState>(4, 4096, 1024, 4, nullptr);
-        CHECK(first_state->ring.TryAppend("aa").status == ReadStatus::Ok);
-        CHECK(second_state->ring.TryAppend("bb").status == ReadStatus::Ok);
-        auto held = ConnectionTestAccess::HoldForTest(first_state);
-        CHECK(bool(held));
-        const auto first_before = first_state->ring.AccessGeneration();
-        held = ConnectionTestAccess::HoldForTest(second_state); // 释放旧守卫 → 接管新
-        CHECK(first_state->ring.AccessGeneration() == first_before + 1);
-        CHECK(first_state.use_count() == 1); // 旧 state 引用已归还
-        CHECK(bool(held) && held.Size() == 2 && held.Peek() == "bb");
-        ConnectionTestAccess::Reset(held);
-    }
-
-    // 6) 空守卫：析构/移动都不触碰任何 state，也不推进代次。
-    {
-        auto empty_state = std::make_shared<ConnectionState>(5, 4096, 1024, 4, nullptr);
-        CHECK(empty_state->ring.TryAppend("z").status == ReadStatus::Ok);
-        const auto before = empty_state->ring.AccessGeneration();
-        ReadAccess none;
-        ReadAccess also_none(std::move(none));
-        CHECK(!also_none);
-        none = std::move(also_none);
-        CHECK(!none);
-        CHECK(empty_state->ring.AccessGeneration() == before);
-        CHECK(empty_state.use_count() == 1);
-    }
-
-    std::cout << "guard_lifetime keepalive/move/empty/closed_tail=ok\n";
-}
 
 //
 // co_context_gate
@@ -830,7 +721,7 @@ static void WriteOutputReuse()
         CHECK(inflight_result.load() == 0);
     }
 
-    // 6) 写接纳分配失败：AsyncWrite 返回 not_enough_memory → 本次 Rejected + op 无效。
+    // 6) Write 的接纳分配失败：not_enough_memory → 本次 Rejected + op 无效。
     {
         auto alloc_state = std::make_shared<ConnectionState>(3, 4096, 4096, 4, nullptr);
         Connection alloc_conn = ConnectionTestAccess::Make(alloc_state);
@@ -938,9 +829,7 @@ static void OutputPreservation()
         CHECK(result.load() == 0);
         CHECK(state->ring.Size() == 0);
     }
-    // 2) Read 分配失败：out 与 ring 双不变（强保证）。成员 Read 的分配点在
-    // TryPopAll 的 takeout/segments 元数据（pop-all 移交不复制载荷），注入
-    // operator new 失败覆盖同一「分配失败零消费」契约。
+    // 2) Read 的快照或输出 Buffer 分配失败：out 与 ring 双不变（强保证）。
     {
         auto state = std::make_shared<ConnectionState>(2, 4096, 1024, 4, nullptr);
         CHECK(state->ring.TryAppend("payload").status == ReadStatus::Ok);
@@ -1493,9 +1382,7 @@ static void ConnectFailureCleanup()
         });
         Get(task);
         CHECK(rejected.load() == 0);
-        WriteOperation write;
-        CHECK(!delivered->AsyncWrite("alive", write));
-        CHECK(write.Valid());
+        CHECK(!delivered->AsyncWrite("alive"));
         CHECK(delivered->WriteAcceptance() != AcceptanceState::Closed);
         CHECK(handler->closes.load() == 0);
         delivered->RequestClose();
@@ -1921,9 +1808,7 @@ static int RunCases(int argc, char** argv)
     try {
         CHECK(argc == 2);
         const std::string test = argv[1];
-        if (test == "guard_lifetime") {
-            GuardLifetime();
-        } else if (test == "co_context_gate") {
+        if (test == "co_context_gate") {
             CoContextGate();
         } else if (test == "options_contract") {
             OptionsContract();

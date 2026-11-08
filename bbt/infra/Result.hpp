@@ -117,12 +117,12 @@ struct Error {
  * @param message 面向人的说明，按值移入。
  * @return 新构造的 Error。
  */
-inline Error MakeError(ErrorCode code, std::string message);
+Error MakeError(ErrorCode code, std::string message);
 
 namespace detail {
 
 /// @brief 严格 UTF-8 良构检查：拒绝截断序列、过长编码、代理区与 >U+10FFFF 码点。
-inline bool IsValidUtf8(std::string_view s) noexcept;
+bool IsValidUtf8(std::string_view s) noexcept;
 
 } // namespace detail
 
@@ -138,7 +138,7 @@ template <> class result<void>;
  * @param error 待校验的错误体。
  * @return 通过返回 ok；违规返回 ProtocolError。
  */
-inline result<void> ValidateErrorDetails(const Error& error);
+result<void> ValidateErrorDetails(const Error& error);
 
 /**
  * @brief 成功值 T 或错误体 Error 二选一的结果类型。
@@ -217,4 +217,4 @@ private:
 
 } // namespace bbt::infra
 
-#include <bbt/infra/impl/ResultImpl.hpp>
+#include <bbt/infra/__TResult.hpp>

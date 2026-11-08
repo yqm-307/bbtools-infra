@@ -2,7 +2,7 @@
 
 /**
  * @file WriteOperation.hpp
- * @brief 公共写句柄与写报告，是 ICoConnection::Write 与 AsyncWrite 的观察与等待面。
+ * @brief Write 的观察句柄与结算报告；AsyncWrite 不返回操作句柄。
  *
  * 与 Connection 同源，值语义稳定。拆成独立头，使 CoTcpConnection 与 ICoConnection 只依赖本头，
  * 而不是整个 Connection.hpp。
@@ -35,23 +35,22 @@ struct WriteOpRecord; // detail：写操作共享记录，布局不出公共面
  * 值语义，默认无效。持有记录的强引用，连接句柄释放后仍可 Query 与 Wait。它不是通用的 Future
  * 或 Task。
  *
- * 拒绝票：ICoConnection::AsyncWrite 的拒绝路径不分配操作记录，而是把拒绝原因放在票内
- * （m_rejection 非空，record 为空）。因此 !Valid() 不能推出 Query() 为 Unknown。只有既无身份
- * 又无拒绝原因的票，Query 才返回 Unknown。释放票不取消发送，也不延长 Engine 或 fd 的寿命。
+ * 只由 Write 在成功接纳后交付。无效句柄的 Query 返回 Unknown。
+ * 释放句柄不取消发送，也不延长 Engine 或 fd 的寿命。
  */
 class WriteOperation {
 public:
     WriteOperation() = default;
 
-    /// @brief 是否持有操作记录。拒绝票为 false，但它的拒绝原因仍可查询。
+    /// @brief 是否持有 Write 成功接纳的操作记录。
     bool Valid() const noexcept;
-    /// @brief 操作身份；与 AsyncWrite/Write 返回的票对应。无效票返回 0。
+    /// @brief 操作身份；与 Write 返回的票对应。无效票返回 0。
     std::uint64_t Id() const noexcept;
 
     /**
      * @brief 非阻塞查询，已接纳的票查询同一条记录的终态。
      *
-     * 句柄寿命内永久可查。拒绝票返回 Rejected、0 与具体原因。无身份票返回 Unknown、0 与空错误。
+     * 句柄寿命内永久可查。无身份票返回 Unknown、0 与空错误。
      */
     WriteOutcome Query() const;
 
@@ -60,24 +59,21 @@ public:
      *
      * 门禁先于快路径：非法调用域返回 operation_not_permitted，即使终态已经存在也如此。
      * 超时或取消只结束等待，不撤销已接纳的发送，终态仍保存在记录上，之后可再次 Query 或 Wait 取得。
-     * Rejected 票已经落定：返回空错误，outcome 保留拒绝时的采样。无身份票返回 invalid_argument。
+     * 无身份票返回 invalid_argument。
      * outcome 非空时，写入返回时的采样。
      */
     std::error_code Wait(const bbt::coroutine::WaitOptions& options, WriteOutcome* outcome = nullptr) const;
 
 private:
-    // 构造责任：Connection::AsyncWrite 与 CoTcpConnection::Write 经 ConnectionState 分配记录并包装，
+    // 构造责任：CoTcpConnection::Write 经 ConnectionState 分配记录并包装，
     // 消费方不能凭任意状态构造。state 以 weak 方式持有：Wait 在局部取得强引用来订阅 write hub，
     // 不与连接状态形成引用环。state 回收后，record 仍可被 Query。
-    friend class Connection;
     friend class CoTcpConnection;
     friend class ConnectionTestAccess;
-    WriteOperation(std::shared_ptr<WriteOpRecord> record, std::weak_ptr<ConnectionState> state = {},
-                   std::error_code rejection = {});
+    WriteOperation(std::shared_ptr<WriteOpRecord> record, std::weak_ptr<ConnectionState> state = {});
 
     std::shared_ptr<WriteOpRecord> m_record;
     std::weak_ptr<ConnectionState> m_state;
-    std::error_code m_rejection; // 非空 = 拒绝票（record 为空，Valid()=false）
 };
 
 /**

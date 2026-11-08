@@ -1,6 +1,21 @@
 # Redis 的 net 窄入口（已合入，默认关闭）
 
-公共头 `<bbt/infra/redis/CoRedisCli.hpp>` 与 `<bbt/infra/redis/CoRedisPool.hpp>`，类型 `bbt::infra::redis::CoRedisCli` / `CoRedisPool`，CMake 目标 `bbt::infra_redis_net`。公共头与实现同目录置于 `bbt/infra/redis/`（对齐 `bbt/infra/net` 布局；include 路径与 namespace 不变），hiredis 编解码共享层在 `bbt/infra/redis/detail/`（模块私有，不公开）。等待入口用上游 PR #414 的 `bbt_co_async(result<...>)` 标记，调用方经 `bbt_co_await` 消费；await helper 的协程域前置检查先于函数体，非协程直调抛 `std::logic_error`。固定大小连接池 `CoRedisPool` 的语义见[池](#池-coredispool)一节。该独立入口经审查后由 [PR #95](https://github.com/yqm-307/bbtools-infra/pull/95) 合入，合并提交 `7401099b16741d67f88a64807dd086a3ea0996ae`；旧 `bbt::infra::CoRedisCli` / `bbt::infra_redis` 保留原契约。默认构建不启用新入口，framework 消费者尚未切换。
+公共消费接口为 `<bbt/infra/redis/interface/IRedisCli.hpp>` 中的 `bbt::infra::redis::IRedisCli`；具体实现仍由 `<bbt/infra/redis/CoRedisCli.hpp>` 与 `<bbt/infra/redis/CoRedisPool.hpp>` 提供，CMake 目标均为 `bbt::infra_redis_net`。具体类的公共头与实现同目录置于 `bbt/infra/redis/`（对齐 `bbt/infra/net` 布局；原 include 路径与 namespace 不变），hiredis 编解码共享层在 `bbt/infra/redis/detail/`（模块私有，不公开）。等待入口用上游 PR #414 的 `bbt_co_async(result<...>)` 标记，调用方经 `bbt_co_await` 消费；await helper 的协程域前置检查先于函数体，非协程直调抛 `std::logic_error`。固定大小连接池 `CoRedisPool` 的语义见[池](#池-coredispool)一节。该独立入口经审查后由 [PR #95](https://github.com/yqm-307/bbtools-infra/pull/95) 合入，合并提交 `7401099b16741d67f88a64807dd086a3ea0996ae`；旧 `bbt::infra::CoRedisCli` / `bbt::infra_redis` 保留原契约。默认构建不启用新入口，framework 消费者尚未切换。
+
+## 公共客户端接口
+
+业务可只包含 `<bbt/infra/redis/interface/IRedisCli.hpp>` 并持有 `IRedisCli&` 或 `std::shared_ptr<IRedisCli>`。`CoRedisCli` 与 `CoRedisPool` 直接实现该接口，工厂和配置保留在具体类；切换实现只改装配，不改业务命令调用。命令值类型定义在 `RedisTypes.hpp`，旧的 `CoRedisCli.hpp` 包含方式仍可用。
+
+```cpp
+// 由装配方传入 CoRedisCli 或 CoRedisPool；options 仍携带绝对 deadline。
+bbt_co_async(result<std::optional<std::string>>)
+LoadValue(redis::IRedisCli& client, std::string_view key, const CallOptions& options)
+{
+    return bbt_co_await client.Get(key, options);
+}
+```
+
+接口包括现有命令与 Connect/Close/IsClosed，不暴露 Engine 或池借还，不增加自动重试。单连接和池仍有不同的并发额度及排队策略；Close 只表示逻辑封口。引入虚接口后须重新编译库和消费者，不兼容旧二进制对象布局。当前没有 CoRedisCluster 实现，集群特有的多 key/路由语义须单独裁定，不能凭统一接口宣称支持；职责与演进边界见 [Redis 客户端公共接口](../decisions/0021-redis-client-interface.md)。
 
 ## 构建和消费
 

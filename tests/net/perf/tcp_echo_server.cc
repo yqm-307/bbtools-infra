@@ -224,8 +224,7 @@ struct RawEchoHandler : RawHandler {
     bool FlushPending(Connection& connection, Slot& slot)
     {
         while (!slot.pending.empty()) {
-            WriteOperation op;
-            const auto err = connection.AsyncWrite(slot.pending.front(), op);
+            const auto err = connection.AsyncWrite(slot.pending.front());
             if (!err) {
                 g_metrics.bytes_out.fetch_add(slot.pending.front().size());
                 slot.pending.pop_front();

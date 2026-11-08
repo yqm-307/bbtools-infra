@@ -2,7 +2,7 @@
 //
 // 覆盖（每条用例以真实屏障证明「等待已挂起」后再触发事件，不靠 sleep）：
 // member_write_done 成员 Write 等首胜后采到 Done+空错
-// async_write_reject_ticket AsyncWrite 拒绝票 Query=Rejected/0/具体原因
+// async_write_fire AsyncWrite 只返回接纳错误，不等待，FIFO 与终态通知保持
 // write_unsubmitted_timeout 容量等待超时未提交（Rejected+无效 op）
 // write_accepted_timeout 已接纳超时仍在途，op 终态后可查
 // write_accepted_cancel 已接纳等待被协程取消，发送不撤销
@@ -38,6 +38,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -240,30 +241,35 @@ static void MemberWriteDone()
     std::cout << "member_write_done done=ok sampled_after_win=ok\n";
 }
 
-static void AsyncWriteRejectTicket()
+static void AsyncWriteFire()
 {
+    static_assert(std::is_same_v<decltype(std::declval<CoTcpConnection&>().AsyncWrite("")), std::error_code>);
+    static_assert(std::is_same_v<decltype(std::declval<Connection&>().AsyncWrite("")), std::error_code>);
     auto state = std::make_shared<ConnectionState>(2, 4096, 128, 4, nullptr);
     auto conn = FacadeOf(state);
-    auto warm = conn.AsyncWrite(std::string(64, 'a'));
-    CHECK(warm.Valid());
-    warm = conn.AsyncWrite(std::string(64, 'b'));
-    CHECK(warm.Valid());
-    // 字节额度已满（128/128）：第三笔拒绝，票自带 Rejected 原因。
-    const auto rejected = conn.AsyncWrite(std::string(1, 'c'));
-    CHECK(!rejected.Valid());
-    const auto outcome = rejected.Query();
-    CHECK(outcome.phase == WritePhase::Rejected);
-    CHECK(outcome.sent == 0);
-    CHECK(outcome.error == std::make_error_code(std::errc::no_buffer_space));
-    // 关闭后拒绝票原因是 Closed（非裸 Unknown）。
+    CHECK(!conn.AsyncWrite(std::string(64, 'a')));
+    CHECK(!conn.AsyncWrite(std::string(64, 'b')));
+    CHECK(state->ActiveOpCount() == 2); // 没有 owner 推进也立即返回，不等待完成。
+    CHECK(conn.AsyncWrite("c") == std::make_error_code(std::errc::no_buffer_space));
+    CHECK(state->ActiveOpCount() == 2); // 拒绝零接纳。
+    std::string sent;
+    state->PumpWrites(8, 4096, [&](const std::string_view* views, std::size_t, std::size_t budget) -> ssize_t {
+        const auto count = std::min(views[0].size(), budget);
+        sent.append(views[0].data(), count);
+        return static_cast<ssize_t>(count);
+    });
+    CHECK(sent == std::string(64, 'a') + std::string(64, 'b'));
+    const auto completed = state->DrainTerminal();
+    CHECK(completed.size() == 2);
+    CHECK(completed[0].id != completed[1].id);
+    CHECK(completed[0].sent == 64 && completed[1].sent == 64);
+    CHECK(!completed[0].error && !completed[1].error);
     conn.RequestClose(make_error_code(NetErrc::Closed));
-    const auto closed_ticket = conn.AsyncWrite("x");
-    CHECK(closed_ticket.Query().phase == WritePhase::Rejected);
-    CHECK(closed_ticket.Query().error == make_error_code(NetErrc::Closed));
-    // 默认票（无身份无原因）才是 Unknown。
+    CHECK(conn.AsyncWrite("x") == make_error_code(NetErrc::Closed));
+    CHECK(CoTcpConnection{}.AsyncWrite("x") == make_error_code(NetErrc::Closed));
     WriteOperation empty;
     CHECK(empty.Query().phase == WritePhase::Unknown);
-    std::cout << "async_write_reject_ticket rejected=reason closed=reason unknown=default\n";
+    std::cout << "async_write_fire immediate_accept=ok fifo=ok reject=error\n";
 }
 
 static void WriteUnsubmittedTimeout()
@@ -271,8 +277,8 @@ static void WriteUnsubmittedTimeout()
     StartRuntime(1);
     auto state = std::make_shared<ConnectionState>(3, 4096, 128, 4, nullptr);
     auto conn = FacadeOf(state);
-    CHECK(conn.AsyncWrite(std::string(64, 'a')).Valid());
-    CHECK(conn.AsyncWrite(std::string(64, 'b')).Valid());
+    CHECK(!conn.AsyncWrite(std::string(64, 'a')));
+    CHECK(!conn.AsyncWrite(std::string(64, 'b')));
     std::atomic<int> result{-1};
     auto task = Task([&] {
         auto report = conn.Write(std::string(1, 'c'), Until(30ms));
@@ -361,21 +367,22 @@ static void OpWaitPartialError()
     StartRuntime(1);
     auto state = std::make_shared<ConnectionState>(6, 4096, 4096, 8, nullptr);
     auto conn = FacadeOf(state);
-    auto ticket = conn.AsyncWrite(std::string(64, 'p'));
-    CHECK(ticket.Valid());
+    WriteOperation ticket;
     ArmedFlag flag;
     flag.ArmWriteAdd();
     std::atomic<int> result{-1};
     auto task = Task([&] {
-        WriteOutcome outcome;
-        const auto error = ticket.Wait(bbt::coroutine::WaitOptions{}, &outcome);
-        if (!error && outcome.phase == WritePhase::Done && outcome.error.value() == EPIPE && outcome.sent == 8) {
+        const auto report = conn.Write(std::string(64, 'p'), bbt::coroutine::WaitOptions{});
+        ticket = report.operation;
+        const auto& outcome = report.outcome;
+        if (!report.wait_error && outcome.phase == WritePhase::Done && outcome.error.value() == EPIPE
+            && outcome.sent == 8) {
             result.store(0);
         } else {
             result.store(1);
         }
     });
-    // 屏障：op.Wait 已挂起后注入「发 8 字节后 EPIPE」的部分发送错误。
+    // 屏障：Write 已挂起后注入「发 8 字节后 EPIPE」的部分发送错误。
     CHECK(WaitUntil([&] { return flag.armed.load() >= 1; }, 3000ms));
     flag.Clear();
     int calls = 0;
@@ -400,11 +407,10 @@ static void WriteZeroLen()
     StartRuntime(1);
     auto state = std::make_shared<ConnectionState>(7, 4096, 4096, 8, nullptr);
     auto conn = FacadeOf(state);
-    const auto ticket = conn.AsyncWrite("");
-    CHECK(ticket.Valid());
-    // 零长写接纳即终态：Done/0/空错误，不占发送字节。
-    const auto outcome = ticket.Query();
-    CHECK(outcome.phase == WritePhase::Done && outcome.sent == 0 && !outcome.error);
+    CHECK(!conn.AsyncWrite(""));
+    // fire 零长写不占字节；终态仍走 owner 的统一事件出口。
+    const auto completed = state->DrainTerminal();
+    CHECK(completed.size() == 1 && completed[0].sent == 0 && !completed[0].error);
     std::atomic<int> result{-1};
     auto task = Task([&] {
         auto report = conn.Write("", Until(500ms));
@@ -424,24 +430,23 @@ static void CloseDefaultReason()
 {
     auto state = std::make_shared<ConnectionState>(8, 4096, 4096, 8, nullptr);
     auto conn = FacadeOf(state);
-    const auto ticket = conn.AsyncWrite(std::string(64, 'u'));
-    CHECK(ticket.Valid());
+    CHECK(!conn.AsyncWrite(std::string(64, 'u')));
     // 默认空 reason：CloseReason 保持空值（首请求固定），但未发完写
     // 必须以 Done+非空错误结算——空 reason 不能冒充本地成功。
     conn.RequestClose({});
-    const auto outcome = ticket.Query();
-    CHECK(outcome.phase == WritePhase::Done);
-    CHECK(outcome.error); // 非空：不能是假成功
-    CHECK(outcome.error == std::make_error_code(std::errc::operation_canceled));
-    CHECK(outcome.sent == 0);
+    const auto completed = state->DrainTerminal();
+    CHECK(completed.size() == 1);
+    CHECK(completed[0].error == std::make_error_code(std::errc::operation_canceled));
+    CHECK(completed[0].sent == 0);
     CHECK(conn.Status().close_reason == std::error_code{}); // reason 仍为空
     // 显式 reason 保留原值结算。
     auto state2 = std::make_shared<ConnectionState>(9, 4096, 4096, 8, nullptr);
     auto conn2 = FacadeOf(state2);
-    const auto ticket2 = conn2.AsyncWrite(std::string(8, 'v'));
+    CHECK(!conn2.AsyncWrite(std::string(8, 'v')));
     conn2.RequestClose(std::error_code(ECONNRESET, std::system_category()));
-    CHECK(ticket2.Query().phase == WritePhase::Done
-          && ticket2.Query().error == std::error_code(ECONNRESET, std::system_category()));
+    const auto completed2 = state2->DrainTerminal();
+    CHECK(completed2.size() == 1);
+    CHECK(completed2[0].error == std::error_code(ECONNRESET, std::system_category()));
     CHECK(conn2.Status().close_reason == std::error_code(ECONNRESET, std::system_category()));
     std::cout << "close_default_reason unfinished=canceled reason_kept=ok\n";
 }
@@ -451,11 +456,14 @@ static void FacadeReleasedOpQueryable()
     StartRuntime(1);
     auto state = std::make_shared<ConnectionState>(10, 4096, 4096, 8, nullptr);
     WriteOperation op;
-    {
+    auto submitted = Task([&] {
         auto conn = FacadeOf(state);
-        op = conn.AsyncWrite(std::string(16, 'f'));
+        const auto report = conn.Write(std::string(16, 'f'), Until(30ms));
+        CHECK(report.wait_error == std::make_error_code(std::errc::timed_out));
+        op = report.operation;
         CHECK(op.Valid());
-    } // facade 释放：句柄销毁不关闭连接，op 终态仍可查
+    });
+    Get(submitted); // facade 释放：Write 返回的 op 终态仍可查，发送未被超时撤销。
     CHECK(op.Query().phase == WritePhase::InFlight);
     ArmedFlag flag;
     flag.ArmWriteAdd();
@@ -589,8 +597,8 @@ static int RunCases(int argc, char** argv)
         const std::string test = argv[1];
         if (test == "member_write_done") {
             MemberWriteDone();
-        } else if (test == "async_write_reject_ticket") {
-            AsyncWriteRejectTicket();
+        } else if (test == "async_write_fire") {
+            AsyncWriteFire();
         } else if (test == "write_unsubmitted_timeout") {
             WriteUnsubmittedTimeout();
         } else if (test == "write_accepted_timeout") {

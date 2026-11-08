@@ -8,7 +8,7 @@
 | `ico_connection/` | `Example_ico_connection` | 成员 Read/Write 与关闭观察 |
 | `http_net/` | `http_net_example` | Client/Server GET、404、POST、连接复用与排空 |
 | `redis_net/` | `redis_net_example` | 单连接/池命令、唯一 key 清理；需要真实 Redis |
-| `rpc_net/` | `rpc_net_example` | HTTP 上的 RPC 回声与业务错误 |
+| `rpc_net/` | `rpc_v2_session_example` | V2 双向会话双进程 consumer：Call/Send 与协作收口 |
 | `config_consume/` | `Example_config_consume` | 内存/文件配置，校验成功才接受 |
 | `mongo_client/` | `mongo_client_example` | BSON 与 async CRUD，真实 Mongo 由 `BBT_TEST_MONGO_URI` 注入 |
 

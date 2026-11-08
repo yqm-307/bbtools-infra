@@ -7,7 +7,8 @@
 add_library(bbt_infra_http_net STATIC
     Client.cc
     Server.cc
-    detail/Http11.cc)
+    detail/Http11.cc
+    detail/Pool.cc)
 add_library(bbt::infra_http_net ALIAS bbt_infra_http_net)
 target_include_directories(bbt_infra_http_net
     PUBLIC "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>"

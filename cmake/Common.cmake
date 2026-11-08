@@ -1,6 +1,6 @@
 # 公共依赖段：普通模式与 NETWORK_ONLY 共用，一次定义，禁止两条路径各自接线。
 #
-# 统一提供：bbt_infra_common（bbt/infra 公共头树的 header-only 契约层，
+# 统一提供：bbt_infra_common（bbt/infra 公共值契约层，
 # 公共头引用 bbt/coroutine 故必须随 coroutine 接口传播）、
 # bbt_infra_internal_debug（STRINGENT_DEBUG 的目标级传播面）、
 # pin 核验过的 bbt_coroutine 源码接入、AsyncMisuseErrors、Threads。
@@ -26,10 +26,15 @@ endif()
 #      该 INTERFACE 的模块库及其内部测试消费者拿到宏，不污染无关 target。
 option(BBT_INFRA_STRINGENT_DEBUG
     "启用 bbtools-infra 内部 debug 观测层（仅 Debug 配置定义宏）" OFF)
-add_library(bbt_infra_internal_debug INTERFACE)
+add_library(bbt_infra_internal_debug STATIC
+    "${PROJECT_SOURCE_DIR}/bbt/infra/debug/InfraDebug.cc")
+target_include_directories(bbt_infra_internal_debug PUBLIC
+    "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>")
+target_compile_features(bbt_infra_internal_debug PUBLIC cxx_std_17)
+target_compile_options(bbt_infra_internal_debug PRIVATE -Wall -Wextra -Wpedantic)
 add_library(bbt::infra_internal_debug ALIAS bbt_infra_internal_debug)
 if(BBT_INFRA_STRINGENT_DEBUG)
-    target_compile_definitions(bbt_infra_internal_debug INTERFACE
+    target_compile_definitions(bbt_infra_internal_debug PUBLIC
         $<$<CONFIG:Debug>:BBT_INFRA_STRINGENT_DEBUG>)
     message(STATUS
         "bbtools-infra: 内部 debug 观测层已启用（仅 Debug 配置定义 "
@@ -38,15 +43,21 @@ else()
     message(STATUS "bbtools-infra: 内部 debug 观测层已关闭（BBT_INFRA_STRINGENT_DEBUG=OFF）")
 endif()
 
-# 公共契约头库：header-only，向外暴露仓根（bbt/infra 公共头树）。新协议模块
+# 公共值契约库：模板实现随头提供，非模板实现编译一次，向外暴露仓根（bbt/infra 公共头树）。新协议模块
 # （bbt/infra/{redis,http,rpc}）的公开头仍引用该树的 NetworkTypes/Result 等
 # 值层类型，因此 common 不属于「旧栈」，普通模式与 NETWORK_ONLY 共用。
-add_library(bbt_infra_common INTERFACE)
+add_library(bbt_infra_common STATIC
+    "${PROJECT_SOURCE_DIR}/bbt/infra/Result.cc"
+    "${PROJECT_SOURCE_DIR}/bbt/infra/Codec.cc"
+    "${PROJECT_SOURCE_DIR}/bbt/infra/NetworkTypes.cc"
+    "${PROJECT_SOURCE_DIR}/bbt/infra/CoMongoCli.cc"
+    "${PROJECT_SOURCE_DIR}/bbt/infra/rpc/codec/PositionalCodec.cc")
 add_library(bbt::infra_common ALIAS bbt_infra_common)
-target_include_directories(bbt_infra_common INTERFACE
+target_include_directories(bbt_infra_common PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>
     $<INSTALL_INTERFACE:include>)
-target_compile_features(bbt_infra_common INTERFACE cxx_std_17)
+target_compile_features(bbt_infra_common PUBLIC cxx_std_17)
+target_compile_options(bbt_infra_common PRIVATE -Wall -Wextra -Wpedantic)
 
 # --- bbtools-coroutine 源码接入 + pin（两条消费路径共用）-------------------------
 # 上游不导出可消费的 CMake 包，源码消费只能经显式路径 add_subdirectory 接入。
@@ -144,7 +155,7 @@ else()
 endif()
 
 # 公共头引用 bbt/coroutine：coroutine 经 common 的链接接口传播给所有模块消费者。
-target_link_libraries(bbt_infra_common INTERFACE bbt_coroutine)
+target_link_libraries(bbt_infra_common PUBLIC bbt_coroutine)
 
 # bbt_co_async/bbt_co_await 误用兜底升级为错误；必须在 coroutine 接入之后
 # include（directory 级 COMPILE_OPTIONS 只作用于之后创建的目标）。

@@ -27,7 +27,7 @@
 #include <bbt/infra/net/Engine.hpp>
 #include <bbt/infra/net/NativeSocket.hpp>
 #include <bbt/infra/net/RawHandler.hpp>
-#include <bbt/infra/net/ReadAccess.hpp>
+
 #include <bbt/infra/net/detail/ConnectionState.hpp>
 #include <bbt/infra/net/detail/EngineTestAccess.hpp>
 #include <bbt/infra/net/detail/ReceiveRing.hpp>
@@ -267,7 +267,7 @@ void AuxThread(std::shared_ptr<Gate> gate)
         gate->aux_error.store(true);
         return;
     }
-    ReadAccess hold;
+    std::unique_lock<std::mutex> hold;
     const auto hold_deadline = std::chrono::steady_clock::now() + 6000ms;
     while (std::chrono::steady_clock::now() < hold_deadline) {
         hold = ConnectionTestAccess::HoldForTest(gate->state);
@@ -297,9 +297,12 @@ void AuxThread(std::shared_ptr<Gate> gate)
 
 void DrainOnce(Connection& connection, Engine& engine, std::string& out)
 {
-    ReadAccess access = connection.TryAccess();
-    if (access && access.Size() != 0) {
-        (void)access.ConsumeInto(out);
+    const auto view = connection.View();
+    if (view && view.Size() != 0) {
+        std::string chunk;
+        if (connection.TryRead(chunk).status == ReadStatus::Ok) {
+            out += chunk;
+        }
         return;
     }
     EngineTestAccess::KickOwner(engine);

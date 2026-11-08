@@ -79,12 +79,6 @@ struct HttpResponse {
     std::string body;                                         ///< 响应体。
 };
 
-/** @brief RPC 端点地址：传输名与端点。 */
-struct RpcAddress {
-    std::string transport; ///< 传输名。
-    std::string endpoint;  ///< 端点，格式由所选传输解释。
-};
-
 /** @brief 非拥有的可写缓冲视图：不持有内存，使用期间由调用方保证数据有效。 */
 struct MutableBytes {
     void* data;       ///< 缓冲区首地址。
@@ -124,29 +118,14 @@ struct DatagramRead {
     bool truncated = false; ///< 数据报超过缓冲区被截断时为 true。
 };
 
-/** @brief RPC 调用的消息信封：服务与方法、请求标识、载荷模式、载荷与元数据。 */
-struct RpcEnvelope {
-    std::string service;                                       ///< 服务名。
-    std::string method;                                        ///< 方法名。
-    std::string request_id;                                    ///< 请求标识。
-    std::string request_schema;                                ///< 请求载荷的 schema ID（见 Codec::SchemaId）。
-    std::string response_schema;                               ///< 响应载荷的 schema ID。
-    std::vector<std::uint8_t> payload;                         ///< 编码后的载荷字节。
-    std::vector<std::pair<std::string, std::string>> metadata; ///< 附加元数据键值对。
-};
-
 /// @brief HTTP 入站处理函数：接收调用上下文与请求，返回响应或错误。
 using HttpHandler = std::function<result<HttpResponse>(IncomingCallContext, HttpRequest)>;
-/// @brief RPC 入站处理函数：接收调用上下文与信封，返回响应信封或错误。
-using RpcHandler = std::function<result<RpcEnvelope>(IncomingCallContext, RpcEnvelope)>;
 
 /**
  * @brief 校验 NetworkLimits 装配值：各项须大于零且不超过对应上限。
  * @param limits 待校验的装配值。
  * @return 通过返回 ok；违规返回 InvalidArgument。
  */
-inline result<void> ValidateNetworkLimits(const NetworkLimits& limits);
+result<void> ValidateNetworkLimits(const NetworkLimits& limits);
 
 } // namespace bbt::infra
-
-#include <bbt/infra/impl/NetworkTypesImpl.hpp>

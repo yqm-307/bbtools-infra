@@ -96,7 +96,6 @@ FOCUS_MAP = (
     ('bbt/infra/net/', '^net\\.|^http\\.net\\.|^redis\\.net\\.|^rpc\\.net\\.'),
     ('bbt/infra/http/', '^http\\.net\\.|^rpc\\.net\\.|^mcp\\.http'),
     ('bbt/infra/redis/', '^redis\\.net\\.'),
-    ('bbt/infra/rpc_tcp/', '^rpc\\.tcp\\.'),
     ('bbt/infra/rpc/', '^rpc\\.'),
     ('bbt/infra/mcp/', '^mcp\\.'),
     ('proto/', '^rpc\\.'),
@@ -114,6 +113,7 @@ FOCUS_MAP = (
     ('tests/', '^contract\\.'),
     ('cmake/', '^contract\\.|^net\\.|^http\\.net\\.|^redis\\.net\\.|^rpc\\.'),
     ('CMakeLists.txt', '^contract\\.|^net\\.|^http\\.net\\.|^redis\\.net\\.|^rpc\\.'),
+    ('examples/rpc_net/', '^rpc\\.net\\.v2_session_consumer'),
     ('examples/', '^example_|^net\\.consumer|^mongo\\.client\\.consumer'),
 )
 

@@ -30,11 +30,11 @@ namespace detail {
 
 /// @brief 表驱动基础分类：同一底层 cause 在所有 adapter 得到同一基础 code。
 /// 只覆盖「底层分类」，不掺入协议阶段判断。
-inline ErrorCode NetBaseErrorCode(const std::error_code& ec) noexcept;
+ErrorCode NetBaseErrorCode(const std::error_code& ec) noexcept;
 
 /// @brief bbt.net 类别的稳定 domain_code 语义名；与 NetErrc 枚举一一对应，
 /// 只表达「net 域内发生了什么」，不携带协议阶段含义。
-inline const char* NetDomainCode(const std::error_code& ec) noexcept;
+const char* NetDomainCode(const std::error_code& ec) noexcept;
 
 } // namespace detail
 
@@ -44,8 +44,6 @@ inline const char* NetDomainCode(const std::error_code& ec) noexcept;
  * @param message 描述调用方这一层正在做什么。阶段结算、重试、退役都由调用方决定，本函数不做。
  * @return 基础分类的 Error，backend_category 与 backend_code 保留后端事实。
  */
-inline Error NetToError(const std::error_code& ec, std::string message);
+Error NetToError(const std::error_code& ec, std::string message);
 
 } // namespace bbt::infra
-
-#include <bbt/infra/impl/NetErrorImpl.hpp>

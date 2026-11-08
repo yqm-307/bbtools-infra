@@ -6,7 +6,7 @@
 #include <bbt/infra/net/detail/ReceiveRing.hpp>
 
 // 内部测试接缝实现：与产品实现同库（bbt_infra_net），但归属 detail 头，
-// 不进公共头自检白名单。CoTestAccess 的屏障定义在 CoConnection.cc，
+// 不进公共头自检白名单。CoTestAccess 的屏障定义在 CoInternal.cc，
 // 这里只做声明链接。
 
 namespace bbt::infra::net {
@@ -27,18 +27,16 @@ WriteOperation ConnectionTestAccess::MakeWrite(std::shared_ptr<WriteOpRecord> re
     return WriteOperation(std::move(record), std::move(state));
 }
 
-ReadAccess ConnectionTestAccess::HoldForTest(std::shared_ptr<ConnectionState> state)
+std::unique_lock<std::mutex> ConnectionTestAccess::HoldForTest(std::shared_ptr<ConnectionState> state)
 {
-    if (!state) {
-        return {};
-    }
-    auto attempt = state->ring.TryHoldAttemptForTest();
-    return ReadAccess(std::move(state), std::move(attempt.lock), attempt.status, attempt.error);
+    return state ? state->ring.TryHoldForTest() : std::unique_lock<std::mutex>();
 }
 
-void ConnectionTestAccess::Reset(ReadAccess& access)
+void ConnectionTestAccess::Reset(std::unique_lock<std::mutex>& lock)
 {
-    access = ReadAccess();
+    if (lock.owns_lock()) {
+        lock.unlock();
+    }
 }
 
 Buffer BufferTestAccess::Make(std::shared_ptr<void> backing, std::vector<BufferSegment> segments)

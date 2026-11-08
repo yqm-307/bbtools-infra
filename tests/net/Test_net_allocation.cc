@@ -235,6 +235,7 @@ static std::size_t AliasAttempt(std::size_t k, bool must_fail)
     const std::string input(700, 'x');
     CHECK(!ring.Append(input));
     const auto view = ring.Peek();
+    const auto cap_before = ring.Capacity();
     bool failed = false;
     std::error_code ec;
     std::size_t attempts;
@@ -248,7 +249,10 @@ static std::size_t AliasAttempt(std::size_t k, bool must_fail)
         attempts = allocation_count;
     }
     CHECK(failed == must_fail && !ec);
-    CHECK(ring.Capacity() == (must_fail ? 1024 : 2048));
+    CHECK(ring.Capacity() >= ring.Size() && ring.Capacity() <= ring.MaxBytes());
+    if (must_fail) {
+        CHECK(ring.Capacity() == cap_before);
+    }
     CHECK(ring.TakeSnapshot().Peek() == (must_fail ? input : input + input));
     CHECK(ring.Size() == (must_fail ? input.size() : input.size() * 2));
     CHECK(!ring.Discard(ring.Size()));

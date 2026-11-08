@@ -1,5 +1,7 @@
 # 0015：立即关闭（Close）与优雅退出（Shutdown）的两种语义
 
+> 后续取代关系（2026-11-08）：**仅 RPC 部分**的关闭约定已由 [现行 RPC 指南](../guides/rpc-net.md) 取代：关闭模式统一由 Close 参数选择，Shutdown 为同步强制关闭。本文 HTTP 部分不受此更新影响；下文保留原决策记录。
+
 - 状态：**已定契约**，随本次实现进入公共头与测试。
 - 适用：`bbtools-infra` 的 `http::Client`、`http::Server`、`rpc::Client`、`rpc::Server`
   与 transport adapter，以及 `bbt-framework` 的 `InfraHttpHost` / `HostLifecycle`。
