@@ -282,7 +282,7 @@ void AuxThread(std::shared_ptr<Gate> gate)
     }
     gate->lock_held.store(true);
     (void)WaitUntil([&] { return gate->release.load(); }, 8000ms);
-    ConnectionTestAccess::Reset(hold);
+    ConnectionTestAccess::Reset(gate->state, hold);
     gate->released.store(true);
     const auto pending_deadline = std::chrono::steady_clock::now() + 6000ms;
     while (std::chrono::steady_clock::now() < pending_deadline) {

@@ -195,6 +195,9 @@ BOOST_AUTO_TEST_CASE(busy_contention_zero_consume)
 {
     auto state = MakeState(1024);
     BOOST_REQUIRE(state->ring.TryAppend("xyz").status == ReadStatus::Ok);
+    std::size_t wakes = 0;
+    state->ring.SetOwnerWake([&] { ++wakes; });
+    const auto generation = state->ring.AccessGeneration();
     Buffer out;
     BOOST_REQUIRE(out.WriteBytes("keep"));
     auto hold = ConnectionTestAccess::HoldForTest(state);
@@ -204,7 +207,12 @@ BOOST_AUTO_TEST_CASE(busy_contention_zero_consume)
     BOOST_CHECK_EQUAL(result.bytes, 0);
     BOOST_CHECK_EQUAL(JoinBuffer(out), "keep");
     BOOST_CHECK_EQUAL(state->ring.Size(), 3);
-    ConnectionTestAccess::Reset(hold);
+    ConnectionTestAccess::Reset(state, hold);
+    BOOST_CHECK_EQUAL(state->ring.AccessGeneration(), generation + 1);
+    BOOST_CHECK_EQUAL(wakes, 1);
+    ConnectionTestAccess::Reset(state, hold);
+    BOOST_CHECK_EQUAL(state->ring.AccessGeneration(), generation + 1);
+    BOOST_CHECK_EQUAL(wakes, 1);
     BOOST_REQUIRE(state->ring.TryCopyConsume(out).status == ReadStatus::Ok);
     BOOST_CHECK_EQUAL(JoinBuffer(out), "keepxyz");
 }

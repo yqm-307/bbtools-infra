@@ -169,6 +169,8 @@ public:
     }
 
 private:
+    friend class ConnectionTestAccess;
+
     static std::function<void()>& BusyBeforeWaiterHookForTest();
     static std::function<void()>& WouldBlockBeforeWaiterHookForTest();
     static std::function<void()>& AfterAddHookForTest();

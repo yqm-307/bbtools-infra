@@ -26,7 +26,7 @@ public:
     static std::shared_ptr<ConnectionState> StateOf(const Connection& connection);
     static WriteOperation MakeWrite(std::shared_ptr<WriteOpRecord> record, std::shared_ptr<ConnectionState> state = {});
     static std::unique_lock<std::mutex> HoldForTest(std::shared_ptr<ConnectionState> state);
-    static void Reset(std::unique_lock<std::mutex>& lock);
+    static void Reset(const std::shared_ptr<ConnectionState>& state, std::unique_lock<std::mutex>& lock);
 };
 
 class CoTestAccess {

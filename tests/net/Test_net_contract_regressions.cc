@@ -377,7 +377,7 @@ static void RingReleaseNotify()
         }
     });
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    ConnectionTestAccess::Reset(held); // 锁外 NotifyRelease
+    ConnectionTestAccess::Reset(state, held); // 锁外 NotifyRelease
     Get(task);
     CHECK(result.load() == 0);
     std::cout << "ring_release_notify busy_wait_woken=ok\n";
@@ -1485,7 +1485,7 @@ static void StagedRecvBusyClose()
         while (!release_hold.load() && std::chrono::steady_clock::now() < deadline) {
             std::this_thread::yield();
         }
-        ConnectionTestAccess::Reset(hold);
+        ConnectionTestAccess::Reset(ConnectionTestAccess::StateOf(*conn1), hold);
         holder_done.store(true);
     });
     EngineTestAccess::SetReadAppendHook(engine, [&] {
@@ -1548,7 +1548,7 @@ static void RingDeferredNonblockingTry()
         while (!release.load() && std::chrono::steady_clock::now() < deadline) {
             std::this_thread::yield();
         }
-        ConnectionTestAccess::Reset(hold);
+        ConnectionTestAccess::Reset(state, hold);
     });
     CHECK(WaitUntil([&] { return held.load(); }, 3000ms));
     const auto begin = std::chrono::steady_clock::now();
@@ -1633,7 +1633,7 @@ static void CoBusyReleasePhases()
         Connection connection = ConnectionTestAccess::Make(state);
         auto hold = ConnectionTestAccess::HoldForTest(state);
         CHECK(bool(hold));
-        ConnectionTestAccess::Reset(hold); // 尝试前释放
+        ConnectionTestAccess::Reset(state, hold); // 尝试前释放
         auto shared_out = std::make_shared<std::string>();
         std::atomic<int> read_result{-1};
         auto read_task = Task([&] {
@@ -1673,7 +1673,7 @@ static void CoBusyReleasePhases()
             }
         });
         CHECK(WaitUntil([&] { return entered.load(); }, 1000ms));
-        ConnectionTestAccess::Reset(hold); // Busy 后、waiter 前释放并推进代次
+        ConnectionTestAccess::Reset(state, hold); // Busy 后、waiter 前释放并推进代次
         release_now.store(true);
         Get(task);
         ReceiveRing::SetBusyBeforeWaiterHookForTest({});
@@ -1696,7 +1696,7 @@ static void CoBusyReleasePhases()
             }
         });
         CHECK(WaitUntil([&] { return added.load(); }, 1000ms));
-        ConnectionTestAccess::Reset(hold); // Add 之后释放
+        ConnectionTestAccess::Reset(state, hold); // Add 之后释放
         Get(task);
         ReceiveRing::SetAfterAddHookForTest({});
         CHECK(result.load() == 0);
@@ -1919,7 +1919,7 @@ static void RawBusyDeferredOnRead()
     CHECK(bool(hold));
     handler->hold_ready.store(true);
     CHECK(WaitUntil([&] { return handler->busy_seen.load(); }, 1000ms));
-    ConnectionTestAccess::Reset(hold); // 释放
+    ConnectionTestAccess::Reset(ConnectionTestAccess::StateOf(*stored), hold); // 释放
     // 无新网络字节：owner 必须补投 OnRead 取回原 ring 字节。
     CHECK(WaitUntil([&] { return handler->got.load(); }, 2000ms));
     {
@@ -2850,7 +2850,7 @@ static void RunStagedCloseBeforeRelease(bool engine_close)
         while (!release_hold.load() && std::chrono::steady_clock::now() < deadline) {
             std::this_thread::yield();
         }
-        ConnectionTestAccess::Reset(hold);
+        ConnectionTestAccess::Reset(ConnectionTestAccess::StateOf(*conn1), hold);
         holder_done.store(true);
     });
     EngineTestAccess::SetReadAppendHook(engine, [&] {
@@ -3167,7 +3167,7 @@ static void RequestCloseReadTerminalOrder()
         while (!release_hold.load() && std::chrono::steady_clock::now() < deadline) {
             std::this_thread::yield();
         }
-        ConnectionTestAccess::Reset(hold);
+        ConnectionTestAccess::Reset(ConnectionTestAccess::StateOf(*conn1), hold);
     });
     EngineTestAccess::SetReadAppendHook(engine, [&] {
         hook_entered.store(true);

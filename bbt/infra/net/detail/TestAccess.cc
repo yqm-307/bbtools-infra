@@ -1,5 +1,6 @@
 #include <bbt/infra/net/detail/TestAccess.hpp>
 
+#include <cassert>
 #include <utility>
 
 #include <bbt/infra/net/detail/ConnectionState.hpp>
@@ -32,10 +33,14 @@ std::unique_lock<std::mutex> ConnectionTestAccess::HoldForTest(std::shared_ptr<C
     return state ? state->ring.TryHoldForTest() : std::unique_lock<std::mutex>();
 }
 
-void ConnectionTestAccess::Reset(std::unique_lock<std::mutex>& lock)
+void ConnectionTestAccess::Reset(const std::shared_ptr<ConnectionState>& state, std::unique_lock<std::mutex>& lock)
 {
     if (lock.owns_lock()) {
+        assert(state && lock.mutex() == &state->ring.m_mutex);
         lock.unlock();
+        // 测试保护也必须完成释放协议，否则 Busy 后的等待者和 owner 无法继续。
+        state->ring.NotifyRelease();
+        state->ring.WakeOwnerOnly();
     }
 }
 
