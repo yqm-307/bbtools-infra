@@ -104,13 +104,12 @@ coroutine 运行时按进程寿命存在、不再有 `Scheduler::Stop()`；infra
 > 已随本修订删除（其结论已被上文取代，不再作为现行证据）。
 
 ```bash
-# 1) 配置构建（ccache、并发 max(2, nproc/4)）
-JOBS=$(( $(nproc) / 4 )); [ "$JOBS" -ge 2 ] || JOBS=2
+# 1) 配置构建（ccache；本地构建并发与排队按 AGENTS.md：固定 2，经 flock 队列）
 cmake -S . -B <build> -G Ninja \
   -DBBT_COROUTINE_SOURCE_DIR=<bbtools-coroutine 源码树> \
   -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_BUILD_TYPE=Release
-cmake --build <build> --target bbt_infra_config Test_config_unit Test_config_watch \
-  Example_config_consume bbt_infra_header_selfcheck Test_contract_basics --parallel "$JOBS"
+flock /tmp/bbt-build.lock cmake --build <build> --target bbt_infra_config Test_config_unit Test_config_watch \
+  Example_config_consume bbt_infra_header_selfcheck Test_contract_basics --parallel 2
 # 结果：0 error；公共头自给检查（config 6 头各生成独立 TU）链接通过
 
 # 2) 定向测试（config 功能 + 冒烟；不跑全量）
@@ -128,7 +127,7 @@ ctest --test-dir <build> -j1 -R '^(config\.unit|config\.watch|contract\.basics)$
 cmake -S examples/config_consumer -B <build>/config-consumer -G Ninja \
   -DBBT_INFRA_SOURCE_DIR="$PWD" -DBBT_COROUTINE_SOURCE_DIR=<bbtools-coroutine 源码树> \
   -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-cmake --build <build>/config-consumer --target config_consumer --parallel "$JOBS"
+flock /tmp/bbt-build.lock cmake --build <build>/config-consumer --target config_consumer --parallel 2
 mkdir -p <run-dir>
 TMPDIR=<run-dir> <build>/config-consumer/config_consumer
 # 结果：16 项检查全 ok，输出 consumer: ALL OK，退出码 0
