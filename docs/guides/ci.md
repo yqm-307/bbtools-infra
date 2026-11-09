@@ -16,6 +16,15 @@
 - `verify_coroutine_pin.sh`：`cmake/coroutine.sha` 的 40hex 格式与精确检出。
 - 模块开启但缺 hiredis/protobuf 前缀时 configure 必须失败；HTTP-only 不拉 protobuf，也不注册 RPC 测试。
 
+跨 run 只复用两类内容，均在 `build-and-gates` 内、装在 `runner.temp`：
+
+- **ccache 对象**：上限 500M。key 由完整工具链/依赖指纹（ccache 实际版本、`g++ -dumpversion`、`infra/CMakeLists.txt` 与 `infra/cmake/**` 哈希）加 run_id/run_attempt 组成；restore 前缀保留完整指纹，不跨指纹复用。ccache 只安装在 hosted 临时 runner，本机不安装；安装不钉 apt 包版本，只要求可用且版本号可解析。`max_size/compression/compiler_check/base_dir` 在**恢复之后**重新固化（归档自带的旧 `ccache.conf` 会覆盖安装时的设置），同一处 `ccache --zero-stats`，统计只反映本次 run。
+- **Boost 源码归档**：只缓存锁定 `boost_1_90_0.tar.gz`，恢复后 `prepare_boost.sh` 仍做完整 SHA256 校验；缺失、损坏或 symlink 一律回退下载，回写失败只告警。不复用已安装 prefix 或 build 树；该条目只由 main push 建立。
+
+`cache-bypass` / `cache-enabled=false` 跳过 ccache 安装与全部 restore/save，并由初始化步骤导出 `CCACHE_DISABLE=1`——即使镜像预装 ccache，`prepare_resource_deps.sh` 见到它也不会真正使用对象缓存；fork PR 保持对象缓存禁用，只可读内容寻址且逐次校验的源码归档。缓存可见范围由 GitHub ref 作用域决定（PR 条目写在 merge ref，main 读不到），key 与 `if` 只是选择条目，不是安全边界；缓存只影响耗时，不改变任何门禁判据或测试选集。
+
+四个 cache action 都是 `continue-on-error: true`：缓存服务或配额异常只失去复用，构建与门禁照跑；`ccache --show-stats` 只作证据。缓存目录在 job 级 `env` 里取不到 `runner.temp`（该位置无 `runner` context），由 `build-and-gates` 首个 run 步骤写进 `$GITHUB_ENV`。`scripts/ci/tests/run_tests.py`（缓存契约、fork/bypass、Boost SHA 等）在同一 job 内作为独立步骤执行，失败即阻断，不再只在本地跑。
+
 ## 执行门禁
 
 | 入口 | 必须证明 |

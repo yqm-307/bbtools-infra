@@ -22,7 +22,7 @@ on:
         default: clean
         options: [clean, cache-bypass]
       cache-enabled:
-        description: "启用本次 run 内 ccache（跨 run 缓存已阻塞）"
+        description: "启用本次 run 的 ccache（含跨 run 对象缓存；false 即完整冷构建）"
         type: boolean
         default: true
 # 顶层最小权限：仅 checkout 的 job 授予 contents: read；无写权限、无 secret、无 OIDC。
@@ -45,6 +45,9 @@ env:
   DEPS_BUNDLE_META: ${{ github.workspace }}/deps-bundle.meta
   JOBS: 3  # hosted 4 vCPU：固定 3，与三仓统一并发口径一致，不按 nproc 抢占。
   CACHE_ENABLED: ${{ github.event_name == 'workflow_dispatch' && inputs.cache-enabled == false && 'false' || inputs.build-mode == 'cache-bypass' && 'false' || 'true' }}
+  # fork PR 不安装/不启用 ccache（对象缓存保持禁用）；Boost 源码归档是内容寻址且每次
+  # 完整 SHA256 校验，不受此限。隔离本身由 GitHub ref 作用域决定，key/if 不是边界。
+  CACHE_ALLOWED: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'true' || 'false' }}
   TEST_DEPTH: ${{ github.event_name == 'workflow_dispatch' && inputs.test-depth || 'smoke' }}  # 非 dispatch 恒 smoke
 jobs:
   changes:
@@ -98,9 +101,31 @@ jobs:
     env:
       REPO_DIR: ${{ github.workspace }}/infra
       WORKSPACE: ${{ github.workspace }}
+      # 缓存目录放在 runner.temp（工作区之外），避免被打包/门禁步骤扫到。
+      # job 级 env 不允许 runner context：两个路径由下面的初始化步骤写进
+      # $GITHUB_ENV，缓存步骤的 path 用步骤级 runner.temp。
+      CCACHE_EPOCH: v1
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with: {path: infra, fetch-depth: 1, persist-credentials: false}
+      # 缓存目录取自 runner.temp；同时显式设置 ccache 开关，保证「允许时启用、
+      # 禁用时不得被 deps recipe 见到 ccache 就隐式启用对象缓存」。
+      - name: "初始化缓存目录与 ccache 开关"
+        run: |
+          set -euo pipefail
+          {
+            echo "CCACHE_DIR=$RUNNER_TEMP/ccache"
+            echo "BOOST_SOURCE_CACHE=$RUNNER_TEMP/src-cache"
+          } >> "$GITHUB_ENV"
+          if [ "$CACHE_ENABLED" = 'true' ] && [ "$CACHE_ALLOWED" = 'true' ]; then
+            echo "CCACHE_NODISABLE=true" >> "$GITHUB_ENV"
+          else
+            echo "CCACHE_DISABLE=1" >> "$GITHUB_ENV"
+          fi
+      # cache/formal 门禁回归：新增的缓存契约、fork/bypass、Boost SHA 用例必须是
+      # hosted 门禁的一部分，否则 workflow 漂移能绕过它们。只跑本仓静态/行为测试。
+      - name: "CI 契约与缓存回归测试（scripts/ci/tests/run_tests.py）"
+        run: PYTHONDONTWRITEBYTECODE=1 python3 infra/scripts/ci/tests/run_tests.py
       - name: "读取 coroutine pin（cmake/coroutine.sha，fail-closed）"
         id: pin
         run: bash infra/scripts/ci/verify_coroutine_pin.sh infra/cmake/coroutine.sha
@@ -116,6 +141,47 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with: {repository: yqm-307/bbtools-core, ref: master,
                path: bbtools-core, fetch-depth: 1, persist-credentials: false}
+      # 安装/恢复必须先于 deps：prepare_resource_deps.sh 见到 ccache 就会给
+      # hiredis/mongo 构建自动加 launcher。cache-bypass / fork PR 不安装，因此
+      # deps recipe 也不会隐式启用缓存。
+      - name: "安装 ccache（仅 hosted 临时 runner；实际版本进 key）"
+        if: ${{ env.CACHE_ENABLED == 'true' && env.CACHE_ALLOWED == 'true' }}
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends ccache
+          version="$(ccache --version | awk 'NR==1 {print $3}')"
+          [ -n "$version" ] || { echo "FAIL: ccache 版本解析失败" >&2; exit 2; }
+          printf 'CCACHE_VERSION=%s\n' "$version" >> "$GITHUB_ENV"
+          printf 'GCC_ID=%s\n' "$(g++ -dumpversion)" >> "$GITHUB_ENV"
+      - name: "恢复 ccache 对象缓存（完整指纹内跨 run；restore 前缀不跨指纹）"
+        if: ${{ env.CACHE_ENABLED == 'true' && env.CACHE_ALLOWED == 'true' }}
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-${{ env.CCACHE_EPOCH }}-linux-gcc${{ env.GCC_ID }}-cc${{ env.CCACHE_VERSION }}-deps${{ hashFiles('infra/CMakeLists.txt', 'infra/cmake/**') }}-run${{ github.run_id }}-attempt${{ github.run_attempt }}
+          restore-keys: |
+            ccache-${{ env.CCACHE_EPOCH }}-linux-gcc${{ env.GCC_ID }}-cc${{ env.CCACHE_VERSION }}-deps${{ hashFiles('infra/CMakeLists.txt', 'infra/cmake/**') }}-
+      - name: "恢复 Boost 源码归档缓存（每次仍按锁定 SHA256 校验）"
+        if: ${{ env.CACHE_ENABLED == 'true' }}
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ runner.temp }}/src-cache
+          key: boost-src-1.90.0-5e93d582aff2
+      # 恢复的归档自带旧 ccache.conf，会覆盖安装时的设置：配置必须在恢复之后
+      # 重新固化并清零统计，且早于 deps（deps recipe 见到 ccache 就加 launcher）。
+      - name: "恢复后固化 ccache 配置并清零统计（早于依赖准备与编译）"
+        if: ${{ env.CACHE_ENABLED == 'true' && env.CACHE_ALLOWED == 'true' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$CCACHE_DIR"
+          ccache --set-config=max_size=500M
+          ccache --set-config=compression=true
+          ccache --set-config=compiler_check=content
+          ccache --set-config=base_dir="$GITHUB_WORKSPACE"
+          ccache --zero-stats
+          ccache --show-config | sed -n '1,20p'
       - name: "复现锁定依赖前缀（Boost/hiredis/mongo*/protobuf + pin 校验）"
         id: deps
         env:
@@ -129,6 +195,15 @@ jobs:
             --protobuf-recipe-url "$PROTOBUF_RECIPE_URL" \
             --protobuf-recipe-sha256 "$PROTOBUF_RECIPE_SHA256" \
             --coroutine-pin-sha "$COROUTINE_PIN_SHA" --jobs "$JOBS"
+      # 只由 main push 建立这条条目（GitHub 缓存按仓库隔离，不跨仓共享），PR 侧
+      # 只读本仓可见版本；缓存里只有已校验源码归档。
+      - name: "保存 Boost 源码归档缓存（仅 push 建立）"
+        if: ${{ success() && env.CACHE_ENABLED == 'true' && github.event_name == 'push' }}
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ runner.temp }}/src-cache
+          key: boost-src-1.90.0-5e93d582aff2
       - name: "打包 prepared deps（tar，保留 symlink）"
         id: pack
         run: |
@@ -144,7 +219,7 @@ jobs:
           retention-days: 1
       - name: "资源前缀拒绝路径回归（A/B，早停）"
         run: bash infra/tests/resource-prefix/run.sh
-      - name: "解析本次 run 内 ccache（跨 run 缓存已阻塞）"
+      - name: "解析 ccache launcher（跨 run 复用由 restore/save 步骤承担）"
         id: cache-meta
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -223,6 +298,16 @@ jobs:
             ${{ github.workspace }}/build-redis_net_gate/Testing/Temporary/LastTest.log
           if-no-files-found: error
           retention-days: 7
+      - name: "打印 ccache 统计（命中率证据；失败也打印）"
+        if: ${{ always() && env.CACHE_ENABLED == 'true' && env.CACHE_ALLOWED == 'true' }}
+        run: ccache --show-stats -v || true
+      - name: "保存 ccache 对象缓存（同 key 已存在时 action 自动跳过）"
+        if: ${{ success() && env.CACHE_ENABLED == 'true' && env.CACHE_ALLOWED == 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-${{ env.CCACHE_EPOCH }}-linux-gcc${{ env.GCC_ID }}-cc${{ env.CCACHE_VERSION }}-deps${{ hashFiles('infra/CMakeLists.txt', 'infra/cmake/**') }}-run${{ github.run_id }}-attempt${{ github.run_attempt }}
 
   # 真实 Redis/Mongo live 门禁（独立 job，复用同 run deps bundle）：仅 dispatch
   # test-depth=full|live；PR/push 恒 skipped 并在 expected_skips 声明。

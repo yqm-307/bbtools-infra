@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 解析本次 run 内 ccache launcher 的启用条件（跨 run 缓存已按 hosted 阻塞）。
+# 解析本次 run 的 ccache launcher 启用条件。跨 run 对象复用由 workflow 的
+# restore/save 步骤承担；本脚本只决定是否给 cmake 传 launcher，不读写缓存。
 # 供 workflow 步骤输出 enabled=true|false 到 $GITHUB_OUTPUT。
 #
 # 输入（env）：
@@ -10,10 +11,10 @@
 #   GITHUB_OUTPUT        可选；未设置时写 stdout
 set -euo pipefail
 
-echo "跨 run ccache/GitHub cache 已按 hosted 明确阻塞：不 restore/save。"
+echo "跨 run ccache 对象复用由 workflow 的 restore/save 步骤承担；本脚本只解析 launcher。"
 if [ "${EVENT_NAME:-}" = "pull_request" ] && \
    [ "${HEAD_REPO:-}" != "${REPO:-}" ]; then
-    echo "fork PR：不启用 ccache launcher"
+    echo "fork PR：保持对象缓存禁用，不启用 ccache launcher"
     echo "enabled=false" >> "${GITHUB_OUTPUT:-/dev/stdout}"
 elif [ "${CACHE_ENABLED:-}" != "true" ]; then
     echo "cache-bypass / cache-enabled=false：不启用 ccache launcher"
