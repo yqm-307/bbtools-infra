@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-14",
+  "commit": "07fb51056a042dfb85b91163e8e2c60c6ffa050c",
+  "base": "146bd7f5dae681c5f9e11c1167c6a46420a16315",
+  "result": "pass",
+  "reviewer": "GPT-6.1 Sol independent read-only reviewer (deleg_16f6af6e)",
+  "summary": "仅审查 tests/Test_mongo_unit.cc 的四处物理收尾预算修正，未发现阻塞项。审查候选 tree 342208df942515069679d5e52952fd8abfd97c95 与代码提交 tree 完全相同。产品 deadline 及关闭、任务落定、worker 归零断言均未变；旧日志不足以确认驱动略超名义 selection 期限为唯一根因。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "独立审查通过，medium confidence，无阻塞发现；父会话已核对实际报告、候选 SHA256 和提交 tree，并补齐本地验证。",
+      "evidence": {
+        "reviewer": "GPT-6.1 Sol / deleg_16f6af6e / sa-0-8e60f433",
+        "scope": "146bd7f5dae681c5f9e11c1167c6a46420a16315..07fb51056a042dfb85b91163e8e2c60c6ffa050c; tests/Test_mongo_unit.cc only; index tree 342208df942515069679d5e52952fd8abfd97c95; SHA256 0a07f4192ba80e09368f539b67adf31b69295a6a5c50823245dff7a3163ded8d",
+        "report": "/home/yqm/.hermes/profiles/alice/reports/infra-pr124-mongo-budget-review.json",
+        "verification": "受影响四例连续6轮 No errors detected；ctest -j1 mongo.unit / mongo.close_single_worker / mongo.async_compile 3/3，mongo.unit 138.128秒；smoke required 27/27，JUnit均无failure/error；check_format.sh --staged和diff --check通过；Test_mongo_unit重编译无新增警告。",
+        "test_artifacts": [
+          "/home/yqm/.hermes/profiles/alice/reports/infra-pr124-mongo-fixed.xml",
+          "/home/yqm/.hermes/profiles/alice/reports/infra-pr124-smoke-mongo-fixed.xml",
+          "/home/yqm/.hermes/profiles/alice/reports/infra-pr124-mongo-fix-build.log"
+        ],
+        "not_covered": "最新远端CI尚未运行；未运行live/perf；不保证任意负载下20秒均足够。"
+      }
+    }
+  ]
+}
