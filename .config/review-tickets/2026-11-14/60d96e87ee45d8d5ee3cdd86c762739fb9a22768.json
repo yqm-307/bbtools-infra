@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-14",
+  "commit": "60d96e87ee45d8d5ee3cdd86c762739fb9a22768",
+  "base": "96441814e16507ed382761f0a0806a7b9fdc91d2",
+  "result": "pass",
+  "reviewer": "Alice (mechanical list sync; labels already covered by independent candidate review)",
+  "summary": "CI run 43596803795 的 test_required_smoke_matches_cmake_labels 失败：4 个 http.router 用例在 CMake 已标 smoke;unit（属已独立审查候选的一部分），但 required_smoke.txt 漏同步。本提交仅向清单追加这 4 个名字，不改 label、不改门禁判据。本地 run_tests.py 60/60 通过，smoke profile 27/27 通过（含 4 个 router 用例）。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "4 行清单同步，无行为/门禁变化；对应 smoke label 已随完整候选通过独立审查（infra-pr-final-closure.md, ship）。",
+      "evidence": {
+        "reviewer": "gpt-6.1-sol candidate review (deleg_2e93a7d1) + Alice CI-failure triage",
+        "scope": "scripts/ci/required_smoke.txt only: append http.router.matching, http.router.framework_wiring, http.router.round_trip, http.router.route_decorator_and_dependencies",
+        "verification": "PYTHONDONTWRITEBYTECODE=1 python3 scripts/ci/tests/run_tests.py -> Ran 60 tests OK (含 network-only 111 passed); run_test_profile.sh smoke --require-file -> 27 passed 0 failed 0 skipped, JUnit infra-pr124-smoke-fix.xml 含全部 4 个 router 用例"
+      }
+    }
+  ]
+}
