@@ -5,6 +5,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -64,7 +65,10 @@ static void Ready(int fd, short events)
     pollfd ready{fd, events, 0};
     int result = 0;
     do {
-        result = ::poll(&ready, 1, 100);
+        /**
+         * 原生就绪夹具不经过协程 Hook，避免等待本身引入额外运行时 fd，污染 socket 回收断言。
+         */
+        result = static_cast<int>(::syscall(SYS_poll, &ready, 1, 100));
         CHECK(result >= 0 || errno == EINTR);
     } while (result <= 0 && std::chrono::steady_clock::now() < until);
     CHECK(result == 1);
@@ -634,14 +638,11 @@ static void NativeAcceptConnect()
                  */
                 CHECK(!probe_ran);
                 client_go->set_value();
-                NativeSocket accepted;
-                for (int i = 0; i < 200 && accepted.Fd() < 0; ++i) {
-                    accepted = listener.Accept(inner_peer, inner);
-                    if (accepted.Fd() < 0) {
-                        CHECK(inner.value() == EAGAIN);
-                        bbtco_yield;
-                    }
-                }
+                /**
+                 * yield 次数不能保证原生客户端线程获得 CPU；先确认连接就绪再接纳。
+                 */
+                Ready(listener.Fd(), POLLIN);
+                auto accepted = listener.Accept(inner_peer, inner);
                 CHECK(accepted.Fd() >= 0);
                 CHECK((::fcntl(accepted.Fd(), F_GETFL) & O_NONBLOCK) != 0);
                 CHECK((::fcntl(accepted.Fd(), F_GETFD) & FD_CLOEXEC) != 0);
@@ -657,13 +658,7 @@ static void NativeAcceptConnect()
                 CHECK(!inner);
                 const auto connected = connector.Connect(completed_bound);
                 CHECK(!connected || connected.value() == EINPROGRESS);
-                for (int i = 0; i < 200; ++i) {
-                    pollfd ready{connector.Fd(), POLLOUT, 0};
-                    if (::poll(&ready, 1, 0) == 1) {
-                        break;
-                    }
-                    bbtco_yield;
-                }
+                Ready(connector.Fd(), POLLOUT);
                 CHECK(!connector.PendingError());
 
                 /**
@@ -678,17 +673,8 @@ static void NativeAcceptConnect()
                 const auto refused_connect = failing.Connect(silent_bound);
                 CHECK(refused_connect.value() == EINPROGRESS || refused_connect.value() == ECONNREFUSED);
                 if (refused_connect.value() == EINPROGRESS) {
-                    bool refused = false;
-                    for (int i = 0; i < 200 && !refused; ++i) {
-                        pollfd ready{failing.Fd(), POLLOUT, 0};
-                        if (::poll(&ready, 1, 0) == 1) {
-                            CHECK(failing.PendingError().value() == ECONNREFUSED);
-                            refused = true;
-                        } else {
-                            bbtco_yield;
-                        }
-                    }
-                    CHECK(refused);
+                    Ready(failing.Fd(), POLLOUT);
+                    CHECK(failing.PendingError().value() == ECONNREFUSED);
                 }
                 CHECK(!accepted.Close() && !connector.Close() && !completed.Close());
                 CHECK(!silent.Close() && !failing.Close());
