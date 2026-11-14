@@ -1,4 +1,4 @@
-# protobuf 3.21.12 依赖 provenance（Issue #8）
+# protobuf 3.21.12 依赖 provenance
 
 本文件固定 RPC wire 模块所用 protoc/C++ runtime 的来源、版本与校验材料。
 CMake 接入只允许经 `-DBBT_PROTOBUF_PREFIX=<前缀>` 显式消费，且前缀内
@@ -32,7 +32,7 @@ protoc/runtime 版本必须精确等于本文件锁定值、runtime 库文件 SH
 archive.ubuntu.com resolute 的 Packages 索引快照；同一索引同时给出
 `Filename`/`SHA256`/`SHA512`）。「包 SHA256」是 `.deb` 文件本身的哈希，
 可用 `apt-get download <pkg>` 取回后 `sha256sum` 复核；「内容 SHA256」是
-本前缀实际解包文件的哈希，已同时钉入 `CMakeLists.txt` 的
+本前缀实际解包文件的哈希，已同时钉入 `cmake/RpcNet.cmake` 的
 `BBT_PROTOBUF_KNOWN_LIB_SHA256` 作为 configure 期运行时库门禁。
 
 | 包 | .deb SHA256（apt 索引） | 关键内容 SHA256（解包后实测） |
@@ -46,9 +46,9 @@ archive.ubuntu.com resolute 的 Packages 索引快照；同一索引同时给出
 
 其他前缀文件（`usr/lib/x86_64-linux-gnu/pkgconfig/protobuf.pc` 等）以
 `protobuf.pc` 的 `Version: 3.21.12` 为交叉校验点：CMake configure 读取该
-文件并要求 Version 与锁定版本完全一致（见 `CMakeLists.txt` RPC 接入段）。
+文件并要求 Version 与锁定版本完全一致（见 `cmake/RpcNet.cmake`）。
 
-## 本机接入前缀（候选私有前缀，不入库）
+## 本机接入前缀（私有前缀，不入库）
 
 - 前缀：`<repo>/.deps/protobuf-3.21.12/`（`.deps/` 已加入 .gitignore）
 - 来源：Ubuntu resolute `apt-get download` 解包的官方 `.deb`，未做重新
@@ -61,7 +61,7 @@ archive.ubuntu.com resolute 的 Packages 索引快照；同一索引同时给出
   - `usr/lib/x86_64-linux-gnu/libprotobuf.{a,so.32.0.12}`
   - `usr/lib/x86_64-linux-gnu/pkgconfig/protobuf.pc`
 - RUNPATH 修正：`usr/bin/protoc` 内置 RUNPATH 为 Debian 打包路径，
-  不能在本机前缀外可靠解析 `libprotoc.so.32`；候选前缀内的 `protoc`
+  不能在本机前缀外可靠解析 `libprotoc.so.32`；本前缀内的 `protoc`
   经 `patchelf --set-rpath <prefix>/usr/lib/x86_64-linux-gnu` 修正，故其
   文件 SHA256 与上游 `.deb` 内原始二进制不同——这是有意差异，真实校验
   点是版本输出与 `NEEDED libprotoc.so.32` 解析到同前缀内（`readelf -d`
@@ -88,10 +88,10 @@ archive.ubuntu.com resolute 的 Packages 索引快照；同一索引同时给出
 
 - 需要更换 protobuf 版本时，必须同时更新：
   1. 本文件的版本号、上游 tag/commit、包/内容 SHA256、许可证摘要；
-  2. `CMakeLists.txt` 中 `BBT_PROTOBUF_PINNED_VERSION(_NUM)` 与
+  2. `cmake/RpcNet.cmake` 中 `BBT_PROTOBUF_PINNED_VERSION(_NUM)` 与
      `BBT_PROTOBUF_KNOWN_LIB_SHA256`；
   3. 前缀 `.deps/protobuf-<新版>/` 内容；
-  4. Issue #8 与 framework #4 消费边界复核记录。
+  4. 跨仓消费边界复核记录（framework 消费者侧）。
 - 未经审查不能放宽「精确版本匹配」语义为「兼容范围」，也不能把
   「版本字符串相等」替代「库文件哈希命中」。
 
@@ -104,7 +104,7 @@ cmake -B build -S . \
   -DBBT_PROTOBUF_PREFIX=<本仓>/.deps/protobuf-3.21.12 \
   -DBUILD_TESTING=ON
 cmake --build build --parallel <n>
-ctest --test-dir build -R 'rpc.wire' --output-on-failure
+ctest --test-dir build -R '^rpc\.net\.v2_' --output-on-failure
 ```
 
 `cmake --version` ≥ 3.16；无 protoc 全局安装要求。

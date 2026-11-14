@@ -16,4 +16,6 @@ template <typename Complete> inline HandlerResult<Complete> HandlerResult<Comple
     return out;
 }
 
-} // namespace bbt::infra::mcp
+// clang-format off
+}
+// clang-format on

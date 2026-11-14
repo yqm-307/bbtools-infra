@@ -1,5 +1,7 @@
+/**
+ * 父头末尾包含的实现；依赖父头已完成类型与声明。
+ */
 #pragma once
-// 父头末尾包含的实现；依赖父头已完成类型与声明。
 
 namespace bbt::infra::mongo_detail {
 
@@ -16,4 +18,6 @@ template <class F> inline bool MongoIoEngine::TryPost(F&& f)
     return true;
 }
 
-} // namespace bbt::infra::mongo_detail
+// clang-format off
+}
+// clang-format on

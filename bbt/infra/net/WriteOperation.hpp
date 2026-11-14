@@ -15,7 +15,6 @@
  *   - WriteReport 是成员 Write 的三元结果：wait_error 描述本次等待的结果；outcome 描述发送在
  *     采样时刻的状态；operation 供事后查询。任何字段都不推断其它字段的终态。
  */
-
 #include <cstdint>
 #include <memory>
 #include <system_error>
@@ -27,7 +26,11 @@
 namespace bbt::infra::net {
 
 class ConnectionState;
-struct WriteOpRecord; // detail：写操作共享记录，布局不出公共面
+
+/**
+ * detail：写操作共享记录，布局不出公共面
+ */
+struct WriteOpRecord;
 
 /**
  * @brief 单次已接纳发送的观察与等待句柄。
@@ -42,9 +45,14 @@ class WriteOperation {
 public:
     WriteOperation() = default;
 
-    /// @brief 是否持有 Write 成功接纳的操作记录。
+    /**
+     * @brief 是否持有 Write 成功接纳的操作记录。
+     */
     bool Valid() const noexcept;
-    /// @brief 操作身份；与 Write 返回的票对应。无效票返回 0。
+
+    /**
+     * @brief 操作身份；与 Write 返回的票对应。无效票返回 0。
+     */
     std::uint64_t Id() const noexcept;
 
     /**
@@ -65,9 +73,11 @@ public:
     std::error_code Wait(const bbt::coroutine::WaitOptions& options, WriteOutcome* outcome = nullptr) const;
 
 private:
-    // 构造责任：CoTcpConnection::Write 经 ConnectionState 分配记录并包装，
-    // 消费方不能凭任意状态构造。state 以 weak 方式持有：Wait 在局部取得强引用来订阅 write hub，
-    // 不与连接状态形成引用环。state 回收后，record 仍可被 Query。
+    /**
+     * 构造责任：CoTcpConnection::Write 经 ConnectionState 分配记录并包装，
+     * 消费方不能凭任意状态构造。state 以 weak 方式持有：Wait 在局部取得强引用来订阅 write hub，
+     * 不与连接状态形成引用环。state 回收后，record 仍可被 Query。
+     */
     friend class CoTcpConnection;
     friend class ConnectionTestAccess;
     WriteOperation(std::shared_ptr<WriteOpRecord> record, std::weak_ptr<ConnectionState> state = {});
@@ -86,9 +96,23 @@ private:
  *   - operation：未提交或调用域非法时为无效句柄。已接纳时为有效句柄，终态可查。
  */
 struct WriteReport {
-    std::error_code wait_error;                        ///< 本次等待的结果，不描述发送本身
-    WriteOutcome outcome{WritePhase::Rejected, 0, {}}; ///< 返回时对发送状态的采样
-    WriteOperation operation;                          ///< 已接纳时的观察句柄；未提交时为无效
+
+    /**
+     * 本次等待的结果，不描述发送本身
+     */
+    std::error_code wait_error;
+
+    /**
+     * 返回时对发送状态的采样
+     */
+    WriteOutcome outcome{WritePhase::Rejected, 0, {}};
+
+    /**
+     * 已接纳时的观察句柄；未提交时为无效
+     */
+    WriteOperation operation;
 };
 
-} // namespace bbt::infra::net
+// clang-format off
+}
+// clang-format on

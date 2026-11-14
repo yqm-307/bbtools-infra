@@ -6,6 +6,8 @@
 # bbt::infra_net 公开 Co 接口，不触碰 Asio socket/net detail。
 add_library(bbt_infra_http_net STATIC
     Client.cc
+    Dependency.cc
+    Router.cc
     Server.cc
     detail/Http11.cc
     detail/Pool.cc)
@@ -20,7 +22,7 @@ target_link_libraries(bbt_infra_http_net
 target_compile_options(bbt_infra_http_net PRIVATE -Wall -Wextra -Wpedantic)
 
 # 公开头自给编译自检：公开头各自单独成 TU（detail 内部头不列入）。
-set(_http_net_headers Client.hpp Server.hpp)
+set(_http_net_headers Client.hpp Dependency.hpp Router.hpp Server.hpp)
 set(_http_net_selfcheck_srcs "")
 foreach(_hdr IN LISTS _http_net_headers)
     set(_tu "${CMAKE_CURRENT_BINARY_DIR}/header_selfcheck/${_hdr}.cc")

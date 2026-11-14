@@ -27,4 +27,6 @@ bbt::coroutine::CoObjectInfo CoObject::GetObjectInfo() const
     return m_info;
 }
 
-} // namespace bbt::infra::net
+// clang-format off
+}
+// clang-format on

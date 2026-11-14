@@ -30,14 +30,6 @@ if(NOT BBT_INFRA_HTTP_NET OR BBT_INFRA_RPC_NET)
     set_tests_properties(rpc.payload PROPERTIES TIMEOUT 60 LABELS "smoke;unit")
 endif()
 
-# 实测 detail::CoPollEvent 单事件上 FD readable + custom wakeup + timeout
-# 组合的确定性四场景。使用 detail 非稳定头与非公开组合路径，仅用于能力裁决，
-# 不作为生产 IoWait 实现依据；不涉及关闭/Stop 安全断言（新契约已无 Stop）。
-add_executable(Test_iowait_combined_wait Test_iowait_combined_wait.cc)
-target_link_libraries(Test_iowait_combined_wait PRIVATE bbt::infra_common)
-target_compile_options(Test_iowait_combined_wait PRIVATE -Wall -Wextra)
-add_test(NAME iowait.combined_wait COMMAND Test_iowait_combined_wait)
-set_tests_properties(iowait.combined_wait PROPERTIES TIMEOUT 60 LABELS "smoke;unit")
 
 # --- Config 基础配置模块测试（Issue #35）--------------------------------------
 # unit：Value 类型化读取/指纹、内存源版本、文件源读取/更新/格式错误（无需调度器）。
@@ -76,6 +68,16 @@ if(TARGET bbt_infra_mongo)
     target_compile_options(Test_mongo_unit PRIVATE -Wall -Wextra)
     add_test(NAME mongo.unit COMMAND Test_mongo_unit)
     set_tests_properties(mongo.unit PROPERTIES TIMEOUT 300 LABELS "unit")
+
+    # 单 worker 独立进程：唯一 Co worker 上的 pulse 在 Close 等待期间仍能推进。
+    # 两 worker 进程无法排除「Close 阻塞了另一个 worker」，故固定 BBT_MONGO_TEST_STATIC_THREADS=1
+    # 另起进程只跑 setup + 该用例；普通 mongo.unit 中该用例按配置跳过。
+    add_test(NAME mongo.close_single_worker
+        COMMAND Test_mongo_unit
+            --run_test=mongo_unit/t_setup_scheduler:mongo_unit/t_owner_close_single_worker_wait_release)
+    set_tests_properties(mongo.close_single_worker PROPERTIES
+        TIMEOUT 120 LABELS "unit"
+        ENVIRONMENT "BBT_MONGO_TEST_STATIC_THREADS=1")
 
     add_executable(Test_mongo_live Test_mongo_live.cc)
     # Issue #34：live 用例需要真实生产状态观测（runtime 的 worker/执行槽计数、
@@ -122,4 +124,19 @@ if(TARGET bbt_infra_mongo)
         "-DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/mongo_async/AsyncCompile.cc"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/mongo_async/AsyncCompile.cmake")
     set_tests_properties(mongo.async_compile PROPERTIES TIMEOUT 60 LABELS "integration")
+endif()
+
+if(TARGET bbt_infra_http_net AND TARGET bbt_infra_rpc_net AND TARGET bbt_infra_redis_net AND TARGET bbt_infra_mongo AND TARGET bbt_infra_config)
+    add_executable(Test_close_public_surface Test_close_public_surface.cc)
+    target_link_libraries(Test_close_public_surface PRIVATE bbt::infra_http_net bbt::infra_rpc_net bbt::infra_redis_net bbt::infra_mongo bbt::infra_config)
+    if(TARGET bbt_infra_mcp_http)
+        target_link_libraries(Test_close_public_surface PRIVATE bbt::infra_mcp_http bbt::infra_mcp_stdio)
+        target_compile_definitions(Test_close_public_surface PRIVATE BBT_CLOSE_MCP)
+    endif()
+    if(TARGET bbt_infra_consul)
+        target_link_libraries(Test_close_public_surface PRIVATE bbt::infra_consul)
+        target_compile_definitions(Test_close_public_surface PRIVATE BBT_CLOSE_CONSUL)
+    endif()
+    add_test(NAME close.public_surface COMMAND Test_close_public_surface)
+    set_tests_properties(close.public_surface PROPERTIES LABELS "unit" TIMEOUT 30)
 endif()

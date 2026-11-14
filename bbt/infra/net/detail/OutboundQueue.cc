@@ -3,7 +3,8 @@
 namespace bbt::infra::net {
 
 OutboundQueue::OutboundQueue(std::size_t ring_bytes, std::size_t max_total_bytes, std::size_t max_segments)
-    : max_total_bytes_(max_total_bytes), max_segments_(max_segments)
+    : max_total_bytes_(max_total_bytes)
+    , max_segments_(max_segments)
 {
     if (ring_bytes != 0 && max_total_bytes != 0 && max_segments != 0 && ring_bytes <= max_total_bytes) {
         geometry_valid_ = true;
@@ -12,8 +13,9 @@ OutboundQueue::OutboundQueue(std::size_t ring_bytes, std::size_t max_total_bytes
 }
 
 OutboundQueue::OutboundQueue(OutboundQueue&& other)
-    : max_total_bytes_(other.max_total_bytes_), max_segments_(other.max_segments_),
-      geometry_valid_(other.geometry_valid_)
+    : max_total_bytes_(other.max_total_bytes_)
+    , max_segments_(other.max_segments_)
+    , geometry_valid_(other.geometry_valid_)
 {
     ring_.swap(other.ring_);
     spill_.swap(other.spill_);
@@ -115,7 +117,10 @@ std::error_code OutboundQueue::ConsumeSent(std::size_t n)
         n -= first;
     }
     if (n != 0 && ring_size_ != 0) {
-        // 绕环剩余部分（此时 head 已回卷到 0 之后仍用通式，不出错）。
+
+        /**
+         * 绕环剩余部分（此时 head 已回卷到 0 之后仍用通式，不出错）。
+         */
         const std::size_t second = n < ring_size_ ? n : ring_size_;
         ring_head_ = (ring_head_ + second) % ring_.size();
         ring_size_ -= second;
@@ -124,9 +129,12 @@ std::error_code OutboundQueue::ConsumeSent(std::size_t n)
     while (n != 0) {
         auto& segment = spill_.front();
         const std::size_t take = n < segment.size() ? n : segment.size();
-        // ponytail: 段内部分消费用 erase(0)，O(段长) 拷贝；段受
-        // kMaxMergedSegmentBytes/追加大小约束，后续 Engine 出现性能
-        // 证据时再改段内偏移游标。
+
+        /**
+         * ponytail: 段内部分消费用 erase(0)，O(段长) 拷贝；段受
+         * kMaxMergedSegmentBytes/追加大小约束，后续 Engine 出现性能
+         * 证据时再改段内偏移游标。
+         */
         segment.erase(0, take);
         list_bytes_ -= take;
         n -= take;
@@ -137,4 +145,6 @@ std::error_code OutboundQueue::ConsumeSent(std::size_t n)
     return {};
 }
 
-} // namespace bbt::infra::net
+// clang-format off
+}
+// clang-format on

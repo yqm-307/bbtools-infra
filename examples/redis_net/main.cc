@@ -20,6 +20,7 @@ CallOptions Options()
 {
     return {std::chrono::steady_clock::now() + 2s};
 }
+
 void Require(const result<void>& value)
 {
     if (!value) {
@@ -67,9 +68,11 @@ unsigned short RedisPort()
     return static_cast<unsigned short>(port);
 }
 
-// 宿主收尾由 Run() 统一执行：RequestClose、join Run、核对 Phase=Stopped。
-
-// 单连接阶段：显式 Connect 后 PING/SET/GET 读回，唯一 key 清理并 EXISTS 读回。
+/**
+ * 单连接阶段：显式 Connect 后 PING/SET/GET 读回，唯一 key 清理并 EXISTS 读回。
+ *
+ * 宿主收尾由 Run() 统一执行：RequestClose、join Run、核对 Phase=Stopped。
+ */
 void RunSingleConnection(std::shared_ptr<net::Engine> engine, const net::Address& address)
 {
     auto created = redis::CoRedisCli::Create(engine, address);
@@ -82,7 +85,10 @@ void RunSingleConnection(std::shared_ptr<net::Engine> engine, const net::Address
     bool registered = false;
     auto completion = std::make_shared<std::promise<void>>();
     auto done = completion->get_future().share();
-    // 宿主登记唯一 API 任务；完成信号前释放捕获，不再访问 adapter。
+
+    /**
+     * 宿主登记唯一 API 任务；完成信号前释放捕获，不再访问 adapter。
+     */
     g_scheduler->RegistCoroutineTask(
         128 * 1024,
         [client, key, completion]() mutable {
@@ -99,7 +105,10 @@ void RunSingleConnection(std::shared_ptr<net::Engine> engine, const net::Address
             } catch (...) {
                 RecordFailure(failure, "single business");
             }
-            // 无论业务成败，只清理这个示例拥有的 key；故障后显式重连再尝试。
+
+            /**
+             * 无论业务成败，只清理这个示例拥有的 key；故障后显式重连再尝试。
+             */
             try {
                 auto cleanup = bbt_co_await client->Delete({key}, Options());
                 if (!cleanup) {
@@ -116,7 +125,7 @@ void RunSingleConnection(std::shared_ptr<net::Engine> engine, const net::Address
             } catch (...) {
                 RecordFailure(failure, "single cleanup");
             }
-            client->Close();
+            (void)client->Close();
             client.reset();
             if (failure) {
                 completion->set_exception(failure);
@@ -128,17 +137,26 @@ void RunSingleConnection(std::shared_ptr<net::Engine> engine, const net::Address
     if (!registered) {
         throw std::runtime_error("API task registration failed");
     }
-    // 普通 native 宿主等待；业务 worker 继续推进，不在协程内同步 wait。
+
+    /**
+     * 普通 native 宿主等待；业务 worker 继续推进，不在协程内同步 wait。
+     */
     if (done.wait_for(10s) != std::future_status::ready) {
         throw std::runtime_error("single stage timeout");
     }
     done.get();
 }
 
-// 池阶段：Connect 全池就绪后经池执行 PING/SET/GET，唯一 key 清理读回。
+/**
+ * 池阶段：Connect 全池就绪后经池执行 PING/SET/GET，唯一 key 清理读回。
+ */
 void RunPool(std::shared_ptr<net::Engine> engine, const net::Address& address)
+
+/**
+ * 3 连接，最多 10 排队。
+ */
 {
-    redis::CoRedisPool::PoolOptions pool_options{3, 10}; // 3 连接，最多 10 排队。
+    redis::CoRedisPool::PoolOptions pool_options{3, 10};
     auto created = redis::CoRedisPool::Create(engine, address, pool_options);
     if (!created) {
         throw std::runtime_error(created.error().message);
@@ -181,7 +199,7 @@ void RunPool(std::shared_ptr<net::Engine> engine, const net::Address& address)
             } catch (...) {
                 RecordFailure(failure, "pool cleanup");
             }
-            pool->Close();
+            (void)pool->Close();
             pool.reset();
             if (failure) {
                 completion->set_exception(failure);
@@ -203,7 +221,11 @@ int Run()
 {
     g_bbt_coroutine_config->m_cfg_static_thread_num = 1;
     g_bbt_coroutine_config->m_cfg_stack_size = 128 * 1024;
-    g_scheduler->Start(); // runtime 进程寿命：整个示例只 Start 一次。
+
+    /**
+     * runtime 进程寿命：整个示例只 Start 一次。
+     */
+    g_scheduler->Start();
     auto engine = net::Engine::Create(nullptr);
     net::EngineConfig config;
     config.runtime_progress = net::RuntimeProgress::Independent;
@@ -234,7 +256,7 @@ int Run()
         std::cerr << error.what() << '\n';
         code = 1;
     }
-    engine->RequestClose();
+    (void)engine->Close();
     control.join();
     if (!run_returned.load() || engine->Phase() != net::EnginePhase::Stopped || run_error || engine->LastFailure()) {
         std::cerr << "host drain failed: " << run_error.message() << '\n';
@@ -245,11 +267,18 @@ int Run()
     engine.reset();
     return code;
 }
-} // namespace
+
+// clang-format off
+}
+// clang-format on
 
 int main()
+
+/**
+ * 全部业务对象在 Run 内销毁后，结束进程寿命的 runtime。
+ */
 {
-    const int code = Run(); // 全部业务对象在 Run 内销毁后，结束进程寿命的 runtime。
+    const int code = Run();
     std::cout.flush();
     std::cerr.flush();
     std::_Exit(code);

@@ -1,4 +1,5 @@
-/** @file ICoCloseable.hpp
+/**
+ * @file ICoCloseable.hpp
  * @brief 协程网络对象的关闭契约：同步释放物理资源，不依赖协程运行时。
  *
  * 关闭时机由资源 owner 或上层（framework manager）决定，本接口不绑定 coroutine runtime。
@@ -13,10 +14,14 @@
 
 namespace bbt::infra {
 
-/** @brief 可同步关闭的资源接口：Close() 返回即物理资源已释放。 */
+/**
+ * @brief 可同步关闭的资源接口：Close() 返回即物理资源已释放。
+ */
 class ICoCloseable {
 public:
-    /// @brief 虚析构；本接口不提供额外的析构语义。
+    /**
+     * @brief 虚析构；本接口不提供额外的析构语义。
+     */
     virtual ~ICoCloseable() = default;
 
     /**
@@ -26,8 +31,12 @@ public:
      */
     virtual void Close() noexcept = 0;
 
-    /// @brief 只读查询是否已关闭。
+    /**
+     * @brief 只读查询是否已关闭。
+     */
     virtual bool IsClosed() const noexcept = 0;
 };
 
-} // namespace bbt::infra
+// clang-format off
+}
+// clang-format on

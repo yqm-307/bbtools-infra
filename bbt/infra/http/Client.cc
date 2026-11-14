@@ -28,14 +28,6 @@ Error Unsupported(std::string message)
     return MakeError(ErrorCode::UnsupportedRoute, "http client: " + std::move(message));
 }
 
-// 排空只能在 native 宿主域等待：受管协程/Processer 域挂起会占住调度资源
-// （与 Server::Drain 同口径）。
-bool NativeHost()
-{
-    return bbt::coroutine::GetLocalCoroutineId() == 0
-           && bbt::coroutine::detail::Processer::TryGetLocalProcesser() == nullptr;
-}
-
 bool EqualsNoCase(std::string_view left, std::string_view right)
 {
     if (left.size() != right.size()) {
@@ -91,7 +83,9 @@ result<void> ValidateHeaders(const Headers& headers)
     return result<void>::ok();
 }
 
-// 最小百分号编码：保留 unreserved，其余 %XX（空格同样编码，不用 +）。
+/**
+ * 最小百分号编码：保留 unreserved，其余 %XX（空格同样编码，不用 +）。
+ */
 std::string PercentEncode(std::string_view value)
 {
     static const char* hex = "0123456789ABCDEF";
@@ -114,11 +108,21 @@ std::string PercentEncode(std::string_view value)
 struct ParsedUrl {
     Origin origin;
     net::Address address;
-    std::string path;  // 含起始 '/'
-    std::string query; // URL 自带 query（原样透传）
+
+    /**
+     * 含起始 '/'
+     */
+    std::string path;
+
+    /**
+     * URL 自带 query（原样透传）
+     */
+    std::string query;
 };
 
-// 仅 http scheme 与数值 IP host（DNS 未交付：显式报错，不静默降级）。
+/**
+ * 仅 http scheme 与数值 IP host（DNS 未交付：显式报错，不静默降级）。
+ */
 result<ParsedUrl> ParseUrl(const std::string& url)
 {
     for (unsigned char c : url) {
@@ -173,7 +177,10 @@ result<ParsedUrl> ParseUrl(const std::string& url)
         return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size();
     };
     if (!authority.empty() && authority.front() == '[') {
-        // IPv6 字面量：[::1]:8080
+
+        /**
+         * IPv6 字面量：[::1]:8080
+         */
         const auto close = authority.find(']');
         if (close == std::string::npos) {
             return result<ParsedUrl>::err(InvalidArgument("ipv6 literal missing ']'"));
@@ -188,8 +195,11 @@ result<ParsedUrl> ParseUrl(const std::string& url)
         }
     } else {
         const auto colon = authority.rfind(':');
-        if (colon != std::string::npos && colon + 1 < authority.size()
-            && authority.find(':') == colon) { // 仅一个冒号（IPv4/host:port）
+
+        /**
+         * 仅一个冒号（IPv4/host:port）
+         */
+        if (colon != std::string::npos && colon + 1 < authority.size() && authority.find(':') == colon) {
             host = authority.substr(0, colon);
             if (!parse_port(std::string_view(authority).substr(colon + 1))) {
                 return result<ParsedUrl>::err(InvalidArgument("invalid URL port"));
@@ -208,7 +218,10 @@ result<ParsedUrl> ParseUrl(const std::string& url)
     std::error_code error;
     auto address = net::Address::Ip(host, port, error);
     if (error) {
-        // net Address 仅数值：主机名在这里被拒绝（DNS 未交付，非静默降级）。
+
+        /**
+         * net Address 仅数值：主机名在这里被拒绝（DNS 未交付，非静默降级）。
+         */
         return result<ParsedUrl>::err(InvalidArgument("host must be numeric IP (DNS 未交付): " + host));
     }
     ParsedUrl out;
@@ -251,10 +264,10 @@ result<ParsedUrl> ValidatePrepared(const PreparedRequest& request)
     if (hosts != 1) {
         return result<ParsedUrl>::err(InvalidArgument("exactly one Host required"));
     }
-    for (const auto& phase :
-         {request.timeout.connect, request.timeout.read, request.timeout.write, request.timeout.pool}) {
-        if (phase.IsInherit() || (phase.Finite() && *phase.Finite() <= std::chrono::milliseconds{0})) {
-            return result<ParsedUrl>::err(InvalidArgument("unresolved or invalid timeout"));
+    for (const auto phase :
+         {request.connect_timeout, request.read_timeout, request.write_timeout, request.pool_timeout}) {
+        if (phase <= std::chrono::milliseconds{0}) {
+            return result<ParsedUrl>::err(InvalidArgument("timeout must be positive or disabled"));
         }
     }
     auto parsed = ParseUrl(request.url);
@@ -270,18 +283,128 @@ result<ParsedUrl> ValidatePrepared(const PreparedRequest& request)
     return parsed;
 }
 
-PhaseTimeout ResolvePhase(const PhaseTimeout& request_phase, const PhaseTimeout& client_phase)
+// clang-format off
+}
+// clang-format on
+
+ClientOptions& ClientOptions::SetTimeout(std::chrono::milliseconds value) noexcept
 {
-    return request_phase.IsInherit() ? client_phase : request_phase;
+    connect_timeout = read_timeout = write_timeout = pool_timeout = value;
+    return *this;
 }
 
-} // namespace
+ClientOptions& ClientOptions::SetConnectTimeout(std::chrono::milliseconds value) noexcept
+{
+    connect_timeout = value;
+    return *this;
+}
 
-// State：公开句柄复制 state 后挂起，恢复后不再访问公开对象（仓内同范式）。
+ClientOptions& ClientOptions::SetReadTimeout(std::chrono::milliseconds value) noexcept
+{
+    read_timeout = value;
+    return *this;
+}
+
+ClientOptions& ClientOptions::SetWriteTimeout(std::chrono::milliseconds value) noexcept
+{
+    write_timeout = value;
+    return *this;
+}
+
+ClientOptions& ClientOptions::SetPoolTimeout(std::chrono::milliseconds value) noexcept
+{
+    pool_timeout = value;
+    return *this;
+}
+
+ClientOptions& ClientOptions::DisableTimeout() noexcept
+{
+    return SetTimeout(std::chrono::milliseconds::max());
+}
+
+ClientOptions& ClientOptions::DisableConnectTimeout() noexcept
+{
+    return SetConnectTimeout(std::chrono::milliseconds::max());
+}
+
+ClientOptions& ClientOptions::DisableReadTimeout() noexcept
+{
+    return SetReadTimeout(std::chrono::milliseconds::max());
+}
+
+ClientOptions& ClientOptions::DisableWriteTimeout() noexcept
+{
+    return SetWriteTimeout(std::chrono::milliseconds::max());
+}
+
+ClientOptions& ClientOptions::DisablePoolTimeout() noexcept
+{
+    return SetPoolTimeout(std::chrono::milliseconds::max());
+}
+
+RequestOptions& RequestOptions::SetTimeout(std::chrono::milliseconds value) noexcept
+{
+    connect_timeout = read_timeout = write_timeout = pool_timeout = value;
+    return *this;
+}
+
+RequestOptions& RequestOptions::SetConnectTimeout(std::chrono::milliseconds value) noexcept
+{
+    connect_timeout = value;
+    return *this;
+}
+
+RequestOptions& RequestOptions::SetReadTimeout(std::chrono::milliseconds value) noexcept
+{
+    read_timeout = value;
+    return *this;
+}
+
+RequestOptions& RequestOptions::SetWriteTimeout(std::chrono::milliseconds value) noexcept
+{
+    write_timeout = value;
+    return *this;
+}
+
+RequestOptions& RequestOptions::SetPoolTimeout(std::chrono::milliseconds value) noexcept
+{
+    pool_timeout = value;
+    return *this;
+}
+
+RequestOptions& RequestOptions::DisableTimeout() noexcept
+{
+    return SetTimeout(std::chrono::milliseconds::max());
+}
+
+RequestOptions& RequestOptions::DisableConnectTimeout() noexcept
+{
+    return SetConnectTimeout(std::chrono::milliseconds::max());
+}
+
+RequestOptions& RequestOptions::DisableReadTimeout() noexcept
+{
+    return SetReadTimeout(std::chrono::milliseconds::max());
+}
+
+RequestOptions& RequestOptions::DisableWriteTimeout() noexcept
+{
+    return SetWriteTimeout(std::chrono::milliseconds::max());
+}
+
+RequestOptions& RequestOptions::DisablePoolTimeout() noexcept
+{
+    return SetPoolTimeout(std::chrono::milliseconds::max());
+}
+
+/**
+ * State：公开句柄复制 state 后挂起，恢复后不再访问公开对象（仓内同范式）。
+ */
 struct Client::State {
     State(std::shared_ptr<net::Engine> engine_arg, ClientOptions options_arg)
-        : engine(std::move(engine_arg)), options(std::move(options_arg)),
-          pool(engine, options.limits, options.max_body_bytes, options.max_header_bytes)
+        : engine(std::move(engine_arg))
+        , options(std::move(options_arg))
+        , pool(engine, options.limits, options.max_body_bytes, options.max_header_bytes)
     {
     }
 
@@ -318,36 +441,38 @@ result<std::shared_ptr<Client>> Client::Create(std::shared_ptr<net::Engine> engi
     if (options.limits.keepalive_expiry && *options.limits.keepalive_expiry < std::chrono::milliseconds{0}) {
         return result<std::shared_ptr<Client>>::err(InvalidArgument("negative keepalive expiry"));
     }
-    // base_url 允许为空（每请求给绝对 URL）；非空则必须能解析。
+
+    /**
+     * base_url 允许为空（每请求给绝对 URL）；非空则必须能解析。
+     */
     if (!options.base_url.empty()) {
         auto parsed = ParseUrl(options.base_url);
         if (!parsed) {
             return result<std::shared_ptr<Client>>::err(std::move(parsed.error()));
         }
     }
-    for (const auto& phase :
-         {options.timeout.connect, options.timeout.read, options.timeout.write, options.timeout.pool}) {
-        const auto finite = phase.Finite();
-        if (phase.IsInherit() || (finite && *finite <= std::chrono::milliseconds{0})) {
-            return result<std::shared_ptr<Client>>::err(
-                InvalidArgument("timeout must be positive, disabled or inherit"));
+    for (const auto phase :
+         {options.connect_timeout, options.read_timeout, options.write_timeout, options.pool_timeout}) {
+        if (phase <= std::chrono::milliseconds{0}) {
+            return result<std::shared_ptr<Client>>::err(InvalidArgument("timeout must be positive or disabled"));
         }
     }
     return result<std::shared_ptr<Client>>::ok(
         std::shared_ptr<Client>(new Client(std::make_shared<State>(std::move(engine), std::move(options)))));
 }
 
-Client::Client(std::shared_ptr<State> state) noexcept : m_state(std::move(state))
+Client::Client(std::shared_ptr<State> state) noexcept
+    : m_state(std::move(state))
 {
 }
 
 Client::~Client() noexcept
 {
-    Close();
+    _BeginClose();
 }
 
-result<PreparedRequest> Client::BuildRequest(std::string_view method, std::string_view url,
-                                             const RequestOptions& options) const
+result<PreparedRequest>
+Client::BuildRequest(std::string_view method, std::string_view url, const RequestOptions& options) const
 {
     const auto state = m_state;
     if (!Token(method)) {
@@ -372,7 +497,9 @@ result<PreparedRequest> Client::BuildRequest(std::string_view method, std::strin
         return result<PreparedRequest>::err(std::move(parsed.error()));
     }
 
-    // headers merge：client 打底，同名（不区分大小写）请求级覆盖。
+    /**
+     * headers merge：client 打底，同名（不区分大小写）请求级覆盖。
+     */
     Headers headers = state->options.headers;
     for (const auto& header : options.headers) {
         bool replaced = false;
@@ -399,7 +526,9 @@ result<PreparedRequest> Client::BuildRequest(std::string_view method, std::strin
         headers.emplace_back("Host", host_header);
     }
 
-    // params merge：client 在前，请求级追加在后；URL 自带 query 透传保留。
+    /**
+     * params merge：client 在前，请求级追加在后；URL 自带 query 透传保留。
+     */
     QueryParams params = state->options.params;
     for (const auto& param : options.params) {
         params.push_back(param);
@@ -416,23 +545,6 @@ result<PreparedRequest> Client::BuildRequest(std::string_view method, std::strin
         target += "?" + query;
     }
 
-    Timeout effective;
-    effective.connect = ResolvePhase(options.timeout ? options.timeout->connect : PhaseTimeout::Inherit(),
-                                     state->options.timeout.connect);
-    effective.read =
-        ResolvePhase(options.timeout ? options.timeout->read : PhaseTimeout::Inherit(), state->options.timeout.read);
-    effective.write =
-        ResolvePhase(options.timeout ? options.timeout->write : PhaseTimeout::Inherit(), state->options.timeout.write);
-    effective.pool =
-        ResolvePhase(options.timeout ? options.timeout->pool : PhaseTimeout::Inherit(), state->options.timeout.pool);
-    for (const auto& phase : {effective.connect, effective.read, effective.write, effective.pool}) {
-        const auto finite = phase.Finite();
-        if (phase.IsInherit() || (finite && *finite <= std::chrono::milliseconds{0})) {
-            return result<PreparedRequest>::err(
-                InvalidArgument("request timeout override must be positive or disabled"));
-        }
-    }
-
     PreparedRequest request;
     request.method.assign(method);
     request.url = "http://" + host_header + target;
@@ -440,7 +552,10 @@ result<PreparedRequest> Client::BuildRequest(std::string_view method, std::strin
     request.address = parsed.value().address;
     request.host_header = std::move(host_header);
     request.headers = std::move(headers);
-    request.timeout = effective;
+    request.connect_timeout = options.connect_timeout.value_or(state->options.connect_timeout);
+    request.read_timeout = options.read_timeout.value_or(state->options.read_timeout);
+    request.write_timeout = options.write_timeout.value_or(state->options.write_timeout);
+    request.pool_timeout = options.pool_timeout.value_or(state->options.pool_timeout);
     auto valid = ValidatePrepared(request);
     if (!valid) {
         return result<PreparedRequest>::err(std::move(valid.error()));
@@ -457,14 +572,17 @@ bbt_co_async(result<Response>) Client::Get(std::string_view url, const RequestOp
     return Send(request.value(), call);
 }
 
-bbt_co_async(result<Response>) Client::Post(std::string_view url, RequestBody body, const RequestOptions& options,
-                                            const CallOptions& call)
+bbt_co_async(result<Response>) Client::Post(
+    std::string_view url, RequestBody body, const RequestOptions& options, const CallOptions& call)
 {
     auto request = BuildRequest("POST", url, options);
     if (!request) {
         return result<Response>::err(std::move(request.error()));
     }
-    // body 与 Content-Type：请求级 headers 已含同名头时不覆盖。
+
+    /**
+     * body 与 Content-Type：请求级 headers 已含同名头时不覆盖。
+     */
     if (!body.content_type.empty()) {
         bool has_type = false;
         for (const auto& header : request.value().headers) {
@@ -481,8 +599,8 @@ bbt_co_async(result<Response>) Client::Post(std::string_view url, RequestBody bo
     return Send(request.value(), call);
 }
 
-bbt_co_async(result<Response>) Client::Request(std::string_view method, std::string_view url,
-                                               const RequestOptions& options, const CallOptions& call)
+bbt_co_async(result<Response>) Client::Request(
+    std::string_view method, std::string_view url, const RequestOptions& options, const CallOptions& call)
 {
     auto request = BuildRequest(method, url, options);
     if (!request) {
@@ -503,8 +621,11 @@ bbt_co_async(result<Response>) Client::Send(const PreparedRequest& request, cons
         }
         return result<Response>::err(MakeError(ErrorCode::Closed, "http client: closed"));
     }
-    // 封口引起的失败以关闭原因对外；已提交（请求可能已生效）的 OutcomeUnknown
-    // 事实不追改，只附加关闭原因供排障。
+
+    /**
+     * 封口引起的失败以关闭原因对外；已提交（请求可能已生效）的 OutcomeUnknown
+     * 事实不追改，只附加关闭原因供排障。
+     */
     const auto fail = [&state](Error error) {
         const auto reason = state->pool.CloseReason();
         if (!reason) {
@@ -522,9 +643,9 @@ bbt_co_async(result<Response>) Client::Send(const PreparedRequest& request, cons
             return result<Response>::err(std::move(valid.error()));
         }
         if (const auto gate = detail::CheckCall(call.deadline)) {
-            return result<Response>::err(
-                MakeError(gate == std::errc::operation_canceled ? ErrorCode::Cancelled : ErrorCode::TimedOut,
-                          "http client: call ended before submission"));
+            return result<Response>::err(MakeError(
+                gate == std::errc::operation_canceled ? ErrorCode::Cancelled : ErrorCode::TimedOut,
+                "http client: call ended before submission"));
         }
         auto serialized = detail::SerializeRequest(request);
         if (!serialized) {
@@ -533,8 +654,7 @@ bbt_co_async(result<Response>) Client::Send(const PreparedRequest& request, cons
         if (state->options.max_request_body_bytes && request.body.size() > *state->options.max_request_body_bytes) {
             return result<Response>::err(InvalidArgument("request body exceeds max_request_body_bytes"));
         }
-        const auto deadlines =
-            detail::ResolveDeadlines(request.timeout, call.deadline, std::chrono::steady_clock::now());
+        const auto deadlines = detail::ResolveDeadlines(request, call.deadline, std::chrono::steady_clock::now());
         auto leased = bbt_co_await state->pool.Acquire(valid.value().origin, request.address, deadlines);
         if (!leased) {
             return fail(std::move(leased.error()));
@@ -550,17 +670,29 @@ bbt_co_async(result<Response>) Client::Send(const PreparedRequest& request, cons
     }
 }
 
-void Client::Close(Error reason) noexcept
+void Client::_BeginClose(Error reason) noexcept
 {
     const auto state = m_state;
     if (!state) {
         return;
     }
     try {
-        state->pool.Close(std::move(reason));
+        (void)state->pool.Close(bbt::infra::CloseOptions::Immediate(std::move(reason)));
     } catch (...) {
-        // noexcept 契约：封口本身已生效（布尔位先写），原因复制失败不放大。
+
+        /**
+         * noexcept 契约：封口本身已生效（布尔位先写），原因复制失败不放大。
+         */
     }
+}
+
+result<void> Client::Close(const CloseOptions& options)
+{
+    const auto state = m_state;
+    if (!state) {
+        return result<void>::err(MakeError(ErrorCode::Closed, "http client: closed"));
+    }
+    return state->pool.Close(options);
 }
 
 bool Client::IsClosed() const noexcept
@@ -575,16 +707,13 @@ std::optional<Error> Client::CloseReason() const noexcept
     return state ? state->pool.CloseReason() : std::nullopt;
 }
 
-result<void> Client::Shutdown(bbt::coroutine::Deadline deadline)
+result<void> Client::_WaitReleased(bbt::coroutine::Deadline deadline)
 {
-    if (!NativeHost()) {
-        return result<void>::err(MakeError(ErrorCode::InvalidContext, "http client: Shutdown requires native host"));
-    }
     const auto state = m_state;
     if (!state) {
         return result<void>::err(MakeError(ErrorCode::Closed, "http client: closed"));
     }
-    return state->pool.Shutdown(deadline);
+    return state->pool.Close(bbt::infra::CloseOptions{bbt::infra::CloseMode::Immediate, true, {}, deadline});
 }
 
 PoolStats Client::Stats() const noexcept
@@ -593,26 +722,10 @@ PoolStats Client::Stats() const noexcept
     return state ? state->pool.Stats() : PoolStats{};
 }
 
-} // namespace bbt::infra::http
+// clang-format off
+}
+// clang-format on
 
 namespace bbt::infra::http {
 
-std::optional<std::chrono::milliseconds> PhaseTimeout::Finite() const noexcept
-{
-    if (m_kind != Kind::Finite) {
-        return std::nullopt;
-    }
-    return m_value;
 }
-
-Timeout Timeout::Uniform(PhaseTimeout phase) noexcept
-{
-    Timeout value;
-    value.connect = phase;
-    value.read = phase;
-    value.write = phase;
-    value.pool = phase;
-    return value;
-}
-
-} // namespace bbt::infra::http

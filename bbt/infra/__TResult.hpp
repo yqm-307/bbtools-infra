@@ -42,11 +42,15 @@ template <class T> inline const Error& result<T>::error() const&
     return std::get<1>(m_data);
 }
 
-template <class T> inline result<T>::result(OkTag, T value) : m_data(std::in_place_index<0>, std::move(value))
+template <class T>
+inline result<T>::result(OkTag, T value)
+    : m_data(std::in_place_index<0>, std::move(value))
 {
 }
 
-template <class T> inline result<T>::result(ErrTag, Error error) : m_data(std::in_place_index<1>, std::move(error))
+template <class T>
+inline result<T>::result(ErrTag, Error error)
+    : m_data(std::in_place_index<1>, std::move(error))
 {
 }
 
@@ -62,4 +66,6 @@ template <class T> inline void result<T>::RequireErr() const
         throw std::logic_error("bbt::infra::result: error() on ok result");
 }
 
-} // namespace bbt::infra
+// clang-format off
+}
+// clang-format on

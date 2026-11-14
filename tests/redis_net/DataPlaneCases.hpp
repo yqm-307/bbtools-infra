@@ -1,22 +1,25 @@
-// 由 Test_redis_net_contract.cc 在匿名 namespace 内包含；覆盖 COMMON 数据面契约。
-// 真实后端用例遵守：BBT_REDIS_PORT 必须显式指向本验证自起的实例；缺失（回落
-// 6379 共享实例）一律拒跑返回非零，不触碰共享服务，也不以 skip 冒充绿。
-// 鉴权覆盖复用同一 BBT_REDIS_PORT 无鉴权实例：管理连接现场创建本用例唯一 ACL
-// 用户（pid+随机、临时密码、仅 ~prefix* 键域与所需命令），RAII 清理 key 与
-// DELUSER 并读回；不修改 default 用户密码、不 CONFIG SET requirepass、不动共享
-// 全局鉴权。CLIENT KILL 只按 CLIENT LIST 中归属本用例 ACL 用户的连接 ID 定点
-// 执行，禁止 TYPE normal / SKIPME no 等范围 kill。
-// 单参数 AUTH 编码由受控 Peer 断言（{AUTH,password} 与 {AUTH,user,pass} 两种
-// 线上字节序，SELECT 必在其后）；真实服务端单参 AUTH 冒烟此前在自有
-// requirepass 实例完成（证据见 handoff），CI 不改 default 故本用例不覆盖该真实路径。
-
+/**
+ * 由 Test_redis_net_contract.cc 在匿名 namespace 内包含；覆盖 COMMON 数据面契约。
+ * 真实后端用例遵守：BBT_REDIS_PORT 必须显式指向本验证自起的实例；缺失（回落
+ * 6379 共享实例）一律拒跑返回非零，不触碰共享服务，也不以 skip 冒充绿。
+ * 鉴权覆盖复用同一 BBT_REDIS_PORT 无鉴权实例：管理连接现场创建本用例唯一 ACL
+ * 用户（pid+随机、临时密码、仅 ~prefix* 键域与所需命令），RAII 清理 key 与
+ * DELUSER 并读回；不修改 default 用户密码、不 CONFIG SET requirepass、不动共享
+ * 全局鉴权。CLIENT KILL 只按 CLIENT LIST 中归属本用例 ACL 用户的连接 ID 定点
+ * 执行，禁止 TYPE normal / SKIPME no 等范围 kill。
+ * 单参数 AUTH 编码由受控 Peer 断言（{AUTH,password} 与 {AUTH,user,pass} 两种
+ * 线上字节序，SELECT 必在其后）。真实服务端的单参 AUTH 不在本用例覆盖：它需要
+ * 自带 requirepass 的实例，而 CI 不改 default 用户。
+ */
+using redis::HashEntries;
 using redis::RedisHandshake;
 using redis::SetOptions;
 using redis::TtlResult;
-using redis::HashEntries;
 namespace redis_detail = bbt::infra::redis_detail;
 
-// 显式端口守门：未注入时 RedisPort() 回落 6379（本机有他人共享实例），必须拒绝。
+/**
+ * 显式端口守门：未注入时 RedisPort() 回落 6379（本机有他人共享实例），必须拒绝。
+ */
 int RequiredPort(const char* variable)
 {
     const char* text = std::getenv(variable);
@@ -34,8 +37,8 @@ std::shared_ptr<Client> MakeHandshake(Host& host, net::Address address, RedisHan
     return client;
 }
 
-std::shared_ptr<Pool> MakePoolWith(Host& host, net::Address address, std::size_t connections, std::size_t max_waiters,
-                                   RedisHandshake handshake = {})
+std::shared_ptr<Pool> MakePoolWith(
+    Host& host, net::Address address, std::size_t connections, std::size_t max_waiters, RedisHandshake handshake = {})
 {
     Pool::PoolOptions opts{connections, max_waiters, std::move(handshake)};
     auto value = Pool::Create(host.engine, address, opts);
@@ -43,17 +46,25 @@ std::shared_ptr<Pool> MakePoolWith(Host& host, net::Address address, std::size_t
     return std::move(value).value();
 }
 
-// 同一 BBT_REDIS_PORT 实例上的同步管理连接：只做 ACL 管理/SELECT/读回/DEL/
-// CLIENT LIST+KILL，不属于被测面。BBT_AUTHED_REDIS_* 已由本夹具取代。
+/**
+ * 同一 BBT_REDIS_PORT 实例上的同步管理连接：只做 ACL 管理/SELECT/读回/DEL/
+ * CLIENT LIST+KILL，不属于被测面。BBT_AUTHED_REDIS_* 已由本夹具取代。
+ */
 class AdminRedis {
 public:
-    explicit AdminRedis(int port) : m_context(redisConnectWithTimeout("127.0.0.1", port, timeval{2, 0}), &redisFree)
+    explicit AdminRedis(int port)
+        : m_context(redisConnectWithTimeout("127.0.0.1", port, timeval{2, 0}), &redisFree)
     {
         CHECK(m_context && m_context->err == 0);
         CHECK(redisSetTimeout(m_context.get(), timeval{2, 0}) == REDIS_OK);
         const int db_count = DbCount();
-        CHECK(db_count > 2); // 用例依赖 db2 存在；CI 默认 16 库。
+
+        /**
+         * 用例依赖 db2 存在；CI 默认 16 库。
+         */
+        CHECK(db_count > 2);
     }
+
     Reply Command(std::vector<std::string> args)
     {
         std::vector<const char*> argv;
@@ -62,14 +73,18 @@ public:
             argv.push_back(arg.data());
             lens.push_back(arg.size());
         }
-        Reply reply(static_cast<redisReply*>(
-                        redisCommandArgv(m_context.get(), static_cast<int>(argv.size()), argv.data(), lens.data())),
-                    &freeReplyObject);
+        Reply reply(
+            static_cast<redisReply*>(
+                redisCommandArgv(m_context.get(), static_cast<int>(argv.size()), argv.data(), lens.data())),
+            &freeReplyObject);
         CHECK(reply);
         return reply;
     }
-    // CLIENT LIST 中归属某 ACL 用户的连接 id；只读这些 id 做定点 KILL，
-    // 拒绝 TYPE normal / SKIPME no / 通配等会波及他人连接的范围 kill。
+
+    /**
+     * CLIENT LIST 中归属某 ACL 用户的连接 id；只读这些 id 做定点 KILL，
+     * 拒绝 TYPE normal / SKIPME no / 通配等会波及他人连接的范围 kill。
+     */
     std::vector<std::string> ClientIdsByUser(const std::string& user)
     {
         auto reply = Command({"CLIENT", "LIST"});
@@ -93,6 +108,7 @@ public:
         }
         return ids;
     }
+
     void KillClientsByUser(const std::string& user)
     {
         for (const auto& id : ClientIdsByUser(user)) {
@@ -108,14 +124,21 @@ private:
         if (reply->type == REDIS_REPLY_ARRAY && reply->elements == 2 && reply->element[1]->type == REDIS_REPLY_STRING) {
             return std::atoi(reply->element[1]->str);
         }
-        return 16; // Redis >= 7.0.2 对无 CONFIG 权限用户返回空数组；未禁用时回默认。
+
+        /**
+         * Redis >= 7.0.2 对无 CONFIG 权限用户返回空数组；未禁用时回默认。
+         */
+        return 16;
     }
+
     std::unique_ptr<redisContext, decltype(&redisFree)> m_context;
 };
 
-// 本用例唯一 ACL 用户的 RAII：创建即限定 ~prefix* 键域与命令集；析构无条件
-// DELUSER + GETUSER 读回确认（成功路径已经显式清理过则仅复核）。用户名与
-// 密码均为进程临时值，不落盘也不进任何错误消息。
+/**
+ * 本用例唯一 ACL 用户的 RAII：创建即限定 ~prefix* 键域与命令集；析构无条件
+ * DELUSER + GETUSER 读回确认（成功路径已经显式清理过则仅复核）。用户名与
+ * 密码均为进程临时值，不落盘也不进任何错误消息。
+ */
 class ScopedAclUser {
 public:
     ScopedAclUser(AdminRedis& admin, const std::string& prefix, const std::vector<std::string>& commands)
@@ -130,26 +153,30 @@ public:
         CHECK(created->type == REDIS_REPLY_STATUS);
         m_active = true;
     }
+
     ~ScopedAclUser()
     {
-        // 与 RealRedis 析构同款：清理失败不抛穿栈展开，只标记由 Run() 末尾核对。
+
+        /**
+         * 与 RealRedis 析构同款：清理失败不抛穿栈展开，只标记由 Run() 末尾核对。
+         */
         try {
             Clear();
         } catch (const std::exception& e) {
             std::cerr << "acl_cleanup_failed " << e.what() << "\n";
         }
     }
+
     ScopedAclUser(const ScopedAclUser&) = delete;
     ScopedAclUser& operator=(const ScopedAclUser&) = delete;
-    const std::string& user() const
-    {
-        return m_user;
-    }
-    const std::string& password() const
-    {
-        return m_password;
-    }
-    // 显式清理：DELUSER 返回 1 且 GETUSER 读回 nil。
+
+    const std::string& user() const { return m_user; }
+
+    const std::string& password() const { return m_password; }
+
+    /**
+     * 显式清理：DELUSER 返回 1 且 GETUSER 读回 nil。
+     */
     void Clear()
     {
         if (!m_active) {
@@ -170,13 +197,18 @@ private:
     bool m_active{false};
 };
 
-// db2 上受控 key 的 RAII：写后本用例仍须把 db 复位回 0，异常路径同样清理
-// 并读回，不把残留留给共享实例。
+/**
+ * db2 上受控 key 的 RAII：写后本用例仍须把 db 复位回 0，异常路径同样清理
+ * 并读回，不把残留留给共享实例。
+ */
 class ScopedDbKey {
 public:
-    ScopedDbKey(AdminRedis& admin, std::string key) : m_admin(admin), m_key(std::move(key))
+    ScopedDbKey(AdminRedis& admin, std::string key)
+        : m_admin(admin)
+        , m_key(std::move(key))
     {
     }
+
     ~ScopedDbKey()
     {
         try {
@@ -185,9 +217,13 @@ public:
             std::cerr << "db2_cleanup_failed " << e.what() << "\n";
         }
     }
+
     ScopedDbKey(const ScopedDbKey&) = delete;
     ScopedDbKey& operator=(const ScopedDbKey&) = delete;
-    // 读回：SELECT 2 → GET → SELECT 0；调用方负责断言内容。
+
+    /**
+     * 读回：SELECT 2 → GET → SELECT 0；调用方负责断言内容。
+     */
     std::optional<std::string> ReadFromDb2()
     {
         CHECK(m_admin.Command({"SELECT", "2"})->type == REDIS_REPLY_STATUS);
@@ -199,6 +235,7 @@ public:
         CHECK(m_admin.Command({"SELECT", "0"})->type == REDIS_REPLY_STATUS);
         return text;
     }
+
     void Clear()
     {
         if (m_key.empty()) {
@@ -218,7 +255,9 @@ private:
     std::string m_key;
 };
 
-// 定点 kill 本用例 ACL 用户的连接并断言前后归属集合；只杀已确认归属的 ID。
+/**
+ * 定点 kill 本用例 ACL 用户的连接并断言前后归属集合；只杀已确认归属的 ID。
+ */
 void KillOwnedConnections(AdminRedis& admin, const ScopedAclUser& acl)
 {
     CHECK(!admin.ClientIdsByUser(acl.user()).empty());
@@ -226,7 +265,9 @@ void KillOwnedConnections(AdminRedis& admin, const ScopedAclUser& acl)
     CHECK(admin.ClientIdsByUser(acl.user()).empty());
 }
 
-// ── SET 选项（COMMON）────────────────────────────────────────────
+/**
+ * ── SET 选项（COMMON）────────────────────────────────────────────
+ */
 void SetOptionsContract()
 {
     const int port = RequiredPort("BBT_REDIS_PORT");
@@ -240,7 +281,9 @@ void SetOptionsContract()
     const auto missing = backend.Key("set-opts-missing");
     const auto reject = backend.Key("set-opts-reject");
 
-    // NX：第一次 true，重复 false（nil 是合法终态不是错误）。
+    /**
+     * NX：第一次 true，重复 false（nil 是合法终态不是错误）。
+     */
     SetOptions nx_opt;
     nx_opt.condition = SetOptions::Condition::NX;
     auto first = host.Call([&] { return bbt_co_await cli->Set(nx, "v1", nx_opt, Until()); });
@@ -250,7 +293,9 @@ void SetOptionsContract()
     auto got = backend.Command({"GET", nx});
     CHECK(got->type == REDIS_REPLY_STRING && std::string(got->str, got->len) == "v1");
 
-    // XX：缺失 key false；已存在 true 并覆盖。
+    /**
+     * XX：缺失 key false；已存在 true 并覆盖。
+     */
     SetOptions xx_opt;
     xx_opt.condition = SetOptions::Condition::XX;
     auto xx_miss = host.Call([&] { return bbt_co_await cli->Set(missing, "x", xx_opt, Until()); });
@@ -263,47 +308,65 @@ void SetOptionsContract()
     got = backend.Command({"GET", xx});
     CHECK(std::string(got->str, got->len) == "new");
 
-    // 过期以毫秒表达（线上 PX）：PTTL 读回落在 (0, 设定值]。
+    /**
+     * 过期以毫秒表达（线上 PX）：PTTL 读回落在 (0, 设定值]。
+     */
     SetOptions px_opt;
     px_opt.expire = std::chrono::milliseconds{60000};
     auto with_ttl = host.Call([&] { return bbt_co_await cli->Set(px, "ttl", px_opt, Until()); });
     CHECK(with_ttl && with_ttl.value());
     auto pttl = backend.Command({"PTTL", px});
     CHECK(pttl->type == REDIS_REPLY_INTEGER && pttl->integer > 0 && pttl->integer <= 60000);
-    // EX 语义由毫秒表达（=chrono 秒换算），同样经 PTTL 观察。
+
+    /**
+     * EX 语义由毫秒表达（=chrono 秒换算），同样经 PTTL 观察。
+     */
     SetOptions ex_opt;
     ex_opt.expire = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::seconds{30});
     const auto ex_key = backend.Key("set-opts-ex");
     CHECK(host.Call([&] { return bbt_co_await cli->Set(ex_key, "ex", ex_opt, Until()); }).value());
     pttl = backend.Command({"PTTL", ex_key});
     CHECK(pttl->integer > 0 && pttl->integer <= 30000);
-    // NX+PX 组合：条件不满足时仍返回 false，且不刷新 TTL。
+
+    /**
+     * NX+PX 组合：条件不满足时仍返回 false，且不刷新 TTL。
+     */
     SetOptions both;
     both.condition = SetOptions::Condition::NX;
     both.expire = std::chrono::milliseconds{5000};
     auto combo = host.Call([&] { return bbt_co_await cli->Set(px, "other", both, Until()); });
     CHECK(combo && !combo.value());
 
-    // 非法选项零接纳：后端读回证明什么都没写。
+    /**
+     * 非法选项零接纳：后端读回证明什么都没写。
+     */
     SetOptions zero;
     zero.expire = std::chrono::milliseconds{0};
-    ExpectCode(host.Call([&] { return bbt_co_await cli->Set(reject, "v", zero, Until()); }),
-               ErrorCode::InvalidArgument);
+    ExpectCode(
+        host.Call([&] { return bbt_co_await cli->Set(reject, "v", zero, Until()); }), ErrorCode::InvalidArgument);
     SetOptions negative;
     negative.expire = std::chrono::milliseconds{-5};
-    ExpectCode(host.Call([&] { return bbt_co_await cli->Set(reject, "v", negative, Until()); }),
-               ErrorCode::InvalidArgument);
+    ExpectCode(
+        host.Call([&] { return bbt_co_await cli->Set(reject, "v", negative, Until()); }), ErrorCode::InvalidArgument);
     SetOptions over;
     over.expire = redis::kMaxSetExpire + std::chrono::milliseconds{1};
-    ExpectCode(host.Call([&] { return bbt_co_await cli->Set(reject, "v", over, Until()); }),
-               ErrorCode::InvalidArgument);
+    ExpectCode(
+        host.Call([&] { return bbt_co_await cli->Set(reject, "v", over, Until()); }), ErrorCode::InvalidArgument);
     ExpectCode(host.Call([&] { return bbt_co_await cli->Set({}, "v", nx_opt, Until()); }), ErrorCode::InvalidArgument);
     auto rejected = backend.Command({"EXISTS", reject});
-    CHECK(rejected->type == REDIS_REPLY_INTEGER && rejected->integer == 0); // 三次零接纳都没写
+
+    /**
+     * 三次零接纳都没写
+     */
+    CHECK(rejected->type == REDIS_REPLY_INTEGER && rejected->integer == 0);
     SetOptions boundary;
     boundary.expire = redis::kMaxSetExpire;
     auto at_max = host.Call([&] { return bbt_co_await cli->Set(reject, "v", boundary, Until()); });
-    CHECK(at_max && at_max.value()); // 上界本身是合法的
+
+    /**
+     * 上界本身是合法的
+     */
+    CHECK(at_max && at_max.value());
     CHECK(host.Call([&] { return bbt_co_await cli->Ping(Until()); }));
 
     cli.reset();
@@ -313,7 +376,9 @@ void SetOptionsContract()
                  "rejected_zero_accept=4 boundary_ok=1 same_stream_ping=1\n";
 }
 
-// ── Expire / Ttl 三态（COMMON）───────────────────────────────────
+/**
+ * ── Expire / Ttl 三态（COMMON）───────────────────────────────────
+ */
 void ExpireTtlContract()
 {
     const int port = RequiredPort("BBT_REDIS_PORT");
@@ -325,21 +390,33 @@ void ExpireTtlContract()
     const auto missing = backend.Key("ttl-missing");
 
     CHECK(host.Call([&] { return bbt_co_await cli->Set(key, "v", Until()); }));
-    // 无过期 key → NoExpiry。
+
+    /**
+     * 无过期 key → NoExpiry。
+     */
     auto ttl = host.Call([&] { return bbt_co_await cli->Ttl(key, Until()); });
     CHECK(ttl && ttl.value().state == TtlResult::State::NoExpiry);
-    // PEXPIRE → Expires，剩余毫秒在 (0, ttl]。
+
+    /**
+     * PEXPIRE → Expires，剩余毫秒在 (0, ttl]。
+     */
     auto set_expire = host.Call([&] { return bbt_co_await cli->Expire(key, 9000ms, Until()); });
     CHECK(set_expire && set_expire.value());
     ttl = host.Call([&] { return bbt_co_await cli->Ttl(key, Until()); });
     CHECK(ttl && ttl.value().state == TtlResult::State::Expires);
     CHECK(ttl.value().remaining > 0ms && ttl.value().remaining <= 9000ms);
-    // 不存在 key：Expire false、Ttl KeyMissing；负 TTL 断言字段为零不泄漏魔数。
+
+    /**
+     * 不存在 key：Expire false、Ttl KeyMissing；负 TTL 断言字段为零不泄漏魔数。
+     */
     auto gone = host.Call([&] { return bbt_co_await cli->Expire(missing, 1000ms, Until()); });
     CHECK(gone && !gone.value());
     ttl = host.Call([&] { return bbt_co_await cli->Ttl(missing, Until()); });
     CHECK(ttl && ttl.value().state == TtlResult::State::KeyMissing && ttl.value().remaining == 0ms);
-    // ttl<=0 非法 → InvalidArgument 零接纳；空 key 同。
+
+    /**
+     * ttl<=0 非法 → InvalidArgument 零接纳；空 key 同。
+     */
     ExpectCode(host.Call([&] { return bbt_co_await cli->Expire(key, 0ms, Until()); }), ErrorCode::InvalidArgument);
     ExpectCode(host.Call([&] { return bbt_co_await cli->Expire(key, -1ms, Until()); }), ErrorCode::InvalidArgument);
     ExpectCode(host.Call([&] { return bbt_co_await cli->Expire({}, 1000ms, Until()); }), ErrorCode::InvalidArgument);
@@ -352,7 +429,9 @@ void ExpireTtlContract()
     std::cout << "expire_ttl three_states=3 pexpire_tf=2 remaining_in_range=1 invalid_rejected=4\n";
 }
 
-// ── INCR 族（COMMON）─────────────────────────────────────────────
+/**
+ * ── INCR 族（COMMON）─────────────────────────────────────────────
+ */
 void IncrFamilyContract()
 {
     const int port = RequiredPort("BBT_REDIS_PORT");
@@ -375,18 +454,30 @@ void IncrFamilyContract()
     auto negative = host.Call([&] { return bbt_co_await cli->IncrBy(counter, -20, Until()); });
     CHECK(negative && negative.value() == -14);
 
-    // 非整数值 → RemoteError，连接保持（RemoteError 是唯一保留连接的错误）。
+    /**
+     * 非整数值 → RemoteError，连接保持（RemoteError 是唯一保留连接的错误）。
+     */
     CHECK(backend.Command({"SET", bad, "not-a-number"})->type == REDIS_REPLY_STATUS);
     auto failed = host.Call([&] { return bbt_co_await cli->Incr(bad, Until()); });
     ExpectCode(failed, ErrorCode::RemoteError);
     CHECK(host.Call([&] { return bbt_co_await cli->Ping(Until()); }));
     value = host.Call([&] { return bbt_co_await cli->Incr(counter, Until()); });
-    CHECK(value && value.value() == -13); // 同一条流继续可用
-    // 溢出同样 RemoteError。
+
+    /**
+     * 同一条流继续可用
+     */
+    CHECK(value && value.value() == -13);
+
+    /**
+     * 溢出同样 RemoteError。
+     */
     CHECK(backend.Command({"SET", overflow, "9223372036854775807"})->type == REDIS_REPLY_STATUS);
     ExpectCode(host.Call([&] { return bbt_co_await cli->Incr(overflow, Until()); }), ErrorCode::RemoteError);
     CHECK(host.Call([&] { return bbt_co_await cli->Ping(Until()); }));
-    // 空 key 零接纳。
+
+    /**
+     * 空 key 零接纳。
+     */
     ExpectCode(host.Call([&] { return bbt_co_await cli->Incr({}, Until()); }), ErrorCode::InvalidArgument);
     CHECK(host.Call([&] { return bbt_co_await cli->Ping(Until()); }));
 
@@ -396,7 +487,9 @@ void IncrFamilyContract()
     std::cout << "incr_family values=5 nonint=RemoteError overflow=RemoteError stream_kept=3 empty_reject=1\n";
 }
 
-// ── Hash（COMMON）────────────────────────────────────────────────
+/**
+ * ── Hash（COMMON）────────────────────────────────────────────────
+ */
 void HashContract()
 {
     const int port = RequiredPort("BBT_REDIS_PORT");
@@ -408,13 +501,23 @@ void HashContract()
     const auto empty_hash = backend.Key("hash-empty");
     const auto wrong = backend.Key("hash-wrongtype");
 
-    // 二进制安全 field/value（含 NUL 与 0xff）。
+    /**
+     * 二进制安全 field/value（含 NUL 与 0xff）。
+     */
     const std::string field_bin("f\0bin", 5);
     const std::string value_bin("v\0\xff\r\n", 5);
     auto created = host.Call([&] { return bbt_co_await cli->HSet(hash, field_bin, value_bin, Until()); });
-    CHECK(created && created.value()); // 新建字段 true
+
+    /**
+     * 新建字段 true
+     */
+    CHECK(created && created.value());
     created = host.Call([&] { return bbt_co_await cli->HSet(hash, field_bin, "v2", Until()); });
-    CHECK(created && !created.value()); // 覆盖 false
+
+    /**
+     * 覆盖 false
+     */
+    CHECK(created && !created.value());
     auto got = host.Call([&] { return bbt_co_await cli->HGet(hash, field_bin, Until()); });
     CHECK(got && got.value() && *got.value() == "v2");
     auto exists = host.Call([&] { return bbt_co_await cli->HExists(hash, field_bin, Until()); });
@@ -424,11 +527,16 @@ void HashContract()
     got = host.Call([&] { return bbt_co_await cli->HGet(hash, "absent", Until()); });
     CHECK(got && !got.value());
 
-    // 多字段 + 顺序读回：后端 LPUSH 顺序写入 f1..f3 后用 HGETALL 对拍顺序。
+    /**
+     * 多字段 + 顺序读回：后端 LPUSH 顺序写入 f1..f3 后用 HGETALL 对拍顺序。
+     */
     CHECK(backend.Command({"HSET", hash, "f1", "1", "f2", "2", "f3", "3"})->type == REDIS_REPLY_INTEGER);
     auto all = host.Call([&] { return bbt_co_await cli->HGetAll(hash, Until()); });
     CHECK(all && all.value().size() == 4);
-    // HGETALL 顺序与服务端一致：直接用 hiredis 对拍同一份序列。
+
+    /**
+     * HGETALL 顺序与服务端一致：直接用 hiredis 对拍同一份序列。
+     */
     auto raw = backend.Command({"HGETALL", hash});
     CHECK(raw->type == REDIS_REPLY_ARRAY && raw->elements == all.value().size() * 2);
     for (std::size_t i = 0; i < all.value().size(); ++i) {
@@ -436,17 +544,28 @@ void HashContract()
         CHECK(field == std::string(raw->element[i * 2]->str, raw->element[i * 2]->len));
         CHECK(value == std::string(raw->element[i * 2 + 1]->str, raw->element[i * 2 + 1]->len));
     }
-    // 二进制 field 也在序列中。
-    CHECK(std::find_if(all.value().begin(), all.value().end(),
-                       [&](const auto& pair) { return pair.first == field_bin && pair.second == "v2"; })
-          != all.value().end());
 
-    // HDel：返回删除数；空 fields 非法。
+    /**
+     * 二进制 field 也在序列中。
+     */
+    CHECK(
+        std::find_if(
+            all.value().begin(),
+            all.value().end(),
+            [&](const auto& pair) { return pair.first == field_bin && pair.second == "v2"; })
+        != all.value().end());
+
+    /**
+     * HDel：返回删除数；空 fields 非法。
+     */
     auto removed = host.Call([&] { return bbt_co_await cli->HDel(hash, {"f1", "f2", "f3", "absent"}, Until()); });
     CHECK(removed && removed.value() == 3);
     removed = host.Call([&] { return bbt_co_await cli->HDel(hash, {"f1"}, Until()); });
     CHECK(removed && removed.value() == 0);
-    // 空 hash：HGETALL 返回空序列而非错误。
+
+    /**
+     * 空 hash：HGETALL 返回空序列而非错误。
+     */
     CHECK(backend.Command({"HSET", empty_hash, "tmp", "x"})->type == REDIS_REPLY_INTEGER);
     CHECK(backend.Command({"HDEL", empty_hash, "tmp"})->integer == 1);
     all = host.Call([&] { return bbt_co_await cli->HGetAll(empty_hash, Until()); });
@@ -454,7 +573,9 @@ void HashContract()
     exists = host.Call([&] { return bbt_co_await cli->HExists(empty_hash, "tmp", Until()); });
     CHECK(exists && !exists.value());
 
-    // WRONGTYPE → RemoteError 且连接仍可用。
+    /**
+     * WRONGTYPE → RemoteError 且连接仍可用。
+     */
     CHECK(backend.Command({"LPUSH", wrong, "item"})->type == REDIS_REPLY_INTEGER);
     ExpectCode(host.Call([&] { return bbt_co_await cli->HGet(wrong, "f", Until()); }), ErrorCode::RemoteError);
     ExpectCode(host.Call([&] { return bbt_co_await cli->HGetAll(wrong, Until()); }), ErrorCode::RemoteError);
@@ -463,7 +584,9 @@ void HashContract()
     got = host.Call([&] { return bbt_co_await cli->HGet(hash, field_bin, Until()); });
     CHECK(got && got.value() && *got.value() == "v2");
 
-    // 空 key / 空 field / 空 fields 列表 → InvalidArgument 零接纳。
+    /**
+     * 空 key / 空 field / 空 fields 列表 → InvalidArgument 零接纳。
+     */
     ExpectCode(host.Call([&] { return bbt_co_await cli->HSet({}, "f", "v", Until()); }), ErrorCode::InvalidArgument);
     ExpectCode(host.Call([&] { return bbt_co_await cli->HSet(hash, {}, "v", Until()); }), ErrorCode::InvalidArgument);
     ExpectCode(host.Call([&] { return bbt_co_await cli->HGet(hash, {}, Until()); }), ErrorCode::InvalidArgument);
@@ -481,26 +604,41 @@ void HashContract()
                  "wrongtype=RemoteError stream_kept=2 invalid_rejected=8\n";
 }
 
-// ── AUTH/SELECT 握手（COMMON）────────────────────────────────────
-// 复用 BBT_REDIS_PORT 无鉴权实例：管理连接现场创建本用例唯一 ACL 用户
-//（~prefix* 键域 + +@connection +get +set），真实验证双参 AUTH/SELECT/错误
-// 密码/定点 CLIENT KILL 后重建连接重握手。单参数 AUTH 编码由 Peer 静态断言；
-// 不改 default 用户与全局鉴权，CI 单实例即可跑。
+/**
+ * ── AUTH/SELECT 握手（COMMON）────────────────────────────────────
+ * 复用 BBT_REDIS_PORT 无鉴权实例：管理连接现场创建本用例唯一 ACL 用户
+ * （~prefix* 键域 + +@connection +get +set），真实验证双参 AUTH/SELECT/错误
+ * 密码/定点 CLIENT KILL 后重建连接重握手。单参数 AUTH 编码由 Peer 静态断言；
+ * 不改 default 用户与全局鉴权，CI 单实例即可跑。
+ */
 void HandshakeAuthSelect()
 {
     const int port = RequiredPort("BBT_REDIS_PORT");
-    RealRedis backend; // 管理本用例唯一 key 前缀与 DEL 读回
+
+    /**
+     * 管理本用例唯一 key 前缀与 DEL 读回
+     */
+    RealRedis backend;
     AdminRedis admin(port);
     const auto prefix = backend.Prefix();
-    // ACL 用户命令集：AUTH 自身握手之外的被测命令 + 管理面不需的键内命令。
+
+    /**
+     * ACL 用户命令集：AUTH 自身握手之外的被测命令 + 管理面不需的键内命令。
+     */
     ScopedAclUser acl(admin, prefix, {"+@connection", "+get", "+set"});
     const auto key0 = backend.Key("db0");
     const auto key2 = backend.Key("db2");
-    ScopedDbKey db2(admin, key2); // db2 上 key2 的 RAII：异常路径同样 DEL+复位 db0
+
+    /**
+     * db2 上 key2 的 RAII：异常路径同样 DEL+复位 db0
+     */
+    ScopedDbKey db2(admin, key2);
     std::random_device rnd;
 
-    // 1) 单参数 AUTH 线上编码断言（受控 Peer，确定性）：user 空时编码为
-    // {AUTH,password}，SELECT 在其后；两端 byte 序对拍真实客户端。
+    /**
+     * 1) 单参数 AUTH 线上编码断言（受控 Peer，确定性）：user 空时编码为
+     * {AUTH,password}，SELECT 在其后；两端 byte 序对拍真实客户端。
+     */
     for (const bool with_select : {false, true}) {
         const std::string pass = "static-pass-" + std::to_string(rnd());
         Peer peer([&](int fd) {
@@ -517,30 +655,39 @@ void HandshakeAuthSelect()
         auto cli = MakeHandshake(host, peer.address, {"", pass, with_select ? 2 : -1});
         host.Connect(cli);
         CHECK(host.Call([&] { return bbt_co_await cli->Ping(Until()); }));
-        cli->Close();
+        (void)cli->Close();
         cli.reset();
         peer.Join();
         host.Finish();
     }
 
-    // 2) AUTH + SELECT db2：双参 AUTH 成功；写入只落 db2（第二个 client 从 db0 读不回）。
+    /**
+     * 2) AUTH + SELECT db2：双参 AUTH 成功；写入只落 db2（第二个 client 从 db0 读不回）。
+     */
     Host host_ready;
     {
         auto writer = MakeHandshake(host_ready, Loopback(port), {acl.user(), acl.password(), 2});
         host_ready.Connect(writer);
         CHECK(host_ready.Call([&] { return bbt_co_await writer->Set(key2, "in-db2", Until()); }));
-        writer->Close();
+        (void)writer->Close();
         writer.reset();
         auto reader = MakeHandshake(host_ready, Loopback(port), {acl.user(), acl.password(), 0});
         host_ready.Connect(reader);
         auto in0 = host_ready.Call([&] { return bbt_co_await reader->Get(key2, Until()); });
-        CHECK(in0 && !in0.value()); // db0 不可见
-        reader->Close();
+
+        /**
+         * db0 不可见
+         */
+        CHECK(in0 && !in0.value());
+        (void)reader->Close();
         reader.reset();
         auto seen = db2.ReadFromDb2();
         CHECK(seen && *seen == "in-db2");
     }
-    // 3) 错误密码：握手失败 RemoteError，错误文本不含密码，client 可 Close。
+
+    /**
+     * 3) 错误密码：握手失败 RemoteError，错误文本不含密码，client 可 Close。
+     */
     {
         const std::string wrong_pass = "wrong-" + std::to_string(rnd());
         auto cli = MakeHandshake(host_ready, Loopback(port), {acl.user(), wrong_pass, -1});
@@ -552,22 +699,32 @@ void HandshakeAuthSelect()
             CHECK(v.find(wrong_pass) == std::string::npos);
         }
         ExpectCode(host_ready.Call([&] { return bbt_co_await cli->Ping(Until()); }), ErrorCode::TransportError);
-        cli->Close(); // 握手失败后 Close 仍然正常
+
+        /**
+         * 握手失败后 Close 仍然正常
+         */
+        (void)cli->Close();
         cli.reset();
     }
-    // 4) ACL 用户名 + 密码双参数 AUTH（键域限定 ~prefix*）：写入读回在管理连接可见。
+
+    /**
+     * 4) ACL 用户名 + 密码双参数 AUTH（键域限定 ~prefix*）：写入读回在管理连接可见。
+     */
     {
         auto cli = MakeHandshake(host_ready, Loopback(port), {acl.user(), acl.password(), -1});
         host_ready.Connect(cli);
         CHECK(host_ready.Call([&] { return bbt_co_await cli->Ping(Until()); }));
         auto who = host_ready.Call([&] { return bbt_co_await cli->Set(key0, "acl", Until()); });
         CHECK(who);
-        cli->Close();
+        (void)cli->Close();
         cli.reset();
     }
-    // 5) 非法库序号：Create 拒绝（Client 侧校验，不经网络）；服务端 databases
-    // 上限之外（默认 16，用回 DbCount 探测值）走服务端 ERR → RemoteError，
-    // 退役不泄漏密码。
+
+    /**
+     * 5) 非法库序号：Create 拒绝（Client 侧校验，不经网络）；服务端 databases
+     * 上限之外（默认 16，用回 DbCount 探测值）走服务端 ERR → RemoteError，
+     * 退役不泄漏密码。
+     */
     {
         auto invalid =
             Client::Create(host_ready.engine, Loopback(port), {acl.user(), acl.password(), redis::kMaxDatabase + 1});
@@ -579,26 +736,35 @@ void HandshakeAuthSelect()
         if (!failed) {
             ExpectCode(failed, ErrorCode::RemoteError);
             CHECK(failed.error().message.find(acl.password()) == std::string::npos);
-            cli->Close();
+            (void)cli->Close();
         }
         cli.reset();
     }
-    // 6) CLIENT KILL 后显式 Connect 重新握手：只杀已确认归属本用例 ACL 用户的
-    // 连接 ID；死流→Connect→命令恢复且重连后 AUTH+SELECT 重放（仍落 db2）。
+
+    /**
+     * 6) CLIENT KILL 后显式 Connect 重新握手：只杀已确认归属本用例 ACL 用户的
+     * 连接 ID；死流→Connect→命令恢复且重连后 AUTH+SELECT 重放（仍落 db2）。
+     */
     {
         auto cli = MakeHandshake(host_ready, Loopback(port), {acl.user(), acl.password(), 2});
         host_ready.Connect(cli);
         CHECK(host_ready.Call([&] { return bbt_co_await cli->Set(key2, "before-kill", Until()); }));
         KillOwnedConnections(admin, acl);
-        // 死流：下一条命令区分 TransportError/OutcomeUnknown 皆可，重点是必须失败。
+
+        /**
+         * 死流：下一条命令区分 TransportError/OutcomeUnknown 皆可，重点是必须失败。
+         */
         auto dead = host_ready.Call([&] { return bbt_co_await cli->Ping(Until(300ms)); });
         CHECK(!dead);
-        // 显式 Connect 重新握手（AUTH+SELECT 重放），随后命令成功且落在 db2。
+
+        /**
+         * 显式 Connect 重新握手（AUTH+SELECT 重放），随后命令成功且落在 db2。
+         */
         host_ready.Connect(cli);
         CHECK(host_ready.Call([&] { return bbt_co_await cli->Set(key2, "after-kill", Until()); }));
         auto seen = db2.ReadFromDb2();
         CHECK(seen && *seen == "after-kill");
-        cli->Close();
+        (void)cli->Close();
         cli.reset();
     }
     acl.Clear();
@@ -609,7 +775,9 @@ void HandshakeAuthSelect()
                  "db_range_rejected=2 client_kill_owned_ids=1 reconnect_handshake=1\n";
 }
 
-// ── 池层镜像（COMMON）：每条新命令经池借还执行。─────────────────────
+/**
+ * ── 池层镜像（COMMON）：每条新命令经池借还执行。─────────────────────
+ */
 void PoolNewCommands()
 {
     const int port = RequiredPort("BBT_REDIS_PORT");
@@ -620,26 +788,37 @@ void PoolNewCommands()
     const auto key = backend.Key("pool-new-key");
     const auto hash = backend.Key("pool-new-hash");
 
-    // Set 选项经池：NX false/true + PX。
+    /**
+     * Set 选项经池：NX false/true + PX。
+     */
     SetOptions nx;
     nx.condition = SetOptions::Condition::NX;
     CHECK(host.Call([&] { return bbt_co_await pool->Set(key, "p1", nx, Until()); }).value());
     auto again = host.Call([&] { return bbt_co_await pool->Set(key, "p2", nx, Until()); });
     CHECK(again && !again.value());
-    // Expire/Ttl 三态。
+
+    /**
+     * Expire/Ttl 三态。
+     */
     CHECK(host.Call([&] { return bbt_co_await pool->Expire(key, 8000ms, Until()); }).value());
     auto ttl = host.Call([&] { return bbt_co_await pool->Ttl(key, Until()); });
     CHECK(ttl && ttl.value().state == TtlResult::State::Expires);
     ttl = host.Call([&] { return bbt_co_await pool->Ttl(backend.Key("pool-new-miss"), Until()); });
     CHECK(ttl && ttl.value().state == TtlResult::State::KeyMissing);
-    // INCR 族。
+
+    /**
+     * INCR 族。
+     */
     auto n = host.Call([&] { return bbt_co_await pool->IncrBy(key + "-c", 5, Until()); });
     CHECK(n && n.value() == 5);
     n = host.Call([&] { return bbt_co_await pool->Decr(key + "-c", Until()); });
     CHECK(n && n.value() == 4);
     auto miss_del = backend.Command({"DEL", key + "-c"});
     CHECK(miss_del->integer == 1);
-    // Hash 五条。
+
+    /**
+     * Hash 五条。
+     */
     CHECK(host.Call([&] { return bbt_co_await pool->HSet(hash, "f", "v", Until()); }).value());
     auto hg = host.Call([&] { return bbt_co_await pool->HGet(hash, "f", Until()); });
     CHECK(hg && hg.value() && *hg.value() == "v");
@@ -648,16 +827,22 @@ void PoolNewCommands()
     CHECK(ha && ha.value().size() == 1 && ha.value()[0].first == "f" && ha.value()[0].second == "v");
     auto hd = host.Call([&] { return bbt_co_await pool->HDel(hash, {"f"}, Until()); });
     CHECK(hd && hd.value() == 1);
-    // 池层 RemoteError 同样只退役该条命令的连接归属……WRONGTYPE 不退役连接。
+
+    /**
+     * 池层 RemoteError 同样只退役该条命令的连接归属……WRONGTYPE 不退役连接。
+     */
     const auto wrong = backend.Key("pool-new-wrong");
     CHECK(backend.Command({"LPUSH", wrong, "x"})->type == REDIS_REPLY_INTEGER);
     ExpectCode(host.Call([&] { return bbt_co_await pool->HGet(wrong, "f", Until()); }), ErrorCode::RemoteError);
     CHECK(host.Call([&] { return bbt_co_await pool->Ping(Until()); }));
-    // 池层 InvalidArgument 零接纳。
+
+    /**
+     * 池层 InvalidArgument 零接纳。
+     */
     ExpectCode(host.Call([&] { return bbt_co_await pool->Expire(key, 0ms, Until()); }), ErrorCode::InvalidArgument);
     ExpectCode(host.Call([&] { return bbt_co_await pool->HDel(hash, {}, Until()); }), ErrorCode::InvalidArgument);
 
-    pool->Close();
+    (void)pool->Close();
     CHECK(pool->IsClosed());
     pool.reset();
     host.Finish();
@@ -665,9 +850,11 @@ void PoolNewCommands()
     std::cout << "pool_new_commands set_opts=2 expire_ttl=3 incr=2 hash=5 wrongtype=1 invalid=2\n";
 }
 
-// ── 池握手（COMMON）：PoolOptions.handshake 对每条池连接生效；失败归还预算。──
-// 与 HandshakeAuthSelect 共用同一 BBT_REDIS_PORT 实例和本用例唯一 ACL 用户；
-// CLIENT KILL 只针对已确认归属的 ID，范围 kill 禁用。
+/**
+ * ── 池握手（COMMON）：PoolOptions.handshake 对每条池连接生效；失败归还预算。──
+ * 与 HandshakeAuthSelect 共用同一 BBT_REDIS_PORT 实例和本用例唯一 ACL 用户；
+ * CLIENT KILL 只针对已确认归属的 ID，范围 kill 禁用。
+ */
 void PoolHandshakeAuth()
 {
     const int port = RequiredPort("BBT_REDIS_PORT");
@@ -679,14 +866,16 @@ void PoolHandshakeAuth()
     ScopedDbKey db2(admin, key2);
     std::random_device rnd;
 
-    // 1) 池开的每条连接都完成握手：2 连接池 + SELECT db2，写入只落 db2。
+    /**
+     * 1) 池开的每条连接都完成握手：2 连接池 + SELECT db2，写入只落 db2。
+     */
     Host host;
     {
         auto pool = MakePoolWith(host, Loopback(port), 2, 2, {acl.user(), acl.password(), 2});
         CHECK(host.Call([&] { return bbt_co_await pool->Connect(Until()); }));
         CHECK(host.Call([&] { return bbt_co_await pool->Set(prefix + "a", "1", Until()); }));
         CHECK(host.Call([&] { return bbt_co_await pool->Set(prefix + "b", "2", Until()); }));
-        pool->Close();
+        (void)pool->Close();
         pool.reset();
         CHECK(admin.Command({"SELECT", "2"})->type == REDIS_REPLY_STATUS);
         auto count = admin.Command({"DBSIZE"});
@@ -701,8 +890,11 @@ void PoolHandshakeAuth()
         auto in0 = admin.Command({"EXISTS", prefix + "a"});
         CHECK(in0->integer == 0);
     }
-    // 2) 修复/重建的连接同样握手：CLIENT KILL 定点杀掉本用例 ACL 用户的池连接 →
-    // 命令发现死流 → 显式 Connect 修复（重建连接的 AUTH+SELECT 生效）。
+
+    /**
+     * 2) 修复/重建的连接同样握手：CLIENT KILL 定点杀掉本用例 ACL 用户的池连接 →
+     * 命令发现死流 → 显式 Connect 修复（重建连接的 AUTH+SELECT 生效）。
+     */
     {
         auto pool = MakePoolWith(host, Loopback(port), 1, 2, {acl.user(), acl.password(), 2});
         CHECK(host.Call([&] { return bbt_co_await pool->Connect(Until()); }));
@@ -713,14 +905,17 @@ void PoolHandshakeAuth()
         CHECK(host.Call([&] { return bbt_co_await pool->Set(key2, "3", Until()); }));
         auto seen = db2.ReadFromDb2();
         CHECK(seen && *seen == "3");
-        pool->Close();
+        (void)pool->Close();
         pool.reset();
     }
-    // 3) 池握手失败不泄漏预算：错误密码建池 → Connect 失败；资源计数与 host drain
-    // 收口证据（CountConnections==0、ConnectTableSize==0、Finish 全断）证明
-    // 无泄漏，不只凭「Ping 返回 not connected」。fd 总数收口由 Run() 末尾的
-    // socket/fd baseline 断言统一给出——此前中途 SocketCount 断言因 fd 异步
-    // 回收时序竞争误报（WaitUntil 3s 内未归位），已移除；原因见 handoff。
+
+    /**
+     * 3) 池握手失败不泄漏预算：错误密码建池 → Connect 失败；资源计数与 host drain
+     * 收口证据（CountConnections==0、ConnectTableSize==0、Finish 全断）证明
+     * 无泄漏，不只凭「Ping 返回 not connected」。fd 总数收口由 Run() 末尾的
+     * socket/fd baseline 断言统一给出：fd 在关闭后由内核异步回收，中途断言会与
+     * 回收时序竞争而误报，故只在收尾比较 baseline。
+     */
     {
         const std::string wrong_pass = "wrong-" + std::to_string(rnd());
         auto pool = MakePoolWith(host, Loopback(port), 2, 2, {acl.user(), wrong_pass, -1});
@@ -728,11 +923,17 @@ void PoolHandshakeAuth()
         ExpectCode(failed, ErrorCode::RemoteError);
         CHECK(failed.error().message.find(wrong_pass) == std::string::npos);
         ExpectCode(host.Call([&] { return bbt_co_await pool->Ping(Until()); }), ErrorCode::RuntimeUnavailable);
-        // 预算归还：引擎无残留连接，reader 全部释放。
+
+        /**
+         * 预算归还：引擎无残留连接，reader 全部释放。
+         */
         CHECK(WaitUntil(
             [&] { return host.engine->CountConnections() == 0 && Access::ConnectTableSize(*host.engine) == 0; }));
-        pool->Close();
-        // Close 后命令报 Closed（在释放句柄前断言，避免空指针解引用）。
+        (void)pool->Close();
+
+        /**
+         * Close 后命令报 Closed（在释放句柄前断言，避免空指针解引用）。
+         */
         ExpectCode(host.Call([&] { return bbt_co_await pool->Ping(Until()); }), ErrorCode::Closed);
         pool.reset();
         CHECK(g_reader_created.load() == g_reader_freed.load());
@@ -745,15 +946,23 @@ void PoolHandshakeAuth()
                  "rollback_budget_returned=1 no_leak=1\n";
 }
 
-// ── 受控假服务端（COMMON）：分帧/嵌套数组/超限/退役语义。─────────────
+/**
+ * ── 受控假服务端（COMMON）：分帧/嵌套数组/超限/退役语义。─────────────
+ */
 void HgetallProtocolFaults()
 {
-    // 1) HGETALL 分帧跨段：回复被拆成多段发送，读回完整序列。
+
+    /**
+     * 1) HGETALL 分帧跨段：回复被拆成多段发送，读回完整序列。
+     */
     {
         std::atomic<bool> release{false}, first{false};
         Peer peer([&](int fd) {
             CHECK(Peer::ReadCommand(fd) == std::vector<std::string>({"HGETALL", "h"}));
-            // "*4\r\n$2\r\nf1\r\n$2\r\nv1\r\n" 与 "$2\r\nf2\r\n$2\r\nv2\r\n" 两段。
+
+            /**
+             * "*4\r\n$2\r\nf1\r\n$2\r\nv1\r\n" 与 "$2\r\nf2\r\n$2\r\nv2\r\n" 两段。
+             */
             CHECK(Peer::Send(fd, "*4\r\n$2\r\nf"));
             first.store(true);
             CHECK(WaitUntil([&] { return release.load(); }));
@@ -776,7 +985,10 @@ void HgetallProtocolFaults()
         g_watch_reader.store(nullptr);
         std::cout << "hgetall_fragmented segments=2 entries=2 order=1\n";
     }
-    // 2) 嵌套数组 → ProtocolError + 连接退役 + 已接纳命令 OutcomeUnknown。
+
+    /**
+     * 2) 嵌套数组 → ProtocolError + 连接退役 + 已接纳命令 OutcomeUnknown。
+     */
     {
         Peer peer([](int fd) {
             CHECK(Peer::ReadCommand(fd)[0] == "HGETALL");
@@ -793,7 +1005,10 @@ void HgetallProtocolFaults()
         peer.Join();
         host.Finish();
     }
-    // 3) 不支持元素类型（数组内 RESP3 map '%'）→ 同上退役语义。
+
+    /**
+     * 3) 不支持元素类型（数组内 RESP3 map '%'）→ 同上退役语义。
+     */
     {
         Peer peer([](int fd) {
             CHECK(Peer::ReadCommand(fd)[0] == "HGETALL");
@@ -810,7 +1025,10 @@ void HgetallProtocolFaults()
         peer.Join();
         host.Finish();
     }
-    // 4) 元素数超 kMaxArrayElements → ProtocolError + 退役 + OutcomeUnknown。
+
+    /**
+     * 4) 元素数超 kMaxArrayElements → ProtocolError + 退役 + OutcomeUnknown。
+     */
     {
         const auto elements = redis_detail::kMaxArrayElements + 2;
         std::string reply = "*" + std::to_string(elements) + "\r\n";
@@ -832,7 +1050,10 @@ void HgetallProtocolFaults()
         peer.Join();
         host.Finish();
     }
-    // 5) 非 Array 回复类型对 HGETALL → ProtocolError（ExpectedReply 拒绝 Array 以外）。
+
+    /**
+     * 5) 非 Array 回复类型对 HGETALL → ProtocolError（ExpectedReply 拒绝 Array 以外）。
+     */
     {
         Peer peer([](int fd) {
             CHECK(Peer::ReadCommand(fd)[0] == "HGETALL");
@@ -848,8 +1069,11 @@ void HgetallProtocolFaults()
         peer.Join();
         host.Finish();
     }
-    // 6) 奇数元素数组：field 无配对 value，fail-close 退役而不是静默丢尾。
-    // 区分回归：修复前返回 ok(empty)。
+
+    /**
+     * 6) 奇数元素数组：field 无配对 value，fail-close 退役而不是静默丢尾；
+     * 断言命令终态为 ProtocolError 而不是 ok(empty)。
+     */
     {
         Peer peer([](int fd) {
             CHECK(Peer::ReadCommand(fd)[0] == "HGETALL");
@@ -866,8 +1090,11 @@ void HgetallProtocolFaults()
         peer.Join();
         host.Finish();
     }
-    // 7) 含 nil 元素的偶数数组：nil 不得折叠成空串 field/value，fail-close 退役。
-    // 区分回归：修复前返回 ok({f,""}) 且连接保留。
+
+    /**
+     * 7) 含 nil 元素的偶数数组：nil 不得折叠成空串 field/value，fail-close 退役；
+     * 断言命令终态为 ProtocolError，而不是 ok({f,""}) 且连接保留。
+     */
     {
         Peer peer([](int fd) {
             CHECK(Peer::ReadCommand(fd)[0] == "HGETALL");
@@ -884,8 +1111,11 @@ void HgetallProtocolFaults()
         peer.Join();
         host.Finish();
     }
-    // 8) 单元素超 kMaxArrayBytes：拒绝并退役；契约层面证明超字节回复零接纳
-    // （修复前同样拒绝，但会先复制超限负载；本用例钉死对外契约）。
+
+    /**
+     * 8) 单元素超 kMaxArrayBytes：拒绝并退役。字节预算在复制元素负载前按剩余
+     * 额度校验，故超限回复零接纳、也不会先分配超限缓冲。
+     */
     {
         const auto over = redis_detail::kMaxArrayBytes + 1;
         const std::string reply =
@@ -905,8 +1135,11 @@ void HgetallProtocolFaults()
         peer.Join();
         host.Finish();
     }
-    // 9) 累计字节超限：第一元素恰为上限被接纳，第二元素把合计推出预算；
-    // 证明 checked-add 预算随元素递减而不是只在循环末尾比较。
+
+    /**
+     * 9) 累计字节超限：第一元素恰为上限被接纳，第二元素把合计推出预算；
+     * 证明 checked-add 预算随元素递减而不是只在循环末尾比较。
+     */
     {
         const auto first = redis_detail::kMaxArrayBytes;
         const std::string reply =
@@ -930,29 +1163,41 @@ void HgetallProtocolFaults()
     }
 }
 
-// ── 握手与 Close 竞争（COMMON /）：阶段证据为 AUTH 完整到达对端
-// （说明 Connect 已在握手 I/O 内挂起），此时 Close 胜出；Connect 不得返回成功，
-// 后续命令一律 Closed。修复前握手经共享成员 connection 收 +OK 后无复查，
-// Close 胜出时 Connect 仍可能 ok()。──
+/**
+ * 握手与 Close 竞争（COMMON /）：阶段证据为 AUTH 完整到达对端（说明 Connect
+ * 已在握手 I/O 内挂起），此时 Close 胜出；Connect 不得返回成功，后续命令一律
+ * Closed。握手每收一步都复查句柄状态，Close 胜出后不再把它当成已连接。
+ */
 void CloseDuringHandshake()
 {
     std::atomic<bool> auth_received{false}, release{false};
     Peer peer([&](int fd) {
         CHECK(Peer::ReadCommand(fd) == std::vector<std::string>({"AUTH", "pw"}));
-        auth_received.store(true); // 阶段屏障：握手命令已到线上，Connect 正等在 +OK
+
+        /**
+         * 阶段屏障：握手命令已到线上，Connect 正等在 +OK
+         */
+        auth_received.store(true);
         CHECK(WaitUntil([&] { return release.load(); }));
-        (void)Peer::Send(fd, "+OK\r\n"); // Close 后迟到的握手回复不归属任何命令
+
+        /**
+         * Close 后迟到的握手回复不归属任何命令
+         */
+        (void)Peer::Send(fd, "+OK\r\n");
     });
     Host host;
     auto cli = MakeHandshake(host, peer.address, {"", "pw", -1});
     auto pending = host.Submit([&] { return bbt_co_await cli->Connect(Until()); });
     CHECK(WaitUntil([&] { return auth_received.load(); }));
     CHECK(pending.wait_for(0ms) == std::future_status::timeout);
-    cli->Close();
+    (void)cli->Close();
     auto value = Get(pending);
     CHECK(!value);
-    // Close 胜出：在途 AUTH 退役为 OutcomeUnknown(cause=Closed)，或复查路径
-    // 直接 Closed——两种终态都可接受，但绝不可能是 ok()。
+
+    /**
+     * Close 胜出：在途 AUTH 退役为 OutcomeUnknown(cause=Closed)，或复查路径
+     * 直接 Closed——两种终态都可接受，但绝不可能是 ok()。
+     */
     const auto code = value.error().code;
     CHECK(code == ErrorCode::OutcomeUnknown || code == ErrorCode::Closed);
     release.store(true);

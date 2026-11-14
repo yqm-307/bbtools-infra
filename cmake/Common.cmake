@@ -63,7 +63,7 @@ target_compile_options(bbt_infra_common PRIVATE -Wall -Wextra -Wpedantic)
 # 上游不导出可消费的 CMake 包，源码消费只能经显式路径 add_subdirectory 接入。
 # 禁止把本机私有绝对路径写进默认值或提交内容。
 set(BBT_COROUTINE_SOURCE_DIR "" CACHE PATH
-    "bbtools-coroutine 源码树路径（含顶层 CMakeLists.txt 与 bbt/；固定 commit 见 cmake/coroutine.sha）")
+    "bbtools-coroutine 本地源码树路径；默认使用当前内容，指定版本用 BBT_COROUTINE_PINNED_SHA")
 if(NOT BBT_COROUTINE_SOURCE_DIR)
     message(FATAL_ERROR
         "需要显式 -DBBT_COROUTINE_SOURCE_DIR=<bbtools-coroutine 源码树路径>；"
@@ -121,8 +121,7 @@ function(bbt_add_source_dependency _target _src_dir _bin_subdir)
     endforeach()
 endfunction()
 
-# T1 pin：固定 commit 由 cmake/coroutine.sha 唯一提供（include 时读取并校验
-# 40hex 格式）；git-only 核验对本模块所有调用方可见。
+# 默认消费本地最新源码；显式指定 SHA 时核验版本与源码洁净性。
 include("${CMAKE_CURRENT_LIST_DIR}/CoroutinePin.cmake")
 get_filename_component(_bbt_co_expected "${BBT_COROUTINE_SOURCE_DIR}" REALPATH)
 
@@ -139,8 +138,7 @@ if(NOT EXISTS "${BBT_COROUTINE_SOURCE_DIR}/CMakeLists.txt")
         "未找到顶层 CMakeLists.txt")
 endif()
 
-# 源码消费的声明目录必须先命中固定 commit
-# （git HEAD+tracked/staged 干净+消费面无 untracked 源码），再做接入。
+# 核验来源；指定版本时还必须命中该 commit，不能以脏树冒充精确版本。
 bbt_coroutine_pin_verify("${_bbt_co_expected}")
 unset(_bbt_co_expected)
 

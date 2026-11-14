@@ -1,5 +1,4 @@
 #include <bbt/infra/redis/CoRedisCli.hpp>
-
 #include <algorithm>
 #include <limits>
 #include <mutex>
@@ -25,14 +24,17 @@ Error ClosedError()
 {
     return MakeError(ErrorCode::Closed, "redis: client closed");
 }
+
 Error BusyError()
 {
     return MakeError(ErrorCode::Overloaded, "redis: operation already active");
 }
+
 Error ContextError()
 {
     return MakeError(ErrorCode::InvalidContext, "redis: coroutine context required");
 }
+
 Error ProtocolError()
 {
     auto error = MakeError(ErrorCode::ProtocolError, "redis: unexpected RESP2 reply");
@@ -65,12 +67,17 @@ const char* CauseName(ErrorCode code)
     }
 }
 
-// 底层分类交给公共桥 NetToError；closed/runtime_unavailable 是 Redis
-// 客户端自身事实（close 封口、engine 非 Running），桥无从知晓，仍在此覆盖。
+/**
+ * 底层分类交给公共桥 NetToError；closed/runtime_unavailable 是 Redis
+ * 客户端自身事实（close 封口、engine 非 Running），桥无从知晓，仍在此覆盖。
+ */
 Error NetError(std::error_code code, bool closed, bool runtime_unavailable = false)
 {
     auto error = NetToError(code, "redis net: " + code.message());
-    // 优先级与旧映射一致：Closed（含 NetErrc::Closed，桥已给）> RuntimeUnavailable。
+
+    /**
+     * 优先级：Closed（含 NetErrc::Closed，桥已给）> RuntimeUnavailable。
+     */
     if (closed) {
         error.code = ErrorCode::Closed;
     } else if (runtime_unavailable && error.code != ErrorCode::Closed) {
@@ -79,8 +86,10 @@ Error NetError(std::error_code code, bool closed, bool runtime_unavailable = fal
     return error;
 }
 
-// ExpectedReply 判定「回复形态是否属于该命令」。set_nil_ok 只用于带选项
-// 的 SET：NX/XX 条件不满足时服务端回 nil，是合法终态而非协议错误。
+/**
+ * ExpectedReply 判定「回复形态是否属于该命令」。set_nil_ok 只用于带选项
+ * 的 SET：NX/XX 条件不满足时服务端回 nil，是合法终态而非协议错误。
+ */
 bool ExpectedReply(const std::string& command, const RawReply& reply, bool set_nil_ok)
 {
     if (command == "PING") {
@@ -108,9 +117,12 @@ bool ExpectedReply(const std::string& command, const RawReply& reply, bool set_n
         || command == "HSET") {
         return reply.type == RawReply::Type::Integer;
     }
-    // HGETALL 契约是 field/value 对：除一维数组外还要求元素数为偶数且
-    // 无 nil 元素；奇数或含 nil 的完整数组同样按协议错误退役（fail-close，
-    // 不静默丢尾或把 nil 折叠成空串）。
+
+    /**
+     * HGETALL 契约是 field/value 对：除一维数组外还要求元素数为偶数且
+     * 无 nil 元素；奇数或含 nil 的完整数组同样按协议错误退役（fail-close，
+     * 不静默丢尾或把 nil 折叠成空串）。
+     */
     if (command == "HGETALL") {
         if (reply.type != RawReply::Type::Array) {
             return false;
@@ -118,36 +130,47 @@ bool ExpectedReply(const std::string& command, const RawReply& reply, bool set_n
         if (reply.elements.size() % 2 != 0) {
             return false;
         }
-        return std::none_of(reply.elements.begin(), reply.elements.end(),
-                            [](const RawReply::Element& e) { return e.is_nil; });
+        return std::none_of(
+            reply.elements.begin(), reply.elements.end(), [](const RawReply::Element& e) { return e.is_nil; });
     }
     if (command == "AUTH" || command == "SELECT") {
         return reply.type == RawReply::Type::Status && reply.str == "OK";
     }
     return false;
 }
-} // namespace
+
+// clang-format off
+}
+// clang-format on
 
 struct CoRedisCli::State {
-    // mutex 保护接纳/发布/封口；活动操作独占 reader，Close 在 busy 时不能释放它。
-    // 这一个位置同时串行化 Connect 与五个命令，锁永不跨 CoDial/Write/Read。
+
+    /**
+     * mutex 保护接纳/发布/封口；活动操作独占 reader，Close 在 busy 时不能释放它。
+     * 这一个位置同时串行化 Connect 与五个命令，锁永不跨 CoDial/Write/Read。
+     */
     std::mutex mutex;
     const std::shared_ptr<net::Engine> engine;
     const net::Address address;
     const RedisHandshake handshake;
     net::Connection connection;
     Reader reader{redisReaderCreate(), &redisReaderFree};
+    std::vector<net::ReclaimReceipt> reclaims;
+    std::optional<Error> close_reason;
     bool closed{false};
     bool busy{false};
     bool broken{false};
 
     State(std::shared_ptr<net::Engine> target, net::Address endpoint, RedisHandshake shake)
-        : engine(std::move(target)), address(std::move(endpoint)), handshake(std::move(shake))
+        : engine(std::move(target))
+        , address(std::move(endpoint))
+        , handshake(std::move(shake))
     {
     }
 
     struct Active {
         State& state;
+
         ~Active()
         {
             std::lock_guard<std::mutex> lock(state.mutex);
@@ -158,13 +181,15 @@ struct CoRedisCli::State {
         }
     };
 
-    // 仅活动操作调用；先退役整条流，再发布失败。迟到回复永不进入下一次命令。
+    /**
+     * 仅活动操作调用；先退役整条流，再发布失败。迟到回复永不进入下一次命令。
+     */
     Error Fail(Error cause, bool accepted)
     {
         {
             std::lock_guard<std::mutex> lock(mutex);
             broken = true;
-            connection.RequestClose();
+            (void)connection.Close();
             connection = {};
             reader.reset();
         }
@@ -185,7 +210,10 @@ struct CoRedisCli::State {
             if (closed) {
                 return result<void>::err(ClosedError());
             }
-            // 已健康连接的幂等 Connect 不触碰 reader，也不占活动位置。
+
+            /**
+             * 已健康连接的幂等 Connect 不触碰 reader，也不占活动位置。
+             */
             if (!broken && connection.Valid() && !connection.Closed()) {
                 return result<void>::ok();
             }
@@ -193,7 +221,7 @@ struct CoRedisCli::State {
                 return result<void>::err(BusyError());
             }
             busy = true;
-            connection.RequestClose();
+            (void)connection.Close();
             connection = {};
         }
         Active active{*this};
@@ -201,52 +229,72 @@ struct CoRedisCli::State {
         net::Connection local;
         {
             std::lock_guard<std::mutex> lock(mutex);
+            reclaims.erase(
+                std::remove_if(
+                    reclaims.begin(), reclaims.end(), [](const auto& receipt) { return receipt.Released(); }),
+                reclaims.end());
+            reclaims.push_back(dialed.reclaim);
             if (closed) {
-                dialed.connection.RequestClose();
+                (void)dialed.connection.Close();
                 return result<void>::err(ClosedError());
             }
             if (dialed.error) {
                 return result<void>::err(NetError(dialed.error, false, engine->Phase() != net::EnginePhase::Running));
             }
-            // 只有显式建连成功才恢复流；失败期间不发布任何可用连接。
+
+            /**
+             * 只有显式建连成功才恢复流；失败期间不发布任何可用连接。
+             */
             if (!reader) {
                 reader.reset(redisReaderCreate());
             }
             if (!reader) {
-                dialed.connection.RequestClose();
+                (void)dialed.connection.Close();
                 return result<void>::err(MakeError(ErrorCode::InternalError, "redis: reader allocation failed"));
             }
             broken = false;
             connection = dialed.connection.Raw();
-            // 握手全程用锁内快照的本地句柄：Close 可能与握手 I/O 并发，不在
-            // 挂起恢复后读写共享成员 connection；句柄共享同一底层状态，
-            // Close 对成员的 RequestClose 仍会封掉这条连接的在途 I/O。
+
+            /**
+             * 握手全程用锁内快照的本地句柄：Close 可能与握手 I/O 并发，不在
+             * 挂起恢复后读写共享成员 connection；句柄共享同一底层状态，
+             * Close 对成员的 RequestClose 仍会封掉这条连接的在途 I/O。
+             */
             local = connection;
         }
-        // 连接级握手：配置后在每次建连（含显式重连）内按 AUTH 再 SELECT
-        // 顺序各等 +OK。仍占本次活动位置与同一绝对 deadline，不流水线；
-        // 锁不跨挂起——握手 I/O 在锁外执行。
-        // 失败返回原样错误（RemoteError 不回密码），随后标记 broken 使后续
-        // 命令按「显式 Connect required」处理；未配置时零动作。
+
+        /**
+         * 连接级握手：配置后在每次建连（含显式重连）内按 AUTH 再 SELECT
+         * 顺序各等 +OK。仍占本次活动位置与同一绝对 deadline，不流水线；
+         * 锁不跨挂起——握手 I/O 在锁外执行。
+         * 失败返回原样错误（RemoteError 不回密码），随后标记 broken 使后续
+         * 命令按「显式 Connect required」处理；未配置时零动作。
+         */
         if (const auto outcome = bbt_co_await RunHandshake(options, local); !outcome) {
-            // 握手失败即退役连接：显式置 broken，后续命令按
-            // 「explicit Connect required」处理，client 仍可 Close。
+
+            /**
+             * 握手失败即退役连接：显式置 broken，后续命令按
+             * 「explicit Connect required」处理，client 仍可 Close。
+             */
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 broken = true;
-                connection.RequestClose();
+                (void)connection.Close();
                 connection = {};
                 reader.reset();
             }
             return result<void>::err(outcome.error());
         }
-        // 握手成功后的线性化复查：Close 在握手期间胜出时 Connect 不得返回
-        // 成功——与 Close 共用同一状态锁的线性化点，退役本次已发布连接。
+
+        /**
+         * 握手成功后的线性化复查：Close 在握手期间胜出时 Connect 不得返回
+         * 成功——与 Close 共用同一状态锁的线性化点，退役本次已发布连接。
+         */
         {
             std::lock_guard<std::mutex> lock(mutex);
             if (closed) {
                 broken = true;
-                connection.RequestClose();
+                (void)connection.Close();
                 connection = {};
                 reader.reset();
                 return result<void>::err(ClosedError());
@@ -255,9 +303,11 @@ struct CoRedisCli::State {
         return result<void>::ok();
     }
 
-    // 仅在 Connect 的活动位置内调用；非空结果表示握手失败（错误原样上抛，
-    // 随后统一置 broken）。错误消息与 details 不含密码。local 为发布锁内
-    // 快照的本地句柄，握手期间不再访问共享成员 connection。
+    /**
+     * 仅在 Connect 的活动位置内调用；非空结果表示握手失败（错误原样上抛，
+     * 随后统一置 broken）。错误消息与 details 不含密码。local 为发布锁内
+     * 快照的本地句柄，握手期间不再访问共享成员 connection。
+     */
     bbt_co_async(result<void>) RunHandshake(const CallOptions& options, const net::Connection& local)
     {
         if (!handshake.password.empty()) {
@@ -281,12 +331,14 @@ struct CoRedisCli::State {
         return result<void>::ok();
     }
 
-    // 已接纳的一次命令全量写 + 分帧读一条完整回复：编码、写、读循环、解析
-    // 与错误分类集中于此；失败按现有规则退役整条流（Fail）。调用方须已
-    // 置 busy 并持本连接 local 句柄（Connect 握手与 Execute 共用本函数）。
-    // set_nil_ok 见 ExpectedReply：带选项 SET 的 nil 回复是合法终态。
-    bbt_co_async(result<RawReply>) RedisRoundtrip(std::vector<std::string> args, const CallOptions& options,
-                                                  bool set_nil_ok, net::Connection local)
+    /**
+     * 已接纳的一次命令全量写 + 分帧读一条完整回复：编码、写、读循环、解析
+     * 与错误分类集中于此；失败按现有规则退役整条流（Fail）。调用方须已
+     * 置 busy 并持本连接 local 句柄（Connect 握手与 Execute 共用本函数）。
+     * set_nil_ok 见 ExpectedReply：带选项 SET 的 nil 回复是合法终态。
+     */
+    bbt_co_async(result<RawReply>) RedisRoundtrip(
+        std::vector<std::string> args, const CallOptions& options, bool set_nil_ok, net::Connection local)
     {
         std::vector<const char*> argv;
         std::vector<std::size_t> lengths;
@@ -321,7 +373,9 @@ struct CoRedisCli::State {
             return result<RawReply>::err(std::move(cause));
         }
 
-        // Read 交付一次可用字节而非一条 RESP 帧。整个循环复用同一个绝对 deadline。
+        /**
+         * Read 交付一次可用字节而非一条 RESP 帧。整个循环复用同一个绝对 deadline。
+         */
         for (;;) {
             auto [read_data, read_error] = co.Read(wait);
             if (bool(read_error)) {
@@ -334,22 +388,25 @@ struct CoRedisCli::State {
             }
             const auto bytes = read_data.CopyTo();
             if (redisReaderFeed(reader.get(), bytes.data(), bytes.size()) != REDIS_OK) {
-                return result<RawReply>::err(
-                    Fail(redis_detail::ClassifyHiredisError(reader->err, reader->errstr, "redis: reader feed failed"),
-                         true));
+                return result<RawReply>::err(Fail(
+                    redis_detail::ClassifyHiredisError(reader->err, reader->errstr, "redis: reader feed failed"),
+                    true));
             }
             void* raw = nullptr;
             const auto parsed = redisReaderGetReply(reader.get(), &raw);
             Reply reply(static_cast<redisReply*>(raw), &freeReplyObject);
             if (parsed != REDIS_OK) {
-                return result<RawReply>::err(
-                    Fail(redis_detail::ClassifyHiredisError(reader->err, reader->errstr, "redis: reply parse failed"),
-                         true));
+                return result<RawReply>::err(Fail(
+                    redis_detail::ClassifyHiredisError(reader->err, reader->errstr, "redis: reply parse failed"),
+                    true));
             }
             if (!reply) {
                 continue;
             }
-            // 无流水线：同批次回复之后的任何额外字节都没有请求归属。
+
+            /**
+             * 无流水线：同批次回复之后的任何额外字节都没有请求归属。
+             */
             if (reader->len != reader->pos) {
                 return result<RawReply>::err(Fail(ProtocolError(), true));
             }
@@ -357,7 +414,11 @@ struct CoRedisCli::State {
             if (!decoded) {
                 if (decoded.error().code == ErrorCode::RemoteError) {
                     return decoded;
-                } // 完整 Redis ERROR 保持流同步。
+
+                    /**
+                 * 完整 Redis ERROR 保持流同步。
+                 */
+                }
                 return result<RawReply>::err(Fail(std::move(decoded.error()), true));
             }
             if (!ExpectedReply(args[0], decoded.value(), set_nil_ok)) {
@@ -367,8 +428,10 @@ struct CoRedisCli::State {
         }
     }
 
-    // 参数先全量校验再锁内接纳；set_nil_ok 透传给 RedisRoundtrip 的
-    // ExpectedReply（见上）。HDEL 与 DEL 一样要求列表非空。
+    /**
+     * 参数先全量校验再锁内接纳；set_nil_ok 透传给 RedisRoundtrip 的
+     * ExpectedReply（见上）。HDEL 与 DEL 一样要求列表非空。
+     */
     bbt_co_async(result<RawReply>) Execute(std::vector<std::string> args, CallOptions options, bool set_nil_ok = false)
     {
         if (bbt::coroutine::GetLocalCoroutineId() == 0) {
@@ -380,11 +443,14 @@ struct CoRedisCli::State {
                 return result<RawReply>::err(ClosedError());
             }
         }
-        // 参数拥有于本调用，编码后不借用调用者的 key/value/options。
-        // args[0] 是命令名；以下参数（i>=1）才做 key/field 空值校验：
-        //   - DEL/HDEL：全部后续参数为 key/field，须非空且列表非空；
-        //   - HSET/HGET/HEXISTS：args[1] key 与 args[2] field 都须非空；
-        //   - 其余命令：第一个参数（key）须非空，value/delta 等允许空串。
+
+        /**
+         * 参数拥有于本调用，编码后不借用调用者的 key/value/options。
+         * args[0] 是命令名；以下参数（i>=1）才做 key/field 空值校验：
+         * - DEL/HDEL：全部后续参数为 key/field，须非空且列表非空；
+         * - HSET/HGET/HEXISTS：args[1] key 与 args[2] field 都须非空；
+         * - 其余命令：第一个参数（key）须非空，value/delta 等允许空串。
+         */
         const bool list_command = args[0] == "DEL" || args[0] == "HDEL";
         if ((args.size() == 1 && list_command)
             || args.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
@@ -410,7 +476,7 @@ struct CoRedisCli::State {
             }
             if (broken || (connection.Valid() && connection.Closed())) {
                 broken = true;
-                connection.RequestClose();
+                (void)connection.Close();
                 reader.reset();
                 return result<RawReply>::err(MakeError(ErrorCode::TransportError, "redis: explicit Connect required"));
             }
@@ -428,12 +494,14 @@ struct CoRedisCli::State {
     }
 };
 
-CoRedisCli::CoRedisCli(std::shared_ptr<State> state) noexcept : state_(std::move(state))
+CoRedisCli::CoRedisCli(std::shared_ptr<State> state) noexcept
+    : state_(std::move(state))
 {
 }
+
 CoRedisCli::~CoRedisCli() noexcept
 {
-    Close();
+    (void)Close();
 }
 
 result<std::shared_ptr<CoRedisCli>> CoRedisCli::Create(std::shared_ptr<net::Engine> engine, net::Address address)
@@ -441,8 +509,8 @@ result<std::shared_ptr<CoRedisCli>> CoRedisCli::Create(std::shared_ptr<net::Engi
     return Create(std::move(engine), std::move(address), RedisHandshake{});
 }
 
-result<std::shared_ptr<CoRedisCli>> CoRedisCli::Create(std::shared_ptr<net::Engine> engine, net::Address address,
-                                                       RedisHandshake handshake)
+result<std::shared_ptr<CoRedisCli>>
+CoRedisCli::Create(std::shared_ptr<net::Engine> engine, net::Address address, RedisHandshake handshake)
 {
     if (!engine || !address.Valid()
         || (address.Family() != net::AddressFamily::IPv4 && address.Family() != net::AddressFamily::IPv6)) {
@@ -461,39 +529,54 @@ result<std::shared_ptr<CoRedisCli>> CoRedisCli::Create(std::shared_ptr<net::Engi
     return result<std::shared_ptr<CoRedisCli>>::ok(std::shared_ptr<CoRedisCli>(new CoRedisCli(std::move(state))));
 }
 
-void CoRedisCli::Close() noexcept
+void CoRedisCli::_CloseConnection(Error reason) noexcept
 {
     const auto state = state_;
     std::lock_guard<std::mutex> lock(state->mutex);
-    state->closed = true; // 与接纳和连接发布共用短锁的线性化点。
-    state->connection.RequestClose();
+    if (!state->close_reason)
+        state->close_reason = std::move(reason);
+
+    /**
+     * 与接纳和连接发布共用短锁的线性化点。
+     */
+    state->closed = true;
+    (void)state->connection.Close();
     if (!state->busy) {
         state->reader.reset();
     }
 }
+
 bool CoRedisCli::StreamHealthy() const noexcept
 {
     const auto state = state_;
     std::lock_guard<std::mutex> lock(state->mutex);
     return !state->closed && !state->broken && state->connection.Valid() && !state->connection.Closed();
 }
+
 bool CoRedisCli::IsClosed() const noexcept
 {
     const auto state = state_;
     std::lock_guard<std::mutex> lock(state->mutex);
     return state->closed;
 }
+
 bbt_co_async(result<void>) CoRedisCli::Connect(const CallOptions& options)
+
+/**
+ * 此后包括挂起恢复都不再访问公开对象。
+ */
 {
-    const auto state = state_; // 此后包括挂起恢复都不再访问公开对象。
+    const auto state = state_;
     return bbt_co_await state->Connect(options);
 }
+
 bbt_co_async(result<void>) CoRedisCli::Ping(const CallOptions& options)
 {
     const auto state = state_;
     auto value = bbt_co_await state->Execute({"PING"}, options);
     return value ? result<void>::ok() : result<void>::err(std::move(value.error()));
 }
+
 bbt_co_async(result<std::optional<std::string>>) CoRedisCli::Get(std::string_view key, const CallOptions& options)
 {
     const auto state = state_;
@@ -506,12 +589,14 @@ bbt_co_async(result<std::optional<std::string>>) CoRedisCli::Get(std::string_vie
     }
     return result<std::optional<std::string>>::ok(std::move(value.value().str));
 }
+
 bbt_co_async(result<void>) CoRedisCli::Set(std::string_view key, std::string_view value, const CallOptions& options)
 {
     const auto state = state_;
     auto reply = bbt_co_await state->Execute({"SET", std::string(key), std::string(value)}, options);
     return reply ? result<void>::ok() : result<void>::err(std::move(reply.error()));
 }
+
 bbt_co_async(result<bool>) CoRedisCli::Exists(std::string_view key, const CallOptions& options)
 {
     const auto state = state_;
@@ -521,6 +606,7 @@ bbt_co_async(result<bool>) CoRedisCli::Exists(std::string_view key, const CallOp
     }
     return result<bool>::ok(value.value().integer == 1);
 }
+
 bbt_co_async(result<std::uint64_t>) CoRedisCli::Delete(std::vector<std::string> keys, const CallOptions& options)
 {
     const auto state = state_;
@@ -532,11 +618,14 @@ bbt_co_async(result<std::uint64_t>) CoRedisCli::Delete(std::vector<std::string> 
     return result<std::uint64_t>::ok(static_cast<std::uint64_t>(value.value().integer));
 }
 
-bbt_co_async(result<bool>) CoRedisCli::Set(std::string_view key, std::string_view value, const SetOptions& set_options,
-                                           const CallOptions& options)
+bbt_co_async(result<bool>) CoRedisCli::Set(
+    std::string_view key, std::string_view value, const SetOptions& set_options, const CallOptions& options)
 {
     const auto state = state_;
-    // 选项先本地校验再编码：越界零接纳（InvalidArgument），什么都不发。
+
+    /**
+     * 选项先本地校验再编码：越界零接纳（InvalidArgument），什么都不发。
+     */
     if (set_options.expire
         && (*set_options.expire <= std::chrono::milliseconds{0} || *set_options.expire > kMaxSetExpire)) {
         return result<bool>::err(MakeError(ErrorCode::InvalidArgument, "redis: SET expire out of range"));
@@ -560,12 +649,15 @@ bbt_co_async(result<bool>) CoRedisCli::Set(std::string_view key, std::string_vie
     if (!reply) {
         return result<bool>::err(std::move(reply.error()));
     }
-    // nil 回复表示条件不满足（NX/XX），是合法终态而非错误。
+
+    /**
+     * nil 回复表示条件不满足（NX/XX），是合法终态而非错误。
+     */
     return result<bool>::ok(reply.value().type == RawReply::Type::Status);
 }
 
-bbt_co_async(result<bool>) CoRedisCli::Expire(std::string_view key, std::chrono::milliseconds ttl,
-                                              const CallOptions& options)
+bbt_co_async(result<bool>)
+    CoRedisCli::Expire(std::string_view key, std::chrono::milliseconds ttl, const CallOptions& options)
 {
     const auto state = state_;
     if (ttl <= std::chrono::milliseconds{0}) {
@@ -607,6 +699,7 @@ bbt_co_async(result<std::int64_t>) CoRedisCli::Incr(std::string_view key, const 
     }
     return result<std::int64_t>::ok(value.value().integer);
 }
+
 bbt_co_async(result<std::int64_t>) CoRedisCli::Decr(std::string_view key, const CallOptions& options)
 {
     const auto state = state_;
@@ -616,8 +709,9 @@ bbt_co_async(result<std::int64_t>) CoRedisCli::Decr(std::string_view key, const 
     }
     return result<std::int64_t>::ok(value.value().integer);
 }
-bbt_co_async(result<std::int64_t>) CoRedisCli::IncrBy(std::string_view key, std::int64_t delta,
-                                                      const CallOptions& options)
+
+bbt_co_async(result<std::int64_t>)
+    CoRedisCli::IncrBy(std::string_view key, std::int64_t delta, const CallOptions& options)
 {
     const auto state = state_;
     auto value = bbt_co_await state->Execute({"INCRBY", std::string(key), std::to_string(delta)}, options);
@@ -626,8 +720,9 @@ bbt_co_async(result<std::int64_t>) CoRedisCli::IncrBy(std::string_view key, std:
     }
     return result<std::int64_t>::ok(value.value().integer);
 }
-bbt_co_async(result<std::int64_t>) CoRedisCli::DecrBy(std::string_view key, std::int64_t delta,
-                                                      const CallOptions& options)
+
+bbt_co_async(result<std::int64_t>)
+    CoRedisCli::DecrBy(std::string_view key, std::int64_t delta, const CallOptions& options)
 {
     const auto state = state_;
     auto value = bbt_co_await state->Execute({"DECRBY", std::string(key), std::to_string(delta)}, options);
@@ -637,8 +732,8 @@ bbt_co_async(result<std::int64_t>) CoRedisCli::DecrBy(std::string_view key, std:
     return result<std::int64_t>::ok(value.value().integer);
 }
 
-bbt_co_async(result<bool>) CoRedisCli::HSet(std::string_view key, std::string_view field, std::string_view value,
-                                            const CallOptions& options)
+bbt_co_async(result<bool>)
+    CoRedisCli::HSet(std::string_view key, std::string_view field, std::string_view value, const CallOptions& options)
 {
     const auto state = state_;
     auto reply =
@@ -648,8 +743,9 @@ bbt_co_async(result<bool>) CoRedisCli::HSet(std::string_view key, std::string_vi
     }
     return result<bool>::ok(reply.value().integer == 1);
 }
-bbt_co_async(result<std::optional<std::string>>) CoRedisCli::HGet(std::string_view key, std::string_view field,
-                                                                  const CallOptions& options)
+
+bbt_co_async(result<std::optional<std::string>>)
+    CoRedisCli::HGet(std::string_view key, std::string_view field, const CallOptions& options)
 {
     const auto state = state_;
     auto value = bbt_co_await state->Execute({"HGET", std::string(key), std::string(field)}, options);
@@ -661,8 +757,9 @@ bbt_co_async(result<std::optional<std::string>>) CoRedisCli::HGet(std::string_vi
     }
     return result<std::optional<std::string>>::ok(std::move(value.value().str));
 }
-bbt_co_async(result<std::uint64_t>) CoRedisCli::HDel(std::string_view key, std::vector<std::string> fields,
-                                                     const CallOptions& options)
+
+bbt_co_async(result<std::uint64_t>)
+    CoRedisCli::HDel(std::string_view key, std::vector<std::string> fields, const CallOptions& options)
 {
     const auto state = state_;
     if (fields.empty()) {
@@ -681,6 +778,7 @@ bbt_co_async(result<std::uint64_t>) CoRedisCli::HDel(std::string_view key, std::
     }
     return result<std::uint64_t>::ok(static_cast<std::uint64_t>(value.value().integer));
 }
+
 bbt_co_async(result<bool>) CoRedisCli::HExists(std::string_view key, std::string_view field, const CallOptions& options)
 {
     const auto state = state_;
@@ -690,6 +788,7 @@ bbt_co_async(result<bool>) CoRedisCli::HExists(std::string_view key, std::string
     }
     return result<bool>::ok(value.value().integer == 1);
 }
+
 bbt_co_async(result<HashEntries>) CoRedisCli::HGetAll(std::string_view key, const CallOptions& options)
 {
     const auto state = state_;
@@ -703,8 +802,48 @@ bbt_co_async(result<HashEntries>) CoRedisCli::HGetAll(std::string_view key, cons
     for (std::size_t i = 0; i + 1 < elements.size(); i += 2) {
         entries.emplace_back(elements[i].str, elements[i + 1].str);
     }
-    // 奇数/含 nil 的数组已被 ExpectedReply 拒绝并退役连接（不会到达这里）：
-    // 能进配对循环的元素必定偶数且非 nil。
+
+    /**
+     * 奇数/含 nil 的数组已被 ExpectedReply 拒绝并退役连接（不会到达这里）：
+     * 能进配对循环的元素必定偶数且非 nil。
+     */
     return result<HashEntries>::ok(std::move(entries));
 }
-} // namespace bbt::infra::redis
+
+// clang-format off
+}
+// clang-format on
+
+namespace bbt::infra::redis {
+result<void> CoRedisCli::Close(const CloseOptions& options)
+{
+    if (options.mode != CloseMode::Immediate || options.wait_release)
+        return result<void>::err(
+            MakeError(ErrorCode::InvalidArgument, "redis client: graceful/release waiting unsupported"));
+    _CloseConnection(options.reason.value_or(MakeError(ErrorCode::Closed, "redis: client closed by owner")));
+    return result<void>::ok();
+}
+
+// clang-format off
+}
+// clang-format on
+
+namespace bbt::infra::redis {
+bool CoRedisCli::Released() const noexcept
+{
+    const auto state = state_;
+    std::lock_guard<std::mutex> lock(state->mutex);
+    return !state->busy && state->connection.Released()
+           && std::all_of(
+               state->reclaims.begin(), state->reclaims.end(), [](const auto& receipt) { return receipt.Released(); });
+}
+
+std::optional<Error> CoRedisCli::CloseReason() const noexcept
+{
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    return state_->close_reason;
+}
+
+// clang-format off
+}
+// clang-format on

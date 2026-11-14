@@ -1,4 +1,6 @@
-// 复制读取契约：跨段 FIFO、尾部、失败零消费、容量释放与输出独立寿命。
+/**
+ * 复制读取契约：跨段 FIFO、尾部、失败零消费、容量释放与输出独立寿命。
+ */
 #define BOOST_TEST_NO_MAIN
 #define BOOST_TEST_ALTERNATIVE_INIT_API
 #include <boost/test/included/unit_test.hpp>
@@ -31,9 +33,18 @@
 
 namespace {
 
-// ---- 分配失败注入（本可执行文件私有；thread_local 不污染 runtime 线程）----
+/**
+ * @name 分配失败注入（本可执行文件私有；thread_local 不污染 runtime 线程）
+ * @{
+ */
 thread_local bool g_fail_alloc = false;
-} // namespace
+
+/**
+ * @}
+ */
+// clang-format off
+}
+// clang-format on
 
 void* operator new(std::size_t size)
 {
@@ -46,22 +57,27 @@ void* operator new(std::size_t size)
     }
     return memory;
 }
+
 void* operator new[](std::size_t size)
 {
     return ::operator new(size);
 }
+
 void operator delete(void* memory) noexcept
 {
     std::free(memory);
 }
+
 void operator delete[](void* memory) noexcept
 {
     std::free(memory);
 }
+
 void operator delete(void* memory, std::size_t) noexcept
 {
     std::free(memory);
 }
+
 void operator delete[](void* memory, std::size_t) noexcept
 {
     std::free(memory);
@@ -128,8 +144,10 @@ bbt::coroutine::WaitOptions Until(std::chrono::milliseconds duration)
     return {std::chrono::steady_clock::now() + duration};
 }
 
-// 连续追加填满每个增长块，构造超过旧段表固定容量的分段输入。
-// ReceiveRing 不可移动（mutex+atomic），用 unique_ptr 返回。
+/**
+ * 连续追加填满每个增长块，构造大量分段输入以覆盖动态段表。
+ * ReceiveRing 不可移动（mutex+atomic），用 unique_ptr 返回。
+ */
 std::unique_ptr<ReceiveRing> MakeSegmentedRing(std::string& expected)
 {
     auto ring = std::make_unique<ReceiveRing>(64 * 1024);
@@ -141,7 +159,9 @@ std::unique_ptr<ReceiveRing> MakeSegmentedRing(std::string& expected)
     return ring;
 }
 
-} // namespace
+// clang-format off
+}
+// clang-format on
 
 BOOST_AUTO_TEST_SUITE(net_copy_consume)
 
@@ -224,7 +244,10 @@ BOOST_AUTO_TEST_CASE(quota_releases_immediately)
     BOOST_CHECK(ring.TryReserveForAppend(1).status == ReadStatus::WouldBlock);
     Buffer out;
     BOOST_REQUIRE(ring.TryCopyConsume(out).status == ReadStatus::Ok);
-    // 用户仍持有输出时，库内额度已经释放。
+
+    /**
+     * 用户仍持有输出时，库内额度已经释放。
+     */
     const auto grant = ring.TryReserveForAppend(60);
     BOOST_CHECK(grant.status == ReadStatus::Ok);
     BOOST_CHECK_EQUAL(grant.granted, 60);
@@ -248,7 +271,10 @@ BOOST_AUTO_TEST_CASE(alloc_failure_keeps_ring_and_quota)
     BOOST_CHECK_EQUAL(result.bytes, 0);
     BOOST_CHECK_EQUAL(JoinBuffer(out), "keep");
     BOOST_CHECK_EQUAL(state->ring.Size(), before_size);
-    // pending 可以合入 ring，但逻辑字节和额度不能被消费。
+
+    /**
+     * pending 可以合入 ring，但逻辑字节和额度不能被消费。
+     */
     const auto grant = state->ring.TryReserveForAppend(4096);
     BOOST_CHECK(grant.status == ReadStatus::Ok);
     BOOST_CHECK_EQUAL(grant.granted, 256 - 65);
@@ -292,7 +318,11 @@ BOOST_AUTO_TEST_CASE(read_gate_rejects_non_coroutine)
     auto [outcome_data, outcome_error] = ico.Read(Until(100ms));
     BOOST_CHECK(bool(outcome_error));
     BOOST_CHECK(outcome_error == std::make_error_code(std::errc::operation_not_permitted));
-    BOOST_CHECK_EQUAL(state->ring.Size(), 4); // 未消费
+
+    /**
+     * 未消费
+     */
+    BOOST_CHECK_EQUAL(state->ring.Size(), 4);
 }
 
 BOOST_AUTO_TEST_CASE(read_waits_and_delivers_across_wakeup)
@@ -303,12 +333,11 @@ BOOST_AUTO_TEST_CASE(read_waits_and_delivers_across_wakeup)
     StartRuntime(2);
     std::atomic<bool> registered{false};
     ReceiveRing::SetAfterAddHookForTest([&] { registered.store(true); });
+
     struct HookGuard {
-        ~HookGuard()
-        {
-            ReceiveRing::SetAfterAddHookForTest({});
-        }
+        ~HookGuard() { ReceiveRing::SetAfterAddHookForTest({}); }
     } hook_guard;
+
     std::atomic<int> result{-1};
     auto task = Task([&] {
         auto [outcome_data, outcome_error] = ico.Read(Until(3000ms));
@@ -348,7 +377,10 @@ BOOST_AUTO_TEST_CASE(read_timeout_does_not_consume)
 
 BOOST_AUTO_TEST_CASE(read_buffer_and_eof_drain)
 {
-    // Read 复制交付尾部，下一次才 Eof。
+
+    /**
+     * Read 复制交付尾部，下一次才 Eof。
+     */
     auto state = MakeState(1024);
     auto conn = ConnectionTestAccess::Make(state);
     CoTcpConnection ico(conn);
@@ -376,7 +408,10 @@ BOOST_AUTO_TEST_CASE(read_buffer_and_eof_drain)
     BOOST_REQUIRE(task.wait_for(5s) == std::future_status::ready);
     task.get();
     BOOST_CHECK_EQUAL(result.load(), 0);
-    // 无效句柄。
+
+    /**
+     * 无效句柄。
+     */
     CoTcpConnection bad;
     BOOST_CHECK(bool(std::get<1>(bad.Read(Until(1ms)))));
 }

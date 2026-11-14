@@ -19,7 +19,8 @@ struct Buffer::WriteStorage {
 Buffer::Buffer() noexcept = default;
 Buffer::~Buffer() = default;
 
-Buffer::Buffer(Buffer&& other) noexcept : Buffer()
+Buffer::Buffer(Buffer&& other) noexcept
+    : Buffer()
 {
     *this = std::move(other);
 }
@@ -63,7 +64,10 @@ const std::vector<BufferSegment>& Buffer::Segments() const
         return m_segments;
     }
     if (m_view.empty()) {
-        // 写热路径只操作 multi_buffer；消费者实际请求视图时才生成段元数据。
+
+        /**
+         * 写热路径只操作 multi_buffer；消费者实际请求视图时才生成段元数据。
+         */
         m_view.reserve(SegmentCount());
         m_view.insert(m_view.end(), m_segments.begin(), m_segments.end());
         for (const auto segment : m_writeStorage->bytes.cdata()) {
@@ -132,11 +136,14 @@ bool Buffer::_Append(std::string_view prefix, std::string_view bytes)
     if (!m_writeStorage) {
         m_writeStorage = std::make_unique<WriteStorage>();
     }
-    // prepare 保持已有可读地址，且输出区不重叠；自追加也不必复制输入临时串。
-    // 所有分配先于 commit，字符串长度和正文不会被半提交。
+
+    /**
+     * prepare 保持已有可读地址，且输出区不重叠；自追加也不必复制输入临时串。
+     * 所有分配先于 commit，字符串长度和正文不会被半提交。
+     */
     const auto output = m_writeStorage->bytes.prepare(count);
-    const std::array<boost::asio::const_buffer, 2> input{boost::asio::buffer(prefix.data(), prefix.size()),
-                                                         boost::asio::buffer(bytes.data(), bytes.size())};
+    const std::array<boost::asio::const_buffer, 2> input{
+        boost::asio::buffer(prefix.data(), prefix.size()), boost::asio::buffer(bytes.data(), bytes.size())};
     boost::asio::buffer_copy(output, input);
     m_writeStorage->bytes.commit(count);
     m_view.clear();
@@ -211,7 +218,10 @@ void Buffer::_Consume(std::size_t count) noexcept
             ++removed;
         }
     }
-    // 只在跨过存储段时移动段元数据，逐字段消费不搬移载荷。
+
+    /**
+     * 只在跨过存储段时移动段元数据，逐字段消费不搬移载荷。
+     */
     m_segments.erase(m_segments.begin(), m_segments.begin() + removed);
     m_sourceBytes -= fromSource;
     if (m_sourceBytes == 0) {
@@ -288,7 +298,10 @@ Buffer& Buffer::operator>>(std::string& value)
     }
     _CopyBytes(0, &encoded, sizeof(encoded));
     const auto length = boost::endian::big_to_native(encoded);
-    // 减法检查先于正文分配，截断输入和不可信长度不能导致越界或提前消费。
+
+    /**
+     * 减法检查先于正文分配，截断输入和不可信长度不能导致越界或提前消费。
+     */
     if (length > Size() - sizeof(encoded)) {
         _Fail(std::errc::result_out_of_range);
         return *this;
@@ -325,8 +338,9 @@ Buffer& Buffer::operator>>(bool& value)
 
 Buffer& Buffer::operator<<(float value)
 {
-    static_assert(sizeof(value) == sizeof(std::uint32_t) && std::numeric_limits<float>::is_iec559,
-                  "Buffer requires IEEE 754 binary32");
+    static_assert(
+        sizeof(value) == sizeof(std::uint32_t) && std::numeric_limits<float>::is_iec559,
+        "Buffer requires IEEE 754 binary32");
     std::uint32_t bits{};
     std::memcpy(&bits, &value, sizeof(bits));
     return *this << bits;
@@ -343,8 +357,9 @@ Buffer& Buffer::operator>>(float& value)
 
 Buffer& Buffer::operator<<(double value)
 {
-    static_assert(sizeof(value) == sizeof(std::uint64_t) && std::numeric_limits<double>::is_iec559,
-                  "Buffer requires IEEE 754 binary64");
+    static_assert(
+        sizeof(value) == sizeof(std::uint64_t) && std::numeric_limits<double>::is_iec559,
+        "Buffer requires IEEE 754 binary64");
     std::uint64_t bits{};
     std::memcpy(&bits, &value, sizeof(bits));
     return *this << bits;
@@ -360,11 +375,14 @@ Buffer& Buffer::operator>>(double& value)
 }
 
 Buffer::Buffer(std::shared_ptr<void> backing, std::vector<BufferSegment> segments)
-    : m_backing(std::move(backing)), m_segments(std::move(segments))
+    : m_backing(std::move(backing))
+    , m_segments(std::move(segments))
 {
     for (const auto& segment : m_segments) {
         m_sourceBytes += segment.size;
     }
 }
 
-} // namespace bbt::infra::net
+// clang-format off
+}
+// clang-format on

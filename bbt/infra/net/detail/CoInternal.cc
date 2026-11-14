@@ -17,9 +17,13 @@ std::error_code InvalidContext()
     return std::make_error_code(std::errc::operation_not_permitted);
 }
 
-} // namespace
+// clang-format off
+}
+// clang-format on
 
-// 拨号私有 test 屏障（正常为空）：Engine::CoDial 提交之后、领取 attach 之前调用。
+/**
+ * 拨号私有 test 屏障（正常为空）：Engine::CoDial 提交之后、领取 attach 之前调用。
+ */
 std::function<void()>& DialBarrierForTest()
 {
     static std::function<void()> barrier;
@@ -28,7 +32,10 @@ std::function<void()>& DialBarrierForTest()
 
 std::error_code RequireCoroutineContext()
 {
-    // 与 ICoObject::RequireCoroutine 同源判定：不构造 CoObject、不缓存 TLS。
+
+    /**
+     * 与 ICoObject::RequireCoroutine 同源判定：不构造 CoObject、不缓存 TLS。
+     */
     return bbt::coroutine::IsInCoroutineContext() ? std::error_code{} : InvalidContext();
 }
 
@@ -44,7 +51,10 @@ std::error_code WaitStatusError(bbt::coroutine::WaitStatus status)
     case bbt::coroutine::WaitStatus::InvalidContext:
         return InvalidContext();
     case bbt::coroutine::WaitStatus::AlreadyWaiting:
-        // 唯一等待位被占用：本地并发冲突，不是 I/O 结果。
+
+        /**
+         * 唯一等待位被占用：本地并发冲突，不是 I/O 结果。
+         */
         return std::make_error_code(std::errc::device_or_resource_busy);
     case bbt::coroutine::WaitStatus::RuntimeUnavailable:
         return std::make_error_code(std::errc::operation_not_supported);
@@ -62,8 +72,11 @@ std::shared_ptr<ConnectionState> CoAccess::StateOf(const Connection& connection)
     return connection.m_state;
 }
 
-std::error_code CoAccess::SubmitConnect(Engine& engine, const Address& address, std::uint64_t& out_connect_id,
-                                        const std::shared_ptr<ReclaimRecord>& reclaim)
+std::error_code CoAccess::SubmitConnect(
+    Engine& engine,
+    const Address& address,
+    std::uint64_t& out_connect_id,
+    const std::shared_ptr<ReclaimRecord>& reclaim)
 {
     if (reclaim) {
         return engine.CoSubmitConnect(address, out_connect_id, reclaim);
@@ -76,8 +89,8 @@ ReclaimReceipt CoAccess::MakeReceipt(std::shared_ptr<ReclaimRecord> record)
     return ReclaimReceipt(std::move(record));
 }
 
-std::error_code CoAccess::WaitConnect(Engine& engine, std::uint64_t connect_id, Connection& out,
-                                      const bbt::coroutine::WaitOptions& options)
+std::error_code CoAccess::WaitConnect(
+    Engine& engine, std::uint64_t connect_id, Connection& out, const bbt::coroutine::WaitOptions& options)
 {
     return engine.CoWaitConnect(connect_id, out, options);
 }
@@ -87,4 +100,6 @@ std::error_code CoAccess::WaitAccepted(Engine& engine, Connection& out, const bb
     return engine.CoWaitAccepted(out, options);
 }
 
-} // namespace bbt::infra::net
+// clang-format off
+}
+// clang-format on

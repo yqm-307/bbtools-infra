@@ -21,6 +21,5 @@
  * 相关文档：README 的模块交付状态、docs/decisions/0010-gnet-network-foundation.md、
  * docs/architecture/gnet-network-execution.md（其中记录了 UDP 未交付的范围）。
  */
-
 #error                                                                                                                 \
     "UDP is not supported yet / UDP 暂不支持: bbt::infra::net has no high-level UDP entry (see bbt/infra/net/Udp.hpp)"

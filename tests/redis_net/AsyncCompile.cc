@@ -11,12 +11,17 @@ static_assert(std::is_convertible_v<redis::CoRedisCli*, redis::IRedisCli*>);
 static_assert(std::is_convertible_v<redis::CoRedisPool*, redis::IRedisCli*>);
 static_assert(!std::is_abstract_v<redis::CoRedisCli>);
 static_assert(!std::is_abstract_v<redis::CoRedisPool>);
+
 void Consume(redis::CoRedisCli& client, redis::CoRedisPool& pool, const CallOptions& options)
 {
 #ifdef BBT_NEGATIVE_ASYNC
     redis::IRedisCli& common = pool;
     auto pending = common.Ping(options);
-    pending.value(); // async 包装不能直接当 result 消费。
+
+    /**
+     * async 包装不能直接当 result 消费。
+     */
+    pending.value();
 #else
     auto one = bbt_co_await client.Ping(options);
     auto many = bbt_co_await pool.Ping(options);

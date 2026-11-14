@@ -1,19 +1,20 @@
-// MCP JsonValue 实现：全仓唯一包含 Boost.JSON 源码实现的 TU。
-//
-// 设计要点（对应 specs R2 与 design「JsonValue」段）：
-//   - 解析走 Boost 的 basic_parser + 自定义 SAX handler：词法/转义/UTF-8/数字
-//     全部由 Boost 完成，本文件只做「重复对象键」「不可表示数值」「值栈装配」
-//     三件 Boost 公开接口不直接提供的事，不手写任何 JSON 词法扫描。
-//   - handler 与 boost/json/detail/handler.ipp（Boost 自带 DOM handler）逐回调
-//     同构，避免自造第二套语义；差异仅在 on_key 里检查重复键、on_double 里拒绝
-//     不可表示数值（非有限，或落到 double 的超 int64/uint64 整数词法）。
-//   - 浮点用 number_precision::precise，整数天然走 int64/uint64，不经 double。
-//   - 有限浮点词法按 IEEE 754 最近舍入；下溢到 0（如 1e-999 → 0）保留 IEEE 语义，
-//     属正常解析而非拒绝面（见 JsonValue.hpp 与 docs/decisions/0010）。
-//   - ponytail 天花板：on_number_part 与 Boost 自带 handler 同口径（忽略分片通知），
-//     Boost 的 parser 会把完整数值经 on_int64/on_uint64/on_double 交付；只有当单个
-//     数字字面量超过解析器内部暂存区时该回调才出现，此时 Boost 自身行为一致。
-
+/**
+ * MCP JsonValue 实现：全仓唯一包含 Boost.JSON 源码实现的 TU。
+ *
+ * 解析与值语义约束：
+ *   - 解析走 Boost 的 basic_parser + 自定义 SAX handler：词法/转义/UTF-8/数字
+ *     全部由 Boost 完成，本文件只做「重复对象键」「不可表示数值」「值栈装配」
+ *     三件 Boost 公开接口不直接提供的事，不手写任何 JSON 词法扫描。
+ *   - handler 与 boost/json/detail/handler.ipp（Boost 自带 DOM handler）逐回调
+ *     同构，避免自造第二套语义；差异仅在 on_key 里检查重复键、on_double 里拒绝
+ *     不可表示数值（非有限，或落到 double 的超 int64/uint64 整数词法）。
+ *   - 浮点用 number_precision::precise，整数天然走 int64/uint64，不经 double。
+ *   - 有限浮点词法按 IEEE 754 最近舍入；下溢到 0（如 1e-999 → 0）保留 IEEE 语义，
+ *     属正常解析而非拒绝面（见 JsonValue.hpp 与 docs/decisions/0010）。
+ *   - ponytail 天花板：on_number_part 与 Boost 自带 handler 同口径（忽略分片通知），
+ *     Boost 的 parser 会把完整数值经 on_int64/on_uint64/on_double 交付；只有当单个
+ *     数字字面量超过解析器内部暂存区时该回调才出现，此时 Boost 自身行为一致。
+ */
 #include <bbt/infra/mcp/JsonValue.hpp>
 
 #include <boost/json/src.hpp>
@@ -28,7 +29,9 @@ namespace bbt::infra::mcp {
 
 namespace {
 
-// 固定错误构造：domain_code 机器可读，message 不回显任何输入字节。
+/**
+ * 固定错误构造：domain_code 机器可读，message 不回显任何输入字节。
+ */
 Error MakeJsonError(ErrorCode code, const char* domain_code, const char* message)
 {
     Error e;
@@ -43,10 +46,12 @@ template <class T> result<T> JsonErr(ErrorCode code, const char* domain_code, co
     return result<T>::err(MakeJsonError(code, domain_code, message));
 }
 
-// 纯整数词法（可选前导 '-'，其余全为数字）判定：无 '.'/'e'/'E'。
-// Boost 的解析器把能装进 int64/uint64 的整数交给 on_int64/on_uint64；一个纯整数
-// 词法落到 on_double，只可能是它已超出 int64/uint64 可表示范围（见 Boost
-// basic_parser_impl 的整数溢出分支 goto finish_dub）。据此拒绝，不静默降级为 double。
+/**
+ * 纯整数词法（可选前导 '-'，其余全为数字）判定：无 '.'/'e'/'E'。
+ * Boost 的解析器把能装进 int64/uint64 的整数交给 on_int64/on_uint64；一个纯整数
+ * 词法落到 on_double，只可能是它已超出 int64/uint64 可表示范围（见 Boost
+ * basic_parser_impl 的整数溢出分支 goto finish_dub）。据此拒绝，不静默降级为 double。
+ */
 bool IsIntegerLexeme(boost::json::string_view raw) noexcept
 {
     if (raw.empty())
@@ -61,31 +66,31 @@ bool IsIntegerLexeme(boost::json::string_view raw) noexcept
     return true;
 }
 
-// Boost 的 DOM handler 同构实现 + 对象重复键拒绝。
-// 键集合按对象层级分帧；on_key/on_key_part 可能与 Boost 自带 handler 一样分片到达，
-// 因此本处按「分片累积 + 完成时判定」处理，绝不假设一次到齐。
+/**
+ * Boost 的 DOM handler 同构实现 + 对象重复键拒绝。
+ * 键集合按对象层级分帧；on_key/on_key_part 可能与 Boost 自带 handler 一样分片到达，
+ * 因此本处按「分片累积 + 完成时判定」处理，绝不假设一次到齐。
+ */
 class StrictDomHandler {
 public:
-    // Boost 的 SAX 契约要求 handler 暴露这些容量上界（与 detail::handler 同值）。
+    /**
+     * Boost 的 SAX 契约要求 handler 暴露这些容量上界（与 detail::handler 同值）。
+     */
     static constexpr std::size_t max_object_size = boost::json::object::max_size();
     static constexpr std::size_t max_array_size = boost::json::array::max_size();
     static constexpr std::size_t max_key_size = boost::json::string::max_size();
     static constexpr std::size_t max_string_size = boost::json::string::max_size();
 
-    bool on_document_begin(boost::system::error_code&)
-    {
-        return true;
-    }
-    bool on_document_end(boost::system::error_code&)
-    {
-        return true;
-    }
+    bool on_document_begin(boost::system::error_code&) { return true; }
+
+    bool on_document_end(boost::system::error_code&) { return true; }
 
     bool on_object_begin(boost::system::error_code&)
     {
         frames_.emplace_back(true);
         return true;
     }
+
     bool on_object_end(std::size_t n, boost::system::error_code&)
     {
         if (!frames_.empty())
@@ -93,11 +98,13 @@ public:
         stack_.push_object(n);
         return true;
     }
+
     bool on_array_begin(boost::system::error_code&)
     {
         frames_.emplace_back(false);
         return true;
     }
+
     bool on_array_end(std::size_t n, boost::system::error_code&)
     {
         if (!frames_.empty())
@@ -112,6 +119,7 @@ public:
         stack_.push_chars(s);
         return true;
     }
+
     bool on_key(boost::json::string_view s, std::size_t, boost::system::error_code& ec)
     {
         key_.append(s.data(), s.size());
@@ -132,43 +140,42 @@ public:
         stack_.push_chars(s);
         return true;
     }
+
     bool on_string(boost::json::string_view s, std::size_t, boost::system::error_code&)
     {
         stack_.push_string(s);
         return true;
     }
 
-    bool on_number_part(boost::json::string_view, boost::system::error_code&)
-    {
-        return true;
-    }
+    bool on_number_part(boost::json::string_view, boost::system::error_code&) { return true; }
 
-    // 注释扩展默认关闭（allow_comments=false），此回调不会被触发；为满足
-    // Boost 的 handler 契约（编译期必须存在）而与 detail::handler 同构保留。
-    bool on_comment_part(boost::json::string_view, boost::system::error_code&)
-    {
-        return true;
-    }
-    bool on_comment(boost::json::string_view, boost::system::error_code&)
-    {
-        return true;
-    }
+    /**
+     * 注释扩展默认关闭（allow_comments=false），此回调不会被触发；为满足
+     * Boost 的 handler 契约（编译期必须存在）而与 detail::handler 同构保留。
+     */
+    bool on_comment_part(boost::json::string_view, boost::system::error_code&) { return true; }
+
+    bool on_comment(boost::json::string_view, boost::system::error_code&) { return true; }
 
     bool on_int64(std::int64_t i, boost::json::string_view, boost::system::error_code&)
     {
         stack_.push_int64(i);
         return true;
     }
+
     bool on_uint64(std::uint64_t u, boost::json::string_view, boost::system::error_code&)
     {
         stack_.push_uint64(u);
         return true;
     }
-    // 非有限（NaN/±Inf 字面量、1e309/1e400）与超范围整数都不可表示，拒绝。
-    // 纯整数词法走到 on_double，说明它已超出 int64/uint64（能装下的整数走
-    // on_int64/on_uint64）——不得静默降级为 double。raw 是 Boost 解析器交付的
-    // 原始数字词法（单次 write_some 下即完整字面量），本处只做形态判断，
-    // 不手写 JSON 词法扫描。
+
+    /**
+     * 非有限（NaN/±Inf 字面量、1e309/1e400）与超范围整数都不可表示，拒绝。
+     * 纯整数词法走到 on_double，说明它已超出 int64/uint64（能装下的整数走
+     * on_int64/on_uint64）——不得静默降级为 double。raw 是 Boost 解析器交付的
+     * 原始数字词法（单次 write_some 下即完整字面量），本处只做形态判断，
+     * 不手写 JSON 词法扫描。
+     */
     bool on_double(double d, boost::json::string_view raw, boost::system::error_code& ec)
     {
         if (!std::isfinite(d) || IsIntegerLexeme(raw)) {
@@ -179,35 +186,32 @@ public:
         stack_.push_double(d);
         return true;
     }
+
     bool on_bool(bool b, boost::system::error_code&)
     {
         stack_.push_bool(b);
         return true;
     }
+
     bool on_null(boost::system::error_code&)
     {
         stack_.push_null();
         return true;
     }
 
-    bool duplicate_key() const noexcept
-    {
-        return duplicate_key_;
-    }
-    bool number_error() const noexcept
-    {
-        return number_error_;
-    }
-    boost::json::value Release() noexcept
-    {
-        return stack_.release();
-    }
+    bool duplicate_key() const noexcept { return duplicate_key_; }
+
+    bool number_error() const noexcept { return number_error_; }
+
+    boost::json::value Release() noexcept { return stack_.release(); }
 
 private:
     struct Frame {
-        explicit Frame(bool object) : is_object(object)
+        explicit Frame(bool object)
+            : is_object(object)
         {
         }
+
         bool is_object;
         std::set<std::string> keys;
     };
@@ -219,41 +223,57 @@ private:
     bool number_error_ = false;
 };
 
-// 与 std::uint64_t 精确表示上界：2^53（double 尾数位宽）。
+/**
+ * 与 std::uint64_t 精确表示上界：2^53（double 尾数位宽）。
+ */
 constexpr std::uint64_t kExactDoubleLimit = 1ULL << 53;
 
-} // namespace
+// clang-format off
+}
+// clang-format on
 
-// 实现细节：类内嵌套（namespace 深度 ≤ 3），定义在本 TU。
+/**
+ * 实现细节：类内嵌套（namespace 深度 ≤ 3），定义在本 TU。
+ */
 struct JsonValue::Impl {
-    explicit Impl(boost::json::value v) : value(std::move(v))
+    explicit Impl(boost::json::value v)
+        : value(std::move(v))
     {
     }
+
     boost::json::value value;
 };
 
-JsonValue::JsonValue(std::unique_ptr<Impl> impl) noexcept : m_impl(std::move(impl))
+JsonValue::JsonValue(std::unique_ptr<Impl> impl) noexcept
+    : m_impl(std::move(impl))
 {
 }
 
 JsonValue::JsonValue() noexcept = default;
-JsonValue::JsonValue(std::nullptr_t) noexcept
-{
-}
+
+JsonValue::JsonValue(std::nullptr_t) noexcept {}
+
 JsonValue::JsonValue(JsonValue&& other) noexcept = default;
 JsonValue& JsonValue::operator=(JsonValue&& other) noexcept = default;
 JsonValue::~JsonValue() = default;
 
-JsonValue::JsonValue(bool value) : m_impl(std::make_unique<Impl>(boost::json::value(value)))
+JsonValue::JsonValue(bool value)
+    : m_impl(std::make_unique<Impl>(boost::json::value(value)))
 {
 }
-JsonValue::JsonValue(int value) : m_impl(std::make_unique<Impl>(boost::json::value(std::int64_t(value))))
+
+JsonValue::JsonValue(int value)
+    : m_impl(std::make_unique<Impl>(boost::json::value(std::int64_t(value))))
 {
 }
-JsonValue::JsonValue(std::int64_t value) : m_impl(std::make_unique<Impl>(boost::json::value(value)))
+
+JsonValue::JsonValue(std::int64_t value)
+    : m_impl(std::make_unique<Impl>(boost::json::value(value)))
 {
 }
-JsonValue::JsonValue(std::uint64_t value) : m_impl(std::make_unique<Impl>(boost::json::value(value)))
+
+JsonValue::JsonValue(std::uint64_t value)
+    : m_impl(std::make_unique<Impl>(boost::json::value(value)))
 {
 }
 
@@ -271,7 +291,8 @@ JsonValue::JsonValue(std::string_view value)
     m_impl = std::make_unique<Impl>(boost::json::value(boost::json::string(value)));
 }
 
-JsonValue::JsonValue(const char* value) : JsonValue(value == nullptr ? std::string_view() : std::string_view(value))
+JsonValue::JsonValue(const char* value)
+    : JsonValue(value == nullptr ? std::string_view() : std::string_view(value))
 {
 }
 
@@ -285,7 +306,10 @@ JsonValue& JsonValue::operator=(const JsonValue& other)
 {
     if (this == &other)
         return *this;
-    // 深复制：先构造新值再替换，失败时本对象保持原值（基本保证）。
+
+    /**
+     * 深复制：先构造新值再替换，失败时本对象保持原值（基本保证）。
+     */
     std::unique_ptr<Impl> copy;
     if (other.m_impl)
         copy = std::make_unique<Impl>(other.m_impl->value);
@@ -297,6 +321,7 @@ JsonValue JsonValue::Object()
 {
     return JsonValue(std::make_unique<Impl>(boost::json::value(boost::json::object())));
 }
+
 JsonValue JsonValue::Array()
 {
     return JsonValue(std::make_unique<Impl>(boost::json::value(boost::json::array())));
@@ -312,28 +337,39 @@ result<JsonValue> JsonValue::Parse(std::string_view text, std::size_t max_bytes,
     boost::json::parse_options options;
     options.max_depth = max_depth;
     options.numbers = boost::json::number_precision::precise;
-    // allow_invalid_utf8 / allow_infinity_and_nan / comments 等非标准扩展保持默认关闭。
 
+    /**
+     * allow_invalid_utf8 / allow_infinity_and_nan / comments 等非标准扩展保持默认关闭。
+     */
     boost::json::basic_parser<StrictDomHandler> parser(options);
     boost::system::error_code ec;
-    // more=false：本次调用即整帧末尾，因此解析器不会在等更多输入的状态下返回。
+
+    /**
+     * more=false：本次调用即整帧末尾，因此解析器不会在等更多输入的状态下返回。
+     */
     const std::size_t parsed_bytes = parser.write_some(false, text.data(), text.size(), ec);
 
     if (parser.handler().duplicate_key())
         return JsonErr<JsonValue>(ErrorCode::ProtocolError, "mcp.json.duplicate_key", "json object has duplicate key");
-    // 不可表示数值：非有限或超范围整数（on_double 已拒绝，不留 DOM）。
+
+    /**
+     * 不可表示数值：非有限或超范围整数（on_double 已拒绝，不留 DOM）。
+     */
     if (parser.handler().number_error())
         return JsonErr<JsonValue>(ErrorCode::ProtocolError, "mcp.json.number", "json number is not representable");
     if (ec) {
         if (ec == boost::json::error::too_deep)
             return JsonErr<JsonValue>(ErrorCode::ProtocolError, "mcp.json.max_depth", "json input exceeds max depth");
-        return JsonErr<JsonValue>(ErrorCode::ProtocolError, "mcp.json.syntax",
-                                  "json input is not a single valid document");
+        return JsonErr<JsonValue>(
+            ErrorCode::ProtocolError, "mcp.json.syntax", "json input is not a single valid document");
     }
-    // 未吃完全部字节 = 尾随数据；done() 为假 = 不完整。两者都不是「单一完整文档」。
+
+    /**
+     * 未吃完全部字节 = 尾随数据；done() 为假 = 不完整。两者都不是「单一完整文档」。
+     */
     if (parsed_bytes != text.size() || !parser.done())
-        return JsonErr<JsonValue>(ErrorCode::ProtocolError, "mcp.json.syntax",
-                                  "json input is not a single valid document");
+        return JsonErr<JsonValue>(
+            ErrorCode::ProtocolError, "mcp.json.syntax", "json input is not a single valid document");
 
     return result<JsonValue>::ok(JsonValue(std::make_unique<Impl>(parser.handler().Release())));
 }
@@ -367,30 +403,37 @@ bool JsonValue::IsNull() const noexcept
 {
     return Kind() == JsonKind::Null;
 }
+
 bool JsonValue::IsBool() const noexcept
 {
     return Kind() == JsonKind::Bool;
 }
+
 bool JsonValue::IsInt64() const noexcept
 {
     return Kind() == JsonKind::Int64;
 }
+
 bool JsonValue::IsUInt64() const noexcept
 {
     return Kind() == JsonKind::UInt64;
 }
+
 bool JsonValue::IsDouble() const noexcept
 {
     return Kind() == JsonKind::Double;
 }
+
 bool JsonValue::IsString() const noexcept
 {
     return Kind() == JsonKind::String;
 }
+
 bool JsonValue::IsArray() const noexcept
 {
     return Kind() == JsonKind::Array;
 }
+
 bool JsonValue::IsObject() const noexcept
 {
     return Kind() == JsonKind::Object;
@@ -431,9 +474,12 @@ result<JsonValue> JsonValue::At(std::size_t index) const
 result<std::vector<std::string>> JsonValue::Keys() const
 {
     if (!m_impl || !m_impl->value.is_object())
-        return JsonErr<std::vector<std::string>>(ErrorCode::InvalidArgument, "mcp.json.not_object",
-                                                 "json value is not an object");
-    // 直接复用 Boost object 的原生迭代（保持插入顺序），只做 owned string 拷贝。
+        return JsonErr<std::vector<std::string>>(
+            ErrorCode::InvalidArgument, "mcp.json.not_object", "json value is not an object");
+
+    /**
+     * 直接复用 Boost object 的原生迭代（保持插入顺序），只做 owned string 拷贝。
+     */
     std::vector<std::string> keys;
     const boost::json::object& object = m_impl->value.as_object();
     keys.reserve(object.size());
@@ -448,7 +494,10 @@ result<void> JsonValue::Set(std::string_view key, JsonValue value)
         return JsonErr<void>(ErrorCode::InvalidArgument, "mcp.json.not_object", "json value is not an object");
     if (!bbt::infra::detail::IsValidUtf8(key))
         return JsonErr<void>(ErrorCode::InvalidArgument, "mcp.json.utf8", "json object key must be valid UTF-8");
-    // 校验全部通过后才写入：不存在半份修改。
+
+    /**
+     * 校验全部通过后才写入：不存在半份修改。
+     */
     m_impl->value.as_object()[key] = value.m_impl ? std::move(value.m_impl->value) : boost::json::value();
     return result<void>::ok();
 }
@@ -511,8 +560,8 @@ result<double> JsonValue::AsDouble() const
         if (u <= kExactDoubleLimit)
             return result<double>::ok(static_cast<double>(u));
     }
-    return JsonErr<double>(ErrorCode::TypeMismatch, "mcp.json.precision",
-                           "json integer not exactly representable as double");
+    return JsonErr<double>(
+        ErrorCode::TypeMismatch, "mcp.json.precision", "json integer not exactly representable as double");
 }
 
 result<std::string> JsonValue::AsString() const
@@ -530,4 +579,6 @@ std::string JsonValue::Serialize() const
     return boost::json::serialize(m_impl->value);
 }
 
-} // namespace bbt::infra::mcp
+// clang-format off
+}
+// clang-format on

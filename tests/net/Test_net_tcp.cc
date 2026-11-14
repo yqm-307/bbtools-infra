@@ -1,18 +1,20 @@
-// TCP/Co 聚焦验证（契约行为，不是“跑过”）。
-//
-// 覆盖：
-// raw_roundtrip port0 raw server/client、sub owner 身份、无协程上下文
-// co_accept_read_write CoAccept/CoRead/CoWrite 同一内核
-// co_dial CoDial 真实建连往返
-// close_retained 关闭后已收尾部可读、Engine 收口后残留 Conn 安全
-// write_backpressure 有界发送 no_buffer_space
-// write_timeout 容量超时未提交 / 完成超时仍在途可查
-// multi_listener 多 listen 地址真实服务
-// close_waiters_settle no-deadline CoAccept / CoWrite 容量等待在关闭时结算
-// ring_combined ReceiveRing 同保护 Peek+Consume、Busy 零消费、释放代次
-// write_fifo_prefix OutboundQueue 部分写 FIFO/真实前缀/错误结算/Settling/Close
-// co_read_timeout CoRead 超时不消费
 
+/**
+ * TCP/Co 聚焦验证（契约行为，不是“跑过”）。
+ *
+ * 覆盖：
+ * raw_roundtrip port0 raw server/client、sub owner 身份、无协程上下文
+ * co_accept_read_write CoAccept/CoRead/CoWrite 同一内核
+ * co_dial CoDial 真实建连往返
+ * close_retained 关闭后已收尾部可读、Engine 收口后残留 Conn 安全
+ * write_backpressure 有界发送 no_buffer_space
+ * write_timeout 容量超时未提交 / 完成超时仍在途可查
+ * multi_listener 多 listen 地址真实服务
+ * close_waiters_settle no-deadline CoAccept / CoWrite 容量等待在关闭时结算
+ * ring_combined ReceiveRing 同保护 Peek+Consume、Busy 零消费、释放代次
+ * write_fifo_prefix OutboundQueue 部分写 FIFO/真实前缀/错误结算/Settling/Close
+ * co_read_timeout CoRead 超时不消费
+ */
 #include <bbt/coroutine/detail/Coroutine.hpp>
 #include <bbt/infra/net/Connection.hpp>
 #include <bbt/infra/net/ConnectionResult.hpp>
@@ -60,6 +62,7 @@ static void Check(bool value, const char* expression, int line)
         throw std::runtime_error("line " + std::to_string(line) + ": " + expression);
     }
 }
+
 #define CHECK(expression) Check(static_cast<bool>(expression), #expression, __LINE__)
 
 static bbt::coroutine::WaitOptions Until(std::chrono::milliseconds duration)
@@ -129,21 +132,21 @@ struct EngineRunner {
     std::error_code error;
     std::thread thread;
 
-    EngineRunner(Engine& target, EngineConfig config) : engine(target)
+    EngineRunner(Engine& target, EngineConfig config)
+        : engine(target)
     {
         thread = std::thread([this, config]() mutable { error = engine.Run(config); });
     }
+
     void CloseAndJoin()
     {
-        engine.RequestClose();
+        (void)engine.Close();
         if (thread.joinable()) {
             thread.join();
         }
     }
-    ~EngineRunner()
-    {
-        CloseAndJoin();
-    }
+
+    ~EngineRunner() { CloseAndJoin(); }
 };
 
 static NativeSocket ConnectClient(const Address& address)
@@ -226,10 +229,8 @@ struct EchoHandler : RawHandler {
         writes.fetch_add(1);
         write_bytes.fetch_add(result.sent);
     }
-    void OnClose(Connection, std::error_code) override
-    {
-        closed.fetch_add(1);
-    }
+
+    void OnClose(Connection, std::error_code) override { closed.fetch_add(1); }
 };
 
 struct NullHandler : RawHandler {};
@@ -239,16 +240,15 @@ struct StoreHandler : RawHandler {
     std::atomic<int> reads{0};
     std::mutex mutex;
     std::shared_ptr<Connection> stored;
+
     void OnAccept(Connection connection) override
     {
         accepted.fetch_add(1);
         std::lock_guard<std::mutex> lock(mutex);
         stored = std::make_shared<Connection>(connection);
     }
-    void OnRead(Connection) override
-    {
-        reads.fetch_add(1);
-    }
+
+    void OnRead(Connection) override { reads.fetch_add(1); }
 };
 
 static EngineConfig ServerConfig(const std::vector<Address>& listen, std::size_t subs = 1)
@@ -265,7 +265,9 @@ static EngineConfig ServerConfig(const Address& listen, std::size_t subs = 1)
     return ServerConfig(std::vector<Address>{listen}, subs);
 }
 
-// 极小同机 ping-pong 基线：返回 ops/sec，p99 单向往返纳秒。
+/**
+ * 极小同机 ping-pong 基线：返回 ops/sec，p99 单向往返纳秒。
+ */
 static double PingPong(const Address& address, int iterations, long long& p99_ns, int& timeouts)
 {
     timeouts = 0;
@@ -327,7 +329,9 @@ static double PingPong(const Address& address, int iterations, long long& p99_ns
     return iterations / std::chrono::duration<double>(elapsed).count();
 }
 
-// 单元测试用：AcceptWrite 输出记录 -> WriteOperation 句柄。
+/**
+ * 单元测试用：AcceptWrite 输出记录 -> WriteOperation 句柄。
+ */
 static std::error_code TryAccept(ConnectionState& state, std::string data, WriteOperation& out)
 {
     std::shared_ptr<WriteOpRecord> record;
@@ -338,8 +342,9 @@ static std::error_code TryAccept(ConnectionState& state, std::string data, Write
     return error;
 }
 
-// ---------------- cases ----------------
-
+/**
+ * ---------------- cases ----------------
+ */
 static void RawRoundtrip()
 {
     StartRuntime(3);
@@ -377,7 +382,7 @@ static void RawRoundtrip()
         3000ms));
     {
         std::lock_guard<std::mutex> lock(handler->mutex);
-        handler->stored->RequestClose();
+        (void)handler->stored->Close();
     }
     CHECK(WaitUntil([&] { return handler->closed.load() >= 1; }, 3000ms));
     runner.CloseAndJoin();
@@ -417,7 +422,7 @@ static void CoAcceptReadWrite()
             result.store(3);
             return;
         }
-        connection.RequestClose();
+        (void)connection.Close();
         result.store(0);
     });
     auto client = ConnectClient(addresses[0]);
@@ -440,7 +445,10 @@ static void CoDial()
     std::vector<Address> addresses;
     CHECK(!server.LocalAddresses(addresses));
 
-    Engine client{std::shared_ptr<RawHandler>()}; // Co-only：超时可回收未交付 fd
+    /**
+     * Co-only：超时可回收未交付 fd
+     */
+    Engine client{std::shared_ptr<RawHandler>()};
     EngineConfig client_config;
     client_config.runtime_progress = RuntimeProgress::Independent;
     client_config.options.num_event_loop = 1;
@@ -465,7 +473,7 @@ static void CoDial()
             result.store(3);
             return;
         }
-        connection.RequestClose();
+        (void)connection.Close();
         result.store(0);
     });
     Get(task);
@@ -655,7 +663,7 @@ static void CloseWaitersSettle()
         }
     });
     std::this_thread::sleep_for(30ms);
-    connection.RequestClose();
+    (void)connection.Close();
     Get(write_task);
     CHECK(write_result.load() == 0);
     std::cout << "close_waiters_settle accept=canceled write=closed\n";
@@ -663,10 +671,17 @@ static void CloseWaitersSettle()
 
 static void RingCombined()
 {
-    // View 只读借用，不消费、不持有连接锁。
+
+    /**
+     * View 只读借用，不消费、不持有连接锁。
+     */
     auto state = std::make_shared<ConnectionState>(1, 64, 64, 4, nullptr);
     Connection connection = ConnectionTestAccess::Make(state);
-    Connection peer = ConnectionTestAccess::Make(state); // 同一 ring 的第二句柄
+
+    /**
+     * 同一 ring 的第二句柄
+     */
+    Connection peer = ConnectionTestAccess::Make(state);
     CHECK(state->ring.TryAppend("abcdef").status == ReadStatus::Ok);
     const auto view = connection.View();
     CHECK(view && view.Bytes() == "abcdef");
@@ -767,7 +782,10 @@ static void CoReadTimeout()
 static void BufferTransferLifetime()
 {
     StartRuntime(2);
-    // 先证明竞争/终态都不改已有输出，且容量在移交后立即释放。
+
+    /**
+     * 先证明竞争/终态都不改已有输出，且容量在移交后立即释放。
+     */
     auto state = std::make_shared<ConnectionState>(1, 8, 8, 4, nullptr);
     auto raw = ConnectionTestAccess::Make(state);
     Buffer held;
@@ -831,7 +849,9 @@ static void BufferTransferLifetime()
     CHECK(transferred.CopyTo() == first);
     CHECK(connection.ReadableBytes() == 0);
 
-    // 读等待已注册后再发送；首个 Buffer 跨实际挂起和下一批容量复用保留。
+    /**
+     * 读等待已注册后再发送；首个 Buffer 跨实际挂起和下一批容量复用保留。
+     */
     auto live_state = CoAccess::StateOf(connection);
     std::atomic<bool> waiting{false};
     live_state->ring.SetAfterAddHookForTest([&] { waiting.store(true); });
@@ -850,7 +870,7 @@ static void BufferTransferLifetime()
     live_state->ring.SetAfterAddHookForTest({});
     CHECK(co_buffer.CopyTo() == next);
     CHECK(transferred.CopyTo() == first);
-    connection.RequestClose();
+    (void)connection.Close();
     CHECK(WaitUntil([&] { return connection.Released(); }, 3000ms));
     char byte;
     CHECK(WaitUntil([&] { return client.Receive(&byte, 1).eof; }, 3000ms));
@@ -892,7 +912,9 @@ static void ReadOverloadContract()
     auto [co_empty, co_blocked] = co.TryRead();
     CHECK(co_blocked == would_block && co_empty.Empty());
 
-    // Read 的执行域门先于可用数据；失败不触及已有 out。
+    /**
+     * Read 的执行域门先于可用数据；失败不触及已有 out。
+     */
     CHECK(state->ring.TryAppend("queued").status == ReadStatus::Ok);
     CHECK(co.Read(out) == std::make_error_code(std::errc::operation_not_permitted));
     unchanged();
@@ -911,7 +933,9 @@ static void ReadOverloadContract()
     Get(timeout);
     CHECK(state->ring.Size() == 0);
 
-    // 证明等待已登记后再取消，校验原错误及已有 Buffer 的 backing 不变。
+    /**
+     * 证明等待已登记后再取消，校验原错误及已有 Buffer 的 backing 不变。
+     */
     std::atomic<bool> registered{false};
     state->ring.SetAfterAddHookForTest([&] { registered.store(true); });
     std::promise<bbt::coroutine::detail::Coroutine*> self;
@@ -929,7 +953,9 @@ static void ReadOverloadContract()
     state->ring.SetAfterAddHookForTest({});
     CHECK(state->ring.Size() == 0);
 
-    // 相同真源，两种 Read 重载先交尾部再报 EOF，且 EOF 不等同 Closed。
+    /**
+     * 相同真源，两种 Read 重载先交尾部再报 EOF，且 EOF 不等同 Closed。
+     */
     CHECK(state->ring.TryAppend("first").status == ReadStatus::Ok);
     auto reads = Task([&] {
         out.Clear();
@@ -951,7 +977,10 @@ static void ReadOverloadContract()
 
     auto faulty = std::make_shared<ConnectionState>(2, 64, 1024, 4, nullptr);
     auto error_raw = ConnectionTestAccess::Make(faulty);
-    // 接收真源保存 OS 错误的 system_category（与真实 socket 错误一致）。
+
+    /**
+     * 接收真源保存 OS 错误的 system_category（与真实 socket 错误一致）。
+     */
     const auto fault = std::error_code(ECONNRESET, std::system_category());
     CHECK(faulty->ring.TryAppend("before-error").status == ReadStatus::Ok);
     faulty->ring.MarkError(fault);
@@ -980,8 +1009,11 @@ static void PerfBaseline()
     runner.CloseAndJoin();
     CHECK(!runner.error);
     CHECK(raw_timeouts == 0);
-    // Co 路径正确性由 net.r2_co_* / net.b4_co_read_* 覆盖；Co 短基线本轮未测
-    // （存在间歇性 coroutine 未恢复，见 b5-fix-ledger，不用统计容忍掩盖）。
+
+    /**
+     * Co 路径正确性由 net.r2_co_* / net.b4_co_read_* 覆盖；Co 短基线本轮未测
+     * （存在间歇性 coroutine 未恢复，见 b5-fix-ledger，不用统计容忍掩盖）。
+     */
     std::cout << "perf raw_ops_per_sec=" << static_cast<long long>(raw_ops) << " raw_p99_us=" << raw_p99 / 1000
               << " raw_timeouts=" << raw_timeouts << " n=" << iterations << " co_baseline=not_measured\n";
 }

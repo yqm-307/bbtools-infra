@@ -13,20 +13,23 @@
 上游 coroutine 已按**进程寿命运行时**收敛（main HEAD `7bcda3b`；契约修订自 `03430a5`：删除 `Scheduler::Stop()`/restart、
 运行时代际、`CompletionSignal`、`CancellationToken`/`CancellationSource`），infra 关闭契约改为**资源
 owner 主动调用的同步 `Close()`**。本文原「§事件、错误与关闭语义」「§所有权与资源边界」中基于
-`RequestClose`/`WaitClosed`/`CloseStatus`/`CompletionSignal`/强制 `Stop` 的结论**已被取代**（原文保留
+`Close(Immediate)`/`WaitClosed`/`CloseStatus`/`CompletionSignal`/强制 `Stop` 的结论**已被取代**（原文保留
 于下方并以本记录 + 改写后的段落标注）。**当前契约**如下（F3 修订：`Watcher` 不再是 `ICoCloseable`——轮询协程的物理停止无法从
 任意调用线程同步兑现，原 `Close()` 在回调内调用时靠提前 `MarkClosed` 伪造物理完成，已修）：
 
-- `Watcher` 提供 `RequestClose() noexcept`（幂等、任意域、非挂起，只逻辑封口并唤醒睡眠中的
-  轮询协程）与 `result<void> WaitStopped(Deadline)`（仅 native 宿主控制域：受管协程/Processer
-  域/回调内立即 `InvalidContext`；未先 `RequestClose` 返回 `InvalidArgument`；deadline 到期
-  返回 `TimedOut`，不冒充完成）。`IsClosed()` 只表示逻辑封口，物理退出由 `WaitStopped`
-  成功证明。没有同步 `Close()`/`ICoCloseable`/`CloseStatus`。
+- `Watcher` 提供 `Close(CloseOptions::Immediate(reason)) noexcept`（幂等、任意域、非挂起，只逻辑封口并唤醒睡眠中的
+  轮询协程；首因固定，回调执行期间不阻塞调用者）、`Close(CloseOptions)`（统一控制面：两种模式都
+  封口；`Immediate` 不等已获准回调，`Graceful` 以 50ms 分片等该回调返回，到期 `TimedOut` 且保留
+  封口，不自动升级；回调内 `Close(Graceful)` 自等待在副作用前返回 `InvalidContext`）与
+  `result<void> Close(wait_release=true)(Deadline)`（仅 native 宿主控制域：受管协程/Processer
+  域/回调内立即 `InvalidContext`；未先封口返回 `InvalidArgument`；deadline 到期
+  返回 `TimedOut`，不冒充完成）。`IsClosed()` 只表示逻辑封口，物理退出由 `Close(wait_release=true)`
+  成功证明。`CloseReason()` 返回首个关闭原因。没有同步 `Close()`/`ICoCloseable`/`CloseStatus`。
 - coroutine 运行时**不参与**资源收口；「运行时是否在跑」用 `Scheduler::IsInitialized()`（不再有代际）。
 - 请求等待用 `CoWaiter::WaitWithCallback`（登记 → 一次投递回调 → 挂起），adapter/轮询路径 `Notify`
   唤醒；结果（事件、错误）放 operation state。
 
-说明：`bbt/infra/config/Watch.hpp` 与 `bbt/infra/config/` 的迁移（`RequestClose`/`WaitClosed` → `Close()`）
+说明：`bbt/infra/config/Watch.hpp` 与 `bbt/infra/config/` 的迁移（`Close(Immediate)`/`WaitClosed` → `Close()`）
 已随 `02567ed` 并入 main，本记录与下方改写描述的是**当前已实现并复验的契约**（复验命令与结果见
 「§有界命令与实测结果」）。
 
@@ -65,14 +68,22 @@ owner 主动调用的同步 `Close()`**。本文原「§事件、错误与关闭
 ## 事件、错误与关闭语义（修订见「修订记录」）
 
 - 事件：`Initial`（首拍）/`Updated`（版本变化）/`Failed`（携带 `Error`）/`Recovered`。
-- `RequestClose()` 幂等、owner 主动调用、**非挂起逻辑封口**：返回即不再投递消费者（本次拍已读出
-  但尚未投递的事件随之丢弃），不 flush、不重开。`IsClosed()` 只读表示该逻辑封口，**不代表轮询协程
-  已物理退出**——物理事实由 `WaitStopped` 成功证明。
-- `WaitStopped(deadline)` 仅 native 宿主控制域调用：等待轮询协程真实退出（`std::condition_variable`
+- `Close(CloseOptions::Immediate(reason))` 幂等、owner 主动调用、**非挂起逻辑封口**：返回即不再投递消费者（本次拍已读出
+  但尚未投递的事件随之丢弃），不 flush、不重开；首因固定（`CloseReason()`）。`IsClosed()` 只读表示该
+  逻辑封口，**不代表轮询协程已物理退出**——物理事实由 `Close(wait_release=true)` 成功证明。
+- `Close(CloseOptions)` 是统一控制面：`Immediate` 封口后立即返回；`Graceful` 以 50ms 分片等「已获准的
+  当前回调返回」（本 watcher 同一时刻最多一个回调，在轮询协程内联执行），到期只返回 `TimedOut`，
+  封口与在途回调责任都保留，不自动升级。回调内 `Close(Graceful)` 是等待自身，副作用前
+  `InvalidContext`；回调内 `Close(Immediate)`/`Close(Immediate)` 合法。
+- `wait_release=true` 只在 native 宿主域成立：同一 `Close` 内继续等轮询协程真实退出到同一绝对期限；
+  受管 Co 域请求该组合在封口/首因之前返回 `InvalidArgument`（物理凭据只由 native-only 的 `Close(wait_release=true)` 提供）。
+- 封口与回调起点的线性化在同一把锁内完成，但该锁**不跨回调持有**：回调执行期间 `Close(Immediate)` 仍立即
+  返回，设备/业务线程不会被用户回调阻塞（回调不得阻塞仍是契约前置）。
+- `Close(options)（wait_release=true，有限 deadline）` 仅 native 宿主控制域调用：等待轮询协程真实退出（`std::condition_variable`
   + 退出记号，记号由协程帧独立持有、与 Impl 寿命无关）。受管协程/Processer 域/回调内调用返回
-  `InvalidContext`（等待自身/挂起调度线程）；未先 `RequestClose` 返回 `InvalidArgument`；到期返回
+  `InvalidContext`（等待自身/挂起调度线程）；未先封口返回 `InvalidArgument`；到期返回
   `TimedOut`，不冒充完成。
-- `~Watcher()` 只 `RequestClose()`：需要排空的宿主先 `WaitStopped` 再释放句柄。
+- `~Watcher()` 只 `Close()`：需要排空的宿主先 `Close(wait_release=true)` 再释放句柄。
 - 关闭落在「本次拍 `Read()` 已完成、事件尚未投递」之间时，**该事件被丢弃**；关闭后不再调用消费者。
   关闭与「刚通过检查、尚未进入回调」的单个事件允许并发（不在回调内持锁，回调不得阻塞）。
 
@@ -88,7 +99,7 @@ coroutine 运行时按进程寿命存在、不再有 `Scheduler::Stop()`；infra
 - 轮询循环只捕获 `weak_ptr<Impl>`，并在 `bbtco_sleep` 挂起前释放每拍的 `shared_ptr<Impl>`：
   挂起期间只剩一个控制块 weak 计数，源随外部句柄释放而析构。
 - 协程退出记号（`LoopExitSignal`）由协程帧与 `Impl` 各持 `shared_ptr`：协程退出时无条件落定，
-  不靠 `weak_ptr` 消失或提前 `MarkClosed` 伪造已退出；`WaitStopped` 只等这个记号。
+  不靠 `weak_ptr` 消失或提前 `MarkClosed` 伪造已退出；`Close(wait_release=true)` 只等这个记号。
 
 前置条件（违反即超出本契约，见 `Watch.hpp` 注释）：`ISource::Read()` 与消费者回调在协程域内联执行，
 必须同步返回、不得挂起（不得调用任何协程等待原语）——循环在本次拍内持有源与回调强引用，
@@ -100,7 +111,7 @@ coroutine 运行时按进程寿命存在、不再有 `Scheduler::Stop()`；infra
 > 验收基线 `e0478cb541e55350da5259bcc18f0029852add11`（worktree `test/infra35-acceptance-3cb0847e2024`）
 > 上、对固定依赖 `bbtools-coroutine = 7bcda3b078f975ff2978424be7f6ba38e04fb7f6`（main HEAD；
 > `git -C <coroutine> status --porcelain` 为空）实测；构建并发 `max(2, nproc/4)=3`、`ctest -j1`、
-> `ccache` 加速，临时文件走 `TMPDIR`。旧 `RequestClose`/`WaitClosed`/强制 `Stop` 语义下的历史命令与结果
+> `ccache` 加速，临时文件走 `TMPDIR`。旧 `Close(Immediate)`/`WaitClosed`/强制 `Stop` 语义下的历史命令与结果
 > 已随本修订删除（其结论已被上文取代，不再作为现行证据）。
 
 ```bash

@@ -1,8 +1,10 @@
-// 独立消费验证（随候选保存的可重现入口，见同目录 README.md）：
-// 只 include bbt/infra/config 公共头，只链接 bbt::infra_config target。
-// 证明最小公共契约与模块 target 可被独立程序消费，不泄漏 framework 或第三方类型。
-//
-// 运行：$TMPDIR 或当前目录用于临时文件；退出码 0 表示全部检查通过。
+/**
+ * 独立消费验证（随候选保存的可重现入口，见同目录 README.md）：
+ * 只 include bbt/infra/config 公共头，只链接 bbt::infra_config target。
+ * 证明最小公共契约与模块 target 可被独立程序消费，不泄漏 framework 或第三方类型。
+ *
+ * 运行：$TMPDIR 或当前目录用于临时文件；退出码 0 表示全部检查通过。
+ */
 
 #include <cstdio>
 #include <cstdlib>
@@ -50,7 +52,9 @@ std::string MakeTempFile(const char* name, const std::string& content)
     return std::string(buf.data());
 }
 
-} // namespace
+// clang-format off
+}
+// clang-format on
 
 int main()
 {
@@ -85,15 +89,20 @@ int main()
         check(r.value().source == "file:" + path, "source 标识");
     }
 
-    // 格式错误不发布伪成功
+    /**
+     * 格式错误不发布伪成功
+     */
     std::ofstream(path, std::ios::trunc) << "version = abc\n";
     auto bad = fsrc.value()->Read();
     check(!bad, "格式错误不发布伪成功快照");
-    check(static_cast<bool>(bad) == false
-              && static_cast<int>(bad.error().code) == static_cast<int>(ErrorCode::ProtocolError),
-          "格式错误映射 ProtocolError");
+    check(
+        static_cast<bool>(bad) == false
+            && static_cast<int>(bad.error().code) == static_cast<int>(ErrorCode::ProtocolError),
+        "格式错误映射 ProtocolError");
 
-    // 目录路径：读取失败，不得发布伪成功空快照
+    /**
+     * 目录路径：读取失败，不得发布伪成功空快照
+     */
     const std::string dir = MakeTempDir();
     check(!dir.empty(), "临时目录创建");
     auto dsrc = FileSource::Create(dir, "app", "server");

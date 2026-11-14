@@ -2,7 +2,9 @@
 
 namespace bbt::infra::net {
 
-ReceiveRing::ReceiveRing(std::size_t max_bytes) : m_ring(max_bytes), m_max_bytes(max_bytes)
+ReceiveRing::ReceiveRing(std::size_t max_bytes)
+    : m_ring(max_bytes)
+    , m_max_bytes(max_bytes)
 {
 }
 
@@ -13,7 +15,10 @@ void ReceiveRing::SetAppendFaultForTest(std::function<void()> hook)
 
 void ReceiveRing::ReserveDeferred(std::size_t capacity)
 {
-    // 预留真实 backing，且与 ring/计数同一协议锁；flush 后仍复用该存储。
+
+    /**
+     * 预留真实 backing，且与 ring/计数同一协议锁；flush 后仍复用该存储。
+     */
     std::lock_guard<std::mutex> lock(m_mutex);
     m_pending.reserve(capacity);
 }
@@ -34,11 +39,18 @@ bool ReceiveRing::StageDetached(std::string_view data)
         try {
             m_detached.append(data.data(), data.size());
         } catch (...) {
-            return false; // 调用者保留 m_recv_hold 责任
+
+            /**
+             * 调用者保留 m_recv_hold 责任
+             */
+            return false;
         }
         m_detached_size.store(m_detached.size(), std::memory_order_release);
     }
-    // 数据已提交：通知失败不得逆转提交事务（不重复提交/不向调用者报未提交）。
+
+    /**
+     * 数据已提交：通知失败不得逆转提交事务（不重复提交/不向调用者报未提交）。
+     */
     NotifyDataChanged();
     return true;
 }
@@ -98,17 +110,28 @@ bool ReceiveRing::AppendDeferred(std::string_view data)
     if (data.empty()) {
         return true;
     }
-    // 非阻塞：owner 读泵不在 driver handler 里等外部读者保护。Busy 立即
-    // 返回 false，由 SubmitReceivedOwner 保留 m_recv_hold，消费者释放
-    // （WakeOwnerOnly）后下一轮 owner 推进重试；不锁外读 underlying ring。
+
+    /**
+     * 非阻塞：owner 读泵不在 driver handler 里等外部读者保护。Busy 立即
+     * 返回 false，由 SubmitReceivedOwner 保留 m_recv_hold，消费者释放
+     * （WakeOwnerOnly）后下一轮 owner 推进重试；不锁外读 underlying ring。
+     */
     std::unique_lock<std::mutex> lock(m_mutex, std::try_to_lock);
     if (!lock.owns_lock()) {
-        return false; // Busy：字节仍由 owner 持有，绝不覆盖/丢弃
+
+        /**
+         * Busy：字节仍由 owner 持有，绝不覆盖/丢弃
+         */
+        return false;
     }
     try {
         m_pending.append(data.data(), data.size());
     } catch (...) {
-        return false; // 真实分配失败：同样保留 owner hold
+
+        /**
+         * 真实分配失败：同样保留 owner hold
+         */
+        return false;
     }
     m_pending_size.store(m_pending.size(), std::memory_order_release);
     m_size.store(m_ring.Size() + m_pending.size(), std::memory_order_release);
@@ -144,7 +167,11 @@ ReadResult ReceiveRing::TryRead(std::string& out)
     RetryPendingNotification();
     std::unique_lock<std::mutex> lock(m_mutex, std::try_to_lock);
     if (!lock.owns_lock()) {
-        RequestRawRetry(); // 保护释放后由 owner 补投 OnRead（合并非递归）
+
+        /**
+         * 保护释放后由 owner 补投 OnRead（合并非递归）
+         */
+        RequestRawRetry();
         return {ReadStatus::Busy, 0, {}};
     }
     FlushPendingLocked();
@@ -227,7 +254,10 @@ ReadView ReceiveRing::TryView()
         NotifyRelease();
         return ReadView(terminal.status, {}, terminal.error);
     }
-    // 视图只借用 ring 当前连续区域；调用方不得跨越下一次 I/O 或并发 owner 写入。
+
+    /**
+     * 视图只借用 ring 当前连续区域；调用方不得跨越下一次 I/O 或并发 owner 写入。
+     */
     const std::string_view view = m_ring.Peek();
     lock.unlock();
     NotifyRelease();
@@ -277,7 +307,10 @@ void ReceiveRing::InvokeAfterAddHookForTest()
 
 void ReceiveRing::SetOwnerWake(std::function<void()> wake)
 {
-    // 启动期只构造一次稳定句柄；通知热路径仅复制 shared_ptr（不分配）。
+
+    /**
+     * 启动期只构造一次稳定句柄；通知热路径仅复制 shared_ptr（不分配）。
+     */
     auto handle = std::make_shared<const std::function<void()>>(std::move(wake));
     std::lock_guard<std::mutex> lock(m_wake_mutex);
     m_owner_wake = std::move(handle);
@@ -357,10 +390,17 @@ void ReceiveRing::FlushPendingLocked()
     if (!m_pending.empty()) {
         const auto error = m_ring.Append(std::string_view(m_pending));
         if (!error) {
-            m_pending.clear(); // capacity retained
+
+            /**
+             * capacity retained
+             */
+            m_pending.clear();
         }
     }
-    // 关闭前 detached（已 recv 的 hold 尾部）在 pending 之后合入，保持 FIFO。
+
+    /**
+     * 关闭前 detached（已 recv 的 hold 尾部）在 pending 之后合入，保持 FIFO。
+     */
     if (m_detached_size.load(std::memory_order_acquire) != 0) {
         std::lock_guard<std::mutex> lock(m_detached_mutex);
         if (!m_detached.empty()) {
@@ -370,7 +410,10 @@ void ReceiveRing::FlushPendingLocked()
                     m_detached_size.store(0, std::memory_order_release);
                 }
             } catch (...) {
-                // 保留 detached 责任，下一次读取重试
+
+                /**
+             * 保留 detached 责任，下一次读取重试
+             */
             }
         }
     }
@@ -395,13 +438,21 @@ void ReceiveRing::WakeOwnerOnly()
     std::shared_ptr<const std::function<void()>> owner_wake;
     {
         std::lock_guard<std::mutex> lock(m_wake_mutex);
-        owner_wake = m_owner_wake; // shared_ptr copy：不分配
+
+        /**
+         * shared_ptr copy：不分配
+         */
+        owner_wake = m_owner_wake;
     }
     if (owner_wake) {
         try {
             (*owner_wake)();
         } catch (...) {
-            m_wake_pending.store(true); // 可达推进责任：下次读/终态通知重试
+
+            /**
+             * 可达推进责任：下次读/终态通知重试
+             */
+            m_wake_pending.store(true);
         }
     }
 }
@@ -423,7 +474,11 @@ void ReceiveRing::RetryPendingNotification()
 void ReceiveRing::NotifyRelease()
 {
     m_access_generation.fetch_add(1, std::memory_order_acq_rel);
-    m_release_hub.NotifyAll(); // Busy 等待者按代次复查
+
+    /**
+     * Busy 等待者按代次复查
+     */
+    m_release_hub.NotifyAll();
 }
 
 void ReceiveRing::NotifyDataChanged()
@@ -431,10 +486,18 @@ void ReceiveRing::NotifyDataChanged()
     std::shared_ptr<const std::function<void()>> owner_wake;
     {
         std::lock_guard<std::mutex> lock(m_wake_mutex);
-        owner_wake = m_owner_wake; // 不复制 std::function/不分配
+
+        /**
+         * 不复制 std::function/不分配
+         */
+        owner_wake = m_owner_wake;
     }
     if (s_notify_fault_once.exchange(false)) {
-        m_notify_pending.store(true); // 测试：通知失败仍不影响已提交数据
+
+        /**
+         * 测试：通知失败仍不影响已提交数据
+         */
+        m_notify_pending.store(true);
     } else {
         try {
             m_data_hub.NotifyAll();
@@ -486,4 +549,6 @@ std::shared_ptr<bbt::coroutine::sync::CoWaiter> ReceiveRing::RegisterReleaseWait
     return m_release_hub.Register();
 }
 
-} // namespace bbt::infra::net
+// clang-format off
+}
+// clang-format on

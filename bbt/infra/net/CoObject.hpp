@@ -4,7 +4,6 @@
  * @file CoObject.hpp
  * @brief net 中登记了上游身份的协程对象基类。
  */
-
 #include <string>
 
 #include <bbt/infra/net/ICoObject.hpp>
@@ -30,11 +29,15 @@ public:
     CoObject(const CoObject&) = delete;
     CoObject& operator=(const CoObject&) = delete;
 
-    /** @brief 返回上游登记的对象身份信息。 */
+    /**
+     * @brief 返回上游登记的对象身份信息。
+     */
     bbt::coroutine::CoObjectInfo GetObjectInfo() const override;
 
 private:
     const bbt::coroutine::CoObjectInfo m_info;
 };
 
-} // namespace bbt::infra::net
+// clang-format off
+}
+// clang-format on

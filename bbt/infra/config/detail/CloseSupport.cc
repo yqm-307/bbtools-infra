@@ -40,4 +40,6 @@ bool ManagedCloseState::BeginClose() noexcept
     return m_phase.compare_exchange_strong(expected, kClosing);
 }
 
-} // namespace bbt::infra::config_detail
+// clang-format off
+}
+// clang-format on

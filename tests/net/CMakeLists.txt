@@ -338,7 +338,7 @@ set_tests_properties(net.udp_high_level_compile_reject PROPERTIES TIMEOUT 120
     LABELS "integration")
 
 # --- coroutine pin 负向/正向 ctest（cmake -P 级，轻量不编译）--------------
-# pin 唯一真源 cmake/coroutine.sha → CoroutinePin.cmake 读取；本组覆盖：
+# 显式 pin 用 cmake/coroutine.sha 作 fixture 基线；本组覆盖默认最新源码、非法指定，以及：
 #   命中（positive）、错误 SHA（wrong_sha）、tracked 脏（dirty）、消费面内
 #   untracked 源码输入（untracked_src）、非 git 树（no_git）、伪造 manifest
 #   （manifest_rejected——自我声明不是来源证据）、普通路径复用 target 来源
@@ -346,7 +346,8 @@ set_tests_properties(net.udp_high_level_compile_reject PROPERTIES TIMEOUT 120
 # 所有 stub 树在 build 临时目录构造，不触碰真实 coroutine 检出。
 set(_pin_module "${PROJECT_SOURCE_DIR}/cmake/CoroutinePin.cmake")
 set(_pin_probe_root "${CMAKE_CURRENT_BINARY_DIR}/pin-probes")
-foreach(_case positive wrong_sha dirty no_git untracked_src manifest_rejected)
+foreach(_case positive wrong_sha dirty no_git untracked_src manifest_rejected latest_clean latest_dirty invalid_sha
+              ci_clean ci_dirty ci_empty ci_wrong_sha)
     add_test(NAME net.pin_${_case} COMMAND ${CMAKE_COMMAND}
         "-DPIN_CASE=${_case}"
         "-DPIN_MODULE=${_pin_module}"
@@ -416,3 +417,14 @@ target_link_libraries(Test_net_co_lifecycle PRIVATE bbt::infra_net Boost::header
 target_compile_options(Test_net_co_lifecycle PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME net.co_lifecycle COMMAND Test_net_co_lifecycle)
 set_tests_properties(net.co_lifecycle PROPERTIES TIMEOUT 30 LABELS "unit")
+
+# Engine 主线程宿主：真实 Engine、CoWaitRunning 等待真实 Running、Run 返回凭据、
+# 失败/关闭先于 Run 的观察、控制门与单 worker 分片推进。
+add_executable(Test_net_lifecycle_seam Test_net_lifecycle_seam.cc)
+target_link_libraries(Test_net_lifecycle_seam PRIVATE bbt::infra_net)
+target_compile_options(Test_net_lifecycle_seam PRIVATE -Wall -Wextra -Wpedantic)
+target_link_options(Test_net_lifecycle_seam PRIVATE -rdynamic)
+foreach(_case ready_release run_failure close_before_run control_gate single_worker)
+    add_test(NAME net.lifecycle_${_case} COMMAND Test_net_lifecycle_seam ${_case})
+    set_tests_properties(net.lifecycle_${_case} PROPERTIES TIMEOUT 60 LABELS "unit")
+endforeach()

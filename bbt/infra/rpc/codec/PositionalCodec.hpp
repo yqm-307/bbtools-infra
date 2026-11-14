@@ -17,7 +17,6 @@
  * 与 framework `CoRpc.hpp` 的位置参数 codec 映射关系见
  * docs/decisions/0009-rpc-runtime.md §4.1。
  */
-
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -33,8 +32,10 @@
 
 namespace bbt::infra::rpc {
 
-/// 位置参数 schema 标识。上层应引用本常量而不是复制字面量，避免出现
-/// 第二套 schema 标识。
+/**
+ * 位置参数 schema 标识。上层应引用本常量而不是复制字面量，避免出现
+ * 第二套 schema 标识。
+ */
 inline constexpr std::string_view kRpcPositionalSchema = "bbt.rpc.positional/v1";
 
 /**
@@ -60,20 +61,32 @@ enum class WireType : std::uint8_t {
  * @tparam T 待编码/解码类型
  */
 template <class T> struct ProtoCodec {
-    static constexpr bool kDefined = false; ///< 是否已为 T 提供 codec 特化
+
+    /**
+     * 是否已为 T 提供 codec 特化
+     */
+    static constexpr bool kDefined = false;
 };
 
-/// T 是否有 ProtoCodec 特化。
+/**
+ * T 是否有 ProtoCodec 特化。
+ */
 template <class T> inline constexpr bool is_proto_codec_v = ProtoCodec<T>::kDefined;
 
-/// 去引用/去 cv 后的存储类型。
+/**
+ * 去引用/去 cv 后的存储类型。
+ */
 template <class T> using Decay = std::decay_t<T>;
 
-/// T 是否为 bytes（std::vector<std::uint8_t>）。
+/**
+ * T 是否为 bytes（std::vector<std::uint8_t>）。
+ */
 template <class T> inline constexpr bool is_bytes_v = std::is_same_v<Decay<T>, std::vector<std::uint8_t>>;
 
-/// 标量 → wire tag。未识别类型落 String（真正拒绝在 EncodeOne/DecodeOne
-/// 的 scalar_supported_v 静态断言）。
+/**
+ * 标量 → wire tag。未识别类型落 String（真正拒绝在 EncodeOne/DecodeOne
+ * 的 scalar_supported_v 静态断言）。
+ */
 template <class T>
 inline constexpr WireType wire_type_v = [] {
     using D = Decay<T>;
@@ -93,29 +106,43 @@ inline constexpr WireType wire_type_v = [] {
         return WireType::String;
 }();
 
-/// 可编码标量：bool / 整数 / 浮点 / string / bytes。
+/**
+ * 可编码标量：bool / 整数 / 浮点 / string / bytes。
+ */
 template <class T>
 inline constexpr bool scalar_supported_v =
     std::is_same_v<Decay<T>, bool>
     || (std::is_integral_v<Decay<T>> && !std::is_same_v<Decay<T>, bool>) || std::is_floating_point_v<Decay<T>>
     || std::is_same_v<Decay<T>, std::string> || is_bytes_v<T>;
 
-/// 32 位长度字段上界：encode 端写长度前显式检查，超界报错而不是静默截断。
+/**
+ * 32 位长度字段上界：encode 端写长度前显式检查，超界报错而不是静默截断。
+ */
 inline constexpr std::uint32_t kMaxFieldBytes = 0xFFFFFFFFu;
 
-/// 长度是否放得进 wire 的 32 位长度字段。用 64 位比较，32 位平台上恒真。
+/**
+ * @brief 长度是否放得进 wire 的 32 位长度字段。用 64 位比较，32 位平台上恒真。
+ */
 bool FitsU32(std::size_t n) noexcept;
 
-/// 追加 4 字节小端长度。
+/**
+ * @brief 追加 4 字节小端长度。
+ */
 void PutU32(std::vector<std::uint8_t>& out, std::uint32_t v);
 
-/// 从 pos 处读取 4 字节小端长度并前移 pos；越界返回 false 且不改 pos。
+/**
+ * @brief 从 pos 处读取 4 字节小端长度并前移 pos；越界返回 false 且不改 pos。
+ */
 bool TakeU32(const std::vector<std::uint8_t>& in, std::size_t& pos, std::uint32_t& v);
 
-/// 构造结构/字节错误（ProtocolError，前缀 "rpc payload: "）。
+/**
+ * @brief 构造结构/字节错误（ProtocolError，前缀 "rpc payload: "）。
+ */
 Error Bad(const char* what);
 
-/// 编码端长度超出 32 位字段：调用方的值无法在 wire 上表达。
+/**
+ * @brief 编码端长度超出 32 位字段：调用方的值无法在 wire 上表达。
+ */
 Error LengthOverflow();
 
 /**
@@ -128,7 +155,9 @@ Error LengthOverflow();
 template <class D>
 inline constexpr bool scalar_size_supported_v = !(std::is_integral_v<D> && !std::is_same_v<D, bool>) || sizeof(D) <= 8;
 
-/// 浮点只按 4/8 字节 memcpy 编解码，long double(16) 等会错读/错写并截断。
+/**
+ * 浮点只按 4/8 字节 memcpy 编解码，long double(16) 等会错读/错写并截断。
+ */
 template <class D>
 inline constexpr bool float_size_supported_v = !std::is_floating_point_v<D> || sizeof(D) == 4 || sizeof(D) == 8;
 
@@ -189,6 +218,8 @@ result<std::tuple<Ts...>> DecodeTuple(const std::vector<std::uint8_t>& in, std::
 template <class Tuple, std::size_t... I>
 result<std::vector<std::uint8_t>> EncodeTuple(const Tuple& values, std::index_sequence<I...>);
 
-} // namespace bbt::infra::rpc
+// clang-format off
+}
+// clang-format on
 
 #include <bbt/infra/rpc/codec/__TPositionalCodec.hpp>

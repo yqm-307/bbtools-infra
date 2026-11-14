@@ -5,10 +5,8 @@ namespace bbt::infra::net {
 const std::error_category& NetErrorCategory()
 {
     static const struct Category final : std::error_category {
-        const char* name() const noexcept override
-        {
-            return "bbt.net";
-        }
+        const char* name() const noexcept override { return "bbt.net"; }
+
         std::string message(int value) const override
         {
             switch (static_cast<NetErrc>(value)) {
@@ -28,6 +26,7 @@ const std::error_category& NetErrorCategory()
             return "unknown net error";
         }
     } category;
+
     return category;
 }
 
@@ -36,4 +35,6 @@ std::error_code make_error_code(NetErrc value) noexcept
     return {static_cast<int>(value), NetErrorCategory()};
 }
 
-} // namespace bbt::infra::net
+// clang-format off
+}
+// clang-format on

@@ -1,5 +1,3 @@
-#pragma once
-
 /**
  * @file Client.hpp
  * @brief 原生协程 HTTP 客户端的装配面与请求/响应值类型（bbt::infra::http）。
@@ -22,6 +20,7 @@
  *   - 不支持：https/TLS、主机名 DNS（host 仅数值 IP，net Address 同界）、
  *     json/form 编码、流式响应、重定向、代理、HTTP/2、请求自动重试。
  */
+#pragma once
 
 #include <chrono>
 #include <cstddef>
@@ -33,6 +32,7 @@
 #include <utility>
 #include <vector>
 
+#include <bbt/infra/CloseOptions.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
 #include <bbt/infra/Result.hpp>
 #include <bbt/infra/net/Address.hpp>
@@ -41,103 +41,119 @@
 
 namespace bbt::infra::http {
 
-/// 请求/响应头序列；保留插入顺序，允许重复键。
+/**
+ * @brief 请求/响应头序列；保留插入顺序，允许重复键。
+ */
 using Headers = std::vector<std::pair<std::string, std::string>>;
-/// 查询参数序列；编码按此顺序拼接。
+
+/**
+ * @brief 查询参数序列；编码按此顺序拼接。
+ */
 using QueryParams = std::vector<std::pair<std::string, std::string>>;
-
-/**
- * @brief 单档超时的三态取值：继承 Client 档、有限值、显式禁用。
- *
- * 单层 optional 表达不了三态（「未指定」与「禁用」必须区分），所以用独立
- * 类型承载。
- */
-class PhaseTimeout {
-public:
-    /// 未指定该档：解析时取 Client 级同档取值。
-    static PhaseTimeout Inherit() noexcept
-    {
-        return PhaseTimeout{Kind::Inherit, {}};
-    }
-    /// 显式禁用该档超时（只看该档以外的限速）。
-    static PhaseTimeout Disabled() noexcept
-    {
-        return PhaseTimeout{Kind::Disabled, {}};
-    }
-    /// 有限值；非正值被拒绝（调用方 Get/Post 返回 InvalidArgument）。
-    static PhaseTimeout Milliseconds(std::chrono::milliseconds value) noexcept
-    {
-        return PhaseTimeout{Kind::Finite, value};
-    }
-
-    /// 是否为继承档。
-    bool IsInherit() const noexcept
-    {
-        return m_kind == Kind::Inherit;
-    }
-    /// 是否为显式禁用档。
-    bool IsDisabled() const noexcept
-    {
-        return m_kind == Kind::Disabled;
-    }
-    /// 有限值档的取值；Inherit/Disabled 返回 nullopt。
-    std::optional<std::chrono::milliseconds> Finite() const noexcept;
-
-private:
-    enum class Kind { Inherit, Finite, Disabled };
-    PhaseTimeout(Kind kind, std::chrono::milliseconds value) noexcept : m_kind(kind), m_value(value)
-    {
-    }
-    Kind m_kind;
-    std::chrono::milliseconds m_value{};
-};
-
-/**
- * @brief 分阶段超时：连接、读、写、池排队四档。
- *
- * 默认四档均 5s（对齐 httpx Timeout(5.0) 的均匀档），逐字段显式写出，
- * 避免「一个字段默认值被误读为四档」。
- */
-struct Timeout {
-    PhaseTimeout connect{PhaseTimeout::Milliseconds(std::chrono::milliseconds{5000})}; ///< 建连
-    PhaseTimeout read{PhaseTimeout::Milliseconds(std::chrono::milliseconds{5000})};    ///< 读响应
-    PhaseTimeout write{PhaseTimeout::Milliseconds(std::chrono::milliseconds{5000})};   ///< 写请求
-    PhaseTimeout pool{PhaseTimeout::Milliseconds(std::chrono::milliseconds{5000})};    ///< 等池内可用连接
-
-    /// 四档取同一个 PhaseTimeout 值。
-    static Timeout Uniform(PhaseTimeout phase) noexcept;
-};
 
 /**
  * @brief 连接池配额。
  *
  * 全局配额（active+idle+dialing+retiring 计入 max_connections），无每 origin
  * 限额。max_queue 是排队人数上界，满即 Overloaded（不静默无限排队）。
+ *
+ * max_connections 含在飞、空闲、建连中与退役中；max_keepalive_connections 是空闲
+ * 保活上限；keepalive_expiry 为 nullopt 表示不过期，过期在池 sweep 中惰性判定。
  */
 struct PoolLimits {
-    std::size_t max_connections{8};           ///< 全局连接上限，含在飞、空闲、建连中与退役中
-    std::size_t max_keepalive_connections{4}; ///< 空闲保活上限
-    /// 空闲连接保活过期；nullopt 表示不过期。过期在池 sweep 中惰性判定。
+    std::size_t max_connections{8};
+    std::size_t max_keepalive_connections{4};
     std::optional<std::chrono::milliseconds> keepalive_expiry{std::chrono::milliseconds{15000}};
-    std::size_t max_queue{32}; ///< 排队等待人数上界，满即 Overloaded
+    std::size_t max_queue{32};
 };
 
 /**
  * @brief Client 级装配选项：默认地址、默认头/参数、分档超时与池配额。
+ *
+ * base_url 形如 "http://127.0.0.1:8080"，scheme 仅 http，host 仅数值 IP（DNS 未
+ * 交付）；headers/params 是 client 级默认值，请求级同名覆盖、参数追加在后；
+ * 各阶段超时独立限时，max() 表示该阶段不设上限，默认均为 5 秒；limits 是连接池
+ * 配额；max_body_bytes 是单响应体上限（Beast body_limit）；
+ * max_request_body_bytes / max_header_bytes 未设置时保留原有行为。
+ *
+ * 超时配置只在 Create 前有意义，Create 后不再读取改动。
  */
 struct ClientOptions {
-    /// 例 "http://127.0.0.1:8080"；scheme 仅 http，host 仅数值 IP（DNS 未交付）。
     std::string base_url;
-    Headers headers;     ///< client 级默认头（请求级同名覆盖）
-    QueryParams params;  ///< client 级默认查询参数（请求级追加在后）
-    Timeout timeout{};   ///< 默认分档超时
-    PoolLimits limits{}; ///< 连接池配额
-    /// 单响应体上限（Beast body_limit）。
+    Headers headers;
+    QueryParams params;
+    std::chrono::milliseconds connect_timeout{5000};
+    std::chrono::milliseconds read_timeout{5000};
+    std::chrono::milliseconds write_timeout{5000};
+    std::chrono::milliseconds pool_timeout{5000};
+    PoolLimits limits{};
     std::uint64_t max_body_bytes{8 * 1024 * 1024};
-    /// 请求 body 字节上限；未设置时保留原有行为。
     std::optional<std::uint64_t> max_request_body_bytes;
-    /// 响应 header 字节上限；未设置时保留原有行为。
     std::optional<std::uint64_t> max_header_bytes;
+
+    /**
+     * @name 超时设置与禁用
+     * @brief 覆盖 Client 级默认阶段超时；时长须为正，由 Create 校验。
+     *
+     * 共享语义：SetTimeout 一次设置全部四个阶段；SetXxxTimeout 只改对应阶段；
+     * DisableXxxTimeout 只禁用该阶段的超时，不取消 CallOptions 的总期限。禁用把
+     * 该阶段保存为 milliseconds::max()，即这个阶段不再有上限。
+     * @{
+     */
+
+    /**
+     * @brief 同时设置 connect/read/write/pool 四个阶段。
+     */
+    ClientOptions& SetTimeout(std::chrono::milliseconds value) noexcept;
+
+    /**
+     * @brief 只设置建连阶段超时。
+     */
+    ClientOptions& SetConnectTimeout(std::chrono::milliseconds value) noexcept;
+
+    /**
+     * @brief 只设置读阶段超时。
+     */
+    ClientOptions& SetReadTimeout(std::chrono::milliseconds value) noexcept;
+
+    /**
+     * @brief 只设置写阶段超时。
+     */
+    ClientOptions& SetWriteTimeout(std::chrono::milliseconds value) noexcept;
+
+    /**
+     * @brief 只设置排队等池的阶段超时。
+     */
+    ClientOptions& SetPoolTimeout(std::chrono::milliseconds value) noexcept;
+
+    /**
+     * @brief 禁用全部四个阶段的超时。
+     */
+    ClientOptions& DisableTimeout() noexcept;
+
+    /**
+     * @brief 禁用建连阶段超时。
+     */
+    ClientOptions& DisableConnectTimeout() noexcept;
+
+    /**
+     * @brief 禁用读阶段超时。
+     */
+    ClientOptions& DisableReadTimeout() noexcept;
+
+    /**
+     * @brief 禁用写阶段超时。
+     */
+    ClientOptions& DisableWriteTimeout() noexcept;
+
+    /**
+     * @brief 禁用排队等池的阶段超时。
+     */
+    ClientOptions& DisablePoolTimeout() noexcept;
+
+    /**
+     * @}
+     */
 };
 
 /**
@@ -147,61 +163,143 @@ struct ClientOptions {
  * json/form 编码未实现，因此不用互斥 union 假装两种形态。
  */
 struct RequestBody {
-    std::string content;      ///< 原样发送的 body 字节
-    std::string content_type; ///< 非空时作为 Content-Type 的默认值
+    std::string content;
+    std::string content_type;
 };
 
 /**
  * @brief 单请求覆盖项：头、查询参数与分档超时。
+ *
+ * headers 按「client 打底、同名覆盖」合并；params 按「client 在前、请求级追加
+ * 在后」拼接；四个 timeout 字段 nullopt 表示继承 Client 配置。
  */
 struct RequestOptions {
-    Headers headers;                ///< merge：client 打底，同名覆盖
-    QueryParams params;             ///< merge：client 在前，请求级追加在后
-    std::optional<Timeout> timeout; ///< 分档覆盖；档为 Inherit 时取 Client 档
+    Headers headers;
+    QueryParams params;
+    std::optional<std::chrono::milliseconds> connect_timeout;
+    std::optional<std::chrono::milliseconds> read_timeout;
+    std::optional<std::chrono::milliseconds> write_timeout;
+    std::optional<std::chrono::milliseconds> pool_timeout;
+
+    /**
+     * @name 超时覆盖与禁用
+     * @brief 只覆盖指定阶段；未设置的阶段继承 Client 配置。
+     *
+     * 共享语义：SetTimeout 覆盖全部阶段；SetXxxTimeout 只改对应阶段；
+     * DisableXxxTimeout 显式禁用该阶段（不等于继承）。时长须为正，由
+     * BuildRequest 校验；对字段 reset() 即恢复继承。
+     * @{
+     */
+
+    /**
+     * @brief 同时覆盖 connect/read/write/pool 四个阶段。
+     */
+    RequestOptions& SetTimeout(std::chrono::milliseconds value) noexcept;
+
+    /**
+     * @brief 只覆盖建连阶段超时。
+     */
+    RequestOptions& SetConnectTimeout(std::chrono::milliseconds value) noexcept;
+
+    /**
+     * @brief 只覆盖读阶段超时。
+     */
+    RequestOptions& SetReadTimeout(std::chrono::milliseconds value) noexcept;
+
+    /**
+     * @brief 只覆盖写阶段超时。
+     */
+    RequestOptions& SetWriteTimeout(std::chrono::milliseconds value) noexcept;
+
+    /**
+     * @brief 只覆盖排队等池的阶段超时。
+     */
+    RequestOptions& SetPoolTimeout(std::chrono::milliseconds value) noexcept;
+
+    /**
+     * @brief 禁用全部四个阶段的超时。
+     */
+    RequestOptions& DisableTimeout() noexcept;
+
+    /**
+     * @brief 禁用建连阶段超时。
+     */
+    RequestOptions& DisableConnectTimeout() noexcept;
+
+    /**
+     * @brief 禁用读阶段超时。
+     */
+    RequestOptions& DisableReadTimeout() noexcept;
+
+    /**
+     * @brief 禁用写阶段超时。
+     */
+    RequestOptions& DisableWriteTimeout() noexcept;
+
+    /**
+     * @brief 禁用排队等池的阶段超时。
+     */
+    RequestOptions& DisablePoolTimeout() noexcept;
+
+    /**
+     * @}
+     */
 };
 
 /**
  * @brief 一次 HTTP 响应（含 4xx/5xx，它们不是错误）。
+ *
+ * status_code 是 HTTP 状态码；headers 保持线上顺序；body 受 max_body_bytes 限制。
  */
 struct Response {
-    int status_code{0}; ///< HTTP 状态码
-    Headers headers;    ///< 响应头，保持线上顺序
-    std::string body;   ///< 响应体字节（受 max_body_bytes 限制）
-    /// 2xx 为 true；其余（含 4xx/5xx）为 false，但仍是有效响应。
-    bool Ok() const noexcept
-    {
-        return status_code >= 200 && status_code < 300;
-    }
+    int status_code{0};
+    Headers headers;
+    std::string body;
+
+    /**
+     * @brief 2xx 为 true；其余（含 4xx/5xx）为 false，但仍是有效响应。
+     */
+    bool Ok() const noexcept { return status_code >= 200 && status_code < 300; }
 };
 
 /**
  * @brief BuildRequest 产物：已合并 base_url/headers/params、已解析超时
- *        （无 Inherit 残留）、已解析 origin/数值地址的待发请求。
+ *        （无待继承项）、已解析 origin/数值地址的待发请求。
  *
- * Send 消费；纯值不联网。（命名说明：方法名 Client::Request 与值类型不能
- * 同名，值类型用 PreparedRequest。）
+ * Send 消费；纯值不联网。命名说明：方法名 Client::Request 与值类型不能同名，
+ * 值类型用 PreparedRequest。
+ *
+ * target_for_wire 是 origin-form（path[?query]），即 HTTP/1.1 wire 目标；
+ * address 是 Engine::CoDial 用的数值地址；host_header 是无用户覆盖时的默认 Host。
  */
 struct PreparedRequest {
-    std::string method;          ///< 请求方法
-    std::string url;             ///< 合并 base_url 后的绝对 URL
-    std::string target_for_wire; ///< origin-form（path[?query]），HTTP/1.1 wire 目标
-    net::Address address;        ///< 数值地址（Engine::CoDial 用）
-    std::string host_header;     ///< 默认 Host（无用户覆盖时）
-    Headers headers;             ///< 合并后的请求头
-    std::string body;            ///< 请求体字节
-    Timeout timeout;             ///< 已解析：任何档都不是 Inherit
+    std::string method;
+    std::string url;
+    std::string target_for_wire;
+    net::Address address;
+    std::string host_header;
+    Headers headers;
+    std::string body;
+    std::chrono::milliseconds connect_timeout{5000};
+    std::chrono::milliseconds read_timeout{5000};
+    std::chrono::milliseconds write_timeout{5000};
+    std::chrono::milliseconds pool_timeout{5000};
 };
 
 /**
  * @brief 连接池观测快照（产品公开面，供容量/退役验证）。
+ *
+ * active 是在飞请求占用；idle 空闲可复用；dialing 建连中；retiring 已请求关闭、
+ * 真实回收凭据尚未完成；waiting 是排队等待者；budget 为以上连接之和，受
+ * max_connections 约束。
  */
 struct PoolStats {
-    std::size_t active{0};   ///< 在飞请求占用
-    std::size_t idle{0};     ///< 空闲可复用
-    std::size_t dialing{0};  ///< 建连中
-    std::size_t retiring{0}; ///< 退役中（已请求关闭，真实回收凭据尚未完成）
-    std::size_t waiting{0};  ///< 排队等待者
-    std::size_t budget{0};   ///< 以上连接之和，受 max_connections 约束
+    std::size_t active{0};
+    std::size_t idle{0};
+    std::size_t dialing{0};
+    std::size_t retiring{0};
+    std::size_t waiting{0};
+    std::size_t budget{0};
 };
 
 /**
@@ -212,81 +310,146 @@ struct PoolStats {
  */
 class Client {
 public:
-    /// 只装配：校验 options、构造池；不联网。Engine 由应用装配并保证可推进。
-    /// @param engine 应用装配并推进的 net::Engine，Client 只借用
-    /// @param options 默认地址、头/参数、分档超时与池配额
-    /// @return 装配失败时为错误（参数非法等）
+    /**
+     * @brief 只装配：校验 options、构造池；不联网。
+     *
+     * Engine 由应用装配并保证可推进。
+     * @param engine 应用装配并推进的 net::Engine，Client 只借用
+     * @param options 默认地址、头/参数、分档超时与池配额
+     * @return 装配失败时为错误（参数非法等）
+     */
     static result<std::shared_ptr<Client>> Create(std::shared_ptr<net::Engine> engine, ClientOptions options);
     ~Client() noexcept;
     Client(const Client&) = delete;
     Client& operator=(const Client&) = delete;
 
-    /// BuildRequest 纯构造，不挂起（可在协程外调用）。URL/base_url 合并、参数
-    /// 编码、headers/超时解析都在此完成。
-    /// @param method 请求方法
-    /// @param url 绝对 URL 或相对 base_url 的路径
-    /// @param options 请求级覆盖项
-    /// @return 已解析的待发请求；解析失败（非法 URL、非正值超时等）为错误
-    result<PreparedRequest> BuildRequest(std::string_view method, std::string_view url,
-                                         const RequestOptions& options) const;
+    /**
+     * @brief BuildRequest 纯构造，不挂起（可在协程外调用）。
+     *
+     * URL/base_url 合并、参数编码、headers/超时解析都在此完成。
+     * @param method 请求方法
+     * @param url 绝对 URL 或相对 base_url 的路径
+     * @param options 请求级覆盖项
+     * @return 已解析的待发请求；解析失败（非法 URL、非正值超时等）为错误
+     */
+    result<PreparedRequest>
+    BuildRequest(std::string_view method, std::string_view url, const RequestOptions& options) const;
 
-    // 以下入口挂起等待，须在协程上下文调用（bbt_co_await 消费）。
-    // 省略 call 时默认无总期限（Deadline::max()），各阶段默认超时限速仍生效；
-    // 显式传 CallOptions{} 表示已过期（deadline 为 epoch），会被拒绝——
-    // 省略与显式零值是两种语义，不是同一缺省。
-    /// GET 请求：url 为绝对 URL 或相对 base_url 的路径，options 为请求级覆盖；
-    /// call 为总期限，省略表示无总期限。返回有效响应（含 4xx/5xx）或传输/排队/
-    /// 装配错误。
-    bbt_co_async(result<Response>) Get(std::string_view url, const RequestOptions& options,
-                                       const CallOptions& call = {bbt::coroutine::Deadline::max()});
-    /// POST 请求（原始 body）：body 携带内容与默认 Content-Type，options 为请求级
-    /// 覆盖，call 为总期限（省略表示无总期限）。返回有效响应（含 4xx/5xx）或
-    /// 传输/排队/装配错误。
-    bbt_co_async(result<Response>) Post(std::string_view url, RequestBody body, const RequestOptions& options,
-                                        const CallOptions& call = {bbt::coroutine::Deadline::max()});
-    /// 任意方法的请求，body 由 RequestBody 承载（无 body 语义时传空 content）；
-    /// call 为总期限（省略表示无总期限）。返回有效响应（含 4xx/5xx）或传输/排队/
-    /// 装配错误。
-    bbt_co_async(result<Response>) Request(std::string_view method, std::string_view url, const RequestOptions& options,
-                                           const CallOptions& call = {bbt::coroutine::Deadline::max()});
-    /// 发送已构建的请求（BuildRequest 产物），不再做 URL/超时解析；返回有效响应
-    /// （含 4xx/5xx）或传输/排队/装配错误。
-    ///
-    /// @param request 已解析的待发请求
-    /// @param call 总期限（省略表示无总期限）
+    /**
+     * @name 请求入口
+     * @brief 在协程上下文中执行请求，阶段超时受 CallOptions 的非重置总期限共同约束。
+     *
+     * 省略 call 表示无总期限；显式 CallOptions{} 的 epoch deadline 会被拒绝。
+     * 各入口只在请求形态、body 和已构建请求方面不同。
+     * @{
+     */
+
+    /**
+     * @brief GET 请求。
+     *
+     * 这一族入口挂起等待，须在协程上下文调用（bbt_co_await 消费）。省略 call 时
+     * 默认无总期限（Deadline::max()），各阶段默认超时限速仍生效；显式传
+     * CallOptions{} 表示已过期（deadline 为 epoch），会被拒绝——省略与显式零值是
+     * 两种语义，不是同一缺省。
+     *
+     * @param url 绝对 URL 或相对 base_url 的路径
+     * @param options 请求级覆盖
+     * @param call 总期限，省略表示无总期限
+     * @return 有效响应（含 4xx/5xx）或传输/排队/装配错误
+     */
+    bbt_co_async(result<Response>)
+        Get(std::string_view url,
+            const RequestOptions& options,
+            const CallOptions& call = {bbt::coroutine::Deadline::max()});
+
+    /**
+     * @brief POST 请求（原始 body）。
+     *
+     * @param url 绝对 URL 或相对 base_url 的路径
+     * @param body 内容与默认 Content-Type
+     * @param options 请求级覆盖
+     * @param call 总期限，省略表示无总期限
+     * @return 有效响应（含 4xx/5xx）或传输/排队/装配错误
+     */
+    bbt_co_async(result<Response>) Post(
+        std::string_view url,
+        RequestBody body,
+        const RequestOptions& options,
+        const CallOptions& call = {bbt::coroutine::Deadline::max()});
+
+    /**
+     * @brief 任意方法的请求，body 由 RequestBody 承载（无 body 语义时传空 content）。
+     *
+     * @param method 请求方法
+     * @param url 绝对 URL 或相对 base_url 的路径
+     * @param options 请求级覆盖
+     * @param call 总期限，省略表示无总期限
+     * @return 有效响应（含 4xx/5xx）或传输/排队/装配错误
+     */
+    bbt_co_async(result<Response>) Request(
+        std::string_view method,
+        std::string_view url,
+        const RequestOptions& options,
+        const CallOptions& call = {bbt::coroutine::Deadline::max()});
+
+    /**
+     * @brief 发送已构建的请求（BuildRequest 产物），不再做 URL/超时解析。
+     *
+     * @param request 已解析的待发请求
+     * @param call 总期限，省略表示无总期限
+     * @return 有效响应（含 4xx/5xx）或传输/排队/装配错误
+     */
     bbt_co_async(result<Response>)
         Send(const PreparedRequest& request, const CallOptions& call = {bbt::coroutine::Deadline::max()});
 
-    /// 立即逻辑封口（Open/Draining → Closed），幂等且不可重开。
-    ///
-    /// 拒绝新请求、唤醒全部排队等待者、对在飞与拨号条目请求关闭，并结算全部
-    /// 未终结操作（「失败在途」恰好一次，Draining 下同样执行，与 Shutdown
-    /// 不共用位）、发布首个关闭原因。不等待在飞请求，不关共享 Engine，
-    /// 不假装物理排空（退役连接的 fd 由 Engine owner 收口）。
-    /// @param reason 首个关闭原因；之后调用不再覆盖
-    void Close(Error reason = MakeError(ErrorCode::Closed, "http client: closed by owner")) noexcept;
-    /// 非 Open 即 true：Shutdown 置位 Draining 后同样报已封口。
-    bool IsClosed() const noexcept;
-    /// Close 发布的原因；Shutdown 只置 Draining 不发布原因，故未 Close 时为空。
-    std::optional<Error> CloseReason() const noexcept;
-    /// 置 Draining（拒新）并等已接纳调用责任归零（在途借用与排队，不看条目
-    /// phase；Retiring 属延迟物理回收不计入）。
-    ///
-    /// 有限期限超时返回 TimedOut 且保持拒新；等待期间被 Close 且仍有在途返回
-    /// 其关闭原因，先排空先胜返回 ok（成功不被追改）；重复调用仍 Draining 且
-    /// 有在途返回 Overloaded（Busy）；已 Closed 返回首个关闭原因。native 宿主
-    /// 专用；协程/Processer 域返回 InvalidContext。
-    /// @param deadline 等待已接纳调用归零的期限
-    /// @return 排空完成、已关闭或相应错误
-    result<void> Shutdown(bbt::coroutine::Deadline deadline);
+    // clang-format off
 
-    /// 当前池占用快照（只读，不阻塞）。
+    /**
+     * @}
+     */
+    // clang-format on
+
+    /**
+     * @brief 统一关闭入口；Immediate 不等待时任意线程可调用。
+     *
+     * - `Immediate`：等价 `Close(Immediate)`，不等待在飞请求。
+     * - `Graceful`：封新、拒绝排队者并发布首因，然后在绝对期限前等已借出租借
+     *   与在途操作归零；排空后退役池内剩余条目。到期只返回 `TimedOut` 并保留
+     *   在途责任，不自动升级。
+     * - `wait_release=true`：模式工作完成后在同一 `Close` 内继续等池条目按
+     *   真实回收出账到同一绝对期限；false 时物理事实仍由 `Close(wait_release=true)` 证明。
+     *
+     * 重复调用幂等、首因固定；`Graceful → Immediate` 升级由任一次
+     * Immediate/Close(Immediate) 触发。不关共享 Engine。
+     * @param options 模式、首因与优雅关闭的有限绝对期限
+     * @return 排空完成、已关闭或相应错误
+     */
+    result<void> Close(const CloseOptions& options = {});
+
+    /**
+     * @brief 非 Open 即 true：优雅关闭置 Draining 后同样报已封口。
+     */
+    bool IsClosed() const noexcept;
+
+    /**
+     * @brief 关闭原因；任意模式首次发布后固定。
+     */
+    std::optional<Error> CloseReason() const noexcept;
+
+    /**
+     * @brief 当前池占用快照（只读，不阻塞）。
+     */
     PoolStats Stats() const noexcept;
 
 private:
+    void _BeginClose(Error reason = MakeError(ErrorCode::Closed, "http client: closed by owner")) noexcept;
+    result<void> _WaitReleased(bbt::coroutine::Deadline deadline);
+
     struct State;
     explicit Client(std::shared_ptr<State> state) noexcept;
     std::shared_ptr<State> m_state;
 };
 
-} // namespace bbt::infra::http
+// clang-format off
+}
+// clang-format on

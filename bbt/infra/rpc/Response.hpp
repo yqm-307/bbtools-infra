@@ -13,7 +13,6 @@
  *
  * 注意：访问器 Metadata() 与别名 rpc::Metadata 同名；类内别名一律 rpc:: 限定。
  */
-
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -31,88 +30,113 @@ namespace bbt::infra::rpc {
 class Response {
 public:
     Response() = default;
-    /// 以给定 payload 构造响应（关联字段留待 setter 填充）。
-    /// @param payload 响应 payload 字节
-    explicit Response(std::vector<std::uint8_t> payload) : m_payload(std::move(payload))
+
+    /**
+     * @brief 以给定 payload 构造响应（关联字段留待 setter 填充）。
+     * @param payload 响应 payload 字节
+     */
+    explicit Response(std::vector<std::uint8_t> payload)
+        : m_payload(std::move(payload))
     {
     }
 
-    /** @brief 复制请求的五个关联字段；回复 payload 与 metadata 初始为空，不保留请求引用。 */
+    /**
+     * @brief 复制请求的五个关联字段；回复 payload 与 metadata 初始为空，不保留请求引用。
+     */
     static Response FromRequest(const Request& request);
 
-    /// 回指的请求 id。
-    const std::string& RequestId() const noexcept
-    {
-        return m_request_id;
-    }
-    /// 服务名（须与请求一致）。
-    const std::string& Service() const noexcept
-    {
-        return m_service;
-    }
-    /// 方法名（须与请求一致）。
-    const std::string& Method() const noexcept
-    {
-        return m_method;
-    }
-    /// 请求 schema 标识（须与请求一致）。
-    const std::string& RequestSchema() const noexcept
-    {
-        return m_request_schema;
-    }
-    /// 响应 schema 标识。
-    const std::string& ResponseSchema() const noexcept
-    {
-        return m_response_schema;
-    }
-    /// 响应 payload（原始字节）。
-    const std::vector<std::uint8_t>& Payload() const noexcept
-    {
-        return m_payload;
-    }
-    /// envelope metadata（顺序保留）。
-    const rpc::Metadata& Metadata() const noexcept
-    {
-        return m_metadata;
-    }
+    /**
+     * @brief 回指的请求 id。
+     */
+    const std::string& RequestId() const noexcept { return m_request_id; }
 
-    /// 设置回指的请求 id。
+    /**
+     * @brief 服务名（须与请求一致）。
+     */
+    const std::string& Service() const noexcept { return m_service; }
+
+    /**
+     * @brief 方法名（须与请求一致）。
+     */
+    const std::string& Method() const noexcept { return m_method; }
+
+    /**
+     * @brief 请求 schema 标识（须与请求一致）。
+     */
+    const std::string& RequestSchema() const noexcept { return m_request_schema; }
+
+    /**
+     * @brief 响应 schema 标识。
+     */
+    const std::string& ResponseSchema() const noexcept { return m_response_schema; }
+
+    /**
+     * @brief 响应 payload（原始字节）。
+     */
+    const std::vector<std::uint8_t>& Payload() const noexcept { return m_payload; }
+
+    /**
+     * @brief envelope metadata（顺序保留）。
+     */
+    const rpc::Metadata& Metadata() const noexcept { return m_metadata; }
+
+    /**
+     * @brief 设置回指的请求 id。
+     */
     Response& SetRequestId(std::string value)
     {
         m_request_id = std::move(value);
         return *this;
     }
-    /// 设置服务名（须与请求一致）。
+
+    /**
+     * @brief 设置服务名（须与请求一致）。
+     */
     Response& SetService(std::string value)
     {
         m_service = std::move(value);
         return *this;
     }
-    /// 设置方法名（须与请求一致）。
+
+    /**
+     * @brief 设置方法名（须与请求一致）。
+     */
     Response& SetMethod(std::string value)
     {
         m_method = std::move(value);
         return *this;
     }
-    /// 设置请求 schema 标识（须与请求一致）。
+
+    /**
+     * @brief 设置请求 schema 标识（须与请求一致）。
+     */
     Response& SetRequestSchema(std::string value)
     {
         m_request_schema = std::move(value);
         return *this;
     }
-    /// 设置响应 schema 标识。
+
+    /**
+     * @brief 设置响应 schema 标识。
+     */
     Response& SetResponseSchema(std::string value)
     {
         m_response_schema = std::move(value);
         return *this;
     }
-    /// 设置 payload 字节。
+
+    /**
+     * @brief 设置 payload 字节。
+     */
     Response& SetPayload(std::vector<std::uint8_t> value)
     {
         m_payload = std::move(value);
         return *this;
     }
-    /// 设置 envelope metadata。
+
+    /**
+     * @brief 设置 envelope metadata。
+     */
     Response& SetMetadata(rpc::Metadata value)
     {
         m_metadata = std::move(value);
@@ -129,4 +153,6 @@ private:
     rpc::Metadata m_metadata;
 };
 
-} // namespace bbt::infra::rpc
+// clang-format off
+}
+// clang-format on

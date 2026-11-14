@@ -6,7 +6,9 @@
 namespace bbt::infra::config {
 
 MemorySource::MemorySource(std::string ns, std::string key)
-    : m_ns(std::move(ns)), m_key(std::move(key)), m_source("memory:" + m_ns + "/" + m_key)
+    : m_ns(std::move(ns))
+    , m_key(std::move(key))
+    , m_source("memory:" + m_ns + "/" + m_key)
 {
     m_current.ns = m_ns;
     m_current.key = m_key;
@@ -58,4 +60,6 @@ Snapshot MemorySource::Current() const
     return m_current;
 }
 
-} // namespace bbt::infra::config
+// clang-format off
+}
+// clang-format on

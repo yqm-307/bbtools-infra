@@ -201,9 +201,12 @@ set(BBT_INFRA_PUBLIC_HEADERS
     ICoCloseable.hpp
     NetworkTypes.hpp
     Codec.hpp
+    MongoClientConfig.hpp
     CoMongoCli.hpp
     mongo/Bson.hpp
-    mongo/Client.hpp
+    mongo/CoMongoDb.hpp
+    mongo/CoMongoColl.hpp
+    mongo/MongoTypes.hpp
     config/Value.hpp
     config/Snapshot.hpp
     config/Source.hpp

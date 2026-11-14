@@ -1,4 +1,5 @@
-/** @file Result.hpp
+/**
+ * @file Result.hpp
  * @brief 统一结果类型 result<T> / result<void>、错误分类 ErrorCode 与错误体 Error。
  *
  * 公共面用返回值表达失败，不以异常传递业务错误：调用方用 explicit operator bool 判定成功，
@@ -46,17 +47,29 @@ enum class ErrorCode {
     InternalError
 };
 
-/// @brief Error.details 的条目上限；超出由 ValidateErrorDetails 整体拒绝，不截断。
+/**
+ * @brief Error.details 的条目上限；超出由 ValidateErrorDetails 整体拒绝，不截断。
+ */
 inline constexpr std::size_t kMaxErrorDetails = 16;
-/// @brief 单个详情键的字节上限（UTF-8）。
+
+/**
+ * @brief 单个详情键的字节上限（UTF-8）。
+ */
 inline constexpr std::size_t kMaxKeyBytes = 64;
-/// @brief 单个详情值的字节上限（UTF-8）。
+
+/**
+ * @brief 单个详情值的字节上限（UTF-8）。
+ */
 inline constexpr std::size_t kMaxValueBytes = 256;
 
-/// @brief 结构化详情：有序键值对；同一详情内键不得重复，由 ValidateErrorDetails 校验。
+/**
+ * @brief 结构化详情：有序键值对；同一详情内键不得重复，由 ValidateErrorDetails 校验。
+ */
 using ErrorDetails = std::vector<std::pair<std::string, std::string>>;
 
-/// @brief infra 自身错误的默认 domain。上层 domain 及其保留键的语义由上层边界拥有，infra 不在本头硬编码任何上层字段。
+/**
+ * @brief infra 自身错误的默认 domain。上层 domain 及其保留键的语义由上层边界拥有，infra 不在本头硬编码任何上层字段。
+ */
 inline constexpr std::string_view kErrorDomainInfra = "infra";
 
 /**
@@ -73,11 +86,31 @@ inline constexpr std::string_view kErrorDomainInfra = "infra";
  *   - ReplyTerminal：已获得可信回复终态（完整响应，含明确的 4xx/5xx）。
  */
 enum class RequestPhase {
-    NotStarted = 0,   ///< 尚未发起任何 I/O（未解析、未连接）。
-    Connecting,       ///< 解析或连接中。
-    Writing,          ///< 请求字节写出中，尚未确认完整写出。
-    RequestCommitted, ///< 请求字节已完整写出，等待回复。
-    ReplyTerminal,    ///< 已获得可信回复终态。
+
+    /**
+     * 尚未发起任何 I/O（未解析、未连接）。
+     */
+    NotStarted = 0,
+
+    /**
+     * 解析或连接中。
+     */
+    Connecting,
+
+    /**
+     * 请求字节写出中，尚未确认完整写出。
+     */
+    Writing,
+
+    /**
+     * 请求字节已完整写出，等待回复。
+     */
+    RequestCommitted,
+
+    /**
+     * 已获得可信回复终态。
+     */
+    ReplyTerminal,
 };
 
 /**
@@ -97,17 +130,52 @@ inline constexpr bool IsRequestCommitted(RequestPhase phase) noexcept
  * 调用方不应据此分支。
  */
 struct Error {
-    ErrorCode code = ErrorCode::InternalError;           ///< 错误分类码。
-    std::string domain = std::string(kErrorDomainInfra); ///< 错误域，默认 "infra"。
-    std::string domain_code;                             ///< 域内语义名（如 net.closed），不适用时为空。
-    std::string message;                                 ///< 面向人的说明，不参与分支判定。
-    std::string backend_category;                        ///< 后端错误类别名（如 generic、system、bbt.net）。
-    int backend_code = 0;                                ///< 后端原始错误值。
-    std::uint64_t transferred_bytes = 0;                 ///< 已传输字节数，由产生错误的协议路径按需填写，默认 0。
-    ErrorDetails details;                                ///< 结构化详情，结构规则见 ValidateErrorDetails。
-    /// 出站请求落定或放弃时的阶段（见 RequestPhase）。
-    /// 不来自出站请求 operation 的错误（上下文、参数校验、装配、已关闭拒绝等），或该路径不携带阶段时为 nullopt。
-    /// OutcomeUnknown 的机器可读判定：阶段与 code 一起看；domain_code、backend_* 与 message 保留物理原因。
+
+    /**
+     * 错误分类码。
+     */
+    ErrorCode code = ErrorCode::InternalError;
+
+    /**
+     * 错误域，默认 "infra"。
+     */
+    std::string domain = std::string(kErrorDomainInfra);
+
+    /**
+     * 域内语义名（如 net.closed），不适用时为空。
+     */
+    std::string domain_code;
+
+    /**
+     * 面向人的说明，不参与分支判定。
+     */
+    std::string message;
+
+    /**
+     * 后端错误类别名（如 generic、system、bbt.net）。
+     */
+    std::string backend_category;
+
+    /**
+     * 后端原始错误值。
+     */
+    int backend_code = 0;
+
+    /**
+     * 已传输字节数，由产生错误的协议路径按需填写，默认 0。
+     */
+    std::uint64_t transferred_bytes = 0;
+
+    /**
+     * 结构化详情，结构规则见 ValidateErrorDetails。
+     */
+    ErrorDetails details;
+
+    /**
+     * 出站请求落定或放弃时的阶段（见 RequestPhase）。
+     * 不来自出站请求 operation 的错误（上下文、参数校验、装配、已关闭拒绝等），或该路径不携带阶段时为 nullopt。
+     * OutcomeUnknown 的机器可读判定：阶段与 code 一起看；domain_code、backend_* 与 message 保留物理原因。
+     */
     std::optional<RequestPhase> request_phase;
 };
 
@@ -121,10 +189,14 @@ Error MakeError(ErrorCode code, std::string message);
 
 namespace detail {
 
-/// @brief 严格 UTF-8 良构检查：拒绝截断序列、过长编码、代理区与 >U+10FFFF 码点。
+/**
+ * @brief 严格 UTF-8 良构检查：拒绝截断序列、过长编码、代理区与 >U+10FFFF 码点。
+ */
 bool IsValidUtf8(std::string_view s) noexcept;
 
-} // namespace detail
+// clang-format off
+}
+// clang-format on
 
 template <class T> class result;
 
@@ -148,32 +220,51 @@ result<void> ValidateErrorDetails(const Error& error);
  */
 template <class T> class result {
 public:
-    /// @brief 构造成功结果。
+    /**
+     * @brief 构造成功结果。
+     */
     static result ok(T value);
-    /// @brief 构造错误结果；error 按值移入。
+
+    /**
+     * @brief 构造错误结果；error 按值移入。
+     */
     static result err(Error error);
 
-    /// @brief 成功时为 true。
-    explicit operator bool() const noexcept
-    {
-        return m_data.index() == 0;
-    }
+    /**
+     * @brief 成功时为 true。
+     */
+    explicit operator bool() const noexcept { return m_data.index() == 0; }
 
-    /// @brief 取成功值的左值引用；在错误分支调用会抛出 std::logic_error。
+    /**
+     * @brief 取成功值的左值引用；在错误分支调用会抛出 std::logic_error。
+     */
     T& value() &;
-    /// @brief 取成功值的 const 左值引用；在错误分支调用会抛出 std::logic_error。
+
+    /**
+     * @brief 取成功值的 const 左值引用；在错误分支调用会抛出 std::logic_error。
+     */
     const T& value() const&;
-    /// @brief 取出成功值（移动语义）；在错误分支调用会抛出 std::logic_error。
+
+    /**
+     * @brief 取出成功值（移动语义）；在错误分支调用会抛出 std::logic_error。
+     */
     T&& value() &&;
 
-    /// @brief 取错误体的引用；在成功分支调用会抛出 std::logic_error。
+    /**
+     * @brief 取错误体的引用；在成功分支调用会抛出 std::logic_error。
+     */
     Error& error() &;
-    /// @brief 取错误体的 const 引用；在成功分支调用会抛出 std::logic_error。
+
+    /**
+     * @brief 取错误体的 const 引用；在成功分支调用会抛出 std::logic_error。
+     */
     const Error& error() const&;
 
 private:
     struct OkTag {};
+
     struct ErrTag {};
+
     result(OkTag, T value);
     result(ErrTag, Error error);
 
@@ -190,20 +281,29 @@ private:
  */
 template <> class result<void> {
 public:
-    /// @brief 构造无值的成功结果。
+    /**
+     * @brief 构造无值的成功结果。
+     */
     static result ok();
-    /// @brief 构造错误结果；error 按值移入。
+
+    /**
+     * @brief 构造错误结果；error 按值移入。
+     */
     static result err(Error error);
 
-    /// @brief 成功时为 true。
-    explicit operator bool() const noexcept
-    {
-        return !m_error.has_value();
-    }
+    /**
+     * @brief 成功时为 true。
+     */
+    explicit operator bool() const noexcept { return !m_error.has_value(); }
 
-    /// @brief 取错误体的引用；在成功分支调用会抛出 std::logic_error。
+    /**
+     * @brief 取错误体的引用；在成功分支调用会抛出 std::logic_error。
+     */
     Error& error() &;
-    /// @brief 取错误体的 const 引用；在成功分支调用会抛出 std::logic_error。
+
+    /**
+     * @brief 取错误体的 const 引用；在成功分支调用会抛出 std::logic_error。
+     */
     const Error& error() const&;
 
 private:
@@ -215,6 +315,8 @@ private:
     std::optional<Error> m_error;
 };
 
-} // namespace bbt::infra
+// clang-format off
+}
+// clang-format on
 
 #include <bbt/infra/__TResult.hpp>

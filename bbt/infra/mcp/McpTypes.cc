@@ -1,8 +1,9 @@
-// MCP 公共基础类型实现（McpTypes.hpp 的非内联部分）。
-//
-// 只有 RequestId 的两件非平凡行为需要编译单元：原值回包（ToJson）与稳定可比较
-// 键（Key）。两者都不做输入回显、不依赖 Boost 类型。
-
+/**
+ * MCP 公共基础类型实现（McpTypes.hpp 的非内联部分）。
+ *
+ * 请求 id 回包与比较键、资源内容校验、关闭观察和请求上下文在此实现；
+ * 公共头只承载自有类型，不依赖 Boost 类型。
+ */
 #include <bbt/infra/mcp/McpTypes.hpp>
 
 #include <cstddef>
@@ -14,8 +15,10 @@ namespace bbt::infra::mcp {
 
 namespace {
 
-// 规范 base64（RFC 4648 §4 标准字母表）：长度 4 的倍数、仅尾部 '=' 填充（≤2 个）、
-// 不接受 URL-safe 字母表、空白或其它字符。
+/**
+ * 规范 base64（RFC 4648 §4 标准字母表）：长度 4 的倍数、仅尾部 '=' 填充（≤2 个）、
+ * 不接受 URL-safe 字母表、空白或其它字符。
+ */
 bool IsCanonicalBase64(const std::string& text)
 {
     if (text.size() % 4 != 0)
@@ -28,8 +31,12 @@ bool IsCanonicalBase64(const std::string& text)
                 first_pad = i;
             continue;
         }
+
+        /**
+         * 填充后不得再出现数据字符
+         */
         if (first_pad != std::string::npos)
-            return false; // 填充后不得再出现数据字符
+            return false;
         const bool alphabet =
             (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '+' || c == '/';
         if (!alphabet)
@@ -49,7 +56,9 @@ Error MakeTypeError(const char* domain_code, const char* message)
     return e;
 }
 
-} // namespace
+// clang-format off
+}
+// clang-format on
 
 JsonValue RequestId::ToJson() const
 {
@@ -60,7 +69,9 @@ JsonValue RequestId::ToJson() const
     return JsonValue(AsUInt64());
 }
 
-// 前缀区分类型：字符串 "1" 与整数 1 不得折叠成同一身份（在途去重/订阅 id 用）。
+/**
+ * 前缀区分类型：字符串 "1" 与整数 1 不得折叠成同一身份（在途去重/订阅 id 用）。
+ */
 std::string RequestId::Key() const
 {
     if (IsString())
@@ -106,12 +117,14 @@ Content Content::Text(std::string text)
     return content;
 }
 
-} // namespace bbt::infra::mcp
+// clang-format off
+}
+// clang-format on
 
 namespace bbt::infra::mcp {
 
-result<InputRequired> InputRequired::Create(std::map<std::string, ClientInputRequest> input_requests,
-                                            std::optional<std::string> request_state)
+result<InputRequired> InputRequired::Create(
+    std::map<std::string, ClientInputRequest> input_requests, std::optional<std::string> request_state)
 {
     if (input_requests.empty() && !request_state) {
         Error error;
@@ -142,7 +155,9 @@ result<InputRequired> InputRequired::Create(std::map<std::string, ClientInputReq
     return result<InputRequired>::ok(std::move(value));
 }
 
-} // namespace bbt::infra::mcp
+// clang-format off
+}
+// clang-format on
 
 namespace bbt::infra::mcp {
 
@@ -152,24 +167,33 @@ bool CancellationView::Cancelled() const noexcept
 }
 
 RequestContext::RequestContext(RequestId id, std::string protocol_version, JsonValue client_capabilities)
-    : RequestContext(std::move(id), std::move(protocol_version), std::move(client_capabilities), CancellationView{}, {},
-                     {})
+    : RequestContext(
+          std::move(id), std::move(protocol_version), std::move(client_capabilities), CancellationView{}, {}, {})
 {
 }
 
-RequestContext::RequestContext(RequestId id, std::string protocol_version, JsonValue client_capabilities,
-                               CancellationView cancellation)
-    : RequestContext(std::move(id), std::move(protocol_version), std::move(client_capabilities),
-                     std::move(cancellation), {}, {})
+RequestContext::RequestContext(
+    RequestId id, std::string protocol_version, JsonValue client_capabilities, CancellationView cancellation)
+    : RequestContext(
+          std::move(id), std::move(protocol_version), std::move(client_capabilities), std::move(cancellation), {}, {})
 {
 }
 
-RequestContext::RequestContext(RequestId id, std::string protocol_version, JsonValue client_capabilities,
-                               CancellationView cancellation, std::map<std::string, JsonValue> input_responses,
-                               std::optional<std::string> request_state, std::chrono::steady_clock::time_point deadline)
-    : m_id(std::move(id)), m_protocol_version(std::move(protocol_version)),
-      m_client_capabilities(std::move(client_capabilities)), m_cancellation(std::move(cancellation)),
-      m_input_responses(std::move(input_responses)), m_request_state(std::move(request_state)), m_deadline(deadline)
+RequestContext::RequestContext(
+    RequestId id,
+    std::string protocol_version,
+    JsonValue client_capabilities,
+    CancellationView cancellation,
+    std::map<std::string, JsonValue> input_responses,
+    std::optional<std::string> request_state,
+    std::chrono::steady_clock::time_point deadline)
+    : m_id(std::move(id))
+    , m_protocol_version(std::move(protocol_version))
+    , m_client_capabilities(std::move(client_capabilities))
+    , m_cancellation(std::move(cancellation))
+    , m_input_responses(std::move(input_responses))
+    , m_request_state(std::move(request_state))
+    , m_deadline(deadline)
 {
 }
 
@@ -178,4 +202,6 @@ bool RequestContext::DeadlineExceeded() const noexcept
     return HasDeadline() && std::chrono::steady_clock::now() >= m_deadline;
 }
 
-} // namespace bbt::infra::mcp
+// clang-format off
+}
+// clang-format on

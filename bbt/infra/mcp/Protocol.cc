@@ -1,10 +1,11 @@
-// MCP 协议输入完整性 / owned 请求 id / modern `_meta` 校验 / discover·error·result
-// 构造基础（specs R2/R3/R4 中不依赖 Schema 与 transport 的部分）。
-//
-// 本文件不做方法分派、不建立会话、不持有在途状态：所有校验都是「单帧、无跨请求
-// 状态」的纯函数，因此 modern 请求之间不可能互相污染（S5 的隔离要求由结构保证，
-// 并由 tests/Test_mcp_protocol.cc 逐项断言）。
-
+/**
+ * MCP 协议输入完整性 / owned 请求 id / modern `_meta` 校验 / discover·error·result
+ * 构造基础（不依赖 Schema 与 transport 的部分）。
+ *
+ * 本文件不做方法分派、不建立会话、不持有在途状态：所有校验都是「单帧、无跨请求
+ * 状态」的纯函数，因此 modern 请求之间不可能互相污染（的隔离要求由结构保证，
+ * 并由 tests/Test_mcp_protocol.cc 逐项断言）。
+ */
 #include <algorithm>
 #include "detail/Protocol.hpp"
 
@@ -14,7 +15,9 @@ namespace bbt::infra::mcp {
 
 namespace {
 
-// 固定错误构造：domain_code 机器可读，message 为规范固定文本（不回显输入）。
+/**
+ * 固定错误构造：domain_code 机器可读，message 为规范固定文本（不回显输入）。
+ */
 Error MakeProtocolError(ErrorCode code, const char* domain_code, const char* message)
 {
     Error e;
@@ -26,14 +29,14 @@ Error MakeProtocolError(ErrorCode code, const char* domain_code, const char* mes
 
 template <class T> result<T> InvalidRequest()
 {
-    return result<T>::err(MakeProtocolError(ErrorCode::ProtocolError, "mcp.rpc.invalid_request",
-                                            "invalid request: not a JSON-RPC 2.0 request"));
+    return result<T>::err(MakeProtocolError(
+        ErrorCode::ProtocolError, "mcp.rpc.invalid_request", "invalid request: not a JSON-RPC 2.0 request"));
 }
 
 template <class T> result<T> InvalidParams()
 {
-    return result<T>::err(MakeProtocolError(ErrorCode::ProtocolError, "mcp.rpc.invalid_params",
-                                            "invalid params: params must be an object or array"));
+    return result<T>::err(MakeProtocolError(
+        ErrorCode::ProtocolError, "mcp.rpc.invalid_params", "invalid params: params must be an object or array"));
 }
 
 ProtocolFailure Failure(JsonRpcErrorCode code, const char* message)
@@ -44,7 +47,9 @@ ProtocolFailure Failure(JsonRpcErrorCode code, const char* message)
     return f;
 }
 
-// -32602 的固定诊断文本（不回显请求内容）。
+/**
+ * -32602 的固定诊断文本（不回显请求内容）。
+ */
 ProtocolFailure MetaShapeFailure(const char* detail)
 {
     ProtocolFailure f;
@@ -53,22 +58,27 @@ ProtocolFailure MetaShapeFailure(const char* detail)
     return f;
 }
 
-// ---- `_meta`/extensions key 命名（spec 39-50，ASCII 规则）----------------------
-
+/**
+ * `_meta`/extensions key 命名（spec 39-50，ASCII 规则）
+ */
 bool IsAsciiAlpha(char c)
 {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
 }
+
 bool IsAsciiDigit(char c)
 {
     return c >= '0' && c <= '9';
 }
+
 bool IsAsciiAlnum(char c)
 {
     return IsAsciiAlpha(c) || IsAsciiDigit(c);
 }
 
-// label：首字母 letter，尾 letter|digit，内部 letter|digit|'-'。
+/**
+ * label：首字母 letter，尾 letter|digit，内部 letter|digit|'-'。
+ */
 bool IsValidMetaLabel(std::string_view label)
 {
     if (label.empty())
@@ -83,7 +93,9 @@ bool IsValidMetaLabel(std::string_view label)
     return true;
 }
 
-// prefix：labels 用 '.' 分隔（无空 label），后跟 '/'；如 io.modelcontextprotocol/。
+/**
+ * prefix：labels 用 '.' 分隔（无空 label），后跟 '/'；如 io.modelcontextprotocol/。
+ */
 bool IsValidMetaPrefix(std::string_view prefix)
 {
     std::size_t start = 0;
@@ -99,7 +111,9 @@ bool IsValidMetaPrefix(std::string_view prefix)
     }
 }
 
-// name：允许为空；非空时首尾字母数字，内部字母数字/'-'/'_'/'.'（不含 '/'）。
+/**
+ * name：允许为空；非空时首尾字母数字，内部字母数字/'-'/'_'/'.'（不含 '/'）。
+ */
 bool IsValidMetaName(std::string_view name)
 {
     if (name.empty())
@@ -112,7 +126,9 @@ bool IsValidMetaName(std::string_view name)
     return true;
 }
 
-// extensions key：prefix（必需且合法）+ '/' + name（空/合法）。
+/**
+ * extensions key：prefix（必需且合法）+ '/' + name（空/合法）。
+ */
 bool IsValidExtensionKey(std::string_view key)
 {
     const std::size_t slash = key.find('/');
@@ -121,18 +137,26 @@ bool IsValidExtensionKey(std::string_view key)
     return IsValidMetaPrefix(key.substr(0, slash)) && IsValidMetaName(key.substr(slash + 1));
 }
 
-// ---- capabilities 已知 shape 的最小校验工具（不做通用 schema 引擎）-----------
-
-// 已知 object 字段：不存在 → 通过；存在则必须是 object。
+/**
+ * capabilities 已知 shape 的最小校验工具（不做通用 schema 引擎）
+ *
+ * 已知 object 字段：不存在 → 通过；存在则必须是 object。
+ */
 bool ObjectIfPresent(const JsonValue& parent, std::string_view field)
 {
     auto value = parent.Find(field);
+
+    /**
+     * 缺省即合法
+     */
     if (!value)
-        return true; // 缺省即合法
+        return true;
     return value.value().IsObject();
 }
 
-// 已知 boolean 字段（roots.listChanged）：不存在 → 通过；存在则必须是 bool。
+/**
+ * 已知 boolean 字段（roots.listChanged）：不存在 → 通过；存在则必须是 bool。
+ */
 bool BoolIfPresent(const JsonValue& parent, std::string_view field)
 {
     auto value = parent.Find(field);
@@ -141,7 +165,9 @@ bool BoolIfPresent(const JsonValue& parent, std::string_view field)
     return value.value().IsBool();
 }
 
-// string→object 映射（experimental / extensions）：每个成员值必须是 object。
+/**
+ * string→object 映射（experimental / extensions）：每个成员值必须是 object。
+ */
 bool IsObjectMap(const JsonValue& value)
 {
     if (!value.IsObject())
@@ -157,7 +183,9 @@ bool IsObjectMap(const JsonValue& value)
     return true;
 }
 
-// experimental（三 revision 同 shape）：可选，string→object 映射。
+/**
+ * experimental（三 revision 同 shape）：可选，string→object 映射。
+ */
 bool ExperimentalOk(const JsonValue& capabilities)
 {
     if (!ObjectIfPresent(capabilities, "experimental"))
@@ -166,7 +194,9 @@ bool ExperimentalOk(const JsonValue& capabilities)
     return !experimental || IsObjectMap(experimental.value());
 }
 
-// roots（legacy 已知子字段 listChanged:boolean；modern 无已知子字段约束）。
+/**
+ * roots（legacy 已知子字段 listChanged:boolean；modern 无已知子字段约束）。
+ */
 bool RootsOk(const JsonValue& capabilities, bool legacy)
 {
     if (!ObjectIfPresent(capabilities, "roots"))
@@ -177,9 +207,11 @@ bool RootsOk(const JsonValue& capabilities, bool legacy)
     return !roots || BoolIfPresent(roots.value(), "listChanged");
 }
 
-// sampling/elicitation（legacy 2025-11-25 要求 object + 已知子字段约束）。
-bool ObjectSubfieldsOk(const JsonValue& capabilities, std::string_view field,
-                       std::initializer_list<std::string_view> subfields)
+/**
+ * sampling/elicitation（legacy 2025-11-25 要求 object + 已知子字段约束）。
+ */
+bool ObjectSubfieldsOk(
+    const JsonValue& capabilities, std::string_view field, std::initializer_list<std::string_view> subfields)
 {
     if (!ObjectIfPresent(capabilities, field))
         return false;
@@ -192,7 +224,9 @@ bool ObjectSubfieldsOk(const JsonValue& capabilities, std::string_view field,
     return true;
 }
 
-// extensions（仅 modern 有已知约束）：string→object 映射，key 须带合法 prefix。
+/**
+ * extensions（仅 modern 有已知约束）：string→object 映射，key 须带合法 prefix。
+ */
 bool ExtensionsOk(const JsonValue& capabilities)
 {
     if (!ObjectIfPresent(capabilities, "extensions"))
@@ -211,8 +245,10 @@ bool ExtensionsOk(const JsonValue& capabilities)
     return true;
 }
 
-// legacy 2025-11-25 tasks 嵌套（list/cancel/requests.{sampling.createMessage,
-// elicitation.create} 均为 object）。
+/**
+ * legacy 2025-11-25 tasks 嵌套（list/cancel/requests.{sampling.createMessage,
+ * elicitation.create} 均为 object）。
+ */
 bool TasksOk(const JsonValue& capabilities)
 {
     if (!ObjectIfPresent(capabilities, "tasks"))
@@ -230,12 +266,20 @@ bool TasksOk(const JsonValue& capabilities)
            && ObjectSubfieldsOk(requests.value(), "elicitation", {"create"});
 }
 
-} // namespace
+// clang-format off
+}
+// clang-format on
 
-result<JsonRpcRequest> ParseRequestFrame(std::string_view raw, const ProtocolLimits& limits,
-                                         std::optional<RequestId>* detected_id, bool* notification_recognized)
+result<JsonRpcRequest> ParseRequestFrame(
+    std::string_view raw,
+    const ProtocolLimits& limits,
+    std::optional<RequestId>* detected_id,
+    bool* notification_recognized)
 {
-    // 每次调用先清空：失败路径绝不沿用上一次调用的 id / 通知分类。
+
+    /**
+     * 每次调用先清空：失败路径绝不沿用上一次调用的 id / 通知分类。
+     */
     if (detected_id)
         detected_id->reset();
     if (notification_recognized)
@@ -246,7 +290,9 @@ result<JsonRpcRequest> ParseRequestFrame(std::string_view raw, const ProtocolLim
         return result<JsonRpcRequest>::err(parsed.error());
     JsonValue frame = std::move(parsed).value();
 
-    // batch（顶层数组）与任何非 object 顶层都被明确拒为非法信封。
+    /**
+     * batch（顶层数组）与任何非 object 顶层都被明确拒为非法信封。
+     */
     if (!frame.IsObject())
         return InvalidRequest<JsonRpcRequest>();
 
@@ -257,8 +303,10 @@ result<JsonRpcRequest> ParseRequestFrame(std::string_view raw, const ProtocolLim
     if (!version_text || version_text.value() != "2.0")
         return InvalidRequest<JsonRpcRequest>();
 
-    // id：string 或整数，保留精确值；无 id 成员即通知（不回响应）。
-    // 先把 id 定下来：后续信封/params 失败若 id 已知，必须原值回包（JSON-RPC 2.0）。
+    /**
+     * id：string 或整数，保留精确值；无 id 成员即通知（不回响应）。
+     * 先把 id 定下来：后续信封/params 失败若 id 已知，必须原值回包（JSON-RPC 2.0）。
+     */
     JsonRpcRequest request;
     auto id = frame.Find("id");
     if (id) {
@@ -273,7 +321,11 @@ result<JsonRpcRequest> ParseRequestFrame(std::string_view raw, const ProtocolLim
         case JsonKind::UInt64:
             request.id = RequestId(id_value.AsUInt64().value());
             break;
-        default: // null / bool / double / array / object：id 不可确定
+
+        /**
+         * null / bool / double / array / object：id 不可确定
+         */
+        default:
             return InvalidRequest<JsonRpcRequest>();
         }
         if (detected_id)
@@ -282,7 +334,9 @@ result<JsonRpcRequest> ParseRequestFrame(std::string_view raw, const ProtocolLim
         request.notification = true;
     }
 
-    // 请求里混入 result/error（即 response 伪装成 request）明确拒。id 已知则已记录。
+    /**
+     * 请求里混入 result/error（即 response 伪装成 request）明确拒。id 已知则已记录。
+     */
     if (frame.Find("result") || frame.Find("error"))
         return InvalidRequest<JsonRpcRequest>();
 
@@ -295,12 +349,14 @@ result<JsonRpcRequest> ParseRequestFrame(std::string_view raw, const ProtocolLim
 
     request.method = std::move(method_text).value();
 
-    // 到这里「基本信封」已合法（jsonrpc 合法、未混入 result|error、method 为非空
-    // string），且无 id 成员 → 该帧是可识别的 JSON-RPC 通知。**仅在此之后**标记
-    // 分类（F2）：若后续 params 形状非法，调用方据此按 JSON-RPC 2.0 §4.1「通知
-    // 不得回包」静默丢弃（不回 -32602），且不把非法 params 当成可执行通知推进状态。
-    // 非法 method / 非法 jsonrpc / result 混入 / parse 失败这类不构成请求的帧在此
-    // 之前已返回，故不会被误分类（仍走 -32700/-32600）。
+    /**
+     * 到这里「基本信封」已合法（jsonrpc 合法、未混入 result|error、method 为非空
+     * string），且无 id 成员 → 该帧是可识别的 JSON-RPC 通知。**仅在此之后**标记
+     * 分类：若后续 params 形状非法，调用方据此按 JSON-RPC 2.0 §4.1「通知
+     * 不得回包」静默丢弃（不回 -32602），且不把非法 params 当成可执行通知推进状态。
+     * 非法 method / 非法 jsonrpc / result 混入 / parse 失败这类不构成请求的帧在此
+     * 之前已返回，故不会被误分类（仍走 -32700/-32600）。
+     */
     if (request.notification && notification_recognized)
         *notification_recognized = true;
 
@@ -323,8 +379,11 @@ result<JsonRpcRequest> ParseRequestFrame(std::string_view raw, const ProtocolLim
 ProtocolFailure ToProtocolFailure(const Error& error)
 {
     const std::string& domain_code = error.domain_code;
-    // 帧级失败（JsonValue::Parse 的固定 domain_code）统一映射为 -32700：原因区分
-    // 保留在 domain_code 中，wire 上仍是规范定义的 Parse error。
+
+    /**
+     * 帧级失败（JsonValue::Parse 的固定 domain_code）统一映射为 -32700：原因区分
+     * 保留在 domain_code 中，wire 上仍是规范定义的 Parse error。
+     */
     if (domain_code.compare(0, 9, "mcp.json.") == 0)
         return Failure(JsonRpcErrorCode::ParseError, "Parse error");
     if (domain_code == "mcp.rpc.invalid_request")
@@ -336,8 +395,8 @@ ProtocolFailure ToProtocolFailure(const Error& error)
     return Failure(JsonRpcErrorCode::InternalError, "Internal error");
 }
 
-std::variant<ModernMeta, ProtocolFailure> ValidateModernMeta(const std::optional<JsonValue>& params,
-                                                             const std::vector<std::string>& advertised_versions)
+std::variant<ModernMeta, ProtocolFailure>
+ValidateModernMeta(const std::optional<JsonValue>& params, const std::vector<std::string>& advertised_versions)
 {
     if (!params || !params->IsObject())
         return MetaShapeFailure("Invalid params: params object with _meta is required");
@@ -345,7 +404,9 @@ std::variant<ModernMeta, ProtocolFailure> ValidateModernMeta(const std::optional
     if (!meta || !meta.value().IsObject())
         return MetaShapeFailure("Invalid params: params._meta object is required");
 
-    // 规范命名空间键（2026-07-28 RequestMetaObject），非裸 protocolVersion。
+    /**
+     * 规范命名空间键（2026-07-28 RequestMetaObject），非裸 protocolVersion。
+     */
     auto version = meta.value().Find(kMetaKeyProtocolVersion);
     if (!version)
         return MetaShapeFailure("Invalid params: params._meta.io.modelcontextprotocol/protocolVersion is required");
@@ -358,17 +419,26 @@ std::variant<ModernMeta, ProtocolFailure> ValidateModernMeta(const std::optional
     if (!capabilities)
         return MetaShapeFailure("Invalid params: params._meta.io.modelcontextprotocol/clientCapabilities is required");
     if (!capabilities.value().IsObject())
-        return MetaShapeFailure("Invalid params: params._meta.io.modelcontextprotocol/clientCapabilities must be an "
-                                "object");
+        return MetaShapeFailure(
+            "Invalid params: params._meta.io.modelcontextprotocol/clientCapabilities must be an "
+            "object");
 
     const std::string requested = std::move(version_text).value();
 
-    // modern acceptance 固定为唯一现代 revision；legacy revision 不因出现在
-    // advertised_versions 里而被现代路径接受（两套方法表隔离，见 specs S7）。
+    /**
+     * modern acceptance 固定为唯一现代 revision；legacy revision 不因出现在
+     * advertised_versions 里而被现代路径接受（两套方法表隔离）。
+     */
     if (requested != kProtocolVersion2026_07_28) {
-        // -32022：data 同时含 requested:string 与 supported:string[]（真实服务列表）。
+
+        /**
+         * -32022：data 同时含 requested:string 与 supported:string[]（真实服务列表）。
+         */
         JsonValue data = JsonValue::Object();
-        // Set 目标为新建 object、键为 ASCII 常量，不会失败（本仓 result 无 nodiscard）。
+
+        /**
+         * Set 目标为新建 object、键为 ASCII 常量，不会失败（本仓 result 无 nodiscard）。
+         */
         data.Set("requested", JsonValue(requested));
         JsonValue list = JsonValue::Array();
         for (const std::string& candidate : advertised_versions)
@@ -379,8 +449,10 @@ std::variant<ModernMeta, ProtocolFailure> ValidateModernMeta(const std::optional
         return failure;
     }
 
-    // F6：已知字段按本 revision 的规范 shape 校验（失败 → -32602 固定诊断），
-    // 成功后仍持有 owned raw object（未知字段保留，不做规范化）。
+    /**
+     * 已知字段按本 revision 的规范 shape 校验（失败 → -32602 固定诊断），
+     * 成功后仍持有 owned raw object（未知字段保留，不做规范化）。
+     */
     auto shape = ValidateClientCapabilities(capabilities.value(), CapabilitiesRevision::Modern2026_07_28);
     if (auto* failure = std::get_if<ProtocolFailure>(&shape))
         return *failure;
@@ -391,8 +463,8 @@ std::variant<ModernMeta, ProtocolFailure> ValidateModernMeta(const std::optional
     return result;
 }
 
-std::variant<JsonValue, ProtocolFailure> ValidateClientCapabilities(const JsonValue& capabilities,
-                                                                    CapabilitiesRevision revision)
+std::variant<JsonValue, ProtocolFailure>
+ValidateClientCapabilities(const JsonValue& capabilities, CapabilitiesRevision revision)
 {
     if (!capabilities.IsObject())
         return MetaShapeFailure("Invalid params: clientCapabilities must be an object");
@@ -400,9 +472,12 @@ std::variant<JsonValue, ProtocolFailure> ValidateClientCapabilities(const JsonVa
         return MetaShapeFailure("Invalid params: clientCapabilities.experimental must map strings to objects");
     if (!RootsOk(capabilities, revision != CapabilitiesRevision::Modern2026_07_28))
         return MetaShapeFailure("Invalid params: clientCapabilities.roots has an invalid shape");
-    // sampling/elicitation：两 revision 都要求 object；子字段约束（context/tools、
-    // form/url 须 object）仅 modern 与 2025-11-25 已知——两 revision 同规则，
-    // 分支只留语义区分（unknown 子字段原样保留）。
+
+    /**
+     * sampling/elicitation：两 revision 都要求 object；子字段约束（context/tools、
+     * form/url 须 object）仅 modern 与 2025-11-25 已知——两 revision 同规则，
+     * 分支只留语义区分（unknown 子字段原样保留）。
+     */
     if (!ObjectIfPresent(capabilities, "sampling"))
         return MetaShapeFailure("Invalid params: clientCapabilities.sampling must be an object");
     if (!ObjectIfPresent(capabilities, "elicitation"))
@@ -416,15 +491,21 @@ std::variant<JsonValue, ProtocolFailure> ValidateClientCapabilities(const JsonVa
             return MetaShapeFailure("Invalid params: clientCapabilities.sampling/elicitation has an invalid shape");
     }
     if (revision == CapabilitiesRevision::Modern2026_07_28 && !ExtensionsOk(capabilities))
-        return MetaShapeFailure("Invalid params: clientCapabilities.extensions keys must carry a valid _meta prefix "
-                                "and map strings to objects");
+        return MetaShapeFailure(
+            "Invalid params: clientCapabilities.extensions keys must carry a valid _meta prefix "
+            "and map strings to objects");
     if (revision == CapabilitiesRevision::Legacy2025_11_25 && !TasksOk(capabilities))
         return MetaShapeFailure("Invalid params: clientCapabilities.tasks has an invalid shape");
-    // owned 副本：调用方传入的帧对象析构后仍有效（值语义深复制）。
+
+    /**
+     * owned 副本：调用方传入的帧对象析构后仍有效（值语义深复制）。
+     */
     return JsonValue(capabilities);
 }
 
-// 形参名避开模板名 result，否则 result<void> 会被解析成比较表达式。
+/**
+ * 形参名避开模板名 result，否则 result<void> 会被解析成比较表达式。
+ */
 result<void> ApplyModernResultType(JsonValue& target)
 {
     if (!target.IsObject())
@@ -446,8 +527,11 @@ result<void> ApplyPrivateCacheHints(JsonValue& target)
 
 JsonValue MakeSuccessResponse(const RequestId& id, JsonValue result_value)
 {
-    // 下列 Set 的目标为新建 object、键为 ASCII 常量，不会失败；本仓 result 无
-    // [[nodiscard]]，此处显式忽略是已知不可失败路径（非静默吞错）。
+
+    /**
+     * 下列 Set 的目标为新建 object、键为 ASCII 常量，不会失败；本仓 result 无
+     * [[nodiscard]]，此处显式忽略是已知不可失败路径（非静默吞错）。
+     */
     JsonValue response = JsonValue::Object();
     response.Set("jsonrpc", JsonValue("2.0"));
     response.Set("id", id.ToJson());
@@ -457,7 +541,10 @@ JsonValue MakeSuccessResponse(const RequestId& id, JsonValue result_value)
 
 JsonValue MakeErrorResponse(const std::optional<RequestId>& id, const ProtocolFailure& failure)
 {
-    // 同 MakeSuccessResponse：新建 object + ASCII 常量键，Set 不可失败。
+
+    /**
+     * 同 MakeSuccessResponse：新建 object + ASCII 常量键，Set 不可失败。
+     */
     JsonValue error = JsonValue::Object();
     error.Set("code", JsonValue(static_cast<std::int64_t>(failure.code)));
     error.Set("message", JsonValue(failure.message));
@@ -471,21 +558,26 @@ JsonValue MakeErrorResponse(const std::optional<RequestId>& id, const ProtocolFa
     return response;
 }
 
-result<JsonValue> MakeDiscoverResult(const std::vector<std::string>& supported_versions, JsonValue capabilities,
-                                     const std::optional<std::string>& instructions)
+result<JsonValue> MakeDiscoverResult(
+    const std::vector<std::string>& supported_versions,
+    JsonValue capabilities,
+    const std::optional<std::string>& instructions)
 {
     if (!capabilities.IsObject())
-        return result<JsonValue>::err(MakeProtocolError(ErrorCode::InvalidArgument, "mcp.discover.capabilities",
-                                                        "capabilities must be a JSON object"));
+        return result<JsonValue>::err(MakeProtocolError(
+            ErrorCode::InvalidArgument, "mcp.discover.capabilities", "capabilities must be a JSON object"));
     if (supported_versions.empty())
-        return result<JsonValue>::err(MakeProtocolError(ErrorCode::InvalidArgument, "mcp.discover.versions",
-                                                        "at least one supported version is required"));
+        return result<JsonValue>::err(MakeProtocolError(
+            ErrorCode::InvalidArgument, "mcp.discover.versions", "at least one supported version is required"));
 
     JsonValue output = JsonValue::Object();
     JsonValue versions = JsonValue::Array();
     for (const std::string& version : supported_versions)
         versions.Push(JsonValue(version));
-    // 新建 object + ASCII 常量键：Set 不可失败（同上）。
+
+    /**
+     * 新建 object + ASCII 常量键：Set 不可失败（同上）。
+     */
     output.Set("supportedVersions", std::move(versions));
     output.Set("capabilities", std::move(capabilities));
     if (instructions)
@@ -500,10 +592,13 @@ result<JsonValue> MakeDiscoverResult(const std::vector<std::string>& supported_v
     return result<JsonValue>::ok(std::move(output));
 }
 
-} // namespace bbt::infra::mcp
+// clang-format off
+}
+// clang-format on
 
-// ---- 2-5：subscriptions/listen 与 MRTR ----------------------------------------
-
+/**
+ * subscriptions/listen 与 MRTR
+ */
 namespace bbt::infra::mcp {
 
 namespace {
@@ -516,7 +611,9 @@ ProtocolFailure InvalidParamsFailure(const char* message)
     return failure;
 }
 
-} // namespace
+// clang-format off
+}
+// clang-format on
 
 std::variant<SubscriptionFilter, ProtocolFailure> ParseSubscriptionFilter(const JsonValue& notifications)
 {
@@ -548,7 +645,10 @@ std::variant<SubscriptionFilter, ProtocolFailure> ParseSubscriptionFilter(const 
             if (!item || !item.value().IsString())
                 return InvalidParamsFailure("Invalid params: resourceSubscriptions must be an array of strings");
             const std::string uri(item.value().AsString().value());
-            // 去重保序：同一 uri 重复请求只接纳一次。
+
+            /**
+             * 去重保序：同一 uri 重复请求只接纳一次。
+             */
             if (std::find(filter.resource_uris.begin(), filter.resource_uris.end(), uri) == filter.resource_uris.end())
                 filter.resource_uris.push_back(uri);
         }
@@ -559,7 +659,10 @@ std::variant<SubscriptionFilter, ProtocolFailure> ParseSubscriptionFilter(const 
 JsonValue MakeSubscriptionFilterJson(const SubscriptionFilter& filter)
 {
     JsonValue out = JsonValue::Object();
-    // 新建 object + ASCII 常量键 → Set 不可失败（ADR 0010 第 11 条同口径）。
+
+    /**
+     * 新建 object + ASCII 常量键 → Set 不可失败（ADR 0010 第 11 条同口径）。
+     */
     if (filter.tools_list_changed)
         out.Set(std::string(kFilterKeyToolsListChanged), JsonValue(true));
     if (filter.prompts_list_changed)
@@ -586,7 +689,10 @@ result<JsonValue> MakeSubscriptionIdMeta(const RequestId& id)
 
 result<JsonValue> MakeInputRequiredResult(const InputRequired& input_required)
 {
-    // 至少其一非空（规范 MUST）；InputRequired::Create 已保证，此处防御性再查。
+
+    /**
+     * 至少其一非空（规范 MUST）；InputRequired::Create 已保证，此处防御性再查。
+     */
     if (input_required.InputRequests().empty() && !input_required.RequestState()) {
         Error error;
         error.code = ErrorCode::InvalidArgument;
@@ -605,10 +711,18 @@ result<JsonValue> MakeInputRequiredResult(const InputRequired& input_required)
             set = value.Set("method", JsonValue(request.method));
             if (!set)
                 return result<JsonValue>::err(set.error());
-            set = value.Set("params", request.params); // 只含 method+params，无内层 id/jsonrpc
+
+            /**
+             * 只含 method+params，无内层 id/jsonrpc
+             */
+            set = value.Set("params", request.params);
             if (!set)
                 return result<JsonValue>::err(set.error());
-            set = requests.Set(key, std::move(value)); // id-keyed map
+
+            /**
+             * id-keyed map
+             */
+            set = requests.Set(key, std::move(value));
             if (!set)
                 return result<JsonValue>::err(set.error());
         }
@@ -624,9 +738,8 @@ result<JsonValue> MakeInputRequiredResult(const InputRequired& input_required)
     return result<JsonValue>::ok(std::move(out));
 }
 
-std::optional<ProtocolFailure>
-CheckInputRequestCapabilities(const JsonValue& client_capabilities,
-                              const std::map<std::string, ClientInputRequest>& input_requests)
+std::optional<ProtocolFailure> CheckInputRequestCapabilities(
+    const JsonValue& client_capabilities, const std::map<std::string, ClientInputRequest>& input_requests)
 {
     static const char* kInvalidMethod = "Invalid params: unknown input request method";
     JsonValue missing = JsonValue::Object();
@@ -642,8 +755,11 @@ CheckInputRequestCapabilities(const JsonValue& client_capabilities,
             capability = "roots";
         else
             return InvalidParamsFailure(kInvalidMethod);
-        // 存在且为 object 即视为已声明（shape 由 ValidateClientCapabilities 按三
-        // revision 校验）；显式 null 与缺失同义。
+
+        /**
+         * 存在且为 object 即视为已声明（shape 由 ValidateClientCapabilities 按三
+         * revision 校验）；显式 null 与缺失同义。
+         */
         auto declared = client_capabilities.Find(std::string(capability));
         if (!declared || !declared.value().IsObject()) {
             any_missing = true;
@@ -662,7 +778,11 @@ CheckInputRequestCapabilities(const JsonValue& client_capabilities,
         error.code = ErrorCode::InternalError;
         error.domain_code = "mcp.mrtr.data";
         error.message = "failed to build error data";
-        return ProtocolFailure{}; // 不可达防御：新建 object + ASCII 键
+
+        /**
+         * 不可达防御：新建 object + ASCII 键
+         */
+        return ProtocolFailure{};
     }
     failure.data = std::move(data);
     return failure;
@@ -694,4 +814,6 @@ std::variant<MrtrRetryInputs, ProtocolFailure> ParseMrtrRetryInputs(const JsonVa
     return out;
 }
 
-} // namespace bbt::infra::mcp
+// clang-format off
+}
+// clang-format on

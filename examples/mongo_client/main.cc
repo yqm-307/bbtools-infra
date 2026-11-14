@@ -1,26 +1,27 @@
-// Mongo 公开入口的最小真实消费示例（Mongo 适配迁移）。
-//
-// 消费面：只 include 公开头 <bbt/infra/mongo/Bson.hpp> /
-// <bbt/infra/mongo/Client.hpp> / <bbt/infra/Result.hpp>，只链接公开 target
-// bbt::infra_mongo。不引用 bbt/infra/mongo/detail 内部头，不出现 mongocxx/bsoncxx 类型。
-//
-// 真实后端：读取 BBT_TEST_MONGO_URI（例如 tests/mongo-live/run.sh 注入的
-// mongodb://127.0.0.1:<port>/）。未设置时打印 "skip:" 并返回 77（ctest 记为
-// Skipped，绝不冒充已运行）。用例只写自己的唯一 _id，结束前删除并用 FindOne
-// 读回未命中确认清理；插入后任何失败都先按同一 _id 补偿清理再抛出，失败路径
-// 同样不留残留，且清理问题与原错误一并上报。
-//
-// 驱动方式：命令只能在协程上下文调用；写了 bbt_co_await 的表达式在协程外会先
-// 撞 AwaitHelper 的 std::logic_error（域检查先于函数体，漏写 await 则不被静态
-// 拦住），故全部调用都放在 Scheduler 的协程任务里，宿主线程等待其完成后再
-// Close owner。
-
+/**
+ * Mongo 公开入口的最小真实消费示例。
+ *
+ * 消费面：只 include 公开头 <bbt/infra/mongo/Bson.hpp> /
+ * <bbt/infra/mongo/CoMongoDb.hpp> / <bbt/infra/Result.hpp>，只链接公开 target
+ * bbt::infra_mongo。不引用 bbt/infra/mongo/detail 内部头，不出现 mongocxx/bsoncxx 类型。
+ *
+ * 真实后端：读取 BBT_TEST_MONGO_URI（例如 tests/mongo-live/run.sh 注入的
+ * mongodb://127.0.0.1:<port>/）。未设置时打印 "skip:" 并返回 77（ctest 记为
+ * Skipped，绝不冒充已运行）。用例只写自己的唯一 _id，结束前删除并用 FindOne
+ * 读回未命中确认清理；插入后任何失败都先按同一 _id 补偿清理再抛出，失败路径
+ * 同样不留残留，且清理问题与原错误一并上报。
+ *
+ * 驱动方式：命令只能在协程上下文调用；写了 bbt_co_await 的表达式在协程外会先
+ * 撞 AwaitHelper 的 std::logic_error（域检查先于函数体，漏写 await 则不被静态
+ * 拦住），故全部调用都放在 Scheduler 的协程任务里，宿主线程等待其完成后再
+ * Close owner。
+ */
 #include <bbt/coroutine/coroutine.hpp>
 #include <bbt/coroutine/syntax/Async.hpp>
 
 #include <bbt/infra/Result.hpp>
 #include <bbt/infra/mongo/Bson.hpp>
-#include <bbt/infra/mongo/Client.hpp>
+#include <bbt/infra/mongo/CoMongoDb.hpp>
 
 #include <chrono>
 #include <cstdlib>
@@ -62,10 +63,12 @@ template <class T> void RequireOk(const result<T>& value, const char* stage)
         throw std::runtime_error(std::string(stage) + ": " + value.error().message);
 }
 
-// 插入成功后的补偿清理：按本次唯一 _id 删除并读回未命中。返回空串 = 删除与
-// 读回都确认无残留；否则是清理问题描述（包括「读回仍能读到」）。删除计数为 0
-// 不算问题（重复清理或已被删都正常），但删除本身报错要带给调用方。只在协程内
-// 调用：不进析构、不在 owner 关闭之后 await，也不宽范围删集合。
+/**
+ * 插入成功后的补偿清理：按本次唯一 _id 删除并读回未命中。返回空串 = 删除与
+ * 读回都确认无残留；否则是清理问题描述（包括「读回仍能读到」）。删除计数为 0
+ * 不算问题（重复清理或已被删都正常），但删除本身报错要带给调用方。只在协程内
+ * 调用：不进析构、不在 owner 关闭之后 await，也不宽范围删集合。
+ */
 bbt_co_async(std::string) CleanupInserted(mongo::CoMongoColl& coll, const mongo::MongoDocument& filter)
 {
     std::string problems;
@@ -84,33 +87,43 @@ bbt_co_async(std::string) CleanupInserted(mongo::CoMongoColl& coll, const mongo:
     return problems;
 }
 
-// 一次完整 CRUD 闭环：构造 → 插入 → 读回（类型化 getter + canonical JSON）
-// → 删除 → 读回未命中。
+/**
+ * 一次完整 CRUD 闭环：构造 → 插入 → 读回（类型化 getter + canonical JSON）
+ * → 删除 → 读回未命中。
+ */
 void Crud(mongo::CoMongoColl& coll, const std::string& id)
 {
     const std::string where = "{\"_id\":\"" + id + "\"}";
 
-    // 构造：JSON → BSON，不再手写字节数组。
+    /**
+     * 构造：JSON → BSON，不再手写字节数组。
+     */
     auto doc =
         mongo::MongoDocument::FromJson("{\"_id\":\"" + id + "\",\"n\":7,\"ratio\":1.5,\"ok\":true,\"tag\":\"hello\"}");
     Require(static_cast<bool>(doc), "FromJson(document) failed");
     auto filter = mongo::MongoDocument::FromJson(where);
     Require(static_cast<bool>(filter), "FromJson(filter) failed");
 
-    // 写：新入口的等待方法经 bbt_co_await 消费。返回错误不代表未落库（如
-    // writeConcern 错误时写入可能已完成），故同样纳入下方精确 _id 补偿路径。
-    // 此后任何失败都必须先按精确 _id 补偿清理，再带原错误抛出——真实服务的
-    // 失败路径同样不得遗留本轮测试数据。
+    /**
+     * 写：新入口的等待方法经 bbt_co_await 消费。返回错误不代表未落库（如
+     * writeConcern 错误时写入可能已完成），故同样纳入下方精确 _id 补偿路径。
+     * 此后任何失败都必须先按精确 _id 补偿清理，再带原错误抛出——真实服务的
+     * 失败路径同样不得遗留本轮测试数据。
+     */
     try {
         RequireOk(bbt_co_await coll.InsertOne(doc.value(), Budget(5000)), "InsertOne");
 
-        // 读：命中返回文档；未命中是 ok(nullopt)，与错误分支区分。
+        /**
+         * 读：命中返回文档；未命中是 ok(nullopt)，与错误分支区分。
+         */
         auto found = bbt_co_await coll.FindOne(filter.value(), Budget(5000));
         RequireOk(found, "FindOne");
         Require(found.value().has_value(), "FindOne: 插入的文档未命中");
         const mongo::MongoDocument& got = *found.value();
 
-        // 读取只经公开面：类型化 getter + Extended JSON（无 bsoncxx 类型）。
+        /**
+         * 读取只经公开面：类型化 getter + Extended JSON（无 bsoncxx 类型）。
+         */
         const auto n = got.GetInt64("n");
         const auto ratio = got.GetDouble("ratio");
         const auto ok = got.GetBool("ok");
@@ -123,20 +136,27 @@ void Crud(mongo::CoMongoColl& coll, const std::string& id)
         RequireOk(json, "ToJson");
         Require(got.Has("_id"), "Has(_id)");
 
-        // 删除并读回：清理属于本示例自己写入的唯一 _id。
+        /**
+         * 删除并读回：清理属于本示例自己写入的唯一 _id。
+         */
         auto removed = bbt_co_await coll.DeleteOne(filter.value(), Budget(5000));
         RequireOk(removed, "DeleteOne");
         auto miss = bbt_co_await coll.FindOne(filter.value(), Budget(5000));
         RequireOk(miss, "FindOne(after delete)");
 
-        // 值断言放在清理之后：失败不会留下测试文档。
+        /**
+         * 值断言放在清理之后：失败不会留下测试文档。
+         */
         Require(n.value() == 7, "n != 7");
         Require(ratio.value() == 1.5, "ratio != 1.5");
         Require(ok.value(), "ok != true");
         Require(tag.value() == "hello", "tag != hello");
         Require(removed.value() == 1u, "DeleteOne 删除数量 != 1");
         Require(!miss.value().has_value(), "删除后仍能读到文档");
-        // canonical Extended JSON 保留 int32/double 类型标记。
+
+        /**
+         * canonical Extended JSON 保留 int32/double 类型标记。
+         */
         Require(json.value().find("$numberInt") != std::string::npos, "canonical JSON 缺少 $numberInt");
         Require(json.value().find("$numberDouble") != std::string::npos, "canonical JSON 缺少 $numberDouble");
 
@@ -144,10 +164,13 @@ void Crud(mongo::CoMongoColl& coll, const std::string& id)
                   << " deleted=" << removed.value() << " miss_after_delete=1\n"
                   << "canonical=" << json.value() << "\n";
     } catch (const std::exception& e) {
-        // 补偿清理仍在同一协程内、owner 关闭之前完成；原错误在前，清理问题随后。
+
+        /**
+         * 补偿清理仍在同一协程内、owner 关闭之前完成；原错误在前，清理问题随后。
+         */
         const std::string cleanup = bbt_co_await CleanupInserted(coll, filter.value());
-        throw std::runtime_error(std::string(e.what())
-                                 + " | cleanup: " + (cleanup.empty() ? "_id=" + id + " 已删除且读回未命中" : cleanup));
+        throw std::runtime_error(
+            std::string(e.what()) + " | cleanup: " + (cleanup.empty() ? "_id=" + id + " 已删除且读回未命中" : cleanup));
     }
 }
 
@@ -178,13 +201,15 @@ int Run()
 
     auto handle = db->Collection({"bbt_example", "items"});
     if (!handle) {
-        db->Close();
+        (void)db->Close();
         throw std::runtime_error("Collection: " + handle.error().message);
     }
     auto coll = std::move(handle).value();
     const std::string id = "bbt:example:mongo-client:" + std::to_string(::getpid());
 
-    // 协程内执行；结果/异常经 promise 交回宿主线程后再收口 owner。
+    /**
+     * 协程内执行；结果/异常经 promise 交回宿主线程后再收口 owner。
+     */
     auto completion = std::make_shared<std::promise<void>>();
     auto done = completion->get_future();
     bool registered = false;
@@ -215,21 +240,33 @@ int Run()
         }
     }
 
-    // 句柄门禁只封本句柄；owner Close 同步收口（返回即 ops 清空 + worker 全退）。
-    coll->Close();
-    db->Close();
+    /**
+     * 句柄门禁只封本句柄；owner Close 同步收口（返回即 ops 清空 + worker 全退）。
+     */
+    (void)coll->Close();
+    (void)db->Close();
     return code;
 }
 
-} // namespace
+// clang-format off
+}
+// clang-format on
 
 int main()
 {
     g_bbt_coroutine_config->m_cfg_static_thread_num = 1;
     g_bbt_coroutine_config->m_cfg_stack_size = 256 * 1024;
-    g_scheduler->Start(); // runtime 进程寿命：整个示例只 Start 一次。
+
+    /**
+     * runtime 进程寿命：整个示例只 Start 一次。
+     */
+    g_scheduler->Start();
     const int code = Run();
     std::cout.flush();
     std::cerr.flush();
-    std::_Exit(code); // Scheduler 无停机入口，进程结束即退出
+
+    /**
+     * Scheduler 无停机入口，进程结束即退出
+     */
+    std::_Exit(code);
 }

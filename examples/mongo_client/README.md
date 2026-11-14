@@ -1,6 +1,6 @@
 # Mongo 公开入口消费示例：只链接公开 target `bbt::infra_mongo`。
 
-本示例演示 Mongo 公开入口的最小真实消费：只 include `<bbt/infra/mongo/Bson.hpp>`、`<bbt/infra/mongo/Client.hpp>`、`<bbt/infra/Result.hpp>`，只链接 `bbt::infra_mongo`，不出现 mongocxx/bsoncxx 类型。走 `FromJson → InsertOne → FindOne → 类型化 getter + canonical ToJson → DeleteOne → 读回未命中` 的 CRUD 闭环，只写自己的唯一 `_id` 并在结束前删除。
+本示例演示 Mongo 公开入口的最小真实消费：只 include `<bbt/infra/mongo/Bson.hpp>`、`<bbt/infra/mongo/CoMongoDb.hpp>`、`<bbt/infra/Result.hpp>`，只链接 `bbt::infra_mongo`，不出现 mongocxx/bsoncxx 类型。走 `FromJson → InsertOne → FindOne → 类型化 getter + canonical ToJson → DeleteOne → 读回未命中` 的 CRUD 闭环，只写自己的唯一 `_id` 并在结束前删除。
 
 真实后端由 `BBT_TEST_MONGO_URI` 注入（例如 `tests/mongo-live/run.sh` 容器）。未设置时打印 `skip:` 并返回 77（ctest 记为 Skipped，绝不冒充已运行）；CI 全量构建只给「公开消费可编译」证据。
 

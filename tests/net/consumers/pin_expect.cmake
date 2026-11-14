@@ -4,7 +4,8 @@
 #
 # 需要的参数：
 #   -DPIN_CASE=<case>      positive|wrong_sha|dirty|no_git|untracked_src|
-#                          manifest_rejected
+#                          manifest_rejected|latest_clean|latest_dirty|invalid_sha|
+#                          ci_clean|ci_dirty|ci_empty|ci_wrong_sha
 #   -DPIN_MODULE=<path>    CoroutinePin.cmake 绝对路径
 #   -DWORK_DIR=<path>      本 case 的临时根（脚本内 file(REMOVE_RECURSE)）
 #   -DREAL_COROUTINE_DIR=<path>  固定 U 的真实干净检出
@@ -19,15 +20,32 @@ endif()
 file(REMOVE_RECURSE "${WORK_DIR}")
 file(MAKE_DIRECTORY "${WORK_DIR}")
 
-include("${PIN_MODULE}")
-set(_pin "${BBT_COROUTINE_PINNED_SHA}")
+# 固定版本用例显式选择 CI 参考 pin，不依赖产品默认锁版。
+get_filename_component(_module_dir "${PIN_MODULE}" DIRECTORY)
+file(READ "${_module_dir}/coroutine.sha" _pin_raw)
+string(REGEX REPLACE "\n$" "" _pin "${_pin_raw}")
+set(_requested "${_pin}")
 
 function(_run_verify dir out_rc out_text)
     set(_probe "${WORK_DIR}/_probe_${PIN_CASE}.cmake")
+    set(_selection "")
+    if(NOT PIN_CASE MATCHES "^(latest_|ci_)")
+        set(_selection "set(BBT_COROUTINE_PINNED_SHA \"${_requested}\")\n")
+    endif()
+    set(_ci false)
+    if(PIN_CASE MATCHES "^ci_")
+        set(_ci true)
+        if(PIN_CASE STREQUAL "ci_empty")
+            set(_selection "set(BBT_COROUTINE_PINNED_SHA \"\" CACHE STRING \"\")\n")
+        elseif(PIN_CASE STREQUAL "ci_wrong_sha")
+            set(_selection "set(BBT_COROUTINE_PINNED_SHA \"0000000000000000000000000000000000000000\")\n")
+        endif()
+    endif()
     file(WRITE "${_probe}"
-        "include(\"${PIN_MODULE}\")\nbbt_coroutine_pin_verify(\"${dir}\")\n")
+        "${_selection}include(\"${PIN_MODULE}\")\nbbt_coroutine_pin_verify(\"${dir}\")\n")
     execute_process(
-        COMMAND "${CMAKE_COMMAND}" -P "${_probe}"
+        COMMAND "${CMAKE_COMMAND}" -E env "GITHUB_ACTIONS=${_ci}"
+                "${CMAKE_COMMAND}" -P "${_probe}"
         RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
     set(${out_rc} "${_rc}" PARENT_SCOPE)
     set(${out_text} "${_out}${_err}" PARENT_SCOPE)
@@ -54,12 +72,17 @@ function(_expect_accept dir)
         message(FATAL_ERROR
             "pin_expect(${PIN_CASE})：bbt_coroutine_pin_verify(${dir}) 意外拒绝：\n${_out}")
     endif()
-    string(FIND "${_out}" "coroutine pin 命中" _pos)
+    if(PIN_CASE MATCHES "^latest_")
+        set(_marker "coroutine 使用本地最新源码")
+    else()
+        set(_marker "coroutine pin 命中")
+    endif()
+    string(FIND "${_out}" "${_marker}" _pos)
     if(_pos EQUAL -1)
         message(FATAL_ERROR
             "pin_expect(${PIN_CASE})：通过但缺命中标记：\n${_out}")
     endif()
-    message(STATUS "pin_expect(${PIN_CASE})：命中 ${_pin}（${dir}）")
+    message(STATUS "pin_expect(${PIN_CASE})：${_marker}（${dir}）")
 endfunction()
 
 function(_copy_checkout src dst)
@@ -94,20 +117,42 @@ function(_export_tree dst tarname)
 endfunction()
 
 if(PIN_CASE STREQUAL "positive")
-    _expect_accept("${REAL_COROUTINE_DIR}")
+    # 真实目录可能正处于开发中；固定版本正例用隔离的干净检出。
+    set(_stub "${WORK_DIR}/stub_positive")
+    _copy_checkout("${REAL_COROUTINE_DIR}" "${_stub}")
+    _expect_accept("${_stub}")
 
 elseif(PIN_CASE STREQUAL "wrong_sha")
-    # 复制真实检出到 stub，造一个空提交使 HEAD != pin（不动真实树）。
-    set(_stub "${WORK_DIR}/stub_wrong_sha")
+    set(_requested "0000000000000000000000000000000000000000")
+    _expect_reject("${REAL_COROUTINE_DIR}" "SHA 漂移拒绝")
+
+elseif(PIN_CASE STREQUAL "invalid_sha")
+    # CMake 的 false-like 值也必须当作非法指定，不能误走最新模式。
+    set(_requested "0")
+    _expect_reject("${REAL_COROUTINE_DIR}" "必须是完整")
+
+elseif(PIN_CASE STREQUAL "latest_clean" OR PIN_CASE STREQUAL "latest_dirty")
+    set(_stub "${WORK_DIR}/stub_latest")
     _copy_checkout("${REAL_COROUTINE_DIR}" "${_stub}")
-    execute_process(
-        COMMAND git -C "${_stub}" -c user.email=pin-probe@local
-                -c user.name=pin-probe commit --allow-empty -m "pin-probe"
-        RESULT_VARIABLE _crc OUTPUT_VARIABLE _co ERROR_VARIABLE _ce)
-    if(NOT _crc EQUAL 0)
-        message(FATAL_ERROR "构造 wrong-SHA stub 失败：${_ce}")
+    if(PIN_CASE STREQUAL "latest_dirty")
+        file(APPEND "${_stub}/CMakeLists.txt" "# local development\n")
+        file(WRITE "${_stub}/bbt/pin_probe_injected.hpp" "// local source\n")
     endif()
-    _expect_reject("${_stub}" "SHA 漂移拒绝")
+    _expect_accept("${_stub}")
+
+elseif(PIN_CASE MATCHES "^ci_")
+    set(_stub "${WORK_DIR}/stub_ci")
+    _copy_checkout("${REAL_COROUTINE_DIR}" "${_stub}")
+    if(PIN_CASE STREQUAL "ci_dirty" OR PIN_CASE STREQUAL "ci_empty")
+        file(APPEND "${_stub}/CMakeLists.txt" "# CI must reject modified source\n")
+        _expect_reject("${_stub}" "内容不干净")
+    elseif(PIN_CASE STREQUAL "ci_wrong_sha")
+        _expect_reject("${_stub}" "CI 指定版本与 coroutine.sha 不一致")
+    elseif(PIN_CASE STREQUAL "ci_clean")
+        _expect_accept("${_stub}")
+    else()
+        message(FATAL_ERROR "未知 PIN_CASE='${PIN_CASE}'")
+    endif()
 
 elseif(PIN_CASE STREQUAL "dirty")
     # 复制检出后在消费面改一个 tracked 文件（不 commit）→ diff --quiet 非零。

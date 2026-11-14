@@ -16,6 +16,8 @@ std::optional<MongoThreadEvidence> MongoRuntimeObservation::LastEvidence() const
     return last_evidence;
 }
 
-} // namespace bbt::infra::debug
+// clang-format off
+}
+// clang-format on
 
-#endif // BBT_INFRA_STRINGENT_DEBUG
+#endif

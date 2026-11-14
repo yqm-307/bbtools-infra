@@ -18,4 +18,6 @@ result<void> ValidateNetworkLimits(const NetworkLimits& limits)
     return result<void>::ok();
 }
 
-} // namespace bbt::infra
+// clang-format off
+}
+// clang-format on

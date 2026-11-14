@@ -1,5 +1,7 @@
-// 独立纯逻辑分配失败回归：不链接 coroutine/runtime。
-// 第 k 次失败只作用于被测窗口；显式 CHECK 在 NDEBUG 下仍生效。
+/**
+ * 独立纯逻辑分配失败回归：不链接 coroutine/runtime。
+ * 第 k 次失败只作用于被测窗口；显式 CHECK 在 NDEBUG 下仍生效。
+ */
 #include <bbt/infra/net/detail/EventRingBuffer.hpp>
 #include <bbt/infra/net/detail/OutboundQueue.hpp>
 #include <cstdio>
@@ -26,22 +28,27 @@ void* operator new(std::size_t size)
     }
     throw std::bad_alloc();
 }
+
 void* operator new[](std::size_t size)
 {
     return ::operator new(size);
 }
+
 void operator delete(void* p) noexcept
 {
     std::free(p);
 }
+
 void operator delete(void* p, std::size_t) noexcept
 {
     std::free(p);
 }
+
 void operator delete[](void* p) noexcept
 {
     std::free(p);
 }
+
 void operator delete[](void* p, std::size_t) noexcept
 {
     std::free(p);
@@ -52,13 +59,16 @@ public:
     explicit AllocationWindow(std::size_t k)
     {
         allocation_count = 0;
-        fail_at = k; // 0 只计数，不注入
+
+        /**
+         * 0 只计数，不注入
+         */
+        fail_at = k;
         allocation_window = true;
     }
-    ~AllocationWindow()
-    {
-        allocation_window = false;
-    }
+
+    ~AllocationWindow() { allocation_window = false; }
+
     AllocationWindow(const AllocationWindow&) = delete;
     AllocationWindow& operator=(const AllocationWindow&) = delete;
 };
@@ -69,6 +79,7 @@ static void Check(bool value, const char* expression, int line)
         throw std::runtime_error("line " + std::to_string(line) + ": " + expression);
     }
 }
+
 #define CHECK(expression) Check(static_cast<bool>(expression), #expression, __LINE__)
 
 static std::string Bytes(const OutboundQueue& q)
@@ -102,16 +113,22 @@ static std::size_t MoveAttempt(std::size_t k, bool must_fail)
             failed = true;
         }
         attempts = allocation_count;
-    } // 检查和恢复操作不在注入窗口
+    }
+
+    /**
+     * 检查和恢复操作不在注入窗口。
+     */
     if (target != nullptr) {
-        // placement 对象也由 RAII 清理，断言抛出时不泄漏。
+
+        /**
+         * placement 对象也由 RAII 清理，断言抛出时不泄漏。
+         */
         struct Destroy {
             OutboundQueue* q;
-            ~Destroy()
-            {
-                q->~OutboundQueue();
-            }
+
+            ~Destroy() { q->~OutboundQueue(); }
         } destroy{target};
+
         CHECK(!must_fail && !failed);
         CHECK(Bytes(*target) == expected);
         CHECK(target->TotalBytes() == expected.size());
@@ -178,7 +195,11 @@ static std::size_t AppendAttempt(std::size_t k, bool merge, bool must_fail)
 {
     OutboundQueue queue(8, 4096, 8);
     const std::string before = merge ? "abcdefgh" + std::string(80, 'x') : "abcd";
-    const std::string input(128, 'y'); // 超 SSO，未超总量
+
+    /**
+     * 超 SSO，未超总量
+     */
+    const std::string input(128, 'y');
     CHECK(!queue.Append(before));
     const auto segments = queue.SegmentCount();
     std::error_code ec;
@@ -201,7 +222,10 @@ static std::size_t AppendAttempt(std::size_t k, bool merge, bool must_fail)
     if (must_fail) {
         CHECK(queue.SegmentCount() == segments);
     }
-    // 超限拒绝不分配/不改数据。
+
+    /**
+     * 超限拒绝不分配/不改数据。
+     */
     const std::string overflow(4096, 'z');
     {
         AllocationWindow window(1);
@@ -272,8 +296,10 @@ static void TestAliasAllocation()
     std::printf("alias allocations=%zu; every failure unchanged\n", allocations);
 }
 
-// Reserve 原语直接回归：有效预留/越界拒绝/扩容失败内容容量保持；已备
-// 容量内追加不再首次分配。旧 move/append 回归保持不变。
+/**
+ * Reserve 原语直接回归：有效预留/越界拒绝/扩容失败内容容量保持；已备
+ * 容量内追加不再首次分配；同时覆盖 move/append 的分配失败边界。
+ */
 static std::size_t ReserveAttempt(std::size_t k, bool must_fail)
 {
     EventRingBuffer ring(4096);
@@ -299,7 +325,10 @@ static std::size_t ReserveAttempt(std::size_t k, bool must_fail)
     CHECK(ring.Capacity() == (must_fail ? cap_before : 2048));
     CHECK(ring.TakeSnapshot().Peek() == content_before);
     if (!must_fail) {
-        // 已备容量内追加：只做 char 提交，不再首次分配。
+
+        /**
+         * 已备容量内追加：只做 char 提交，不再首次分配。
+         */
         const std::string filler(2048 - size_before, 'x');
         {
             AllocationWindow window(1);
@@ -309,7 +338,10 @@ static std::size_t ReserveAttempt(std::size_t k, bool must_fail)
         CHECK(ring.Size() == 2048);
         CHECK(ring.Capacity() == 2048);
     }
-    // 边界：超过 MaxBytes 拒绝且不分配、内容不变。
+
+    /**
+     * 边界：超过 MaxBytes 拒绝且不分配、内容不变。
+     */
     {
         AllocationWindow window(1);
         CHECK(ring.Reserve(4097) == std::make_error_code(std::errc::no_buffer_space));

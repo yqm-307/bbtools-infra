@@ -13,4 +13,6 @@ Response Response::FromRequest(const Request& request)
     return response;
 }
 
-} // namespace bbt::infra::rpc
+// clang-format off
+}
+// clang-format on

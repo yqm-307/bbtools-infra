@@ -1,12 +1,13 @@
-// RPC v2 AppSession 双进程 consumer 示例（真实两 OS 进程 + 动态 loopback
-// 端口）：server 进程打印实际监听端口到 stdout；client 进程读端口并发起
-// Call/Send；两侧各一 Engine + Client(owner) + Server(同 owner)。
-// 用法：
-//   rpc_v2_session_example server        → stdout 第一行 "PORT <n>"，之后
-//                                          处理 admission 直到 stdin EOF/60s。
-//   rpc_v2_session_example client <port> → 拨号 + Call/Send，打印 PASS 行。
-// 本示例只绑定 127.0.0.1 动态端口，不连接生产/共享服务。
-
+/**
+ * RPC v2 AppSession 双进程 consumer 示例（真实两 OS 进程 + 动态 loopback
+ * 端口）：server 进程打印实际监听端口到 stdout；client 进程读端口并发起
+ * Call/Send；两侧各一 Engine + Client(owner) + Server(同 owner)。
+ * 用法：
+ *   rpc_v2_session_example server        → stdout 第一行 "PORT <n>"，之后
+ *                                          处理 admission 直到 stdin EOF/60s。
+ *   rpc_v2_session_example client <port> → 拨号 + Call/Send，打印 PASS 行。
+ * 本示例只绑定 127.0.0.1 动态端口，不连接生产/共享服务。
+ */
 #include <bbt/coroutine/coroutine.hpp>
 #include <bbt/coroutine/syntax/Async.hpp>
 #include <bbt/infra/rpc/CoRpcClient.hpp>
@@ -88,7 +89,8 @@ struct Assembly {
             return false;
         }
         auto made = rpc::CoRpcServer::Create(
-            engine, client,
+            engine,
+            client,
             [this](rpc::AdmissionItem&& item) -> bbt::infra::result<void> {
                 std::lock_guard<std::mutex> lock(mu);
                 admitted.push_back(std::move(item));
@@ -126,15 +128,16 @@ struct Assembly {
         }
         return true;
     }
+
     ~Assembly()
     {
         if (server) {
-            server->Shutdown();
+            (void)server->Close(bbt::infra::CloseOptions::Immediate());
         }
         if (client) {
-            client->Shutdown();
+            (void)client->Close(bbt::infra::CloseOptions::Immediate());
         }
-        engine->RequestClose();
+        (void)engine->Close();
         if (runner.joinable()) {
             runner.join();
         }
@@ -158,10 +161,13 @@ struct Assembly {
             if (item.reply && item.request.Reply() == rpc::ReplyMode::Required) {
                 auto response = rpc::Response::FromRequest(item.request);
                 response.SetPayload(item.request.Payload());
-                // P2-6：Complete 是 bbt_co_async（仅受管协程可挂起等写终态）——
-                // native pump 线程不能直接调用（返回 InvalidContext 且不回
-                // 复）。把 Complete 提交到 scheduler 的受管协程执行，回复
-                // 是否到达由对端 Call 结果证明；不静默丢弃 InvalidContext。
+
+                /**
+                 * Complete 是 bbt_co_async（仅受管协程可挂起等写终态）——
+                 * native pump 线程不能直接调用（返回 InvalidContext 且不回
+                 * 复）。把 Complete 提交到 scheduler 的受管协程执行，回复
+                 * 是否到达由对端 Call 结果证明；不静默丢弃 InvalidContext。
+                 */
                 SubmitCo([reply = item.reply, response = std::move(response)]() mutable {
                     return bbt_co_await reply->Complete(std::move(response));
                 });
@@ -176,14 +182,16 @@ struct Assembly {
 int RunServer()
 {
     Assembly app;
-    if (!app.Start("session-server", /*listen=*/true)) {
+    if (!app.Start("session-server", true)) {
         return Fail("server start failed");
     }
     std::cout << "PORT " << app.address.Port() << '\n' << std::flush;
 
-    // 协作退出：stdin watcher 线程阻塞读 stdin；driver 在 client 通过后
-    // 关闭 stdin（EOF，或写一行 shutdown）→ 结束 pump 循环。60s 硬上限
-    // 只是 driver 被强杀时的兜底，不属于正常路径，触发即判失败。
+    /**
+     * 协作退出：stdin watcher 线程阻塞读 stdin；driver 在 client 通过后
+     * 关闭 stdin（EOF，或写一行 shutdown）→ 结束 pump 循环。60s 硬上限
+     * 只是 driver 被强杀时的兜底，不属于正常路径，触发即判失败。
+     */
     std::atomic<bool> stop{false};
     std::thread stdin_watcher([&stop] {
         std::string line;
@@ -202,22 +210,38 @@ int RunServer()
     stdin_watcher.join();
     const bool normal_stop = stop.load();
 
-    // 正常资源收口：排空已准入项（完成在途回复）后走唯一关闭入口——
-    // Close(Graceful) 等已接纳责任归还后封口，Close(Timeout) 有界确认物理
-    // 收口；析构内 Shutdown 幂等。
+    /**
+     * 正常资源收口：排空已准入项（完成在途回复）后走唯一关闭入口——
+     * Close(Graceful) 等已接纳责任归还后封口；WaitStopped 有界确认物理收口；
+     * 析构内 RequestClose 幂等。
+     */
     const auto drain_deadline = Clock::now() + 3s;
     while (app.HasPendingAdmissions() && Clock::now() < drain_deadline) {
         app.PumpOnce();
         std::this_thread::sleep_for(1ms);
     }
-    auto close_future = SubmitCo([&] { return bbt_co_await app.server->Close(rpc::CloseFlag::Graceful, 3000); });
+    auto close_future = SubmitCo([&] {
+        return bbt_co_await app.server->Close(
+            bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::milliseconds(3000)));
+    });
     if (close_future.wait_for(5s) != std::future_status::ready) {
         return Fail("server graceful close hung");
     }
     if (!close_future.get()) {
         return Fail("server graceful close failed");
     }
-    auto settle_future = SubmitCo([&] { return bbt_co_await app.server->Close(rpc::CloseFlag::Timeout, 3000); });
+    auto settle_future = SubmitCo([&] {
+        auto closed = bbt_co_await app.server->Close(bbt::infra::CloseOptions::Immediate());
+        if (!closed) {
+            return closed;
+        }
+        return bbt_co_await app.server->Close(
+            bbt::infra::CloseOptions{
+                bbt::infra::CloseMode::Immediate,
+                true,
+                {},
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(3000)});
+    });
     if (settle_future.wait_for(5s) != std::future_status::ready || !settle_future.get()) {
         return Fail("server close did not settle");
     }
@@ -238,12 +262,14 @@ int RunServer()
 int RunClient(std::uint16_t port)
 {
     Assembly app;
-    if (!app.Start("session-client", /*listen=*/false)) {
+    if (!app.Start("session-client", false)) {
         return Fail("client start failed");
     }
     const std::string target = "tcp://127.0.0.1:" + std::to_string(port);
 
-    // Call：echo 回复。
+    /**
+     * Call：echo 回复。
+     */
     auto call_future = SubmitCo([&] {
         rpc::Request request("svc", "Echo");
         request.SetRequestId("consumer-call")
@@ -259,7 +285,10 @@ int RunClient(std::uint16_t port)
         options.deadline = Clock::now() + 5s;
         return bbt_co_await app.client->Call(target, std::move(request), options);
     });
-    // pump server admission from client side thread (server 进程已 pump)。
+
+    /**
+     * pump server admission from client side thread (server 进程已 pump)。
+     */
     const auto reply = [&] {
         const auto status = call_future.wait_for(5s);
         if (status != std::future_status::ready) {
@@ -275,7 +304,9 @@ int RunClient(std::uint16_t port)
         return Fail("call correlation mismatch");
     }
 
-    // Send + RequireRemoteAcceptance。
+    /**
+     * Send + RequireRemoteAcceptance。
+     */
     auto send_future = SubmitCo([&] {
         rpc::Request message("svc", "Tell");
         message.SetMessageId("consumer-send")
@@ -310,7 +341,9 @@ int RunClient(std::uint16_t port)
     return 0;
 }
 
-} // namespace
+// clang-format off
+}
+// clang-format on
 
 int main(int argc, char** argv)
 {
@@ -329,7 +362,10 @@ int main(int argc, char** argv)
     } else {
         code = Fail("usage: server|client <port>");
     }
-    // 与 tests 同一收口理由：跳过 runtime 静态析构竞态。
+
+    /**
+     * 与 tests 同一收口理由：跳过 runtime 静态析构竞态。
+     */
     std::cout.flush();
     std::cerr.flush();
     std::_Exit(code);

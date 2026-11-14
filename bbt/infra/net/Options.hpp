@@ -8,7 +8,6 @@
  * 新增字段需要评估位置初始化与 structured binding 的源码兼容性，因此推荐使用具名赋值。
  * 本头不做 I/O、日志、线程或 runtime 操作，只描述值。
  */
-
 #include <chrono>
 #include <cstdint>
 #include <system_error>
@@ -34,19 +33,73 @@ namespace bbt::infra::net {
  *   映射为同名 socket 选项。
  */
 struct Options {
-    LoadBalancing lb{LoadBalancing::RoundRobin};  ///< 连接分配到 sub owner 时使用的策略
-    bool reuse_addr{false};                       ///< 映射为 SO_REUSEADDR
-    bool reuse_port{false};                       ///< 映射为 SO_REUSEPORT
-    std::int64_t num_event_loop{0};               ///< sub owner 数量；0 视为 1，负值拒绝
-    std::chrono::seconds tcp_keep_alive{0};       ///< keepalive 空闲时长；0 禁用；负值或超出原生 int 秒范围时拒绝
-    std::chrono::seconds tcp_keep_interval{0};    ///< 探测间隔；负值拒绝；keepalive 启用且为 0 时取 idle/5，最小 1 秒
-    std::int64_t tcp_keep_count{0};               ///< 探测次数；负值或超出原生 int 拒绝；keepalive 启用且为 0 时取 5
-    bool tcp_no_delay{true};                      ///< TCP_NODELAY，默认开启
-    std::int64_t socket_recv_buffer{0};           ///< SO_RCVBUF；0 表示不设置；负值或超出原生 int 拒绝
-    std::int64_t socket_send_buffer{0};           ///< SO_SNDBUF；0 表示不设置；负值或超出原生 int 拒绝
-    std::int64_t max_inbound_bytes{1024 * 1024};  ///< 每连接读方向的总量界，必须为正
-    std::int64_t max_outbound_bytes{1024 * 1024}; ///< 每连接写方向的总量界，必须为正
-    std::int64_t max_pending_events{1024};        ///< 每连接的操作责任上限，必须为正
+
+    /**
+     * 连接分配到 sub owner 时使用的策略
+     */
+    LoadBalancing lb{LoadBalancing::RoundRobin};
+
+    /**
+     * 映射为 SO_REUSEADDR
+     */
+    bool reuse_addr{false};
+
+    /**
+     * 映射为 SO_REUSEPORT
+     */
+    bool reuse_port{false};
+
+    /**
+     * sub owner 数量；0 视为 1，负值拒绝
+     */
+    std::int64_t num_event_loop{0};
+
+    /**
+     * keepalive 空闲时长；0 禁用；负值或超出原生 int 秒范围时拒绝
+     */
+    std::chrono::seconds tcp_keep_alive{0};
+
+    /**
+     * 探测间隔；负值拒绝；keepalive 启用且为 0 时取 idle/5，最小 1 秒
+     */
+    std::chrono::seconds tcp_keep_interval{0};
+
+    /**
+     * 探测次数；负值或超出原生 int 拒绝；keepalive 启用且为 0 时取 5
+     */
+    std::int64_t tcp_keep_count{0};
+
+    /**
+     * TCP_NODELAY，默认开启
+     */
+    bool tcp_no_delay{true};
+
+    /**
+     * SO_RCVBUF；0 表示不设置；负值或超出原生 int 拒绝
+     */
+    std::int64_t socket_recv_buffer{0};
+
+    /**
+     * SO_SNDBUF；0 表示不设置；负值或超出原生 int 拒绝
+     */
+    std::int64_t socket_send_buffer{0};
+
+    /**
+     * 每连接读方向的总量界，必须为正
+     */
+    std::int64_t max_inbound_bytes{1024 * 1024};
+
+    /**
+     * 每连接写方向的总量界，必须为正
+     */
+    std::int64_t max_outbound_bytes{1024 * 1024};
+
+    /**
+     * 每连接的操作责任上限，必须为正
+     */
+    std::int64_t max_pending_events{1024};
 };
 
-} // namespace bbt::infra::net
+// clang-format off
+}
+// clang-format on

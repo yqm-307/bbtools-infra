@@ -1,19 +1,21 @@
-// /：ICoConnection 成员写/关闭观察聚焦验证（契约行为，不是“跑过”）。
-//
-// 覆盖（每条用例以真实屏障证明「等待已挂起」后再触发事件，不靠 sleep）：
-// member_write_done 成员 Write 等首胜后采到 Done+空错
-// async_write_fire AsyncWrite 只返回接纳错误，不等待，FIFO 与终态通知保持
-// write_unsubmitted_timeout 容量等待超时未提交（Rejected+无效 op）
-// write_accepted_timeout 已接纳超时仍在途，op 终态后可查
-// write_accepted_cancel 已接纳等待被协程取消，发送不撤销
-// op_wait_partial_error 部分发送后错误结算 Done+error+真实前缀
-// write_zero_len 零长写立即可采 Done
-// close_default_reason RequestClose({}) 未发完写 Done+非空错误
-// facade_released_op_queryable facade 释放后 op 终态仍可查/可 Wait
-// waitclosed_driver_failed driver Failed 唤醒 WaitClosed，不伪调 OnClose
-// waitclosed_late_no_miss 已关闭后 WaitClosed 立即成功（晚到不丢）
-// status_projection valid/read_eof/write/closed/released 采样
 
+/**
+ * /：ICoConnection 成员写/关闭观察聚焦验证（契约行为，不是“跑过”）。
+ *
+ * 覆盖（每条用例以真实屏障证明「等待已挂起」后再触发事件，不靠 sleep）：
+ * member_write_done 成员 Write 等首胜后采到 Done+空错
+ * async_write_fire AsyncWrite 只返回接纳错误，不等待，FIFO 与终态通知保持
+ * write_unsubmitted_timeout 容量等待超时未提交（Rejected+无效 op）
+ * write_accepted_timeout 已接纳超时仍在途，op 终态后可查
+ * write_accepted_cancel 已接纳等待被协程取消，发送不撤销
+ * op_wait_partial_error 部分发送后错误结算 Done+error+真实前缀
+ * write_zero_len 零长写立即可采 Done
+ * close_default_reason RequestClose({}) 未发完写 Done+非空错误
+ * facade_released_op_queryable facade 释放后 op 终态仍可查/可 Wait
+ * waitclosed_driver_failed driver Failed 唤醒 WaitClosed，不伪调 OnClose
+ * waitclosed_late_no_miss 已关闭后 WaitClosed 立即成功（晚到不丢）
+ * status_projection valid/read_eof/write/closed/released 采样
+ */
 #include <bbt/infra/net/CoTcpConnection.hpp>
 #include <bbt/infra/net/Engine.hpp>
 #include <bbt/infra/net/NativeSocket.hpp>
@@ -57,6 +59,7 @@ static void Check(bool value, const char* expression, int line)
         throw std::runtime_error("line " + std::to_string(line) + ": " + expression);
     }
 }
+
 #define CHECK(expression) Check(static_cast<bool>(expression), #expression, __LINE__)
 
 static bbt::coroutine::WaitOptions Until(std::chrono::milliseconds duration)
@@ -120,25 +123,26 @@ struct EngineRunner {
     std::error_code error;
     std::thread thread;
 
-    EngineRunner(Engine& target, EngineConfig config) : engine(target)
+    EngineRunner(Engine& target, EngineConfig config)
+        : engine(target)
     {
         thread = std::thread([this, config]() mutable { error = engine.Run(config); });
     }
+
     bool WaitForReturn(std::chrono::milliseconds timeout)
     {
         return WaitUntil([&] { return engine.Phase() == EnginePhase::Stopped; }, timeout);
     }
+
     void CloseAndJoin()
     {
-        engine.RequestClose();
+        (void)engine.Close();
         if (thread.joinable()) {
             thread.join();
         }
     }
-    ~EngineRunner()
-    {
-        CloseAndJoin();
-    }
+
+    ~EngineRunner() { CloseAndJoin(); }
 };
 
 static NativeSocket ConnectClient(const Address& address)
@@ -159,16 +163,15 @@ struct StoreHandler : RawHandler {
     std::atomic<int> closed{0};
     std::mutex mutex;
     std::shared_ptr<Connection> stored;
+
     void OnAccept(Connection connection) override
     {
         accepted.fetch_add(1);
         std::lock_guard<std::mutex> lock(mutex);
         stored = std::make_shared<Connection>(connection);
     }
-    void OnClose(Connection, std::error_code) override
-    {
-        closed.fetch_add(1);
-    }
+
+    void OnClose(Connection, std::error_code) override { closed.fetch_add(1); }
 };
 
 static EngineConfig ServerConfig(const Address& listen, std::size_t subs = 1)
@@ -180,9 +183,11 @@ static EngineConfig ServerConfig(const Address& listen, std::size_t subs = 1)
     return config;
 }
 
-// 独立 ConnectionState + facade：无 owner，终态由测试线程手动 PumpWrites/
-// MarkClosed 推进；等待「已挂起」由 SetWrite/CloseAddHookForTest 在
-// on_registered 内给出屏障信号（Add 成功 = runtime 已登记事件）。
+/**
+ * 独立 ConnectionState + facade：无 owner，终态由测试线程手动 PumpWrites/
+ * MarkClosed 推进；等待「已挂起」由 SetWrite/CloseAddHookForTest 在
+ * on_registered 内给出屏障信号（Add 成功 = runtime 已登记事件）。
+ */
 static CoTcpConnection FacadeOf(const std::shared_ptr<ConnectionState>& state)
 {
     return CoTcpConnection(ConnectionTestAccess::Make(state));
@@ -190,18 +195,19 @@ static CoTcpConnection FacadeOf(const std::shared_ptr<ConnectionState>& state)
 
 struct ArmedFlag {
     std::atomic<int> armed{0};
-    ~ArmedFlag()
-    {
-        Clear();
-    }
+
+    ~ArmedFlag() { Clear(); }
+
     void ArmWriteAdd()
     {
         ConnectionState::SetWriteAddHookForTest([this] { armed.fetch_add(1); });
     }
+
     void ArmCloseAdd()
     {
         ConnectionState::SetCloseAddHookForTest([this] { armed.fetch_add(1); });
     }
+
     void Clear()
     {
         ConnectionState::SetWriteAddHookForTest({});
@@ -209,8 +215,9 @@ struct ArmedFlag {
     }
 };
 
-// ---------------- cases ----------------
-
+/**
+ * ---------------- cases ----------------
+ */
 static void MemberWriteDone()
 {
     StartRuntime(2);
@@ -228,7 +235,10 @@ static void MemberWriteDone()
             result.store(1);
         }
     });
-    // 真实屏障：等待者已在 write hub 登记后再完成该 op（不用 sleep）。
+
+    /**
+     * 真实屏障：等待者已在 write hub 登记后再完成该 op（不用 sleep）。
+     */
     CHECK(WaitUntil([&] { return flag.armed.load() >= 1; }, 3000ms));
     auto sink = [](const std::string_view* views, std::size_t, std::size_t budget) -> ssize_t {
         return static_cast<ssize_t>(std::min(views[0].size(), budget));
@@ -236,7 +246,10 @@ static void MemberWriteDone()
     state->PumpWrites(8, 4096, sink);
     Get(task);
     CHECK(result.load() == 0);
-    // 等待返回时已采到 Done（首胜后采样，不是“InFlight 快照”）。
+
+    /**
+     * 等待返回时已采到 Done（首胜后采样，不是“InFlight 快照”）。
+     */
     flag.Clear();
     std::cout << "member_write_done done=ok sampled_after_win=ok\n";
 }
@@ -249,9 +262,17 @@ static void AsyncWriteFire()
     auto conn = FacadeOf(state);
     CHECK(!conn.AsyncWrite(std::string(64, 'a')));
     CHECK(!conn.AsyncWrite(std::string(64, 'b')));
-    CHECK(state->ActiveOpCount() == 2); // 没有 owner 推进也立即返回，不等待完成。
+
+    /**
+     * 没有 owner 推进也立即返回，不等待完成。
+     */
+    CHECK(state->ActiveOpCount() == 2);
     CHECK(conn.AsyncWrite("c") == std::make_error_code(std::errc::no_buffer_space));
-    CHECK(state->ActiveOpCount() == 2); // 拒绝零接纳。
+
+    /**
+     * 拒绝零接纳。
+     */
+    CHECK(state->ActiveOpCount() == 2);
     std::string sent;
     state->PumpWrites(8, 4096, [&](const std::string_view* views, std::size_t, std::size_t budget) -> ssize_t {
         const auto count = std::min(views[0].size(), budget);
@@ -264,7 +285,7 @@ static void AsyncWriteFire()
     CHECK(completed[0].id != completed[1].id);
     CHECK(completed[0].sent == 64 && completed[1].sent == 64);
     CHECK(!completed[0].error && !completed[1].error);
-    conn.RequestClose(make_error_code(NetErrc::Closed));
+    (void)conn.Close({}, make_error_code(NetErrc::Closed));
     CHECK(conn.AsyncWrite("x") == make_error_code(NetErrc::Closed));
     CHECK(CoTcpConnection{}.AsyncWrite("x") == make_error_code(NetErrc::Closed));
     WriteOperation empty;
@@ -314,7 +335,10 @@ static void WriteAcceptedTimeout()
     });
     Get(task);
     CHECK(result.load() == 0);
-    // 超时不撤销：op 仍在途可查；推进后终态落到同一 record。
+
+    /**
+     * 超时不撤销：op 仍在途可查；推进后终态落到同一 record。
+     */
     CHECK(holder->Query().phase == WritePhase::InFlight);
     auto sink = [](const std::string_view* views, std::size_t, std::size_t budget) -> ssize_t {
         return static_cast<ssize_t>(std::min(views[0].size(), budget));
@@ -346,14 +370,20 @@ static void WriteAcceptedCancel()
             result.store(1);
         }
     });
-    // 屏障：等待已真实挂起（runtime 已登记事件 + Add 成功）后取消协程。
+
+    /**
+     * 屏障：等待已真实挂起（runtime 已登记事件 + Add 成功）后取消协程。
+     */
     CHECK(WaitUntil([&] { return flag.armed.load() >= 1; }, 3000ms));
     flag.Clear();
     CHECK(self_future.wait_for(3s) == std::future_status::ready);
     self_future.get()->RequestCancel();
     Get(task);
     CHECK(result.load() == 0);
-    // 取消不撤销发送：record 仍可推进到 Done。
+
+    /**
+     * 取消不撤销发送：record 仍可推进到 Done。
+     */
     auto sink = [](const std::string_view* views, std::size_t, std::size_t budget) -> ssize_t {
         return static_cast<ssize_t>(std::min(views[0].size(), budget));
     };
@@ -382,7 +412,10 @@ static void OpWaitPartialError()
             result.store(1);
         }
     });
-    // 屏障：Write 已挂起后注入「发 8 字节后 EPIPE」的部分发送错误。
+
+    /**
+     * 屏障：Write 已挂起后注入「发 8 字节后 EPIPE」的部分发送错误。
+     */
     CHECK(WaitUntil([&] { return flag.armed.load() >= 1; }, 3000ms));
     flag.Clear();
     int calls = 0;
@@ -408,7 +441,10 @@ static void WriteZeroLen()
     auto state = std::make_shared<ConnectionState>(7, 4096, 4096, 8, nullptr);
     auto conn = FacadeOf(state);
     CHECK(!conn.AsyncWrite(""));
-    // fire 零长写不占字节；终态仍走 owner 的统一事件出口。
+
+    /**
+     * fire 零长写不占字节；终态仍走 owner 的统一事件出口。
+     */
     const auto completed = state->DrainTerminal();
     CHECK(completed.size() == 1 && completed[0].sent == 0 && !completed[0].error);
     std::atomic<int> result{-1};
@@ -431,19 +467,29 @@ static void CloseDefaultReason()
     auto state = std::make_shared<ConnectionState>(8, 4096, 4096, 8, nullptr);
     auto conn = FacadeOf(state);
     CHECK(!conn.AsyncWrite(std::string(64, 'u')));
-    // 默认空 reason：CloseReason 保持空值（首请求固定），但未发完写
-    // 必须以 Done+非空错误结算——空 reason 不能冒充本地成功。
-    conn.RequestClose({});
+
+    /**
+     * 默认空 reason：CloseReason 保持空值（首请求固定），但未发完写
+     * 必须以 Done+非空错误结算——空 reason 不能冒充本地成功。
+     */
+    (void)conn.Close({}, {});
     const auto completed = state->DrainTerminal();
     CHECK(completed.size() == 1);
     CHECK(completed[0].error == std::make_error_code(std::errc::operation_canceled));
     CHECK(completed[0].sent == 0);
-    CHECK(conn.Status().close_reason == std::error_code{}); // reason 仍为空
-    // 显式 reason 保留原值结算。
+
+    /**
+     * reason 仍为空
+     */
+    CHECK(conn.Status().close_reason == std::error_code{});
+
+    /**
+     * 显式 reason 保留原值结算。
+     */
     auto state2 = std::make_shared<ConnectionState>(9, 4096, 4096, 8, nullptr);
     auto conn2 = FacadeOf(state2);
     CHECK(!conn2.AsyncWrite(std::string(8, 'v')));
-    conn2.RequestClose(std::error_code(ECONNRESET, std::system_category()));
+    (void)conn2.Close({}, std::error_code(ECONNRESET, std::system_category()));
     const auto completed2 = state2->DrainTerminal();
     CHECK(completed2.size() == 1);
     CHECK(completed2[0].error == std::error_code(ECONNRESET, std::system_category()));
@@ -463,7 +509,11 @@ static void FacadeReleasedOpQueryable()
         op = report.operation;
         CHECK(op.Valid());
     });
-    Get(submitted); // facade 释放：Write 返回的 op 终态仍可查，发送未被超时撤销。
+
+    /**
+     * facade 释放：Write 返回的 op 终态仍可查，发送未被超时撤销。
+     */
+    Get(submitted);
     CHECK(op.Query().phase == WritePhase::InFlight);
     ArmedFlag flag;
     flag.ArmWriteAdd();
@@ -518,15 +568,22 @@ static void WaitClosedDriverFailed()
         const auto error = conn.WaitClosed(Until(4000ms));
         result.store(error ? 1 : 0);
     });
-    // 真实屏障：WaitClosed 已在 close hub 登记后才注入 driver Failed；
-    // Failed 走控制域 CancelControl→MarkClosed，唤醒等待但不伪调 OnClose。
+
+    /**
+     * 真实屏障：WaitClosed 已在 close hub 登记后才注入 driver Failed；
+     * Failed 走控制域 CancelControl→MarkClosed，唤醒等待但不伪调 OnClose。
+     */
     CHECK(WaitUntil([&] { return flag.armed.load() >= 1; }, 3000ms));
     flag.Clear();
     CHECK(!EngineTestAccess::InjectDriverFailure(engine));
     Get(task);
     CHECK(result.load() == 0);
     CHECK(conn.Status().closed);
-    CHECK(handler->closed.load() == 0); // Failed 路径不伪调 owner 回调
+
+    /**
+     * Failed 路径不伪调 owner 回调
+     */
+    CHECK(handler->closed.load() == 0);
     CHECK(runner.WaitForReturn(5000ms));
     CHECK(engine.LastError());
     CHECK(!client.Close());
@@ -539,9 +596,12 @@ static void WaitClosedLateNoMiss()
     StartRuntime(1);
     auto state = std::make_shared<ConnectionState>(11, 4096, 4096, 8, nullptr);
     auto conn = FacadeOf(state);
-    conn.RequestClose(std::error_code(ECONNRESET, std::system_category()));
+    (void)conn.Close({}, std::error_code(ECONNRESET, std::system_category()));
     CHECK(conn.Status().closed);
-    // 已发布后晚到的 WaitClosed 直接成功（谓词复查，不依赖 Notify 留存）。
+
+    /**
+     * 已发布后晚到的 WaitClosed 直接成功（谓词复查，不依赖 Notify 留存）。
+     */
     std::atomic<int> result{-1};
     auto task = Task([&] {
         const auto error = conn.WaitClosed(Until(500ms));
@@ -568,11 +628,14 @@ static void StatusProjection()
     CHECK(status.valid && !status.closed && !status.read_eof);
     CHECK(status.write == AcceptanceState::Open);
     CHECK(status.readable_bytes == 0 && !status.read_error);
-    // 独立 state 无 backend fd：ReclaimRecord 缺省即「无责任」→
-    // released=true 从创建起为真（与 closed=false 可合法共存）。
+
+    /**
+     * 独立 state 无 backend fd：ReclaimRecord 缺省即「无责任」→
+     * released=true 从创建起为真（与 closed=false 可合法共存）。
+     */
     CHECK(status.released);
     CHECK(conn.Valid() && !conn.IsClosed() && conn.IsReleased());
-    conn.RequestClose({});
+    (void)conn.Close({}, {});
     status = conn.Status();
     CHECK(status.closed && status.released);
     CHECK(status.write == AcceptanceState::Closed);

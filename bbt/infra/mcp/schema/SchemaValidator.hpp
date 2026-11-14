@@ -29,7 +29,6 @@
  * 未覆盖（不在本包宣称）：tools/handler 输入输出接线、注册表聚合、
  * 格式关键字（format）Unicode 语义、完整 JSON Schema Test Suite。
  */
-
 #include <cstddef>
 #include <map>
 #include <memory>
@@ -40,46 +39,135 @@
 
 namespace bbt::infra::mcp {
 
-/// 复杂度与依赖上限；默认值可在 Compile 时显式覆盖，必须为正。
+/**
+ * @brief 复杂度与依赖上限；默认值可在 Compile 时显式覆盖，必须为正。
+ */
 struct SchemaOptions {
-    std::size_t max_schema_bytes = 256u * 1024u;    ///< schema 字节上限
-    std::size_t max_schema_depth = 64;              ///< schema 嵌套深度上限
-    std::size_t max_schema_nodes = 10000;           ///< schema 节点数上限
-    std::size_t max_instance_bytes = 1024u * 1024u; ///< instance 字节上限
-    std::size_t max_instance_depth = 128;           ///< instance 嵌套深度上限
-    std::size_t max_instance_nodes = 50000;         ///< instance 节点数上限
-    // 测试专用离线 remote fixture：base-url（无 fragment）→ schema。默认空，
-    // 即一切外部 ref（http/https/file/绝对路径等）在 compile 期拒绝。
-    std::map<std::string, JsonValue> remotes; ///< 离线 remote fixture（测试专用）
+
+    /**
+     * schema 字节上限
+     */
+    std::size_t max_schema_bytes = 256u * 1024u;
+
+    /**
+     * schema 嵌套深度上限
+     */
+    std::size_t max_schema_depth = 64;
+
+    /**
+     * schema 节点数上限
+     */
+    std::size_t max_schema_nodes = 10000;
+
+    /**
+     * instance 字节上限
+     */
+    std::size_t max_instance_bytes = 1024u * 1024u;
+
+    /**
+     * instance 嵌套深度上限
+     */
+    std::size_t max_instance_depth = 128;
+
+    /**
+     * instance 节点数上限
+     */
+    std::size_t max_instance_nodes = 50000;
+
+    /**
+     * 测试专用离线 remote fixture：base-url（无 fragment）→ schema。默认空，即一切外部
+     * ref（http/https/file/绝对路径等）在 compile 期拒绝。
+     */
+    std::map<std::string, JsonValue> remotes;
 };
 
-/// Schema 编译/验证错误码。
+/**
+ * @brief Schema 编译/验证错误码。
+ */
 enum class SchemaErrorCode {
-    InvalidSchema, ///< 结构非法 / draft 2020-12 编译拒绝
-    ExternalRef,   ///< 外部或未知 ref 被默认 resolver 拒绝
-    LimitExceeded, ///< schema 或 instance 超出显式字节/深度/节点上限
-    RegexInvalid,  ///< pattern 无法编译（std::regex 与 ICU 均拒绝）
-    Unsupported,   ///< ICU 路径不覆盖的条件/ref 位置（compile 期拒绝，不静默跳过）
-    Internal,      ///< 未预期内部错误（脱敏，不含输入内容）
+
+    /**
+     * 结构非法 / draft 2020-12 编译拒绝
+     */
+    InvalidSchema,
+
+    /**
+     * 外部或未知 ref 被默认 resolver 拒绝
+     */
+    ExternalRef,
+
+    /**
+     * schema 或 instance 超出显式字节/深度/节点上限
+     */
+    LimitExceeded,
+
+    /**
+     * pattern 无法编译（std::regex 与 ICU 均拒绝）
+     */
+    RegexInvalid,
+
+    /**
+     * ICU 路径不覆盖的条件/ref 位置（compile 期拒绝，不静默跳过）
+     */
+    Unsupported,
+
+    /**
+     * 未预期内部错误（脱敏，不含输入内容）
+     */
+    Internal,
 };
 
-/// Schema 错误：码 + 脱敏描述。
+/**
+ * @brief Schema 错误：码 + 脱敏描述。
+ */
 struct SchemaError {
-    SchemaErrorCode code = SchemaErrorCode::Internal; ///< 错误码
-    std::string message;                              ///< 固定短语级描述；不回显 schema/实例/敏感值
+
+    /**
+     * 错误码
+     */
+    SchemaErrorCode code = SchemaErrorCode::Internal;
+
+    /**
+     * 固定短语级描述；不回显 schema/实例/敏感值
+     */
+    std::string message;
 };
 
-/// 单条验证失败：只含 keyword 与 schema/instance 指针路径（无值）。
+/**
+ * @brief 单条验证失败：只含 keyword 与 schema/instance 指针路径（无值）。
+ */
 struct ValidationIssue {
-    std::string keyword;       ///< 触发的关键字
-    std::string schema_path;   ///< schema 内路径
-    std::string instance_path; ///< instance 内路径
+
+    /**
+     * 触发的关键字
+     */
+    std::string keyword;
+
+    /**
+     * schema 内路径
+     */
+    std::string schema_path;
+
+    /**
+     * instance 内路径
+     */
+    std::string instance_path;
 };
 
-/// 验证结果：是否通过及失败项列表。
+/**
+ * @brief 验证结果：是否通过及失败项列表。
+ */
 struct ValidationResult {
-    bool ok = true;                      ///< 是否通过
-    std::vector<ValidationIssue> issues; ///< 失败项（ok=false 时非空）
+
+    /**
+     * 是否通过
+     */
+    bool ok = true;
+
+    /**
+     * 失败项（ok=false 时非空）
+     */
+    std::vector<ValidationIssue> issues;
 };
 
 /**
@@ -87,35 +175,44 @@ struct ValidationResult {
  */
 class SchemaValidator {
 public:
-    // 不透明编译产物：完整类型定义在实现 TU（PIMPL）。公开仅使内部帮助结构
-    // 能以 shared_ptr 持有；不泄露任何第三方头。
+    /**
+     * @brief 不透明编译产物：完整类型定义在实现 TU（PIMPL）。
+     *
+     * 公开仅使内部帮助结构能以 shared_ptr 持有；不泄露任何第三方头。
+     */
     struct Impl;
 
-    // 全有或全无编译（含官方完整 metaschema 全文校验、ref 策略、复杂度上限、
-    // pattern 分类与 ICU 编译）。成功时填充 *out；失败时填充 *error（可空），
-    // 不产生半注册状态。
-    /// 全有或全无编译。
-    /// @param schema 待编译 schema
-    /// @param options 复杂度与依赖上限
-    /// @param out 成功时填充的编译产物
-    /// @param error 失败时填充的错误（可空）
-    /// @return 是否编译成功
-    static bool Compile(const JsonValue& schema, const SchemaOptions& options, SchemaValidator* out,
-                        SchemaError* error);
+    /**
+     * @brief 全有或全无编译（含官方完整 metaschema 全文校验、ref 策略、复杂度上限、
+     *        pattern 分类与 ICU 编译）。
+     *
+     * 成功时填充 *out；失败时填充 *error（可空），不产生半注册状态。
+     * @param schema 待编译 schema
+     * @param options 复杂度与依赖上限
+     * @param out 成功时填充的编译产物
+     * @param error 失败时填充的错误（可空）
+     * @return 是否编译成功
+     */
+    static bool
+    Compile(const JsonValue& schema, const SchemaOptions& options, SchemaValidator* out, SchemaError* error);
 
-    // 验证 instance（线程安全，可并发调用）。实例超出上限时返回 ok=false 的
-    // LimitExceeded 错误（经 *error，可空）；ICU 运行期失败返回 ok=false 且
-    // *error 为脱敏 Internal（不冒充「不匹配」）。成功或普通 schema mismatch
-    // 不写 *error（调用方原值保留）。未编译对象（默认构造或 Compile 失败）
-    // Validate 返回 ok=false 的脱敏 Internal，不崩溃。
-    /// 验证 instance（线程安全，可并发调用）。
-    /// @param instance 待验证实例
-    /// @param error 超限/内部失败时填充的错误（可空）
-    /// @return 验证结果；超限或内部失败为 ok=false
+    /**
+     * @brief 验证 instance（线程安全，可并发调用）。
+     *
+     * 实例超出上限时返回 ok=false 的 LimitExceeded 错误（经 *error，可空）；ICU 运行期失败
+     * 返回 ok=false 且 *error 为脱敏 Internal（不冒充「不匹配」）。成功或普通 schema mismatch
+     * 不写 *error（调用方原值保留）。未编译对象（默认构造或 Compile 失败）Validate 返回
+     * ok=false 的脱敏 Internal，不崩溃。
+     * @param instance 待验证实例
+     * @param error 超限/内部失败时填充的错误（可空）
+     * @return 验证结果；超限或内部失败为 ok=false
+     */
     ValidationResult Validate(const JsonValue& instance, SchemaError* error) const;
 
 private:
     std::shared_ptr<const Impl> impl_;
 };
 
-} // namespace bbt::infra::mcp
+// clang-format off
+}
+// clang-format on

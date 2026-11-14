@@ -33,9 +33,10 @@
  *
  * 生命周期：Create 要求 server 已 Start、engine 为 Idle（与 http::Server 同一
  * 规则）；Start 要求 engine Running 且有监听。transport 持 server 强引用，core
- * 对 transport 只经会话 sink 弱引用（无环）。StopAccepting → Drain → Close →
- * WaitStopped 与 http::Server 同一契约，native 宿主专用 Drain/WaitStopped；Close
- * 不关 Engine、幂等、取消每个活动流源一次（http::Server 的 session 收口完成）。
+ * 对 transport 只经会话 sink 弱引用（无环）。`Close(CloseOptions)`、`Close(Immediate)`
+ * 与 `Close(wait_release=true)` 与 http::Server 同一契约，直接委托内部 server：逻辑封口/在途
+ * 请求排空由 server 承担，本层不重复实现等待；Close 不关 Engine、幂等、取消每个
+ * 活动流源一次（http::Server 的 session 收口完成）。
  * 断连驱动订阅结束（HTTP 帧取消不支持，连接终止经 EndAllSubscriptions 结束本会话
  * 订阅）。
  *
@@ -50,13 +51,14 @@
  * 兼容面（规范对照未核对，故不接受）。非 loopback 监听默认被拒；确需对外暴露时
  * 由部署方显式 opt-in（McpHttpOptions::allow_non_loopback）并自带外层认证/反代。
  */
-
 #include <chrono>
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
+#include <bbt/infra/CloseOptions.hpp>
 #include <bbt/infra/Result.hpp>
 #include <bbt/infra/mcp/McpServer.hpp>
 #include <bbt/infra/net/Engine.hpp>
@@ -65,35 +67,70 @@ namespace bbt::infra {
 namespace http {
 class Server;
 }
+
+// clang-format off
 }
+// clang-format on
 
 namespace bbt::infra::mcp {
 
-/// Streamable HTTP transport 的安全门禁、请求体上限与 SSE 流配额。
+/**
+ * @brief Streamable HTTP transport 的安全门禁、请求体上限与 SSE 流配额。
+ */
 struct McpHttpOptions {
-    // 安全门禁：Host 白名单必须非空且匹配配置的监听（如
-    // {"127.0.0.1:PORT","localhost:PORT"}，匹配 host[:port]、大小写不敏感、
-    // 剥离 [v6] 括号与尾随点）；空 → Create InvalidArgument。Origin 白名单为
-    // 显式浏览器 allowlist：空表表示「允许无 Origin，拒绝任何给出的 Origin」；
-    // 命中按精确值比较（大小写敏感）。
-    std::vector<std::string> allowed_hosts;   ///< Host 白名单（必须非空）
-    std::vector<std::string> allowed_origins; ///< 浏览器 Origin allowlist（可空）
-    /// 请求体上限（>0，≤ http 层 max_body_bytes；Create 同步收紧 http limits）。
-    std::size_t max_body_bytes = 1U << 20; // 1 MiB
-    // SSE 流配额（透传 http::StreamingOptions 前先经本包校验为正且 ≤24h）。
-    std::size_t max_chunk_bytes = 16U << 10;              ///< SSE 单块字节上限
-    std::chrono::milliseconds max_stream_lifetime{60000}; ///< SSE 流总期限
-    std::chrono::milliseconds stream_write_timeout{5000}; ///< 每次 wire 写期限
-    /// 每 SSE 流事件队列上限（条数，>0）；满即丢帧 + 诊断（有界，不阻塞发布者）。
+
+    /**
+     * Host 白名单（必须非空）：匹配配置的监听（如 {"127.0.0.1:PORT","localhost:PORT"}，
+     * 匹配 host[:port]、大小写不敏感、剥离 [v6] 括号与尾随点）；空 → Create InvalidArgument。
+     * 同一门禁里的 Origin 白名单是显式浏览器 allowlist：空表表示「允许无 Origin，
+     * 拒绝任何给出的 Origin」；命中按精确值比较（大小写敏感）。
+     */
+    std::vector<std::string> allowed_hosts;
+
+    /**
+     * 浏览器 Origin allowlist（可空）；比较规则同上（精确值、大小写敏感）。
+     */
+    std::vector<std::string> allowed_origins;
+
+    /**
+     * 请求体上限（>0，≤ http 层 max_body_bytes；Create 同步收紧 http limits），默认 1 MiB。
+     */
+    std::size_t max_body_bytes = 1U << 20;
+
+    /**
+     * SSE 单块字节上限；流配额（max_stream_lifetime / stream_write_timeout）透传
+     * http::StreamingOptions 前先经本包校验为正且 ≤24h。
+     */
+    std::size_t max_chunk_bytes = 16U << 10;
+
+    /**
+     * SSE 流总期限。
+     */
+    std::chrono::milliseconds max_stream_lifetime{60000};
+
+    /**
+     * 每次 wire 写期限。
+     */
+    std::chrono::milliseconds stream_write_timeout{5000};
+
+    /**
+     * 每 SSE 流事件队列上限（条数，>0）；满即丢帧 + 诊断（有界，不阻塞发布者）。
+     */
     std::size_t max_stream_events = 64;
-    /// SSE 「: 」注释心跳间隔（>0；keepalive 不重置流期限）。
+
+    /**
+     * SSE 「: 」注释心跳间隔（>0；keepalive 不重置流期限）。
+     */
     std::chrono::milliseconds keepalive_interval{15000};
-    // 非 loopback 监听 opt-in（默认 false）。SHTTP 规范 SHOULD 本地运行时只绑
-    // localhost；默认 Start 对任何非 loopback 监听地址（0.0.0.0、::、公网 IP）
-    // 直接失败（ErrorCode::UnsupportedRoute，domain_code mcp.http.non_loopback），
-    // 只有显式置 true 才放行——该开关是「我知道在做什么」的声明，不是
-    // Host/Origin 白名单（白名单防的是 Host 头伪造，挡不住 bind 暴露）。
-    bool allow_non_loopback = false; ///< 是否允许非 loopback 监听（默认拒绝）
+
+    /**
+     * 非 loopback 监听 opt-in（默认 false）。SHTTP 规范 SHOULD 本地运行时只绑 localhost；
+     * 默认 Start 对任何非 loopback 监听地址（0.0.0.0、::、公网 IP）直接失败
+     * （ErrorCode::UnsupportedRoute，domain_code mcp.http.non_loopback），只有显式置 true
+     * 才放行——该开关是「我知道在做什么」的声明，不是 Host/Origin 白名单（白名单防的是
+     * Host 头伪造，挡不住 bind 暴露）。
+     */
+    bool allow_non_loopback = false;
 };
 
 /**
@@ -104,48 +141,59 @@ struct McpHttpOptions {
  */
 class McpHttpTransport {
 public:
-    /// 校验 options（白名单/字节/期限全为正且有限），创建内部 streaming
-    /// http::Server（engine 必须 Idle；http limits.max_body_bytes 收紧到
-    /// options.max_body_bytes）。失败不留半装配 transport。
-    /// @param server 已 Start 的服务实例
-    /// @param engine 应用独占并推进的 net::Engine
-    /// @param options 安全门禁、请求体上限与 SSE 流配额
-    /// @return transport 或装配失败原因
+    /**
+     * @brief 校验 options（白名单/字节/期限全为正且有限）并创建内部 streaming http::Server。
+     *
+     * engine 必须 Idle；http limits.max_body_bytes 收紧到 options.max_body_bytes。失败不留
+     * 半装配 transport。
+     * @param server 已 Start 的服务实例
+     * @param engine 应用独占并推进的 net::Engine
+     * @param options 安全门禁、请求体上限与 SSE 流配额
+     * @return transport 或装配失败原因
+     */
     static result<std::shared_ptr<McpHttpTransport>>
     Create(std::shared_ptr<McpServer> server, std::shared_ptr<net::Engine> engine, McpHttpOptions options);
     ~McpHttpTransport();
 
-    // 一次性：要求 engine Running 且有监听地址（与 http::Server::Start 同契约）。
-    // 默认要求所有监听地址为 loopback（127.0.0.0/8、::1、Unix）；任一非 loopback
-    // 监听地址且未显式 opt-in（McpHttpOptions::allow_non_loopback）→
-    // ErrorCode::UnsupportedRoute（domain_code mcp.http.non_loopback）。
-    /// 开始接纳（一次性；要求 Engine Running 且有监听）。
-    /// @return 状态不满足或非 loopback 未 opt-in 时为错误
+    /**
+     * @brief 开始接纳（一次性；要求 engine Running 且有监听地址，与 http::Server::Start 同契约）。
+     *
+     * 默认要求所有监听地址为 loopback（127.0.0.0/8、::1、Unix）；任一非 loopback 监听地址
+     * 且未显式 opt-in（McpHttpOptions::allow_non_loopback）→ ErrorCode::UnsupportedRoute
+     * （domain_code mcp.http.non_loopback）。
+     * @return 状态不满足或非 loopback 未 opt-in 时为错误
+     */
     result<void> Start();
-    // 与 http::Server 同一四段收口契约：StopAccepting 封新 handler；Drain 等待
-    // 授权请求与流终态（含 SSE chunk 写终态）；Close 幂等取消每流源一次并关
-    // 本 server 的连接（不关 Engine）；WaitStopped 核 listener 停止、
-    // callback/源销毁、连接 Released。Drain/WaitStopped 为 native 宿主专用
-    // （协程域内调用返回 InvalidContext）。超时保留责任、不谎称已停。
-    /// 封新 handler；已授权请求与流继续。
-    void StopAccepting() noexcept;
-    /// 等授权请求与流终态（native 宿主专用）。
-    /// @param deadline 等待期限
-    /// @return 排空完成、超时或已关闭
-    result<void> Drain(bbt::coroutine::Deadline deadline);
-    /// 幂等封口：取消每流源一次并关本 server 的连接（不关 Engine）。
-    void Close() noexcept;
-    /// 核 listener 停止、回调/源销毁、连接 Released（native 宿主专用）。
-    /// @param deadline 等待期限
-    /// @return 回收完成、超时或已关闭
-    result<void> WaitStopped(bbt::coroutine::Deadline deadline);
-    /// 是否已封口。
+
+    /**
+     * @brief 统一逻辑关闭入口，语义与 http::Server 相同（本层委托，不另造等待）。
+     *
+     * Close 逻辑封口并按模式等待在途请求：Graceful 到写终态，Immediate 直接失败在途并取消
+     * 每流源一次；wait_release=true 在同一 Close 内等物理回收到同一期限（listener 停止、
+     * callback/源销毁、连接 Released）。Close(Immediate) 任意域非阻塞封口。均不关共享 Engine。
+     * @param options 模式、首因与优雅关闭的有限绝对期限
+     */
+    result<void> Close(const CloseOptions& options = {});
+
+    /**
+     * @brief 关闭原因；任意模式首次发布后固定。
+     */
+    std::optional<Error> CloseReason() const noexcept;
+
+    /**
+     * @brief 是否已封口。
+     */
     bool IsClosed() const noexcept;
 
 private:
+    void _BeginClose(Error reason = MakeError(ErrorCode::Closed, "mcp.http: closed by owner")) noexcept;
+    result<void> _WaitReleased(bbt::coroutine::Deadline deadline);
+
     struct Impl;
     explicit McpHttpTransport(std::shared_ptr<Impl> impl) noexcept;
     std::shared_ptr<Impl> m_impl;
 };
 
-} // namespace bbt::infra::mcp
+// clang-format off
+}
+// clang-format on

@@ -6,7 +6,10 @@
  *
  * `Engine::Run` 占调用它的宿主 native 控制线程，自动绑定已登记 Processer 槽，
  * 每个 Reactor 由对应 P 的 driver 推进自有 Asio context；不新建库内控制线程或
- * 网络 I/O 线程。生命周期与取舍见 docs/architecture/gnet-network-execution.md。
+ * 网络 I/O 线程。应用运行时只在入口 native host hook 内调用一次 `Run`，主协程
+ * 用 `CoWaitRunning` 观察 Running；`Run` 返回是本代网络资源收口的唯一凭据。
+ * 生命周期与取舍见 docs/architecture/gnet-network-execution.md 与
+ * docs/architecture/native-lifecycle-seam-contract.md。
  *
  * 生命周期与判定顺序：
  *   - `Run` 先校验宿主控制域：在协程上下文或已登记 Processer 上调用返回
@@ -18,7 +21,7 @@
  *   - 成功后自动绑槽（server 1 main + N sub；client-only 无 main），安装
  *     listener，发布 Running（此时 `LocalAddresses` 才可能有完整语义），进入
  *     控制循环。
- *   - `RequestClose` 并发安全、幂等，只封口并唤醒控制域；`Run` 返回才表示本
+ *   - `Close(Immediate)` 并发安全、幂等，只封口并唤醒控制域；`Run` 返回才表示本
  *     Engine 的网络资源、回调与 driver 已收口。
  *   - 控制域按持有 token 有限复查 `QueryProcesserDriver`；Failed 时封口、同代
  *     解绑，以冻结状态、`LastError`/`LastFailure` 与内部完成订阅作为替代出口，
@@ -27,11 +30,11 @@
  * 原始回调在 owner 的非业务协程边界执行：短、非阻塞、不可挂起。运行时对象
  * （Scheduler/driver/Processer）由宿主负责，本类不取消它们的寿命。
  */
-
 #include <cstddef>
 #include <utility>
 #include <exception>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <system_error>
@@ -40,6 +43,7 @@
 #include <bbt/coroutine/sync/CoWaiter.hpp>
 #include <bbt/coroutine/object/CoObject.hpp>
 
+#include <bbt/infra/Result.hpp>
 #include <bbt/infra/net/Address.hpp>
 #include <bbt/infra/net/Connection.hpp>
 #include <bbt/infra/net/ConnectionResult.hpp>
@@ -68,13 +72,32 @@ enum class RuntimeProgress { Unspecified, Independent };
  * @brief `Run` 的输入：监听地址、网络选项与推进方式声明。
  */
 struct EngineConfig {
-    std::vector<Address> listen_addresses;                          ///< 空表示 client-only，不创建 main accept owner
-    Options options;                                                ///< 网络选项，见 Options
-    RuntimeProgress runtime_progress{RuntimeProgress::Unspecified}; ///< 必须为 Independent，否则 Run 拒绝
+
+    /**
+     * 空表示 client-only，不创建 main accept owner
+     */
+    std::vector<Address> listen_addresses;
+
+    /**
+     * 网络选项，见 Options
+     */
+    Options options;
+
+    /**
+     * 必须为 Independent，否则 Run 拒绝
+     */
+    RuntimeProgress runtime_progress{RuntimeProgress::Unspecified};
 };
 
-struct EngineImpl;    ///< 定义在 Engine.cc，布局不出公共面
-struct ReclaimRecord; ///< detail：物理回收共享释放记录，带句柄 CoDial 内部传递
+/**
+ * 定义在 Engine.cc，布局不出公共面
+ */
+struct EngineImpl;
+
+/**
+ * detail：物理回收共享释放记录，带句柄 CoDial 内部传递
+ */
+struct ReclaimRecord;
 
 class EngineTestAccess;
 struct CoAccess;
@@ -85,8 +108,8 @@ struct CoAccess;
  * 一个 Engine 对应一代网络资源。「代」是唯一的重启单位：`Run` 成功进入
  * Running，`Run` 返回即本代全部资源收口；同一实例不能重新开启。
  *
- * 线程与域约束见各成员的注释：`RequestClose`、`RequestStopAccepting` 等可从任意线程
- * 调用，`Run` 只能在宿主的 native 控制线程上调用。
+ * 线程与域约束见各成员的注释：`Close(Immediate)`、`RequestStopAccepting` 等可从任意线程
+ * 调用，`Run` 只能由应用入口的 native host hook 在每个运行实例中调用一次。
  */
 class Engine : public bbt::coroutine::CoObject {
 public:
@@ -111,12 +134,16 @@ public:
     Engine& operator=(const Engine&) = delete;
 
     /**
-     * @brief 阻塞的宿主控制线程入口；本代成功收口后返回。
+     * @brief 应用入口 native host hook 的执行入口；阻塞到本代成功收口后返回。
      *
-     * 前置校验失败时在绑定与 socket 副作用之前返回。
+     * 只允许在应用入口的 native host hook 中调用一次；同一实例的第二次 `Run`
+     * （含并发）在绑定与 socket 副作用之前返回 `device_or_resource_busy`，
+     * `Run` 成功后不可重开。前置校验失败时在绑定与 socket 副作用之前返回。
      *
      * @param config 监听地址、网络选项与推进方式声明。
-     * @return 空表示正常收口；否则为前置校验或启动失败的原因。
+     * @return 空表示正常收口；否则为前置校验或启动失败的原因。返回本身就是本代
+     *         网络资源收口的凭据，`Phase()` 同时为 Stopped；仍为 Closing 时表示
+     *         解绑失败，错误保留给宿主报告。
      */
     std::error_code Run(const EngineConfig& config);
 
@@ -125,9 +152,11 @@ public:
      *
      * 只封口并唤醒控制域；收口凭据是 `Run` 返回。
      */
-    void RequestClose() noexcept;
+    std::error_code Close(const CloseOptions& options = {}) noexcept;
 
-    /** @brief 当前阶段快照。 */
+    /**
+     * @brief 当前阶段快照。
+     */
     EnginePhase Phase() const noexcept;
 
     /**
@@ -174,8 +203,8 @@ public:
      * server 的 main 是 `main_owners` 的第一项；client-only 的 `main_owners` 为空。
      * 未运行时返回空。
      */
-    std::error_code ReactorOwnerIds(std::vector<std::uint64_t>& main_owners,
-                                    std::vector<std::uint64_t>& sub_owners) const;
+    std::error_code
+    ReactorOwnerIds(std::vector<std::uint64_t>& main_owners, std::vector<std::uint64_t>& sub_owners) const;
 
     /**
      * @brief 非阻塞建连，只用于配置了 RawHandler 的 Engine。建连结果只通过 raw 回调交付。
@@ -205,8 +234,8 @@ public:
      * @brief 只停止监听与 handoff 的接受，可从任意线程调用，非阻塞、幂等，且不可重新开启。
      *
      * 只封本代的 listener 与 handoff。它不封已交付连接的 Read 与 Write，不封 `CoDial`，
-     * 也不停止 driver，不调用 `RequestClose`，不改动已交付的连接。`Run` 之后，已交付连接的
-     * 双向读写继续可用，宿主需另行调用 `RequestClose` 并 join。
+     * 也不停止 driver，不调用 `Close(Immediate)`，不改动已交付的连接。`Run` 之后，已交付连接的
+     * 双向读写继续可用，宿主需另行调用 `Close(Immediate)` 并 join。
      *
      * 请求本身不是物理关闭的凭据。只有 `AcceptingStopped` 为 true 时，本代全部 listener
      * 才已真正关闭（或在 Failed 时由控制域同代解绑收口），handoff 已封口，且等待者已唤醒。
@@ -222,48 +251,85 @@ public:
      */
     bool AcceptingStopped() const noexcept;
 
-    // ---- Co 成员入口 ---------------------------------------------------------
-    // 协程消费面以成员函数的形式提供：执行域 gate 先于
-    // 一切状态判定，包括已就绪的快路径；非受管协程返回 operation_not_permitted，
-    // 不创建 CoObject/Processer，也不产生网络副作用。
-    // 终态（sealed/Closing/Stopped → operation_canceled）先于 Idle/Starting
-    // 与 client-only；失败不覆盖 result.connection，reclaim 按提交阶段描述本次 socket 责任。
-    // 实现落在 Engine.cc，经私有步骤 CoSubmitConnect/CoWaitConnect/CoWaitAccepted 完成。
-
-    /** @brief 取一条已接纳的连接。必须在受管协程内调用，可挂起。 */
+    /**
+     * ---- Co 成员入口 ---------------------------------------------------------
+     * 协程消费面以成员函数的形式提供：执行域 gate 先于
+     * 一切状态判定，包括已就绪的快路径；非受管协程返回 operation_not_permitted，
+     * 不创建 CoObject/Processer，也不产生网络副作用。
+     * 终态（sealed/Closing/Stopped → operation_canceled）先于 Idle/Starting
+     * 与 client-only；失败不覆盖 result.connection，reclaim 按提交阶段描述本次 socket 责任。
+     * 实现落在 Engine.cc，经私有步骤 CoSubmitConnect/CoWaitConnect/CoWaitAccepted 完成。
+     * @brief 取一条已接纳的连接。必须在受管协程内调用，可挂起。
+     */
     ConnectionResult CoAccept(const bbt::coroutine::WaitOptions& options = {});
 
-    /** @brief 拨号并等待结果。必须在受管协程内调用，可挂起。 */
+    /**
+     * @brief 拨号并等待结果。必须在受管协程内调用，可挂起。
+     */
     ConnectionResult CoDial(const Address& address, const bbt::coroutine::WaitOptions& options = {});
+
+    /**
+     * @brief 受管协程内等待本代进入 Running。
+     *
+     * - 持久谓词是 `Phase()`：Running 返回成功；Stopped 先于 Running 出现时返回
+     *   `LastError()` 映射的错误（无错误为 `Closed`），绝不伪报 Ready；Run 已返回但
+     *   仍为 Closing（解绑失败）同样按失败返回。
+     * - 期限必须有限，到期返回 `TimedOut` 且不清任何状态；非受管协程返回
+     *   `InvalidContext` 且无副作用。
+     * - 用既有 CoWaiter 与 50ms 分片等待，不阻塞 worker，也不退回 native CV/join。
+     */
+    result<void> CoWaitRunning(const bbt::coroutine::WaitOptions& options);
 
 private:
     friend class EngineTestAccess;
     friend struct CoAccess;
 
-    // ---- Co 内部步骤（仅由 detail/CoInternal.hpp 调用）-----------------------
-    // 两段式建连是 CoDial 的内部细节：提交（登记接收意图）与领取（等待结果）。
-    // 不公开，避免把一个无法放弃的中间 ID 变成公共契约。
+    /**
+     * Run 的唯一实现体（控制门已由 Run 占用）。
+     */
+    std::error_code RunImpl(const EngineConfig& config);
 
+    /**
+     * 析构兜底：Run 因解绑失败保留 Closing 时再尝试一次同代同步收口。
+     *
+     * 只在 phase==Closing 时有实际动作；成功返回空错误并发布 Stopped，
+     * 解绑失败返回原错误并保留同代绑定。可在 native 非 Processer 域调用。
+     */
+    std::error_code FinalizeNative();
+
+    /**
+     * ---- Co 内部步骤（仅由 detail/CoInternal.hpp 调用）-----------------------
+     * 两段式建连是 CoDial 的内部细节：提交（登记接收意图）与领取（等待结果）。
+     * 不公开，避免把一个无法放弃的中间 ID 变成公共契约。
+     */
     std::error_code CoSubmitConnect(const Address& address, std::uint64_t& out_connect_id);
 
-    /// 带责任记录的提交，仅供带句柄的 CoDial 使用。记录随提交经过 owner 的各个真实
-    /// close/转交点；未交付的失败由 owner 的回收路径收口该记录。
-    std::error_code CoSubmitConnect(const Address& address, std::uint64_t& out_connect_id,
-                                    const std::shared_ptr<ReclaimRecord>& reclaim);
+    /**
+     * 带责任记录的提交，仅供带句柄的 CoDial 使用。记录随提交经过 owner 的各个真实
+     * close/转交点；未交付的失败由 owner 的回收路径收口该记录。
+     */
+    std::error_code CoSubmitConnect(
+        const Address& address, std::uint64_t& out_connect_id, const std::shared_ptr<ReclaimRecord>& reclaim);
 
-    /// 领取结果。仅成功时把本次结果交付到 `out`；失败不修改 `out`。调用方必须在本函数内
-    /// 归还 claim 与登记责任，并让 owner 回收未交付的 fd。
-    std::error_code CoWaitConnect(std::uint64_t connect_id, Connection& out,
-                                  const bbt::coroutine::WaitOptions& options);
+    /**
+     * 领取结果。仅成功时把本次结果交付到 `out`；失败不修改 `out`。调用方必须在本函数内
+     * 归还 claim 与登记责任，并让 owner 回收未交付的 fd。
+     */
+    std::error_code
+    CoWaitConnect(std::uint64_t connect_id, Connection& out, const bbt::coroutine::WaitOptions& options);
 
-    /// 从有界 handoff 队列取已接纳的连接。配置或生命周期错误立即返回，不等待。
-    /// 判定优先级与 CoAccept 一致：终态（sealed/Closing/Stopped →
-    /// operation_canceled）先于 Idle/Starting 与 client-only 的判定。
+    /**
+     * 从有界 handoff 队列取已接纳的连接。配置或生命周期错误立即返回，不等待。
+     * 判定优先级与 CoAccept 一致：终态（sealed/Closing/Stopped →
+     * operation_canceled）先于 Idle/Starting 与 client-only 的判定。
+     */
     std::error_code CoWaitAccepted(Connection& out, const bbt::coroutine::WaitOptions& options);
 
     std::shared_ptr<EngineImpl> m_impl;
 };
 
-} // namespace bbt::infra::net
+// clang-format off
+}
+// clang-format on
 
 #include <bbt/infra/net/__TEngine.hpp>

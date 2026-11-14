@@ -14,10 +14,13 @@
 #include <boost/asio/ip/address.hpp>
 
 namespace {
-// L3：Boost 的 scope 解析带 atoi 回退（%4294967296→0、%-1→u32max、%3garbage→3），
-// 因此 scope 在进入 Boost 前自行严格校验：只支持完整十进制数字（C++17 from_chars，
-// u32 范围），拒绝负号、空、尾随垃圾、溢出、重复 '%' 与 IPv4/主机名带 scope；
-// 不支持接口名（无 if_nametoindex/atoi 回退）。返回 false 表示已置 error。
+
+/**
+ * L3：Boost 的 scope 解析带 atoi 回退（%4294967296→0、%-1→u32max、%3garbage→3），
+ * 因此 scope 在进入 Boost 前自行严格校验：只支持完整十进制数字（C++17 from_chars，
+ * u32 范围），拒绝负号、空、尾随垃圾、溢出、重复 '%' 与 IPv4/主机名带 scope；
+ * 不支持接口名（无 if_nametoindex/atoi 回退）。返回 false 表示已置 error。
+ */
 bool SplitV6Scope(const std::string& host, std::string* body, std::uint32_t* scope, std::error_code& error)
 {
     const auto percent = host.find('%');
@@ -26,14 +29,22 @@ bool SplitV6Scope(const std::string& host, std::string* body, std::uint32_t* sco
     }
     const auto invalid = std::make_error_code(std::errc::invalid_argument);
     if (host.find('%', percent + 1) != std::string::npos) {
+
+        /**
+         * 拒绝重复的 scope 分隔符。
+         */
         error = invalid;
         return false;
-    } // 重复 %
+    }
     *body = host.substr(0, percent);
     if (body->find(':') == std::string::npos) {
+
+        /**
+         * IPv4 地址和主机名不支持 scope。
+         */
         error = invalid;
         return false;
-    } // IPv4/主机名不支持 scope
+    }
     const std::string suffix = host.substr(percent + 1);
     if (suffix.empty()) {
         error = invalid;
@@ -44,13 +55,20 @@ bool SplitV6Scope(const std::string& host, std::string* body, std::uint32_t* sco
     std::uint32_t value = 0;
     const auto parsed = std::from_chars(first, last, value, 10);
     if (parsed.ec != std::errc{} || parsed.ptr != last) {
+
+        /**
+         * scope 必须是完整的十进制数字且不能溢出 uint32。
+         */
         error = invalid;
         return false;
-    } // 非数字/垃圾/溢出
+    }
     *scope = value;
     return true;
 }
-} // namespace
+
+// clang-format off
+}
+// clang-format on
 
 namespace bbt::infra::net {
 
@@ -207,4 +225,7 @@ Address Address::FromNative(const sockaddr* addr, socklen_t length)
     out.m_size = length;
     return out;
 }
-} // namespace bbt::infra::net
+
+// clang-format off
+}
+// clang-format on

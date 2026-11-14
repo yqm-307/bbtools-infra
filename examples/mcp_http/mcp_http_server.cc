@@ -1,29 +1,30 @@
-// 3-2（本切片 HTTP 形态）：MCP Streamable HTTP 可运行示例 server。
-//
-// 这是什么：一个最小但真实可跑的 MCP over HTTP 示例，演示 bbtools-infra
-// 公共面的完整生命周期与 Streamable HTTP transport：
-//
-//   GlobalConfig/Scheduler 启动共享协程运行时
-//   → McpServer::Create → 注册 resource/prompt → Start 冻结快照
-//   → net::Engine 装配 + McpHttpTransport::Create → engine->Run（监听 127.0.0.1）
-//   → transport->Start → 打印 http://127.0.0.1:<port>/mcp
-//   → 主线程等 SIGINT/SIGTERM
-//   → 按契约同步收口：StopAccepting → Drain → Close → WaitStopped
-//   → server->Close()（core 生命周期由业务决定，transport 不代管）
-//
-// 门禁与 wire：POST /mcp only；Accept 双媒体；Origin/Host 白名单；modern 三件套
-// 路由头（含 base64 sentinel）；JSON 响应 / subscriptions/listen SSE /
-// 通知 202 / 非 /mcp 404 / 非 POST 405。
-//
-// 怎么跑：
-//   $ ./Example_mcp_http_server --http
-//   → 打印 mcp-example: listening http://127.0.0.1:<port>/mcp
-//   再用官方 Python SDK 2.3.0 的 streamable_http_client 连接（见 VERIFY interop），
-//   或 curl 手工 POST。
-//
-// Origin/Host 白名单演示：无 Origin/匹配 Host 的 POST 放行；`-D` Origin 白名单
-// 为空时任何带 Origin 的请求 → 403（浏览器默认拒绝），curl 不带 Origin 不受影响。
-
+/**
+ * MCP Streamable HTTP 可运行示例 server。
+ *
+ * 这是什么：一个最小但真实可跑的 MCP over HTTP 示例，演示 bbtools-infra
+ * 公共面的完整生命周期与 Streamable HTTP transport：
+ *
+ *   GlobalConfig/Scheduler 启动共享协程运行时
+ *   → McpServer::Create → 注册 resource/prompt → Start 冻结快照
+ *   → net::Engine 装配 + McpHttpTransport::Create → engine->Run（监听 127.0.0.1）
+ *   → transport->Start → 打印 http://127.0.0.1:<port>/mcp
+ *   → 主线程等 SIGINT/SIGTERM
+ *   → 按契约同步收口：StopAccepting → Drain → Close → WaitStopped
+ *   → server->Close()（core 生命周期由业务决定，transport 不代管）
+ *
+ * 门禁与 wire：POST /mcp only；Accept 双媒体；Origin/Host 白名单；modern 三件套
+ * 路由头（含 base64 sentinel）；JSON 响应 / subscriptions/listen SSE /
+ * 通知 202 / 非 /mcp 404 / 非 POST 405。
+ *
+ * 怎么跑：
+ *   $ ./Example_mcp_http_server --http
+ *   → 打印 mcp-example: listening http://127.0.0.1:<port>/mcp
+ *   再用官方 Python SDK 2.3.0 的 streamable_http_client 连接（见 VERIFY interop），
+ *   或 curl 手工 POST。
+ *
+ * Origin/Host 白名单演示：无 Origin/匹配 Host 的 POST 放行；`-D` Origin 白名单
+ * 为空时任何带 Origin 的请求 → 403（浏览器默认拒绝），curl 不带 Origin 不受影响。
+ */
 #include <atomic>
 #include <csignal>
 #include <cstdio>
@@ -47,13 +48,14 @@
 namespace {
 
 volatile std::sig_atomic_t g_stop = 0;
+
 void OnStopSignal(int)
 {
     g_stop = 1;
 }
 
-bbt::infra::result<bbt::infra::mcp::ResourceResult> EchoResource(const bbt::infra::mcp::RequestContext&,
-                                                                 const std::string& uri)
+bbt::infra::result<bbt::infra::mcp::ResourceResult>
+EchoResource(const bbt::infra::mcp::RequestContext&, const std::string& uri)
 {
     auto content = bbt::infra::mcp::ResourceContents::Text(uri, "text/plain", "echo:" + uri);
     if (!content)
@@ -63,8 +65,8 @@ bbt::infra::result<bbt::infra::mcp::ResourceResult> EchoResource(const bbt::infr
     return bbt::infra::result<bbt::infra::mcp::ResourceResult>::ok(std::move(out));
 }
 
-bbt::infra::result<bbt::infra::mcp::PromptResult> EchoPrompt(const bbt::infra::mcp::RequestContext&,
-                                                             const bbt::infra::mcp::JsonValue& arguments)
+bbt::infra::result<bbt::infra::mcp::PromptResult>
+EchoPrompt(const bbt::infra::mcp::RequestContext&, const bbt::infra::mcp::JsonValue& arguments)
 {
     std::string text = "你好";
     if (arguments.IsObject()) {
@@ -86,11 +88,15 @@ bbt::infra::result<bbt::infra::mcp::PromptResult> EchoPrompt(const bbt::infra::m
 
 void PrintUsage(std::FILE* out)
 {
-    std::fprintf(out, "用法：Example_mcp_http_server --http\n"
-                      "  --http  POST /mcp Streamable HTTP（127.0.0.1 随机端口）\n");
+    std::fprintf(
+        out,
+        "用法：Example_mcp_http_server --http\n"
+        "  --http  POST /mcp Streamable HTTP（127.0.0.1 随机端口）\n");
 }
 
-} // namespace
+// clang-format off
+}
+// clang-format on
 
 int main(int argc, char** argv)
 {
@@ -146,8 +152,11 @@ int main(int argc, char** argv)
 
     auto engine = bbt::infra::net::Engine::Create(std::shared_ptr<bbt::infra::net::RawHandler>{});
     bbt::infra::mcp::McpHttpOptions http_options;
-    // loopback-only：Host/Origin 白名单覆盖本机；非 loopback 部署经外层反代
-    // 改 allowed_hosts（鉴权在 infra 之上）。
+
+    /**
+     * loopback-only：Host/Origin 白名单覆盖本机；非 loopback 部署经外层反代
+     * 改 allowed_hosts（鉴权在 infra 之上）。
+     */
     http_options.allowed_hosts = {"127.0.0.1", "localhost"};
     auto made_transport = bbt::infra::mcp::McpHttpTransport::Create(server, engine, std::move(http_options));
     if (!made_transport) {
@@ -186,8 +195,10 @@ int main(int argc, char** argv)
     }
     std::fprintf(stderr, "mcp-example: listening http://127.0.0.1:%u/mcp\n", addresses.front().Port());
 
-    // 演示发布入口：每 2s 发一次 mem://echo 的资源变更，给 SSE 订阅流一个真实
-    // 事件源（PublishResourceChanged 是公共面显式发布入口）。
+    /**
+     * 演示发布入口：每 2s 发一次 mem://echo 的资源变更，给 SSE 订阅流一个真实
+     * 事件源（PublishResourceChanged 是公共面显式发布入口）。
+     */
     std::atomic<bool> publish_run{true};
     std::thread publisher([&] {
         while (publish_run.load()) {
@@ -203,14 +214,12 @@ int main(int argc, char** argv)
     publish_run.store(false);
     publisher.join();
 
-    transport->StopAccepting();
-    const auto drained = transport->Drain(std::chrono::steady_clock::now() + std::chrono::seconds{3});
-    transport->Close();
-    const auto stopped = transport->WaitStopped(std::chrono::steady_clock::now() + std::chrono::seconds{3});
-    std::fprintf(stderr, "mcp-example: http stopped drain=%d stopped=%d\n", static_cast<bool>(drained),
-                 static_cast<bool>(stopped));
-    server->Close();
-    engine->RequestClose();
+    auto close_options = bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::seconds{3});
+    close_options.wait_release = true;
+    const auto stopped = transport->Close(close_options);
+    std::fprintf(stderr, "mcp-example: http stopped=%d\n", static_cast<bool>(stopped));
+    (void)server->Close();
+    (void)engine->Close();
     runner.join();
     return 0;
 }

@@ -2,12 +2,20 @@
 
 namespace bbt::infra::net {
 
-ConnectionState::ConnectionState(std::uint64_t id, std::size_t inbound_max, std::size_t outbound_max,
-                                 std::size_t max_ops, std::shared_ptr<std::atomic<bool>> service_sealed,
-                                 std::shared_ptr<ReclaimRecord> owner_released)
-    : m_id(id), ring(inbound_max), m_queue(std::min<std::size_t>(outbound_max, 64 * 1024), outbound_max, max_ops),
-      m_outbound_max(outbound_max), m_max_ops(max_ops), m_service_sealed(std::move(service_sealed)),
-      m_owner_released(owner_released ? std::move(owner_released) : std::make_shared<ReclaimRecord>(true))
+ConnectionState::ConnectionState(
+    std::uint64_t id,
+    std::size_t inbound_max,
+    std::size_t outbound_max,
+    std::size_t max_ops,
+    std::shared_ptr<std::atomic<bool>> service_sealed,
+    std::shared_ptr<ReclaimRecord> owner_released)
+    : m_id(id)
+    , ring(inbound_max)
+    , m_queue(std::min<std::size_t>(outbound_max, 64 * 1024), outbound_max, max_ops)
+    , m_outbound_max(outbound_max)
+    , m_max_ops(max_ops)
+    , m_service_sealed(std::move(service_sealed))
+    , m_owner_released(owner_released ? std::move(owner_released) : std::make_shared<ReclaimRecord>(true))
 {
     m_pending_terminal.set_capacity(std::max<std::size_t>(1, max_ops));
 }
@@ -19,7 +27,11 @@ std::error_code ConnectionState::AcceptWrite(std::string data, std::shared_ptr<W
     }
     std::unique_lock<std::mutex> lock(m_write_mutex);
     if (m_close_requested) {
-        return make_error_code(NetErrc::Closed); // 关闭意图从首次请求起永久拒绝
+
+        /**
+         * 关闭意图从首次请求起永久拒绝
+         */
+        return make_error_code(NetErrc::Closed);
     }
     if (m_acceptance == AcceptanceState::Closed) {
         return make_error_code(NetErrc::Closed);
@@ -27,7 +39,10 @@ std::error_code ConnectionState::AcceptWrite(std::string data, std::shared_ptr<W
     if (m_acceptance == AcceptanceState::Settling) {
         return make_error_code(NetErrc::WriteSettling);
     }
-    // 普通 + 零长 + 已终结未派发合计责任上限。
+
+    /**
+     * 普通 + 零长 + 已终结未派发合计责任上限。
+     */
     if (m_ops.size() + PendingCountLocked() >= m_max_ops) {
         return std::make_error_code(std::errc::no_buffer_space);
     }
@@ -60,7 +75,11 @@ std::error_code ConnectionState::AcceptWrite(std::string data, std::shared_ptr<W
         record->id = m_next_op++;
         record->total = bytes;
         record->remaining = bytes;
-        m_ops.push_back(record); // 先占活动责任，再接纳字节
+
+        /**
+         * 先占活动责任，再接纳字节
+         */
+        m_ops.push_back(record);
     } catch (...) {
         return std::make_error_code(std::errc::not_enough_memory);
     }
@@ -71,7 +90,11 @@ std::error_code ConnectionState::AcceptWrite(std::string data, std::shared_ptr<W
         append_error = std::make_error_code(std::errc::not_enough_memory);
     }
     if (append_error) {
-        m_ops.pop_back(); // 事务撤销：没有字节入队，记录未发布
+
+        /**
+         * 事务撤销：没有字节入队，记录未发布
+         */
+        m_ops.pop_back();
         return append_error;
     }
     out = std::move(record);
@@ -136,10 +159,17 @@ void ConnectionState::RequestClose(std::error_code reason)
     {
         std::lock_guard<std::mutex> lock(m_write_mutex);
         if (m_read_closed_published) {
-            return; // 最终关闭后保留已经发布的原因
+
+            /**
+             * 最终关闭后保留已经发布的原因
+             */
+            return;
         }
         if (!m_close_requested) {
-            // 首次请求：即使 reason 默认 {} 也固定为首请求 reason，后续不覆盖。
+
+            /**
+             * 首次请求：即使 reason 默认 {} 也固定为首请求 reason，后续不覆盖。
+             */
             m_close_requested = true;
             m_close_reason = reason;
         }
@@ -147,8 +177,11 @@ void ConnectionState::RequestClose(std::error_code reason)
             m_acceptance = AcceptanceState::Settling;
         }
     }
-    // 无 owner 的独立 state（detail 单测/无后端）没有 hold/stage 责任，
-    // 直接发布最终 closed；Engine 连接由 owner 在 stage 后发布。
+
+    /**
+     * 无 owner 的独立 state（detail 单测/无后端）没有 hold/stage 责任，
+     * 直接发布最终 closed；Engine 连接由 owner 在 stage 后发布。
+     */
     if (!owner_dirty) {
         MarkClosed(reason);
         return;
@@ -159,7 +192,11 @@ void ConnectionState::RequestClose(std::error_code reason)
 bool ConnectionState::CloseRequested()
 {
     std::lock_guard<std::mutex> lock(m_write_mutex);
-    return m_close_requested; // 持久 intent，不被写结算暂态清除
+
+    /**
+     * 持久 intent，不被写结算暂态清除
+     */
+    return m_close_requested;
 }
 
 void ConnectionState::MarkClosed(std::error_code reason)
@@ -172,14 +209,21 @@ void ConnectionState::MarkClosed(std::error_code reason)
             return;
         }
         if (m_close_requested) {
-            reason = m_close_reason; // owner 发布不能替换首次请求原因
+
+            /**
+             * owner 发布不能替换首次请求原因
+             */
+            reason = m_close_reason;
         } else {
             m_close_reason = reason;
         }
         m_close_requested = true;
-        // 未发完写必须以 Done+非空错误结算：默认空 reason 只描述关闭
-        // 意图，不能让未完整发送的写冒充本地成功（已完成写早已带着
-        // 空错误进 m_pending_terminal，不受此影响）。
+
+        /**
+         * 未发完写必须以 Done+非空错误结算：默认空 reason 只描述关闭
+         * 意图，不能让未完整发送的写冒充本地成功（已完成写早已带着
+         * 空错误进 m_pending_terminal，不受此影响）。
+         */
         const std::error_code settle = reason ? reason : std::make_error_code(std::errc::operation_canceled);
         bool settled_any = false;
         while (!m_ops.empty()) {
@@ -193,12 +237,18 @@ void ConnectionState::MarkClosed(std::error_code reason)
             m_ops.pop_front();
             settled_any = true;
         }
-        // 所有已接纳责任结算后才发布 Closed；若中途异常可重入继续。
+
+        /**
+         * 所有已接纳责任结算后才发布 Closed；若中途异常可重入继续。
+         */
         m_acceptance = AcceptanceState::Closed;
         if (m_queue.TotalBytes() != 0) {
             m_queue.ConsumeSent(m_queue.TotalBytes());
         }
-        // 没有新写被结算时，关闭不能抹去此前的发送错误；fire 调用者仍需查询失败事实。
+
+        /**
+         * 没有新写被结算时，关闭不能抹去此前的发送错误；fire 调用者仍需查询失败事实。
+         */
         if (settled_any || !m_last_error) {
             m_last_error = settled_any ? settle : reason;
         }
@@ -206,7 +256,11 @@ void ConnectionState::MarkClosed(std::error_code reason)
         publish_read_closed = !m_read_closed_published;
     }
     if (publish_read_closed) {
-        ring.MarkClosed(); // 即使 acceptance 已因 sealed 写失败置 Closed，也要发布读 EOF
+
+        /**
+         * 即使 acceptance 已因 sealed 写失败置 Closed，也要发布读 EOF
+         */
+        ring.MarkClosed();
         std::lock_guard<std::mutex> lock(m_write_mutex);
         m_read_closed_published = true;
     }
@@ -344,8 +398,11 @@ void ConnectionState::FailCurrentLocked(std::error_code error)
     if (m_queue.TotalBytes() != 0) {
         m_queue.ConsumeSent(m_queue.TotalBytes());
     }
-    // 有关闭意图时保持 Settling，等 owner stage 后发布最终终态；普通 I/O
-    // 错误只结算写责任，不升级为自动关闭。
+
+    /**
+     * 有关闭意图时保持 Settling，等 owner stage 后发布最终终态；普通 I/O
+     * 错误只结算写责任，不升级为自动关闭。
+     */
     if (!m_close_requested) {
         const bool sealed = m_service_sealed && m_service_sealed->load(std::memory_order_acquire);
         m_acceptance = sealed ? AcceptanceState::Closed : AcceptanceState::Open;
@@ -377,4 +434,6 @@ std::shared_ptr<bbt::coroutine::sync::CoWaiter> ConnectionState::RegisterReadWai
     return ring.RegisterWaiter();
 }
 
-} // namespace bbt::infra::net
+// clang-format off
+}
+// clang-format on

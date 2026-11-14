@@ -7,7 +7,6 @@
  * 这些值的语义与成员含义属于公共契约。它们不放在 detail 中，是为了让公共头不必间接暴露
  * 接收环的布局或内部枚举的位置；内部存储、通知与游标策略不属于契约，调用方不应依赖。
  */
-
 #include <cstddef>
 #include <system_error>
 
@@ -23,11 +22,25 @@ namespace bbt::infra::net {
  */
 enum class ReadStatus { Ok, Busy, WouldBlock, Eof, Error };
 
-/** @brief TryRead 的结果。 */
+/**
+ * @brief TryRead 的结果。
+ */
 struct ReadResult {
-    ReadStatus status{ReadStatus::WouldBlock}; ///< 结果状态
-    std::size_t bytes{0};                      ///< Ok 时本次复制并消费的字节数
-    std::error_code error;                     ///< 持久错误原因，仅 Error 状态有意义
+
+    /**
+     * 结果状态
+     */
+    ReadStatus status{ReadStatus::WouldBlock};
+
+    /**
+     * Ok 时本次复制并消费的字节数
+     */
+    std::size_t bytes{0};
+
+    /**
+     * 持久错误原因，仅 Error 状态有意义
+     */
+    std::error_code error;
 };
 
 /**
@@ -47,9 +60,21 @@ enum class WritePhase { InFlight, Done, Rejected, Unknown };
  * 这是采样值，表示返回那一刻的状态；调用返回时操作未必仍在途。
  */
 struct WriteOutcome {
-    WritePhase phase{WritePhase::Unknown}; ///< 采样时的阶段
-    std::size_t sent{0};                   ///< 该操作实际交给内核的字节前缀
-    std::error_code error;                 ///< 该操作的真实错误
+
+    /**
+     * 采样时的阶段
+     */
+    WritePhase phase{WritePhase::Unknown};
+
+    /**
+     * 该操作实际交给内核的字节前缀
+     */
+    std::size_t sent{0};
+
+    /**
+     * 该操作的真实错误
+     */
+    std::error_code error;
 };
 
 /**
@@ -61,4 +86,6 @@ struct WriteOutcome {
  */
 enum class AcceptanceState { Open, Settling, Closed };
 
-} // namespace bbt::infra::net
+// clang-format off
+}
+// clang-format on

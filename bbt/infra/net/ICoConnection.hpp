@@ -1,4 +1,5 @@
 #pragma once
+#include <bbt/infra/CloseOptions.hpp>
 
 /**
  * @file ICoConnection.hpp
@@ -21,10 +22,9 @@
  * 物理回收由 IsReleased 体现。
  *
  * 生命周期：ICoConnection 是接口，其实现（如 CoTcpConnection）是值语义的视图。销毁视图不关闭
- * 连接；关闭由 RequestClose 发起，由 owner 完成物理收口。不自动为连接建业务协程，不自动关闭、
+ * 连接；关闭由 Close(Immediate) 发起，由 owner 完成物理收口。不自动为连接建业务协程，不自动关闭、
  * 重连或重发。
  */
-
 #include <cstdint>
 #include <string>
 #include <system_error>
@@ -48,14 +48,46 @@ namespace bbt::infra::net {
  * WaitClosed 或 IsReleased 进入终态；不能靠一次 Status 证明下一次操作必然成功。
  */
 struct ConnectionStatus {
-    bool valid{false};                              ///< 句柄是否持有效共享状态
-    std::size_t readable_bytes{0};                  ///< 库内已发布、尚未交付字节采样
-    bool read_eof{true};                            ///< 读方向已见 EOF（可与尾部字节共存）
-    std::error_code read_error;                     ///< 持久读错误（可与尾部字节共存）
-    AcceptanceState write{AcceptanceState::Closed}; ///< 写接纳状态真源采样
-    bool closed{true};                              ///< 逻辑关闭终态（acceptance Closed 或等价）
-    std::error_code close_reason;                   ///< 第一次请求原因固定（含默认空原因）
-    bool released{true};                            ///< fd 已关且 owner 本连接责任清理
+
+    /**
+     * 句柄是否持有效共享状态
+     */
+    bool valid{false};
+
+    /**
+     * 库内已发布、尚未交付字节采样
+     */
+    std::size_t readable_bytes{0};
+
+    /**
+     * 读方向已见 EOF（可与尾部字节共存）
+     */
+    bool read_eof{true};
+
+    /**
+     * 持久读错误（可与尾部字节共存）
+     */
+    std::error_code read_error;
+
+    /**
+     * 写接纳状态真源采样
+     */
+    AcceptanceState write{AcceptanceState::Closed};
+
+    /**
+     * 逻辑关闭终态（acceptance Closed 或等价）
+     */
+    bool closed{true};
+
+    /**
+     * 第一次请求原因固定（含默认空原因）
+     */
+    std::error_code close_reason;
+
+    /**
+     * fd 已关且 owner 本连接责任清理
+     */
+    bool released{true};
 };
 
 /**
@@ -67,16 +99,17 @@ class ICoConnection {
 public:
     virtual ~ICoConnection() = default;
 
-    // ---- 读：等待后复制消费，或短时只读查看 ----
     /**
+     * ---- 读：等待后复制消费，或短时只读查看 ----
      * @brief 等待并复制全部已发布的可读字节到调用方 Buffer，然后消费连接数据。
      *
      * 仅业务协程可调用，可挂起。先执行门禁，再访问数据或快路径。有数据时，原子取走线性化点上
      * 所有已发布的可读字节，复制到 out 后消费连接数据。Busy 或 WouldBlock 由内部等待处理。先交付尾部数据，
      * 耗尽后才返回 Eof 或 Error。options 只约束等待；超时、取消或内存不足都不消费数据，
-     * 也不会自动 RequestClose。
+     * 也不会自动 Close(Immediate)。
      */
     virtual std::error_code Read(Buffer& out, const bbt::coroutine::WaitOptions& options = {}) = 0;
+
     /**
      * @brief 等待读取并以 tuple 返回缓冲区和结果。
      *
@@ -87,8 +120,11 @@ public:
      */
     std::tuple<Buffer, std::error_code> Read(const bbt::coroutine::WaitOptions& options = {});
 
-    /// @brief 任意合法调用域；不等待、不校验协程上下文。
+    /**
+     * @brief 任意合法调用域；不等待、不校验协程上下文。
+     */
     virtual std::error_code TryRead(Buffer& out) = 0;
+
     /**
      * @brief 非等待读取并以 tuple 返回缓冲区和结果。
      *
@@ -96,11 +132,13 @@ public:
      */
     std::tuple<Buffer, std::error_code> TryRead();
 
-    /// @brief 非等待只读查看；不消费，不拥有底层存储，视图不可跨下一次 I/O 使用。
+    /**
+     * @brief 非等待只读查看；不消费，不拥有底层存储，视图不可跨下一次 I/O 使用。
+     */
     virtual ReadView View() = 0;
 
-    // ---- 写：非挂起提交 ----
     /**
+     * ---- 写：非挂起提交 ----
      * @brief 全量接纳或零接纳，不等待容量或发送完成。
      *
      * 任意合法调用域可用，不挂起。空错误只表示库已接纳，后续由 owner 发送；
@@ -110,8 +148,8 @@ public:
      */
     virtual std::error_code AsyncWrite(std::string data) = 0;
 
-    // ---- 写：协程组合等待 ----
     /**
+     * ---- 写：协程组合等待 ----
      * @brief 同一绝对 deadline 依次等待容量、接纳与本地完成，不等待业务回包。
      *
      * 仅业务协程可调用，可挂起。等容量失败时结果为 Rejected。接纳后即使等待结束，也返回 op 与
@@ -119,15 +157,15 @@ public:
      */
     virtual WriteReport Write(std::string data, const bbt::coroutine::WaitOptions& options = {}) = 0;
 
-    // ---- 关闭 ----
     /**
+     * ---- 关闭 ----
      * @brief 请求封口：拒绝新写并唤醒 owner，首次请求的 reason 被固定。
      *
      * 任意合法调用域可用，不挂起，幂等。不保证冲刷未发完的写；owner 结算这些写，保留已发出的
      * 前缀，不把未发完的写报告为成功。fd 与已收到的尾部数据由 owner 收口。析构与普通 I/O 错误
      * 不会隐式触发这一策略。
      */
-    virtual void RequestClose(std::error_code reason = {}) = 0;
+    virtual std::error_code Close(const CloseOptions& options = {}, std::error_code reason = {}) = 0;
 
     /**
      * @brief 等待 Status().closed 对应的既有谓词成立。
@@ -138,8 +176,8 @@ public:
      */
     virtual std::error_code WaitClosed(const bbt::coroutine::WaitOptions& options = {}) = 0;
 
-    // ---- 状态投影 ----
     /**
+     * ---- 状态投影 ----
      * @brief 返回连接状态独立副本，无网络探活副作用。
      *
      * 任意合法调用域可用，不挂起。返回值为独立副本，无需持锁使用。每个字段来自既有真源，读、写
@@ -147,22 +185,23 @@ public:
      */
     virtual ConnectionStatus Status() const = 0;
 
-    // 非虚便捷投影，不维护第二套标志；这些投影也不提供跨查询原子性。
-    /// @brief 是否持有效共享状态；等价于 Status().valid。
-    bool Valid() const
-    {
-        return Status().valid;
-    }
-    /// @brief 逻辑关闭终态；等价于 Status().closed。
-    bool IsClosed() const
-    {
-        return Status().closed;
-    }
-    /// @brief 物理资源是否已回收；等价于 Status().released。
-    bool IsReleased() const
-    {
-        return Status().released;
-    }
+    /**
+     * 非虚便捷投影，不维护第二套标志；这些投影也不提供跨查询原子性。
+     * @brief 是否持有效共享状态；等价于 Status().valid。
+     */
+    bool Valid() const { return Status().valid; }
+
+    /**
+     * @brief 逻辑关闭终态；等价于 Status().closed。
+     */
+    bool IsClosed() const { return Status().closed; }
+
+    /**
+     * @brief 物理资源是否已回收；等价于 Status().released。
+     */
+    bool IsReleased() const { return Status().released; }
 };
 
-} // namespace bbt::infra::net
+// clang-format off
+}
+// clang-format on

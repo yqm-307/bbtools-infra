@@ -1,7 +1,8 @@
-// rpc v2 wire 契约：SessionFrame profile 2 编解码、kind 字段存在性矩阵、
-// acceptance_requested presence、错误阶段、metadata/budget 上限、u32be 分帧
-// 上限与畸形报文拒绝（纯字节层验证，不连网络）。
-
+/**
+ * rpc v2 wire 契约：SessionFrame profile 2 编解码、kind 字段存在性矩阵、
+ * acceptance_requested presence、错误阶段、metadata/budget 上限、u32be 分帧
+ * 上限与畸形报文拒绝（纯字节层验证，不连网络）。
+ */
 #include <bbt/infra/rpc/SessionCodec.hpp>
 #include <bbt/infra/rpc/detail/RpcFrameProtocol.hpp>
 #include <bbt/infra/rpc/Options.hpp>
@@ -21,14 +22,20 @@ namespace rpc_v2_test {
 namespace {
 
 namespace rpc = bbt::infra::rpc;
-using namespace bbt::infra; // ErrorCode / MakeError / RequestPhase / result
-using rpc_net_test::ExpectCode;
-using rpc::SessionFrame;
-using rpc::FrameKind;
-using rpc::TrafficClass;
-using rpc::ReplyMode;
 
-// 标准合法帧模板：Send（带 message_id 与显式 acceptance_requested）。
+/**
+ * ErrorCode / MakeError / RequestPhase / result
+ */
+using namespace bbt::infra;
+using rpc::FrameKind;
+using rpc::ReplyMode;
+using rpc::SessionFrame;
+using rpc::TrafficClass;
+using rpc_net_test::ExpectCode;
+
+/**
+ * 标准合法帧模板：Send（带 message_id 与显式 acceptance_requested）。
+ */
 SessionFrame ValidSend()
 {
     SessionFrame f;
@@ -83,11 +90,15 @@ SessionFrame ValidHello()
     return f;
 }
 
-// ---- roundtrip --------------------------------------------------------------
-
+/**
+ * @name roundtrip @{
+ */
 void Roundtrip()
 {
-    // Send：acceptance_requested=true 显式保留 presence 与值。
+
+    /**
+     * Send：acceptance_requested=true 显式保留 presence 与值。
+     */
     {
         const auto send = ValidSend();
         auto bytes = rpc::EncodeSessionFrame(send);
@@ -106,7 +117,10 @@ void Roundtrip()
         CHECK(*d.acceptance_requested == true);
         CHECK(!d.has_outcome);
     }
-    // Send acceptance_requested=false：presence 显式 false ≠ 缺席。
+
+    /**
+     * Send acceptance_requested=false：presence 显式 false ≠ 缺席。
+     */
     {
         auto send = ValidSend();
         send.acceptance_requested = false;
@@ -117,7 +131,10 @@ void Roundtrip()
         CHECK(back.value().acceptance_requested.has_value());
         CHECK(*back.value().acceptance_requested == false);
     }
-    // Send 无 acceptance_requested：presence 缺席保留 nullopt。
+
+    /**
+     * Send 无 acceptance_requested：presence 缺席保留 nullopt。
+     */
     {
         auto send = ValidSend();
         send.acceptance_requested = std::nullopt;
@@ -126,7 +143,10 @@ void Roundtrip()
         auto back = rpc::DecodeSessionFrame(bytes.value());
         CHECK(back && !back.value().acceptance_requested.has_value());
     }
-    // Call 往返：reply Required、schema/budget/ordering 保留。
+
+    /**
+     * Call 往返：reply Required、schema/budget/ordering 保留。
+     */
     {
         auto call = ValidCall();
         call.sequence = 3;
@@ -142,7 +162,10 @@ void Roundtrip()
         CHECK(d.request_schema == "bbt.rpc.positional/v1");
         CHECK(d.remaining_budget_ms == 1000);
     }
-    // Response 成功分支：outcome=success=true 保留。
+
+    /**
+     * Response 成功分支：outcome=success=true 保留。
+     */
     {
         auto resp = ValidResponse();
         auto bytes = rpc::EncodeSessionFrame(resp);
@@ -150,7 +173,10 @@ void Roundtrip()
         auto back = rpc::DecodeSessionFrame(bytes.value());
         CHECK(back && back.value().has_outcome && back.value().success);
     }
-    // Response 错误分支：Error 全字段 + request_phase 保留。
+
+    /**
+     * Response 错误分支：Error 全字段 + request_phase 保留。
+     */
     {
         auto resp = ValidResponse();
         resp.success = false;
@@ -158,7 +184,11 @@ void Roundtrip()
         resp.error.domain = "framework.actor";
         resp.error.domain_code = "svc.x";
         resp.error.backend_category = "echo";
-        resp.error.backend_code = -7; // int32 two's-complement 编码须保留负值
+
+        /**
+         * int32 two's-complement 编码须保留负值
+         */
+        resp.error.backend_code = -7;
         resp.error.transferred_bytes = 9;
         resp.error.details = {{"route.key", "a/b"}};
         resp.error.request_phase = RequestPhase::RequestCommitted;
@@ -174,7 +204,10 @@ void Roundtrip()
         CHECK(e.details.size() == 1 && e.details[0].first == "route.key");
         CHECK(e.request_phase.has_value() && *e.request_phase == RequestPhase::RequestCommitted);
     }
-    // Response 无 request_phase：nullopt 保留，不补成未提交。
+
+    /**
+     * Response 无 request_phase：nullopt 保留，不补成未提交。
+     */
     {
         auto resp = ValidResponse();
         resp.success = false;
@@ -184,17 +217,24 @@ void Roundtrip()
         auto back = rpc::DecodeSessionFrame(bytes.value());
         CHECK(back && !back.value().error.request_phase.has_value());
     }
-    // Hello：peer_identity/connection_nonce 保留。
+
+    /**
+     * Hello：peer_identity/connection_nonce 保留。
+     */
     {
         auto hello = ValidHello();
         auto bytes = rpc::EncodeSessionFrame(hello);
         CHECK(bytes);
         auto back = rpc::DecodeSessionFrame(bytes.value());
         CHECK(back);
-        CHECK(back.value().peer_identity == "app-a" && back.value().connection_nonce == 42
-              && back.value().session_epoch == 1);
+        CHECK(
+            back.value().peer_identity == "app-a" && back.value().connection_nonce == 42
+            && back.value().session_epoch == 1);
     }
-    // SendAccepted：outcome + message_id；无 request_id。
+
+    /**
+     * SendAccepted：outcome + message_id；无 request_id。
+     */
     {
         SessionFrame sa;
         sa.kind = FrameKind::SendAccepted;
@@ -209,8 +249,11 @@ void Roundtrip()
         CHECK(back && back.value().has_outcome && back.value().success);
         CHECK(back.value().message_id == "msg-1");
     }
-    // Request/Response 值层互转：Call → frame → Request 字段不丢失，
-    // RequestContext 经 detail 接缝填充后读回。
+
+    /**
+     * Request/Response 值层互转：Call → frame → Request 字段不丢失，
+     * RequestContext 经 detail 接缝填充后读回。
+     */
     {
         rpc::Request req;
         req.SetService("echo")
@@ -230,10 +273,14 @@ void Roundtrip()
         ctx.peer_principal = "svc@cluster";
         auto back = rpc::RequestFromSessionFrame(f.value(), ctx);
         CHECK(back);
-        CHECK(back.value().RequestId() == "r-1" && back.value().Sequence() == 5
-              && back.value().Context().peer_identity == "peer-b"
-              && back.value().Context().peer_principal == "svc@cluster");
-        // Response 互转。
+        CHECK(
+            back.value().RequestId() == "r-1" && back.value().Sequence() == 5
+            && back.value().Context().peer_identity == "peer-b"
+            && back.value().Context().peer_principal == "svc@cluster");
+
+        /**
+         * Response 互转。
+         */
         rpc::Response resp;
         resp.SetRequestId("r-1")
             .SetService("echo")
@@ -248,12 +295,17 @@ void Roundtrip()
     }
 }
 
-// ---- 非法值（编码端） ---------------------------------------------------------
-
+/**
+ * @}
+ * @name 非法值（编码端） @{
+ */
 void Reject()
 {
     const auto valid = ValidCall();
-    // frame_kind：Unspecified/未知本地值。
+
+    /**
+     * frame_kind：Unspecified/未知本地值。
+     */
     {
         auto f = valid;
         f.kind = FrameKind::Unspecified;
@@ -261,7 +313,10 @@ void Reject()
         f.kind = static_cast<FrameKind>(99);
         ExpectCode(rpc::EncodeSessionFrame(f), ErrorCode::ProtocolError);
     }
-    // traffic：数据帧用 System / 控制帧用非 System。
+
+    /**
+     * traffic：数据帧用 System / 控制帧用非 System。
+     */
     {
         auto f = valid;
         f.traffic = TrafficClass::System;
@@ -270,7 +325,10 @@ void Reject()
         h.traffic = TrafficClass::Service;
         ExpectCode(rpc::EncodeSessionFrame(h), ErrorCode::InvalidArgument);
     }
-    // reply_mode：Call 非 Required / Send 非 None。
+
+    /**
+     * reply_mode：Call 非 Required / Send 非 None。
+     */
     {
         auto f = valid;
         f.reply = ReplyMode::None;
@@ -279,7 +337,10 @@ void Reject()
         s.reply = ReplyMode::Required;
         ExpectCode(rpc::EncodeSessionFrame(s), ErrorCode::InvalidArgument);
     }
-    // acceptance_requested 出现在非 Send。
+
+    /**
+     * acceptance_requested 出现在非 Send。
+     */
     {
         auto f = valid;
         f.acceptance_requested = true;
@@ -291,7 +352,10 @@ void Reject()
         h.acceptance_requested = true;
         ExpectCode(rpc::EncodeSessionFrame(h), ErrorCode::InvalidArgument);
     }
-    // outcome：请求帧携带 / 响应帧缺席。
+
+    /**
+     * outcome：请求帧携带 / 响应帧缺席。
+     */
     {
         auto f = valid;
         f.has_outcome = true;
@@ -301,7 +365,10 @@ void Reject()
         r.has_outcome = false;
         ExpectCode(rpc::EncodeSessionFrame(r), ErrorCode::InvalidArgument);
     }
-    // peer_identity / connection_nonce：非握手帧携带、握手帧缺失。
+
+    /**
+     * peer_identity / connection_nonce：非握手帧携带、握手帧缺失。
+     */
     {
         auto f = valid;
         f.peer_identity = "x";
@@ -316,7 +383,10 @@ void Reject()
         f.connection_nonce = 1;
         ExpectCode(rpc::EncodeSessionFrame(f), ErrorCode::InvalidArgument);
     }
-    // session_epoch：数据帧/握手帧 0。
+
+    /**
+     * session_epoch：数据帧/握手帧 0。
+     */
     {
         auto f = valid;
         f.session_epoch = 0;
@@ -325,7 +395,10 @@ void Reject()
         h.session_epoch = 0;
         ExpectCode(rpc::EncodeSessionFrame(h), ErrorCode::InvalidArgument);
     }
-    // message_id：Send 缺、超长；非 Send 携带。
+
+    /**
+     * message_id：Send 缺、超长；非 Send 携带。
+     */
     {
         auto s = ValidSend();
         s.message_id.clear();
@@ -337,13 +410,19 @@ void Reject()
         f.message_id = "m";
         ExpectCode(rpc::EncodeSessionFrame(f), ErrorCode::InvalidArgument);
     }
-    // request_id：Call 缺失。
+
+    /**
+     * request_id：Call 缺失。
+     */
     {
         auto f = valid;
         f.request_id.clear();
         ExpectCode(rpc::EncodeSessionFrame(f), ErrorCode::InvalidArgument);
     }
-    // budget：Call/Send 0 或越界；控制帧非零。
+
+    /**
+     * budget：Call/Send 0 或越界；控制帧非零。
+     */
     {
         auto f = valid;
         f.remaining_budget_ms = 0;
@@ -355,7 +434,10 @@ void Reject()
         h.remaining_budget_ms = 1;
         ExpectCode(rpc::EncodeSessionFrame(h), ErrorCode::InvalidArgument);
     }
-    // ordering：seq>0 无 key / seq=0 带 key / key 超长。
+
+    /**
+     * ordering：seq>0 无 key / seq=0 带 key / key 超长。
+     */
     {
         auto f = valid;
         f.sequence = 9;
@@ -370,7 +452,10 @@ void Reject()
         f.ordering_key = std::string(rpc::kRpcV2MaxOrderingKeyBytes + 1, 'k');
         ExpectCode(rpc::EncodeSessionFrame(f), ErrorCode::InvalidArgument);
     }
-    // schema：Call 缺失。
+
+    /**
+     * schema：Call 缺失。
+     */
     {
         auto f = valid;
         f.request_schema.clear();
@@ -379,7 +464,10 @@ void Reject()
         f.response_schema.clear();
         ExpectCode(rpc::EncodeSessionFrame(f), ErrorCode::InvalidArgument);
     }
-    // metadata：未注册前缀 / 重复键 / 条数超限。
+
+    /**
+     * metadata：未注册前缀 / 重复键 / 条数超限。
+     */
     {
         auto f = valid;
         f.metadata = {{"user.k", "v"}};
@@ -392,7 +480,10 @@ void Reject()
             f.metadata.push_back({"route.k" + std::to_string(i), "v"});
         ExpectCode(rpc::EncodeSessionFrame(f), ErrorCode::ProtocolError);
     }
-    // error.details 结构违规保持 ProtocolError。
+
+    /**
+     * error.details 结构违规保持 ProtocolError。
+     */
     {
         auto r = ValidResponse();
         r.success = false;
@@ -400,7 +491,10 @@ void Reject()
         r.error.details = {{"a", "1"}, {"a", "2"}};
         ExpectCode(rpc::EncodeSessionFrame(r), ErrorCode::ProtocolError);
     }
-    // 非法本地 request_phase：编码端 ProtocolError。
+
+    /**
+     * 非法本地 request_phase：编码端 ProtocolError。
+     */
     {
         auto r = ValidResponse();
         r.success = false;
@@ -410,28 +504,38 @@ void Reject()
     }
 }
 
-// ---- 解码端负用例 -------------------------------------------------------------
-
+/**
+ * @}
+ * @name 解码端负用例 @{
+ */
 void Malformed()
 {
     const auto valid = ValidCall();
     auto good_bytes = rpc::EncodeSessionFrame(valid);
     CHECK(good_bytes);
 
-    // 空字节/垃圾字节：ProtocolError。
+    /**
+     * 空字节/垃圾字节：ProtocolError。
+     */
     ExpectCode(rpc::DecodeSessionFrame(std::vector<std::uint8_t>{}), ErrorCode::ProtocolError);
     {
         std::vector<std::uint8_t> garbage{0xff, 0xff, 0x0a};
         ExpectCode(rpc::DecodeSessionFrame(garbage), ErrorCode::ProtocolError);
     }
-    // 截断帧：不再整体解出。
+
+    /**
+     * 截断帧：不再整体解出。
+     */
     {
         auto bytes = good_bytes.value();
         bytes.pop_back();
         bytes.pop_back();
         CHECK(!rpc::DecodeSessionFrame(bytes));
     }
-    // profile_version 非 2：field1 varint 3（tag 0x08 值 0x03）。
+
+    /**
+     * profile_version 非 2：field1 varint 3（tag 0x08 值 0x03）。
+     */
     {
         auto bytes = good_bytes.value();
         bool patched = false;
@@ -445,7 +549,10 @@ void Malformed()
         CHECK(patched);
         ExpectCode(rpc::DecodeSessionFrame(bytes), ErrorCode::ProtocolError);
     }
-    // 未知 frame_kind：field2 varint 99（tag 0x10 值 0x63）。
+
+    /**
+     * 未知 frame_kind：field2 varint 99（tag 0x10 值 0x63）。
+     */
     {
         auto bytes = good_bytes.value();
         bool patched = false;
@@ -459,7 +566,10 @@ void Malformed()
         CHECK(patched);
         ExpectCode(rpc::DecodeSessionFrame(bytes), ErrorCode::ProtocolError);
     }
-    // acceptance_requested 出现在 Call：field21 varint 1（tag 0xA8 0x01 值 0x01）。
+
+    /**
+     * acceptance_requested 出现在 Call：field21 varint 1（tag 0xA8 0x01 值 0x01）。
+     */
     {
         auto bytes = good_bytes.value();
         bytes.push_back(0xA8);
@@ -467,8 +577,11 @@ void Malformed()
         bytes.push_back(0x01);
         ExpectCode(rpc::DecodeSessionFrame(bytes), ErrorCode::ProtocolError);
     }
-    // Call 无 outcome（合法帧按 Call 解码无 outcome）——改成 Response kind
-    // 后必须拒绝（Response 要求 outcome）：field2 值 3→4。
+
+    /**
+     * Call 无 outcome（合法帧按 Call 解码无 outcome）——改成 Response kind
+     * 后必须拒绝（Response 要求 outcome）：field2 值 3→4。
+     */
     {
         auto bytes = good_bytes.value();
         for (std::size_t i = 0; i + 1 < bytes.size(); ++i) {
@@ -479,17 +592,60 @@ void Malformed()
         }
         ExpectCode(rpc::DecodeSessionFrame(bytes), ErrorCode::ProtocolError);
     }
-    // 未知 request_phase：嵌套 error{code=NOT_FOUND, request_phase=99} 装在
-    // Response 上（field19 LEN 子消息），按枚举矩阵拒绝。
+
+    /**
+     * 未知 request_phase：嵌套 error{code=NOT_FOUND, request_phase=99} 装在
+     * Response 上（field19 LEN 子消息），按枚举矩阵拒绝。
+     */
     {
         std::vector<std::uint8_t> bad = {
-            0x08, 0x02, 0x10, 0x04, 0x18, 0x01, 0x28, 0x07, 0x3A, 0x01, 'r', 0x42, 0x01, 's',
-            0x4A, 0x01, 'm',  0x50, 0x01, 0x6A, 0x01, 'q',  0x72, 0x01, 'q', 0x9A, 0x01, 0x04, // error LEN=4
-            0x08, 0x0B, 0x48, 0x63, // code=NOT_FOUND, request_phase=99
+            0x08,
+            0x02,
+            0x10,
+            0x04,
+            0x18,
+            0x01,
+            0x28,
+            0x07,
+            0x3A,
+            0x01,
+            'r',
+            0x42,
+            0x01,
+            's',
+
+            /**
+             * error LEN=4
+             */
+            0x4A,
+            0x01,
+            'm',
+            0x50,
+            0x01,
+            0x6A,
+            0x01,
+            'q',
+            0x72,
+            0x01,
+            'q',
+            0x9A,
+            0x01,
+            0x04,
+
+            /**
+             * code=NOT_FOUND, request_phase=99
+             */
+            0x08,
+            0x0B,
+            0x48,
+            0x63,
         };
         ExpectCode(rpc::DecodeSessionFrame(bad), ErrorCode::ProtocolError);
     }
-    // 未知字段忽略：末尾追加 field 200 varint。
+
+    /**
+     * 未知字段忽略：末尾追加 field 200 varint。
+     */
     {
         auto bytes = good_bytes.value();
         bytes.push_back(0xC0);
@@ -500,19 +656,27 @@ void Malformed()
     }
 }
 
-// ---- 分帧（u32be） ------------------------------------------------------------
-
+/**
+ * @}
+ * @name 分帧（u32be） @{
+ */
 void Framing()
 {
     const auto valid = ValidSend();
-    // 前缀编解码：u32be 与逐字节移位一致。
+
+    /**
+     * 前缀编解码：u32be 与逐字节移位一致。
+     */
     {
         std::uint8_t pre[4];
         rpc::EncodeFramePrefix(0x01020304, pre);
         CHECK(pre[0] == 0x01 && pre[1] == 0x02 && pre[2] == 0x03 && pre[3] == 0x04);
         CHECK(rpc::DecodeFramePrefix(pre) == 0x01020304);
     }
-    // EncodeFramedSessionFrame：前缀==body 长度，decoder 一轮取回。
+
+    /**
+     * EncodeFramedSessionFrame：前缀==body 长度，decoder 一轮取回。
+     */
     {
         auto framed = rpc::EncodeFramedSessionFrame(valid);
         CHECK(framed && framed.value().size() > 4);
@@ -523,7 +687,10 @@ void Framing()
         CHECK(f && f.value().has_value());
         CHECK(f.value()->message_id == "msg-1");
     }
-    // 分片到达：前缀/body 任意切分后仍按完整帧解出（含 1 字节片）。
+
+    /**
+     * 分片到达：前缀/body 任意切分后仍按完整帧解出（含 1 字节片）。
+     */
     {
         auto framed = rpc::EncodeFramedSessionFrame(valid);
         CHECK(framed);
@@ -538,7 +705,10 @@ void Framing()
         }
         CHECK(got.has_value() && got->message_id == "msg-1");
     }
-    // 一次喂入多帧：按序取出。
+
+    /**
+     * 一次喂入多帧：按序取出。
+     */
     {
         auto a = rpc::EncodeFramedSessionFrame(ValidHello());
         auto b = rpc::EncodeFramedSessionFrame(valid);
@@ -554,36 +724,59 @@ void Framing()
         CHECK(f2 && f2.value().has_value() && f2.value()->kind == FrameKind::Send);
         CHECK(f3 && !f3.value().has_value());
     }
-    // 前缀 0：立即 ProtocolError，进入 terminal。
+
+    /**
+     * 前缀 0：立即 ProtocolError，进入 terminal。
+     */
     {
         rpc::SessionFrameDecoder dec;
         const std::uint8_t zero[4] = {0, 0, 0, 0};
         CHECK(dec.Feed(zero, 4));
         ExpectCode(dec.Next(), ErrorCode::ProtocolError);
         CHECK(dec.IsTerminal());
-        // terminal 后后续 Feed/Next 保持失败。
+
+        /**
+         * terminal 后后续 Feed/Next 保持失败。
+         */
         ExpectCode(dec.Feed(zero, 4), ErrorCode::ProtocolError);
         ExpectCode(dec.Next(), ErrorCode::ProtocolError);
     }
-    // 前缀超硬上限：Feed 读到完整前缀即拒绝，不必喂满 body。
+
+    /**
+     * 前缀超硬上限：Feed 读到完整前缀即拒绝，不必喂满 body。
+     */
     {
         rpc::SessionFrameDecoder dec;
         std::uint8_t pre[4];
-        rpc::EncodeFramePrefix(static_cast<std::uint32_t>(0xFFFFFFFFu), pre); // > 1GiB 硬上限
+
+        /**
+         * > 1GiB 硬上限
+         */
+        rpc::EncodeFramePrefix(static_cast<std::uint32_t>(0xFFFFFFFFu), pre);
         ExpectCode(dec.Feed(pre, 4), ErrorCode::ProtocolError);
         CHECK(dec.IsTerminal());
         ExpectCode(dec.Next(), ErrorCode::ProtocolError);
     }
-    // Hello 超 64KiB 握手上限：编码端 EncodeFramed 对超 kind 上限拒绝；
-    // 解码端握手态（默认 hello_phase）在**前缀阶段**即拒，不等 body 喂满
-    // （ADR §5.2：检查长度后才允许分配 body——F2）。
+
+    /**
+     * Hello 超 64KiB 握手上限：编码端 EncodeFramed 对超 kind 上限拒绝；
+     * 解码端握手态（默认 hello_phase）在**前缀阶段**即拒，不等 body 喂满
+     * （检查长度后才允许分配 body）。
+     */
     {
         rpc::SessionFrame big = ValidHello();
-        big.payload.assign(70000, 0xAB); // 合法 Hello 字段，仅尺寸超限
+
+        /**
+         * 合法 Hello 字段，仅尺寸超限
+         */
+        big.payload.assign(70000, 0xAB);
         ExpectCode(rpc::EncodeFramedSessionFrame(big, rpc::kRpcV2DefaultMaxFrameBytes), ErrorCode::InvalidArgument);
-        // 解码端：EncodeSessionFrame（无尺寸上限）拿到可解析 body，手工
-        // u32be 前缀喂给 hello_phase decoder——声明 70000 > min(8MiB,64KiB)
-        // → Feed 前缀即 ProtocolError 终态，无需喂 body。
+
+        /**
+         * 解码端：EncodeSessionFrame（无尺寸上限）拿到可解析 body，手工
+         * u32be 前缀喂给 hello_phase decoder——声明 70000 > min(8MiB,64KiB)
+         * → Feed 前缀即 ProtocolError 终态，无需喂 body。
+         */
         auto body = rpc::EncodeSessionFrame(big);
         CHECK(body && body.value().size() > rpc::kRpcV2HelloMaxFrameBytes);
         rpc::SessionFrameDecoder dec;
@@ -593,112 +786,231 @@ void Framing()
         CHECK(dec.IsTerminal());
         ExpectCode(dec.Next(), ErrorCode::ProtocolError);
     }
-    // 握手态前缀限额小额度即时拒绝：max=1024 → min(max,64KiB)=1024；
-    // 声明 2048 的帧前缀一到即拒（先于任何 body 复制），terminal 保持。
+
+    /**
+     * 握手态前缀限额小额度即时拒绝：max=1024 → min(max,64KiB)=1024；
+     * 声明 2048 的帧前缀一到即拒（先于任何 body 复制），terminal 保持。
+     */
     {
-        rpc::SessionFrameDecoder dec(/*max_frame_bytes=*/1024);
+
+        /**
+         * max_frame_bytes = 1024。
+         */
+        rpc::SessionFrameDecoder dec(1024);
         std::uint8_t pre[4];
         rpc::EncodeFramePrefix(2048, pre);
         ExpectCode(dec.Feed(pre, 4), ErrorCode::ProtocolError);
         CHECK(dec.IsTerminal());
         ExpectCode(dec.Next(), ErrorCode::ProtocolError);
     }
-    // F2：同批输入「4 字节前缀 + 超限 body」——body 字节不得先复制进
-    // 缓冲（ADR §5.2：检查长度后才允许分配 body）；拒绝后 PendingBytes
-    // 只剩合法前缀本身，terminal 保持。
-    // 总输入 2044 ≤ pending 上限 2052，故不会先撞 pending 总界——唯一能
-    // 区分「复制 body 前校验」与「整个 Feed 后校验」的路径。
+
+    /**
+     * 同批输入「4 字节前缀 + 超限 body」——body 字节不得先复制进
+     * 缓冲（ADR §5.2：检查长度后才允许分配 body）；拒绝后 PendingBytes
+     * 只剩合法前缀本身，terminal 保持。
+     * 总输入 2044 ≤ pending 上限 2052，故不会先撞 pending 总界——唯一能
+     * 区分「复制 body 前校验」与「整个 Feed 后校验」的路径。
+     */
     {
-        rpc::SessionFrameDecoder dec(/*max_frame_bytes=*/1024);
+
+        /**
+         * max_frame_bytes = 1024。
+         */
+        rpc::SessionFrameDecoder dec(1024);
         std::vector<std::uint8_t> input(4 + 2040, 0xEE);
-        rpc::EncodeFramePrefix(2048, input.data()); // 声明 2048 > 1024
+
+        /**
+         * 声明 2048 > 1024
+         */
+        rpc::EncodeFramePrefix(2048, input.data());
         ExpectCode(dec.Feed(input.data(), input.size()), ErrorCode::ProtocolError);
         CHECK(dec.IsTerminal());
-        // body 未复制：缓冲只剩 4 字节前缀，不是 2044。
+
+        /**
+         * body 未复制：缓冲只剩 4 字节前缀，不是 2044。
+         */
         CHECK(dec.PendingBytes() == 4);
         ExpectCode(dec.Next(), ErrorCode::ProtocolError);
     }
-    // F2：前缀拆 3+1 且第 4 字节与超限 body 同批——拼齐前缀即拒，
-    // body 仍不复制（PendingBytes 最终 4，不含同批 body）。
+
+    /**
+     * 前缀拆 3+1 且第 4 字节与超限 body 同批——拼齐前缀即拒，
+     * body 仍不复制（PendingBytes 最终 4，不含同批 body）。
+     */
     {
-        rpc::SessionFrameDecoder dec(/*max_frame_bytes=*/1024);
+
+        /**
+         * max_frame_bytes = 1024。
+         */
+        rpc::SessionFrameDecoder dec(1024);
         std::uint8_t pre[4];
         rpc::EncodeFramePrefix(2048, pre);
-        CHECK(dec.Feed(pre, 3)); // 先喂 3 字节
+
+        /**
+         * 先喂 3 字节
+         */
+        CHECK(dec.Feed(pre, 3));
         CHECK(dec.PendingBytes() == 3);
         std::vector<std::uint8_t> tail(1 + 2040, 0xDD);
-        tail[0] = pre[3]; // 第 4 字节 + body
+
+        /**
+         * 第 4 字节 + body
+         */
+        tail[0] = pre[3];
         ExpectCode(dec.Feed(tail.data(), tail.size()), ErrorCode::ProtocolError);
         CHECK(dec.IsTerminal());
-        CHECK(dec.PendingBytes() == 4); // body 未入缓冲
+
+        /**
+         * body 未入缓冲
+         */
+        CHECK(dec.PendingBytes() == 4);
         ExpectCode(dec.Next(), ErrorCode::ProtocolError);
     }
-    // F2 流水线：合法完整首帧尚未 Next 出队时，同批第二帧「前缀+超限 body」
-    // 同样先校验声明长度再复制 body——不依赖「不完整帧在缓冲头」之外假设；
-    // PendingBytes 只保留合法首帧 + 4B 第二帧前缀，body 字节不入缓冲。
-    // 数据阶段（SetHelloPhase(false)）帧限统一，尾随帧前缀可即时校验；
-    // 握手阶段完整帧后的余字节属未验证 stash，不在本用例范围。
+
+    /**
+     * 流水线：合法完整首帧尚未 Next 出队时，同批第二帧「前缀+超限 body」
+     * 同样先校验声明长度再复制 body——不依赖「不完整帧在缓冲头」之外假设；
+     * PendingBytes 只保留合法首帧 + 4B 第二帧前缀，body 字节不入缓冲。
+     * 数据阶段（SetHelloPhase(false)）帧限统一，尾随帧前缀可即时校验；
+     * 握手阶段完整帧后的余字节属未验证 stash，不在本用例范围。
+     */
     {
         auto first = rpc::EncodeFramedSessionFrame(valid, 4096);
         CHECK(first);
-        rpc::SessionFrameDecoder dec(/*max_frame_bytes=*/4096);
-        dec.SetHelloPhase(false); // 数据态：limit=4096
+
+        /**
+         * max_frame_bytes = 4096。
+         */
+        rpc::SessionFrameDecoder dec(4096);
+
+        /**
+         * 数据态：limit=4096
+         */
+        dec.SetHelloPhase(false);
         std::vector<std::uint8_t> stream(first.value());
-        const std::size_t base = stream.size(); // 首帧全长（前缀+body）
+
+        /**
+         * 首帧全长（前缀+body）
+         */
+        const std::size_t base = stream.size();
         stream.resize(base + 4 + 2040, 0xEE);
-        rpc::EncodeFramePrefix(8192, stream.data() + base); // 声明 > 4096
+
+        /**
+         * 声明 > 4096
+         */
+        rpc::EncodeFramePrefix(8192, stream.data() + base);
         ExpectCode(dec.Feed(stream.data(), stream.size()), ErrorCode::ProtocolError);
         CHECK(dec.IsTerminal());
-        // 第二帧 body 未复制：缓冲 = 完整首帧 + 4B 前缀。
+
+        /**
+         * 第二帧 body 未复制：缓冲 = 完整首帧 + 4B 前缀。
+         */
         CHECK(dec.PendingBytes() == base + 4);
         ExpectCode(dec.Next(), ErrorCode::ProtocolError);
     }
-    // F2 流水线：第二帧前缀跨 Feed 分批——首帧完整在缓冲、第二帧前缀
-    // 先喂 3B，第 4 字节与超限 body 同批到达；拼齐前缀即拒，body 不复制。
+
+    /**
+     * 流水线：第二帧前缀跨 Feed 分批——首帧完整在缓冲、第二帧前缀
+     * 先喂 3B，第 4 字节与超限 body 同批到达；拼齐前缀即拒，body 不复制。
+     */
     {
         auto first = rpc::EncodeFramedSessionFrame(valid, 4096);
         CHECK(first);
-        rpc::SessionFrameDecoder dec(/*max_frame_bytes=*/4096);
-        dec.SetHelloPhase(false); // 数据态：尾随帧前缀即时校验
+
+        /**
+         * max_frame_bytes = 4096。
+         */
+        rpc::SessionFrameDecoder dec(4096);
+
+        /**
+         * 数据态：尾随帧前缀即时校验
+         */
+        dec.SetHelloPhase(false);
         std::vector<std::uint8_t> stream(first.value());
         const std::size_t base = stream.size();
         std::uint8_t pre[4];
-        rpc::EncodeFramePrefix(8192, pre);         // 声明 > 4096
-        stream.insert(stream.end(), pre, pre + 3); // 第二帧前缀前 3 字节
+
+        /**
+         * 声明 > 4096
+         */
+        rpc::EncodeFramePrefix(8192, pre);
+
+        /**
+         * 第二帧前缀前 3 字节
+         */
+        stream.insert(stream.end(), pre, pre + 3);
         CHECK(dec.Feed(stream.data(), stream.size()));
         CHECK(!dec.IsTerminal());
         CHECK(dec.PendingBytes() == base + 3);
         std::vector<std::uint8_t> tail(1 + 2040, 0xDD);
-        tail[0] = pre[3]; // 第 4 字节 + body
+
+        /**
+         * 第 4 字节 + body
+         */
+        tail[0] = pre[3];
         ExpectCode(dec.Feed(tail.data(), tail.size()), ErrorCode::ProtocolError);
         CHECK(dec.IsTerminal());
-        CHECK(dec.PendingBytes() == base + 4); // 只多留 1B 前缀
+
+        /**
+         * 只多留 1B 前缀
+         */
+        CHECK(dec.PendingBytes() == base + 4);
         ExpectCode(dec.Next(), ErrorCode::ProtocolError);
     }
-    // F2 流水线：合法两帧同批且首帧不 Next 出队——第二帧前缀照常被
-    // 校验但不误算 PendingBytes；喂第三帧超限前缀即拒，缓冲保留
-    // 「首帧+第二帧完整+4B 前缀」，不误计 body。
+
+    /**
+     * 流水线：合法两帧同批且首帧不 Next 出队——第二帧前缀照常被
+     * 校验但不误算 PendingBytes；喂第三帧超限前缀即拒，缓冲保留
+     * 「首帧+第二帧完整+4B 前缀」，不误计 body。
+     */
     {
         auto f1 = rpc::EncodeFramedSessionFrame(valid, 4096);
         auto f2 = rpc::EncodeFramedSessionFrame(valid, 4096);
         CHECK(f1 && f2);
-        rpc::SessionFrameDecoder dec(/*max_frame_bytes=*/4096);
-        dec.SetHelloPhase(false); // 数据态：尾随帧前缀即时校验
+
+        /**
+         * max_frame_bytes = 4096。
+         */
+        rpc::SessionFrameDecoder dec(4096);
+
+        /**
+         * 数据态：尾随帧前缀即时校验
+         */
+        dec.SetHelloPhase(false);
         std::vector<std::uint8_t> stream(f1.value());
         stream.insert(stream.end(), f2.value().begin(), f2.value().end());
-        const std::size_t pipelined = stream.size(); // 两帧总长
+
+        /**
+         * 两帧总长
+         */
+        const std::size_t pipelined = stream.size();
         std::uint8_t pre[4];
-        rpc::EncodeFramePrefix(8192, pre); // 第三帧声明 > 4096
+
+        /**
+         * 第三帧声明 > 4096
+         */
+        rpc::EncodeFramePrefix(8192, pre);
         stream.insert(stream.end(), pre, pre + 4);
-        stream.resize(stream.size() + 100, 0xCC); // 第三帧 body 片段
+
+        /**
+         * 第三帧 body 片段
+         */
+        stream.resize(stream.size() + 100, 0xCC);
         ExpectCode(dec.Feed(stream.data(), stream.size()), ErrorCode::ProtocolError);
         CHECK(dec.IsTerminal());
-        CHECK(dec.PendingBytes() == pipelined + 4); // 前缀保留，body 不入
+
+        /**
+         * 前缀保留，body 不入
+         */
+        CHECK(dec.PendingBytes() == pipelined + 4);
         ExpectCode(dec.Next(), ErrorCode::ProtocolError);
     }
-    // 跃迁后合法合包不误拒：hello_phase 下 Hello(≤64KiB)+Call 同缓冲，两帧
-    // 按序解出（第二帧声明 ≤64KiB 故握手态前缀门不拦，kind 复核通过）；
-    // 转数据态后声明 >64KiB 的数据帧同样接纳。
+
+    /**
+     * 跃迁后合法合包不误拒：hello_phase 下 Hello(≤64KiB)+Call 同缓冲，两帧
+     * 按序解出（第二帧声明 ≤64KiB 故握手态前缀门不拦，kind 复核通过）；
+     * 转数据态后声明 >64KiB 的数据帧同样接纳。
+     */
     {
         auto hello = rpc::EncodeFramedSessionFrame(ValidHello());
         auto call = rpc::EncodeFramedSessionFrame(ValidCall());
@@ -711,9 +1023,17 @@ void Framing()
         auto f2 = dec.Next();
         CHECK(f1 && f1.value().has_value() && f1.value()->kind == FrameKind::Hello);
         CHECK(f2 && f2.value().has_value() && f2.value()->kind == FrameKind::Call);
-        dec.SetHelloPhase(false); // 握手完成 → 数据态
+
+        /**
+         * 握手完成 → 数据态
+         */
+        dec.SetHelloPhase(false);
         rpc::SessionFrame big_send = ValidSend();
-        big_send.payload.assign(80000, 0x5A); // >64KiB ≤8MiB：握手态会拒
+
+        /**
+         * >64KiB ≤8MiB：握手态会拒
+         */
+        big_send.payload.assign(80000, 0x5A);
         auto big = rpc::EncodeFramedSessionFrame(big_send);
         CHECK(big);
         CHECK(dec.Feed(big.value()));
@@ -721,7 +1041,10 @@ void Framing()
         CHECK(f3 && f3.value().has_value() && f3.value()->kind == FrameKind::Send);
         CHECK(!dec.IsTerminal());
     }
-    // 余帧移交：PendingBytes/TakePending 把未耗尽字节原样转给下一解码器。
+
+    /**
+     * 余帧移交：PendingBytes/TakePending 把未耗尽字节原样转给下一解码器。
+     */
     {
         auto hello = rpc::EncodeFramedSessionFrame(ValidHello());
         auto call = rpc::EncodeFramedSessionFrame(ValidCall());
@@ -739,35 +1062,62 @@ void Framing()
         auto f2 = b.Next();
         CHECK(f2 && f2.value().has_value() && f2.value()->kind == FrameKind::Call);
     }
-    // payload 超数据帧上限（max_frame_bytes 可配）：EncodeFramed 拒绝。
+
+    /**
+     * payload 超数据帧上限（max_frame_bytes 可配）：EncodeFramed 拒绝。
+     */
     {
         rpc::SessionFrame big = ValidSend();
         big.payload.assign(1025, 0xCD);
-        auto framed = rpc::EncodeFramedSessionFrame(big, /*max_frame_bytes=*/1024);
+
+        /**
+         * max_frame_bytes = 1024。
+         */
+        auto framed = rpc::EncodeFramedSessionFrame(big, 1024);
         ExpectCode(framed, ErrorCode::InvalidArgument);
     }
-    // 未决缓冲硬上限（分配/复制前检查，不实际分配大额）：小额 max_frame
-    // 下，前缀声明恰好界内但 body 未喂满时连续 Feed 到达上限即终态。
-    // 字节流必须是合法 wire：喂过帧界的字节属于下一帧，其 4B 前缀照常
-    // 参与校验——用合法小帧流水线把 pending 精确推到 2052 再越界。
+
+    /**
+     * 未决缓冲硬上限（分配/复制前检查，不实际分配大额）：小额 max_frame
+     * 下，前缀声明恰好界内但 body 未喂满时连续 Feed 到达上限即终态。
+     * 字节流必须是合法 wire：喂过帧界的字节属于下一帧，其 4B 前缀照常
+     * 参与校验——用合法小帧流水线把 pending 精确推到 2052 再越界。
+     */
     {
-        rpc::SessionFrameDecoder dec(/*max_frame_bytes=*/1024);
-        // 上限 = 4 + 2*1024 = 2052。喂入一个 1024B 声明前缀 + 不足 body 的
-        // 合法开头（buffer=4+512），未超上限，不拒绝。
+
+        /**
+         * max_frame_bytes = 1024。
+         */
+        rpc::SessionFrameDecoder dec(1024);
+
+        /**
+         * 上限 = 4 + 2*1024 = 2052。喂入一个 1024B 声明前缀 + 不足 body 的
+         * 合法开头（buffer=4+512），未超上限，不拒绝。
+         */
         std::uint8_t pre[4];
         rpc::EncodeFramePrefix(1024, pre);
         CHECK(dec.Feed(pre, 4));
         const std::vector<std::uint8_t> partial(512, 0xEE);
         CHECK(dec.Feed(partial.data(), partial.size()));
-        // 补满首帧剩余 512B body 后再接第二帧前缀——帧界对齐，声明 1020
-        // ≤1024 合法且占满 pending：4+1024+4+1020=2052 ≤ 2052。
+
+        /**
+         * 补满首帧剩余 512B body 后再接第二帧前缀——帧界对齐，声明 1020
+         * ≤1024 合法且占满 pending：4+1024+4+1020=2052 ≤ 2052。
+         */
         std::vector<std::uint8_t> more(512, 0xDD);
         rpc::EncodeFramePrefix(1020, pre);
         more.insert(more.end(), pre, pre + 4);
-        more.resize(more.size() + 1020, 0xBB); // 第二帧 body 1020B
+
+        /**
+         * 第二帧 body 1020B
+         */
+        more.resize(more.size() + 1020, 0xBB);
         CHECK(dec.Feed(more.data(), more.size()));
         CHECK(dec.PendingBytes() == 2052);
-        // 再喂 1B → 2053 > 2052 → 分配前拒绝并进 terminal。
+
+        /**
+         * 再喂 1B → 2053 > 2052 → 分配前拒绝并进 terminal。
+         */
         const std::uint8_t one = 0xAA;
         ExpectCode(dec.Feed(&one, 1), ErrorCode::ProtocolError);
         CHECK(dec.IsTerminal());
@@ -775,11 +1125,18 @@ void Framing()
         ExpectCode(dec.Next(), ErrorCode::ProtocolError);
     }
     {
-        // 合法流水线不误拒：两个完整 Send 帧（均 ≤1024）同一 Feed 到达。
+
+        /**
+         * 合法流水线不误拒：两个完整 Send 帧（均 ≤1024）同一 Feed 到达。
+         */
         auto f1 = rpc::EncodeFramedSessionFrame(valid, 1024);
         auto f2 = rpc::EncodeFramedSessionFrame(valid, 1024);
         CHECK(f1 && f2);
-        rpc::SessionFrameDecoder dec(/*max_frame_bytes=*/1024);
+
+        /**
+         * max_frame_bytes = 1024。
+         */
+        rpc::SessionFrameDecoder dec(1024);
         std::vector<std::uint8_t> stream(f1.value());
         stream.insert(stream.end(), f2.value().begin(), f2.value().end());
         CHECK(dec.Feed(stream));
@@ -789,7 +1146,10 @@ void Framing()
         CHECK(b && b.value().has_value());
         CHECK(!dec.IsTerminal());
     }
-    // max_frame_bytes 非法：0 与超硬上限拒绝。
+
+    /**
+     * max_frame_bytes 非法：0 与超硬上限拒绝。
+     */
     {
         ExpectCode(rpc::EncodeFramedSessionFrame(valid, 0), ErrorCode::InvalidArgument);
         ExpectCode(rpc::EncodeFramedSessionFrame(valid, rpc::kRpcV2MaxFrameBytes + 1), ErrorCode::InvalidArgument);
@@ -841,7 +1201,10 @@ void ResponseFromRequest()
         CHECK(response.RequestSchema() == "request-schema");
         CHECK(response.ResponseSchema() == "response-schema");
     }
-    // 源请求及上下文已销毁，响应仍拥有自己的字段与业务数据。
+
+    /**
+     * 源请求及上下文已销毁，响应仍拥有自己的字段与业务数据。
+     */
     CHECK(response.RequestId() == "req-from-request");
     CHECK(response.Service() == "echo-service");
     CHECK(response.Method() == "Say");
@@ -851,11 +1214,16 @@ void ResponseFromRequest()
     CHECK(response.Metadata() == rpc::Metadata({{"trace.id", "response-trace"}}));
 }
 
-// ---- Options/Stats 值层 ---------------------------------------------------------
-
+/**
+ * @}
+ * @name Options/Stats 值层 @{
+ */
 void Values()
 {
-    // ClientOptions Validate：合法默认通过；逐项越界拒绝。
+
+    /**
+     * ClientOptions Validate：合法默认通过；逐项越界拒绝。
+     */
     {
         rpc::ClientOptions o;
         o.SetLocalIdentity("app-a").SetTrustedNetworkPlaintext(true);
@@ -876,7 +1244,10 @@ void Values()
         o.SetMaxFrameBytes(1024).SetServiceWeight(0);
         ExpectCode(o.Validate(), ErrorCode::InvalidArgument);
     }
-    // SendOptions：deadline 必须有限且未过期。
+
+    /**
+     * SendOptions：deadline 必须有限且未过期。
+     */
     {
         rpc::SendOptions o;
         ExpectCode(o.Validate(), ErrorCode::InvalidArgument);
@@ -888,10 +1259,17 @@ void Values()
         o.RequireRemoteAcceptance();
         CHECK(o.RequiresRemoteAcceptance());
     }
-    // ServerOptions：listen 必填、各项上限。
+
+    /**
+     * ServerOptions：listen 必填、各项上限。
+     */
     {
         rpc::ServerOptions o;
-        ExpectCode(o.Validate(), ErrorCode::InvalidArgument); // 无 listen
+
+        /**
+         * 无 listen
+         */
+        ExpectCode(o.Validate(), ErrorCode::InvalidArgument);
         std::error_code ec;
         o.SetListenAddress(bbt::infra::net::Address::Ip("127.0.0.1", 0, ec));
         CHECK(!ec);
@@ -901,7 +1279,10 @@ void Values()
         o.SetIncomingTimeout(std::chrono::milliseconds{25000 * 3600});
         ExpectCode(o.Validate(), ErrorCode::InvalidArgument);
     }
-    // Stats 值类型可聚合。
+
+    /**
+     * Stats 值类型可聚合。
+     */
     {
         rpc::ClientStats cs;
         cs.sessions = 2;
@@ -913,7 +1294,10 @@ void Values()
         CHECK(cs.sessions == 2 && cs.service.inflight == 3);
         CHECK(ss.accepted_connections == 5 && ss.actor.queued == 9);
     }
-    // RequestContext 默认空值；Request 默认 traffic=Service reply=None。
+
+    /**
+     * RequestContext 默认空值；Request 默认 traffic=Service reply=None。
+     */
     {
         rpc::Request r;
         CHECK(r.Traffic() == TrafficClass::Service);
@@ -923,11 +1307,17 @@ void Values()
     }
 }
 
-// ---- 无状态帧协议接缝：单 reader 顺序 + 合包/拆包 + opaque payload ----------
-// 直接经 detail::RpcFrameProtocol（Validate/Encode/Decode/Feed/Next）驱动：
-// 协议层不持有拆包缓冲（缓冲属于调用方 SessionFrameDecoder），一帧字节任意
-// 切分或多帧合包到达时，单个 reader 必须按发送顺序完整取帧，payload 与
-// ordering key 原样不透明。
+/**
+ * @}
+ * @name 无状态帧协议接缝：单 reader 顺序 + 合包/拆包 + opaque payload @{
+ */
+
+/**
+ * 直接经 detail::RpcFrameProtocol（Validate/Encode/Decode/Feed/Next）驱动：
+ * 协议层不持有拆包缓冲（缓冲属于调用方 SessionFrameDecoder），一帧字节任意
+ * 切分或多帧合包到达时，单个 reader 必须按发送顺序完整取帧，payload 与
+ * ordering key 原样不透明。
+ */
 void FrameProtocolSeam()
 {
     using rpc::detail::RpcFrameProtocol;
@@ -937,7 +1327,11 @@ void FrameProtocolSeam()
         frame.message_id = id;
         frame.sequence = sequence;
         frame.payload = std::move(payload);
-        frame.ordering_key = std::string("k\0\xff", 3); // 不透明字节而非文本
+
+        /**
+         * 不透明字节而非文本
+         */
+        frame.ordering_key = std::string("k\0\xff", 3);
         return frame;
     };
     const std::vector<SessionFrame> frames = {
@@ -946,7 +1340,9 @@ void FrameProtocolSeam()
         make("opaque-3", 3, std::vector<std::uint8_t>(65536, 0xAB)),
     };
 
-    // Encode/Decode 是纯函数：单帧 roundtrip 的 payload/ordering key 字节一致。
+    /**
+     * Encode/Decode 是纯函数：单帧 roundtrip 的 payload/ordering key 字节一致。
+     */
     std::vector<std::uint8_t> stream;
     for (const auto& frame : frames) {
         CHECK(RpcFrameProtocol::Validate(frame));
@@ -959,10 +1355,16 @@ void FrameProtocolSeam()
         stream.insert(stream.end(), encoded.value().begin(), encoded.value().end());
     }
 
-    // 单 reader 顺序：一次 Feed 合包三帧，Next 逐帧按发送顺序取净。
+    /**
+     * 单 reader 顺序：一次 Feed 合包三帧，Next 逐帧按发送顺序取净。
+     */
     {
         rpc::SessionFrameDecoder decoder;
-        decoder.SetHelloPhase(false); // 数据态：帧限统一，大 payload 不被 64KiB 握手门误拒
+
+        /**
+         * 数据态：帧限统一，大 payload 不被 64KiB 握手门误拒
+         */
+        decoder.SetHelloPhase(false);
         CHECK(RpcFrameProtocol::Feed(decoder, stream.data(), stream.size()));
         for (const auto& frame : frames) {
             auto next = RpcFrameProtocol::Next(decoder);
@@ -972,10 +1374,16 @@ void FrameProtocolSeam()
             CHECK(next.value()->payload == frame.payload);
         }
         auto tail = RpcFrameProtocol::Next(decoder);
-        CHECK(tail && !tail.value().has_value()); // 无多余帧、无丢失
+
+        /**
+         * 无多余帧、无丢失
+         */
+        CHECK(tail && !tail.value().has_value());
     }
 
-    // 拆包：同一帧逐字节到达时只在读满后出帧，出帧字节完全一致。
+    /**
+     * 拆包：同一帧逐字节到达时只在读满后出帧，出帧字节完全一致。
+     */
     {
         auto encoded = RpcFrameProtocol::Encode(frames.back());
         CHECK(encoded);
@@ -990,12 +1398,18 @@ void FrameProtocolSeam()
                 CHECK(next.value().has_value());
                 CHECK(next.value()->payload == frames.back().payload);
             } else {
-                CHECK(!next.value().has_value()); // 未读满不早出帧
+
+                /**
+                 * 未读满不早出帧
+                 */
+                CHECK(!next.value().has_value());
             }
         }
     }
 
-    // 合包再分片：两帧合包后按 7 字节片喂入，仍按同一顺序出帧。
+    /**
+     * 合包再分片：两帧合包后按 7 字节片喂入，仍按同一顺序出帧。
+     */
     {
         auto first = RpcFrameProtocol::Encode(frames[0]);
         auto third = RpcFrameProtocol::Encode(frames[2]);
@@ -1021,7 +1435,9 @@ void FrameProtocolSeam()
         CHECK(order.size() == 2 && order[0] == "opaque-1" && order[1] == "opaque-3");
     }
 
-    // 无状态：两个独立 decoder 从同一字节流得到相同的首帧（协议层无共享状态）。
+    /**
+     * 无状态：两个独立 decoder 从同一字节流得到相同的首帧（协议层无共享状态）。
+     */
     {
         rpc::SessionFrameDecoder first;
         rpc::SessionFrameDecoder second;
@@ -1037,7 +1453,9 @@ void FrameProtocolSeam()
     std::cout << "v2 frame protocol seam: single-reader order, coalesced/split, opaque payload ok\n";
 }
 
-} // namespace
+// clang-format off
+}
+// clang-format on
 
 int RunCase(const std::string& mode)
 {
@@ -1062,7 +1480,12 @@ int RunCase(const std::string& mode)
     return 0;
 }
 
-} // namespace rpc_v2_test
+/**
+ * @}
+ */
+// clang-format off
+}
+// clang-format on
 
 int main(int argc, char** argv)
 {

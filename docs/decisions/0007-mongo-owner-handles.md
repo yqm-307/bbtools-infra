@@ -223,3 +223,50 @@ driver 侧失败→Unavailable，无效参数→InvalidArgument，pool wait 超�
 WaitUntil ok==2）未消除，非本增量引入，本轮单次全过不构成已修；PHASE B/C 与 run.sh
 编排未在本增量中实跑。CI 路径：新 unit 用例落在 `mongo.unit` 全量 ctest，新 live 用例
 落在 `tests/mongo-live/run.sh` PHASE A（全量跑该二进制）；`.github/` 未改。
+
+### 增量：关闭控制面与后台 finalizer（2026-11-11，未合入，待独立审查）
+
+本增量只改 owner 的关闭/保活/回收链：mongocxx 同步 driver、有界 worker、队列、错误映射与
+`Submit` 的等待范式一行未改；不新增公共生命周期类型、通用回收器或第二套关闭入口。
+
+1. **`wait_release` 在 owner 落地**：`Close(CloseOptions)` 先做值校验（`Graceful` 或
+   `wait_release=true` 且无有限绝对期限 → `InvalidArgument`，零副作用），再封口；
+   `wait_release=true` 在模式工作完成后用**同一绝对 `deadline`** 等真实物理回收
+   （worker 退出 + `JoinWorkers()` + pool lease 归还），到期 `TimedOut` 保留 worker 与
+   在途 driver 责任，不自动升级、不续预算。
+2. **join 只在 finalizer 线程**：唯一配对 finalizer 的 native 线程在 `Start` 成功发布前
+   创建（前置准备），成功启动的 owner 从启动当刻起就有确定回收责任；封口
+   （`Close`/`RequestClose`/Start 失败）只向它投递请求，**不在关闭路径临时建线程**。
+   它完成排空等待、join、lease 归还与 `MarkClosed`，被唤醒的
+   `Close(wait_release=true)`/`WaitStopped` 只观察该事实。受管协程按 50ms 分片挂起
+   等待，native 宿主用条件变量有界等待，两者都不自己 join；native 等待严格受同一
+   deadline 约束，不回落「本线程 Finalize」。
+3. **最后引用与析构不在 Co worker 上 join**：`MongoRuntime` 只经 `MongoRuntime::Create`
+   构造（自定义删除器）。引用归零时若 finalizer 未完成，删除器只置「收口后 delete」
+   请求并把 delete 责任交给 finalizer 线程（不新建线程、不 join）；从未成功启动的
+   owner 没有 worker/在途 driver，删除器直接释放，析构线程补做同一幂等封口也是有界的。
+   `Close()`（无参，`ICoCloseable`）在 native 宿主等收口、在受管协程只封口后返回——
+   需要物理凭据的协程调用方改用 `Close(Immediate + wait_release=true)`。
+4. **组件层一致**：`CoMongoDb::Close(CloseOptions)` 先校验再置位自身接纳门禁（F6），
+   本层只在物理收口落定后发布 Closed；`CoMongoColl::Close()` 仍是接纳门禁，不等待 owner。
+
+验证锚点（`mongo.unit`，本机实测，无真实 MongoDB）：
+`t_owner_wait_release_co_suspends_until_physical`（driver 在途握手 → Co
+`Close(Immediate + wait_release)` 挂起期间同一调度器其它协程持续推进 → 返回即 worker 全退、
+`IsClosed()` 为真）、`t_owner_wait_release_timeout_keeps_worker`（300ms 期限对 1500ms driver：
+`TimedOut` + worker 责任保留 + 后续 native `WaitStopped` 兑现）、
+`t_owner_close_options_rejected_without_side_effects`（两种无期限组合零副作用，接纳面仍可用）、
+`t_owner_release_last_ref_in_coroutine_no_join`（Co worker 上丢弃 owner 对象即刻返回、当刻 worker
+仍在、后台仍完成回收）、`t_owner_runtime_last_ref_reclaimed`（不保留任何 runtime/handle 强引用：
+Co worker 上丢弃全部外部引用即刻返回、worker 当刻仍在，`weak_ptr` 失效 + 本 owner pool lease 归还
+证明真实回收）、`t_owner_close_single_worker_wait_release`（独立单 worker 进程：Close 等待期间同一
+唯一 worker 上的 pulse 持续推进且 Close 尚未返回）、`t_finalizer_spawn_failure_bounded`（线程创建
+失败接缝：Start 有界失败、无 worker 且 lease 归还；Co 域关闭有界且真实收口）。
+
+未覆盖（诚实边界）：本增量没有运行 `mongo.live`，真实 MongoDB 的 driver 阻塞/写入语义与
+live 通过与否不受本轮证据支持；前置 finalizer 的线程创建失败已用测试接缝在 unit 证明
+（Start 在建 worker 前失败返回、lease 归还、无 join/假 Closed），真实资源耗尽场景未做压测。
+
+## 取代关系
+
+关闭公开入口由 [ADR 0023](0023-single-close.md) 取代；本文其余历史决策保留。

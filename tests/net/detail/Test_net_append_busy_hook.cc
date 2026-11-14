@@ -1,21 +1,23 @@
-// 接收路径确定性交错用例：验证「pending 未合入前，下一次 recv 的数据会插到它前面」。
-//
-// 与既有用例的关系：
-// net.b4_raw_busy_deferred_onread 只验证 Busy→保留→补投 OnRead 的可见性，
-// 不涉及「pending 存在期间继续 recv」。本文件补的正是那条缺口。
-//
-// 判据（块序与全字节分别断言，不只看块首字节）：
-// out == A+B+C（逐字节 + 长度）→ 通过（修复后应如此）
-// out == A+C+B（逐字节 + 长度）→ 违反 FIFO，必须失败并打印证据
-// 其他 → 其他不一致，单独报错（不得归入上面两类）
-//
-// 线程约定：本文件不使用 std::this_thread::sleep_for —— 它在非协程上下文会
-// 进入 coroutine hook 的 UseSleep/Nanosleep 路径并触发断言。等待一律用
-// steady_clock + yield 的有界轮询（与 b4_contract.cc:1746 的既有写法一致）。
 
-// net 测试的退出边界（见 tests/net/ProcessRuntimeTestMain.hpp）：coroutine runtime
-// 无 Stop，正常 return 会进入静态析构窗口并可能 SIGSEGV。故本文件抑制 Boost.Test
-// 自动生成的 main，自己调用 unit_test_main 后在所有局部对象离开作用域再 _Exit。
+/**
+ * 接收路径确定性交错用例：验证「pending 未合入前，下一次 recv 的数据会插到它前面」。
+ *
+ * 与既有用例的关系：
+ * net.b4_raw_busy_deferred_onread 只验证 Busy→保留→补投 OnRead 的可见性，
+ * 不涉及「pending 存在期间继续 recv」。本文件补的正是那条缺口。
+ *
+ * 判据（块序与全字节分别断言，不只看块首字节）：
+ * out == A+B+C（逐字节 + 长度）→ 通过（修复后应如此）
+ * out == A+C+B（逐字节 + 长度）→ 违反 FIFO，必须失败并打印证据
+ * 其他 → 其他不一致，单独报错（不得归入上面两类）
+ *
+ * 线程约定：本文件不使用 std::this_thread::sleep_for —— 它在非协程上下文会
+ * 进入 coroutine hook 的 UseSleep/Nanosleep 路径并触发断言。等待一律用
+ * steady_clock + yield 的有界轮询（与 b4_contract.cc:1746 的既有写法一致）。
+ * net 测试的退出边界（见 tests/net/ProcessRuntimeTestMain.hpp）：coroutine runtime
+ * 无 Stop，正常 return 会进入静态析构窗口并可能 SIGSEGV。故本文件抑制 Boost.Test
+ * 自动生成的 main，自己调用 unit_test_main 后在所有局部对象离开作用域再 _Exit。
+ */
 #define BOOST_TEST_NO_MAIN
 #define BOOST_TEST_ALTERNATIVE_INIT_API
 #include <boost/test/included/unit_test.hpp>
@@ -53,7 +55,10 @@ namespace {
 using namespace bbt::infra::net;
 using namespace std::chrono_literals;
 
-constexpr std::size_t kSeg = 16384; // = Engine.cc 的 kReadChunk：一段对应一次完整 recv
+/**
+ * = Engine.cc 的 kReadChunk：一段对应一次完整 recv
+ */
+constexpr std::size_t kSeg = 16384;
 
 bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds timeout)
 {
@@ -62,7 +67,11 @@ bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds
         if (predicate()) {
             return true;
         }
-        std::this_thread::yield(); // 不用 sleep_for：见文件头线程约定
+
+        /**
+         * 不用 sleep_for：见文件头线程约定
+         */
+        std::this_thread::yield();
     }
     return predicate();
 }
@@ -90,10 +99,12 @@ EngineConfig ServerConfig(const Address& listen)
     return config;
 }
 
-// 低压水线场景：把读方向总量界压到刚好容纳本例字节数。
-// ReadLowWater = max_inbound_bytes / 2。选 49152*2 使低水位 = 49152，
-// 与 A+B+C 总量相等 —— 这是「消费者读完仍不低于低水位」的最不利边界，
-// 用来验证 pending 导致的暂停能否真正解除（而不是永久卡住读泵）。
+/**
+ * 低压水线场景：把读方向总量界压到刚好容纳本例字节数。
+ * ReadLowWater = max_inbound_bytes / 2。选 49152*2 使低水位 = 49152，
+ * 与 A+B+C 总量相等 —— 这是「消费者读完仍不低于低水位」的最不利边界，
+ * 用来验证 pending 导致的暂停能否真正解除（而不是永久卡住读泵）。
+ */
 EngineConfig TightServerConfig(const Address& listen)
 {
     EngineConfig config = ServerConfig(listen);
@@ -106,21 +117,21 @@ struct EngineRunner {
     std::error_code error;
     std::thread thread;
 
-    EngineRunner(Engine& target, EngineConfig config) : engine(target)
+    EngineRunner(Engine& target, EngineConfig config)
+        : engine(target)
     {
         thread = std::thread([this, config]() mutable { error = engine.Run(config); });
     }
+
     void CloseAndJoin()
     {
-        engine.RequestClose();
+        (void)engine.Close();
         if (thread.joinable()) {
             thread.join();
         }
     }
-    ~EngineRunner()
-    {
-        CloseAndJoin();
-    }
+
+    ~EngineRunner() { CloseAndJoin(); }
 };
 
 NativeSocket ConnectClient(const Address& address, bool& ok)
@@ -181,15 +192,15 @@ struct StoreHandler : RawHandler {
         std::lock_guard<std::mutex> lock(mutex);
         stored = std::make_shared<Connection>(connection);
     }
-    void OnRead(Connection) override
-    {
-    }
-    void OnClose(Connection, std::error_code) override
-    {
-    }
+
+    void OnRead(Connection) override {}
+
+    void OnClose(Connection, std::error_code) override {}
 };
 
-// 段内容：整段填同一标记，段首/段尾带可识别标签。
+/**
+ * 段内容：整段填同一标记，段首/段尾带可识别标签。
+ */
 std::string MakeSeg(char tag)
 {
     std::string segment(kSeg, tag);
@@ -200,27 +211,47 @@ std::string MakeSeg(char tag)
     return segment;
 }
 
-// 交错门：接缝回调（owner 线程）与辅助线程（真实数据锁）之间的握手状态。
+/**
+ * 交错门：接缝回调（owner 线程）与辅助线程（真实数据锁）之间的握手状态。
+ */
 struct Gate {
     std::shared_ptr<ConnectionState> state;
     bool expect_c{true};
-    std::atomic<int> read_hook_calls{0}; // B 的 recv、C 的 recv 各一次
-    std::atomic<int> busy_hook_calls{0}; // 每次 TryAppend 观测到 Busy 记一次
+
+    /**
+     * B 的 recv、C 的 recv 各一次
+     */
+    std::atomic<int> read_hook_calls{0};
+
+    /**
+     * 每次 TryAppend 观测到 Busy 记一次
+     */
+    std::atomic<int> busy_hook_calls{0};
     std::atomic<bool> take_lock{false};
     std::atomic<bool> lock_held{false};
     std::atomic<bool> c_sent{false};
-    std::atomic<bool> c_recv_seen{false}; // C 的 recv 已发生（append 紧随其后）
+
+    /**
+     * C 的 recv 已发生（append 紧随其后）
+     */
+    std::atomic<bool> c_recv_seen{false};
     std::atomic<bool> release{false};
     std::atomic<bool> released{false};
-    std::atomic<bool> seam_observed{false}; // Busy 接缝首次在「仍持锁」时触发
+
+    /**
+     * Busy 接缝首次在「仍持锁」时触发
+     */
+    std::atomic<bool> seam_observed{false};
     std::atomic<bool> aux_error{false};
     std::atomic<std::size_t> pending_observed{0};
 };
 
-// 接缝回调在 owner 线程执行：绝不抛异常（抛出会终止进程，破坏可判定性）。
-// #1 = B 的 recv 之后（既有 read-append 接缝）：让 aux 取得真实数据锁并确认持有，
-// 这同时把 owner 挡在 append 之前，构成「此时才能发 C」的门。
-// docs/decisions/0002-co-network-contract.md = C 的 recv 之后：置位 c_recv_seen，让主线程知道 append 即将发生。
+/**
+ * 接缝回调在 owner 线程执行：绝不抛异常（抛出会终止进程，破坏可判定性）。
+ * #1 = B 的 recv 之后（既有 read-append 接缝）：让 aux 取得真实数据锁并确认持有，
+ * 这同时把 owner 挡在 append 之前，构成「此时才能发 C」的门。
+ * docs/decisions/0002-co-network-contract.md = C 的 recv 之后：置位 c_recv_seen，让主线程知道 append 即将发生。
+ */
 std::function<void()> MakeReadAppendHook(const std::shared_ptr<Gate>& gate)
 {
     return [gate] {
@@ -238,8 +269,10 @@ std::function<void()> MakeReadAppendHook(const std::shared_ptr<Gate>& gate)
     };
 }
 
-// Busy 接缝：只在「TryAppend 观测 Busy、deferred 尚未提交」时被调用。
-// 首次 = B；若 C 也 Busy，则第二次出现，说明本次没构造出「C 直接入 ring」的窗口。
+/**
+ * Busy 接缝：只在「TryAppend 观测 Busy、deferred 尚未提交」时被调用。
+ * 首次 = B；若 C 也 Busy，则第二次出现，说明本次没构造出「C 直接入 ring」的窗口。
+ */
 std::function<void()> MakeAppendBusyHook(const std::shared_ptr<Gate>& gate)
 {
     return [gate] {
@@ -343,8 +376,10 @@ std::size_t FirstDiff(const std::string& actual, const std::string& expected)
     return index;
 }
 
-// 一次完整交错：A 入 ring → B 走 deferred → C 单独 recv → 读回判定。
-// 返回 true 表示 FIFO 成立；false 表示观测到 A+C+B 或其他不一致。
+/**
+ * 一次完整交错：A 入 ring → B 走 deferred → C 单独 recv → 读回判定。
+ * 返回 true 表示 FIFO 成立；false 表示观测到 A+C+B 或其他不一致。
+ */
 struct Outcome {
     bool fifo_ok{false};
     bool reordered{false};
@@ -387,11 +422,15 @@ Outcome RunInterleave(bool send_c, bool tight = false)
     state = ConnectionTestAccess::StateOf(*conn);
     BOOST_REQUIRE(state != nullptr);
 
-    // 步骤 1：A 先入 ring（owner 已从内核取走 = ring.Size 含 pending 达到 |A|）。
+    /**
+     * 步骤 1：A 先入 ring（owner 已从内核取走 = ring.Size 含 pending 达到 |A|）。
+     */
     BOOST_REQUIRE(SendAll(client, a, 3000ms));
     BOOST_REQUIRE(WaitUntil([&] { return state->ring.Size() == a.size(); }, 5000ms));
 
-    // 步骤 2：武装两个接缝 + 辅助线程。
+    /**
+     * 步骤 2：武装两个接缝 + 辅助线程。
+     */
     auto gate = std::make_shared<Gate>();
     gate->state = state;
     gate->expect_c = send_c;
@@ -399,25 +438,33 @@ Outcome RunInterleave(bool send_c, bool tight = false)
     EngineTestAccess::SetAppendBusyHook(engine, MakeAppendBusyHook(gate));
     std::thread aux(AuxThread, gate);
 
-    // 步骤 3：此刻发 B → TryAppend 观测 Busy（aux 持真实数据锁）→ 接缝 docs/decisions/0002-co-network-contract.md 等待。
+    /**
+     * 步骤 3：此刻发 B → TryAppend 观测 Busy（aux 持真实数据锁）→ 接缝 docs/decisions/0002-co-network-contract.md 等待。
+     */
     BOOST_REQUIRE(SendAll(client, b, 3000ms));
     BOOST_REQUIRE(WaitUntil([&] { return gate->lock_held.load() || gate->aux_error.load(); }, 6000ms));
     BOOST_TEST(!gate->aux_error.load());
 
-    // 步骤 4：B 已 recv、append 尚未发生；此刻发 C，使其落在后续独立 recv。
+    /**
+     * 步骤 4：B 已 recv、append 尚未发生；此刻发 C，使其落在后续独立 recv。
+     */
     if (send_c) {
         BOOST_REQUIRE(SendAll(client, c, 3000ms));
         gate->c_sent.store(true);
     }
 
-    // 步骤 5：等 defer 落位。aux 释放后 AppendDeferred 成功，未修路径继续 recv。
+    /**
+     * 步骤 5：等 defer 落位。aux 释放后 AppendDeferred 成功，未修路径继续 recv。
+     */
     BOOST_REQUIRE(WaitUntil([&] { return gate->released.load(); }, 8000ms));
     (void)WaitUntil([&] { return gate->pending_observed.load() != 0; }, 6000ms);
 
-    // 步骤 5b：观测「缺陷窗口是否出现」，用于解释结果，不作为执行前提。
-    // window_ok=1：C 在 pending 仍在时被 recv（旧行为下即 A+C+B 的成因）
-    // window_ok=0：owner 在 pending 存在时停止了 recv（修复后的正确行为）
-    // 把 window_ok 当前置条件会把「已修好」误判成「前提未成立」——这是判据错误。
+    /**
+     * 步骤 5b：观测「缺陷窗口是否出现」，用于解释结果，不作为执行前提。
+     * window_ok=1：C 在 pending 仍在时被 recv（旧行为下即 A+C+B 的成因）
+     * window_ok=0：owner 在 pending 存在时停止了 recv（修复后的正确行为）
+     * 把 window_ok 当前置条件会把「已修好」误判成「前提未成立」——这是判据错误。
+     */
     const bool window_ok = WaitUntil(
         [&] {
             return gate->read_hook_calls.load() >= 2 && gate->busy_hook_calls.load() == 1
@@ -425,24 +472,28 @@ Outcome RunInterleave(bool send_c, bool tight = false)
         },
         6000ms);
 
-    // 步骤 6：读回全部字节。
+    /**
+     * 步骤 6：读回全部字节。
+     */
     const std::size_t expected_size = send_c ? abc.size() : (a.size() + b.size());
     result.out = ReadBounded(*conn, engine, expected_size, 8000ms);
 
-    BOOST_TEST_MESSAGE("READ_HOOK_CALLS=" << gate->read_hook_calls.load()
-                                          << " BUSY_HOOK_CALLS=" << gate->busy_hook_calls.load()
-                                          << " SEAM_OBSERVED=" << (gate->seam_observed.load() ? 1 : 0)
-                                          << " WINDOW_OK=" << (window_ok ? 1 : 0)
-                                          << " PENDING_OBSERVED=" << gate->pending_observed.load());
-    BOOST_TEST_MESSAGE("BLOCK_ORDER=" << BlockOrder(result.out) << " ACTUAL_SIZE=" << result.out.size()
-                                      << " EXPECTED_SIZE=" << expected_size);
+    BOOST_TEST_MESSAGE(
+        "READ_HOOK_CALLS=" << gate->read_hook_calls.load() << " BUSY_HOOK_CALLS=" << gate->busy_hook_calls.load()
+                           << " SEAM_OBSERVED=" << (gate->seam_observed.load() ? 1 : 0) << " WINDOW_OK="
+                           << (window_ok ? 1 : 0) << " PENDING_OBSERVED=" << gate->pending_observed.load());
+    BOOST_TEST_MESSAGE(
+        "BLOCK_ORDER=" << BlockOrder(result.out) << " ACTUAL_SIZE=" << result.out.size()
+                       << " EXPECTED_SIZE=" << expected_size);
 
     EngineTestAccess::SetReadAppendHook(engine, std::function<void()>());
     EngineTestAccess::SetAppendBusyHook(engine, std::function<void()>());
     aux.join();
 
-    // 前提只要求「真的造出了 Busy→deferred 交错」；是否出现窗口属于被测行为，
-    // 由 fifo_ok/reordered 判定，不能拿来当前置。
+    /**
+     * 前提只要求「真的造出了 Busy→deferred 交错」；是否出现窗口属于被测行为，
+     * 由 fifo_ok/reordered 判定，不能拿来当前置。
+     */
     result.precondition_ok = gate->seam_observed.load() && !gate->aux_error.load();
     result.window_observed = window_ok;
     result.fifo_ok = (result.out == abc) || (!send_c && result.out == a + b);
@@ -456,12 +507,16 @@ Outcome RunInterleave(bool send_c, bool tight = false)
     return result;
 }
 
-} // namespace
+// clang-format off
+}
+// clang-format on
 
 BOOST_AUTO_TEST_SUITE(net_append_busy_hook)
 
-// 核心用例：pending 存在期间继续 recv 的数据不得越过 pending。
-// 未修产品上应观测到 A+C+B（本用例失败）；修复后必须 A+B+C。
+/**
+ * 核心用例：pending 存在期间继续 recv 的数据不得越过 pending。
+ * 未修产品上应观测到 A+C+B（本用例失败）；修复后必须 A+B+C。
+ */
 BOOST_AUTO_TEST_CASE(pending_not_flushed_before_next_recv)
 {
     const Outcome outcome = RunInterleave(true);
@@ -471,8 +526,10 @@ BOOST_AUTO_TEST_CASE(pending_not_flushed_before_next_recv)
     BOOST_CHECK(outcome.fifo_ok);
 }
 
-// 对照：B 走 deferred 但不继续 recv，读回必须是 A+B。
-// 用来把变量隔离到「pending 未合入前的下一次 recv」，而不是「存在 pending」。
+/**
+ * 对照：B 走 deferred 但不继续 recv，读回必须是 A+B。
+ * 用来把变量隔离到「pending 未合入前的下一次 recv」，而不是「存在 pending」。
+ */
 BOOST_AUTO_TEST_CASE(pending_without_next_recv_is_ordered)
 {
     const Outcome outcome = RunInterleave(false);
@@ -480,13 +537,19 @@ BOOST_AUTO_TEST_CASE(pending_without_next_recv_is_ordered)
     BOOST_CHECK(outcome.fifo_ok);
 }
 
-// 低水位边界：读方向总量界压到 49152（= A+B+C 总量），使 ReadLowWater 恰为
-// 49152。消费者读完全部数据后 ring.Size 才降到低水位，是「暂停能否解除」的
-// 最不利情况。若该场景下仍能读全 A+B+C，说明 m_read_paused 恢复路径有效，
-// 不会因 pending 暂停而永久卡住读泵。
+/**
+ * 低水位边界：读方向总量界压到 49152（= A+B+C 总量），使 ReadLowWater 恰为
+ * 49152。消费者读完全部数据后 ring.Size 才降到低水位，是「暂停能否解除」的
+ * 最不利情况。若该场景下仍能读全 A+B+C，说明 m_read_paused 恢复路径有效，
+ * 不会因 pending 暂停而永久卡住读泵。
+ */
 BOOST_AUTO_TEST_CASE(pending_pause_recovers_at_low_water)
 {
-    const Outcome outcome = RunInterleave(true, /*tight=*/true);
+
+    /**
+     * tight=
+     */
+    const Outcome outcome = RunInterleave(true, true);
     BOOST_REQUIRE_MESSAGE(outcome.precondition_ok, "交错前提未成立");
     BOOST_TEST_MESSAGE("BLOCK_ORDER=" << BlockOrder(outcome.out) << " ACTUAL_SIZE=" << outcome.out.size());
     BOOST_CHECK_MESSAGE(outcome.fifo_ok, "低水位边界下未读全全部字节：暂停恢复路径可能卡死读泵");
@@ -494,7 +557,9 @@ BOOST_AUTO_TEST_CASE(pending_pause_recovers_at_low_water)
 
 BOOST_AUTO_TEST_SUITE_END()
 
-// 替代 Boost.Test 自动 main：保留 net 测试的 _Exit 退出边界。
+/**
+ * 替代 Boost.Test 自动 main：保留 net 测试的 _Exit 退出边界。
+ */
 bool init_unit_test()
 {
     return true;
@@ -511,5 +576,9 @@ int main(int argc, char* argv[])
             final_code = 1;
         }
     }
-    std::_Exit(final_code); // 跳过静态析构/atexit 窗口
+
+    /**
+     * 跳过静态析构/atexit 窗口
+     */
+    std::_Exit(final_code);
 }

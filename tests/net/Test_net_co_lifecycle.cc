@@ -1,4 +1,6 @@
-// Co 入口快路径门禁与 native Engine 的非拥有观测回归。
+/**
+ * Co 入口快路径门禁与 native Engine 的非拥有观测回归。
+ */
 #define BOOST_TEST_MODULE net.co_lifecycle
 #include <boost/test/included/unit_test.hpp>
 
@@ -48,10 +50,17 @@ void OnCo(std::function<void()> action)
         submitted);
     BOOST_REQUIRE(submitted);
     if (future.wait_for(std::chrono::seconds(5)) != std::future_status::ready)
-        std::terminate(); // 超时不允许在途 action 借用已退出的用例栈。
+
+        /**
+         * 超时不允许在途 action 借用已退出的用例栈。
+         */
+        std::terminate();
     future.get();
 }
+
+// clang-format off
 }
+// clang-format on
 
 BOOST_FIXTURE_TEST_SUITE(co_lifecycle, Runtime)
 
@@ -71,8 +80,11 @@ BOOST_AUTO_TEST_CASE(non_co_dial_accept_have_no_submission)
     BOOST_CHECK(!accepted.reclaim.Valid());
     BOOST_CHECK(engine.Phase() == net::EnginePhase::Idle);
     BOOST_CHECK_EQUAL(engine.CountConnections(), 0U);
-    engine.RequestClose();
-    // 同一封口对象的 Co 调用返回真实终态，不再是上下文错误。
+    (void)engine.Close();
+
+    /**
+     * 同一封口对象的 Co 调用返回真实终态，不再是上下文错误。
+     */
     BOOST_CHECK(engine.CoAccept({}).error == std::errc::operation_not_permitted);
     OnCo([&] { BOOST_CHECK(engine.CoAccept({}).error == std::errc::operation_canceled); });
 }
@@ -95,7 +107,9 @@ BOOST_AUTO_TEST_CASE(non_co_connection_ready_paths_do_not_consume)
     BOOST_CHECK(after.write == before.write);
     BOOST_CHECK(!after.closed);
 
-    // fire 提交可在 native 域调用；等待票只从协程 Write 取得，仍遵守等待门禁。
+    /**
+     * fire 提交可在 native 域调用；等待票只从协程 Write 取得，仍遵守等待门禁。
+     */
     BOOST_REQUIRE(!connection.AsyncWrite(""));
     net::WriteOperation operation;
     OnCo([&] {
@@ -105,8 +119,8 @@ BOOST_AUTO_TEST_CASE(non_co_connection_ready_paths_do_not_consume)
     });
     BOOST_REQUIRE(operation.Valid());
     BOOST_CHECK(operation.Wait({}, nullptr) == std::errc::operation_not_permitted);
-    connection.RequestClose();
-    connection.RequestClose();
+    (void)connection.Close();
+    (void)connection.Close();
     BOOST_CHECK(connection.Status().closed);
     BOOST_CHECK(connection.WaitClosed({}) == std::errc::operation_not_permitted);
     OnCo([&] { BOOST_CHECK(!connection.WaitClosed({})); });
@@ -121,8 +135,8 @@ BOOST_AUTO_TEST_CASE(engine_observation_does_not_require_co_or_own_engine)
     const auto identity = engine->GetObjectInfo();
     BOOST_CHECK(identity.id != 0);
     BOOST_REQUIRE(co::GetCoObjectManager()->GetObjectInfo(identity.id));
-    engine->RequestClose();
-    engine->RequestClose();
+    (void)engine->Close();
+    (void)engine->Close();
     BOOST_CHECK_EQUAL(co::GetCoObjectStats("infra.net.Engine").alive, before.alive + 1);
     engine.reset();
     BOOST_CHECK(weak.expired());

@@ -14,8 +14,12 @@ result<void> MongoIoEngine::Start()
         return result<void>::err(MakeError(ErrorCode::RuntimeUnavailable, "coroutine shared io executor is empty"));
 
     std::lock_guard<std::mutex> lk(m_post_mtx);
+
+    /**
+     * 幂等：并发 Start 只建立一次
+     */
     if (m_io)
-        return result<void>::ok(); // 幂等：并发 Start 只建立一次
+        return result<void>::ok();
     m_io.emplace(ex);
     return result<void>::ok();
 }
@@ -114,4 +118,6 @@ result<bbt::coroutine::CoObjectInfo> NewObjectInfo(std::string kind)
     }
 }
 
-} // namespace bbt::infra::mongo_detail
+// clang-format off
+}
+// clang-format on

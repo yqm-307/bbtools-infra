@@ -32,7 +32,8 @@ const Error& result<void>::error() const&
     return *m_error;
 }
 
-result<void>::result(Error error) : m_error(std::move(error))
+result<void>::result(Error error)
+    : m_error(std::move(error))
 {
 }
 
@@ -60,12 +61,17 @@ result<void> ValidateErrorDetails(const Error& error)
             if (details[j].first == key)
                 return result<void>::err(MakeError(ErrorCode::ProtocolError, "error.details duplicate key"));
     }
-    // 上层域的保留键归属与格式由上层边界校验；infra 通用层只保证本函数的结构规则，
-    // 契约见 docs/decisions/0002-co-network-contract.md。
+
+    /**
+     * 上层域的保留键归属与格式由上层边界校验；infra 通用层只保证本函数的结构规则，
+     * 契约见 docs/decisions/0002-co-network-contract.md。
+     */
     return result<void>::ok();
 }
 
-} // namespace bbt::infra
+// clang-format off
+}
+// clang-format on
 
 namespace bbt::infra::detail {
 
@@ -114,4 +120,6 @@ bool IsValidUtf8(std::string_view s) noexcept
     return true;
 }
 
-} // namespace bbt::infra::detail
+// clang-format off
+}
+// clang-format on

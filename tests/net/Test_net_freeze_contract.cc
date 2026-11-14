@@ -1,23 +1,25 @@
-// net 最小 API 冻结契约测试（计划 / –）。
-//
-// 与 b4_contract / r2_tcp 的分工：这里只针对"冻结后的公共面"与取消的内部接缝
-// 做可判别回归，不重复业务往返。每个用例名对应计划 的一行场景：
-// guard_lifetime 守卫保活/唯一释放/移动/空守卫（Engine 收口后尾部）
-// co_context_gate 四个 Co 入口在非法执行域零消费/零提交/零建连
-// options_contract 保留字段边界 + 默认值（编译期删除由负向 TU 证明）
-// write_output_reuse 写输出只描述本次调用（含接纳后等待失败）
-// output_preservation 失败不覆盖调用者 out（CoRead/CoAccept/CoDial）
-// connect_delivery raw 单一交付：out_id/回调 once+相等/拒绝不变；
-// 早到交付用提交后屏障确定性制造（回调确在返回前）
-// connect_failure_cleanup 未交付退出全回收（建立失败/满额/超时/取消）
-// accept_configuration 无 handler 无 handoff 拒绝 + handler/handoff 共存
-//
-// 编译期"公共面不含 State/内部构造/测试屏障/旧等待 API"由
-// net.freeze_public_surface（tests/net/consumers/expect_public_surface.cmake +
-// consumers/public_surface_negative/neg_*.cc）以正向 TU 与逐项负向 TU 证明。
-// 本文件除公共头外只经 detail/TestAccess、detail/CoInternal、detail/EngineTestAccess
-// 注入交错与内部状态；这些接缝不回到公共面，也不被公共 consumer 引用。
 
+/**
+ * net 最小 API 冻结契约测试（计划 / –）。
+ *
+ * 与 b4_contract / r2_tcp 的分工：这里只针对"冻结后的公共面"与取消的内部接缝
+ * 做可判别回归，不重复业务往返。每个用例名对应计划 的一行场景：
+ * guard_lifetime 守卫保活/唯一释放/移动/空守卫（Engine 收口后尾部）
+ * co_context_gate 四个 Co 入口在非法执行域零消费/零提交/零建连
+ * options_contract 保留字段边界 + 默认值（编译期删除由负向 TU 证明）
+ * write_output_reuse 写输出只描述本次调用（含接纳后等待失败）
+ * output_preservation 失败不覆盖调用者 out（CoRead/CoAccept/CoDial）
+ * connect_delivery raw 单一交付：out_id/回调 once+相等/拒绝不变；
+ * 早到交付用提交后屏障确定性制造（回调确在返回前）
+ * connect_failure_cleanup 未交付退出全回收（建立失败/满额/超时/取消）
+ * accept_configuration 无 handler 无 handoff 拒绝 + handler/handoff 共存
+ *
+ * 编译期"公共面不含 State/内部构造/测试屏障/旧等待 API"由
+ * net.freeze_public_surface（tests/net/consumers/expect_public_surface.cmake +
+ * consumers/public_surface_negative/neg_*.cc）以正向 TU 与逐项负向 TU 证明。
+ * 本文件除公共头外只经 detail/TestAccess、detail/CoInternal、detail/EngineTestAccess
+ * 注入交错与内部状态；这些接缝不回到公共面，也不被公共 consumer 引用。
+ */
 #include <bbt/infra/net/CoTcpConnection.hpp>
 #include <bbt/infra/net/Engine.hpp>
 #include <bbt/infra/net/ICoConnection.hpp>
@@ -66,7 +68,9 @@
 using namespace bbt::infra::net;
 using namespace std::chrono_literals;
 
-// ---- 分配失败注入（仅本可执行文件；thread_local 只影响设置它的线程）----
+/**
+ * ---- 分配失败注入（仅本可执行文件；thread_local 只影响设置它的线程）----
+ */
 namespace {
 thread_local bool g_fail_alloc = false;
 }
@@ -82,22 +86,27 @@ void* operator new(std::size_t size)
     }
     return memory;
 }
+
 void* operator new[](std::size_t size)
 {
     return ::operator new(size);
 }
+
 void operator delete(void* memory) noexcept
 {
     std::free(memory);
 }
+
 void operator delete[](void* memory) noexcept
 {
     std::free(memory);
 }
+
 void operator delete(void* memory, std::size_t) noexcept
 {
     std::free(memory);
 }
+
 void operator delete[](void* memory, std::size_t) noexcept
 {
     std::free(memory);
@@ -109,6 +118,7 @@ static void Check(bool value, const char* expression, int line)
         throw std::runtime_error("line " + std::to_string(line) + ": " + expression);
     }
 }
+
 #define CHECK(expression) Check(static_cast<bool>(expression), #expression, __LINE__)
 
 static bbt::coroutine::WaitOptions Until(std::chrono::milliseconds duration)
@@ -178,25 +188,26 @@ struct EngineRunner {
     std::error_code error;
     std::thread thread;
 
-    EngineRunner(Engine& target, EngineConfig config) : engine(target)
+    EngineRunner(Engine& target, EngineConfig config)
+        : engine(target)
     {
         thread = std::thread([this, config]() mutable { error = engine.Run(config); });
     }
+
     bool WaitForReturn(std::chrono::milliseconds timeout)
     {
         return WaitUntil([&] { return engine.Phase() == EnginePhase::Stopped; }, timeout);
     }
+
     void CloseAndJoin()
     {
-        engine.RequestClose();
+        (void)engine.Close();
         if (thread.joinable()) {
             thread.join();
         }
     }
-    ~EngineRunner()
-    {
-        CloseAndJoin();
-    }
+
+    ~EngineRunner() { CloseAndJoin(); }
 };
 
 static EngineConfig ServerConfig(const Address& listen, std::size_t subs = 1)
@@ -243,9 +254,9 @@ static NativeSocket ConnectClient(const Address& address)
 
 struct NullHandler : RawHandler {};
 
-//
-// co_context_gate
-//
+/**
+ * co_context_gate
+ */
 namespace {
 
 struct GateProbe {
@@ -258,10 +269,12 @@ struct GateProbe {
     std::string read_out;
 };
 
-// 在给定调用域内跑四个 Co 入口；调用者预先放好"快路径"条件（有数据/零长写/
-// 已就绪 handoff 队列），从而证明拒绝发生在消费/提交/出队之前。
-GateProbe RunAllCoEntries(Connection& connection, Engine& accept_engine, Engine& dial_engine,
-                          const Address& dial_address)
+/**
+ * 在给定调用域内跑四个 Co 入口；调用者预先放好"快路径"条件（有数据/零长写/
+ * 已就绪 handoff 队列），从而证明拒绝发生在消费/提交/出队之前。
+ */
+GateProbe
+RunAllCoEntries(Connection& connection, Engine& accept_engine, Engine& dial_engine, const Address& dial_address)
 {
     GateProbe probe;
     CoTcpConnection co_conn{connection};
@@ -292,16 +305,29 @@ void CheckGateProbe(const GateProbe& probe, const char* domain)
     CHECK(probe.outcome.sent == 0);
     CHECK(probe.outcome.error == not_permitted);
     CHECK(!probe.operation_valid);
-    CHECK(probe.read_out.empty()); // CoRead 失败不改 out
+
+    /**
+     * CoRead 失败不改 out
+     */
+    CHECK(probe.read_out.empty());
     std::cout << "co_context_gate domain=" << domain << " all=operation_not_permitted\n";
 }
 
-} // namespace
+// clang-format off
+}
+// clang-format on
 
 static void CoContextGate()
 {
-    StartRuntime(4); // server 占 main+1 sub，host 另占 1 sub
-    // 服务端：handler + handoff，用来观察"已就绪 accept 是否被出队"。
+
+    /**
+     * server 占 main+1 sub，host 另占 1 sub
+     */
+    StartRuntime(4);
+
+    /**
+     * 服务端：handler + handoff，用来观察"已就绪 accept 是否被出队"。
+     */
     auto handler = std::make_shared<NullHandler>();
     Engine server(handler);
     CHECK(!server.EnableAcceptHandoff(4));
@@ -310,13 +336,17 @@ static void CoContextGate()
     std::vector<Address> server_addresses;
     CHECK(!server.LocalAddresses(server_addresses));
 
-    // client-only + handoff：用于非法域 CoAccept（无 main owner → not_supported 是
-    // 合法域下的结果，这里只关心 gate 先行，所以另建一个已配置 handoff 的 server）。
+    /**
+     * client-only + handoff：用于非法域 CoAccept（无 main owner → not_supported 是
+     * 合法域下的结果，这里只关心 gate 先行，所以另建一个已配置 handoff 的 server）。
+     */
     Engine host{std::shared_ptr<RawHandler>()};
     EngineRunner host_runner(host, ClientConfig());
     CHECK(WaitUntil([&] { return host.Phase() == EnginePhase::Running; }, 3000ms));
 
-    // 连接真源：ring 里已有数据 + 一个活动写操作（任何提交都会推进 ActiveOpCount）。
+    /**
+     * 连接真源：ring 里已有数据 + 一个活动写操作（任何提交都会推进 ActiveOpCount）。
+     */
     auto state = std::make_shared<ConnectionState>(7, 4096, 1024, 4, nullptr);
     CHECK(state->ring.TryAppend("pending-bytes").status == ReadStatus::Ok);
     Connection connection = ConnectionTestAccess::Make(state);
@@ -326,25 +356,31 @@ static void CoContextGate()
     const std::size_t ops_before = state->ActiveOpCount();
     const auto queue_before = state->ring.AccessGeneration();
 
-    // 让 handoff 队列里真实有一个已接纳连接（否则"不出队"无法判别）。
+    /**
+     * 让 handoff 队列里真实有一个已接纳连接（否则"不出队"无法判别）。
+     */
     auto client = ConnectClient(server_addresses[0]);
     CHECK(WaitUntil([&] { return server.CountConnections() >= 1; }, 3000ms));
 
     const auto connect_table_before = EngineTestAccess::ConnectTableSize(host);
 
-    // 域 1：普通线程（未启动 TLS 的调用线程）。
+    /**
+     * 域 1：普通线程（未启动 TLS 的调用线程）。
+     */
     CheckGateProbe(RunAllCoEntries(connection, server, host, server_addresses[0]), "plain_thread");
 
-    // 域 2：runtime 已启动、本线程显式开启 TLS 协程使用，但仍未持有协程上下文
-    // （idle：LocalThread 允许用协程，GetLocalCoroutineId 仍为 0）。与域 1 的
-    // 区别是可判别事实：TLS 开关为 true，gate 仍须按 coroutine_id 拒绝。
+    /**
+     * 域 2：runtime 已启动、本线程显式开启 TLS 协程使用，但仍未持有协程上下文
+     * （idle：LocalThread 允许用协程，GetLocalCoroutineId 仍为 0）。与域 1 的
+     * 区别是可判别事实：TLS 开关为 true，gate 仍须按 coroutine_id 拒绝。
+     */
     std::exception_ptr idle_thread_error;
     std::thread idle_thread([&] {
         try {
             bbt::coroutine::detail::LocalThread::GetTLSInst()->SetEnableUseCo(true);
             CHECK(bbt::coroutine::GetLocalCoroutineId() == 0);
-            CheckGateProbe(RunAllCoEntries(connection, server, host, server_addresses[0]),
-                           "runtime_idle_thread_tls_enabled");
+            CheckGateProbe(
+                RunAllCoEntries(connection, server, host, server_addresses[0]), "runtime_idle_thread_tls_enabled");
         } catch (...) {
             idle_thread_error = std::current_exception();
         }
@@ -354,15 +390,17 @@ static void CoContextGate()
         std::rethrow_exception(idle_thread_error);
     }
 
-    // 域 3：raw owner 回调同域（非业务协程）。**这是模拟**：raw 回调在 owner 的
-    // 非协程边界执行，这里用一个不持协程上下文的普通线程复现同一判定，避免向
-    // 产品面加测试回调钩子；它不证明 owner 线程的其它属性（TLS 开关、线程名）。
+    /**
+     * 域 3：raw owner 回调同域（非业务协程）。**这是模拟**：raw 回调在 owner 的
+     * 非协程边界执行，这里用一个不持协程上下文的普通线程复现同一判定，避免向
+     * 产品面加测试回调钩子；它不证明 owner 线程的其它属性（TLS 开关、线程名）。
+     */
     std::exception_ptr owner_like_error;
     std::thread owner_like([&] {
         try {
             CHECK(bbt::coroutine::GetLocalCoroutineId() == 0);
-            CheckGateProbe(RunAllCoEntries(connection, server, host, server_addresses[0]),
-                           "owner_callback_domain_simulated");
+            CheckGateProbe(
+                RunAllCoEntries(connection, server, host, server_addresses[0]), "owner_callback_domain_simulated");
         } catch (...) {
             owner_like_error = std::current_exception();
         }
@@ -372,27 +410,37 @@ static void CoContextGate()
         std::rethrow_exception(owner_like_error);
     }
 
-    // 零副作用：数据未消费、无新活动写、handoff 队列未被弹走、零新建连。
+    /**
+     * 零副作用：数据未消费、无新活动写、handoff 队列未被弹走、零新建连。
+     */
     CHECK(state->ring.Size() == ring_before);
     CHECK(state->ActiveOpCount() == ops_before);
     CHECK(state->ring.AccessGeneration() == queue_before);
     CHECK(EngineTestAccess::ConnectTableSize(host) == connect_table_before);
     CHECK(host.CountConnections() == 0);
-    CHECK(server.CountConnections() >= 1); // 队列里的连接仍在
 
-    // 已就绪 handoff 仍可被合法域（协程）取走：证明拒绝路径零出队。
+    /**
+     * 队列里的连接仍在
+     */
+    CHECK(server.CountConnections() >= 1);
+
+    /**
+     * 已就绪 handoff 仍可被合法域（协程）取走：证明拒绝路径零出队。
+     */
     std::atomic<int> accepted{-1};
     auto task = Task([&] {
         auto res = server.CoAccept(Until(3000ms));
         if (!res.error && res.connection.Valid()) {
             accepted.store(1);
-            res.connection.RequestClose();
+            (void)res.connection.Close();
         }
     });
     Get(task);
     CHECK(accepted.load() == 1);
 
-    // 受管协程正向对照：同样四个入口在合法域成功（CoDial 到 server 地址）。
+    /**
+     * 受管协程正向对照：同样四个入口在合法域成功（CoDial 到 server 地址）。
+     */
     std::atomic<int> positive{-1};
     auto positive_task = Task([&] {
         auto pos_state = std::make_shared<ConnectionState>(8, 4096, 1024, 4, nullptr);
@@ -407,7 +455,10 @@ static void CoContextGate()
         if (out != "in-domain") {
             return;
         }
-        // 已接纳后无 owner 推进：允许 timed_out + InFlight（本次 op 有效可查）。
+
+        /**
+         * 已接纳后无 owner 推进：允许 timed_out + InFlight（本次 op 有效可查）。
+         */
         const auto report = co_pos.Write("x", Until(300ms));
         const auto write_error = report.wait_error;
         const auto outcome = report.outcome;
@@ -422,7 +473,7 @@ static void CoContextGate()
         if (res.error || !res.connection.Valid()) {
             return;
         }
-        res.connection.RequestClose();
+        (void)res.connection.Close();
         positive.store(1);
     });
     Get(positive_task);
@@ -434,12 +485,15 @@ static void CoContextGate()
     std::cout << "co_context_gate positive_control=ok queue_preserved=ok\n";
 }
 
-//
-// options_contract（编译期删除项在 net.freeze_public_surface 负向 TU）
-//
+/**
+ * options_contract（编译期删除项在 net.freeze_public_surface 负向 TU）
+ */
 static void OptionsContract()
 {
-    // 默认：loop=1（不做 CPU 推导）、总量界 1MiB、pending 1024、keepalive 关闭。
+
+    /**
+     * 默认：loop=1（不做 CPU 推导）、总量界 1MiB、pending 1024、keepalive 关闭。
+     */
     NormalizedOptions defaults;
     CHECK(!NormalizeOptions(Options{}, defaults));
     CHECK(defaults.num_event_loop == 1);
@@ -455,7 +509,9 @@ static void OptionsContract()
     CHECK(!defaults.reuse_addr);
     CHECK(!defaults.reuse_port);
 
-    // 显式 loop 与负值（失败不改 out）。
+    /**
+     * 显式 loop 与负值（失败不改 out）。
+     */
     {
         Options options;
         options.num_event_loop = 3;
@@ -474,14 +530,21 @@ static void OptionsContract()
         CHECK(out.max_pending_events == 4321);
     }
 
-    // num_event_loop 的可表示范围：只断言本平台真能表达的结论，不机械复制
-    // "32 位也拒绝"。64 位下 int64 正值都能用 size_t 表示，归一化不设固定上界。
+/**
+ * num_event_loop 的可表示范围：只断言本平台真能表达的结论，不机械复制
+ * "32 位也拒绝"。64 位下 int64 正值都能用 size_t 表示，归一化不设固定上界。
+ */
 #if SIZE_MAX < UINT64_MAX
-    // 32 位目标：int64 正值不能全部用 size_t 表示，server 还要额外 +1 main 槽，
-    // 所以归一化必须拒绝，且失败路径不改 out。
+
+    /**
+     * 32 位目标：int64 正值不能全部用 size_t 表示，server 还要额外 +1 main 槽，
+     * 所以归一化必须拒绝，且失败路径不改 out。
+     */
     {
-        const std::int64_t unusable[] = {static_cast<std::int64_t>(std::numeric_limits<std::size_t>::max()),
-                                         std::int64_t{1} << 62, std::numeric_limits<std::int64_t>::max()};
+        const std::int64_t unusable[] = {
+            static_cast<std::int64_t>(std::numeric_limits<std::size_t>::max()),
+            std::int64_t{1} << 62,
+            std::numeric_limits<std::int64_t>::max()};
         for (const auto loops_value : unusable) {
             Options options;
             options.num_event_loop = loops_value;
@@ -494,7 +557,10 @@ static void OptionsContract()
         }
     }
 #else
-    // 64 位目标：归一化接受，worker 槽不足属运行期资源事实，由 Engine::Run 拒绝。
+
+    /**
+     * 64 位目标：归一化接受，worker 槽不足属运行期资源事实，由 Engine::Run 拒绝。
+     */
     {
         Options options;
         options.num_event_loop = std::numeric_limits<std::int64_t>::max();
@@ -504,7 +570,9 @@ static void OptionsContract()
     }
 #endif
 
-    // 资源界 0 / 1 / 4096 / 超范围：小值必须可用（旧 cap 交叉校验已删除）。
+    /**
+     * 资源界 0 / 1 / 4096 / 超范围：小值必须可用（旧 cap 交叉校验已删除）。
+     */
     const auto bounds = [](std::int64_t inbound, std::int64_t outbound, std::int64_t events) {
         Options options;
         options.max_inbound_bytes = inbound;
@@ -524,13 +592,18 @@ static void OptionsContract()
         Options options;
         options.max_pending_events = std::numeric_limits<std::int64_t>::max();
         NormalizedOptions out;
-        // 64 位平台上 int64 max 恰好落在 size_t 范围内：合法且不截断。
+
+        /**
+         * 64 位平台上 int64 max 恰好落在 size_t 范围内：合法且不截断。
+         */
         const auto error = NormalizeOptions(options, out);
         CHECK(!error);
         CHECK(out.max_pending_events == static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()));
     }
 
-    // keepalive：默认 interval=idle/5、count=5、最小 1s；非法值逐项拒绝。
+    /**
+     * keepalive：默认 interval=idle/5、count=5、最小 1s；非法值逐项拒绝。
+     */
     {
         Options options;
         options.tcp_keep_alive = std::chrono::seconds{11};
@@ -565,16 +638,21 @@ static void OptionsContract()
         CHECK(NormalizeOptions(options, out) == std::make_error_code(std::errc::result_out_of_range));
     }
     {
-        // 合法枚举原样保留；非法枚举拒绝（不再有 LogLevel 这类占位字段）。
+
+        /**
+         * 合法枚举原样保留；非法枚举拒绝（不再有 LogLevel 这类占位字段）。
+         */
         Options options;
         options.lb = static_cast<LoadBalancing>(42);
         NormalizedOptions out;
         CHECK(NormalizeOptions(options, out) == std::make_error_code(std::errc::invalid_argument));
     }
 
-    // 极端 num_event_loop 经真实 Engine::Run：必须返回错误而不是抛异常，且 phase
-    // 落在 Stopped（旧行为抛 std::length_error 并停在 Starting，Engine 永久作废）。
-    // 客户端（无 main 槽）与服务端（合法 handler + handoff，多一个 main 槽）各跑一遍。
+    /**
+     * 极端 num_event_loop 经真实 Engine::Run：必须返回错误而不是抛异常，且 phase
+     * 落在 Stopped（旧行为抛 std::length_error 并停在 Starting，Engine 永久作废）。
+     * 客户端（无 main 槽）与服务端（合法 handler + handoff，多一个 main 槽）各跑一遍。
+     */
     StartRuntime(2);
     const auto extreme_config = [](bool as_server, std::int64_t loops) {
         EngineConfig config;
@@ -618,8 +696,10 @@ static void OptionsContract()
         }
     }
 
-    // 正对照：同一 runtime 上普通客户端仍能启动 —— 极端值失败没有留下 driver 占用
-    // （拒绝发生在 reserve/登记之前，走既有 fail 回滚）。
+    /**
+     * 正对照：同一 runtime 上普通客户端仍能启动 —— 极端值失败没有留下 driver 占用
+     * （拒绝发生在 reserve/登记之前，走既有 fail 回滚）。
+     */
     {
         Engine normal{std::shared_ptr<RawHandler>()};
         EngineRunner normal_runner(normal, ClientConfig());
@@ -629,9 +709,9 @@ static void OptionsContract()
     std::cout << "options_contract defaults/bounds/keepalive/extreme_loop=ok\n";
 }
 
-//
-// write_output_reuse
-//
+/**
+ * write_output_reuse
+ */
 static void WriteOutputReuse()
 {
     StartRuntime(1);
@@ -640,24 +720,41 @@ static void WriteOutputReuse()
     auto sink = [](const std::string_view* views, std::size_t, std::size_t budget) -> ssize_t {
         return static_cast<ssize_t>(std::min(views[0].size(), budget));
     };
-    // 1) 先取得一次真实成功的结果，把它留在 outcome/operation 里（复用变量的起点）。
+
+    /**
+     * 1) 先取得一次真实成功的结果，把它留在 outcome/operation 里（复用变量的起点）。
+     */
     std::shared_ptr<WriteOpRecord> done_record;
-    CHECK(!state->AcceptWrite("hello", done_record)); // 真实接纳路径
+
+    /**
+     * 真实接纳路径
+     */
+    CHECK(!state->AcceptWrite("hello", done_record));
     state->PumpWrites(8, 4096, sink);
     CHECK(ConnectionTestAccess::MakeWrite(done_record).Query().phase == WritePhase::Done);
 
     std::atomic<int> result{-1};
-    std::atomic<int> progress{0}; // 失败时定位到具体步骤
+
+    /**
+     * 失败时定位到具体步骤
+     */
+    std::atomic<int> progress{0};
     auto task = Task([&] {
         WriteOutcome outcome = ConnectionTestAccess::MakeWrite(done_record).Query();
         WriteOperation operation = ConnectionTestAccess::MakeWrite(done_record);
         if (outcome.phase != WritePhase::Done || outcome.sent != 5 || !operation.Valid() || outcome.error) {
-            return; // 起点不成立，后面的"覆盖"就没有判别力
+
+            /**
+             * 起点不成立，后面的"覆盖"就没有判别力
+             */
+            return;
         }
         const auto first_id = operation.Id();
         progress.store(2);
 
-        // 2) 无效连接：必须覆盖为本次 Rejected + op 无效，不泄露上次 Done。
+        /**
+         * 2) 无效连接：必须覆盖为本次 Rejected + op 无效，不泄露上次 Done。
+         */
         Connection invalid;
         const auto invalid_report = CoTcpConnection{invalid}.Write("x", Until(50ms));
         const auto invalid_error = invalid_report.wait_error;
@@ -668,7 +765,9 @@ static void WriteOutputReuse()
             return;
         }
 
-        // 3) 超大写（> max_outbound_bytes）：Rejected/no_buffer_space，op 无效。
+        /**
+         * 3) 超大写（> max_outbound_bytes）：Rejected/no_buffer_space，op 无效。
+         */
         progress.store(4);
         const std::string oversized(257, 'o');
         const auto oversized_report = CoTcpConnection{connection}.Write(oversized, Until(500ms));
@@ -680,7 +779,9 @@ static void WriteOutputReuse()
             return;
         }
 
-        // 4) 已封口连接：Rejected/Closed，op 无效。
+        /**
+         * 4) 已封口连接：Rejected/Closed，op 无效。
+         */
         progress.store(5);
         Connection closed_conn = ConnectionTestAccess::Make(state);
         state->MarkClosed(std::make_error_code(std::errc::operation_canceled));
@@ -702,7 +803,9 @@ static void WriteOutputReuse()
     }
     CHECK(result.load() == 0);
 
-    // 5) 接纳后等待失败保留本次 op：无 owner 推进的 state 上必然超时且在途。
+    /**
+     * 5) 接纳后等待失败保留本次 op：无 owner 推进的 state 上必然超时且在途。
+     */
     {
         auto in_flight_state = std::make_shared<ConnectionState>(2, 4096, 4096, 16, nullptr);
         Connection in_flight = ConnectionTestAccess::Make(in_flight_state);
@@ -721,7 +824,9 @@ static void WriteOutputReuse()
         CHECK(inflight_result.load() == 0);
     }
 
-    // 6) Write 的接纳分配失败：not_enough_memory → 本次 Rejected + op 无效。
+    /**
+     * 6) Write 的接纳分配失败：not_enough_memory → 本次 Rejected + op 无效。
+     */
     {
         auto alloc_state = std::make_shared<ConnectionState>(3, 4096, 4096, 4, nullptr);
         Connection alloc_conn = ConnectionTestAccess::Make(alloc_state);
@@ -743,12 +848,18 @@ static void WriteOutputReuse()
         CHECK(alloc_result.load() == 0);
     }
 
-    // 7) 容量等待名额满（hub 256）：Rejected/no_buffer_space，零接纳、op 无效。
+    /**
+     * 7) 容量等待名额满（hub 256）：Rejected/no_buffer_space，零接纳、op 无效。
+     */
     {
         auto full_state = std::make_shared<ConnectionState>(4, 4096, 4, 4, nullptr);
         Connection full_conn = ConnectionTestAccess::Make(full_state);
         std::shared_ptr<WriteOpRecord> warm_record;
-        CHECK(!full_state->AcceptWrite("warm", warm_record)); // 占满 outbound=8
+
+        /**
+         * 占满 outbound=8
+         */
+        CHECK(!full_state->AcceptWrite("warm", warm_record));
         std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>> keep;
         for (std::size_t i = 0; i < WakeHub::kMaxWaiters; ++i) {
             auto waiter = full_state->CreateWriteWaiter();
@@ -768,11 +879,17 @@ static void WriteOutputReuse()
         });
         Get(full_task);
         CHECK(full_result.load() == 0);
-        CHECK(full_state->ActiveOpCount() == 1); // 只有 warm 被接纳
+
+        /**
+         * 只有 warm 被接纳
+         */
+        CHECK(full_state->ActiveOpCount() == 1);
     }
 
-    // 8) Done + error（失败结算）与等待错误分开：等待返回空表示本地终态，
-    // outcome.error 才是发送结果。用 EPIPE sink 制造真实写失败。
+    /**
+     * 8) Done + error（失败结算）与等待错误分开：等待返回空表示本地终态，
+     * outcome.error 才是发送结果。用 EPIPE sink 制造真实写失败。
+     */
     {
         auto failed_state = std::make_shared<ConnectionState>(4, 4096, 4096, 4, nullptr);
         Connection failed_conn = ConnectionTestAccess::Make(failed_state);
@@ -790,8 +907,11 @@ static void WriteOutputReuse()
             const auto wait_error = report.wait_error;
             const auto outcome = report.outcome;
             const auto operation = report.operation;
-            // 本地完成路径：等待正常结束（wait_error 为空），发送错误落在
-            // outcome.error（EPIPE）；这与"等待超时但仍在途"是不同的两个结果。
+
+            /**
+             * 本地完成路径：等待正常结束（wait_error 为空），发送错误落在
+             * outcome.error（EPIPE）；这与"等待超时但仍在途"是不同的两个结果。
+             */
             if (!wait_error && outcome.phase == WritePhase::Done && outcome.error.value() == EPIPE && outcome.sent == 0
                 && operation.Valid()) {
                 failed_result.store(0);
@@ -804,13 +924,16 @@ static void WriteOutputReuse()
     std::cout << "write_output_reuse invalid/oversize/closed/wait_fail/done_error=ok\n";
 }
 
-//
-// output_preservation
-//
+/**
+ * output_preservation
+ */
 static void OutputPreservation()
 {
     StartRuntime(2);
-    // 1) CoRead 超时不消费、不改非空 out。
+
+    /**
+     * 1) CoRead 超时不消费、不改非空 out。
+     */
     {
         auto state = std::make_shared<ConnectionState>(1, 4096, 1024, 4, nullptr);
         Connection connection = ConnectionTestAccess::Make(state);
@@ -829,7 +952,10 @@ static void OutputPreservation()
         CHECK(result.load() == 0);
         CHECK(state->ring.Size() == 0);
     }
-    // 2) Read 的快照或输出 Buffer 分配失败：out 与 ring 双不变（强保证）。
+
+    /**
+     * 2) Read 的快照或输出 Buffer 分配失败：out 与 ring 双不变（强保证）。
+     */
     {
         auto state = std::make_shared<ConnectionState>(2, 4096, 1024, 4, nullptr);
         CHECK(state->ring.TryAppend("payload").status == ReadStatus::Ok);
@@ -845,14 +971,21 @@ static void OutputPreservation()
                     read_data.AppendTo(*out);
                 }
             } catch (const std::bad_alloc&) {
-                g_fail_alloc = false; // 分配失败未交付任何数据，等价 Error 路径
+
+                /**
+                 * 分配失败未交付任何数据，等价 Error 路径
+                 */
+                g_fail_alloc = false;
             }
         });
         Get(task);
         CHECK(*out == "existing");
         CHECK(state->ring.Size() == 7);
     }
-    // 3) CoAccept 失败不覆盖调用者已有 Connection（未启用 handoff → 立即拒绝）。
+
+    /**
+     * 3) CoAccept 失败不覆盖调用者已有 Connection（未启用 handoff → 立即拒绝）。
+     */
     {
         auto stack_handler = std::make_shared<NullHandler>();
         Engine engine(stack_handler);
@@ -875,14 +1008,21 @@ static void OutputPreservation()
         CHECK(result.load() == 0);
         runner.CloseAndJoin();
     }
-    // 4) CoDial 失败（无监听对端）不覆盖调用者已有 Connection 且连接仍可用。
+
+    /**
+     * 4) CoDial 失败（无监听对端）不覆盖调用者已有 Connection 且连接仍可用。
+     */
     {
         Engine host{std::shared_ptr<RawHandler>()};
         EngineRunner runner(host, ClientConfig());
         CHECK(WaitUntil([&] { return host.Phase() == EnginePhase::Running; }, 3000ms));
         Address dead;
         auto dead_listener = MakeListener(dead);
-        CHECK(!dead_listener.Close()); // 已关闭的监听地址：连接必然失败
+
+        /**
+         * 已关闭的监听地址：连接必然失败
+         */
+        CHECK(!dead_listener.Close());
 
         auto original_state = std::make_shared<ConnectionState>(10, 1024, 1024, 4, nullptr);
         CHECK(original_state->ring.TryAppend("kept").status == ReadStatus::Ok);
@@ -904,9 +1044,9 @@ static void OutputPreservation()
     std::cout << "output_preservation read/accept/dial=ok\n";
 }
 
-//
-// connect_delivery
-//
+/**
+ * connect_delivery
+ */
 static void ConnectDelivery()
 {
     StartRuntime(2);
@@ -942,12 +1082,14 @@ static void ConnectDelivery()
             }
             if (connection.Valid()) {
                 success.fetch_add(1);
-                connection.RequestClose();
+                (void)connection.Close();
             }
         }
     };
 
-    // 1) raw 成功：非零 id、回调恰一次、operation == out_id。
+    /**
+     * 1) raw 成功：非零 id、回调恰一次、operation == out_id。
+     */
     {
         auto handler = std::make_shared<Recorder>();
         Engine client(handler);
@@ -958,7 +1100,11 @@ static void ConnectDelivery()
         CHECK(id != 0);
         handler->submit_returned.store(true);
         CHECK(WaitUntil([&] { return handler->calls.load() == 1; }, 3000ms));
-        CHECK(handler->last_operation.load() == id); // 以回调自带 operation 关联
+
+        /**
+         * 以回调自带 operation 关联
+         */
+        CHECK(handler->last_operation.load() == id);
         CHECK(handler->success.load() == 1);
         CHECK(handler->operations.size() == 1);
         CHECK(WaitUntil([&] { return EngineTestAccess::ConnectTableSize(client) == 0; }, 2000ms));
@@ -969,9 +1115,11 @@ static void ConnectDelivery()
                   << " callback_before_return=" << (handler->callback_before_return.load() ? 1 : 0) << '\n';
     }
 
-    // 1b) 早到交付交错（确定性）：提交已成功 TryPost 但尚未写 out_id 时，用内部
-    // 屏障在提交线程内等 owner 完成 OnConnect 回调；返回后断言回调恰一次、
-    // 回调 operation == 最终 out_id、且确实发生在返回之前（不再靠竞速观察）。
+    /**
+     * 1b) 早到交付交错（确定性）：提交已成功 TryPost 但尚未写 out_id 时，用内部
+     * 屏障在提交线程内等 owner 完成 OnConnect 回调；返回后断言回调恰一次、
+     * 回调 operation == 最终 out_id、且确实发生在返回之前（不再靠竞速观察）。
+     */
     {
         auto handler = std::make_shared<Recorder>();
         Engine client(handler);
@@ -981,21 +1129,44 @@ static void ConnectDelivery()
         std::atomic<bool> barrier_entered{false};
         EngineTestAccess::SetConnectSubmitBarrierOnce(client, [&] {
             barrier_entered.store(true);
-            // 屏障在 TryPost 之后、写 out_id 之前：owner 可自由推进并回调。
+
+            /**
+             * 屏障在 TryPost 之后、写 out_id 之前：owner 可自由推进并回调。
+             */
             const bool fired = WaitUntil([&] { return handler->calls.load() >= 1; }, 3000ms);
             callback_inside_barrier.store(fired);
         });
         const std::uint64_t sentinel = 0x5a5a;
         std::uint64_t id = sentinel;
         CHECK(!client.AsyncConnect(address, id));
-        CHECK(barrier_entered.load());         // 屏障真的被调用（否则本用例无判别力）
-        CHECK(callback_inside_barrier.load()); // 回调确实先于提交返回
+
+        /**
+         * 屏障真的被调用（否则本用例无判别力）
+         */
+        CHECK(barrier_entered.load());
+
+        /**
+         * 回调确实先于提交返回
+         */
+        CHECK(callback_inside_barrier.load());
         CHECK(handler->callback_before_return.load());
-        CHECK(id != 0); // 返回时 out_id 已写入
+
+        /**
+         * 返回时 out_id 已写入
+         */
+        CHECK(id != 0);
         CHECK(id != sentinel);
         CHECK(WaitUntil([&] { return handler->calls.load() == 1; }, 3000ms));
-        CHECK(handler->calls.load() == 1);           // 恰一次（屏障内没有重复派发）
-        CHECK(handler->last_operation.load() == id); // operation == 最终 out_id
+
+        /**
+         * 恰一次（屏障内没有重复派发）
+         */
+        CHECK(handler->calls.load() == 1);
+
+        /**
+         * operation == 最终 out_id
+         */
+        CHECK(handler->last_operation.load() == id);
         CHECK(handler->success.load() == 1);
         std::lock_guard<std::mutex> lock(handler->mutex);
         CHECK(handler->operations.size() == 1);
@@ -1004,25 +1175,37 @@ static void ConnectDelivery()
                   << " calls=1 operation_matches_out_id=1" << std::endl;
     }
     {
-        // 同一屏障的负对照：不武装时回调不在返回前（保证 1b 的"先于返回"不是
-        // 由本用例环境天然成立而无法判别）。
+
+        /**
+         * 同一屏障的负对照：不武装时回调不在返回前（保证 1b 的"先于返回"不是
+         * 由本用例环境天然成立而无法判别）。
+         */
         auto handler = std::make_shared<Recorder>();
         Engine client(handler);
         EngineRunner runner(client, ClientConfig());
         CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
-        // 300ms 只为让"回调晚于返回"稳定成立（负对照比对的是先后关系，不是耗时上限）。
+
+        /**
+         * 300ms 只为让"回调晚于返回"稳定成立（负对照比对的是先后关系，不是耗时上限）。
+         */
         EngineTestAccess::SetConnectDeliveryDelay(client, std::chrono::milliseconds(300));
         std::uint64_t id = 0;
         CHECK(!client.AsyncConnect(address, id));
         CHECK(id != 0);
         handler->submit_returned.store(true);
-        CHECK(!handler->callback_before_return.load()); // 负对照：未武装时不会早到
+
+        /**
+         * 负对照：未武装时不会早到
+         */
+        CHECK(!handler->callback_before_return.load());
         CHECK(WaitUntil([&] { return handler->calls.load() == 1; }, 3000ms));
         CHECK(handler->last_operation.load() == id);
     }
 
-    // 1c) raw 投递失败（零接纳）：与真实 post 失败同一段回滚——out_id 不变、
-    // 零表项、零回调；下一次提交走真实路径并正常交付。
+    /**
+     * 1c) raw 投递失败（零接纳）：与真实 post 失败同一段回滚——out_id 不变、
+     * 零表项、零回调；下一次提交走真实路径并正常交付。
+     */
     {
         auto handler = std::make_shared<Recorder>();
         Engine client(handler);
@@ -1032,14 +1215,26 @@ static void ConnectDelivery()
         const std::uint64_t sentinel = 0x2b2b;
         std::uint64_t id = sentinel;
         CHECK(client.AsyncConnect(address, id) == std::make_error_code(std::errc::operation_canceled));
-        CHECK(id == sentinel); // 拒绝不改 out_id
+
+        /**
+         * 拒绝不改 out_id
+         */
+        CHECK(id == sentinel);
         CHECK(EngineTestAccess::ConnectTableSize(client) == 0);
-        CHECK(handler->calls.load() == 0); // 零回调
+
+        /**
+         * 零回调
+         */
+        CHECK(handler->calls.load() == 0);
         CHECK(client.CountConnections() == 0);
         EngineTestAccess::ClearConnectInjection(client);
         std::uint64_t recovered = 0;
         CHECK(!client.AsyncConnect(address, recovered));
-        CHECK(recovered != 0); // 名额/op 槽未被消耗
+
+        /**
+         * 名额/op 槽未被消耗
+         */
+        CHECK(recovered != 0);
         CHECK(WaitUntil([&] { return handler->calls.load() == 1; }, 3000ms));
         CHECK(handler->last_operation.load() == recovered);
         CHECK(handler->success.load() == 1);
@@ -1048,8 +1243,10 @@ static void ConnectDelivery()
         CHECK(!runner.error);
     }
 
-    // 1d) raw 在 Idle（从未 Run）阶段提交：明确拒绝、out_id 不变、零回调；
-    // 正对照：同一 Engine 正常 Run 后提交成功交付。
+    /**
+     * 1d) raw 在 Idle（从未 Run）阶段提交：明确拒绝、out_id 不变、零回调；
+     * 正对照：同一 Engine 正常 Run 后提交成功交付。
+     */
     {
         auto handler = std::make_shared<Recorder>();
         Engine client(handler);
@@ -1072,8 +1269,10 @@ static void ConnectDelivery()
         CHECK(handler->operations.size() == 1);
     }
 
-    // 1e) raw 真实建连失败（对端监听已关闭）：恰一次失败回调，operation 与
-    // out_id 相等，无连接进入 Engine，表项回收。
+    /**
+     * 1e) raw 真实建连失败（对端监听已关闭）：恰一次失败回调，operation 与
+     * out_id 相等，无连接进入 Engine，表项回收。
+     */
     {
         auto handler = std::make_shared<Recorder>();
         Engine client(handler);
@@ -1087,10 +1286,17 @@ static void ConnectDelivery()
         CHECK(id != 0);
         handler->submit_returned.store(true);
         CHECK(WaitUntil([&] { return handler->calls.load() >= 1; }, 3000ms));
-        // owner 先派发回调、再 ResolveConnect 擦表项：等表项回收即可确定回调动
-        // 作已完成，无需"睡一段再看"这种不受控等待。
+
+        /**
+         * owner 先派发回调、再 ResolveConnect 擦表项：等表项回收即可确定回调动
+         * 作已完成，无需"睡一段再看"这种不受控等待。
+         */
         CHECK(WaitUntil([&] { return EngineTestAccess::ConnectTableSize(client) == 0; }, 3000ms));
-        CHECK(handler->calls.load() == 1); // 恰一次（无重复派发）
+
+        /**
+         * 恰一次（无重复派发）
+         */
+        CHECK(handler->calls.load() == 1);
         CHECK(handler->failures.load() == 1);
         CHECK(handler->success.load() == 0);
         CHECK(handler->last_operation.load() == id);
@@ -1101,7 +1307,9 @@ static void ConnectDelivery()
         CHECK(!runner.error);
     }
 
-    // 2) 无 handler：零提交拒绝，out_id 原值，无本次回调（无回调通道）。
+    /**
+     * 2) 无 handler：零提交拒绝，out_id 原值，无本次回调（无回调通道）。
+     */
     {
         auto handler = std::make_shared<Recorder>();
         Engine client(handler);
@@ -1109,7 +1317,10 @@ static void ConnectDelivery()
         CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
         const std::uint64_t sentinel = 0x1234;
         std::uint64_t id = sentinel;
-        // 有 handler 时是合法 raw 提交；此处换到无 handler 的 Engine 验证拒绝。
+
+        /**
+         * 有 handler 时是合法 raw 提交；此处换到无 handler 的 Engine 验证拒绝。
+         */
         Engine co_only{std::shared_ptr<RawHandler>()};
         EngineRunner co_runner(co_only, ClientConfig());
         CHECK(WaitUntil([&] { return co_only.Phase() == EnginePhase::Running; }, 3000ms));
@@ -1117,20 +1328,25 @@ static void ConnectDelivery()
         CHECK(id == sentinel);
         CHECK(EngineTestAccess::ConnectTableSize(co_only) == 0);
         CHECK(handler->calls.load() == 0);
-        // 零提交是同步结论：直接断言，不用 sleep 当观察窗口。
+
+        /**
+         * 零提交是同步结论：直接断言，不用 sleep 当观察窗口。
+         */
         CHECK(co_only.CountConnections() == 0);
         CHECK(EngineTestAccess::ConnectTableSize(co_only) == 0);
         runner.CloseAndJoin();
         co_runner.CloseAndJoin();
     }
 
-    // 3) 已封口 Engine：拒绝、out_id 不变、无回调。
+    /**
+     * 3) 已封口 Engine：拒绝、out_id 不变、无回调。
+     */
     {
         auto handler = std::make_shared<Recorder>();
         Engine client(handler);
         EngineRunner runner(client, ClientConfig());
         CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
-        client.RequestClose();
+        (void)client.Close();
         CHECK(WaitUntil(
             [&] { return client.Phase() == EnginePhase::Closing || client.Phase() == EnginePhase::Stopped; }, 3000ms));
         const std::uint64_t sentinel = 0x77;
@@ -1141,7 +1357,9 @@ static void ConnectDelivery()
         runner.CloseAndJoin();
     }
 
-    // 4) 容量满：零接纳、out_id 不变、不产生该次回调。
+    /**
+     * 4) 容量满：零接纳、out_id 不变、不产生该次回调。
+     */
     {
         auto handler = std::make_shared<Recorder>();
         Engine client(handler);
@@ -1162,9 +1380,14 @@ static void ConnectDelivery()
         runner.CloseAndJoin();
     }
 
-    // 5) CoDial 矩阵：无 handler 的 client-only 与 server 都支持；有 handler 拒绝。
+    /**
+     * 5) CoDial 矩阵：无 handler 的 client-only 与 server 都支持；有 handler 拒绝。
+     */
     {
-        // client-only（无 listen）Engine。
+
+        /**
+         * client-only（无 listen）Engine。
+         */
         Engine co_client{std::shared_ptr<RawHandler>()};
         EngineRunner client_runner(co_client, ClientConfig());
         CHECK(WaitUntil([&] { return co_client.Phase() == EnginePhase::Running; }, 3000ms));
@@ -1173,14 +1396,16 @@ static void ConnectDelivery()
             auto res = co_client.CoDial(address, Until(3000ms));
             if (!res.error && res.connection.Valid()) {
                 client_result.store(0);
-                res.connection.RequestClose();
+                (void)res.connection.Close();
             }
         });
         Get(task);
         CHECK(client_result.load() == 0);
         client_runner.CloseAndJoin();
 
-        // server 布局（有 listener）+ handoff，无 handler：CoDial 也支持。
+        /**
+         * server 布局（有 listener）+ handoff，无 handler：CoDial 也支持。
+         */
         Engine co_server{std::shared_ptr<RawHandler>()};
         CHECK(!co_server.EnableAcceptHandoff(4));
         EngineRunner server_runner(co_server, ServerConfig(Loopback(0), 1));
@@ -1190,14 +1415,16 @@ static void ConnectDelivery()
             auto res = co_server.CoDial(address, Until(3000ms));
             if (!res.error && res.connection.Valid()) {
                 server_result.store(0);
-                res.connection.RequestClose();
+                (void)res.connection.Close();
             }
         });
         Get(server_task);
         CHECK(server_result.load() == 0);
         server_runner.CloseAndJoin();
 
-        // 有 handler 的 Engine：CoDial 在任何提交前拒绝。
+        /**
+         * 有 handler 的 Engine：CoDial 在任何提交前拒绝。
+         */
         auto raw_handler = std::make_shared<Recorder>();
         Engine raw_client(raw_handler);
         EngineRunner raw_runner(raw_client, ClientConfig());
@@ -1211,7 +1438,11 @@ static void ConnectDelivery()
         });
         Get(reject_task);
         CHECK(rejected.load() == 0);
-        CHECK(EngineTestAccess::ConnectTableSize(raw_client) == 0); // 零提交
+
+        /**
+         * 零提交
+         */
+        CHECK(EngineTestAccess::ConnectTableSize(raw_client) == 0);
         CHECK(raw_handler->calls.load() == 0);
         raw_runner.CloseAndJoin();
     }
@@ -1223,17 +1454,19 @@ static void ConnectDelivery()
     std::cout << "connect_delivery raw/nohandler/sealed/cap/codial_matrix=ok\n";
 }
 
-//
-// connect_failure_cleanup
-//
+/**
+ * connect_failure_cleanup
+ */
 static void ConnectFailureCleanup()
 {
     StartRuntime(2);
     Address address;
     auto listener = MakeListener(address);
 
-    // 1) 等待对象建立失败 → not_enough_memory；同 Engine 仍可正常建连，且失败
-    // 退出路径不遗留 fd（首轮含 Asio 上下文惰性建立，故按"轮次间不增长"判定）。
+    /**
+     * 1) 等待对象建立失败 → not_enough_memory；同 Engine 仍可正常建连，且失败
+     * 退出路径不遗留 fd（首轮含 Asio 上下文惰性建立，故按"轮次间不增长"判定）。
+     */
     {
         Engine client{std::shared_ptr<RawHandler>()};
         EngineRunner runner(client, ClientConfig());
@@ -1245,20 +1478,31 @@ static void ConnectFailureCleanup()
             auto task = Task([&] { value.store(client.CoDial(address, Until(1000ms)).error.value()); });
             Get(task);
             CHECK(value.load() == std::make_error_code(std::errc::not_enough_memory).value());
-            // 未交付路径必须归还 claim/连接责任：表项回收、连接回收。
+
+            /**
+             * 未交付路径必须归还 claim/连接责任：表项回收、连接回收。
+             */
             CHECK(WaitUntil([&] { return EngineTestAccess::ConnectTableSize(client) == 0; }, 3000ms));
             CHECK(WaitUntil([&] { return EngineTestAccess::ConnectionCount(client) == 0; }, 3000ms));
         };
-        fail_cycle(); // 首轮：含上下文惰性 fd
+
+        /**
+         * 首轮：含上下文惰性 fd
+         */
+        fail_cycle();
         const auto fds_after_first = CountFds();
-        fail_cycle(); // 次轮：fd 不得增长
+
+        /**
+         * 次轮：fd 不得增长
+         */
+        fail_cycle();
         CHECK(WaitUntil([&] { return CountFds() <= fds_after_first; }, 3000ms));
         std::atomic<int> recovered{-2};
         auto recovered_task = Task([&] {
             auto res = client.CoDial(address, Until(3000ms));
             if (!res.error && res.connection.Valid()) {
                 recovered.store(0);
-                res.connection.RequestClose();
+                (void)res.connection.Close();
             }
         });
         Get(recovered_task);
@@ -1267,7 +1511,9 @@ static void ConnectFailureCleanup()
         CHECK(!runner.error);
     }
 
-    // 2) 等待登记满额（hub 256）→ no_buffer_space；owner 稍后交付必须被回收。
+    /**
+     * 2) 等待登记满额（hub 256）→ no_buffer_space；owner 稍后交付必须被回收。
+     */
     {
         Engine client{std::shared_ptr<RawHandler>()};
         EngineRunner runner(client, ClientConfig());
@@ -1282,7 +1528,7 @@ static void ConnectFailureCleanup()
             Connection out;
             full.store(CoAccess::WaitConnect(client, id, out, Until(2000ms)).value());
             if (out.Valid()) {
-                out.RequestClose();
+                (void)out.Close();
             }
         });
         Get(task);
@@ -1293,7 +1539,9 @@ static void ConnectFailureCleanup()
         CHECK(!runner.error);
     }
 
-    // 3) 超时：迟到交付被回收，fd 不增长，第二轮正常。
+    /**
+     * 3) 超时：迟到交付被回收，fd 不增长，第二轮正常。
+     */
     {
         Engine client{std::shared_ptr<RawHandler>()};
         EngineRunner runner(client, ClientConfig());
@@ -1311,7 +1559,7 @@ static void ConnectFailureCleanup()
             auto res = client.CoDial(address, Until(3000ms));
             if (!res.error && res.connection.Valid()) {
                 recovered.store(0);
-                res.connection.RequestClose();
+                (void)res.connection.Close();
             }
         });
         Get(recovered_task);
@@ -1321,7 +1569,9 @@ static void ConnectFailureCleanup()
         CHECK(!runner.error);
     }
 
-    // 4) 取消投递失败（单次）：责任持久化到控制循环，pending 早于 5s 撤销。
+    /**
+     * 4) 取消投递失败（单次）：责任持久化到控制循环，pending 早于 5s 撤销。
+     */
     {
         Engine client{std::shared_ptr<RawHandler>()};
         EngineRunner runner(client, ClientConfig());
@@ -1338,13 +1588,16 @@ static void ConnectFailureCleanup()
         CHECK(!runner.error);
     }
 
-    // 5) 已有 raw 已交付连接不受 Co 失败影响：失败后该连接仍可收发/可读。
+    /**
+     * 5) 已有 raw 已交付连接不受 Co 失败影响：失败后该连接仍可收发/可读。
+     */
     {
         struct RawDelivery : RawHandler {
             std::atomic<int> connects{0};
             std::atomic<int> closes{0};
             std::mutex mutex;
             std::shared_ptr<Connection> stored;
+
             void OnConnect(Connection connection, std::error_code error, std::uint64_t) override
             {
                 if (error || !connection.Valid()) {
@@ -1354,11 +1607,10 @@ static void ConnectFailureCleanup()
                 std::lock_guard<std::mutex> lock(mutex);
                 stored = std::make_shared<Connection>(connection);
             }
-            void OnClose(Connection, std::error_code) override
-            {
-                closes.fetch_add(1);
-            }
+
+            void OnClose(Connection, std::error_code) override { closes.fetch_add(1); }
         };
+
         auto handler = std::make_shared<RawDelivery>();
         Engine client(handler);
         EngineRunner runner(client, ClientConfig());
@@ -1372,7 +1624,10 @@ static void ConnectFailureCleanup()
             delivered = handler->stored;
         }
         CHECK(delivered && delivered->Valid());
-        // Co 侧同 Engine 一律拒绝（raw 唯一交付），且不影响已交付连接。
+
+        /**
+         * Co 侧同 Engine 一律拒绝（raw 唯一交付），且不影响已交付连接。
+         */
         std::atomic<int> rejected{-1};
         auto task = Task([&] {
             auto res = client.CoDial(address, Until(1000ms));
@@ -1385,33 +1640,41 @@ static void ConnectFailureCleanup()
         CHECK(!delivered->AsyncWrite("alive"));
         CHECK(delivered->WriteAcceptance() != AcceptanceState::Closed);
         CHECK(handler->closes.load() == 0);
-        delivered->RequestClose();
+        (void)delivered->Close();
         CHECK(WaitUntil([&] { return handler->closes.load() == 1; }, 3000ms));
         runner.CloseAndJoin();
         CHECK(!runner.error);
     }
 
-    // 6) 等待返回非 Completed 的三个真实退出路径（InvalidContext / RuntimeUnavailable
-    // / AlreadyWaiting）：在等待返回边界注入状态，op 仍 pending，走产品既有
-    // abandon(true) 归还 claim + 取消投递 + owner 回收；断言实际 CoDial/领取
-    // 返回 errc、out 不变、无 raw 误关、表项/名额/fd/连接回热基线，之后正常
-    // CoDial 可用。每条都有正对照（注入前 pending、注入后同上 Engine 成功）。
+    /**
+     * 6) 等待返回非 Completed 的三个真实退出路径（InvalidContext / RuntimeUnavailable
+     * / AlreadyWaiting）：在等待返回边界注入状态，op 仍 pending，走产品既有
+     * abandon(true) 归还 claim + 取消投递 + owner 回收；断言实际 CoDial/领取
+     * 返回 errc、out 不变、无 raw 误关、表项/名额/fd/连接回热基线，之后正常
+     * CoDial 可用。每条都有正对照（注入前 pending、注入后同上 Engine 成功）。
+     */
     {
         using bbt::coroutine::WaitStatus;
+
         struct Injected {
             WaitStatus status;
             std::error_code expected;
             const char* label;
         };
+
         const Injected cases[] = {
             {WaitStatus::InvalidContext, std::make_error_code(std::errc::operation_not_permitted), "invalid_context"},
-            {WaitStatus::RuntimeUnavailable, std::make_error_code(std::errc::operation_not_supported),
+            {WaitStatus::RuntimeUnavailable,
+             std::make_error_code(std::errc::operation_not_supported),
              "runtime_unavailable"},
             {WaitStatus::AlreadyWaiting, std::make_error_code(std::errc::device_or_resource_busy), "already_waiting"},
         };
         for (const auto& item : cases) {
-            // 本段的 listener 只是"有对端可连"：每轮先取走 backlog，避免多轮内核
-            // 拒绝新连接而让本条因环境而非契约失败。
+
+            /**
+             * 本段的 listener 只是"有对端可连"：每轮先取走 backlog，避免多轮内核
+             * 拒绝新连接而让本条因环境而非契约失败。
+             */
             auto drain_listener = [&listener] {
                 Address peer;
                 std::error_code ignored;
@@ -1420,19 +1683,25 @@ static void ConnectFailureCleanup()
                 (void)peer;
             };
             drain_listener();
-            // 无 handler（Co-only）Engine：raw 唯一交付通道不存在，任何"误关/误回调"
-            // 都只能表现为连接数/表项/fd 异常。
+
+            /**
+             * 无 handler（Co-only）Engine：raw 唯一交付通道不存在，任何"误关/误回调"
+             * 都只能表现为连接数/表项/fd 异常。
+             */
             Engine client{std::shared_ptr<RawHandler>()};
             EngineRunner runner(client, ClientConfig());
             CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
-            // 正对照：无注入时同一路径真实成功。
+
+            /**
+             * 正对照：无注入时同一路径真实成功。
+             */
             {
                 std::atomic<int> baseline{-1};
                 auto warm = Task([&] {
                     auto res = client.CoDial(address, Until(3000ms));
                     if (!res.error && res.connection.Valid()) {
                         baseline.store(0);
-                        res.connection.RequestClose();
+                        (void)res.connection.Close();
                     }
                 });
                 Get(warm);
@@ -1441,7 +1710,9 @@ static void ConnectFailureCleanup()
             }
             const auto fds_baseline = CountFds();
 
-            // 让 op 在 owner 侧保持 pending（尚未建 socket），注入点才落在"未完成"分支。
+            /**
+             * 让 op 在 owner 侧保持 pending（尚未建 socket），注入点才落在"未完成"分支。
+             */
             EngineTestAccess::SetConnectStartDelay(client, std::chrono::milliseconds(5000));
             std::uint64_t id = 0;
             CHECK(!CoAccess::SubmitConnect(client, address, id));
@@ -1465,19 +1736,39 @@ static void ConnectFailureCleanup()
                 }
             });
             Get(task);
-            CHECK(observed.load() == item.expected.value()); // 实际返回的 errc
-            CHECK(out_kept.load() == 0);                     // 未交付失败不覆盖 out
-            // 责任回收：claim 已归还、op 表项清空、无遗留 pending、无连接进入 Engine。
+
+            /**
+             * 实际返回的 errc
+             */
+            CHECK(observed.load() == item.expected.value());
+
+            /**
+             * 未交付失败不覆盖 out
+             */
+            CHECK(out_kept.load() == 0);
+
+            /**
+             * 责任回收：claim 已归还、op 表项清空、无遗留 pending、无连接进入 Engine。
+             */
             CHECK(WaitUntil([&] { return EngineTestAccess::ConnectTableSize(client) == 0; }, 4000ms));
             CHECK(EngineTestAccess::PendingConnectCount(client) == 0);
             CHECK(WaitUntil([&] { return client.CountConnections() == 0; }, 3000ms));
-            CHECK(WaitUntil([&] { return CountFds() <= fds_baseline; }, 3000ms)); // 无 fd 泄漏/误关
+
+            /**
+             * 无 fd 泄漏/误关
+             */
+            CHECK(WaitUntil([&] { return CountFds() <= fds_baseline; }, 3000ms));
             CHECK(client.Phase() == EnginePhase::Running);
 
-            // 同一状态再经公开 CoDial 走一遍：这是"实际 CoDial 返回 errc"的证据，
-            // 与上面"先 pending 再失败"的内部两段式互为补充，不互相替代。
+            /**
+             * 同一状态再经公开 CoDial 走一遍：这是"实际 CoDial 返回 errc"的证据，
+             * 与上面"先 pending 再失败"的内部两段式互为补充，不互相替代。
+             */
             EngineTestAccess::SetConnectWaitStatusOnce(client, static_cast<int>(item.status));
-            // 上一段已消费过 original 的字节，这里换一条新的同款连接做 out 保留证据。
+
+            /**
+             * 上一段已消费过 original 的字节，这里换一条新的同款连接做 out 保留证据。
+             */
             auto dial_state = std::make_shared<ConnectionState>(197, 1024, 1024, 4, nullptr);
             CHECK(dial_state->ring.TryAppend("held-dial").status == ReadStatus::Ok);
             Connection dial_original = ConnectionTestAccess::Make(dial_state);
@@ -1493,15 +1784,29 @@ static void ConnectFailureCleanup()
                 }
             });
             Get(dial_task);
-            CHECK(dial_errc.load() == item.expected.value()); // CoDial 实际 errc
-            CHECK(dial_out_kept.load() == 0);                 // CoDial 也保留原 out
+
+            /**
+             * CoDial 实际 errc
+             */
+            CHECK(dial_errc.load() == item.expected.value());
+
+            /**
+             * CoDial 也保留原 out
+             */
+            CHECK(dial_out_kept.load() == 0);
             CHECK(WaitUntil([&] { return EngineTestAccess::ConnectTableSize(client) == 0; }, 4000ms));
             CHECK(EngineTestAccess::PendingConnectCount(client) == 0);
-            CHECK(client.CountConnections() == 0); // 未交付 fd 被回收，无误留
+
+            /**
+             * 未交付 fd 被回收，无误留
+             */
+            CHECK(client.CountConnections() == 0);
             CHECK(WaitUntil([&] { return CountFds() <= fds_baseline; }, 3000ms));
 
-            // 同一 Engine 解除注入后正常 CoDial：名额/fd/连接都回到可用基线。
-            // 起始延迟是持久设置（非 once），恢复前必须归零，否则下一次仍是 pending。
+            /**
+             * 同一 Engine 解除注入后正常 CoDial：名额/fd/连接都回到可用基线。
+             * 起始延迟是持久设置（非 once），恢复前必须归零，否则下一次仍是 pending。
+             */
             EngineTestAccess::ClearConnectInjection(client);
             EngineTestAccess::SetConnectStartDelay(client, std::chrono::milliseconds(0));
             std::atomic<int> recovered{-1};
@@ -1509,7 +1814,7 @@ static void ConnectFailureCleanup()
                 auto res = client.CoDial(address, Until(3000ms));
                 if (!res.error && res.connection.Valid()) {
                     recovered.store(0);
-                    res.connection.RequestClose();
+                    (void)res.connection.Close();
                 }
             });
             Get(recovered_task);
@@ -1523,16 +1828,20 @@ static void ConnectFailureCleanup()
         }
     }
 
-    // 7) WaitStatus 逐项映射：上游该 SHA 的 6 个成员各自映射到明确 errc，
-    // 不允许任何成员落到 io_error（旧实现的默认项）。上一段已用内部接缝在
-    // 运行期真实制造 InvalidContext/RuntimeUnavailable/AlreadyWaiting；本段
-    // 只锁纯映射表（含 TimedOut/Cancelled/Completed），两者不可互相替代。
+    /**
+     * 7) WaitStatus 逐项映射：上游该 SHA 的 6 个成员各自映射到明确 errc，
+     * 不允许任何成员落到 io_error（旧实现的默认项）。上一段已用内部接缝在
+     * 运行期真实制造 InvalidContext/RuntimeUnavailable/AlreadyWaiting；本段
+     * 只锁纯映射表（含 TimedOut/Cancelled/Completed），两者不可互相替代。
+     */
     {
         using bbt::coroutine::WaitStatus;
+
         struct Mapping {
             WaitStatus status;
             std::error_code expected;
         };
+
         const Mapping mappings[] = {
             {WaitStatus::Completed, std::error_code{}},
             {WaitStatus::TimedOut, std::make_error_code(std::errc::timed_out)},
@@ -1557,14 +1866,16 @@ static void ConnectFailureCleanup()
     std::cout << "connect_failure_cleanup create/hub/timeout/cancel/raw_intact=ok\n";
 }
 
-//
-// accept_configuration
-//
+/**
+ * accept_configuration
+ */
 static void AcceptConfiguration()
 {
     StartRuntime(3);
 
-    // 1) server 布局 + 无 handler + 未启用 handoff：Run 在绑定前拒绝。
+    /**
+     * 1) server 布局 + 无 handler + 未启用 handoff：Run 在绑定前拒绝。
+     */
     {
         const auto fds_before = CountFds();
         Engine engine{std::shared_ptr<RawHandler>()};
@@ -1574,40 +1885,56 @@ static void AcceptConfiguration()
         CHECK(engine.Phase() == EnginePhase::Stopped);
         std::vector<Address> addresses;
         CHECK(engine.LocalAddresses(addresses) == std::make_error_code(std::errc::operation_not_permitted));
-        CHECK(CountFds() == fds_before); // 零 socket 副作用
+
+        /**
+         * 零 socket 副作用
+         */
+        CHECK(CountFds() == fds_before);
     }
 
-    // 2) CoAccept 阶段/配置精确 errc 矩阵。每条都断言：精确 errc、快速拒绝（不占满
-    // deadline）、失败不覆盖调用者原有 out（原连接仍可读自己的字节）。
-    // 3) 与 4/4b) 的具体阶段见各段注释。
-    auto expect_accept_rejection = [](Engine& engine, std::error_code expected, const char* label,
-                                      std::uint64_t state_id) {
-        auto original_state = std::make_shared<ConnectionState>(state_id, 1024, 1024, 4, nullptr);
-        CHECK(original_state->ring.TryAppend("accept-kept").status == ReadStatus::Ok);
-        Connection original = ConnectionTestAccess::Make(original_state);
-        const auto begin = std::chrono::steady_clock::now();
-        std::atomic<int> errc{0};
-        std::atomic<int> kept{-1};
-        auto task = Task([&] {
-            auto res = engine.CoAccept(Until(3000ms));
-            errc.store(res.error.value());
-            std::string tail;
-            if (!res.connection.Valid() && original.Valid() && original.TryRead(tail).status == ReadStatus::Ok
-                && tail == "accept-kept") {
-                kept.store(0);
-            }
-        });
-        Get(task);
-        const auto elapsed =
-            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count();
-        CHECK(errc.load() == expected.value());
-        CHECK(kept.load() == 0); // 原 out 保留且原连接未受影响
-        CHECK(elapsed < 1000);   // 快速拒绝，不占满 deadline
-        std::cout << "accept_configuration reject=" << label << " errc=" << errc.load() << " fast=1 out_kept=1"
-                  << std::endl;
-    };
+    /**
+     * 2) CoAccept 阶段/配置精确 errc 矩阵。每条都断言：精确 errc、快速拒绝（不占满
+     * deadline）、失败不覆盖调用者原有 out（原连接仍可读自己的字节）。
+     * 3) 与 4/4b) 的具体阶段见各段注释。
+     */
+    auto expect_accept_rejection =
+        [](Engine& engine, std::error_code expected, const char* label, std::uint64_t state_id) {
+            auto original_state = std::make_shared<ConnectionState>(state_id, 1024, 1024, 4, nullptr);
+            CHECK(original_state->ring.TryAppend("accept-kept").status == ReadStatus::Ok);
+            Connection original = ConnectionTestAccess::Make(original_state);
+            const auto begin = std::chrono::steady_clock::now();
+            std::atomic<int> errc{0};
+            std::atomic<int> kept{-1};
+            auto task = Task([&] {
+                auto res = engine.CoAccept(Until(3000ms));
+                errc.store(res.error.value());
+                std::string tail;
+                if (!res.connection.Valid() && original.Valid() && original.TryRead(tail).status == ReadStatus::Ok
+                    && tail == "accept-kept") {
+                    kept.store(0);
+                }
+            });
+            Get(task);
+            const auto elapsed =
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count();
+            CHECK(errc.load() == expected.value());
 
-    // 2a) Idle（从未 Run）：尚未建立 accept 生产者 → not_permitted。
+            /**
+             * 原 out 保留且原连接未受影响
+             */
+            CHECK(kept.load() == 0);
+
+            /**
+             * 快速拒绝，不占满 deadline
+             */
+            CHECK(elapsed < 1000);
+            std::cout << "accept_configuration reject=" << label << " errc=" << errc.load() << " fast=1 out_kept=1"
+                      << std::endl;
+        };
+
+    /**
+     * 2a) Idle（从未 Run）：尚未建立 accept 生产者 → not_permitted。
+     */
     {
         Engine engine{std::shared_ptr<RawHandler>()};
         CHECK(!engine.EnableAcceptHandoff(2));
@@ -1615,13 +1942,18 @@ static void AcceptConfiguration()
         expect_accept_rejection(engine, std::make_error_code(std::errc::operation_not_permitted), "idle", 101);
     }
 
-    // 2b) Starting（Run 已发布 Starting、owner 尚未安装完）：not_permitted；
-    // 用 install 延迟把 Starting 窗口固定住，之后转 Running 并正常收口。
+    /**
+     * 2b) Starting（Run 已发布 Starting、owner 尚未安装完）：not_permitted；
+     * 用 install 延迟把 Starting 窗口固定住，之后转 Running 并正常收口。
+     */
     {
         auto handler = std::make_shared<NullHandler>();
         Engine engine(handler);
         CHECK(!engine.EnableAcceptHandoff(2));
-        // 800ms：把 Starting 窗口拉宽到足够覆盖一次协程调度，避免落到安装完成之后。
+
+        /**
+         * 800ms：把 Starting 窗口拉宽到足够覆盖一次协程调度，避免落到安装完成之后。
+         */
         EngineTestAccess::SetInstallDelay(engine, std::chrono::milliseconds(800));
         EngineRunner runner(engine, ServerConfig(Loopback(0), 1));
         CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Starting; }, 3000ms));
@@ -1630,18 +1962,22 @@ static void AcceptConfiguration()
         runner.CloseAndJoin();
     }
 
-    // 2c) Running server + handler，未开启 handoff：not_permitted（配置缺失）。
+    /**
+     * 2c) Running server + handler，未开启 handoff：not_permitted（配置缺失）。
+     */
     {
         auto handler = std::make_shared<NullHandler>();
         Engine engine(handler);
         EngineRunner runner(engine, ServerConfig(Loopback(0), 1));
         CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
-        expect_accept_rejection(engine, std::make_error_code(std::errc::operation_not_permitted),
-                                "running_without_handoff", 103);
+        expect_accept_rejection(
+            engine, std::make_error_code(std::errc::operation_not_permitted), "running_without_handoff", 103);
         runner.CloseAndJoin();
     }
 
-    // 2d) Running client-only（有 handoff 无 main owner）：not_supported。
+    /**
+     * 2d) Running client-only（有 handoff 无 main owner）：not_supported。
+     */
     {
         Engine engine{std::shared_ptr<RawHandler>()};
         CHECK(!engine.EnableAcceptHandoff(2));
@@ -1651,8 +1987,10 @@ static void AcceptConfiguration()
         runner.CloseAndJoin();
     }
 
-    // 4) 已封口（Closing，main owner 仍在）：operation_canceled。
-    // 用 seal 延迟把 Closing 窗口固定住，避免与收口竞争。
+    /**
+     * 4) 已封口（Closing，main owner 仍在）：operation_canceled。
+     * 用 seal 延迟把 Closing 窗口固定住，避免与收口竞争。
+     */
     {
         auto handler = std::make_shared<NullHandler>();
         Engine engine(handler);
@@ -1660,32 +1998,37 @@ static void AcceptConfiguration()
         EngineRunner runner(engine, ServerConfig(Loopback(0), 1));
         CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
         EngineTestAccess::SetSealDelay(engine, std::chrono::milliseconds(400));
-        engine.RequestClose();
+        (void)engine.Close();
         CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Closing; }, 3000ms));
         expect_accept_rejection(engine, std::make_error_code(std::errc::operation_canceled), "closing", 105);
         runner.CloseAndJoin();
     }
 
-    // 4b) 完全 Stopped（main owner 已解绑）：终态优先 → operation_canceled，
-    // 不得因"没有 main owner"被误判成 client-only 的 not_supported。
+    /**
+     * 4b) 完全 Stopped（main owner 已解绑）：终态优先 → operation_canceled，
+     * 不得因"没有 main owner"被误判成 client-only 的 not_supported。
+     */
     {
         auto handler = std::make_shared<NullHandler>();
         Engine engine(handler);
         CHECK(!engine.EnableAcceptHandoff(2));
         EngineRunner runner(engine, ServerConfig(Loopback(0), 1));
         CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
-        engine.RequestClose();
+        (void)engine.Close();
         CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Stopped; }, 3000ms));
         expect_accept_rejection(engine, std::make_error_code(std::errc::operation_canceled), "stopped", 106);
         runner.CloseAndJoin();
     }
 
-    // 5) handler + handoff 共存：同一连接既进 OnAccept 也进 handoff，Id 相同。
+    /**
+     * 5) handler + handoff 共存：同一连接既进 OnAccept 也进 handoff，Id 相同。
+     */
     {
         struct CountingHandler : RawHandler {
             std::atomic<int> accepted{0};
             std::mutex mutex;
             std::vector<std::uint64_t> ids;
+
             void OnAccept(Connection connection) override
             {
                 accepted.fetch_add(1);
@@ -1693,6 +2036,7 @@ static void AcceptConfiguration()
                 ids.push_back(connection.Id());
             }
         };
+
         auto handler = std::make_shared<CountingHandler>();
         Engine engine(handler);
         CHECK(!engine.EnableAcceptHandoff(4));
@@ -1709,7 +2053,7 @@ static void AcceptConfiguration()
             if (!res.error && res.connection.Valid()) {
                 handoff_id.store(res.connection.Raw().Id());
                 result.store(0);
-                res.connection.RequestClose();
+                (void)res.connection.Close();
             }
         });
         Get(task);
@@ -1721,13 +2065,19 @@ static void AcceptConfiguration()
             raw_id = handler->ids.front();
         }
         CHECK(raw_id != 0);
-        CHECK(handoff_id.load() == raw_id); // 同一连接、两个交付者
+
+        /**
+         * 同一连接、两个交付者
+         */
+        CHECK(handoff_id.load() == raw_id);
         (void)client.Close();
         runner.CloseAndJoin();
         CHECK(!runner.error);
     }
 
-    // 6) 队列满后恢复：容量 1，先 reserve 再取，依次交付 3 条。
+    /**
+     * 6) 队列满后恢复：容量 1，先 reserve 再取，依次交付 3 条。
+     */
     {
         auto handler = std::make_shared<NullHandler>();
         Engine engine(handler);
@@ -1748,7 +2098,7 @@ static void AcceptConfiguration()
                     return;
                 }
                 accepted.fetch_add(1);
-                res.connection.RequestClose();
+                (void)res.connection.Close();
             }
         });
         Get(task);
@@ -1760,8 +2110,10 @@ static void AcceptConfiguration()
         }
     }
 
-    // 7) 已有 out 有效但本轮无 handoff：内部等待必须按本轮结果判定（超时），
-    // 不能因 out 已有效而误报成功。
+    /**
+     * 7) 已有 out 有效但本轮无 handoff：内部等待必须按本轮结果判定（超时），
+     * 不能因 out 已有效而误报成功。
+     */
     {
         auto handler = std::make_shared<NullHandler>();
         Engine engine(handler);

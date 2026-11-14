@@ -116,4 +116,6 @@ std::string Value::Fingerprint() const noexcept
     return Fnv1a64Hex(canonical);
 }
 
-} // namespace bbt::infra::config
+// clang-format off
+}
+// clang-format on

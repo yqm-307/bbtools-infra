@@ -1,4 +1,5 @@
-/** @file RedisTypes.hpp
+/**
+ * @file RedisTypes.hpp
  * @brief Redis 命令选项、返回值与装配值；不依赖具体客户端或网络实现。
  */
 #pragma once
@@ -20,12 +21,26 @@ namespace bbt::infra::redis {
  * 不写入任何错误消息、日志或 details。
  */
 struct RedisHandshake {
-    std::string username;       ///< 可选；为空时 AUTH 走单参数 legacy 形式。
-    std::string password;       ///< 可选；为空表示不发送 AUTH。
-    std::int64_t database = -1; ///< <0 表示不 SELECT；合法值 0..kMaxDatabase。
+
+    /**
+     * @brief 可选；为空时 AUTH 走单参数 legacy 形式。
+     */
+    std::string username;
+
+    /**
+     * @brief 可选；为空表示不发送 AUTH。
+     */
+    std::string password;
+
+    /**
+     * @brief <0 表示不 SELECT；合法值 0..kMaxDatabase。
+     */
+    std::int64_t database = -1;
 };
 
-/// @brief Redis SELECT 的库序号实际上限（int64 正数，与服务端 dbid_t 一致）。
+/**
+ * @brief Redis SELECT 的库序号实际上限（int64 正数，与服务端 dbid_t 一致）。
+ */
 inline constexpr std::int64_t kMaxDatabase = 1000000;
 
 /**
@@ -35,12 +50,21 @@ inline constexpr std::int64_t kMaxDatabase = 1000000;
  * condition 为 NX/XX 时服务端条件不满足返回 nil，公开面表达为 ok(false) 而非错误。
  */
 struct SetOptions {
-    std::optional<std::chrono::milliseconds> expire; ///< 过期时长；未设置表示不设置过期。
-    /// @brief 条件写模式：None 无条件写，NX 仅键不存在时写，XX 仅键存在时写。
-    enum class Condition { None, NX, XX } condition = Condition::None; ///< 生效的条件写模式。
+
+    /**
+     * @brief 过期时长；未设置表示不设置过期。
+     */
+    std::optional<std::chrono::milliseconds> expire;
+
+    /**
+     * @brief 条件写模式：None 无条件写，NX 仅键不存在时写，XX 仅键存在时写。
+     */
+    enum class Condition { None, NX, XX } condition = Condition::None;
 };
 
-/// @brief SET 过期时长上限（365 天）；超过上限在接纳前返回 InvalidArgument。
+/**
+ * @brief SET 过期时长上限（365 天）；超过上限在接纳前返回 InvalidArgument。
+ */
 inline constexpr std::chrono::milliseconds kMaxSetExpire{std::chrono::hours{24} * 365};
 
 /**
@@ -48,12 +72,23 @@ inline constexpr std::chrono::milliseconds kMaxSetExpire{std::chrono::hours{24} 
  * -1/-2 魔数泄漏到公共 API。
  */
 struct TtlResult {
-    /// @brief PTTL 的三态：key 不存在、存在但无过期、剩余毫秒。
-    enum class State { KeyMissing, NoExpiry, Expires } state; ///< 三态之一。
-    std::chrono::milliseconds remaining{0};                   ///< 仅 State==Expires 有意义。
+
+    /**
+     * @brief 三态之一：key 不存在、存在但无过期、剩余毫秒。
+     */
+    enum class State { KeyMissing, NoExpiry, Expires } state;
+
+    /**
+     * @brief 仅 State==Expires 有意义。
+     */
+    std::chrono::milliseconds remaining{0};
 };
 
-/// @brief HGETALL 的 field/value 对序列：保持服务端顺序与二进制安全。
+/**
+ * @brief HGETALL 的 field/value 对序列：保持服务端顺序与二进制安全。
+ */
 using HashEntries = std::vector<std::pair<std::string, std::string>>;
 
-} // namespace bbt::infra::redis
+// clang-format off
+}
+// clang-format on

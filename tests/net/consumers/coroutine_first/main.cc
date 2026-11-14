@@ -1,6 +1,8 @@
-// L2 回归 consumer：coroutine-first parent 只 link bbt::infra_net；
-// 编译期消费 CoObject/NativeSocket 公共头（复用分支 include 修复的可编译证明），
-// 运行期在受管协程内做真实 UDP 往返并核对身份环境。
+/**
+ * coroutine-first consumer 的 parent 只 link bbt::infra_net；
+ * 编译期消费 CoObject/NativeSocket 公共头（复用分支 include 修复的可编译证明），
+ * 运行期在受管协程内做真实 UDP 往返并核对身份环境。
+ */
 #include <bbt/infra/net/CoObject.hpp>
 #include <bbt/infra/net/NativeSocket.hpp>
 
@@ -25,6 +27,7 @@ static void Check(bool value, const char* expression, int line)
         throw std::runtime_error("line " + std::to_string(line) + ": " + expression);
     }
 }
+
 #define CHECK(expression) Check(static_cast<bool>(expression), #expression, __LINE__)
 
 #include "../../ProcessRuntimeTestMain.hpp"
@@ -84,7 +87,10 @@ static int RunConsumerCases()
 
 int main()
 {
-    // 测试进程退出边界：局部 RAII 收口 → 刷新输出 → _Exit，见
-    // ../../ProcessRuntimeTestMain.hpp 头注（静态析构竞态为已知限制，未修复）。
+
+    /**
+     * 测试进程退出边界：局部 RAII 收口 → 刷新输出 → _Exit，见
+     * ../../ProcessRuntimeTestMain.hpp 头注（静态析构竞态为已知限制，未修复）。
+     */
     return bbt_net_test::RunTestProcessExit([] { return RunConsumerCases(); });
 }

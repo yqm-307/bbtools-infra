@@ -28,7 +28,9 @@ Value Map(std::initializer_list<std::pair<std::string, std::string>> kv)
     return Value::FromMap(std::move(m));
 }
 
-// 临时文件统一落在 TMPDIR（进程 scratch），不放系统 /tmp。
+/**
+ * 临时文件统一落在 TMPDIR（进程 scratch），不放系统 /tmp。
+ */
 std::string MakeTempPath(const char* name)
 {
     const char* t = std::getenv("TMPDIR");
@@ -80,23 +82,31 @@ BOOST_AUTO_TEST_CASE(value_typed_getters)
     BOOST_REQUIRE(ratio);
     BOOST_CHECK_CLOSE(ratio.value(), 0.5, 1e-9);
 
-    // 缺失键 → NotFound
+    /**
+     * 缺失键 → NotFound
+     */
     auto missing = v.GetString("nope");
     BOOST_CHECK(!missing);
     BOOST_CHECK(static_cast<int>(missing.error().code) == static_cast<int>(ErrorCode::NotFound));
 
-    // 空串是「存在且为空」，与缺失区分
+    /**
+     * 空串是「存在且为空」，与缺失区分
+     */
     auto empty = v.GetString("empty");
     BOOST_REQUIRE(empty);
     BOOST_CHECK_EQUAL(empty.value(), "");
 
-    // 类型不匹配 → TypeMismatch
+    /**
+     * 类型不匹配 → TypeMismatch
+     */
     BOOST_CHECK(!v.GetInt64("server.host"));
     BOOST_CHECK(static_cast<int>(v.GetInt64("server.host").error().code) == static_cast<int>(ErrorCode::TypeMismatch));
     BOOST_CHECK(!v.GetBool("server.host"));
     BOOST_CHECK(!v.GetDouble("server.host"));
 
-    // bool 全真/全假集合
+    /**
+     * bool 全真/全假集合
+     */
     auto b = Map(
         {{"a", "1"}, {"b", "0"}, {"c", "yes"}, {"d", "no"}, {"e", "on"}, {"f", "off"}, {"g", "TRUE"}, {"h", "False"}});
     BOOST_CHECK(b.GetBool("a").value());
@@ -113,7 +123,11 @@ BOOST_AUTO_TEST_CASE(value_fingerprint_stable)
 {
     const auto v1 = Map({{"a", "1"}, {"b", "2"}});
     const auto v2 = Map({{"a", "1"}, {"b", "2"}});
-    const auto v3 = Map({{"b", "2"}, {"a", "1"}}); // 乱序构造，映射排序后一致
+
+    /**
+     * 乱序构造，映射排序后一致
+     */
+    const auto v3 = Map({{"b", "2"}, {"a", "1"}});
     const auto v4 = Map({{"a", "1"}, {"b", "3"}});
     BOOST_CHECK_EQUAL(v1.Fingerprint(), v2.Fingerprint());
     BOOST_CHECK_EQUAL(v1.Fingerprint(), v3.Fingerprint());
@@ -141,17 +155,23 @@ BOOST_AUTO_TEST_CASE(memory_source_versions)
     BOOST_REQUIRE(r);
     BOOST_CHECK_EQUAL(r.value().version, 1u);
 
-    // 相同内容 → 版本仍递增，revision 不变（内容指纹）
+    /**
+     * 相同内容 → 版本仍递增，revision 不变（内容指纹）
+     */
     const auto s2 = src.Set(Map({{"a", "1"}}));
     BOOST_CHECK_EQUAL(s2.version, 2u);
     BOOST_CHECK(s2.revision == s1.revision);
 
-    // 不同内容 → revision 变化
+    /**
+     * 不同内容 → revision 变化
+     */
     const auto s3 = src.Set(Map({{"a", "2"}}));
     BOOST_CHECK_EQUAL(s3.version, 3u);
     BOOST_CHECK(s3.revision != s2.revision);
 
-    // 显式版本必须严格递增
+    /**
+     * 显式版本必须严格递增
+     */
     const auto bad = src.Set(Map({{"a", "3"}}), 3);
     BOOST_CHECK(!bad);
     BOOST_CHECK(static_cast<int>(bad.error().code) == static_cast<int>(ErrorCode::InvalidArgument));
@@ -178,14 +198,18 @@ BOOST_AUTO_TEST_CASE(file_source_read_and_update)
     BOOST_REQUIRE(port);
     BOOST_CHECK_EQUAL(port.value(), 8080);
 
-    // 更新文件 → 版本与 revision 均变
+    /**
+     * 更新文件 → 版本与 revision 均变
+     */
     WriteFile(path, "version = 6\nserver.port = 9090\n");
     auto r2 = src.value()->Read();
     BOOST_REQUIRE(r2);
     BOOST_CHECK_EQUAL(r2.value().version, 6u);
     BOOST_CHECK(r2.value().revision != r.value().revision);
 
-    // 同内容重读 → SameVersionAs
+    /**
+     * 同内容重读 → SameVersionAs
+     */
     auto r3 = src.value()->Read();
     BOOST_REQUIRE(r3);
     BOOST_CHECK(r3.value().SameVersionAs(r2.value()));
@@ -195,7 +219,10 @@ BOOST_AUTO_TEST_CASE(file_source_read_and_update)
 
 BOOST_AUTO_TEST_CASE(file_source_malformed_no_pseudo_success)
 {
-    // version 非数字
+
+    /**
+     * version 非数字
+     */
     {
         const std::string p = MakeTempFile("cfg_badver", "version = abc\nk = v\n");
         auto src = FileSource::Create(p, "app", "k");
@@ -205,7 +232,10 @@ BOOST_AUTO_TEST_CASE(file_source_malformed_no_pseudo_success)
         BOOST_CHECK(static_cast<int>(r.error().code) == static_cast<int>(ErrorCode::ProtocolError));
         ::unlink(p.c_str());
     }
-    // 重复键
+
+    /**
+     * 重复键
+     */
     {
         const std::string p = MakeTempFile("cfg_dup", "k = 1\nk = 2\n");
         auto src = FileSource::Create(p, "app", "k");
@@ -215,7 +245,10 @@ BOOST_AUTO_TEST_CASE(file_source_malformed_no_pseudo_success)
         BOOST_CHECK(static_cast<int>(r.error().code) == static_cast<int>(ErrorCode::ProtocolError));
         ::unlink(p.c_str());
     }
-    // 无 '='
+
+    /**
+     * 无 '='
+     */
     {
         const std::string p = MakeTempFile("cfg_noeq", "novalue\n");
         auto src = FileSource::Create(p, "app", "k");
@@ -225,7 +258,10 @@ BOOST_AUTO_TEST_CASE(file_source_malformed_no_pseudo_success)
         BOOST_CHECK(static_cast<int>(r.error().code) == static_cast<int>(ErrorCode::ProtocolError));
         ::unlink(p.c_str());
     }
-    // 空键
+
+    /**
+     * 空键
+     */
     {
         const std::string p = MakeTempFile("cfg_emptykey", " = 1\n");
         auto src = FileSource::Create(p, "app", "k");
@@ -246,7 +282,10 @@ BOOST_AUTO_TEST_CASE(file_source_missing)
 
 BOOST_AUTO_TEST_CASE(file_source_directory_and_empty)
 {
-    // 目录路径：open 成功但读取失败 → InternalError，不得发布伪成功空快照
+
+    /**
+     * 目录路径：open 成功但读取失败 → InternalError，不得发布伪成功空快照
+     */
     const char* t = std::getenv("TMPDIR");
     std::string dir = (t && *t) ? t : ".";
     std::string tmpl = dir + "/cfg_dir_XXXXXX";
@@ -263,7 +302,9 @@ BOOST_AUTO_TEST_CASE(file_source_directory_and_empty)
     }
     ::rmdir(dirpath.c_str());
 
-    // 空文件：合法空配置，不是读取失败
+    /**
+     * 空文件：合法空配置，不是读取失败
+     */
     const std::string empty = MakeTempPath("cfg_empty");
     {
         auto src = FileSource::Create(empty, "app", "k");
@@ -276,4 +317,6 @@ BOOST_AUTO_TEST_CASE(file_source_directory_and_empty)
     ::unlink(empty.c_str());
 }
 
-} // namespace
+// clang-format off
+}
+// clang-format on

@@ -1,4 +1,6 @@
-// 位置参数 payload codec 的非模板实现；模板实现随 __TPositionalCodec.hpp 提供。
+/**
+ * 位置参数 payload codec 的非模板实现；模板实现随 __TPositionalCodec.hpp 提供。
+ */
 #include <bbt/infra/rpc/codec/PositionalCodec.hpp>
 
 namespace bbt::infra::rpc {
@@ -34,4 +36,6 @@ bool FitsU32(std::size_t n) noexcept
     return static_cast<std::uint64_t>(n) <= static_cast<std::uint64_t>(kMaxFieldBytes);
 }
 
-} // namespace bbt::infra::rpc
+// clang-format off
+}
+// clang-format on

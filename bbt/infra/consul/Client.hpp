@@ -1,4 +1,5 @@
-/** @file Client.hpp
+/**
+ * @file Client.hpp
  * @brief Consul agent HTTP API 的最小注册/健康发现适配（bbt::infra::consul）。
  *
  * 职责：把「注册本实例」「注销本实例」「按服务名取 passing 实例快照」映射到
@@ -9,11 +10,13 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include <bbt/coroutine/syntax/Async.hpp>
+#include <bbt/infra/CloseOptions.hpp>
 #include <bbt/infra/ICoCloseable.hpp>
 #include <bbt/infra/Result.hpp>
 #include <bbt/infra/http/Client.hpp>
@@ -24,15 +27,30 @@ namespace bbt::infra::consul {
  * @brief agent 连接与查询选项。
  */
 struct Options {
-    /// 例 "http://127.0.0.1:8500"；仅 http + 数值 loopback，可带结尾 '/'。
+
+    /**
+     * 例 "http://127.0.0.1:8500"；仅 http + 数值 loopback，可带结尾 '/'。
+     */
     std::string agent_url;
-    /// 单次操作的总期限（含连接、写出、读取、阻塞等待）。
+
+    /**
+     * 单次操作的总期限（含连接、写出、读取、阻塞等待）。
+     */
     std::chrono::milliseconds request_timeout{3000};
-    /// 阻塞查询的 wait；0 表示不附加 index/wait（只取一次权威快照）。
+
+    /**
+     * 阻塞查询的 wait；0 表示不附加 index/wait（只取一次权威快照）。
+     */
     std::chrono::milliseconds query_wait{2000};
-    /// 空表示使用 agent 默认 datacenter。
+
+    /**
+     * 空表示使用 agent 默认 datacenter。
+     */
     std::string datacenter;
-    /// 空表示无 ACL；只走 X-Consul-Token 头，不落日志。
+
+    /**
+     * 空表示无 ACL；只走 X-Consul-Token 头，不落日志。
+     */
     std::string token;
 };
 
@@ -40,19 +58,57 @@ struct Options {
  * @brief 一次服务注册的本实例描述。
  */
 struct ServiceRegistration {
-    std::string id;                ///< 每进程 incarnation 唯一，不能用可复用地址充当。
-    std::string name;              ///< 逻辑服务名。
-    std::string address;           ///< 数值地址（不接受主机名）。
-    std::uint16_t port{0};         ///< 服务端口。
-    std::vector<std::string> tags; ///< 服务标签，原样交给 agent。
+
+    /**
+     * 每进程 incarnation 唯一，不能用可复用地址充当。
+     */
+    std::string id;
+
+    /**
+     * 逻辑服务名。
+     */
+    std::string name;
+
+    /**
+     * 数值地址（不接受主机名）。
+     */
+    std::string address;
+
+    /**
+     * 服务端口。
+     */
+    std::uint16_t port{0};
+
+    /**
+     * 服务标签，原样交给 agent。
+     */
+    std::vector<std::string> tags;
 };
 
-/// @brief 健康发现返回的单个实例（agent 视图里的一条 service 记录）。
+/**
+ * @brief 健康发现返回的单个实例（agent 视图里的一条 service 记录）。
+ */
 struct Instance {
-    std::string id;        ///< 实例 id。
-    std::string name;      ///< 逻辑服务名。
-    std::string address;   ///< 数值地址。
-    std::uint16_t port{0}; ///< 端口。
+
+    /**
+     * 实例 id。
+     */
+    std::string id;
+
+    /**
+     * 逻辑服务名。
+     */
+    std::string name;
+
+    /**
+     * 数值地址。
+     */
+    std::string address;
+
+    /**
+     * 端口。
+     */
+    std::uint16_t port{0};
 };
 
 /**
@@ -63,8 +119,16 @@ struct Instance {
  * 缺失、非数字或越界 header 是 ProtocolError。
  */
 struct ServiceSnapshot {
-    std::uint64_t index{0};          ///< agent 视图修订号。
-    std::vector<Instance> instances; ///< passing 实例，顺序即 agent 返回顺序。
+
+    /**
+     * agent 视图修订号。
+     */
+    std::uint64_t index{0};
+
+    /**
+     * passing 实例，顺序即 agent 返回顺序。
+     */
+    std::vector<Instance> instances;
 };
 
 /**
@@ -90,7 +154,7 @@ struct ServiceSnapshot {
  *   - 所有操作只在协程上下文调用（bbt_co_await）；协程外调用返回 InvalidContext，
  *     不抛异常、不静默降级。
  */
-class Client : public bbt::infra::ICoCloseable {
+class Client {
 public:
     /**
      * @brief 创建适配器并接管专属 HTTP Client。
@@ -103,11 +167,19 @@ public:
      */
     static result<std::shared_ptr<Client>> Create(std::shared_ptr<bbt::infra::http::Client> http, Options options);
 
-    /// @brief 只调用 Close()。
-    ~Client() noexcept override;
-    /// @brief 不可拷贝：适配器独占专属 HTTP Client 的关闭责任。
+    /**
+     * @brief 只调用 Close()。
+     */
+    ~Client() noexcept;
+
+    /**
+     * @brief 不可拷贝：适配器独占专属 HTTP Client 的关闭责任。
+     */
     Client(const Client&) = delete;
-    /// @brief 不可拷贝赋值。
+
+    /**
+     * @brief 不可拷贝赋值。
+     */
     Client& operator=(const Client&) = delete;
 
     /**
@@ -139,28 +211,53 @@ public:
     bbt_co_async(result<ServiceSnapshot>) HealthyInstances(std::string_view service, std::uint64_t index = 0);
 
     /**
-     * @brief 同步物理收口：拒绝新操作 → 等待已接纳交换完成或失败 → 关闭专属 HTTP
-     * Client → 等待全部已登记操作离开本对象状态后返回。
+     * @brief 统一逻辑关闭入口：封口 + 发布首因；Graceful 等在途请求发布结果。
      *
-     * 首个与并发 Close 都等同一终态，返回即「已封口、专属 HTTP Client 已关闭、在飞操作
-     * 已离开」；不设 1s 之类的提前返回上限——每个已登记操作受 Options::request_timeout
-     * 绝对期限约束，终态可达：不以 drain timeout 放弃等待（见
-     * docs/decisions/0005-co-io-adapter-contract.md）。协程上下文内以协作挂起等待，
-     * 不阻塞 Processer 线程。幂等、可在任意线程调用；须在调度器/Engine 仍能推进在途操作时
-     * 调用（框架在 handlers drain 后、网络关闭前调用）。
+     * 两种模式都立即封口（拒绝新操作、发布首个原因）并唤醒排队/挂起等待者：
+     *   - `Immediate` 不等在途请求，立即关闭专属 HTTP Client；在途 await 返回关闭
+     *     原因，迟到成功只消费不交付。不能强杀的底层责任仍持有 owner 到安全退出。
+     *   - `Graceful` 在绝对期限前等已登记操作全部离开（各自的 await 已拿到结果），
+     *     到期返回 `TimedOut` 并保留在途责任与封口，不自动升级为 Immediate。
+     *
+     * 可在受管协程（50ms 分片、不占 Processer）或 native 宿主域调用；Processer
+     * 线程上但不在协程内返回 `InvalidContext`。本对象自己的操作协程内调用不拒绝
+     * （封口本身不等自身，Graceful 等的是其它已登记操作）。
+     * `wait_release=true` 时模式工作完成后在同一 `Close` 内继续等专属 HTTP Client
+     * 的连接真实退役到同一绝对期限（不续预算）。
+     * @param options 模式、首因与优雅关闭的有限绝对期限
+     * @return 排空完成、已封口或相应错误
      */
-    void Close() noexcept override;
-    /// @brief 只读查询是否已封口。
-    bool IsClosed() const noexcept override;
+    result<void> Close(const CloseOptions& options = {});
+
+    /**
+     * @brief 首个关闭原因；封口前为空，封口后固定。
+     */
+    std::optional<Error> CloseReason() const noexcept;
+
+    /**
+     * @brief 只读查询是否已封口。
+     */
+    bool IsClosed() const noexcept;
 
 private:
+    void _BeginClose(
+        Error reason = MakeError(ErrorCode::Closed, "consul: client closed by owner"), bool immediate = true) noexcept;
+    result<void> _WaitReleased(bbt::coroutine::Deadline deadline);
+
     struct State;
     class OpScope;
     explicit Client(std::shared_ptr<State> state) noexcept;
-    // Close 的等待半段：宿主线程阻塞等待、协程域协作挂起等待，都等同一终态。
-    static void WaitTerminal(const std::shared_ptr<State>& state) noexcept;
+
+    /**
+     * 关闭的等待半段：宿主线程阻塞等待、协程域协作挂起等待，都等同一谓词；
+     * deadline 到期返回 TimedOut，不冒充完成。
+     */
+    static result<void>
+    WaitUntil(const std::shared_ptr<State>& state, bbt::coroutine::Deadline deadline, bool terminal) noexcept;
 
     std::shared_ptr<State> m_state;
 };
 
-} // namespace bbt::infra::consul
+// clang-format off
+}
+// clang-format on

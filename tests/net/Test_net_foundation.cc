@@ -5,6 +5,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -23,7 +24,10 @@
 #include <vector>
 
 #include <bbt/coroutine/coroutine.hpp>
-// 只为最小支持缺口探针使用 detail；产品 net API 没有该依赖。
+
+/**
+ * 只为最小支持缺口探针使用 detail；产品 net API 没有该依赖。
+ */
 #include <bbt/coroutine/detail/LocalThread.hpp>
 
 using namespace bbt::infra::net;
@@ -31,6 +35,7 @@ using namespace std::chrono_literals;
 
 static std::atomic_bool inject_send_eintr{false};
 extern "C" ssize_t __real_send(int, const void*, size_t, int);
+
 extern "C" ssize_t __wrap_send(int fd, const void* data, size_t size, int flags)
 {
     if (inject_send_eintr.exchange(false)) {
@@ -46,6 +51,7 @@ static void Check(bool value, const char* expression, int line)
         throw std::runtime_error("line " + std::to_string(line) + ": " + expression);
     }
 }
+
 #define CHECK(expression) Check(static_cast<bool>(expression), #expression, __LINE__)
 
 static bool WouldBlock(const std::error_code& error)
@@ -59,7 +65,10 @@ static void Ready(int fd, short events)
     pollfd ready{fd, events, 0};
     int result = 0;
     do {
-        result = ::poll(&ready, 1, 100);
+        /**
+         * 原生就绪夹具不经过协程 Hook，避免等待本身引入额外运行时 fd，污染 socket 回收断言。
+         */
+        result = static_cast<int>(::syscall(SYS_poll, &ready, 1, 100));
         CHECK(result >= 0 || errno == EINTR);
     } while (result <= 0 && std::chrono::steady_clock::now() < until);
     CHECK(result == 1);
@@ -101,6 +110,7 @@ static Address Unix(const std::string& path, bool abstract = false)
 struct OwnedPath {
     std::string path;
     bool bound{false};
+
     ~OwnedPath()
     {
         if (bound) {
@@ -132,21 +142,65 @@ static void AddressAndOwnership()
     CHECK(Ip("127.0.0.1", 65535).ToString() == "127.0.0.1:65535");
     CHECK(Ip("::1", 0).ToString() == "[::1]:0");
     CHECK(Ip("fe80::1%3", 1).ToString() == "[fe80::1%3]:1");
-    //scope 严格校验——合法边界与 Boost atoi 回退曾误收的反例。
-    CHECK(Ip("fe80::1%4294967295", 1).ToString() == "[fe80::1%4294967295]:1"); // u32 上界
-    CHECK(Ip("fe80::1%0", 1).ToString() == "[fe80::1]:1");                     // 0 合法，ToString 不输出
+
+    /**
+     * scope 严格校验——合法边界与 Boost atoi 回退曾误收的反例。
+     * u32 上界
+     */
+    CHECK(Ip("fe80::1%4294967295", 1).ToString() == "[fe80::1%4294967295]:1");
+
+    /**
+     * 0 合法，ToString 不输出
+     */
+    CHECK(Ip("fe80::1%0", 1).ToString() == "[fe80::1]:1");
     const auto reject_ip = [&error](const std::string& host) {
         CHECK(!Address::Ip(host, 1, error).Valid() && error == std::errc::invalid_argument);
     };
-    reject_ip("fe80::1%4294967296"); // 溢出
-    reject_ip("fe80::1%-1");         // 负号
-    reject_ip("fe80::1%+3");         // 显式符号
-    reject_ip("fe80::1%3garbage");   // 尾随垃圾
-    reject_ip("fe80::1%");           // 空 suffix
-    reject_ip("fe80::1% 3");         // 空白
-    reject_ip("fe80::1%3%4");        // 重复 %
-    reject_ip("fe80::1%eth0");       // 接口名不支持，无 if_nametoindex/atoi 回退
-    reject_ip("127.0.0.1%3");        // IPv4 带 scope
+
+    /**
+     * 溢出
+     */
+    reject_ip("fe80::1%4294967296");
+
+    /**
+     * 负号
+     */
+    reject_ip("fe80::1%-1");
+
+    /**
+     * 显式符号
+     */
+    reject_ip("fe80::1%+3");
+
+    /**
+     * 尾随垃圾
+     */
+    reject_ip("fe80::1%3garbage");
+
+    /**
+     * 空 suffix
+     */
+    reject_ip("fe80::1%");
+
+    /**
+     * 空白
+     */
+    reject_ip("fe80::1% 3");
+
+    /**
+     * 重复 %
+     */
+    reject_ip("fe80::1%3%4");
+
+    /**
+     * 接口名不支持，无 if_nametoindex/atoi 回退
+     */
+    reject_ip("fe80::1%eth0");
+
+    /**
+     * IPv4 带 scope
+     */
+    reject_ip("127.0.0.1%3");
     CHECK(Unix("sample").ToString() == "sample");
     CHECK(Unix("sample", true).ToString() == "@sample");
     CHECK(Address{}.Family() == AddressFamily::Unspecified);
@@ -314,7 +368,11 @@ static void StreamRoundtrip(const Address& address, OwnedPath* path = nullptr)
     Ready(pair.server.Fd(), POLLIN);
     const auto eof = pair.server.Receive(&byte, 1);
     CHECK(!eof.error && eof.eof && eof.bytes == 0);
-    CHECK(pair.client.Send("x", 1).error.value() == EPIPE); // NOSIGNAL：不能终止测试进程。
+
+    /**
+     * NOSIGNAL：不能终止测试进程。
+     */
+    CHECK(pair.client.Send("x", 1).error.value() == EPIPE);
     CHECK(!pair.client.Close() && !pair.server.Close());
     std::cout << "stream roundtrip + EOF + NOSIGNAL passed\n";
 }
@@ -390,7 +448,10 @@ static void PartialAndErrors()
     CHECK(std::all_of(received.begin(), received.end(), [](char value) { return value == 'x'; }));
     CHECK(!pair.client.Close() && !pair.server.Close());
     std::cout << "partial=" << first.bytes << " queued before EAGAIN=" << total << "; injected EINTR preserved\n";
-    // 自有动态端口：绑定但不 listen，绝不依赖外部不可达服务或固定端口。
+
+    /**
+     * 自有动态端口：绑定但不 listen，绝不依赖外部不可达服务或固定端口。
+     */
     auto not_listening = Open(AddressFamily::IPv4, SocketType::Stream);
     CHECK(!not_listening.Bind(Ip("127.0.0.1")));
     std::error_code error;
@@ -420,8 +481,9 @@ static void Sockets()
     StreamRoundtrip(Unix("foundation-abstract-" + std::to_string(::getpid()), true));
     DatagramRoundtrip(Ip("127.0.0.1"), Ip("127.0.0.1"));
     DatagramRoundtrip(Ip("::1"), Ip("::1"));
-    DatagramRoundtrip(Unix("foundation-dgram-a-" + std::to_string(::getpid()), true),
-                      Unix("foundation-dgram-b-" + std::to_string(::getpid()), true));
+    DatagramRoundtrip(
+        Unix("foundation-dgram-a-" + std::to_string(::getpid()), true),
+        Unix("foundation-dgram-b-" + std::to_string(::getpid()), true));
     PartialAndErrors();
     CHECK(FdCount() == before);
     CHECK(std::filesystem::is_empty(std::filesystem::current_path()));
@@ -430,10 +492,7 @@ static void Sockets()
 
 class ProbeObject : public ICoObject {
 public:
-    bbt::coroutine::CoObjectInfo GetObjectInfo() const override
-    {
-        return {};
-    }
+    bbt::coroutine::CoObjectInfo GetObjectInfo() const override { return {}; }
 };
 
 static void Context()
@@ -495,7 +554,10 @@ static void Context()
 
 static bool ContextNoCreate(bool upstream_only = false)
 {
-    // 没启动 worker，本进程没有其他 Processer 创建者。id 是上游单调原子计数。
+
+    /**
+     * 没启动 worker，本进程没有其他 Processer 创建者。id 是上游单调原子计数。
+     */
     CHECK(!g_scheduler->IsInitialized());
     const auto before_ordinary = bbt::coroutine::detail::Processer::Create()->GetId();
     ProbeObject object;
@@ -529,9 +591,12 @@ static bool ContextNoCreate(bool upstream_only = false)
 
 static void NativeAcceptConnect()
 {
-    //accept4/connect 在 Linux 原生 primitive 边界走 SYS_accept4/SYS_connect，
-    // 不经 coroutine Hook。受管协程内空 listener 必须立即 EAGAIN 且不让出执行权；
-    // Connect 保留真实 EINPROGRESS pending（受管返回 0 即旧 Hook 缺陷回归）。
+
+    /**
+     * accept4/connect 在 Linux 原生 primitive 边界走 SYS_accept4/SYS_connect，
+     * 不经 coroutine Hook。受管协程内空 listener 必须立即 EAGAIN 且不让出执行权；
+     * Connect 必须保留真实 EINPROGRESS pending，不能被 Hook 改为等待后返回 0。
+     */
     const auto before = FdCount();
     auto listener = Open(AddressFamily::IPv4, SocketType::Stream);
     CHECK(!listener.Bind(Ip("127.0.0.1")));
@@ -544,7 +609,11 @@ static void NativeAcceptConnect()
     CHECK(listener.Accept(peer, error).Fd() == -1 && error.value() == EAGAIN);
     CHECK(std::chrono::steady_clock::now() - ordinary_started < 200ms);
     static std::atomic_bool probe_ran{false};
-    g_bbt_coroutine_config->m_cfg_static_thread_num = 1; // 单 Processer：Accept 让位才会轮到后注册任务
+
+    /**
+     * 单 Processer：Accept 让位才会轮到后注册任务
+     */
+    g_bbt_coroutine_config->m_cfg_static_thread_num = 1;
     g_bbt_coroutine_config->m_cfg_stack_size = 65536;
     g_scheduler->Start();
     auto client_go = std::make_shared<std::promise<void>>();
@@ -557,23 +626,30 @@ static void NativeAcceptConnect()
                 std::error_code inner;
                 Address inner_peer = Ip("127.0.0.1", 42);
                 const auto empty_started = std::chrono::steady_clock::now();
-                // TLS 受管许可下空 listener：不设 SO_RCVTIMEO 也必须立即 EAGAIN（旧 Hook 会无限等）。
+
+                /**
+                 * TLS 受管许可下空 listener：不设 SO_RCVTIMEO 也必须立即 EAGAIN，不能被 Hook 改为等待。
+                 */
                 CHECK(listener.Accept(inner_peer, inner).Fd() == -1 && inner.value() == EAGAIN);
                 CHECK(std::chrono::steady_clock::now() - empty_started < 200ms);
-                CHECK(!probe_ran); // 任务顺序证明：Accept 未让位（否则后注册 probe 已先运行）
+
+                /**
+                 * 任务顺序证明：Accept 未让位（否则后注册 probe 已先运行）
+                 */
+                CHECK(!probe_ran);
                 client_go->set_value();
-                NativeSocket accepted;
-                for (int i = 0; i < 200 && accepted.Fd() < 0; ++i) {
-                    accepted = listener.Accept(inner_peer, inner);
-                    if (accepted.Fd() < 0) {
-                        CHECK(inner.value() == EAGAIN);
-                        bbtco_yield;
-                    }
-                }
+                /**
+                 * yield 次数不能保证原生客户端线程获得 CPU；先确认连接就绪再接纳。
+                 */
+                Ready(listener.Fd(), POLLIN);
+                auto accepted = listener.Accept(inner_peer, inner);
                 CHECK(accepted.Fd() >= 0);
                 CHECK((::fcntl(accepted.Fd(), F_GETFL) & O_NONBLOCK) != 0);
                 CHECK((::fcntl(accepted.Fd(), F_GETFD) & FD_CLOEXEC) != 0);
-                // 受管 Connect → 真实 listener：pending 可见，readiness 后真正完成。
+
+                /**
+                 * 受管 Connect → 真实 listener：pending 可见，readiness 后真正完成。
+                 */
                 auto connector = Open(AddressFamily::IPv4, SocketType::Stream);
                 auto completed = Open(AddressFamily::IPv4, SocketType::Stream);
                 CHECK(!completed.Bind(Ip("127.0.0.1")));
@@ -582,16 +658,13 @@ static void NativeAcceptConnect()
                 CHECK(!inner);
                 const auto connected = connector.Connect(completed_bound);
                 CHECK(!connected || connected.value() == EINPROGRESS);
-                for (int i = 0; i < 200; ++i) {
-                    pollfd ready{connector.Fd(), POLLOUT, 0};
-                    if (::poll(&ready, 1, 0) == 1) {
-                        break;
-                    }
-                    bbtco_yield;
-                }
+                Ready(connector.Fd(), POLLOUT);
                 CHECK(!connector.PendingError());
-                // 受管 Connect → 未监听端口：保持真实 pending，readiness 后 ECONNREFUSED；
-                // 旧 Hook 缺陷在此返回 0。
+
+                /**
+                 * 受管 Connect → 未监听端口：保持真实 pending，readiness 后 ECONNREFUSED；
+                 * Hook 不得把真实 pending 改写为同步成功。
+                 */
                 auto silent = Open(AddressFamily::IPv4, SocketType::Stream);
                 CHECK(!silent.Bind(Ip("127.0.0.1")));
                 const auto silent_bound = silent.LocalAddress(inner);
@@ -600,17 +673,8 @@ static void NativeAcceptConnect()
                 const auto refused_connect = failing.Connect(silent_bound);
                 CHECK(refused_connect.value() == EINPROGRESS || refused_connect.value() == ECONNREFUSED);
                 if (refused_connect.value() == EINPROGRESS) {
-                    bool refused = false;
-                    for (int i = 0; i < 200 && !refused; ++i) {
-                        pollfd ready{failing.Fd(), POLLOUT, 0};
-                        if (::poll(&ready, 1, 0) == 1) {
-                            CHECK(failing.PendingError().value() == ECONNREFUSED);
-                            refused = true;
-                        } else {
-                            bbtco_yield;
-                        }
-                    }
-                    CHECK(refused);
+                    Ready(failing.Fd(), POLLOUT);
+                    CHECK(failing.PendingError().value() == ECONNREFUSED);
                 }
                 CHECK(!accepted.Close() && !connector.Close() && !completed.Close());
                 CHECK(!silent.Close() && !failing.Close());
@@ -647,7 +711,10 @@ static void NativeAcceptConnect()
             client_error = std::current_exception();
         }
     });
-    // 任何等待/传播路径先 join：joinable thread 析构 terminate 会掩盖真实断言。
+
+    /**
+     * 任何等待/传播路径先 join：joinable thread 析构 terminate 会掩盖真实断言。
+     */
     try {
         CHECK(accepted_future.wait_for(10s) == std::future_status::ready);
         CHECK(accepted_future.get() == 0);
@@ -668,8 +735,11 @@ static void NativeAcceptConnect()
 
 static void FlagsContract()
 {
-    //flags 只承诺保守 allowlist；未列出位在任何系统调用前拒绝（bytes=0，
-    // 不发出/不消费报文），数据报 TRUNC 返回值只计拷贝字节。
+
+    /**
+     * flags 只承诺保守 allowlist；未列出位在任何系统调用前拒绝（bytes=0，
+     * 不发出/不消费报文），数据报 TRUNC 返回值只计拷贝字节。
+     */
     auto pair = ConnectPair(Ip("127.0.0.1"));
     CHECK(pair.client.Send("x", 1, 0x80000000).error == std::errc::operation_not_supported);
     CHECK(pair.client.Send("x", 1, MSG_OOB).error == std::errc::operation_not_supported);
@@ -677,7 +747,11 @@ static void FlagsContract()
     const ConstBuffer buffers[]{{"v", 1}};
     CHECK(pair.client.Sendv(buffers, 1, MSG_ZEROCOPY).error == std::errc::operation_not_supported);
     char byte = 0;
-    CHECK(WouldBlock(pair.server.Receive(&byte, 1).error)); // 被拒 send 未发出任何数据
+
+    /**
+     * 被拒 send 未发出任何数据
+     */
+    CHECK(WouldBlock(pair.server.Receive(&byte, 1).error));
     CHECK(!pair.client.Send("abc", 3).error);
     Ready(pair.server.Fd(), POLLIN);
     CHECK(pair.server.Receive(&byte, 1, MSG_TRUNC).error == std::errc::operation_not_supported);
@@ -700,17 +774,33 @@ static void FlagsContract()
     char data[8]{};
     CHECK(a.SendTo("truncate-me", 11, b_bound, MSG_ZEROCOPY).error == std::errc::operation_not_supported);
     CHECK(a.SendTo("truncate-me", 11, b_bound, MSG_TRUNC).error == std::errc::operation_not_supported);
-    CHECK(WouldBlock(b.ReceiveFrom(data, sizeof(data), source).error));    // 被拒 SendTo 未发出
-    CHECK(!a.SendTo("truncate-me-long", 16, b_bound, MSG_NOSIGNAL).error); // NOSIGNAL 用户可传
+
+    /**
+     * 被拒 SendTo 未发出
+     */
+    CHECK(WouldBlock(b.ReceiveFrom(data, sizeof(data), source).error));
+
+    /**
+     * NOSIGNAL 用户可传
+     */
+    CHECK(!a.SendTo("truncate-me-long", 16, b_bound, MSG_NOSIGNAL).error);
     Ready(b.Fd(), POLLIN);
     const auto truncated = b.ReceiveFrom(data, 4, source, MSG_TRUNC);
-    CHECK(!truncated.error && truncated.truncated && truncated.bytes == 4); // bytes 只计拷贝
+
+    /**
+     * bytes 只计拷贝
+     */
+    CHECK(!truncated.error && truncated.truncated && truncated.bytes == 4);
     CHECK(std::memcmp(data, "trun", 4) == 0);
     CHECK(!a.SendTo("keep", 4, b_bound).error);
     Ready(b.Fd(), POLLIN);
     CHECK(b.ReceiveFrom(data, 4, source, 0x80000000).error == std::errc::operation_not_supported);
     const auto kept = b.ReceiveFrom(data, 4, source);
-    CHECK(!kept.error && kept.bytes == 4 && std::memcmp(data, "keep", 4) == 0); // 拒绝未消费报文
+
+    /**
+     * 拒绝未消费报文
+     */
+    CHECK(!kept.error && kept.bytes == 4 && std::memcmp(data, "keep", 4) == 0);
     CHECK(!a.SendTo("peek", 4, b_bound).error);
     Ready(b.Fd(), POLLIN);
     const auto peek_one = b.ReceiveFrom(data, 4, source, MSG_PEEK);
@@ -757,7 +847,10 @@ static int RunFoundationCases(int argc, char** argv)
 
 int main(int argc, char** argv)
 {
-    // 测试进程退出边界：局部 RAII 收口 → 刷新输出 → _Exit，见
-    // ProcessRuntimeTestMain.hpp 头注（静态析构竞态为已知限制，未修复）。
+
+    /**
+     * 测试进程退出边界：局部 RAII 收口 → 刷新输出 → _Exit，见
+     * ProcessRuntimeTestMain.hpp 头注（静态析构竞态为已知限制，未修复）。
+     */
     return bbt_net_test::RunTestProcessExit([&] { return RunFoundationCases(argc, argv); });
 }

@@ -1,8 +1,11 @@
-// 由 Test_redis_net_contract.cc 在匿名 namespace 内包含；复用真实 TCP/宿主 fixture。
+/**
+ * 只被 Test_redis_net_contract.cc 包含：用例直接摊在这一个 TU 里，函数不需要
+ * inline；复用真实 TCP/宿主 fixture。
+ */
 using PoolAccess = redis::PoolTestAccess;
 
-std::shared_ptr<redis::CoRedisPool> PeerPool(Host& host, net::Address address, std::size_t size = 1,
-                                             std::size_t waiters = 1)
+std::shared_ptr<redis::CoRedisPool>
+PeerPool(Host& host, net::Address address, std::size_t size = 1, std::size_t waiters = 1)
 {
     auto created = redis::CoRedisPool::Create(host.engine, address, {size, waiters});
     CHECK(created);
@@ -11,7 +14,9 @@ std::shared_ptr<redis::CoRedisPool> PeerPool(Host& host, net::Address address, s
     return pool;
 }
 
-// 完整命令已到对端才提交等待者；两个槽都占满，FIFO、排队上限与归还容量。
+/**
+ * 完整命令已到对端才提交等待者；两个槽都占满，FIFO、排队上限与归还容量。
+ */
 void PoolStages()
 {
     Endpoint listener(true);
@@ -27,16 +32,16 @@ void PoolStages()
             workers.push_back(std::async(std::launch::async, [&, fd] {
                 struct CloseFd {
                     int fd;
-                    ~CloseFd()
-                    {
-                        ::close(fd);
-                    }
+                    ~CloseFd() { ::close(fd); }
                 } close{fd};
                 CHECK(Peer::ReadCommand(fd) == std::vector<std::string>({"PING"}));
                 ++received;
                 CHECK(WaitUntil([&] { return release.load(); }));
                 CHECK(Peer::Send(fd, "+PONG\r\n"));
-                // 后续命令在 pool Close 前由 host 逐个提交。
+
+                /**
+                 * 后续命令在 pool Close 前由 host 逐个提交。
+                 */
                 for (;;) {
                     pollfd ready{fd, POLLIN, 0};
                     CHECK(::poll(&ready, 1, 3000) == 1);
@@ -77,17 +82,22 @@ void PoolStages()
     CHECK(Get(b));
     CHECK(Get(c));
     CHECK(Get(d));
-    // 两连接的完成顺序不必 FIFO；FIFO 由单槽用例另外断言。
+
+    /**
+     * 两连接的完成顺序不必 FIFO；FIFO 由单槽用例另外断言。
+     */
     CHECK(order.size() == 2 && PoolAccess::Queued(*pool) == 0);
     CHECK(host.Call([&] { return bbt_co_await pool->Ping(Until()); }));
-    pool->Close();
+    (void)pool->Close();
     pool.reset();
     Get(server);
     host.Finish();
     std::cout << "pool_stages complete_commands=2 occupied=2 queue_peak=2 excess=Overloaded capacity_returned=1\n";
 }
 
-// 单槽 FIFO；超时/取消/Close 均在真实入队后触发；0 拒绝不登记。
+/**
+ * 单槽 FIFO；超时/取消/Close 均在真实入队后触发；0 拒绝不登记。
+ */
 void PoolWaitExits()
 {
     for (const std::string mode : {"fifo", "timeout", "cancel", "close", "zero", "deadline"}) {
@@ -105,7 +115,11 @@ void PoolWaitExits()
                 CHECK(Peer::ReadCommand(fd) == std::vector<std::string>({"PING"}));
                 if (mode == "deadline") {
                     char byte;
-                    CHECK(::recv(fd, &byte, 1, 0) == 0); // 等待+命令共用期限，命令超时退役。
+
+                    /**
+                     * 等待+命令共用期限，命令超时退役。
+                     */
+                    CHECK(::recv(fd, &byte, 1, 0) == 0);
                     return;
                 }
                 CHECK(Peer::Send(fd, "+PONG\r\n"));
@@ -140,18 +154,23 @@ void PoolWaitExits()
         } else if (mode == "cancel") {
             current->RequestCancel();
         } else if (mode == "close") {
-            pool->Close();
+            (void)pool->Close();
         }
         if (mode == "timeout" || mode == "cancel" || mode == "close" || mode == "zero") {
             auto value = Get(b);
-            ExpectCode(value, mode == "timeout"  ? ErrorCode::TimedOut
-                              : mode == "cancel" ? ErrorCode::Cancelled
-                              : mode == "close"  ? ErrorCode::Closed
-                                                 : ErrorCode::Overloaded);
+            ExpectCode(
+                value,
+                mode == "timeout"  ? ErrorCode::TimedOut
+                : mode == "cancel" ? ErrorCode::Cancelled
+                : mode == "close"  ? ErrorCode::Closed
+                                   : ErrorCode::Overloaded);
             CHECK(PoolAccess::Queued(*pool) == 0);
         }
         if (mode == "deadline") {
-            // 已确认 B 入队，扣留 A 消耗大部分预算；重置期限会越过下方界限。
+
+            /**
+             * 已确认 B 入队，扣留 A 消耗大部分预算；重置期限会越过下方界限。
+             */
             CHECK(WaitUntil([&] { return std::chrono::steady_clock::now() >= options.deadline - 60ms; }));
         }
         release.store(true);
@@ -175,7 +194,7 @@ void PoolWaitExits()
         if (mode == "close") {
             CHECK(host.engine->Phase() == net::EnginePhase::Running);
         }
-        pool->Close();
+        (void)pool->Close();
         pool.reset();
         peer.Join();
         host.Finish();
@@ -183,8 +202,10 @@ void PoolWaitExits()
     }
 }
 
-// 登记前的旧丢通知窗口：归还与 Close 都发生在 B 尚未登记时。
-// 取消先胜但归还已交接的窗口：出账必须把槽交给 C。
+/**
+ * 登记前的丢通知窗口：归还与 Close 都发生在 B 尚未登记时。
+ * 取消先胜但归还已交接的窗口：出账必须把槽交给 C。
+ */
 void PoolWaitWindows()
 {
     for (const std::string mode : {"return_before_register", "close_before_register", "throw_registered"}) {
@@ -197,7 +218,10 @@ void PoolWaitWindows()
                 return;
             }
             CHECK(Peer::Send(fd, "+PONG\r\n"));
-            // throw/cancel 两例由 C 使用归还容量，return 由 B 使用。
+
+            /**
+             * throw/cancel 两例由 C 使用归还容量，return 由 B 使用。
+             */
             CHECK(Peer::ReadCommand(fd) == std::vector<std::string>({"PING"}));
             CHECK(Peer::Send(fd, "+PONG\r\n"));
         });
@@ -226,7 +250,7 @@ void PoolWaitWindows()
             CHECK(WaitUntil([&] { return paused.entered.load(); }));
         }
         if (mode == "close_before_register") {
-            pool->Close();
+            (void)pool->Close();
         }
         release.store(true);
         auto first = Get(a);
@@ -255,7 +279,7 @@ void PoolWaitWindows()
             CHECK(host.Call([&] { return bbt_co_await pool->Ping(Until()); }));
         }
         PoolAccess::SetWaitHook(*pool, {});
-        pool->Close();
+        (void)pool->Close();
         pool.reset();
         peer.Join();
         host.Finish();
@@ -290,13 +314,17 @@ void PoolCancelHandoff()
     CHECK(WaitUntil([&] { return PoolAccess::Queued(*pool) == 1; }));
     current->RequestCancel();
     CHECK(WaitUntil([&] { return paused.entered.load(); }));
-    held.reset(); // B 已取消，尚未出账；native 归还仍把槽 handoff 给 B。
+
+    /**
+     * B 已取消，尚未出账；native 归还仍把槽 handoff 给 B。
+     */
+    held.reset();
     CHECK(PoolAccess::Queued(*pool) == 0);
     paused.Release();
     ExpectCode(Get(b), ErrorCode::Cancelled);
     PoolAccess::SetWaitHook(*pool, {});
     CHECK(host.Call([&] { return bbt_co_await pool->Ping(Until()); }));
-    pool->Close();
+    (void)pool->Close();
     pool.reset();
     peer.Join();
     host.Finish();
@@ -330,9 +358,13 @@ void PoolRepairWaiter()
     CHECK(!failed);
     CheckUnknown(failed.error(), "TransportError");
     CHECK(host.Call([&] { return bbt_co_await pool->Connect(Until()); }));
-    CHECK(Get(b)); // 不发送第三个命令，显式恢复必须主动服务 B。
+
+    /**
+     * 不发送第三个命令，显式恢复必须主动服务 B。
+     */
+    CHECK(Get(b));
     CHECK(PoolAccess::Queued(*pool) == 0);
-    pool->Close();
+    (void)pool->Close();
     pool.reset();
     peer.Join();
     host.Finish();
@@ -355,14 +387,18 @@ void PoolConnectRollback()
     auto pool = std::move(created).value();
     auto connected = host.Call([&] { return bbt_co_await pool->Connect(Until()); });
     ExpectCode(connected, ErrorCode::Cancelled);
-    CHECK(dials == 2); // 第二次拨号前第一条已成功；取消只作用于第二次。
+
+    /**
+     * 第二次拨号前第一条已成功；取消只作用于第二次。
+     */
+    CHECK(dials == 2);
     net::CoTestAccess::SetDialBarrier({});
     ExpectCode(host.Call([&] { return bbt_co_await pool->Ping(Until()); }), ErrorCode::RuntimeUnavailable);
     CHECK(
         WaitUntil([&] { return host.engine->CountConnections() == 0 && Access::ConnectTableSize(*host.engine) == 0; }));
     CHECK(host.Call([&] { return bbt_co_await pool->Connect(Until()); }));
     CHECK(host.engine->CountConnections() == 2);
-    pool->Close();
+    (void)pool->Close();
     pool.reset();
     host.Finish();
     std::cout << "pool_rollback first_connected_second_cancelled=1 all_rolled_back=1 explicit_retry_ready=1\n";

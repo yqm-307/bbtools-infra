@@ -1,11 +1,12 @@
 #pragma once
 
-// http_net 契约测试支持：自有进程、动态端口的真实 loopback HTTP/1.1 对端
-// （POSIX listener + 独立线程，记录 accept 总数与单连接请求数作为连接复用
-// 证据），共享 client-only Engine 宿主装配（Run 线程 + 任务清账 + 收口凭据），
-// 有界 watchdog 与真实 CoWaiter 屏障。fixture 只补充时序控制与观察，不 mock
-// HTTP 协议本身。
-
+/**
+ * http_net 契约测试支持：自有进程、动态端口的真实 loopback HTTP/1.1 对端
+ * （POSIX listener + 独立线程，记录 accept 总数与单连接请求数作为连接复用
+ * 证据），共享 client-only Engine 宿主装配（Run 线程 + 任务清账 + 收口凭据），
+ * 有界 watchdog 与真实 CoWaiter 屏障。fixture 只补充时序控制与观察，不 mock
+ * HTTP 协议本身。
+ */
 #include <bbt/infra/http/Client.hpp>
 #include <bbt/infra/net/detail/EngineTestAccess.hpp>
 #include <bbt/infra/net/detail/TestAccess.hpp>
@@ -50,12 +51,14 @@ inline void Check(bool value, const char* expression, int line)
         throw std::runtime_error("line " + std::to_string(line) + ": " + expression);
     }
 }
+
 #define CHECK(expression) ::http_net_test::Check(static_cast<bool>(expression), #expression, __LINE__)
 
 inline CallOptions Until(std::chrono::milliseconds duration = 2s)
 {
     return {std::chrono::steady_clock::now() + duration};
 }
+
 inline bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds timeout = 3s)
 {
     const auto end = std::chrono::steady_clock::now() + timeout;
@@ -67,11 +70,13 @@ inline bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milli
     }
     return true;
 }
+
 template <class T> T Get(std::future<T>& future)
 {
     CHECK(future.wait_for(5s) == std::future_status::ready);
     return future.get();
 }
+
 template <class T> void ExpectCode(const result<T>& value, ErrorCode code)
 {
     CHECK(!value);
@@ -91,19 +96,22 @@ inline std::size_t SocketCount()
     return count;
 }
 
-// 测试进程 watchdog：超时仍为失败；不把强制退出当资源清理成功。
+/**
+ * 测试进程 watchdog：超时仍为失败；不把强制退出当资源清理成功。
+ */
 class Watchdog {
 public:
     Watchdog()
         : m_thread([this] {
-              std::unique_lock<std::mutex> lock(m_mutex);
-              if (!m_cv.wait_for(lock, 20s, [this] { return m_done; })) {
-                  std::cerr << "FAIL watchdog: bounded test did not finish\n" << std::flush;
-                  std::_Exit(3);
-              }
-          })
+            std::unique_lock<std::mutex> lock(m_mutex);
+            if (!m_cv.wait_for(lock, 20s, [this] { return m_done; })) {
+                std::cerr << "FAIL watchdog: bounded test did not finish\n" << std::flush;
+                std::_Exit(3);
+            }
+        })
     {
     }
+
     ~Watchdog()
     {
         {
@@ -121,14 +129,19 @@ private:
     std::thread m_thread;
 };
 
-// 业务协程通过 CoWaiter 等待的真实屏障：目标阶段由 Release 之前的状态断言证明。
+/**
+ * 业务协程通过 CoWaiter 等待的真实屏障：目标阶段由 Release 之前的状态断言证明。
+ */
 struct Gate {
     std::atomic<bool> entered{false};
     std::shared_ptr<bbt::coroutine::sync::CoWaiter> waiter;
-    Gate() : waiter(bbt::coroutine::sync::CoWaiter::Create())
+
+    Gate()
+        : waiter(bbt::coroutine::sync::CoWaiter::Create())
     {
         CHECK(waiter);
     }
+
     void Pause()
     {
         const auto status = waiter->WaitWithCallback({std::chrono::steady_clock::now() + 5s}, [this] {
@@ -137,26 +150,25 @@ struct Gate {
         });
         CHECK(status == bbt::coroutine::WaitStatus::Completed);
     }
-    void Release()
-    {
-        waiter->Notify();
-    }
-    ~Gate()
-    {
-        Release();
-    }
+
+    void Release() { waiter->Notify(); }
+
+    ~Gate() { Release(); }
 };
 
 struct Ledger {
     std::atomic<unsigned> submitted{0};
     std::atomic<unsigned> completed{0};
 };
+
 inline bool Drained(bool run_returned, net::EnginePhase phase, unsigned submitted, unsigned completed)
 {
     return run_returned && phase == net::EnginePhase::Stopped && submitted == completed;
 }
 
-// client-only Engine 宿主：Run 线程 + 协程任务提交 + 完整收口凭据。
+/**
+ * client-only Engine 宿主：Run 线程 + 协程任务提交 + 完整收口凭据。
+ */
 class Host {
 public:
     std::shared_ptr<net::Engine> engine;
@@ -164,7 +176,8 @@ public:
     std::error_code run_error;
     std::atomic<bool> run_returned{false};
 
-    Host() : engine(net::Engine::Create(std::shared_ptr<net::RawHandler>{}))
+    Host()
+        : engine(net::Engine::Create(std::shared_ptr<net::RawHandler>{}))
     {
         net::EngineConfig config;
         config.runtime_progress = net::RuntimeProgress::Independent;
@@ -176,10 +189,8 @@ public:
         CHECK(WaitUntil([this] { return engine->Phase() == net::EnginePhase::Running || run_returned.load(); }));
         CHECK(engine->Phase() == net::EnginePhase::Running);
     }
-    ~Host()
-    {
-        Stop();
-    }
+
+    ~Host() { Stop(); }
 
     template <class F> auto Submit(F fn) -> std::future<decltype(fn())>
     {
@@ -218,19 +229,22 @@ public:
         }
         return future;
     }
+
     template <class F> auto Call(F fn) -> decltype(fn())
     {
         auto future = Submit(std::move(fn));
         return Get(future);
     }
+
     void Stop()
     {
         if (!m_thread.joinable()) {
             return;
         }
-        engine->RequestClose();
+        (void)engine->Close();
         m_thread.join();
     }
+
     void Finish()
     {
         Stop();
@@ -251,9 +265,11 @@ private:
     std::thread m_thread;
 };
 
-// 自有真实 loopback HTTP/1.1 对端。默认行为：keep-alive 循环读完整请求
-// （header + Content-Length body），记录后按 canned 响应回写；hook 可完全接管
-// 一次连接（坏流注入、无响应断开、屏障暂停等）。
+/**
+ * 自有真实 loopback HTTP/1.1 对端。默认行为：keep-alive 循环读完整请求
+ * （header + Content-Length body），记录后按 canned 响应回写；hook 可完全接管
+ * 一次连接（坏流注入、无响应断开、屏障暂停等）。
+ */
 class HttpPeer {
 public:
     struct Recorded {
@@ -263,9 +279,15 @@ public:
         std::string body;
     };
 
-    // canned 响应构造。
-    static std::string HttpResponse(int status, const std::string& reason, const std::string& body,
-                                    const bbt::infra::http::Headers& extra = {}, bool include_content_length = true)
+    /**
+     * canned 响应构造。
+     */
+    static std::string HttpResponse(
+        int status,
+        const std::string& reason,
+        const std::string& body,
+        const bbt::infra::http::Headers& extra = {},
+        bool include_content_length = true)
     {
         std::string out = "HTTP/1.1 " + std::to_string(status) + " " + reason + "\r\n";
         if (include_content_length) {
@@ -297,65 +319,54 @@ public:
         CHECK(!m_address_error);
         m_thread = std::thread([this] { AcceptLoop(); });
     }
+
     ~HttpPeer()
     {
         Stop();
         ::close(m_listener);
     }
 
-    // hook 复用入口：读完整 HTTP 请求（header+\r\n\r\n+Content-Length body）与发送。
-    static std::optional<Recorded> ReadRequestForHook(int fd)
-    {
-        return ReadRequest(fd);
-    }
-    static bool SendForHook(int fd, const std::string& bytes)
-    {
-        return Send(fd, bytes);
-    }
+    /**
+     * hook 复用入口：读完整 HTTP 请求（header+\r\n\r\n+Content-Length body）与发送。
+     */
+    static std::optional<Recorded> ReadRequestForHook(int fd) { return ReadRequest(fd); }
 
-    int port() const noexcept
-    {
-        return m_port;
-    }
-    const net::Address& address() const noexcept
-    {
-        return m_address;
-    }
-    std::string base_url() const
-    {
-        return "http://127.0.0.1:" + std::to_string(m_port);
-    }
+    static bool SendForHook(int fd, const std::string& bytes) { return Send(fd, bytes); }
 
-    unsigned accept_total() const noexcept
-    {
-        return m_accept_total.load();
-    }
-    unsigned requests_total() const noexcept
-    {
-        return m_requests_total.load();
-    }
-    unsigned max_requests_on_one_connection() const noexcept
-    {
-        return m_max_requests_single.load();
-    }
+    int port() const noexcept { return m_port; }
+
+    const net::Address& address() const noexcept { return m_address; }
+
+    std::string base_url() const { return "http://127.0.0.1:" + std::to_string(m_port); }
+
+    unsigned accept_total() const noexcept { return m_accept_total.load(); }
+
+    unsigned requests_total() const noexcept { return m_requests_total.load(); }
+
+    unsigned max_requests_on_one_connection() const noexcept { return m_max_requests_single.load(); }
+
     std::vector<Recorded> requests() const
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_requests;
     }
 
-    // 一次性连接 hook（按 accept 顺序消费）：完全接管一条连接（可阻塞、可发
-    // 坏流）；没有 hook 的连接走默认 keep-alive 服务循环。
+    /**
+     * 一次性连接 hook（按 accept 顺序消费）：完全接管一条连接（可阻塞、可发
+     * 坏流）；没有 hook 的连接走默认 keep-alive 服务循环。
+     */
     void PushConnectionHook(std::function<void(int)> hook)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_hooks.push_back(std::move(hook));
     }
+
     void set_canned(std::function<std::string(const Recorded&)> canned)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_canned = std::move(canned);
     }
+
     void Stop()
     {
         {
@@ -372,7 +383,10 @@ public:
         if (m_thread.joinable()) {
             m_thread.join();
         }
-        // 活跃连接线程的 fd 由 shutdown 触发收尾；等待全部线程退出与 fd 关闭。
+
+        /**
+         * 活跃连接线程的 fd 由 shutdown 触发收尾；等待全部线程退出与 fd 关闭。
+         */
         CHECK(WaitUntil([this] {
             std::lock_guard<std::mutex> lock(m_mutex);
             return m_conns.empty();
@@ -488,7 +502,9 @@ private:
         return true;
     }
 
-    // 读完整 HTTP 请求（hook 复用）：header 直到 \r\n\r\n，再按 Content-Length 读 body。
+    /**
+     * 读完整 HTTP 请求（hook 复用）：header 直到 \r\n\r\n，再按 Content-Length 读 body。
+     */
     static std::optional<Recorded> ReadRequest(int fd)
     {
         std::string buffer;
@@ -583,4 +599,6 @@ private:
     std::atomic<unsigned> m_max_requests_single{0};
 };
 
-} // namespace http_net_test
+// clang-format off
+}
+// clang-format on

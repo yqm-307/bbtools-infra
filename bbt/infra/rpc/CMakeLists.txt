@@ -10,6 +10,8 @@ add_library(bbt_infra_rpc_net STATIC
     detail/RpcSession.cc
     detail/AdmissionImpl.cc
     detail/SessionHooks.cc
+    detail/RpcSessionState.cc
+    detail/RpcChannel.cc
     detail/Tcp.cc)
 add_library(bbt::infra_rpc_net ALIAS bbt_infra_rpc_net)
 target_include_directories(bbt_infra_rpc_net

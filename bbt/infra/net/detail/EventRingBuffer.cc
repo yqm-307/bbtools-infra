@@ -3,7 +3,8 @@
 namespace bbt::infra::net {
 
 EventSnapshot::EventSnapshot(EventSnapshot&& other) noexcept
-    : data_(std::move(other.data_)), cursor_(std::exchange(other.cursor_, 0))
+    : data_(std::move(other.data_))
+    , cursor_(std::exchange(other.cursor_, 0))
 {
 }
 
@@ -35,16 +36,20 @@ std::error_code EventSnapshot::Consume(std::size_t n, std::string& out)
     return {};
 }
 
-EventSnapshot::EventSnapshot(std::string data) : data_(std::move(data))
+EventSnapshot::EventSnapshot(std::string data)
+    : data_(std::move(data))
 {
 }
 
-EventRingBuffer::EventRingBuffer(std::size_t max_bytes) noexcept : storage_(max_bytes), max_bytes_(max_bytes)
+EventRingBuffer::EventRingBuffer(std::size_t max_bytes) noexcept
+    : storage_(max_bytes)
+    , max_bytes_(max_bytes)
 {
 }
 
 EventRingBuffer::EventRingBuffer(EventRingBuffer&& other) noexcept
-    : storage_(std::move(other.storage_)), max_bytes_(other.max_bytes_)
+    : storage_(std::move(other.storage_))
+    , max_bytes_(other.max_bytes_)
 {
 }
 
@@ -81,7 +86,10 @@ std::error_code EventRingBuffer::Append(std::string_view data)
         owned_input.assign(data.data(), data.size());
         data = owned_input;
     }
-    // prepare 保留可读段地址，输出区与可读区不重叠；别名输入已在上面复制。
+
+    /**
+     * prepare 保留可读段地址，输出区与可读区不重叠；别名输入已在上面复制。
+     */
     const auto output = storage_.prepare(data.size());
     boost::asio::buffer_copy(output, boost::asio::buffer(data.data(), data.size()));
     storage_.commit(data.size());
@@ -127,7 +135,10 @@ std::error_code EventRingBuffer::Consume(std::size_t n, std::string& out)
     if (n == 0) {
         return {};
     }
-    // 先确保输出容量；分段追加期间不得因分配失败留下部分输出。
+
+    /**
+     * 先确保输出容量；分段追加期间不得因分配失败留下部分输出。
+     */
     if (n > out.max_size() - out.size()) {
         throw std::length_error("buffer output too long");
     }
@@ -155,4 +166,6 @@ EventSnapshot EventRingBuffer::TakeSnapshot() const
     return EventSnapshot(std::move(data));
 }
 
-} // namespace bbt::infra::net
+// clang-format off
+}
+// clang-format on

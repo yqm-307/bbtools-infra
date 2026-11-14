@@ -1,6 +1,8 @@
 # 0015：立即关闭（Close）与优雅退出（Shutdown）的两种语义
 
 > 后续取代关系（2026-11-08）：**仅 RPC 部分**的关闭约定已由 [现行 RPC 指南](../guides/rpc-net.md) 取代：关闭模式统一由 Close 参数选择，Shutdown 为同步强制关闭。本文 HTTP 部分不受此更新影响；下文保留原决策记录。
+>
+> 后续取代关系（2026-11-09）：公开控制面由 `Close(CloseOptions{mode, reason, deadline})` 统一，`Close`/`Shutdown` 两入口与 RPC `CloseFlag` 的三模式均不再作为目标面；三终态、自等待拒绝、模块责任矩阵见 [关闭控制面契约](../architecture/close-options-contract.md)。本文保留为历史决策，其“逻辑失败与物理 Released 分离”“原因首次固定”结论由新文继承。
 
 - 状态：**已定契约**，随本次实现进入公共头与测试。
 - 适用：`bbtools-infra` 的 `http::Client`、`http::Server`、`rpc::Client`、`rpc::Server`
@@ -78,3 +80,7 @@
   `Client::Shutdown` 返回 `UnsupportedRoute`，是明确的能力边界而非成功。
 - `net::Engine` 与 coroutine runtime 不在本决策内：Engine 仍是「`RequestClose()`
   登记、`Run` 返回才确认资源/回调/driver 收口」。
+
+## 取代关系
+
+关闭公开入口由 [ADR 0023](0023-single-close.md) 取代；本文其余历史决策保留。

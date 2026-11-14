@@ -109,7 +109,7 @@ if(TARGET bbt_infra_mcp_http)
     target_link_libraries(Test_mcp_http_transport PRIVATE
         bbt::infra_mcp_http Threads::Threads)
     target_compile_options(Test_mcp_http_transport PRIVATE -Wall -Wextra)
-    foreach(_case headers modern_headers mcp_name responses legacy bind lifecycle)
+    foreach(_case headers modern_headers mcp_name responses legacy bind lifecycle close_options)
         add_test(NAME mcp.http.${_case} COMMAND Test_mcp_http_transport ${_case})
         set_tests_properties(mcp.http.${_case} PROPERTIES TIMEOUT 60 LABELS "mcp_http")
     endforeach()

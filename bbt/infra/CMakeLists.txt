@@ -37,7 +37,11 @@ if(BBT_INFRA_MONGO AND BBT_MONGOCXX_PREFIX)
         mongo/detail/MongoDetail.cc
         mongo/detail/MongoProcess.cc
         mongo/detail/MongoRuntime.cc
-        mongo/Client.cc
+        mongo/detail/MongoCollImpl.cc
+        mongo/detail/CoMongoCliImpl.cc
+        mongo/MongoTypes.cc
+        mongo/CoMongoDb.cc
+        mongo/detail/CoMongoDbImpl.cc
         mongo/detail/MongoSupport.cc)
     add_library(bbt::infra_mongo ALIAS bbt_infra_mongo)
 

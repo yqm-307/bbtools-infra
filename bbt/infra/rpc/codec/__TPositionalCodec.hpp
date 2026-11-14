@@ -6,8 +6,10 @@ template <class T> inline result<std::vector<std::uint8_t>> EncodeOne(const T& v
 {
     using D = Decay<T>;
     static_assert(scalar_supported_v<D>, "rpc payload: positional argument has no scalar codec");
-    static_assert(scalar_size_supported_v<D>, "rpc payload: integer positional argument wider than 8 bytes "
-                                              "is unsupported");
+    static_assert(
+        scalar_size_supported_v<D>,
+        "rpc payload: integer positional argument wider than 8 bytes "
+        "is unsupported");
     static_assert(float_size_supported_v<D>, "rpc payload: float positional argument must be 4 or 8 bytes");
     std::vector<std::uint8_t> out;
     constexpr auto wt = wire_type_v<D>;
@@ -41,8 +43,10 @@ template <class T> inline result<T> DecodeOne(std::uint8_t type, const std::uint
 {
     using D = Decay<T>;
     static_assert(scalar_supported_v<D>, "rpc payload: positional argument has no scalar codec");
-    static_assert(scalar_size_supported_v<D>, "rpc payload: integer positional argument wider than 8 bytes "
-                                              "is unsupported");
+    static_assert(
+        scalar_size_supported_v<D>,
+        "rpc payload: integer positional argument wider than 8 bytes "
+        "is unsupported");
     static_assert(float_size_supported_v<D>, "rpc payload: float positional argument must be 4 or 8 bytes");
     if (type != static_cast<std::uint8_t>(wire_type_v<D>))
         return result<T>::err(MakeError(ErrorCode::TypeMismatch, "rpc payload argument type mismatch"));
@@ -191,4 +195,6 @@ inline result<std::vector<std::uint8_t>> EncodeTuple(const Tuple& values, std::i
     return result<std::vector<std::uint8_t>>::ok(std::move(out));
 }
 
-} // namespace bbt::infra::rpc
+// clang-format off
+}
+// clang-format on

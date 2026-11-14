@@ -1,4 +1,6 @@
-// 会话客户端生命周期；状态与网络责任统一由 session owner 持有。
+/**
+ * 会话客户端生命周期；状态与网络责任统一由 session owner 持有。
+ */
 #include <bbt/infra/rpc/CoRpcClient.hpp>
 
 #include <utility>
@@ -8,7 +10,8 @@
 
 namespace bbt::infra::rpc {
 
-CoRpcClient::CoRpcClient(std::shared_ptr<SessionOwnerState> owner) noexcept : m_owner(std::move(owner))
+CoRpcClient::CoRpcClient(std::shared_ptr<SessionOwnerState> owner) noexcept
+    : m_owner(std::move(owner))
 {
 }
 
@@ -58,14 +61,9 @@ CoRpcClient::~CoRpcClient() noexcept
     detail::SessionOwnerSeal(m_owner, SettleCloseReason(Error{}, "rpc client: closed by owner"));
 }
 
-bbt_co_async(result<void>) CoRpcClient::Close(CloseFlag flag, std::int64_t timeout_ms, Error reason)
+bbt_co_async(result<void>) CoRpcClient::Close(const CloseOptions& options)
 {
-    return detail::SessionOwnerClose(m_owner, flag, timeout_ms, std::move(reason));
-}
-
-void CoRpcClient::Shutdown(Error reason) noexcept
-{
-    detail::SessionOwnerSeal(m_owner, SettleCloseReason(std::move(reason), "rpc client: closed by owner"));
+    return detail::SessionOwnerClose(m_owner, options);
 }
 
 bool CoRpcClient::IsClosed() const noexcept
@@ -78,4 +76,6 @@ std::optional<Error> CoRpcClient::CloseReason() const noexcept
     return detail::SessionOwnerCloseReason(*m_owner);
 }
 
-} // namespace bbt::infra::rpc
+// clang-format off
+}
+// clang-format on

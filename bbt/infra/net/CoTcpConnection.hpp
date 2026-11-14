@@ -1,4 +1,5 @@
 #pragma once
+#include <bbt/infra/CloseOptions.hpp>
 
 /**
  * @file CoTcpConnection.hpp
@@ -6,16 +7,15 @@
  *
  * 本对象只持有一个 Connection 值句柄（内部是 shared_ptr<ConnectionState>），不复制 ring、
  * 不缓存状态投影、不建第二队列。所有 ICoConnection 成员直接转发到底层 Connection/ConnectionState
- * 的同一真源。拷贝本对象只是再持一份同一连接的视图，销毁视图不影响连接寿命；关闭经 RequestClose
+ * 的同一真源。拷贝本对象只是再持一份同一连接的视图，销毁视图不影响连接寿命；关闭经 Close(Immediate)
  * 发起，由 owner 完成物理收口。
  *
  * 构造责任：持有合法 Connection 值句柄的消费方可构造本对象，但不能凭裸状态伪造连接。
  * Connection 的私有构造约束原样继承。
  *
- * 实现位置：Read、Write、WaitClosed、AsyncWrite、RequestClose 与 Status 的函数体在 CoTcpConnection.cc，
+ * 实现位置：Read、Write、WaitClosed、AsyncWrite、Close(Immediate) 与 Status 的函数体在 CoTcpConnection.cc，
  * 等待逻辑依赖 ConnectionState 与 detail 部件，不进入公共头。Raw 保留头内的纯转发。
  */
-
 #include <cstdint>
 #include <string>
 #include <system_error>
@@ -30,46 +30,80 @@
 
 namespace bbt::infra::net {
 
-/// @brief ICoConnection 的 TCP 实现：持有 Connection 值句柄的纯转发视图。
+/**
+ * @brief ICoConnection 的 TCP 实现：持有 Connection 值句柄的纯转发视图。
+ */
 class CoTcpConnection final : public ICoConnection {
 public:
-    /// @brief 构造无效视图；不持 socket，不承担资源责任。
+    /**
+     * @brief 构造无效视图；不持 socket，不承担资源责任。
+     */
     CoTcpConnection() = default;
 
-    /// @brief 以既有连接句柄构造视图，共享同一状态而不复制；explicit 防隐式转换。
+    /**
+     * @brief 以既有连接句柄构造视图，共享同一状态而不复制；explicit 防隐式转换。
+     */
     explicit CoTcpConnection(Connection connection) noexcept;
-    /// @brief 析构不隐式 RequestClose，也不等物理回收。
+
+    /**
+     * @brief 析构不隐式 Close(Immediate)，也不等物理回收。
+     */
     ~CoTcpConnection() override = default;
 
-    // 以下每个 override 完整继承 ICoConnection 的域/挂起/所有权/错误契约。
     /**
+     * 以下每个 override 完整继承 ICoConnection 的域/挂起/所有权/错误契约。
      * @brief 暴露 ICoConnection 的 tuple 等待读取重载。
      *
      * @param options 本次等待的选项；deadline 只约束本次等待。
      * @return 包含读取缓冲区和错误码的 tuple；失败时缓冲区为空。
      */
     using ICoConnection::Read;
+
     /**
      * @brief 暴露 ICoConnection 的 tuple 非等待读取重载。
      *
      * @return 包含读取缓冲区和错误码的 tuple；失败时缓冲区为空。
      */
     using ICoConnection::TryRead;
-    /// @brief 非等待复制读取；契约见 ICoConnection::TryRead。
+
+    /**
+     * @brief 非等待复制读取；契约见 ICoConnection::TryRead。
+     */
     std::error_code TryRead(Buffer& out) override;
-    /// @brief 协程等待复制读取；契约见 ICoConnection::Read。
+
+    /**
+     * @brief 协程等待复制读取；契约见 ICoConnection::Read。
+     */
     std::error_code Read(Buffer& out, const bbt::coroutine::WaitOptions& options = {}) override;
-    /// @brief 非等待只读查看；契约见 ICoConnection::View。
+
+    /**
+     * @brief 非等待只读查看；契约见 ICoConnection::View。
+     */
     ReadView View() override;
-    /// @brief 非挂起提交写；契约见 ICoConnection::AsyncWrite。
+
+    /**
+     * @brief 非挂起提交写；契约见 ICoConnection::AsyncWrite。
+     */
     std::error_code AsyncWrite(std::string data) override;
-    /// @brief 协程内组合等待写；契约见 ICoConnection::Write。
+
+    /**
+     * @brief 协程内组合等待写；契约见 ICoConnection::Write。
+     */
     WriteReport Write(std::string data, const bbt::coroutine::WaitOptions& options = {}) override;
-    /// @brief 等待逻辑关闭终态；契约见 ICoConnection::WaitClosed。
+
+    /**
+     * @brief 等待逻辑关闭终态；契约见 ICoConnection::WaitClosed。
+     */
     std::error_code WaitClosed(const bbt::coroutine::WaitOptions& options = {}) override;
-    /// @brief 转发到底层 Connection::RequestClose。
-    void RequestClose(std::error_code reason = {}) override;
-    /// @brief 返回状态投影副本；契约见 ICoConnection::Status。
+
+    /**
+     * @brief 转发到底层 Connection::Close(Immediate)。
+     */
+    std::error_code Close(const CloseOptions& options = {}, std::error_code reason = {}) override;
+
+    /**
+     * @brief 返回状态投影副本；契约见 ICoConnection::Status。
+     */
     ConnectionStatus Status() const override;
 
     /**
@@ -81,7 +115,12 @@ public:
     const Connection& Raw() const noexcept;
 
 private:
-    Connection m_conn; // 唯一的共享值句柄，没有第二数据队列或关闭槽
+    /**
+     * 唯一的共享值句柄，没有第二数据队列或关闭槽
+     */
+    Connection m_conn;
 };
 
-} // namespace bbt::infra::net
+// clang-format off
+}
+// clang-format on
