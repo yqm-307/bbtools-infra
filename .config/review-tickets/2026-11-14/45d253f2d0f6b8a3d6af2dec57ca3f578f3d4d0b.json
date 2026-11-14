@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-14",
+  "commit": "45d253f2d0f6b8a3d6af2dec57ca3f578f3d4d0b",
+  "base": "96441814e16507ed382761f0a0806a7b9fdc91d2",
+  "result": "pass",
+  "reviewer": "gpt-6.1-sol independent reviewers; Alice integration verification",
+  "summary": "完整候选风险审查与修复验收完成，F1-F5已关闭。最终功能审查tree=9a37cfe8df6aa68a67a3322ca4e3dba01e21e711。随后授权合入BASE，无冲突；四个CI执行文件逐字等于BASE，ci.md仅追加BASE的9行缓存说明，未改变产品或测试。最终提交tree=e96605af36994acc3317a741dcf7a297f35f6f7f。未声明live/perf或远端CI通过。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "独立整批审查、F1-F5复审和F5-R1限定验收均完成；未关闭阻塞为零。末两行Register/Deregister Deliver仅静态核验，未重编译测试。",
+      "evidence": {
+        "reviewer": "gpt-6.1-sol (deleg_b0be7e54, deleg_a811ec31, deleg_2e93a7d1)",
+        "scope": "96441814e16507ed382761f0a0806a7b9fdc91d2..45d253f2d0f6b8a3d6af2dec57ca3f578f3d4d0b: Close/resource settlement, HTTP Router/dependency/timeout API, Mongo concrete owner, MCP/Redis/Consul close fixes, public contracts, layout and dependency integration. Parent checked upstream-only merge delta separately.",
+        "verification": "Build 301/301; smoke 27/27; focused 297/297; missing direct-coupling set 67/67; MCP/Redis 8/8; Redis follow-up 1/1; Consul final 1/1 with 8 deterministic interleavings; MCP teardown final 1/1. Batches overlap. No failures/skips in cited successful runs. Final two Deliver lines static-only. Existing a_bound warning documented in baseline; new saved_out warning fixed with stronger assertion.",
+        "reports": ["infra-pr-review.md", "infra-pr-recheck.md", "infra-pr-final-closure.md"]
+      }
+    }
+  ]
+}
