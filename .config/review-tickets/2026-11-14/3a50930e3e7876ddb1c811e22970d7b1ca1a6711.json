@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-14",
+  "commit": "3a50930e3e7876ddb1c811e22970d7b1ca1a6711",
+  "base": "706d0f0be56b9f040a762875cc48586652a2afa1",
+  "result": "pass",
+  "reviewer": "GPT-6.1 Sol independent read-only reviewer (deleg_7c85245d)",
+  "summary": "仅审查 tests/net/Test_net_foundation.cc 就绪夹具增量，无阻塞发现，medium confidence；代码提交 tree 与审查候选 6869c0b1b257a79b38165b78e518695f9da31a1c 一致。三处固定次数轮询替换为有界内核就绪等待，保留原生非挂起、错误、fd flags 和资源基线断言。未改产品与 CI 配置。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "独立只读审查 ship，无 findings；父会话已读实际报告并核对提交 tree，重复及冒烟验证已完成。",
+      "evidence": {
+        "reviewer": "GPT-6.1 Sol / deleg_7c85245d / sa-0-381a774b",
+        "scope": "706d0f0be56b9f040a762875cc48586652a2afa1..3a50930e3e7876ddb1c811e22970d7b1ca1a6711; tests/net/Test_net_foundation.cc only; candidate tree 6869c0b1b257a79b38165b78e518695f9da31a1c; SHA256 dde101dfcfa59dce5a498d35c91de382c92553ff911c7ed34045dd61b438ade8",
+        "report": "/home/yqm/.hermes/profiles/alice/reports/infra-pr124-native-ready-review.json",
+        "verification": "最终候选目标用例连续30/30次通过；直接相关ctest -j1 6/6；required smoke 27/27；两份JUnit无failure/error/skipped；check_format --staged及diff --check通过。构建链接完成，唯一warning为未改动的既有a_bound未使用，无新增警告。",
+        "test_artifacts": [
+          "/home/yqm/.hermes/profiles/alice/reports/infra-pr124-native-final-30.log",
+          "/home/yqm/.hermes/profiles/alice/reports/infra-pr124-native-related-final.xml",
+          "/home/yqm/.hermes/profiles/alice/reports/infra-pr124-native-smoke.xml",
+          "/home/yqm/.hermes/profiles/alice/reports/infra-pr124-native-build-final.log"
+        ],
+        "not_covered": "CI原始固定yield次数耗尽交错未在本地复现，修复方向与CI Accept失败一致，不断言唯一根因；未强制每次Connect进入EINPROGRESS分支；未跑live/perf/sanitizer；远端CI等待推送后执行。"
+      }
+    }
+  ]
+}
