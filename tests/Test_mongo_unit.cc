@@ -293,6 +293,13 @@ mongo::MongoRuntimeConfig MakeRtCfg(std::size_t workers = 2, std::size_t queue =
     return cfg;
 }
 
+/**
+ * Close(Immediate) 等待在途 driver 调用物理落定的预算：须覆盖不可达地址的
+ * server selection 上限并留出调度抖动余量。与 server selection 超时同值时
+ * 两者零余量竞态——driver 落定略晚于名义超时，Close 就超时（负载下偶发）。
+ */
+constexpr auto kInflightCloseBudget = std::chrono::seconds{20};
+
 std::shared_ptr<mongo::CoMongoDb> NewOwner(const mongo::MongoRuntimeConfig& cfg)
 {
     auto d = mongo::CoMongoDb::Create(cfg);
@@ -1625,7 +1632,7 @@ BOOST_AUTO_TEST_CASE(t_dp_queue_overloaded)
     (void)oh.coll->Close();
     BOOST_REQUIRE(oh.db->Close(
         bbt::infra::CloseOptions{
-            bbt::infra::CloseMode::Immediate, true, {}, std::chrono::steady_clock::now() + std::chrono::seconds{8}}));
+            bbt::infra::CloseMode::Immediate, true, {}, std::chrono::steady_clock::now() + kInflightCloseBudget}));
     BOOST_REQUIRE(WaitUntil([&] { return done.load() == 4; }, 30000));
     BOOST_REQUIRE(oh.db->IsClosed());
     BOOST_CHECK_EQUAL(oh.rt->LiveWorkersForTest(), 0);
@@ -2620,7 +2627,7 @@ BOOST_AUTO_TEST_CASE(t_owner_multi_handles_share_workers)
         (void)h->Close();
     BOOST_REQUIRE(db->Close(
         bbt::infra::CloseOptions{
-            bbt::infra::CloseMode::Immediate, true, {}, std::chrono::steady_clock::now() + std::chrono::seconds{8}}));
+            bbt::infra::CloseMode::Immediate, true, {}, std::chrono::steady_clock::now() + kInflightCloseBudget}));
     BOOST_REQUIRE(WaitUntil([&] { return submitted.load() == 3; }, 30000));
     BOOST_REQUIRE(db->IsClosed());
     BOOST_CHECK_EQUAL(rt->LiveWorkersForTest(), 0);
@@ -2792,7 +2799,7 @@ BOOST_AUTO_TEST_CASE(t_shared_backpressure_queue_one)
     (void)hc.value()->Close();
     BOOST_REQUIRE(db->Close(
         bbt::infra::CloseOptions{
-            bbt::infra::CloseMode::Immediate, true, {}, std::chrono::steady_clock::now() + std::chrono::seconds{8}}));
+            bbt::infra::CloseMode::Immediate, true, {}, std::chrono::steady_clock::now() + kInflightCloseBudget}));
     BOOST_REQUIRE(WaitUntil([&] { return b_done.load() + c_done.load() == 3; }, 30000));
     BOOST_REQUIRE(db->IsClosed());
     BOOST_CHECK_EQUAL(rt->LiveWorkersForTest(), 0);
@@ -2877,7 +2884,7 @@ BOOST_AUTO_TEST_CASE(t_handle_close_scoped)
     (void)c2->Close();
     BOOST_REQUIRE(db->Close(
         bbt::infra::CloseOptions{
-            bbt::infra::CloseMode::Immediate, true, {}, std::chrono::steady_clock::now() + std::chrono::seconds{8}}));
+            bbt::infra::CloseMode::Immediate, true, {}, std::chrono::steady_clock::now() + kInflightCloseBudget}));
     BOOST_REQUIRE(WaitUntil([&] { return h1_done.load() && h2_done.load(); }, 30000));
     BOOST_REQUIRE(db->IsClosed());
     BOOST_CHECK_EQUAL(rt->LiveWorkersForTest(), 0);
