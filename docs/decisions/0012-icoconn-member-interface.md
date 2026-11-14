@@ -47,3 +47,7 @@
 AsyncWrite 的票据返回/出参约定已由 [0018：AsyncWrite 只提交](0018-async-write-fire.md) 取代；Write 的等待语义保留。
 
 读取 backing 移交与 `TryAccess`/`ReadAccess` 约定已由 [0019：读取面收敛为 Read 与只读 View](0019-read-view.md) 取代。
+
+## 取代关系
+
+关闭公开入口由 [ADR 0023](0023-single-close.md) 取代；本文其余历史决策保留。

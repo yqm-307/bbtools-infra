@@ -1,54 +1,38 @@
-# bbtools-coroutine 固定 commit 消费门禁（infra-perf loop T1）。
-#
-# 单一锁版真源：cmake/coroutine.sha（本模块同目录、40 hex 单行）。
-#   - CMake 在加载本模块时读取并校验格式；CI 的 load-pin 步骤读同一文件产出
-#     COROUTINE_PIN_SHA（.github/workflows/ci.yml），checkout ref/prepare-deps/
-#     network job 复核都用它——一处真源，不维护多份字面量；
-#   - 普通消费与 BBT_INFRA_NETWORK_ONLY 都在解析完上游真实路径后调用
-#     bbt_coroutine_pin_verify()，在 include() 作用域内 fail-closed；
-#   - 出处/语义见 docs/dependencies/bbtools-coroutine-pin.provenance.md。
-#
-# 核验口径（诚实边界，git-only）：
-#   - 必须是 git 仓库检出：HEAD == pin 且 tracked 内容干净（git diff --quiet
-#     HEAD 覆盖 tracked modify/delete；git diff --cached --quiet 覆盖暂存；
-#     另查 untracked 中落在 bbt/、cmake/、CMakeLists.txt 上的新增源码输入——
-#     消费面内混入未追踪源码同样不是固定版本）。
-#   - 无 .git / git 不可用 / 非 git 归档树：一律拒绝。来历不明的源码不能证明
-#     自己是固定版本；没有「非 git 放行通道」（原 .bbt-coroutine-pin manifest
-#     模式已删除：其 SHA 段正则恒不匹配属死代码，且只自我声明、不锚定内容，
-#     不证明来源）。已安装 find_package 包同样无法证明 pin（CMakeLists.txt
-#     回退分支发 WARNING，不冒充锁版证据）。
-#   - coroutine.sha 格式：恰好 40 个 [0-9a-f] 字符，不做规范化/截断/大小写
-#     折叠——格式不符直接 FATAL_ERROR（pin 文件本身是门禁的一部分）。
-#
-# 本模块只核验，不取替 add_subdirectory / target 复用检查（NetworkOnly.cmake
-# 与普通 CMakeLists.txt 的 SOURCE_DIR 一致性检查仍然独立存在）。
-
-set(_bbt_pin_file "${CMAKE_CURRENT_LIST_DIR}/coroutine.sha")
-if(NOT EXISTS "${_bbt_pin_file}")
-    message(FATAL_ERROR
-        "[bbt-infra-pin] coroutine pin 真源缺失：${_bbt_pin_file}；"
-        "锁版实现要求 cmake/coroutine.sha 单行 40hex commit。")
+# coroutine 源码消费：默认使用所选本地检出的当前内容；显式 SHA 才锁版。
+# 不 fetch/checkout，不自动把 CI 的 cmake/coroutine.sha 当作本地开发要求。
+# 来源目录一致性在两种模式下都检查，最新模式不冒充固定版本证据。
+if(NOT DEFINED BBT_COROUTINE_PINNED_SHA)
+    set(BBT_COROUTINE_PINNED_SHA "" CACHE STRING
+        "可选的 coroutine 完整 commit SHA；留空使用所选本地检出的当前源码（允许未提交改动）")
 endif()
-file(READ "${_bbt_pin_file}" _bbt_pin_raw)
-string(REGEX REPLACE "\n$" "" BBT_COROUTINE_PINNED_SHA "${_bbt_pin_raw}")
-string(LENGTH "${BBT_COROUTINE_PINNED_SHA}" _bbt_pin_length)
-if(NOT _bbt_pin_length EQUAL 40)
-    message(FATAL_ERROR "[bbt-infra-pin] coroutine.sha 必须只有一个完整 40hex SHA，可带一个末尾换行")
+if("$ENV{GITHUB_ACTIONS}" STREQUAL "true")
+    # 保留现有 GitHub CI 的固定版本门禁，不把本地默认值传播成 CI 放宽。
+    # 使用普通变量，不将 CI 选择写回本地 cache。
+    file(READ "${CMAKE_CURRENT_LIST_DIR}/coroutine.sha" _bbt_ci_pin_raw)
+    string(REGEX REPLACE "\n$" "" _bbt_ci_pin "${_bbt_ci_pin_raw}")
+    if(NOT "${BBT_COROUTINE_PINNED_SHA}" STREQUAL ""
+       AND NOT "${BBT_COROUTINE_PINNED_SHA}" STREQUAL "${_bbt_ci_pin}")
+        message(FATAL_ERROR "[bbt-infra-pin] CI 指定版本与 coroutine.sha 不一致")
+    endif()
+    set(BBT_COROUTINE_PINNED_SHA "${_bbt_ci_pin}")
+    if("${BBT_COROUTINE_PINNED_SHA}" STREQUAL "")
+        message(FATAL_ERROR "[bbt-infra-pin] CI coroutine.sha 不得为空")
+    endif()
 endif()
-if(NOT BBT_COROUTINE_PINNED_SHA MATCHES "^[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]$")
-    message(FATAL_ERROR
-        "[bbt-infra-pin] coroutine.sha 格式非法：'${BBT_COROUTINE_PINNED_SHA}'；"
-        "要求恰好 40 个小写 hex 字符，不做规范化/截断。")
+if(NOT "${BBT_COROUTINE_PINNED_SHA}" STREQUAL "")
+    string(LENGTH "${BBT_COROUTINE_PINNED_SHA}" _bbt_pin_length)
+    if(NOT _bbt_pin_length EQUAL 40 OR NOT BBT_COROUTINE_PINNED_SHA MATCHES "^[0-9a-f]+$")
+        message(FATAL_ERROR
+            "[bbt-infra-pin] BBT_COROUTINE_PINNED_SHA 必须是完整 40 位小写 hex SHA，或留空使用本地最新源码")
+    endif()
 endif()
-unset(_bbt_pin_file)
 
 # bbt_coroutine_verify_existing_target(<expected_source_dir_realpath>)
 #   普通/NetworkOnly 两条消费路径共用：已有 bbt_coroutine target 时核其真实
 #   SOURCE_DIR（解 alias、realpath）与声明目录一致；不一致/无 SOURCE_DIR
 #   （imported/同名 target）即 FATAL_ERROR——声明目录核验过了不代表实际链接
 #   的是同一棵树。应在 bbt_coroutine_pin_verify() 之前调用；通过后对声明目录
-#   pin 等价于对实际来源 pin。
+#   核验等价于对实际来源核验。
 function(bbt_coroutine_verify_existing_target _expected)
     if(NOT TARGET bbt_coroutine)
         return()
@@ -77,13 +61,12 @@ endfunction()
 function(bbt_coroutine_pin_verify _dir)
     set(_expected "${BBT_COROUTINE_PINNED_SHA}")
 
-    # git-only：没有 git 可执行文件就没有可证明的固定来源。
+    # 两种模式都要求真实 Git 来源；最新模式只放宽版本/洁净要求。
     find_package(Git QUIET)
     if(NOT GIT_FOUND)
         message(FATAL_ERROR
             "[bbt-infra-pin] 无法核验 coroutine pin：git 不可用。"
-            "请提供 git，并以 -DBBT_COROUTINE_SOURCE_DIR=<git 检出树> 指向 "
-            "bbtools-coroutine 在 ${_expected} 的干净检出。")
+            "请提供 git，并以 -DBBT_COROUTINE_SOURCE_DIR=<git 检出树> 指向 bbtools-coroutine。")
     endif()
 
     # stub 树（git archive 输出、无 .git）必须直接拒绝——rev-parse 会向上
@@ -91,8 +74,7 @@ function(bbt_coroutine_pin_verify _dir)
     if(NOT EXISTS "${_dir}/.git")
         message(FATAL_ERROR
             "[bbt-infra-pin] ${_dir} 不是可核验的 git 检出：无 .git。"
-            "请指向 bbtools-coroutine 在 ${_expected} 的 git 检出"
-            "（git clone + git checkout <sha>）。")
+            "请指向 bbtools-coroutine 的 git 检出。")
     endif()
 
     execute_process(
@@ -102,8 +84,12 @@ function(bbt_coroutine_pin_verify _dir)
     if(NOT _rc EQUAL 0)
         message(FATAL_ERROR
             "[bbt-infra-pin] ${_dir} 不是可核验的 git 检出：${_err}。"
-            "请指向 bbtools-coroutine 在 ${_expected} 的 git 检出"
-            "（git clone + git checkout <sha>）。")
+            "请指向 bbtools-coroutine 的 git 检出。")
+    endif()
+    if("${_expected}" STREQUAL "")
+        message(STATUS
+            "[bbt-infra-pin] coroutine 使用本地最新源码，允许未提交改动；HEAD=${_head} 仅为基线，不代表完整源码快照（${_dir}）")
+        return()
     endif()
     if(NOT _head STREQUAL _expected)
         message(FATAL_ERROR

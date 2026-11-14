@@ -5,7 +5,11 @@ namespace bbt::infra::net {
 std::shared_ptr<bbt::coroutine::sync::CoWaiter> WakeHub::Create()
 {
     if (s_create_fault_once.exchange(false)) {
-        throw std::bad_alloc(); // 私有 test：等待对象建立单次失败
+
+        /**
+         * 私有 test：等待对象建立单次失败
+         */
+        throw std::bad_alloc();
     }
     return std::make_shared<bbt::coroutine::sync::CoWaiter>();
 }
@@ -34,7 +38,11 @@ void WakeHub::NotifyAll()
 {
     std::unique_lock<std::mutex> lock(m_mutex);
     if (m_waiters.empty()) {
-        return; // 登记后复查谓词；空 hub 不需要构造 snapshot 或再次加锁。
+
+        /**
+         * 登记后复查谓词；空 hub 不需要构造 snapshot 或再次加锁。
+         */
+        return;
     }
     std::array<std::shared_ptr<bbt::coroutine::sync::CoWaiter>, kMaxWaiters> snapshot;
     std::size_t count = 0;
@@ -68,4 +76,6 @@ void WakeHub::PruneLocked()
     m_waiters.resize(write);
 }
 
-} // namespace bbt::infra::net
+// clang-format off
+}
+// clang-format on

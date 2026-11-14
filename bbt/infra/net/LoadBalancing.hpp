@@ -9,7 +9,6 @@
  * 跨 owner 的注册串行化与连接计数由 Engine 层负责，因此 LoadBalancer 明确不是线程安全的，
  * 不得误标为线程安全。
  */
-
 #include <cstddef>
 #include <cstdint>
 #include <system_error>
@@ -17,13 +16,30 @@
 
 namespace bbt::infra::net {
 
-class Address; // 值借用：Next 只读取其 ToString 的字节。
+/**
+ * 值借用：Next 只读取其 ToString 的字节。
+ */
+class Address;
 
-/** @brief 连接分配策略。 */
+/**
+ * @brief 连接分配策略。
+ */
 enum class LoadBalancing : int {
-    RoundRobin = 0,       ///< 依次轮询
-    LeastConnections = 1, ///< 选择连接数最少的 owner
-    SourceAddrHash = 2,   ///< 按远端地址哈希
+
+    /**
+     * 依次轮询
+     */
+    RoundRobin = 0,
+
+    /**
+     * 选择连接数最少的 owner
+     */
+    LeastConnections = 1,
+
+    /**
+     * 按远端地址哈希
+     */
+    SourceAddrHash = 2,
 };
 
 /**
@@ -43,17 +59,15 @@ public:
      */
     LoadBalancer(LoadBalancing mode, std::size_t loop_count, std::error_code& error);
 
-    /** @brief owner 数量；构造失败时为 0。 */
-    std::size_t Size() const noexcept
-    {
-        return loop_count_;
-    }
+    /**
+     * @brief owner 数量；构造失败时为 0。
+     */
+    std::size_t Size() const noexcept { return loop_count_; }
 
-    /** @brief 当前策略。 */
-    LoadBalancing Mode() const noexcept
-    {
-        return mode_;
-    }
+    /**
+     * @brief 当前策略。
+     */
+    LoadBalancing Mode() const noexcept { return mode_; }
 
     /**
      * @brief 选择下一个 owner 的索引。
@@ -67,13 +81,19 @@ public:
      * @param[out] error 成功时清空，失败时写入原因。
      * @return 被选中的 owner 索引；失败时为 Size()。
      */
-    std::size_t Next(const Address& remote, const std::vector<std::uint64_t>& connection_counts,
-                     std::error_code& error);
+    std::size_t
+    Next(const Address& remote, const std::vector<std::uint64_t>& connection_counts, std::error_code& error);
 
 private:
     LoadBalancing mode_{LoadBalancing::RoundRobin};
     std::size_t loop_count_{0};
-    std::size_t next_offset_{0}; // RoundRobin 游标，恒在 [0, loop_count_) 内，不会溢出
+
+    /**
+     * RoundRobin 游标，恒在 [0, loop_count_) 内，不会溢出
+     */
+    std::size_t next_offset_{0};
 };
 
-} // namespace bbt::infra::net
+// clang-format off
+}
+// clang-format on

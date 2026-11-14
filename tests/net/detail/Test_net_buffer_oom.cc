@@ -1,4 +1,6 @@
-// 分配失败契约：复制读取不丢字节，追加失败不提交，预留容量可复用。
+/**
+ * 分配失败契约：复制读取不丢字节，追加失败不提交，预留容量可复用。
+ */
 #define BOOST_TEST_NO_MAIN
 #define BOOST_TEST_ALTERNATIVE_INIT_API
 #include <boost/test/included/unit_test.hpp>
@@ -38,8 +40,10 @@
 
 namespace {
 
-// ---- 分配失败/计数注入（本可执行文件私有；thread_local 不污染 runtime 线程）----
-// fail_at=0 关闭；>0 时第 fail_at 次 operator new 抛 bad_alloc；calls 记录序号。
+/**
+ * ---- 分配失败/计数注入（本可执行文件私有；thread_local 不污染 runtime 线程）----
+ * fail_at=0 关闭；>0 时第 fail_at 次 operator new 抛 bad_alloc；calls 记录序号。
+ */
 thread_local int g_fail_at = 0;
 thread_local int g_calls = 0;
 thread_local std::size_t g_alloc_sizes[16]{};
@@ -52,6 +56,7 @@ void Arm(int index)
     }
     g_fail_at = index;
 }
+
 void Disarm()
 {
     g_fail_at = 0;
@@ -67,7 +72,10 @@ std::string AllocTrace()
     return out;
 }
 
-} // namespace
+// clang-format off
+}
+// clang-format on
+
 void* operator new(std::size_t size)
 {
     if (g_fail_at != 0) {
@@ -85,22 +93,27 @@ void* operator new(std::size_t size)
     }
     return memory;
 }
+
 void* operator new[](std::size_t size)
 {
     return ::operator new(size);
 }
+
 void operator delete(void* memory) noexcept
 {
     std::free(memory);
 }
+
 void operator delete[](void* memory) noexcept
 {
     std::free(memory);
 }
+
 void operator delete(void* memory, std::size_t) noexcept
 {
     std::free(memory);
 }
+
 void operator delete[](void* memory, std::size_t) noexcept
 {
     std::free(memory);
@@ -153,11 +166,15 @@ bbt::coroutine::WaitOptions Until(std::chrono::milliseconds duration)
     return {std::chrono::steady_clock::now() + duration};
 }
 
-} // namespace
+// clang-format off
+}
+// clang-format on
 
 BOOST_AUTO_TEST_SUITE(net_buffer_oom)
 
-// 逐序号注入覆盖快照与输出分配；失败保留已有输出、全部接收字节和重试能力。
+/**
+ * 逐序号注入覆盖快照与输出分配；失败保留已有输出、全部接收字节和重试能力。
+ */
 BOOST_AUTO_TEST_CASE(read_copy_oom_no_loss)
 {
     StartRuntime(1);
@@ -194,8 +211,9 @@ BOOST_AUTO_TEST_CASE(read_copy_oom_no_loss)
         });
         BOOST_REQUIRE(task.wait_for(10s) == std::future_status::ready);
         task.get();
-        BOOST_TEST_MESSAGE("read_fail_at=" << index << " threw=" << threw << " error=" << first_error.value()
-                                           << " used_after=" << used_after);
+        BOOST_TEST_MESSAGE(
+            "read_fail_at=" << index << " threw=" << threw << " error=" << first_error.value()
+                            << " used_after=" << used_after);
         BOOST_CHECK(!threw);
         if (!first_error) {
             saw_data = true;
@@ -216,7 +234,9 @@ BOOST_AUTO_TEST_CASE(read_copy_oom_no_loss)
     BOOST_CHECK(saw_error);
 }
 
-// 复制消费不再移走 ring backing；预留仍可复用，但真正扩容的 OOM 仍须返回错误。
+/**
+ * 复制消费不再移走 ring backing；预留仍可复用，但真正扩容的 OOM 仍须返回错误。
+ */
 BOOST_AUTO_TEST_CASE(grant_copy_append_oom_no_throw)
 {
     ReceiveRing ring(4096);
@@ -240,7 +260,9 @@ BOOST_AUTO_TEST_CASE(grant_copy_append_oom_no_throw)
     BOOST_CHECK_EQUAL(retry.CopyTo(), payload);
 }
 
-// 不强迫短串转堆；真正追加扩容失败时，原 pending/detached 数据和计数不变。
+/**
+ * 不强迫短串转堆；真正追加扩容失败时，原 pending/detached 数据和计数不变。
+ */
 BOOST_AUTO_TEST_CASE(staging_append_failure_keeps_bytes)
 {
     const std::string payload(2048, 'Q');
@@ -300,14 +322,19 @@ BOOST_AUTO_TEST_CASE(staging_reserved_capacity_reused)
     }
 }
 
-// ---- （修复后契约）：Buffer 拷贝已删除，OOM 悬空段形态不可达 ----
+/**
+ * ---- （修复后契约）：Buffer 拷贝已删除，OOM 悬空段形态不可达 ----
+ */
 BOOST_AUTO_TEST_CASE(copy_assign_deleted)
 {
     static_assert(!std::is_copy_constructible_v<Buffer>, "修复后契约：Buffer 不可拷贝构造");
     static_assert(!std::is_copy_assignable_v<Buffer>, "修复后契约：Buffer 不可拷贝赋值");
     static_assert(std::is_move_constructible_v<Buffer>, "修复后契约：Buffer 可移动构造");
     static_assert(std::is_move_assignable_v<Buffer>, "修复后契约：Buffer 可移动赋值");
-    // 移动语义仍可用：move 后来源为空、目标持有全部段。
+
+    /**
+     * 移动语义仍可用：move 后来源为空、目标持有全部段。
+     */
     ReceiveRing one(256);
     BOOST_REQUIRE(one.TryAppend(std::string(64, 'A')).status == ReadStatus::Ok);
     Buffer dest;
@@ -315,7 +342,10 @@ BOOST_AUTO_TEST_CASE(copy_assign_deleted)
     Buffer moved = std::move(dest);
     BOOST_CHECK_EQUAL(moved.Size(), 64);
     BOOST_CHECK(dest.Segments().empty());
-    // move-assign：旧 backing 移交，不留旧段悬空形态。
+
+    /**
+     * move-assign：旧 backing 移交，不留旧段悬空形态。
+     */
     Buffer assigned;
     assigned = std::move(moved);
     BOOST_CHECK_EQUAL(assigned.Size(), 64);
@@ -323,12 +353,18 @@ BOOST_AUTO_TEST_CASE(copy_assign_deleted)
     BOOST_TEST_MESSAGE("d4 copy_deleted move_ok=1");
 }
 
-// ---- （修复后契约）：backing+segments 构造已收回 private ----
+/**
+ * ---- （修复后契约）：backing+segments 构造已收回 private ----
+ */
 BOOST_AUTO_TEST_CASE(public_ctor_forge_denied)
 {
-    static_assert(!std::is_constructible_v<Buffer, std::shared_ptr<void>, std::vector<BufferSegment>>,
-                  "修复后契约：公共构造已收回，owning 不变量不可伪造");
-    // 内部接缝仍可构造任意分段输入；不代表 Read 的复制路径。
+    static_assert(
+        !std::is_constructible_v<Buffer, std::shared_ptr<void>, std::vector<BufferSegment>>,
+        "修复后契约：公共构造已收回，owning 不变量不可伪造");
+
+    /**
+     * 内部接缝仍可构造任意分段输入；不代表 Read 的复制路径。
+     */
     char backing_byte = 'B';
     auto backing = std::make_shared<char>(backing_byte);
     const char* seg_ptr = backing.get();
@@ -340,10 +376,13 @@ BOOST_AUTO_TEST_CASE(public_ctor_forge_denied)
     BOOST_TEST_MESSAGE("d5 forge_denied=1 test_access_make_ok=1");
 }
 
-// ---- （修复后契约）：CoAccept reclaim 与连接同一事实源 ----
+/**
+ * ---- （修复后契约）：CoAccept reclaim 与连接同一事实源 ----
+ */
 BOOST_AUTO_TEST_CASE(coaccept_reclaim_valid_ticket)
 {
     struct NullHandler : RawHandler {};
+
     auto handler = std::make_shared<NullHandler>();
     Engine engine(handler);
     BOOST_REQUIRE(!engine.EnableAcceptHandoff(4));
@@ -357,17 +396,20 @@ BOOST_AUTO_TEST_CASE(coaccept_reclaim_valid_ticket)
     StartRuntime(2);
     std::error_code run_error;
     std::thread runner([&] { run_error = engine.Run(config); });
+
     struct RunnerGuard {
         Engine& engine;
         std::thread& thread;
+
         ~RunnerGuard()
         {
-            engine.RequestClose();
+            (void)engine.Close();
             if (thread.joinable()) {
                 thread.join();
             }
         }
     } guard{engine, runner};
+
     BOOST_REQUIRE(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
     std::vector<Address> addresses;
     BOOST_REQUIRE(!engine.LocalAddresses(addresses));
@@ -390,7 +432,7 @@ BOOST_AUTO_TEST_CASE(coaccept_reclaim_valid_ticket)
         reclaim_released.store(res.reclaim.Released() ? 1 : 0);
         Connection raw = res.connection.Raw();
         conn_released.store(raw.Released() ? 1 : 0);
-        res.connection.RequestClose();
+        (void)res.connection.Close();
     });
     std::error_code ec;
     NativeSocket client = NativeSocket::Open(AddressFamily::IPv4, SocketType::Stream, ec);
@@ -402,17 +444,29 @@ BOOST_AUTO_TEST_CASE(coaccept_reclaim_valid_ticket)
     BOOST_REQUIRE(!client.PendingError());
     BOOST_REQUIRE(task.wait_for(10s) == std::future_status::ready);
     task.get();
-    BOOST_TEST_MESSAGE("d6 accept_error=" << accept_error.load() << " conn_valid=" << conn_valid.load()
-                                          << " reclaim_valid=" << reclaim_valid.load() << " reclaim_released="
-                                          << reclaim_released.load() << " conn_released=" << conn_released.load());
+    BOOST_TEST_MESSAGE(
+        "d6 accept_error=" << accept_error.load() << " conn_valid=" << conn_valid.load() << " reclaim_valid="
+                           << reclaim_valid.load() << " reclaim_released=" << reclaim_released.load()
+                           << " conn_released=" << conn_released.load());
     BOOST_REQUIRE_EQUAL(accept_error.load(), 0);
-    // 修复后契约：reclaim 有效且与连接同一事实源——fd 存活时 ticket 报未释放。
+
+    /**
+     * 修复后契约：reclaim 有效且与连接同一事实源——fd 存活时 ticket 报未释放。
+     */
     BOOST_CHECK_EQUAL(conn_valid.load(), 1);
     BOOST_CHECK_EQUAL(conn_released.load(), 0);
-    BOOST_CHECK_EQUAL(reclaim_valid.load(), 1);    // 有效票
-    BOOST_CHECK_EQUAL(reclaim_released.load(), 0); // 与 conn 同一事实：未释放
+
+    /**
+     * 有效票
+     */
+    BOOST_CHECK_EQUAL(reclaim_valid.load(), 1);
+
+    /**
+     * 与 conn 同一事实：未释放
+     */
+    BOOST_CHECK_EQUAL(reclaim_released.load(), 0);
     (void)client.Close();
-    engine.RequestClose();
+    (void)engine.Close();
     runner.join();
     BOOST_CHECK(!run_error);
 }

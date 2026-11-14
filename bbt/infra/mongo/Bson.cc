@@ -19,10 +19,12 @@ Error InvalidArg(std::string message)
     return MakeError(ErrorCode::InvalidArgument, std::move(message));
 }
 
-// 首个非空白字符是否 '{'：libbson 的 JSON 前端会把顶层数组解析成以数字为键
-// 的文档（实测 `[1,2]` → {"0":1,"1":2}）。BSON 文档语义上没有这种形态，
-// 这里显式拒绝，不把「数组字面量」静默变成文档。返回首个非空白位置，
-// 全空白时返回 npos。
+/**
+ * 首个非空白字符是否 '{'：libbson 的 JSON 前端会把顶层数组解析成以数字为键
+ * 的文档（实测 `[1,2]` → {"0":1,"1":2}）。BSON 文档语义上没有这种形态，
+ * 这里显式拒绝，不把「数组字面量」静默变成文档。返回首个非空白位置，
+ * 全空白时返回 npos。
+ */
 std::size_t FirstNonSpace(std::string_view json)
 {
     std::size_t i = 0;
@@ -31,9 +33,11 @@ std::size_t FirstNonSpace(std::string_view json)
     return i == json.size() ? std::string_view::npos : i;
 }
 
-// 首个顶层对象的结束位置（对象右花括号的后一位）：只做结构范围定位——跳过
-// 双引号字符串及其反斜杠转义、按层数配平花括号，不判断词法与类型。未闭合
-// 返回 npos。
+/**
+ * 首个顶层对象的结束位置（对象右花括号的后一位）：只做结构范围定位——跳过
+ * 双引号字符串及其反斜杠转义、按层数配平花括号，不判断词法与类型。未闭合
+ * 返回 npos。
+ */
 std::size_t ObjectEnd(std::string_view json, std::size_t begin)
 {
     int depth = 0;
@@ -62,8 +66,10 @@ std::size_t ObjectEnd(std::string_view json, std::size_t begin)
     return std::string_view::npos;
 }
 
-// bytes → 只读视图：空/不良构 → InvalidArgument（libbson 全结构校验，
-// 与实现内部 MongoDetail::ViewOf 同一道门，driver 之前返回）。
+/**
+ * bytes → 只读视图：空/不良构 → InvalidArgument（libbson 全结构校验，
+ * 与实现内部 MongoDetail::ViewOf 同一道门，driver 之前返回）。
+ */
 result<bsoncxx::v_noabi::document::view> ViewOf(const MongoDocument& doc)
 {
     if (doc.bytes.empty())
@@ -84,7 +90,9 @@ Error FieldTypeMismatch(std::string_view field, const char* expected)
     return MakeError(ErrorCode::TypeMismatch, "mongo: field '" + std::string(field) + "' is not " + expected);
 }
 
-// 顶层字段定位：bytes 非法 → InvalidArgument；缺失 → NotFound。
+/**
+ * 顶层字段定位：bytes 非法 → InvalidArgument；缺失 → NotFound。
+ */
 result<bsoncxx::v_noabi::document::element> FindField(const MongoDocument& doc, std::string_view field)
 {
     auto view = ViewOf(doc);
@@ -96,7 +104,9 @@ result<bsoncxx::v_noabi::document::element> FindField(const MongoDocument& doc, 
     return result<bsoncxx::v_noabi::document::element>::ok(element);
 }
 
-} // namespace
+// clang-format off
+}
+// clang-format on
 
 result<MongoDocument> MongoDocument::FromJson(std::string_view json)
 {
@@ -108,13 +118,19 @@ result<MongoDocument> MongoDocument::FromJson(std::string_view json)
 
     try {
         const auto parsed = bsoncxx::from_json(json);
-        // 单文档校验：libbson 的 JSON 前端只消费第一份文档、静默忽略其后的
-        // 内容（实测 `{"v":1}{"w":2}` 只剩前者），故解析成功后再核对整段输入
-        // 确实只有一份顶层对象、其后仅允许空白。字符串内的括号与转义由
-        // ObjectEnd 跳过，不参与配平。
+
+        /**
+         * 单文档校验：libbson 的 JSON 前端只消费第一份文档、静默忽略其后的
+         * 内容（实测 `{"v":1}{"w":2}` 只剩前者），故解析成功后再核对整段输入
+         * 确实只有一份顶层对象、其后仅允许空白。字符串内的括号与转义由
+         * ObjectEnd 跳过，不参与配平。
+         */
         const std::size_t end = ObjectEnd(json, first);
         if (end == std::string_view::npos || FirstNonSpace(json.substr(end)) != std::string_view::npos) {
-            // 本组件的输入完整性检查（不是库报错），故不带 backend_* 元数据。
+
+            /**
+             * 本组件的输入完整性检查（不是库报错），故不带 backend_* 元数据。
+             */
             return result<MongoDocument>::err(InvalidArg("mongo FromJson: input must be exactly one JSON object"));
         }
         const auto view = parsed.view();
@@ -122,8 +138,11 @@ result<MongoDocument> MongoDocument::FromJson(std::string_view json)
         out.bytes.assign(view.data(), view.data() + view.length());
         return result<MongoDocument>::ok(std::move(out));
     } catch (const bsoncxx::v_noabi::exception& e) {
-        // 解析期失败全部是调用方输入问题（空/畸形/数字越界），
-        // 沿用既有 BSON 域口径：InvalidArgument + backend_category="bsoncxx"。
+
+        /**
+         * 解析期失败全部是调用方输入问题（空/畸形/数字越界），
+         * 沿用既有 BSON 域口径：InvalidArgument + backend_category="bsoncxx"。
+         */
         Error err = InvalidArg(std::string("mongo FromJson: ") + e.what());
         err.backend_category = "bsoncxx";
         err.backend_code = e.code().value();
@@ -137,9 +156,11 @@ result<std::string> MongoDocument::ToJson(MongoJsonMode mode) const
     if (!view)
         return result<std::string>::err(std::move(view).error());
     try {
-        return result<std::string>::ok(bsoncxx::to_json(view.value(), mode == MongoJsonMode::k_relaxed
-                                                                          ? bsoncxx::ExtendedJsonMode::k_relaxed
-                                                                          : bsoncxx::ExtendedJsonMode::k_canonical));
+        return result<std::string>::ok(
+            bsoncxx::to_json(
+                view.value(),
+                mode == MongoJsonMode::k_relaxed ? bsoncxx::ExtendedJsonMode::k_relaxed
+                                                 : bsoncxx::ExtendedJsonMode::k_canonical));
     } catch (const bsoncxx::v_noabi::exception& e) {
         Error err = MakeError(ErrorCode::InternalError, std::string("mongo ToJson: ") + e.what());
         err.backend_category = "bsoncxx";
@@ -172,7 +193,10 @@ result<std::int64_t> MongoDocument::GetInt64(std::string_view field) const
     auto element = FindField(*this, field);
     if (!element)
         return result<std::int64_t>::err(std::move(element).error());
-    // int32/int64 统一读出；其它类型（double/bool/string…）不隐式转换。
+
+    /**
+     * int32/int64 统一读出；其它类型（double/bool/string…）不隐式转换。
+     */
     switch (element.value().type()) {
     case bsoncxx::type::k_int32:
         return result<std::int64_t>::ok(element.value().get_int32().value);
@@ -203,4 +227,6 @@ result<bool> MongoDocument::GetBool(std::string_view field) const
     return result<bool>::ok(element.value().get_bool().value);
 }
 
-} // namespace bbt::infra::mongo
+// clang-format off
+}
+// clang-format on

@@ -1,24 +1,26 @@
-// ICoConnection 成员化收口最小消费示例：
-// 只消费公开 target（bbt::infra_net + bbtools-coroutine）与公开头；
-// 不触碰 net detail 或 raw ring 接口。
-//
-// 真实 TCP 回环，两端都是本仓 Engine：
-//   - server Engine：EnableAcceptHandoff → 协程 CoAccept → conn.Read() →
-//     conn.Write(回显) → 客户端关后 RequestClose → WaitClosed。
-//   - client Engine：client-only（无 listener、无 RawHandler）→
-//     协程 CoDial → conn.Write("hello") → conn.Read() 收回显 →
-//     RequestClose → WaitClosed → Status 采样。
-//
-// 每个成员形态均有真实调用断言：
-//   - Read → tuple<owning Buffer, error_code>，Buffer.CopyTo
-//     得到真实回显字节；
-//   - Write → WriteReport{wait_error 空, outcome=Done+sent, operation 有效}；
-//   - WaitClosed → RequestClose 后观察到逻辑 closed 终态；
-//   - Status → ConnectionStatus 聚合投影（closed=true, write=Closed 等）。
-//
-// 退出约定与 co_net_service 相同：runtime 无优雅停机，业务收口后
-// flush 并以 std::_Exit 结束，不展开栈。
 
+/**
+ * ICoConnection 成员化收口最小消费示例：
+ * 只消费公开 target（bbt::infra_net + bbtools-coroutine）与公开头；
+ * 不触碰 net detail 或 raw ring 接口。
+ *
+ * 真实 TCP 回环，两端都是本仓 Engine：
+ * - server Engine：EnableAcceptHandoff → 协程 CoAccept → conn.Read() →
+ * conn.Write(回显) → 客户端关后 RequestClose → WaitClosed。
+ * - client Engine：client-only（无 listener、无 RawHandler）→
+ * 协程 CoDial → conn.Write("hello") → conn.Read() 收回显 →
+ * RequestClose → WaitClosed → Status 采样。
+ *
+ * 每个成员形态均有真实调用断言：
+ * - Read → tuple<owning Buffer, error_code>，Buffer.CopyTo
+ * 得到真实回显字节；
+ * - Write → WriteReport{wait_error 空, outcome=Done+sent, operation 有效}；
+ * - WaitClosed → RequestClose 后观察到逻辑 closed 终态；
+ * - Status → ConnectionStatus 聚合投影（closed=true, write=Closed 等）。
+ *
+ * 退出约定与 co_net_service 相同：runtime 无优雅停机，业务收口后
+ * flush 并以 std::_Exit 结束，不展开栈。
+ */
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -58,7 +60,9 @@ bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds
     return predicate();
 }
 
-} // namespace
+// clang-format off
+}
+// clang-format on
 
 int main()
 {
@@ -70,13 +74,17 @@ int main()
         }
     };
 
-    // 槽位预算：server 布局占 main + num_event_loop(1) = 2 个 Processer
-    // driver 槽；client-only 再占 num_event_loop(1) = 1 个。共需 3。
+    /**
+     * 槽位预算：server 布局占 main + num_event_loop(1) = 2 个 Processer
+     * driver 槽；client-only 再占 num_event_loop(1) = 1 个。共需 3。
+     */
     g_bbt_coroutine_config->m_cfg_static_thread_num = 3;
     g_bbt_coroutine_config->m_cfg_stack_size = 65536;
     g_scheduler->Start();
 
-    // ---- server Engine：listen + handoff ----
+    /**
+     * ---- server Engine：listen + handoff ----
+     */
     net::Engine server(std::make_shared<net::RawHandler>());
     check(!server.EnableAcceptHandoff(4), "enable accept handoff");
 
@@ -93,19 +101,29 @@ int main()
     std::vector<net::Address> addresses;
     check(!server.LocalAddresses(addresses) && addresses.size() == 1, "server addresses");
 
-    // ---- client Engine：client-only（空 listen 才能走 CoDial）----
+    /**
+     * ---- client Engine：client-only（空 listen 才能走 CoDial）----
+     */
     net::Engine client_engine(nullptr);
     std::error_code client_run_error;
     std::thread client_runner([&] {
-        net::EngineConfig config; // 空 listen_addresses = client-only
+        // clang-format off
+
+        /**
+         * 空 listen_addresses = client-only
+         */
+        // clang-format on
+        net::EngineConfig config;
         config.runtime_progress = net::RuntimeProgress::Independent;
         config.options.num_event_loop = 1;
         client_run_error = client_engine.Run(config);
     });
-    check(WaitUntil([&] { return client_engine.Phase() == net::EnginePhase::Running; }, 3000ms),
-          "client engine running");
+    check(
+        WaitUntil([&] { return client_engine.Phase() == net::EnginePhase::Running; }, 3000ms), "client engine running");
 
-    // ---- server 协程：CoAccept → Read → Write(echo) → 对端关后 RequestClose → WaitClosed ----
+    /**
+     * ---- server 协程：CoAccept → Read → Write(echo) → 对端关后 RequestClose → WaitClosed ----
+     */
     std::atomic<int> server_read_ok{0};
     std::atomic<int> server_write_ok{0};
     std::atomic<int> server_waitclosed_ok{0};
@@ -120,19 +138,29 @@ int main()
                 server_promise->set_value();
                 return;
             }
-            auto conn = accepted.connection; // CoTcpConnection 值视图
+
+            /**
+             * CoTcpConnection 值视图
+             */
+            auto conn = accepted.connection;
             if (!conn.Valid()) {
                 std::cerr << "server accepted conn invalid\n";
                 server_promise->set_value();
                 return;
             }
-            // Read → owning Buffer（真零拷贝移交）。
+
+            /**
+             * Read → owning Buffer（真零拷贝移交）。
+             */
             auto [read_data, read_error] = conn.Read(Until(5000ms));
             if (!read_error && read_data.Size() > 0) {
                 const std::string payload = read_data.CopyTo();
                 if (payload == "hello") {
                     server_read_ok.store(1);
-                    // Write → WriteReport。
+
+                    /**
+                     * Write → WriteReport。
+                     */
                     auto report = conn.Write(payload, Until(3000ms));
                     if (!report.wait_error && report.outcome.phase == net::WritePhase::Done && !report.outcome.error
                         && report.outcome.sent == payload.size() && report.operation.Valid()) {
@@ -146,16 +174,26 @@ int main()
             } else {
                 std::cerr << "server Read: " << " error=" << read_error.message() << '\n';
             }
-            // 客户端 RequestClose 后本端 Read 会见到 EOF/关闭；主动收口才等
-            // WaitClosed。这里先排空尾部直到 EOF/终态，再 RequestClose。
+
+            /**
+             * 客户端 RequestClose 后本端 Read 会见到 EOF/关闭；主动收口才等
+             * WaitClosed。这里先排空尾部直到 EOF/终态，再 RequestClose。
+             */
             while (true) {
                 auto [drain_data, drain_error] = conn.Read(Until(3000ms));
                 if (bool(drain_error)) {
-                    break; // Eof 或 Error 终态
+
+                    /**
+                     * Eof 或 Error 终态
+                     */
+                    break;
                 }
             }
-            conn.RequestClose();
-            // WaitClosed → 等逻辑 closed 终态。
+            (void)conn.Close();
+
+            /**
+             * WaitClosed → 等逻辑 closed 终态。
+             */
             const auto wait_error = conn.WaitClosed(Until(3000ms));
             if (!wait_error && conn.Status().closed) {
                 server_waitclosed_ok.store(1);
@@ -164,7 +202,9 @@ int main()
         },
         "example.server");
 
-    // ---- client 协程：CoDial → Write → Read(echo) → RequestClose → WaitClosed → Status ----
+    /**
+     * ---- client 协程：CoDial → Write → Read(echo) → RequestClose → WaitClosed → Status ----
+     */
     std::atomic<int> dial_ok{0};
     std::atomic<int> client_write_ok{0};
     std::atomic<int> client_read_ok{0};
@@ -188,10 +228,15 @@ int main()
                 return;
             }
             dial_ok.store(1);
-            // reclaim 票与 conn.IsReleased 同真源（成功交付）。
+
+            /**
+             * reclaim 票与 conn.IsReleased 同真源（成功交付）。
+             */
             check(dialed.reclaim.Valid() == dialed.reclaim.Valid(), "reclaim usable");
 
-            // Write → WriteReport{wait_error, outcome, operation}。
+            /**
+             * Write → WriteReport{wait_error, outcome, operation}。
+             */
             auto sent = conn.Write("hello", Until(3000ms));
             if (!sent.wait_error && sent.outcome.phase == net::WritePhase::Done && !sent.outcome.error
                 && sent.outcome.sent == 5 && sent.operation.Valid()) {
@@ -201,7 +246,9 @@ int main()
                           << " phase=" << static_cast<int>(sent.outcome.phase) << '\n';
             }
 
-            // Read → tuple<owning Buffer, error_code>。
+            /**
+             * Read → tuple<owning Buffer, error_code>。
+             */
             auto [echoed_data, echoed_error] = conn.Read(Until(5000ms));
             if (!echoed_error && echoed_data.CopyTo() == "hello") {
                 client_read_ok.store(1);
@@ -209,8 +256,10 @@ int main()
                 std::cerr << "client Read: " << " error=" << echoed_error.message() << '\n';
             }
 
-            // 逻辑封口请求 → WaitClosed 等 closed 终态 → Status 采样。
-            conn.RequestClose();
+            /**
+             * 逻辑封口请求 → WaitClosed 等 closed 终态 → Status 采样。
+             */
+            (void)conn.Close();
             const auto wait_error = conn.WaitClosed(Until(3000ms));
             if (!wait_error) {
                 client_waitclosed_ok.store(1);
@@ -223,7 +272,9 @@ int main()
         },
         "example.client");
 
-    // ---- 收口 ----
+    /**
+     * ---- 收口 ----
+     */
     if (client_future.wait_for(10s) == std::future_status::ready) {
         client_future.get();
     } else {
@@ -235,8 +286,8 @@ int main()
         check(false, "server task completed");
     }
 
-    server.RequestClose();
-    client_engine.RequestClose();
+    (void)server.Close();
+    (void)client_engine.Close();
     server_runner.join();
     client_runner.join();
     check(!server_run_error, "server run clean");

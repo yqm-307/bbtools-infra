@@ -1,6 +1,7 @@
 #include <bbt/infra/net/Connection.hpp>
 
 #include <utility>
+#include <bbt/infra/detail/CloseWait.hpp>
 
 #include <bbt/infra/net/Error.hpp>
 #include <bbt/infra/net/detail/CoInternal.hpp>
@@ -8,55 +9,14 @@
 #include <bbt/infra/net/detail/ReclaimRecord.hpp>
 #include <bbt/infra/net/detail/ReceiveRing.hpp>
 
-// 实现放 .cc：Connection/WriteOperation 的转发需要 ConnectionState/ReceiveRing
-// 完整定义，放在公共头会把 state/ring 布局与内部枚举经公共面传出。
-
+/**
+ * 实现放 .cc：Connection/WriteOperation 的转发需要 ConnectionState/ReceiveRing
+ * 完整定义，放在公共头会把 state/ring 布局与内部枚举经公共面传出。
+ */
 namespace bbt::infra::net {
 
-// ReclaimReceipt：无效句柄没有已提交资源责任（Released=true）；有效句柄的
-// 释放状态在共享记录上，终态在句柄寿命内永久可查，观察不改变回收本身。
-bool ReclaimReceipt::Valid() const noexcept
-{
-    return m_record != nullptr;
-}
-
-bool ReclaimReceipt::Released() const noexcept
-{
-    return !m_record || m_record->released.load(std::memory_order_acquire);
-}
-
-ReclaimReceipt::ReclaimReceipt(std::shared_ptr<ReclaimRecord> record) : m_record(std::move(record))
-{
-}
-
-WriteOperation::WriteOperation(std::shared_ptr<WriteOpRecord> record, std::weak_ptr<ConnectionState> state)
-    : m_record(std::move(record)), m_state(std::move(state))
-{
-}
-
-bool WriteOperation::Valid() const noexcept
-{
-    return m_record != nullptr;
-}
-
-std::uint64_t WriteOperation::Id() const noexcept
-{
-    return m_record ? m_record->id : 0;
-}
-
-WriteOutcome WriteOperation::Query() const
-{
-    if (!m_record) {
-        return {};
-    }
-    std::lock_guard<std::mutex> lock(m_record->mutex);
-    if (!m_record->terminal) {
-        return WriteOutcome{WritePhase::InFlight, m_record->sent, {}};
-    }
-    return WriteOutcome{WritePhase::Done, m_record->sent, m_record->error};
-}
-
-Connection::Connection(std::shared_ptr<ConnectionState> state) : m_state(std::move(state))
+Connection::Connection(std::shared_ptr<ConnectionState> state)
+    : m_state(std::move(state))
 {
 }
 
@@ -75,7 +35,10 @@ std::error_code Connection::AsyncWrite(std::string data)
     if (!m_state) {
         return make_error_code(NetErrc::Closed);
     }
-    // 记录只供 owner 做 FIFO/部分发送及 OnWrite 结算，不创建等待者或交付票据。
+
+    /**
+     * 记录只供 owner 做 FIFO/部分发送及 OnWrite 结算，不创建等待者或交付票据。
+     */
     std::shared_ptr<WriteOpRecord> record;
     return m_state->AcceptWrite(std::move(data), record);
 }
@@ -156,8 +119,11 @@ bool Connection::Closed() const
 
 bool Connection::Released() const noexcept
 {
-    // 无效句柄没有资源责任；有效句柄以 owner 物理收口标记为准（conn_state
-    // 记录在 fd 真实关闭且 owner 责任清理后置位）。
+
+    /**
+     * 无效句柄没有资源责任；有效句柄以 owner 物理收口标记为准（conn_state
+     * 记录在 fd 真实关闭且 owner 责任清理后置位）。
+     */
     return !m_state || m_state->OwnerReleased();
 }
 
@@ -166,11 +132,32 @@ std::error_code Connection::CloseReason() const
     return m_state ? m_state->CloseReason() : make_error_code(NetErrc::Closed);
 }
 
-void Connection::RequestClose(std::error_code reason)
+std::error_code Connection::Close(const CloseOptions& options, std::error_code reason)
 {
-    if (m_state) {
+    if (!bbt::infra::detail::ValidateCloseOptions(options) || options.mode != CloseMode::Immediate
+        || (options.reason && !options.reason->message.empty()))
+        return std::make_error_code(std::errc::invalid_argument);
+
+    /**
+     * Raw callbacks must not wait for their owner. Co waiting only suspends the caller.
+     */
+    if (options.wait_release && !bbt::coroutine::IsInCoroutineContext())
+        return std::make_error_code(std::errc::operation_not_permitted);
+    auto signal = options.wait_release ? bbt::coroutine::sync::CoWaiter::Create() : nullptr;
+    if (options.wait_release && !signal)
+        return std::make_error_code(std::errc::resource_unavailable_try_again);
+    if (m_state)
         m_state->RequestClose(reason);
+    while (options.wait_release && !Released()) {
+        if (std::chrono::steady_clock::now() >= options.deadline)
+            return std::make_error_code(std::errc::timed_out);
+        auto waited = bbt::infra::detail::WaitCloseSlice(signal, bbt::infra::detail::NextCloseSlice(options.deadline));
+        if (!waited)
+            return std::make_error_code(std::errc::operation_canceled);
     }
+    return {};
 }
 
-} // namespace bbt::infra::net
+// clang-format off
+}
+// clang-format on

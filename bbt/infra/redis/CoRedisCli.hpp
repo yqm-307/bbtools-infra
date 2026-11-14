@@ -1,4 +1,5 @@
-/** @file CoRedisCli.hpp
+/**
+ * @file CoRedisCli.hpp
  * @brief 单连接 Redis 适配：协程域内的命令等待、连接级握手配置与关闭语义。
  *
  * 只经 net::Engine 出网，不引入 Redis SDK、不自建 Engine 线程。服务端回复的边界形态
@@ -42,6 +43,7 @@ public:
      * @return 成功返回 client 句柄；参数非法返回 InvalidArgument，reader 分配失败返回 InternalError。
      */
     static result<std::shared_ptr<CoRedisCli>> Create(std::shared_ptr<net::Engine> engine, net::Address address);
+
     /**
      * @brief 携带连接级握手配置的装配。
      *
@@ -53,13 +55,22 @@ public:
      * @param handshake 连接级握手配置。
      * @return 成功返回 client 句柄；参数非法返回 InvalidArgument，reader 分配失败返回 InternalError。
      */
-    static result<std::shared_ptr<CoRedisCli>> Create(std::shared_ptr<net::Engine> engine, net::Address address,
-                                                      RedisHandshake handshake);
-    /// @brief 只调用 Close()，不等在途操作退出。
+    static result<std::shared_ptr<CoRedisCli>>
+    Create(std::shared_ptr<net::Engine> engine, net::Address address, RedisHandshake handshake);
+
+    /**
+     * @brief 只调用 Close()，不等在途操作退出。
+     */
     ~CoRedisCli() noexcept override;
-    /// @brief 不可拷贝：句柄独占连接状态与 reader。
+
+    /**
+     * @brief 不可拷贝：句柄独占连接状态与 reader。
+     */
     CoRedisCli(const CoRedisCli&) = delete;
-    /// @brief 不可拷贝赋值。
+
+    /**
+     * @brief 不可拷贝赋值。
+     */
     CoRedisCli& operator=(const CoRedisCli&) = delete;
 
     /**
@@ -71,23 +82,42 @@ public:
      * @return 成功表示连接可用；失败见映射后的错误分类。
      */
     bbt_co_async(result<void>) Connect(const CallOptions& options) override;
-    /// @brief PING，期望 +PONG；其余回复形态按 ProtocolError 处理。
+
+    /**
+     * @brief PING，期望 +PONG；其余回复形态按 ProtocolError 处理。
+     */
     bbt_co_async(result<void>) Ping(const CallOptions& options) override;
-    /// @brief GET：键缺失返回 ok(nullopt)。
+
+    /**
+     * @brief GET：键缺失返回 ok(nullopt)。
+     */
     bbt_co_async(result<std::optional<std::string>>) Get(std::string_view key, const CallOptions& options) override;
-    /// @brief 无条件 SET：写入成功返回 ok。
+
+    /**
+     * @brief 无条件 SET：写入成功返回 ok。
+     */
     bbt_co_async(result<void>) Set(std::string_view key, std::string_view value, const CallOptions& options) override;
+
     /**
      * @brief 带选项的 SET：写入成功 ok(true)；NX/XX 条件不满足（nil 回复）
      * ok(false)，不是错误。
      *
      * options.expire 越界在接纳前返回 InvalidArgument（零接纳，什么都不发）。空 key 同样 InvalidArgument。
      */
-    bbt_co_async(result<bool>) Set(std::string_view key, std::string_view value, const SetOptions& set_options,
-                                   const CallOptions& options) override;
-    /// @brief EXISTS：键存在为 true。
+    bbt_co_async(result<bool>)
+        Set(std::string_view key,
+            std::string_view value,
+            const SetOptions& set_options,
+            const CallOptions& options) override;
+
+    /**
+     * @brief EXISTS：键存在为 true。
+     */
     bbt_co_async(result<bool>) Exists(std::string_view key, const CallOptions& options) override;
-    /// @brief DEL：返回服务端报告的实际删除数量。
+
+    /**
+     * @brief DEL：返回服务端报告的实际删除数量。
+     */
     bbt_co_async(result<std::uint64_t>) Delete(std::vector<std::string> keys, const CallOptions& options) override;
 
     /**
@@ -97,7 +127,10 @@ public:
      */
     bbt_co_async(result<bool>)
         Expire(std::string_view key, std::chrono::milliseconds ttl, const CallOptions& options) override;
-    /// @brief PTTL：KeyMissing / NoExpiry / Expires 三态；不存在 -1/-2 魔数。
+
+    /**
+     * @brief PTTL：KeyMissing / NoExpiry / Expires 三态；不存在 -1/-2 魔数。
+     */
     bbt_co_async(result<TtlResult>) Ttl(std::string_view key, const CallOptions& options) override;
 
     /**
@@ -106,12 +139,21 @@ public:
      * 非整数、溢出由服务端报错映射为 RemoteError（唯一保留连接的错误），连接保持同步。
      */
     bbt_co_async(result<std::int64_t>) Incr(std::string_view key, const CallOptions& options) override;
-    /// @brief DECR 一步；错误语义同 Incr。
+
+    /**
+     * @brief DECR 一步；错误语义同 Incr。
+     */
     bbt_co_async(result<std::int64_t>) Decr(std::string_view key, const CallOptions& options) override;
-    /// @brief INCRBY 指定增量；错误语义同 Incr。
+
+    /**
+     * @brief INCRBY 指定增量；错误语义同 Incr。
+     */
     bbt_co_async(result<std::int64_t>)
         IncrBy(std::string_view key, std::int64_t delta, const CallOptions& options) override;
-    /// @brief DECRBY 指定减量；错误语义同 Incr。
+
+    /**
+     * @brief DECRBY 指定减量；错误语义同 Incr。
+     */
     bbt_co_async(result<std::int64_t>)
         DecrBy(std::string_view key, std::int64_t delta, const CallOptions& options) override;
 
@@ -124,15 +166,25 @@ public:
      */
     bbt_co_async(result<bool>)
         HSet(std::string_view key, std::string_view field, std::string_view value, const CallOptions& options) override;
-    /// @brief HGET：字段缺失或 key 不存在为 ok(nullopt)。
+
+    /**
+     * @brief HGET：字段缺失或 key 不存在为 ok(nullopt)。
+     */
     bbt_co_async(result<std::optional<std::string>>)
         HGet(std::string_view key, std::string_view field, const CallOptions& options) override;
-    /// @brief HDEL：返回删除的字段数量。
+
+    /**
+     * @brief HDEL：返回删除的字段数量。
+     */
     bbt_co_async(result<std::uint64_t>)
         HDel(std::string_view key, std::vector<std::string> fields, const CallOptions& options) override;
-    /// @brief HEXISTS：字段存在为 true。
+
+    /**
+     * @brief HEXISTS：字段存在为 true。
+     */
     bbt_co_async(result<bool>)
         HExists(std::string_view key, std::string_view field, const CallOptions& options) override;
+
     /**
      * @brief HGETALL：field/value 对按服务端顺序。
      *
@@ -144,19 +196,33 @@ public:
     /**
      * @brief 立即逻辑封口并请求关闭已发布连接；不等 fd、在途拨号或 API 任务退出。
      *
-     * 宿主最终须 Close 全部 client、RequestClose Engine、join Run 且核 Stopped、
-     * 等登记的全部 API 任务完成并释放捕获。不可直接充当旧 ICoCloseable 同步资源。
+     * 宿主最终须 Close 全部 client、Close(Immediate) Engine、join Run 且核 Stopped、
+     * 等登记的全部 API 任务完成并释放捕获。不可当作 ICoCloseable 的同步资源使用。
      */
-    void Close() noexcept override;
-    /// @brief 只读查询逻辑封口：Close() 已生效为 true；不代表连接已物理回收。
+    result<void> Close(const CloseOptions& options = {}) override;
+
+    /**
+     * @brief 只读查询逻辑封口：Close() 已生效为 true；不代表连接已物理回收。
+     */
     bool IsClosed() const noexcept override;
 
+    /**
+     * @brief 本 client 的所有拨号凭据释放且 API 已退出；不是逻辑封口。
+     */
+    bool Released() const noexcept;
+    std::optional<Error> CloseReason() const noexcept;
+
 private:
+    void _CloseConnection(Error reason) noexcept;
     friend class CoRedisPool;
     bool StreamHealthy() const noexcept;
     struct State;
     explicit CoRedisCli(std::shared_ptr<State> state) noexcept;
+
+private:
     std::shared_ptr<State> state_;
 };
 
-} // namespace bbt::infra::redis
+// clang-format off
+}
+// clang-format on

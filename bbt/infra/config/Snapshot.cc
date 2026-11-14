@@ -7,4 +7,6 @@ std::string Snapshot::FullKey() const
     return ns + "/" + key;
 }
 
-} // namespace bbt::infra::config
+// clang-format off
+}
+// clang-format on

@@ -16,4 +16,6 @@ std::tuple<Buffer, std::error_code> ICoConnection::TryRead()
     return {std::move(out), error};
 }
 
-} // namespace bbt::infra::net
+// clang-format off
+}
+// clang-format on

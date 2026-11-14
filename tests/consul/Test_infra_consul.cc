@@ -1,20 +1,21 @@
-// infra.consul：Consul HTTP adapter 的定向验收。
-//
-// 覆盖两类证据，全部经真实网络栈（不 mock HTTP、不 mock JSON）：
-//   1) 参数/协议/关闭错误面：被拒绝的 agent 地址与注册字段、HTTP 非 2xx、非法
-//      JSON、缺失或非法 X-Consul-Index、非法实例端口、critical 实例过滤、
-//      封口后拒绝新操作——用自有 loopback 对端返回固定字节（对端只产生协议
-//      字节，不替代 Consul 语义）；
-//   2) 真后端闭环：以官方固定版 Consul（BBT_TEST_CONSUL_BIN，SHA256 已核）在
-//      本进程租用的动态端口上 -dev 启动，走真实注册/健康查询/阻塞查询 index/
-//      注销/空视图，并在 agent 停止后验证不可达在有限期限内失败。
-//
-// 只管理本进程启动的 Consul 与本次租用的 loopback socket；结束/失败均经析构
-// 收口（SIGTERM → 有界等待 → SIGKILL 只作用于自己的子进程），不 pkill。
+/**
+ * infra.consul：Consul HTTP adapter 的定向验收。
+ * 覆盖两类证据，全部经真实网络栈（不 mock HTTP、不 mock JSON）：
+ * 1) 参数/协议/关闭错误面：被拒绝的 agent 地址与注册字段、HTTP 非 2xx、非法
+ * JSON、缺失或非法 X-Consul-Index、非法实例端口、critical 实例过滤、
+ * 封口后拒绝新操作——用自有 loopback 对端返回固定字节（对端只产生协议
+ * 字节，不替代 Consul 语义）；
+ * 2) 真后端闭环：以官方固定版 Consul（BBT_TEST_CONSUL_BIN，SHA256 已核）在
+ * 本进程租用的动态端口上 -dev 启动，走真实注册/健康查询/阻塞查询 index/
+ * 注销/空视图，并在 agent 停止后验证不可达在有限期限内失败。
+ * 只管理本进程启动的 Consul 与本次租用的 loopback socket；结束/失败均经析构
+ * 收口（SIGTERM → 有界等待 → SIGKILL 只作用于自己的子进程），不 pkill。
+ */
 #include "../http_net/TestSupport.hpp"
 #include "../net/ProcessRuntimeTestMain.hpp"
 
 #include <bbt/infra/consul/Client.hpp>
+#include <bbt/infra/consul/detail/ClientTestAccess.hpp>
 #include <bbt/infra/http/Client.hpp>
 #include <bbt/infra/net/Engine.hpp>
 
@@ -43,7 +44,10 @@
 
 extern char** environ;
 
-using namespace http_net_test; // NOLINT：复用 http_net 的 Host/CHECK/Watchdog 夹具
+/**
+ * 复用 http_net 的 Host/CHECK/Watchdog 夹具。
+ */
+using namespace http_net_test; // NOLINT
 namespace consul = bbt::infra::consul;
 namespace http = bbt::infra::http;
 
@@ -52,20 +56,23 @@ namespace {
 using std::chrono::milliseconds;
 using namespace std::chrono_literals;
 
-// 本套件含真实 Consul 启停与阻塞查询，固定 20s 的 http_net watchdog 不够，
-// 这里用同一个「超时仍判失败」的出口，但给出与 ctest TIMEOUT 一致的界。
+/**
+ * 本套件含真实 Consul 启停与阻塞查询，固定 20s 的 http_net watchdog 不够，
+ * 这里用同一个「超时仍判失败」的出口，但给出与 ctest TIMEOUT 一致的界。
+ */
 class BoundedWatchdog {
 public:
     explicit BoundedWatchdog(std::chrono::milliseconds budget)
         : m_thread([this, budget] {
-              std::unique_lock<std::mutex> lock(m_mutex);
-              if (!m_cv.wait_for(lock, budget, [this] { return m_done; })) {
-                  std::cerr << "FAIL watchdog: bounded test did not finish\n" << std::flush;
-                  std::_Exit(3);
-              }
-          })
+            std::unique_lock<std::mutex> lock(m_mutex);
+            if (!m_cv.wait_for(lock, budget, [this] { return m_done; })) {
+                std::cerr << "FAIL watchdog: bounded test did not finish\n" << std::flush;
+                std::_Exit(3);
+            }
+        })
     {
     }
+
     ~BoundedWatchdog()
     {
         {
@@ -83,9 +90,9 @@ private:
     std::thread m_thread;
 };
 
-// ---------------------------------------------------------------- 协程辅助 ---
-
-// 协程内休眠：用 CoWaiter 的到期唤醒让出 worker，而不是阻塞调度线程。
+/**
+ * 协程内休眠：用 CoWaiter 的到期唤醒让出 worker，而不是阻塞调度线程。
+ */
 void CoSleep(milliseconds duration)
 {
     auto waiter = bbt::coroutine::sync::CoWaiter::Create();
@@ -94,13 +101,17 @@ void CoSleep(milliseconds duration)
     CHECK(status == bbt::coroutine::WaitStatus::TimedOut);
 }
 
-// 关闭契约的观测时间戳：同一进程内单调可比，只用于比较「谁先返回」。
+/**
+ * 关闭契约的观测时间戳：同一进程内单调可比，只用于比较「谁先返回」。
+ */
 long long NowMs()
 {
     return std::chrono::duration_cast<milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-// 在本进程 Host 的调度器上执行一次 await，可选记录墙钟耗时（阻塞查询证据）。
+/**
+ * 在本进程 Host 的调度器上执行一次 await，可选记录墙钟耗时（阻塞查询证据）。
+ */
 template <class F> auto Await(Host& host, F fn, long long* elapsed_ms = nullptr) -> decltype(fn())
 {
     const auto start = std::chrono::steady_clock::now();
@@ -111,8 +122,6 @@ template <class F> auto Await(Host& host, F fn, long long* elapsed_ms = nullptr)
     }
     return value;
 }
-
-// ---------------------------------------------------------------- 端口/监听 ---
 
 int FreeTcpPort()
 {
@@ -130,7 +139,9 @@ int FreeTcpPort()
     return port;
 }
 
-// 真实 listener：Consul 的 TCP check 只有真端口才通过，测试据此区分健康实例。
+/**
+ * 真实 listener：Consul 的 TCP check 只有真端口才通过，测试据此区分健康实例。
+ */
 class ListenSocket {
 public:
     ListenSocket()
@@ -148,28 +159,29 @@ public:
         CHECK(::getsockname(m_fd, reinterpret_cast<sockaddr*>(&local), &size) == 0);
         m_port = ntohs(local.sin_port);
     }
+
     ~ListenSocket()
     {
         if (m_fd >= 0) {
             ::close(m_fd);
         }
     }
+
     ListenSocket(const ListenSocket&) = delete;
     ListenSocket& operator=(const ListenSocket&) = delete;
-    std::uint16_t port() const noexcept
-    {
-        return m_port;
-    }
+
+    std::uint16_t port() const noexcept { return m_port; }
 
 private:
     int m_fd{-1};
     std::uint16_t m_port{0};
 };
 
-// ---------------------------------------------------------------- 固定对端 ---
-
-std::string RawResponse(int status, const std::string& reason, std::string body,
-                        std::vector<std::pair<std::string, std::string>> headers = {})
+std::string RawResponse(
+    int status,
+    const std::string& reason,
+    std::string body,
+    std::vector<std::pair<std::string, std::string>> headers = {})
 {
     std::string out = "HTTP/1.1 " + std::to_string(status) + " " + reason + "\r\n";
     out += "Content-Length: " + std::to_string(body.size()) + "\r\n";
@@ -183,8 +195,10 @@ std::string RawResponse(int status, const std::string& reason, std::string body,
     return out;
 }
 
-// 固定应答的 loopback HTTP/1.1 对端：只产生协议字节（状态码/头/体），用来验证
-// adapter 对非 2xx、坏 JSON、缺 index 的映射；不参与任何 Consul 语义判断。
+/**
+ * 固定应答的 loopback HTTP/1.1 对端：只产生协议字节（状态码/头/体），用来验证
+ * adapter 对非 2xx、坏 JSON、缺 index 的映射；不参与任何 Consul 语义判断。
+ */
 class CannedPeer {
 public:
     struct Recorded {
@@ -193,7 +207,9 @@ public:
         std::string body;
     };
 
-    explicit CannedPeer(std::string response, bool hold = false) : m_response(std::move(response)), m_hold(hold)
+    explicit CannedPeer(std::string response, bool hold = false)
+        : m_response(std::move(response))
+        , m_hold(hold)
     {
         m_listener = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
         CHECK(m_listener >= 0);
@@ -209,30 +225,33 @@ public:
         m_port = ntohs(local.sin_port);
         m_thread = std::thread([this] { Loop(); });
     }
-    ~CannedPeer()
-    {
-        Stop();
-    }
+
+    ~CannedPeer() { Stop(); }
+
     CannedPeer(const CannedPeer&) = delete;
     CannedPeer& operator=(const CannedPeer&) = delete;
 
-    std::string base_url() const
-    {
-        return "http://127.0.0.1:" + std::to_string(m_port);
-    }
+    std::string base_url() const { return "http://127.0.0.1:" + std::to_string(m_port); }
+
     std::vector<Recorded> requests() const
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_requests;
     }
-    // hold 模式下：请求已被对端完整读出（在飞阶段成立）才返回 true。这是
-    // 「先证明真实操作进入目标阶段，再触发关闭」的观测点，不是 sleep 猜时序。
+
+    /**
+     * hold 模式下：请求已被对端完整读出（在飞阶段成立）才返回 true。这是
+     * 「先证明真实操作进入目标阶段，再触发关闭」的观测点，不是 sleep 猜时序。
+     */
     bool WaitFirstRequest(milliseconds timeout = 5s)
     {
         std::unique_lock<std::mutex> lock(m_mutex);
         return m_cv.wait_for(lock, timeout, [this] { return m_received; });
     }
-    // 放行被 hold 的响应；之后的回包时刻由 response_sent_at() 观测。
+
+    /**
+     * 放行被 hold 的响应；之后的回包时刻由 response_sent_at() 观测。
+     */
     void Release()
     {
         {
@@ -241,11 +260,13 @@ public:
         }
         m_cv.notify_all();
     }
+
     long long response_sent_at() const
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_response_sent_at;
     }
+
     void Stop()
     {
         {
@@ -254,7 +275,11 @@ public:
                 return;
             }
             m_stopped = true;
-            m_released = true; // hold 中的对端线程必须先被放行才能 join
+
+            /**
+             * hold 中的对端线程必须先被放行才能 join
+             */
+            m_released = true;
             if (m_conn >= 0) {
                 ::shutdown(m_conn, SHUT_RDWR);
             }
@@ -404,24 +429,24 @@ private:
     std::vector<Recorded> m_requests;
 };
 
-// ---------------------------------------------------------------- Consul agent --
-
-// 自有 Consul agent 子进程：显式动态端口 + loopback 绑定 + 日志落文件；停止
-// 顺序为 SIGTERM → 有界等待 → SIGKILL，绝不触碰其它进程。
+/**
+ * 自有 Consul agent 子进程：显式动态端口 + loopback 绑定 + 日志落文件；停止
+ * 顺序为 SIGTERM → 有界等待 → SIGKILL，绝不触碰其它进程。
+ */
 class ConsulAgent {
 public:
     ConsulAgent(std::string binary, std::filesystem::path data_dir)
-        : m_binary(std::move(binary)), m_data_dir(std::move(data_dir))
+        : m_binary(std::move(binary))
+        , m_data_dir(std::move(data_dir))
     {
         m_http_port = FreeTcpPort();
         m_serf_lan = FreeTcpPort();
         m_serf_wan = FreeTcpPort();
         m_server = FreeTcpPort();
     }
-    ~ConsulAgent()
-    {
-        Stop();
-    }
+
+    ~ConsulAgent() { Stop(); }
+
     ConsulAgent(const ConsulAgent&) = delete;
     ConsulAgent& operator=(const ConsulAgent&) = delete;
 
@@ -457,8 +482,8 @@ public:
 
         posix_spawn_file_actions_t actions;
         CHECK(posix_spawn_file_actions_init(&actions) == 0);
-        CHECK(posix_spawn_file_actions_addopen(&actions, 1, m_log_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644)
-              == 0);
+        CHECK(
+            posix_spawn_file_actions_addopen(&actions, 1, m_log_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644) == 0);
         CHECK(posix_spawn_file_actions_adddup2(&actions, 1, 2) == 0);
         const int rc = posix_spawn(&m_pid, m_binary.c_str(), &actions, nullptr, argv.data(), environ);
         posix_spawn_file_actions_destroy(&actions);
@@ -469,14 +494,9 @@ public:
         return true;
     }
 
-    int http_port() const noexcept
-    {
-        return m_http_port;
-    }
-    pid_t pid() const noexcept
-    {
-        return m_pid;
-    }
+    int http_port() const noexcept { return m_http_port; }
+
+    pid_t pid() const noexcept { return m_pid; }
 
     bool Alive() const
     {
@@ -538,18 +558,20 @@ private:
     int m_server{0};
 };
 
-// ---------------------------------------------------------------- 建 Client ---
-
 struct Fixture {
     std::shared_ptr<consul::Client> client;
 };
 
-Fixture MakeClient(Host& host, const std::string& agent_url, milliseconds request_timeout = 3s,
-                   milliseconds query_wait = 1s, std::string token = {})
+Fixture MakeClient(
+    Host& host,
+    const std::string& agent_url,
+    milliseconds request_timeout = 3s,
+    milliseconds query_wait = 1s,
+    std::string token = {})
 {
     http::ClientOptions options;
     options.limits.max_connections = 8;
-    options.timeout = http::Timeout::Uniform(http::PhaseTimeout::Milliseconds(5s));
+    options.SetTimeout(5s);
     auto created_http = http::Client::Create(host.engine, std::move(options));
     CHECK(created_http);
     consul::Options consul_options;
@@ -564,8 +586,8 @@ Fixture MakeClient(Host& host, const std::string& agent_url, milliseconds reques
     return fixture;
 }
 
-consul::ServiceRegistration Catalog(const std::string& id, std::uint16_t port,
-                                    const std::string& name = "ecommerce-catalog")
+consul::ServiceRegistration
+Catalog(const std::string& id, std::uint16_t port, const std::string& name = "ecommerce-catalog")
 {
     consul::ServiceRegistration registration;
     registration.id = id;
@@ -585,13 +607,19 @@ std::set<std::string> IdsOf(const consul::ServiceSnapshot& snapshot)
     return ids;
 }
 
-// ---------------------------------------------------------------- 用例：参数 ---
-
 void CaseValidation(Host& host)
 {
-    // agent 地址只接受 http + 数值 loopback。
-    for (const std::string url : {"https://127.0.0.1:8500", "http://localhost:8500", "http://10.0.0.1:8500",
-                                  "http://127.0.0.1:0", "http://127.0.0.1:8500/v1", "127.0.0.1:8500"}) {
+
+    /**
+     * agent 地址只接受 http + 数值 loopback。
+     */
+    for (const std::string url :
+         {"https://127.0.0.1:8500",
+          "http://localhost:8500",
+          "http://10.0.0.1:8500",
+          "http://127.0.0.1:0",
+          "http://127.0.0.1:8500/v1",
+          "127.0.0.1:8500"}) {
         http::ClientOptions options;
         auto created_http = http::Client::Create(host.engine, std::move(options));
         CHECK(created_http);
@@ -601,7 +629,10 @@ void CaseValidation(Host& host)
         CHECK(!created);
         CHECK(created.error().code == ErrorCode::InvalidArgument);
     }
-    // 期限必须为正。
+
+    /**
+     * 期限必须为正。
+     */
     {
         http::ClientOptions options;
         auto created_http = http::Client::Create(host.engine, std::move(options));
@@ -613,7 +644,10 @@ void CaseValidation(Host& host)
         CHECK(!created);
         CHECK(created.error().code == ErrorCode::InvalidArgument);
     }
-    // 阻塞查询的 wait 必须给 wait/16 抖动和固定收尾余量留出空间。
+
+    /**
+     * 阻塞查询的 wait 必须给 wait/16 抖动和固定收尾余量留出空间。
+     */
     {
         http::ClientOptions options;
         auto created_http = http::Client::Create(host.engine, std::move(options));
@@ -626,7 +660,10 @@ void CaseValidation(Host& host)
         CHECK(!created);
         CHECK(created.error().code == ErrorCode::InvalidArgument);
     }
-    // 无 http Client 时拒绝。
+
+    /**
+     * 无 http Client 时拒绝。
+     */
     {
         consul::Options consul_options;
         consul_options.agent_url = "http://127.0.0.1:8500";
@@ -634,7 +671,10 @@ void CaseValidation(Host& host)
         CHECK(!created);
         CHECK(created.error().code == ErrorCode::InvalidArgument);
     }
-    // 注册字段校验不触网（对端为未使用的 loopback 端口即可）。
+
+    /**
+     * 注册字段校验不触网（对端为未使用的 loopback 端口即可）。
+     */
     {
         auto fixture = MakeClient(host, "http://127.0.0.1:" + std::to_string(FreeTcpPort()));
         const std::vector<consul::ServiceRegistration> invalid{
@@ -658,11 +698,9 @@ void CaseValidation(Host& host)
         auto query = Await(host, [&] { return bbt_co_await fixture.client->HealthyInstances(""); });
         CHECK(!query);
         CHECK(query.error().code == ErrorCode::InvalidArgument);
-        fixture.client->Close();
+        (void)fixture.client->Close();
     }
 }
-
-// ---------------------------------------------------------------- 用例：不可达 ---
 
 void CaseUnreachable(Host& host)
 {
@@ -680,14 +718,15 @@ void CaseUnreachable(Host& host)
     CHECK(!registered);
     CHECK(registered.error().code == ErrorCode::TransportError);
     CHECK(register_elapsed < 2000);
-    fixture.client->Close();
+    (void)fixture.client->Close();
 }
-
-// ---------------------------------------------------------------- 用例：协议面 ---
 
 void CaseWireAndErrors(Host& host)
 {
-    // 1) 注册请求的真实 wire 形态：PUT 目标 + JSON 字段（含 TCP check）。
+
+    /**
+     * 1) 注册请求的真实 wire 形态：PUT 目标 + JSON 字段（含 TCP check）。
+     */
     {
         CannedPeer peer(RawResponse(200, "OK", ""));
         auto fixture = MakeClient(host, peer.base_url());
@@ -703,9 +742,12 @@ void CaseWireAndErrors(Host& host)
         CHECK(requests[0].body.find("\"Port\":18001") != std::string::npos);
         CHECK(requests[0].body.find("\"TCP\":\"127.0.0.1:18001\"") != std::string::npos);
         CHECK(requests[0].body.find("\"DeregisterCriticalServiceAfter\":\"1m\"") != std::string::npos);
-        fixture.client->Close();
+        (void)fixture.client->Close();
     }
-    // 2) 非 2xx：TransportError + 保留状态码。
+
+    /**
+     * 2) 非 2xx：TransportError + 保留状态码。
+     */
     {
         CannedPeer peer(RawResponse(500, "Internal Server Error", "boom"));
         auto fixture = MakeClient(host, peer.base_url());
@@ -715,9 +757,12 @@ void CaseWireAndErrors(Host& host)
         CHECK(registered.error().code == ErrorCode::TransportError);
         CHECK(registered.error().backend_code == 500);
         CHECK(registered.error().message.find("500") != std::string::npos);
-        fixture.client->Close();
+        (void)fixture.client->Close();
     }
-    // 3) 合法健康响应：Service.Address 为空时回落 Node.Address；index 透传。
+
+    /**
+     * 3) 合法健康响应：Service.Address 为空时回落 Node.Address；index 透传。
+     */
     {
         const std::string body = "[{\"Node\":{\"Address\":\"127.0.0.1\"},"
                                  "\"Service\":{\"ID\":\"catalog-1\",\"Service\":\"ecommerce-catalog\","
@@ -733,7 +778,10 @@ void CaseWireAndErrors(Host& host)
         CHECK(snapshot.value().instances[0].name == "ecommerce-catalog");
         CHECK(snapshot.value().instances[0].address == "127.0.0.1");
         CHECK(snapshot.value().instances[0].port == 19001);
-        // 阻塞查询参数：index 与 wait 都在 wire 上。
+
+        /**
+         * 阻塞查询参数：index 与 wait 都在 wire 上。
+         */
         auto blocked =
             Await(host, [&] { return bbt_co_await fixture.client->HealthyInstances("ecommerce-catalog", 42); });
         CHECK(blocked);
@@ -741,23 +789,30 @@ void CaseWireAndErrors(Host& host)
         CHECK(requests.size() == 2);
         CHECK(requests[0].target == "/v1/health/service/ecommerce-catalog?passing=true");
         CHECK(requests[1].target == "/v1/health/service/ecommerce-catalog?passing=true&index=42&wait=1000ms");
-        fixture.client->Close();
+        (void)fixture.client->Close();
     }
-    // 4) 缺少 X-Consul-Index / 非法 JSON / 非法端口 / 空 ID → ProtocolError。
+
+    /**
+     * 4) 缺少 X-Consul-Index / 非法 JSON / 非法端口 / 空 ID → ProtocolError。
+     */
     {
         const std::vector<std::string> bad_responses{
             RawResponse(200, "OK", "[]"),
             RawResponse(200, "OK", "not-json", {{"X-Consul-Index", "7"}}),
-            RawResponse(200, "OK",
-                        "[{\"Node\":{\"Address\":\"127.0.0.1\"},"
-                        "\"Service\":{\"ID\":\"c\",\"Service\":\"s\",\"Address\":\"127.0.0.1\","
-                        "\"Port\":0}}]",
-                        {{"X-Consul-Index", "7"}}),
-            RawResponse(200, "OK",
-                        "[{\"Node\":{\"Address\":\"127.0.0.1\"},"
-                        "\"Service\":{\"ID\":\"\",\"Service\":\"s\",\"Address\":\"127.0.0.1\","
-                        "\"Port\":19002}}]",
-                        {{"X-Consul-Index", "7"}}),
+            RawResponse(
+                200,
+                "OK",
+                "[{\"Node\":{\"Address\":\"127.0.0.1\"},"
+                "\"Service\":{\"ID\":\"c\",\"Service\":\"s\",\"Address\":\"127.0.0.1\","
+                "\"Port\":0}}]",
+                {{"X-Consul-Index", "7"}}),
+            RawResponse(
+                200,
+                "OK",
+                "[{\"Node\":{\"Address\":\"127.0.0.1\"},"
+                "\"Service\":{\"ID\":\"\",\"Service\":\"s\",\"Address\":\"127.0.0.1\","
+                "\"Port\":19002}}]",
+                {{"X-Consul-Index", "7"}}),
             RawResponse(200, "OK", "{}", {{"X-Consul-Index", "7"}}),
         };
         for (const auto& response : bad_responses) {
@@ -766,10 +821,13 @@ void CaseWireAndErrors(Host& host)
             auto snapshot = Await(host, [&] { return bbt_co_await fixture.client->HealthyInstances("s"); });
             CHECK(!snapshot);
             CHECK(snapshot.error().code == ErrorCode::ProtocolError);
-            fixture.client->Close();
+            (void)fixture.client->Close();
         }
     }
-    // 5) critical check 过滤：即使 agent 忽略 passing 也不会被当成可用目标。
+
+    /**
+     * 5) critical check 过滤：即使 agent 忽略 passing 也不会被当成可用目标。
+     */
     {
         const std::string body = "[{\"Node\":{\"Address\":\"127.0.0.1\"},"
                                  "\"Service\":{\"ID\":\"critical-1\",\"Service\":\"ecommerce-catalog\","
@@ -780,9 +838,12 @@ void CaseWireAndErrors(Host& host)
         auto snapshot = Await(host, [&] { return bbt_co_await fixture.client->HealthyInstances("ecommerce-catalog"); });
         CHECK(snapshot);
         CHECK(snapshot.value().instances.empty());
-        fixture.client->Close();
+        (void)fixture.client->Close();
     }
-    // 6) 注销路径：id 必须百分号编码，不能被当成多级路径。
+
+    /**
+     * 6) 注销路径：id 必须百分号编码，不能被当成多级路径。
+     */
     {
         CannedPeer peer(RawResponse(200, "OK", ""));
         auto fixture = MakeClient(host, peer.base_url());
@@ -792,33 +853,46 @@ void CaseWireAndErrors(Host& host)
         CHECK(requests.size() == 1);
         CHECK(requests[0].method == "PUT");
         CHECK(requests[0].target == "/v1/agent/service/deregister/catalog%2F1%20a%2Bb");
-        fixture.client->Close();
+        (void)fixture.client->Close();
     }
-    // 6b) 注销幂等：agent 对已不存在的 ID 返回 404，也算已注销。
+
+    /**
+     * 6b) 注销幂等：agent 对已不存在的 ID 返回 404，也算已注销。
+     */
     {
         CannedPeer peer(RawResponse(404, "Not Found", "Unknown service ID"));
         auto fixture = MakeClient(host, peer.base_url());
         auto deregistered = Await(host, [&] { return bbt_co_await fixture.client->Deregister("gone"); });
         CHECK(deregistered);
-        fixture.client->Close();
+        (void)fixture.client->Close();
     }
-    // 6c) 非 Consul 的 404 不能被误判为幂等注销成功。
+
+    /**
+     * 6c) 非 Consul 的 404 不能被误判为幂等注销成功。
+     */
     {
         CannedPeer peer(RawResponse(404, "Not Found", "proxy route missing"));
         auto fixture = MakeClient(host, peer.base_url());
         auto deregistered = Await(host, [&] { return bbt_co_await fixture.client->Deregister("gone"); });
         CHECK(!deregistered);
         CHECK(deregistered.error().code == ErrorCode::TransportError);
-        fixture.client->Close();
+        (void)fixture.client->Close();
     }
-    // 7) 封口后拒绝新操作；Close 幂等。
+
+    /**
+     * 7) 封口后拒绝新操作；Close 幂等。
+     */
     {
         CannedPeer peer(RawResponse(200, "OK", "[]", {{"X-Consul-Index", "1"}}));
         auto fixture = MakeClient(host, peer.base_url());
         CHECK(!fixture.client->IsClosed());
-        fixture.client->Close();
+        (void)fixture.client->Close();
         CHECK(fixture.client->IsClosed());
-        fixture.client->Close(); // 幂等
+
+        /**
+         * 幂等
+         */
+        (void)fixture.client->Close();
         auto registered =
             Await(host, [&] { return bbt_co_await fixture.client->Register(Catalog("after-close", 1234)); });
         CHECK(!registered);
@@ -832,13 +906,13 @@ void CaseWireAndErrors(Host& host)
     }
 }
 
-// ---------------------------------------------------------------- 用例：关闭契约 ---
-
-// Close 的同步收口契约：首个/并发/协程域 Close 都必须等同一真实终态（已封口 +
-// 专属 HTTP Client 已关闭 + 已登记操作全部离开），不提前返回。每个子用例先让真实
-// HTTP 交换停在对端「已完整读出请求、尚未回包」的阶段，再触发 Close：这样
-// 「Close 返回时在飞操作是否已离开」可直接观测，不靠 sleep 猜时序。
-// 子用例各自记录结论、最后统一断言，便于一次运行同时暴露三类缺陷。
+/**
+ * Graceful 的责任排空契约：首个/并发/协程域调用都等待已登记操作离开；
+ * wait_release 另等专属 HTTP Client 真实退役。每个子用例先让真实
+ * HTTP 交换停在对端「已完整读出请求、尚未回包」的阶段，再触发 Close：这样
+ * 「Close 返回时在飞操作是否已离开」可直接观测，不靠 sleep 猜时序。
+ * 子用例各自记录结论、最后统一断言，便于一次运行同时暴露三类缺陷。
+ */
 void CaseCloseContract(Host& host)
 {
     bool all_ok = true;
@@ -852,9 +926,11 @@ void CaseCloseContract(Host& host)
     };
     const auto response = RawResponse(200, "OK", "[]", {{"X-Consul-Index", "7"}});
 
-    // 1) 在途请求关闭：Close 必须等在飞查询离开后才返回。
+    /**
+     * 1) 在途请求关闭：Close 必须等在飞查询离开后才返回。
+     */
     {
-        CannedPeer peer(response, /*hold=*/true);
+        CannedPeer peer(response, true);
         auto fixture = MakeClient(host, peer.base_url(), 3s, 0ms);
         auto& client = *fixture.client;
         std::atomic<long long> op_left_at{0};
@@ -868,12 +944,16 @@ void CaseCloseContract(Host& host)
 
         std::atomic<long long> close_returned_at{0};
         std::thread closer([&] {
-            client.Close();
+            (void)client.Close(
+                bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::seconds{5}));
             close_returned_at.store(NowMs());
         });
         std::this_thread::sleep_for(300ms);
         expect(close_returned_at.load() == 0, "inflight: 300ms 时 Close 未返回");
-        // 累计 1.2s：越过旧实现 min(request_timeout, 1s) 的提前返回点。
+
+        /**
+         * 累计 1.2s：越过旧实现 min(request_timeout, 1s) 的提前返回点。
+         */
         std::this_thread::sleep_for(900ms);
         expect(close_returned_at.load() == 0, "inflight: 1.2s 时仍在等（旧实现此处已提前返回）");
         peer.Release();
@@ -883,13 +963,18 @@ void CaseCloseContract(Host& host)
         const auto sent_at = peer.response_sent_at();
         expect(sent_at != 0, "inflight: 对端确实回过包");
         expect(close_returned_at.load() >= sent_at, "inflight: Close 不早于回包");
-        // 允许调度交接的毫秒级顺序差；旧实现的差距是 1s 等待上限与回包时刻之差。
+
+        /**
+         * 允许调度交接的毫秒级顺序差；旧实现的差距是 1s 等待上限与回包时刻之差。
+         */
         expect(close_returned_at.load() + 50 >= op_left_at.load(), "inflight: Close 不早于操作离开");
     }
 
-    // 2) 并发 Close：所有调用者等同一终态，第二个起不能提前返回。
+    /**
+     * 2) 并发 Close：所有调用者等同一终态，第二个起不能提前返回。
+     */
     {
-        CannedPeer peer(response, /*hold=*/true);
+        CannedPeer peer(response, true);
         auto fixture = MakeClient(host, peer.base_url(), 3s, 0ms);
         auto& client = *fixture.client;
         auto op = host.Submit([&] { return bbt_co_await client.HealthyInstances("ecommerce-catalog"); });
@@ -904,7 +989,8 @@ void CaseCloseContract(Host& host)
         closers.reserve(3);
         for (int i = 0; i < 3; ++i) {
             closers.emplace_back([&client, &returned, i] {
-                client.Close();
+                (void)client.Close(
+                    bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::seconds{5}));
                 returned[i].store(NowMs());
             });
         }
@@ -935,10 +1021,12 @@ void CaseCloseContract(Host& host)
         expect(client.IsClosed(), "concurrent: 收口后 IsClosed");
     }
 
-    // 3) 协程中 Close：必须协作挂起而不是占住 Processer 线程，否则在飞操作没有
-    //    worker 可恢复（两个并发 Close 足以占满本套件的 2 个 Processer）。
+    /**
+     * 3) 协程中 Close：必须协作挂起而不是占住 Processer 线程，否则在飞操作没有
+     * worker 可恢复（两个并发 Close 足以占满本套件的 2 个 Processer）。
+     */
     {
-        CannedPeer peer(response, /*hold=*/true);
+        CannedPeer peer(response, true);
         auto fixture = MakeClient(host, peer.base_url(), 3s, 0ms);
         auto& client = *fixture.client;
         std::atomic<long long> op_left_at{0};
@@ -964,12 +1052,14 @@ void CaseCloseContract(Host& host)
         std::atomic<bool> close_in_coroutine{false};
         auto first = host.Submit([&] {
             close_in_coroutine.store(bbt::coroutine::IsInCoroutineContext());
-            client.Close();
+            (void)client.Close(
+                bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::seconds{5}));
             first_close_at.store(NowMs());
             return true;
         });
         auto second = host.Submit([&] {
-            client.Close();
+            (void)client.Close(
+                bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::seconds{5}));
             second_close_at.store(NowMs());
             return true;
         });
@@ -980,27 +1070,33 @@ void CaseCloseContract(Host& host)
         expect(ticks.load() >= 20, "coroutine: Close 等待期间调度器继续推进其它协程");
         expect(first_close_at.load() == 0 && second_close_at.load() == 0, "coroutine: 两个 Close 均未提前返回");
         peer.Release();
-        // Get 有 5s 界：若 Close 在协程里阻塞等待，两个 worker 会被占满，这里
-        // 有界失败而不是挂住整个测试进程。
+
+        /**
+         * Get 有 5s 界：若 Close 在协程里阻塞等待，两个 worker 会被占满，这里
+         * 有界失败而不是挂住整个测试进程。
+         */
         CHECK(Get(first));
         CHECK(Get(second));
         auto snapshot = Get(op);
         expect(static_cast<bool>(snapshot), "coroutine: 在飞操作正常完成");
         expect(close_in_coroutine.load(), "coroutine: Close 确实在协程上下文内调用");
         const auto sent_at = peer.response_sent_at();
-        expect(first_close_at.load() >= sent_at && second_close_at.load() >= sent_at,
-               "coroutine: 两个 Close 都不早于回包");
+        expect(
+            first_close_at.load() >= sent_at && second_close_at.load() >= sent_at,
+            "coroutine: 两个 Close 都不早于回包");
         expect(first_close_at.load() + 50 >= op_left_at.load(), "coroutine: Close 不早于操作离开");
         stop_ticker.store(true);
         CHECK(Get(ticker));
     }
 
-    // 4) 预取消协程中的 Close：取消位已置位时 CoWaiter 入口即返回 Cancelled、
-    //    Hook_Sleep 也立即返回，不能靠线程 sleep/自旋等待终态。两个预取消 Close
-    //    足以占满本套件的两个 Processer，只有真正让出 worker（bbtco_yield），
-    //    ticker 与在飞操作才能推进，Close 也才能等到真实终态。
+    /**
+     * 4) 预取消协程中的 Close：取消位已置位时 CoWaiter 入口即返回 Cancelled、
+     * Hook_Sleep 也立即返回，不能靠线程 sleep/自旋等待终态。两个预取消 Close
+     * 足以占满本套件的两个 Processer，只有真正让出 worker（bbtco_yield），
+     * ticker 与在飞操作才能推进，Close 也才能等到真实终态。
+     */
     {
-        CannedPeer peer(response, /*hold=*/true);
+        CannedPeer peer(response, true);
         auto fixture = MakeClient(host, peer.base_url(), 3s, 0ms);
         auto& client = *fixture.client;
         std::atomic<long long> op_left_at{0};
@@ -1021,43 +1117,233 @@ void CaseCloseContract(Host& host)
             }
             return true;
         });
-        std::atomic<long long> first_at{0};
-        std::atomic<long long> second_at{0};
+
+        /**
+         * 预取消：统一关闭等待把取消如实映射为 Cancelled（不空转重试、不伪造
+         * 进度）；封口已生效，在途责任仍在，物理收口留给后续 WaitStopped。
+         */
+        std::optional<bbt::infra::result<void>> first_result;
+        std::optional<bbt::infra::result<void>> second_result;
         auto first = host.Submit([&] {
             g_bbt_tls_coroutine_co->RequestCancel();
-            client.Close();
-            first_at.store(NowMs());
+            first_result.emplace(client.Close(
+                bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::seconds{3})));
             return true;
         });
         auto second = host.Submit([&] {
             g_bbt_tls_coroutine_co->RequestCancel();
-            client.Close();
-            second_at.store(NowMs());
+            second_result.emplace(client.Close(
+                bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::seconds{3})));
             return true;
         });
         const auto tick_deadline = std::chrono::steady_clock::now() + 2s;
         while (ticks.load() < 20 && std::chrono::steady_clock::now() < tick_deadline) {
             std::this_thread::sleep_for(5ms);
         }
-        expect(ticks.load() >= 20, "cancel: 预取消 Close 等待期间调度器继续推进其它协程");
-        expect(first_at.load() == 0 && second_at.load() == 0, "cancel: 两个预取消 Close 均未提前返回");
-        peer.Release();
+        expect(ticks.load() >= 20, "cancel: 关闭等待期间调度器继续推进其它协程");
         CHECK(Get(first));
         CHECK(Get(second));
+        expect(first_result.has_value() && second_result.has_value(), "cancel: 两个预取消 Close 都返回");
+        expect(
+            first_result && !*first_result && first_result->error().code == ErrorCode::Cancelled,
+            "cancel: 预取消如实返回 Cancelled");
+        expect(
+            second_result && !*second_result && second_result->error().code == ErrorCode::Cancelled,
+            "cancel: 第二个预取消同样返回 Cancelled");
+        expect(client.IsClosed(), "cancel: 封口已生效");
+        auto still = client.Close(
+            bbt::infra::CloseOptions{
+                bbt::infra::CloseMode::Graceful,
+                true,
+                {},
+                std::chrono::steady_clock::now() + std::chrono::milliseconds{100}});
+        expect(!still && still.error().code == ErrorCode::TimedOut, "cancel: 在途未归零时 WaitStopped TimedOut");
+
+        peer.Release();
         auto snapshot = Get(op);
         expect(static_cast<bool>(snapshot), "cancel: 在飞操作正常完成");
-        const auto sent_at = peer.response_sent_at();
-        expect(first_at.load() >= sent_at && second_at.load() >= sent_at, "cancel: 两个预取消 Close 都不早于回包");
-        expect(first_at.load() + 50 >= op_left_at.load(), "cancel: Close 不早于操作离开");
-        expect(client.IsClosed(), "cancel: 收口后 IsClosed");
+        auto stopped = client.Close(
+            bbt::infra::CloseOptions{
+                bbt::infra::CloseMode::Immediate,
+                true,
+                {},
+                std::chrono::steady_clock::now() + std::chrono::seconds{5}});
+        expect(static_cast<bool>(stopped), "cancel: 归零后物理收口");
         stop_ticker.store(true);
         CHECK(Get(ticker));
     }
 
+    /**
+     * 4) CloseOptions Graceful（native 宿主域）：到期只报 TimedOut 并保留在途责任，
+     * 放行后同对象 Graceful 成功；首因固定；WaitStopped 才是物理凭据。
+     */
+    {
+        CannedPeer peer(response, true);
+        auto fixture = MakeClient(host, peer.base_url(), 3s, 0ms);
+        auto& client = *fixture.client;
+        auto op = host.Submit([&] { return bbt_co_await client.HealthyInstances("ecommerce-catalog"); });
+        CHECK(peer.WaitFirstRequest(5s));
+
+        /**
+         * 需要等待却没有有限绝对期限的两种组合都在副作用前拒绝——不封口、
+         * 无首因；随后的合法关闭仍能工作。
+         */
+        auto unbounded = client.Close(bbt::infra::CloseOptions::Graceful(bbt::coroutine::Deadline::max()));
+        expect(
+            !unbounded && unbounded.error().code == ErrorCode::InvalidArgument,
+            "options: 无期限 Graceful → InvalidArgument");
+        bbt::infra::CloseOptions unbounded_release = bbt::infra::CloseOptions::Immediate();
+        unbounded_release.wait_release = true;
+        auto bad_release = client.Close(unbounded_release);
+        expect(
+            !bad_release && bad_release.error().code == ErrorCode::InvalidArgument,
+            "options: 无期限 wait_release → InvalidArgument");
+        expect(!client.IsClosed() && !client.CloseReason().has_value(), "options: 校验失败不封口");
+
+        const auto begin = NowMs();
+        auto graceful = client.Close(
+            bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::milliseconds{300}));
+        const auto elapsed = NowMs() - begin;
+        expect(!graceful && graceful.error().code == ErrorCode::TimedOut, "options: Graceful 到期 TimedOut");
+        expect(elapsed >= 250, "options: Graceful 确实等满期限");
+        expect(client.IsClosed(), "options: 到期仍封口");
+        expect(client.CloseReason().has_value(), "options: 首因可读");
+        auto still = client.Close(
+            bbt::infra::CloseOptions{
+                bbt::infra::CloseMode::Graceful,
+                true,
+                {},
+                std::chrono::steady_clock::now() + std::chrono::milliseconds{100}});
+        expect(!still && still.error().code == ErrorCode::TimedOut, "options: 在途未归零时 WaitStopped TimedOut");
+
+        peer.Release();
+        auto snapshot = Get(op);
+        expect(static_cast<bool>(snapshot), "options: 在飞操作正常完成");
+
+        /**
+         * wait_release=true：同一 Close 内继续等专属 HTTP Client 连接真实退役。
+         */
+        auto settled_options =
+            bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::seconds{2});
+        settled_options.wait_release = true;
+        auto settled = client.Close(settled_options);
+        expect(static_cast<bool>(settled), "options: 归零后 Graceful+wait_release 成功");
+        auto stopped = client.Close(
+            bbt::infra::CloseOptions{
+                bbt::infra::CloseMode::Immediate,
+                true,
+                {},
+                std::chrono::steady_clock::now() + std::chrono::seconds{5}});
+        expect(static_cast<bool>(stopped), "options: 专属 HTTP Client 物理退役");
+        const auto reason = client.CloseReason();
+        expect(reason.has_value(), "options: 收口后首因仍可读");
+        auto again = client.Close(bbt::infra::CloseOptions::Immediate());
+        expect(static_cast<bool>(again), "options: 幂等再关闭");
+        expect(client.CloseReason().value().message == reason.value().message, "options: 首因不被覆盖");
+    }
+
+    /**
+     * 5) 所有操作的完整请求到达 peer 后才 Immediate：强制关闭专属 HTTP，
+     * 上层只收到关闭终态，迟到的成功不再交付。含 Graceful 超时后的显式升级。
+     */
+    for (int operation = 0; operation != 3; ++operation) {
+        CannedPeer peer(response, true);
+        auto fixture = MakeClient(host, peer.base_url(), 3s, 0ms);
+        auto& client = *fixture.client;
+        auto op = host.Submit([&]() -> result<void> {
+            if (operation == 1)
+                return bbt_co_await client.Register(Catalog("closing", 1234));
+            if (operation == 2)
+                return bbt_co_await client.Deregister("closing");
+            auto snapshot = bbt_co_await client.HealthyInstances("ecommerce-catalog");
+            return snapshot ? result<void>::ok() : result<void>::err(snapshot.error());
+        });
+        CHECK(peer.WaitFirstRequest(5s));
+
+        if (operation == 1) {
+            auto timed = client.Close(bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now()));
+            expect(!timed && timed.error().code == ErrorCode::TimedOut, "options: upgrade retains pending operation");
+        }
+        const auto begin = NowMs();
+        auto immediate = client.Close(bbt::infra::CloseOptions::Immediate());
+        const auto elapsed = NowMs() - begin;
+        expect(static_cast<bool>(immediate), "options: Immediate 成功");
+        expect(elapsed < 500, "options: Immediate 不等回包");
+        expect(client.IsClosed(), "options: Immediate 后即封口");
+
+        /**
+         * 封口后新操作被拒（首因附在错误上）。
+         */
+        auto rejected = Await(host, [&] { return bbt_co_await client.HealthyInstances("ecommerce-catalog"); });
+        expect(!rejected && rejected.error().code == ErrorCode::Closed, "options: 封口后不再接纳");
+
+        /**
+         * peer 尚未回包，HTTP 关闭必须主动打断 await；随后才放行迟到成功。
+         */
+        auto snapshot = Get(op);
+        expect(
+            !snapshot && snapshot.error().code == ErrorCode::Closed, "options: Immediate suppresses inflight success");
+        const auto first_reason = client.CloseReason();
+        CHECK(client.Close(bbt::infra::CloseOptions::Immediate(MakeError(ErrorCode::Unavailable, "later close"))));
+        expect(first_reason && client.CloseReason()->message == first_reason->message, "options: first cause retained");
+        peer.Release();
+        auto stopped = client.Close(
+            bbt::infra::CloseOptions{
+                bbt::infra::CloseMode::Immediate,
+                true,
+                {},
+                std::chrono::steady_clock::now() + std::chrono::seconds{5}});
+        expect(static_cast<bool>(stopped), "options: Immediate 后物理收口可达");
+    }
+
+    /**
+     * 响应已完整返回，候选结果已产生但尚未交付。屏障固定这个窗口，
+     * 证明 Immediate 不仅抑制成功，也覆盖状态、index、JSON 和实例错误。
+     */
+    const std::vector<std::string> delivery_responses{
+        RawResponse(500, "Internal Server Error", "boom"),
+        RawResponse(200, "OK", "[]"),
+        RawResponse(200, "OK", "[]", {{"X-Consul-Index", "invalid"}}),
+        RawResponse(200, "OK", "not-json", {{"X-Consul-Index", "7"}}),
+        RawResponse(200, "OK", "{}", {{"X-Consul-Index", "7"}}),
+        RawResponse(200, "OK", "[false]", {{"X-Consul-Index", "7"}}),
+        RawResponse(200, "OK", R"([{"Service":{"ID":"c","Port":0}}])", {{"X-Consul-Index", "7"}}),
+        RawResponse(200, "OK", "[]", {{"X-Consul-Index", "7"}}),
+    };
+    for (const auto& wire_response : delivery_responses) {
+        CannedPeer peer(wire_response);
+        auto fixture = MakeClient(host, peer.base_url(), 3s, 0ms);
+        auto& client = *fixture.client;
+        auto pause = consul::ClientTestAccess::PauseHealthDelivery(client);
+        auto op = host.Submit([&] { return bbt_co_await client.HealthyInstances("s"); });
+        CHECK(WaitUntil([&] { return pause->reached.load(std::memory_order_acquire); }, 5s));
+        CHECK(op.wait_for(0ms) != std::future_status::ready);
+
+        const auto first = MakeError(ErrorCode::Unavailable, "health delivery first close");
+        auto graceful = client.Close(bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now(), first));
+        CHECK(!graceful && graceful.error().code == ErrorCode::TimedOut);
+        CHECK(client.Close(bbt::infra::CloseOptions::Immediate(MakeError(ErrorCode::Closed, "later immediate"))));
+        CHECK(client.CloseReason()->code == first.code);
+        CHECK(client.CloseReason()->message == first.message);
+        CHECK(op.wait_for(0ms) != std::future_status::ready);
+        auto release = bbt::infra::CloseOptions::Immediate();
+        release.wait_release = true;
+        release.deadline = std::chrono::steady_clock::now();
+        auto pending = client.Close(release);
+        CHECK(!pending && pending.error().code == ErrorCode::TimedOut);
+
+        pause->resume->Notify();
+        auto snapshot = Get(op);
+        CHECK(!snapshot);
+        CHECK(snapshot.error().code == first.code);
+        CHECK(snapshot.error().message == first.message);
+        release.deadline = std::chrono::steady_clock::now() + 5s;
+        CHECK(client.Close(release));
+        std::cout << "health delivery: response parsed, Immediate retained first cause, physical close complete\n";
+    }
+
     CHECK(all_ok);
 }
-
-// ---------------------------------------------------------------- 用例：真后端 ---
 
 bool WaitReady(Host& host, consul::Client& client)
 {
@@ -1079,9 +1365,11 @@ bool WaitReady(Host& host, consul::Client& client)
     return false;
 }
 
-// 有限轮询取快照：轮询只是等待 agent 视图收敛，不是用固定 sleep 冒充同步。
-consul::ServiceSnapshot WaitForCount(Host& host, consul::Client& client, const std::string& service,
-                                     std::size_t expected, milliseconds timeout = 5s)
+/**
+ * 有限轮询取快照：轮询只是等待 agent 视图收敛，不是用固定 sleep 冒充同步。
+ */
+consul::ServiceSnapshot WaitForCount(
+    Host& host, consul::Client& client, const std::string& service, std::size_t expected, milliseconds timeout = 5s)
 {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     consul::ServiceSnapshot last;
@@ -1104,8 +1392,10 @@ consul::ServiceSnapshot WaitForCount(Host& host, consul::Client& client, const s
 void CaseLive(Host& host, const std::string& binary)
 {
     const auto root = std::filesystem::temp_directory_path() / ("bbt-consul-live-" + std::to_string(::getpid()));
+
     struct Cleanup {
         std::filesystem::path path;
+
         ~Cleanup()
         {
             std::error_code ec;
@@ -1121,7 +1411,11 @@ void CaseLive(Host& host, const std::string& binary)
     ListenSocket catalog_a;
     ListenSocket catalog_b;
     ListenSocket catalog_c;
-    const int dead_port = FreeTcpPort(); // 无监听者 → TCP check 必 critical
+
+    /**
+     * 无监听者 → TCP check 必 critical
+     */
+    const int dead_port = FreeTcpPort();
 
     {
         auto fixture = MakeClient(host, "http://127.0.0.1:" + std::to_string(agent.http_port()), 3s, 1s);
@@ -1133,7 +1427,9 @@ void CaseLive(Host& host, const std::string& binary)
         }
         CHECK(ready);
 
-        // 三实例：两个端口真实可达，一个端口不可达（用于健康过滤证据）。
+        /**
+         * 三实例：两个端口真实可达，一个端口不可达（用于健康过滤证据）。
+         */
         CHECK(Await(host, [&] {
             return bbt_co_await client.Register(
                 Catalog("catalog-1-" + std::to_string(::getpid()) + "-a", catalog_a.port()));
@@ -1147,8 +1443,10 @@ void CaseLive(Host& host, const std::string& binary)
                 Catalog("catalog-3-" + std::to_string(::getpid()) + "-c", static_cast<std::uint16_t>(dead_port)));
         }));
 
-        // 刚注册时 TCP check 还没首探，passing 视图可以合法为空——这次即时查询
-        // 是「注册 ≠ 健康」的证据，不拿它做断言（时序取决于 agent 首探）。
+        /**
+         * 刚注册时 TCP check 还没首探，passing 视图可以合法为空——这次即时查询
+         * 是「注册 ≠ 健康」的证据，不拿它做断言（时序取决于 agent 首探）。
+         */
         long long immediate_elapsed = 0;
         auto immediate =
             Await(host, [&] { return bbt_co_await client.HealthyInstances("ecommerce-catalog"); }, &immediate_elapsed);
@@ -1157,8 +1455,10 @@ void CaseLive(Host& host, const std::string& binary)
         std::cout << "live immediate_query index=" << immediate.value().index
                   << " instances=" << immediate.value().instances.size() << " elapsed_ms=" << immediate_elapsed << "\n";
 
-        // 等真实 TCP check 通过：只有端口可达的两个实例能进入 passing 视图，
-        // 端口不可达的 catalog-3 必须始终缺席（健康过滤证据）。
+        /**
+         * 等真实 TCP check 通过：只有端口可达的两个实例能进入 passing 视图，
+         * 端口不可达的 catalog-3 必须始终缺席（健康过滤证据）。
+         */
         auto first = WaitForCount(host, client, "ecommerce-catalog", 2, 10s);
         const std::uint64_t index0 = first.index;
         CHECK(index0 >= immediate.value().index);
@@ -1169,7 +1469,9 @@ void CaseLive(Host& host, const std::string& binary)
         }
         std::cout << "live healthy_view index=" << index0 << " instances=" << first.instances.size() << "\n";
 
-        // 阻塞查询：同 index 重问应停住约 wait 而不是立即返回，且视图不变。
+        /**
+         * 阻塞查询：同 index 重问应停住约 wait 而不是立即返回，且视图不变。
+         */
         long long blocking_elapsed = 0;
         auto blocked = Await(
             host, [&] { return bbt_co_await client.HealthyInstances("ecommerce-catalog", index0); }, &blocking_elapsed);
@@ -1180,7 +1482,9 @@ void CaseLive(Host& host, const std::string& binary)
         std::cout << "live blocking_query index=" << blocked.value().index << " elapsed_ms=" << blocking_elapsed
                   << "\n";
 
-        // 扩容：新增实例后视图从 2 变 3，index 前进（不是每轮都刷新）。
+        /**
+         * 扩容：新增实例后视图从 2 变 3，index 前进（不是每轮都刷新）。
+         */
         const std::uint64_t index1 = blocked.value().index;
         CHECK(Await(host, [&] {
             return bbt_co_await client.Register(
@@ -1190,41 +1494,49 @@ void CaseLive(Host& host, const std::string& binary)
         CHECK(grown.index > index1);
         std::cout << "live after_register index=" << grown.index << " instances=" << grown.instances.size() << "\n";
 
-        // 退出：注销一个实例后不再出现在 passing 视图里。
-        CHECK(Await(host,
-                    [&] { return bbt_co_await client.Deregister("catalog-1-" + std::to_string(::getpid()) + "-a"); }));
+        /**
+         * 退出：注销一个实例后不再出现在 passing 视图里。
+         */
+        CHECK(Await(
+            host, [&] { return bbt_co_await client.Deregister("catalog-1-" + std::to_string(::getpid()) + "-a"); }));
         auto shrunk = WaitForCount(host, client, "ecommerce-catalog", 2);
         CHECK(shrunk.index > grown.index);
         CHECK(IdsOf(shrunk).count("catalog-1-" + std::to_string(::getpid()) + "-a") == 0);
         std::cout << "live after_deregister index=" << shrunk.index << " instances=" << shrunk.instances.size() << "\n";
 
-        // 空视图：全部注销后是合法空列表，不是错误也不保留旧实例。
-        CHECK(Await(host,
-                    [&] { return bbt_co_await client.Deregister("catalog-2-" + std::to_string(::getpid()) + "-b"); }));
-        CHECK(Await(host,
-                    [&] { return bbt_co_await client.Deregister("catalog-3-" + std::to_string(::getpid()) + "-c"); }));
-        CHECK(Await(host,
-                    [&] { return bbt_co_await client.Deregister("catalog-4-" + std::to_string(::getpid()) + "-d"); }));
+        /**
+         * 空视图：全部注销后是合法空列表，不是错误也不保留旧实例。
+         */
+        CHECK(Await(
+            host, [&] { return bbt_co_await client.Deregister("catalog-2-" + std::to_string(::getpid()) + "-b"); }));
+        CHECK(Await(
+            host, [&] { return bbt_co_await client.Deregister("catalog-3-" + std::to_string(::getpid()) + "-c"); }));
+        CHECK(Await(
+            host, [&] { return bbt_co_await client.Deregister("catalog-4-" + std::to_string(::getpid()) + "-d"); }));
         auto empty = WaitForCount(host, client, "ecommerce-catalog", 0);
         CHECK(empty.index > shrunk.index);
         std::cout << "live empty_view index=" << empty.index << " instances=0\n";
 
-        // 幂等注销 + 未知服务查询。
-        CHECK(Await(host,
-                    [&] { return bbt_co_await client.Deregister("catalog-2-" + std::to_string(::getpid()) + "-b"); }));
+        /**
+         * 幂等注销 + 未知服务查询。
+         */
+        CHECK(Await(
+            host, [&] { return bbt_co_await client.Deregister("catalog-2-" + std::to_string(::getpid()) + "-b"); }));
         auto unknown = Await(host, [&] { return bbt_co_await client.HealthyInstances("no-such-service"); });
         CHECK(unknown);
         CHECK(unknown.value().instances.empty());
         CHECK(unknown.value().index >= 1);
 
-        client.Close();
+        (void)client.Close();
         CHECK(client.IsClosed());
         auto after_close = Await(host, [&] { return bbt_co_await client.Register(Catalog("after-close-live", 1234)); });
         CHECK(!after_close);
         CHECK(after_close.error().code == ErrorCode::Closed);
     }
 
-    // 真实后端退出：有限期限内明确失败，不无限重试。
+    /**
+     * 真实后端退出：有限期限内明确失败，不无限重试。
+     */
     agent.Stop();
     CHECK(!agent.Alive());
     {
@@ -1237,11 +1549,9 @@ void CaseLive(Host& host, const std::string& binary)
         CHECK(elapsed < 2000);
         std::cout << "live after_stop elapsed_ms=" << elapsed << " code=" << static_cast<int>(query.error().code)
                   << "\n";
-        fixture.client->Close();
+        (void)fixture.client->Close();
     }
 }
-
-// ---------------------------------------------------------------- 入口 ---
 
 int Run(int argc, char** argv)
 {
@@ -1260,7 +1570,10 @@ int Run(int argc, char** argv)
     g_bbt_coroutine_config->m_cfg_processer_auto_scale = false;
     g_scheduler->Start();
     {
-        // 延迟初始化后的稳定基线（对齐 http_net/redis_net 夹具的做法）。
+
+        /**
+         * 延迟初始化后的稳定基线（对齐 http_net/redis_net 夹具的做法）。
+         */
         Host warm;
         CHECK(warm.Call([] {
             CoSleep(5ms);
@@ -1297,7 +1610,9 @@ int Run(int argc, char** argv)
     return 0;
 }
 
-} // namespace
+// clang-format off
+}
+// clang-format on
 
 int main(int argc, char** argv)
 {

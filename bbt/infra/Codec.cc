@@ -30,4 +30,6 @@ result<std::string> Codec<std::string>::Decode(const std::vector<std::uint8_t>& 
     return result<std::string>::ok(std::move(value));
 }
 
-} // namespace bbt::infra
+// clang-format off
+}
+// clang-format on

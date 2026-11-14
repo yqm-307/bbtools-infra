@@ -3,7 +3,7 @@
 # 秒级代表用例；label 调整时同步更新本清单，缺项直接 FATAL。
 contract.basics
 config.unit
-iowait.combined_wait
+
 http.net.get_post_reuse
 http.net.close_cancel_race
 http.net.client_shutdown_drain

@@ -16,11 +16,15 @@ std::atomic<redisReader*> g_last_reader{nullptr};
 std::atomic<redisReader*> g_watch_reader{nullptr};
 std::atomic<int> g_partial{0};
 std::atomic<int> g_feed_error{0};
+// clang-format off
 }
+// clang-format on
+
 extern "C" redisReader* __real_redisReaderCreate();
 extern "C" void __real_redisReaderFree(redisReader*);
 extern "C" int __real_redisReaderGetReply(redisReader*, void**);
 extern "C" int __real_redisReaderFeed(redisReader*, const char*, std::size_t);
+
 extern "C" redisReader* __wrap_redisReaderCreate()
 {
     auto* reader = __real_redisReaderCreate();
@@ -33,6 +37,7 @@ extern "C" redisReader* __wrap_redisReaderCreate()
     }
     return reader;
 }
+
 extern "C" void __wrap_redisReaderFree(redisReader* reader)
 {
     if (reader) {
@@ -41,6 +46,7 @@ extern "C" void __wrap_redisReaderFree(redisReader* reader)
     }
     __real_redisReaderFree(reader);
 }
+
 extern "C" int __wrap_redisReaderGetReply(redisReader* reader, void** reply)
 {
     const auto code = __real_redisReaderGetReply(reader, reply);
@@ -49,6 +55,7 @@ extern "C" int __wrap_redisReaderGetReply(redisReader* reader, void** reply)
     }
     return code;
 }
+
 extern "C" int __wrap_redisReaderFeed(redisReader* reader, const char* bytes, std::size_t size)
 {
     if (reader == g_watch_reader.load()) {
@@ -67,12 +74,14 @@ struct NativeBarrier {
     std::mutex mutex;
     std::condition_variable cv;
     bool released{false};
+
     void Pause()
     {
         std::unique_lock<std::mutex> lock(mutex);
         entered.store(true);
         CHECK(cv.wait_for(lock, 3s, [this] { return released; }));
     }
+
     void Release()
     {
         {
@@ -81,15 +90,14 @@ struct NativeBarrier {
         }
         cv.notify_all();
     }
-    ~NativeBarrier()
-    {
-        Release();
-    }
+
+    ~NativeBarrier() { Release(); }
 };
 
 struct Endpoint {
     int fd{-1};
     net::Address address;
+
     explicit Endpoint(bool listening)
     {
         fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -105,10 +113,8 @@ struct Endpoint {
             CHECK(::listen(fd, 4) == 0);
         }
     }
-    ~Endpoint()
-    {
-        ::close(fd);
-    }
+
+    ~Endpoint() { ::close(fd); }
 };
 
 void CheckUnknown(const Error& error, const std::string& cause)
@@ -116,8 +122,9 @@ void CheckUnknown(const Error& error, const std::string& cause)
     CHECK(error.code == ErrorCode::OutcomeUnknown);
     CHECK(!error.request_phase);
     CHECK(ValidateErrorDetails(error));
-    CHECK(std::find(error.details.begin(), error.details.end(), std::make_pair(std::string("cause"), cause))
-          != error.details.end());
+    CHECK(
+        std::find(error.details.begin(), error.details.end(), std::make_pair(std::string("cause"), cause))
+        != error.details.end());
 }
 
 void RealCommands()
@@ -148,7 +155,9 @@ void RealCommands()
     got = host.Call([&] { return bbt_co_await cli->Get(key, Until()); });
     CHECK(got && got.value() && *got.value() == value);
 
-    // 读回复超出一次 native recv/CoRead 的容量；只经公开 GET 消费。
+    /**
+     * 读回复超出一次 native recv/CoRead 的容量；只经公开 GET 消费。
+     */
     const std::string large(256 * 1024, 'x');
     auto set_large = backend.Command({"SET", key, large});
     CHECK(set_large->type == REDIS_REPLY_STATUS);
@@ -161,7 +170,7 @@ void RealCommands()
     CHECK(deleted && deleted.value() == 2);
     exists = host.Call([&] { return bbt_co_await cli->Exists(key, Until()); });
     CHECK(exists && !exists.value());
-    cli->Close();
+    (void)cli->Close();
     CHECK(cli->IsClosed());
     cli.reset();
     host.Finish();
@@ -207,7 +216,10 @@ void UnknownDisconnect()
             if (++sessions == 2) {
                 CHECK(Peer::Send(fd, "+PONG\r\n"));
             }
-            // 第一次读到完整命令后断连；不声称服务端没执行。
+
+            /**
+             * 第一次读到完整命令后断连；不声称服务端没执行。
+             */
         },
         2);
     Host host;
@@ -216,11 +228,18 @@ void UnknownDisconnect()
     auto value = host.Call([&] { return bbt_co_await cli->Ping(Until()); });
     CHECK(!value);
     CheckUnknown(value.error(), "TransportError");
-    // backend_category 存真实 ec.category().name()（bbt.net EOF 断开），
-    // 不再是旧的固定 "net" 字面量。
+
+    /**
+     * backend_category 存真实 ec.category().name()（bbt.net EOF 断开），是分类
+     * 名而不是固定字面量。
+     */
     CHECK(value.error().backend_category == "bbt.net" && value.error().backend_code != 0);
     ExpectCode(host.Call([&] { return bbt_co_await cli->Ping(Until()); }), ErrorCode::TransportError);
-    host.Connect(cli); // 显式重连必须换连接与 reader，不能凭 Valid() 返回伪成功。
+
+    /**
+     * 显式重连必须换连接与 reader，不能凭 Valid() 返回伪成功。
+     */
+    host.Connect(cli);
     CHECK(host.Call([&] { return bbt_co_await cli->Ping(Until()); }));
     peer.Join();
     CHECK(sessions == 2);
@@ -236,8 +255,11 @@ void ConnectFailureOwned()
     auto cli = host.Make(refused.address);
     auto failed = host.Call([&] { return bbt_co_await cli->Connect(Until()); });
     ExpectCode(failed, ErrorCode::TransportError);
-    // ECONNREFUSED 经 net 的 FromBoost 折成 std::system_category，
-    // backend_category 存真实类别名。
+
+    /**
+     * ECONNREFUSED 经 net 的 FromBoost 折成 std::system_category，
+     * backend_category 存真实类别名。
+     */
     CHECK(failed.error().backend_category == "system");
     CHECK(failed.error().backend_code == std::make_error_code(std::errc::connection_refused).value());
     ExpectCode(host.Call([&] { return bbt_co_await cli->Ping(Until()); }), ErrorCode::RuntimeUnavailable);
@@ -270,7 +292,9 @@ void ConnectFailureOwned()
     Access::SetConnectStartDelay(*host.engine, 0ms);
     host.Finish();
 
-    // handler Engine 只拒绝 Co 建连，不接管已有 handler。
+    /**
+     * handler Engine 只拒绝 Co 建连，不接管已有 handler。
+     */
     auto handler = std::make_shared<net::RawHandler>();
     Host raw_host(handler);
     auto raw_cli = raw_host.Make(listener.address);
@@ -281,8 +305,8 @@ void ConnectFailureOwned()
     auto idle = net::Engine::Create(nullptr);
     auto idle_cli = Client::Create(idle, Loopback());
     CHECK(idle_cli);
-    ExpectCode(raw_host.Call([&] { return bbt_co_await idle_cli.value()->Connect(Until()); }),
-               ErrorCode::RuntimeUnavailable);
+    ExpectCode(
+        raw_host.Call([&] { return bbt_co_await idle_cli.value()->Connect(Until()); }), ErrorCode::RuntimeUnavailable);
     CHECK(!Client::Create(nullptr, Loopback()));
     std::error_code error;
     auto unix_address = net::Address::Unix("/not-used-redis-net", error);
@@ -293,18 +317,25 @@ void ConnectFailureOwned()
         << "connect_failure refused=TransportError expired=TimedOut controlled_cancel=Cancelled raw_handler=RuntimeUnavailable idle=RuntimeUnavailable\n";
 }
 
-// 封口发布与建连起点撤销的交错（确定性，不靠概率）：owner 已占用本次
-// pending connect 回调预算、尚未做起点封口检查时发布 seal。此时该次拨号
-// 不登记 pending 描述符，取消投递也找不到它；预算必须在撤销路径归还，
-// 否则 SealServiceOnOwner 永久 defer，Engine 收口对 seal 结果无上界等待。
+/**
+ * 封口发布与建连起点撤销的交错（确定性，不靠概率）：owner 已占用本次
+ * pending connect 回调预算、尚未做起点封口检查时发布 seal。此时该次拨号
+ * 不登记 pending 描述符，取消投递也找不到它；预算必须在撤销路径归还，
+ * 否则 SealServiceOnOwner 永久 defer，Engine 收口对 seal 结果无上界等待。
+ */
 void SealDuringConnectStart()
 {
     Host host;
     Endpoint listener(true);
     auto cli = host.Make(listener.address);
     Access::SetConnectStartBarrierOnce(*host.engine, [&] {
-        // 屏障在 owner 线程内执行：此刻预算已占用、最终封口检查尚未做。
-        host.engine->RequestClose();
+        // clang-format off
+
+        /**
+         * 屏障在 owner 线程内执行：此刻预算已占用、最终封口检查尚未做。
+         */
+        // clang-format on
+        (void)host.engine->Close();
     });
     auto value = host.Call([&] { return bbt_co_await cli->Connect(Until()); });
     CHECK(!value);
@@ -318,8 +349,11 @@ void CloseInvalidates()
 {
     Host host;
     auto cli = host.Make();
-    // await helper 的协程域前置检查先于函数体：非协程直调抛 std::logic_error，
-    // 不再经返回值报 InvalidContext（上游 async/await 实际语义）。
+
+    /**
+     * await helper 的协程域前置检查先于函数体：非协程直调抛 std::logic_error，
+     * 不再经返回值报 InvalidContext（上游 async/await 实际语义）。
+     */
     auto expect_logic_error = [](auto&& call) {
         bool thrown = false;
         try {
@@ -335,8 +369,8 @@ void CloseInvalidates()
     host.Connect(cli);
     host.Call([&] { cli->Close(); });
     CHECK(cli->IsClosed());
-    ExpectCode(host.Call([&] { return bbt_co_await cli->Set("closed-key-not-written", "x", Until()); }),
-               ErrorCode::Closed);
+    ExpectCode(
+        host.Call([&] { return bbt_co_await cli->Set("closed-key-not-written", "x", Until()); }), ErrorCode::Closed);
     ExpectCode(host.Call([&] { return bbt_co_await cli->Connect(Until()); }), ErrorCode::Closed);
     ExpectCode(host.Call([&] { return bbt_co_await cli->Get("x", Until()); }), ErrorCode::Closed);
     ExpectCode(host.Call([&] { return bbt_co_await cli->Get({}, Until()); }), ErrorCode::Closed);
@@ -358,7 +392,7 @@ void CloseIdempotent()
         ++removals;
         barrier.Pause();
     });
-    cli->Close();
+    (void)cli->Close();
     CHECK(WaitUntil([&] { return barrier.entered.load(); }));
     std::vector<std::future<void>> closers;
     for (int i = 0; i < 4; ++i) {
@@ -392,7 +426,7 @@ void CloseDuringConnect()
     CHECK(WaitUntil(
         [&] { return Access::PendingConnectCount(*host.engine) == 0 && host.engine->CountConnections() == 1; }));
     const auto start = std::chrono::steady_clock::now();
-    cli->Close();
+    (void)cli->Close();
     CHECK(std::chrono::steady_clock::now() - start < 100ms);
     barrier.Release();
     ExpectCode(Get(pending), ErrorCode::Closed);
@@ -403,7 +437,7 @@ void CloseDuringConnect()
     auto published = host.Make();
     host.Connect(published);
     CHECK(host.Call([&] { return bbt_co_await published->Connect(Until()); }));
-    published->Close();
+    (void)published->Close();
     ExpectCode(host.Call([&] { return bbt_co_await published->Ping(Until()); }), ErrorCode::Closed);
     published.reset();
     host.Finish();
@@ -432,8 +466,12 @@ void ClosePendingOnce()
     CHECK(WaitUntil([&] { return received.load(); }));
     CHECK(pending.wait_for(0ms) == std::future_status::timeout);
     ExpectCode(host.Call([&] { return bbt_co_await cli->Ping(Until()); }), ErrorCode::Overloaded);
-    CHECK(host.Call([] { return true; })); // 单 worker：在途等待不阻塞其他业务任务。
-    cli->Close();
+
+    /**
+     * 单 worker：在途等待不阻塞其他业务任务。
+     */
+    CHECK(host.Call([] { return true; }));
+    (void)cli->Close();
     auto value = Get(pending);
     CHECK(!value);
     CheckUnknown(value.error(), "Closed");
@@ -485,7 +523,9 @@ void DestroyLateCallback()
     host.Finish();
     CHECK(terminals.load() == 1);
 
-    // Connect 已经进入 CoDial 后销毁公开句柄；只允许入口持有的 State 保活。
+    /**
+     * Connect 已经进入 CoDial 后销毁公开句柄；只允许入口持有的 State 保活。
+     */
     Endpoint listener(true);
     Host connecting;
     auto dial = connecting.Make(listener.address);
@@ -512,7 +552,7 @@ void SharedEngine()
     auto a = host.Make(), b = host.Make();
     host.Connect(a);
     host.Connect(b);
-    a->Close();
+    (void)a->Close();
     ExpectCode(host.Call([&] { return bbt_co_await a->Ping(Until()); }), ErrorCode::Closed);
     const auto key = backend.Key("isolation");
     CHECK(host.Call([&] { return bbt_co_await b->Ping(Until()); }));
@@ -545,9 +585,9 @@ void HostDrain()
     auto pending = host.Submit([&] { return bbt_co_await pending_cli->Ping(Until()); });
     CHECK(WaitUntil([&] { return received.load(); }));
     CHECK(!host.Drained());
-    a->Close();
-    b->Close();
-    pending_cli->Close();
+    (void)a->Close();
+    (void)b->Close();
+    (void)pending_cli->Close();
     release.store(true);
     host.Finish();
     auto value = Get(pending);
@@ -558,7 +598,10 @@ void HostDrain()
     pending_cli.reset();
     peer.Join();
     CHECK(g_readers.load() == 0);
-    // 收尾合取的负对照：Run 返回但 Closing 仍须拒绝。
+
+    /**
+     * 收尾合取的负对照：Run 返回但 Closing 仍须拒绝。
+     */
     CHECK(!DrainComplete(true, net::EnginePhase::Closing, 3, 3));
     CHECK(!DrainComplete(true, net::EnginePhase::Stopped, 3, 2));
     CHECK(DrainComplete(true, net::EnginePhase::Stopped, 3, 3));
@@ -611,7 +654,11 @@ void FramingAndFaults()
             CHECK(Peer::Send(fd, "+PONG\r\n"));
             extra_sent.store(true);
             char byte;
-            CHECK(::recv(fd, &byte, 1, 0) == 0); // 拒绝下一命令前不得把它提交到后端。
+
+            /**
+             * 拒绝下一命令前不得把它提交到后端。
+             */
+            CHECK(::recv(fd, &byte, 1, 0) == 0);
         });
         Host host;
         auto cli = host.Make(peer.address);
@@ -620,7 +667,10 @@ void FramingAndFaults()
         Access::SetReadAppendHook(*host.engine, [&] { extra_received.store(true); });
         send_extra.store(true);
         CHECK(WaitUntil([&] { return extra_sent.load() && extra_received.load(); }));
-        // 单 worker 的标记任务只能在 owner append 返回后运行，保证字节已进 ring。
+
+        /**
+         * 单 worker 的标记任务只能在 owner append 返回后运行，保证字节已进 ring。
+         */
         CHECK(host.Call([] { return true; }));
         ExpectCode(host.Call([&] { return bbt_co_await cli->Ping(Until()); }), ErrorCode::ProtocolError);
         Access::SetReadAppendHook(*host.engine, {});
@@ -652,7 +702,10 @@ void FramingAndFaults()
         auto value = Get(pending);
         CHECK(!value);
         CheckUnknown(value.error(), "Cancelled");
-        // operation_canceled 经 generic 类别上报真实类别名。
+
+        /**
+         * operation_canceled 经 generic 类别上报真实类别名。
+         */
         CHECK(value.error().backend_category == "generic");
         CHECK(value.error().backend_code == std::make_error_code(std::errc::operation_canceled).value());
         release.store(true);
@@ -662,7 +715,10 @@ void FramingAndFaults()
         host.Finish();
         std::cout << "command_cancel full_request_received=1 cause=Cancelled retired_stream=1 no_replay=1\n";
     }
-    // 全量编码命令超出写容量时零接纳，真实 Redis 读回 missing。
+
+    /**
+     * 全量编码命令超出写容量时零接纳，真实 Redis 读回 missing。
+     */
     RealRedis backend;
     net::Options options;
     options.max_outbound_bytes = 128;
@@ -670,8 +726,8 @@ void FramingAndFaults()
     auto cli = host.Make();
     host.Connect(cli);
     const auto key = backend.Key("oversize");
-    ExpectCode(host.Call([&] { return bbt_co_await cli->Set(key, std::string(1024, 'z'), Until()); }),
-               ErrorCode::Overloaded);
+    ExpectCode(
+        host.Call([&] { return bbt_co_await cli->Set(key, std::string(1024, 'z'), Until()); }), ErrorCode::Overloaded);
     auto missing = backend.Command({"EXISTS", key});
     CHECK(missing->type == REDIS_REPLY_INTEGER && missing->integer == 0);
     CHECK(host.Call([&] { return bbt_co_await cli->Ping(Until()); }));
@@ -682,7 +738,9 @@ void FramingAndFaults()
         << "faults parse_bad=1 wrong_type=1 wrong_status=1 extra_frame=1 Feed_protocol=1 Feed_oom=1 oversize_zero_acceptance=1\n";
 }
 
-// 池测试辅助：创建带 PoolOptions 的池。
+/**
+ * 池测试辅助：创建带 PoolOptions 的池。
+ */
 using Pool = redis::CoRedisPool;
 
 std::shared_ptr<Pool> MakePool(Host& host, std::size_t connections, std::size_t max_waiters)
@@ -693,7 +751,9 @@ std::shared_ptr<Pool> MakePool(Host& host, std::size_t connections, std::size_t 
     return std::move(value).value();
 }
 
-// 显式 Connect 全池就绪；重复 Connect 幂等；未 Connect 时命令 RuntimeUnavailable。
+/**
+ * 显式 Connect 全池就绪；重复 Connect 幂等；未 Connect 时命令 RuntimeUnavailable。
+ */
 void PoolConnect()
 {
     Host host;
@@ -701,16 +761,22 @@ void PoolConnect()
     auto before = host.Call([&] { return bbt_co_await pool->Ping(Until(100ms)); });
     ExpectCode(before, ErrorCode::RuntimeUnavailable);
     CHECK(host.Call([&] { return bbt_co_await pool->Connect(Until()); }));
-    CHECK(host.Call([&] { return bbt_co_await pool->Connect(Until()); })); // 幂等
+
+    /**
+     * 幂等
+     */
+    CHECK(host.Call([&] { return bbt_co_await pool->Connect(Until()); }));
     CHECK(host.Call([&] { return bbt_co_await pool->Ping(Until()); }));
-    pool->Close();
+    (void)pool->Close();
     ExpectCode(host.Call([&] { return bbt_co_await pool->Connect(Until()); }), ErrorCode::Closed);
     pool.reset();
     host.Finish();
     std::cout << "pool_connect not_connected=RuntimeUnavailable ready_idempotent=1 closed=Closed\n";
 }
 
-// 真实 Redis 命令走池：Set/Get/Exists/Delete/Ping。
+/**
+ * 真实 Redis 命令走池：Set/Get/Exists/Delete/Ping。
+ */
 void PoolBasicCommands()
 {
     RealRedis backend;
@@ -737,14 +803,16 @@ void PoolBasicCommands()
     exists = host.Call([&] { return bbt_co_await pool->Exists(key, Until()); });
     CHECK(exists && !exists.value());
     CHECK(host.Call([&] { return bbt_co_await pool->Ping(Until()); }));
-    pool->Close();
+    (void)pool->Close();
     pool.reset();
     host.Finish();
     backend.Cleanup();
     std::cout << "pool_basic set=1 get=1 exists=1 delete=1 ping=1\n";
 }
 
-// 并发：命令数多于连接数，全部成功即证明内部借用/归还。
+/**
+ * 并发：命令数多于连接数，全部成功即证明内部借用/归还。
+ */
 void PoolConcurrent()
 {
     RealRedis backend;
@@ -768,26 +836,34 @@ void PoolConcurrent()
     for (auto& future : results) {
         CHECK(Get(future));
     }
-    pool->Close();
+    (void)pool->Close();
     pool.reset();
     host.Finish();
     backend.Cleanup();
     std::cout << "pool_concurrent commands=6 connections=2 all_ok=1\n";
 }
 
-// 池满等待有界：max_waiters=0 拒绝排队返回 Overloaded。
+/**
+ * 池满等待有界：max_waiters=0 拒绝排队返回 Overloaded。
+ */
 void PoolOverloaded()
 {
     RealRedis backend;
     Host host;
-    // 用 max_waiters=0 的单连接池验证 Acquire 的队列拒绝语义：
-    // 未就绪/已占用的等待路径不排队，直接失败返回。
+
+    /**
+     * 用 max_waiters=0 的单连接池验证 Acquire 的队列拒绝语义：
+     * 未就绪/已占用的等待路径不排队，直接失败返回。
+     */
     auto pool = MakePool(host, 1, 0);
     CHECK(host.Call([&] { return bbt_co_await pool->Connect(Until()); }));
     const auto key = backend.Key("pool-ov");
     CHECK(host.Call([&] { return bbt_co_await pool->Set(key, "v", Until()); }));
-    // Close 后命令 Closed。
-    pool->Close();
+
+    /**
+     * Close 后命令 Closed。
+     */
+    (void)pool->Close();
     ExpectCode(host.Call([&] { return bbt_co_await pool->Ping(Until()); }), ErrorCode::Closed);
     pool.reset();
     host.Finish();
@@ -795,7 +871,9 @@ void PoolOverloaded()
     std::cout << "pool_overloaded max_waiters_zero=1 sequential_ok=1 closed=Closed\n";
 }
 
-// Close 并发安全幂等：等待者不遗失，Close 后命令 Closed。
+/**
+ * Close 并发安全幂等：等待者不遗失，Close 后命令 Closed。
+ */
 void PoolClose()
 {
     RealRedis backend;
@@ -803,8 +881,12 @@ void PoolClose()
     auto pool = MakePool(host, 1, 4);
     CHECK(host.Call([&] { return bbt_co_await pool->Connect(Until()); }));
     CHECK(host.Call([&] { return bbt_co_await pool->Ping(Until()); }));
-    pool->Close();
-    pool->Close(); // 幂等
+    (void)pool->Close();
+
+    /**
+     * 幂等
+     */
+    (void)pool->Close();
     CHECK(pool->IsClosed());
     ExpectCode(host.Call([&] { return bbt_co_await pool->Ping(Until()); }), ErrorCode::Closed);
     ExpectCode(host.Call([&] { return bbt_co_await pool->Set("k", "v", Until()); }), ErrorCode::Closed);
@@ -814,6 +896,160 @@ void PoolClose()
     host.Finish();
     backend.Cleanup();
     std::cout << "pool_close idempotent=1 commands=Closed connect=Closed\n";
+}
+
+/**
+ * CloseOptions：值校验、借出责任排空、超时保留、自等待拒绝、首因固定、
+ * 升级与物理收口；单 worker 下分片等待让同 worker 任务推进。
+ */
+void CloseOptionsCase()
+{
+    Peer backend(
+        [](int fd) {
+            char byte;
+            CHECK(::recv(fd, &byte, 1, 0) == 0);
+        },
+        2);
+    Host host;
+    auto created = redis::CoRedisPool::Create(host.engine, backend.address, {1, 2});
+    CHECK(created);
+    auto pool = std::move(created).value();
+    CHECK(host.Call([&] { return bbt_co_await pool->Connect(Until()); }));
+
+    /**
+     * 默认控制面是 Immediate + 不等物理回收；需要等待却没有有限绝对期限的组合
+     * （Graceful / wait_release）在副作用前拒绝，不改封口状态。
+     */
+    CHECK(bbt::infra::CloseOptions{}.mode == bbt::infra::CloseMode::Immediate);
+    CHECK(!bbt::infra::CloseOptions{}.wait_release);
+    ExpectCode(
+        host.Call([&] { return pool->Close(bbt::infra::CloseOptions::Graceful(bbt::coroutine::Deadline::max())); }),
+        ErrorCode::InvalidArgument);
+    bbt::infra::CloseOptions unbounded_wait = bbt::infra::CloseOptions::Immediate();
+    unbounded_wait.wait_release = true;
+    ExpectCode(host.Call([&] { return pool->Close(unbounded_wait); }), ErrorCode::InvalidArgument);
+    CHECK(!pool->IsClosed());
+
+    /**
+     * 借出连接的协程内 Close 是自等待：副作用前 InvalidContext。
+     */
+    CHECK(host.Call([&] {
+        auto held = bbt_co_await redis::PoolTestAccess::Take(*pool, Until());
+        CHECK(held);
+        auto rejected = pool->Close(
+            bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::milliseconds(200)));
+        CHECK(!rejected && rejected.error().code == ErrorCode::InvalidContext);
+        return true;
+    }));
+    CHECK(!pool->IsClosed());
+
+    /**
+     * 借出责任未归还：Graceful 到期只报 TimedOut 并保留；物理等待同样超时。
+     */
+    std::atomic<int> ticks{0};
+    {
+        auto borrowed = host.Call([&] { return bbt_co_await redis::PoolTestAccess::Take(*pool, Until()); });
+        CHECK(borrowed);
+        auto closing = host.Submit([&] {
+            return pool->Close(
+                bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::milliseconds(80)));
+        });
+        auto pulse = host.Submit([&] {
+            for (int i = 0; i != 40; ++i) {
+                ++ticks;
+                bbtco_sleep(1);
+            }
+        });
+        auto timed = Get(closing);
+        CHECK(!timed && timed.error().code == ErrorCode::TimedOut);
+        CHECK(pool->IsClosed());
+
+        /**
+         * 同模式新调用仍持有借用：必须消费自己的期限并报 TimedOut，而不是把
+         * Graceful 封口误当作 Immediate。随后两个显式 Graceful 在归还后均可完成。
+         */
+        auto retry = host.Call(
+            [&] { return pool->Close(bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + 50ms)); });
+        CHECK(!retry && retry.error().code == ErrorCode::TimedOut);
+        auto wait = host.Call([&] {
+            auto options = bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + 50ms);
+            options.wait_release = true;
+            return pool->Close(options);
+        });
+        CHECK(!wait && wait.error().code == ErrorCode::TimedOut);
+        auto continuing = host.Submit(
+            [&] { return pool->Close(bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + 2s)); });
+        auto concurrent = host.Submit(
+            [&] { return pool->Close(bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + 2s)); });
+        borrowed = result<redis::CoRedisPool::Borrow>::err(MakeError(ErrorCode::Closed, "test: return borrow"));
+        CHECK(Get(continuing));
+        CHECK(Get(concurrent));
+
+        Get(pulse);
+
+        /**
+         * 单 worker 下 Co 分片没有阻塞 pulse
+         */
+        CHECK(ticks.load() >= 5);
+    }
+
+    /**
+     * 借出归还后：同一池已封口，Close(Graceful) 完成剩余条目的物理关闭。
+     * wait_release=true 把池槽真实关闭并入同一次调用（不依赖调用方再等）。
+     */
+    auto sealed = bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + 2s);
+    sealed.wait_release = true;
+    CHECK(host.Call([&] { return pool->Close(sealed); }));
+    CHECK(host.Call([&] {
+        return pool->Close(
+            bbt::infra::CloseOptions{
+                bbt::infra::CloseMode::Immediate, true, {}, std::chrono::steady_clock::now() + 2s});
+    }));
+
+    /**
+     * Graceful 超时保留首因；显式 Immediate 升级和后续 Graceful 都不能覆盖它，
+     * 在借出责任未归还时，升级后的 Graceful 返回首因而不是继续等待。
+     */
+    auto upgrade_created = redis::CoRedisPool::Create(host.engine, backend.address, {1, 1});
+    CHECK(upgrade_created);
+    auto upgrade_pool = std::move(upgrade_created).value();
+    CHECK(host.Call([&] { return bbt_co_await upgrade_pool->Connect(Until()); }));
+    {
+        auto borrowed = host.Call([&] { return bbt_co_await redis::PoolTestAccess::Take(*upgrade_pool, Until()); });
+        CHECK(borrowed);
+        auto first = host.Call([&] {
+            return upgrade_pool->Close(
+                bbt::infra::CloseOptions::Graceful(
+                    std::chrono::steady_clock::now(), MakeError(ErrorCode::Unavailable, "owner close")));
+        });
+        CHECK(!first && first.error().code == ErrorCode::TimedOut);
+        CHECK(
+            upgrade_pool->Close(bbt::infra::CloseOptions::Immediate(MakeError(ErrorCode::Closed, "later immediate"))));
+        auto upgraded = host.Call([&] {
+            return upgrade_pool->Close(bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + 2s));
+        });
+        CHECK(!upgraded && upgraded.error().code == ErrorCode::Unavailable);
+        auto wait = host.Call([&] {
+            auto options = bbt::infra::CloseOptions::Immediate(MakeError(ErrorCode::Closed, "later cause"));
+            options.wait_release = true;
+            options.deadline = std::chrono::steady_clock::now() + 50ms;
+            return upgrade_pool->Close(options);
+        });
+        CHECK(!wait && wait.error().code == ErrorCode::TimedOut);
+    }
+    CHECK(host.Call([&] {
+        return upgrade_pool->Close(bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + 2s));
+    }));
+    CHECK(host.Call([&] {
+        return upgrade_pool->Close(
+            bbt::infra::CloseOptions{
+                bbt::infra::CloseMode::Immediate, true, {}, std::chrono::steady_clock::now() + 2s});
+    }));
+    pool.reset();
+    upgrade_pool.reset();
+    host.Finish();
+    backend.Join();
+    std::cout << "redis close-options timeout/self-wait/first-cause/physical ok\n";
 }
 
 #include "PoolCases.hpp"
@@ -892,6 +1128,8 @@ int Run(int argc, char** argv)
             PoolOverloaded();
         } else if (name == "pool_close") {
             PoolClose();
+        } else if (name == "close_options") {
+            CloseOptionsCase();
         } else if (name == "set_options_contract") {
             SetOptionsContract();
         } else if (name == "expire_ttl_contract") {
@@ -927,7 +1165,11 @@ int Run(int argc, char** argv)
         return 1;
     }
 }
-} // namespace
+
+// clang-format off
+}
+// clang-format on
+
 int main(int argc, char** argv)
 {
     return bbt_net_test::RunTestProcessExit([&] { return Run(argc, argv); });

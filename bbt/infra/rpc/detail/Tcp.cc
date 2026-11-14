@@ -26,7 +26,10 @@ result<void> ParseTcpEndpoint(const std::string& endpoint, std::string& out_host
         if (colon == std::string::npos) {
             return invalid;
         }
-        // 未 bracket 的多冒号串不是合法 authority（裸 IPv6 必须 bracket）。
+
+        /**
+         * 未 bracket 的多冒号串不是合法 authority（裸 IPv6 必须 bracket）。
+         */
         if (endpoint.find(':') != colon) {
             return invalid;
         }
@@ -49,7 +52,10 @@ result<void> ParseTcpEndpoint(const std::string& endpoint, std::string& out_host
     if (number == 0) {
         return invalid;
     }
-    // host 必须是数值 IP：Address::Ip 是唯一权威（不 DNS、不截断端口）。
+
+    /**
+     * host 必须是数值 IP：Address::Ip 是唯一权威（不 DNS、不截断端口）。
+     */
     std::error_code addr_error;
     const auto address = net::Address::Ip(out_host, 0, addr_error);
     if (addr_error || !address.Valid()) {
@@ -78,16 +84,27 @@ result<void> TcpSettleWrite(const net::WriteReport& report, const char* message)
         return result<void>::ok();
     }
     const auto cause = report.wait_error ? report.wait_error : outcome.error;
-    auto error = TcpCallError(cause, message, /*committed=*/false);
+
+    /**
+     * committed = false。
+     */
+    auto error = TcpCallError(cause, message, false);
     if (!error.request_phase.has_value()) {
         error.request_phase = RequestPhase::Writing;
     }
-    // 已接纳仍在发送：等待结束不等于撤销；除调用方取消外不得当作零提交。
+
+    /**
+     * 已接纳仍在发送：等待结束不等于撤销；除调用方取消外不得当作零提交。
+     */
     if (report.operation.Valid() && outcome.phase == net::WritePhase::InFlight && error.code != ErrorCode::Cancelled) {
         error.code = ErrorCode::OutcomeUnknown;
     }
     return result<void>::err(std::move(error));
 }
 
-} // namespace detail
-} // namespace bbt::infra::rpc
+// clang-format off
+}
+// clang-format on
+// clang-format off
+}
+// clang-format on

@@ -87,7 +87,7 @@ actions/cache 未命中 -> 运行 scripts/prepare_resource_deps.sh <prefix-root>
 - `find_package` 一律 `NO_DEFAULT_PATH`，杜绝误链 `/usr/local` 等同名库。
 - `BBT_MONGOCXX_PREFIX` 与 `BBT_MONGOC_PREFIX` 必须成对给出（mongocxxConfig 的
   `find_dependency(mongoc/bsoncxx)` 需经 `<pkg>_DIR` 钉到私有前缀）。
-- 未给前缀时对应模块整体跳过，不产出半成品 target。
+- Mongo 模块未给前缀时整体跳过，不导出 target；Redis、RPC 模块在对应开关为 `ON` 且缺前缀时 configure 直接失败。
 
 ### 消费者自检
 
@@ -110,7 +110,7 @@ configure FATAL_ERROR。
 最小回归入口：`tests/resource-prefix/run.sh [--prefix <prefix-root>]`（fail-closed 路径 +
 正向 / 异版负向，不重复三方依赖构建）。
 
-CI 接入：`.github/workflows/ci.yml` 的「资源前缀拒绝路径回归（A/B，不含 C/D）」步骤只跑
+CI 接入：`.github/workflows/ci.yml` 中的资源前缀拒绝路径步骤只跑
 不带 `--prefix` 的 A/B（已存在目录/悬浮符号链接/锁占用拒绝 + 克隆失败清理），无网络、
 无 docker、不依赖已构建前缀；C/D 需要真实前缀，本 workflow 不运行，该步骤的 exit 0
 不表示 C/D 通过。
@@ -151,8 +151,8 @@ LD_LIBRARY_PATH=<prefix-root>/hiredis/lib:<prefix-root>/mongoc/lib:<prefix-root>
 
    | 依赖 | 来源 | 实测要求 |
    |---|---|---|
-   | `libc6`（glibc） | 基础镜像 | prefix4 实测三份前缀产物最高要求 `GLIBC_2.38`（`manifest.abi_requirements.glibc`，`objdump -T` 汇总）。实际镜像必须以同基座构建并重新核对 |
-   | `libstdc++6` | g++ 运行时 | prefix4 实测需 `GLIBCXX_3.4.32`（随 builder gcc 版本） |
+   | `libc6`（glibc） | 基础镜像 | 实测产物最高要求 `GLIBC_2.38`（以该次构建 manifest 的 `abi_requirements.glibc` 为准，由 `objdump -T` 汇总）。实际镜像必须以同基座构建并重新核对 |
+   | `libstdc++6` | g++ 运行时 | 实测需 `GLIBCXX_3.4.32`（随 builder gcc 版本） |
    | `libgcc-s1` | gcc 运行时 | `libgcc_s.so.1` |
    | `libm`/`libresolv` | libc6 提供 | mongoc `NEEDED`（现代 glibc 已并入 libc6） |
 

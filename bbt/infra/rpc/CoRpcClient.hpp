@@ -15,6 +15,7 @@
 
 #include <bbt/coroutine/syntax/Async.hpp>
 #include <bbt/coroutine/object/CoObject.hpp>
+#include <bbt/infra/CloseOptions.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
 #include <bbt/infra/Result.hpp>
 #include <bbt/infra/rpc/Options.hpp>
@@ -23,7 +24,9 @@
 #include <bbt/infra/rpc/Stats.hpp>
 #include <bbt/infra/rpc/Hooks.hpp>
 
-// 执行底座由应用装配并最终收口。
+/**
+ * 执行底座由应用装配并最终收口。
+ */
 namespace bbt::infra::net {
 class Engine;
 }
@@ -31,7 +34,11 @@ class Engine;
 namespace bbt::infra::rpc {
 
 class CoRpcServer;
-struct SessionOwnerState; // detail：会话 owner，定义见 detail/RpcSessionState.hpp
+
+/**
+ * detail：会话 owner，定义见 detail/RpcSessionState.hpp
+ */
+struct SessionOwnerState;
 
 /**
  * @brief 双向 RPC 会话客户端。
@@ -96,44 +103,42 @@ public:
     /**
      * @brief 统一关闭入口（受管协程内 bbt_co_await 消费）。
      *
-     * 三种形态共用同一入口，不另设 Drain/WaitClosed：
-     *   - Close(Immediate, 0)：立即逻辑封口并发布首个关闭原因（幂等、不可
-     *     重开）；拒绝新 Call/Send，对在途 link 强制关闭并结算全部未终结
-     *     调用，不等待任何在途完成。
-     *   - Close(Timeout, timeout_ms)：先同上强制收口，再有界等待 RPC 自己
-     *     持有的 session/握手责任物理收口；超时返回 TimedOut。
-     *   - Close(Graceful, timeout_ms)：先拒新（不发布原因），等已接纳调用
-     *     真实归还责任后封口并发布原因；timeout_ms==-1 表示无限等待，有限
-     *     期限超时返回 TimedOut 并强制收口。等待只覆盖 RPC 自身责任，
+     * 模式、首因与绝对期限唯一由 CloseOptions 表达：
+     *   - Immediate：立即逻辑封口并发布首个关闭原因（幂等、不可重开）；
+     *     拒绝新 Call/Send，对在途 link 强制关闭并结算全部未终结调用，不等待。
+     *   - Graceful：拒新并发布首个原因，等已接纳调用真实归还责任；到期只
+     *     返回 TimedOut 并保留责任，不自动升级。等待只覆盖 RPC 自身责任，
      *     不承诺业务 handler 的优雅结束。
-     * @param flag 关闭模式。
-     * @param timeout_ms 毫秒；仅 Graceful 允许 -1（无限），其余负值返回
-     *        InvalidArgument 且不启动等待。
-     * @param reason 关闭原因；message 为空时使用默认 Closed 原因。
-     * @return 等待模式的收口结果；不返回「排空失败」的额外分类。
+     *   - wait_release=true：模式工作完成后在同一 Close 内继续等 link 物理
+     *     close 与在途结算出账到同一绝对期限（不续预算）。
+     *
+     * 本 owner 已接纳调用的协程内调用（自等待）在副作用前返回
+     * InvalidContext。重复调用幂等、首因固定；Graceful → Immediate 升级由任一
+     * 次 Immediate/Close(Immediate) 触发。
+     * @param options 模式、首因与优雅关闭的有限绝对期限。
      */
-    bbt_co_async(result<void>)
-        Close(CloseFlag flag = CloseFlag::Immediate, std::int64_t timeout_ms = 0, Error reason = {});
+    bbt_co_async(result<void>) Close(const CloseOptions& options = {});
 
     /**
-     * @brief 宿主侧同步强制关闭（任意域、不挂起、幂等）。
-     *
-     * 立即拒绝新操作、强制关闭所有 session/link、未终结调用立即失败；
-     * 不等待 handler、reply、队列或物理释放。与 Close(Immediate) 共用同一
-     * 套关闭状态，不产生另一套生命周期。
-     * @param reason 关闭原因；message 为空时使用默认 Closed 原因。
+     * @brief 查询当前是否已逻辑封口。
      */
-    void Shutdown(Error reason = {}) noexcept;
-
-    /// @brief 查询当前是否已逻辑封口。
     bool IsClosed() const noexcept;
-    /// @brief 已发布的首个关闭原因；未发布为空。
+
+    /**
+     * @brief 已发布的首个关闭原因；未发布为空。
+     */
     std::optional<Error> CloseReason() const noexcept;
 
 private:
     explicit CoRpcClient(std::shared_ptr<SessionOwnerState> owner) noexcept;
-    friend class CoRpcServer; // CoRpcServer::Create 注入 session_owner 取 m_owner
+
+    /**
+     * CoRpcServer::Create 注入 session_owner 取 m_owner
+     */
+    friend class CoRpcServer;
     std::shared_ptr<SessionOwnerState> m_owner;
 };
 
-} // namespace bbt::infra::rpc
+// clang-format off
+}
+// clang-format on

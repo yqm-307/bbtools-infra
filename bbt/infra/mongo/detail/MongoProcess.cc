@@ -6,9 +6,11 @@ namespace bbt::infra::mongo_detail {
 
 namespace {
 
-// 进程级注册表：instance 强引用 + URI → pool lease 弱引用表。
-// 静态生存期问题经 lease 内 instance 强引用化解——即便注册表先析构，
-// 存活 lease 也保证 instance 晚于 pool 销毁。
+/**
+ * 进程级注册表：instance 强引用 + URI → pool lease 弱引用表。
+ * 静态生存期问题经 lease 内 instance 强引用化解——即便注册表先析构，
+ * 存活 lease 也保证 instance 晚于 pool 销毁。
+ */
 struct MongoProcessState {
     std::mutex mtx;
     std::shared_ptr<mongocxx::v1::instance> instance;
@@ -21,14 +23,18 @@ MongoProcessState& ProcessState()
     return state;
 }
 
-} // namespace
+// clang-format off
+}
+// clang-format on
 
 result<std::shared_ptr<MongoPoolLease>> AcquireMongoPool(const std::string& effective_uri)
 {
     auto& state = ProcessState();
     std::lock_guard<std::mutex> lk(state.mtx);
 
-    // 顺手回收已失效槽位，distinct URI 计数只算存活 lease。
+    /**
+     * 顺手回收已失效槽位，distinct URI 计数只算存活 lease。
+     */
     for (auto it = state.pools.begin(); it != state.pools.end();) {
         if (it->second.expired())
             it = state.pools.erase(it);
@@ -60,13 +66,18 @@ result<std::shared_ptr<MongoPoolLease>> AcquireMongoPool(const std::string& effe
     }
 }
 
-} // namespace bbt::infra::mongo_detail
+// clang-format off
+}
+// clang-format on
 
 namespace bbt::infra::mongo_detail {
 
 MongoPoolLease::MongoPoolLease(std::shared_ptr<mongocxx::v1::instance> inst, mongocxx::v1::uri u)
-    : instance(std::move(inst)), pool(std::move(u))
+    : instance(std::move(inst))
+    , pool(std::move(u))
 {
 }
 
-} // namespace bbt::infra::mongo_detail
+// clang-format off
+}
+// clang-format on

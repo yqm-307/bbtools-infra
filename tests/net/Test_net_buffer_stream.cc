@@ -20,7 +20,9 @@ thread_local bool probeActive = false;
 thread_local std::size_t allocationCalls = 0;
 thread_local std::size_t failAt = 0;
 
-// 不在探针窗口内调用 Boost.Test；断言本身可能分配。
+/**
+ * 不在探针窗口内调用 Boost.Test；断言本身可能分配。
+ */
 struct AllocationProbe {
     explicit AllocationProbe(std::size_t failure = 0)
     {
@@ -28,12 +30,13 @@ struct AllocationProbe {
         failAt = failure;
         probeActive = true;
     }
-    ~AllocationProbe()
-    {
-        probeActive = false;
-    }
+
+    ~AllocationProbe() { probeActive = false; }
 };
-} // namespace
+
+// clang-format off
+}
+// clang-format on
 
 void* operator new(std::size_t size)
 {
@@ -45,22 +48,27 @@ void* operator new(std::size_t size)
     }
     throw std::bad_alloc();
 }
+
 void* operator new[](std::size_t size)
 {
     return ::operator new(size);
 }
+
 BOOST_NOINLINE void operator delete(void* memory) noexcept
 {
     std::free(memory);
 }
+
 BOOST_NOINLINE void operator delete[](void* memory) noexcept
 {
     std::free(memory);
 }
+
 BOOST_NOINLINE void operator delete(void* memory, std::size_t) noexcept
 {
     std::free(memory);
 }
+
 BOOST_NOINLINE void operator delete[](void* memory, std::size_t) noexcept
 {
     std::free(memory);
@@ -75,8 +83,10 @@ static_assert(std::is_nothrow_move_constructible_v<Buffer>);
 static_assert(std::is_nothrow_move_assignable_v<Buffer>);
 
 template <class T, class = void> struct CanInsert : std::false_type {};
+
 template <class T>
 struct CanInsert<T, std::void_t<decltype(std::declval<Buffer&>() << std::declval<T>())>> : std::true_type {};
+
 static_assert(!CanInsert<int*>::value);
 static_assert(!CanInsert<std::nullptr_t>::value);
 static_assert(CanInsert<const char*>::value);
@@ -92,18 +102,22 @@ template <class T> void CheckIntegerLimits()
     BOOST_CHECK(high == (std::numeric_limits<T>::max)());
     BOOST_CHECK(buffer.Empty());
 }
-} // namespace
+
+// clang-format off
+}
+// clang-format on
 
 BOOST_AUTO_TEST_CASE(golden_wire_and_integer_limits)
 {
     Buffer buffer;
     buffer << std::uint8_t{0x12} << std::uint16_t{0x3456} << std::uint32_t{0x789abcde} << std::int16_t{-2} << true
            << false << 1.0f << -0.0 << "A";
-    const std::string golden("\x12\x34\x56\x78\x9a\xbc\xde\xff\xfe\x01\x00"
-                             "\x3f\x80\x00\x00\x80\x00\x00\x00\x00\x00\x00\x00"
-                             "\x00\x00\x00\x01"
-                             "A",
-                             28);
+    const std::string golden(
+        "\x12\x34\x56\x78\x9a\xbc\xde\xff\xfe\x01\x00"
+        "\x3f\x80\x00\x00\x80\x00\x00\x00\x00\x00\x00\x00"
+        "\x00\x00\x00\x01"
+        "A",
+        28);
     BOOST_CHECK_EQUAL(buffer.CopyTo(), golden);
     CheckIntegerLimits<std::uint8_t>();
     CheckIntegerLimits<std::uint16_t>();

@@ -1,24 +1,25 @@
-// 4-2A（本切片 stdio 形态）：MCP 可运行示例 server（bbtools-infra mcp 交付线）。
-//
-// 这是什么：一个最小但真实可跑的 MCP server 示例，演示 bbtools-infra 当前公共面
-// （bbt/infra/mcp/）的完整生命周期与 stdio transport：
-//
-//   GlobalConfig/Scheduler 启动共享协程运行时
-//   → McpServer::Create → 注册 resource/prompt（tools 需 Schema 选件）→ Start 冻结快照
-//   → McpStdioTransport::Start（逐行 JSON 帧，协议帧走 stdout、诊断走 stderr）
-//   → 主线程等 stdin EOF 或 SIGINT/SIGTERM
-//   → 按契约同步 Close：transport->Close()（幂等、任意线程、返回即物理收口）
-//     → server->Close()（core 生命周期由业务决定，transport 不代管）
-//   → 进程退出；不依赖协程栈展开与 Scheduler::Stop（运行时按进程寿命存在）。
-//
-// 怎么跑（构建目录 B 按仓库说明配置后）：
-//   $ ./Example_mcp_stdio_server --stdio    < frames.ndjson   # stdin 用管道接帧
-// 注意：stdio 模式要求 stdin/stdout 是管道（transport 按 S_ISFIFO 校验，独占使用），
-// 终端直连会启动失败；协议帧只写 stdout，本文件的日志只写 stderr。
-//
-// Schema 选件 ON：真实 echo tool + resource + prompt；OFF：只注册 resource/prompt，
-// 不链接 Schema/ICU，不宣告 tools。ON 的依赖或注册失败直接非零退出，不使用 stub。
-
+/**
+ * MCP 可运行示例 server（bbtools-infra mcp 交付线）。
+ *
+ * 这是什么：一个最小但真实可跑的 MCP server 示例，演示 bbtools-infra 当前公共面
+ * （bbt/infra/mcp/）的完整生命周期与 stdio transport：
+ *
+ *   GlobalConfig/Scheduler 启动共享协程运行时
+ *   → McpServer::Create → 注册 resource/prompt（tools 需 Schema 选件）→ Start 冻结快照
+ *   → McpStdioTransport::Start（逐行 JSON 帧，协议帧走 stdout、诊断走 stderr）
+ *   → 主线程等 stdin EOF 或 SIGINT/SIGTERM
+ *   → 按契约同步 Close：transport->Close()（幂等、任意线程、返回即物理收口）
+ *     → server->Close()（core 生命周期由业务决定，transport 不代管）
+ *   → 进程退出；不依赖协程栈展开与 Scheduler::Stop（运行时按进程寿命存在）。
+ *
+ * 怎么跑（构建目录 B 按仓库说明配置后）：
+ *   $ ./Example_mcp_stdio_server --stdio    < frames.ndjson   # stdin 用管道接帧
+ * 注意：stdio 模式要求 stdin/stdout 是管道（transport 按 S_ISFIFO 校验，独占使用），
+ * 终端直连会启动失败；协议帧只写 stdout，本文件的日志只写 stderr。
+ *
+ * Schema 选件 ON：真实 echo tool + resource + prompt；OFF：只注册 resource/prompt，
+ * 不链接 Schema/ICU，不宣告 tools。ON 的依赖或注册失败直接非零退出，不使用 stub。
+ */
 #include <atomic>
 #include <cerrno>
 #include <csignal>
@@ -41,8 +42,10 @@
 
 namespace {
 
-// 信号只置位，Close 留给主线程在正常上下文按契约同步执行（handler 内不做
-// 非异步安全调用，也不依赖协程栈展开）。
+/**
+ * 信号只置位，Close 留给主线程在正常上下文按契约同步执行（handler 内不做
+ * 非异步安全调用，也不依赖协程栈展开）。
+ */
 volatile std::sig_atomic_t g_stop = 0;
 
 void OnStopSignal(int)
@@ -50,8 +53,9 @@ void OnStopSignal(int)
     g_stop = 1;
 }
 
-// --- 确定性业务 handler：echo，无外部依赖、无随机性 --------------------------------
-
+/**
+ * 确定性业务 handler：echo，无外部依赖、无随机性
+ */
 #ifdef BBT_MCP_SCHEMA_ADAPTER
 std::atomic<int> g_tool_calls{0};
 
@@ -69,7 +73,10 @@ EchoTool(const bbt::infra::mcp::RequestContext&, bbt::infra::mcp::JsonValue argu
     ToolResult out;
     out.content.push_back(Content::Text(message.value()));
     auto structured = JsonValue::Object();
-    // 新 object 与常量 ASCII 键；值已由输入 Schema 校验。
+
+    /**
+     * 新 object 与常量 ASCII 键；值已由输入 Schema 校验。
+     */
     structured.Set("echo", JsonValue(message.value()));
     structured.Set("count", JsonValue(++g_tool_calls));
     out.structured_content = std::move(structured);
@@ -77,9 +84,11 @@ EchoTool(const bbt::infra::mcp::RequestContext&, bbt::infra::mcp::JsonValue argu
 }
 #endif
 
-// resources/read：回显注册 uri（与注册 uri 相同，库已校验）。
-bbt::infra::result<bbt::infra::mcp::ResourceResult> EchoResource(const bbt::infra::mcp::RequestContext&,
-                                                                 const std::string& uri)
+/**
+ * resources/read：回显注册 uri（与注册 uri 相同，库已校验）。
+ */
+bbt::infra::result<bbt::infra::mcp::ResourceResult>
+EchoResource(const bbt::infra::mcp::RequestContext&, const std::string& uri)
 {
     auto content = bbt::infra::mcp::ResourceContents::Text(uri, "text/plain", "echo:" + uri);
     if (!content)
@@ -89,9 +98,11 @@ bbt::infra::result<bbt::infra::mcp::ResourceResult> EchoResource(const bbt::infr
     return bbt::infra::result<bbt::infra::mcp::ResourceResult>::ok(std::move(out));
 }
 
-// prompts/get：取 params.arguments.text（缺省「你好」），回显到单条 user 消息。
-bbt::infra::result<bbt::infra::mcp::PromptResult> EchoPrompt(const bbt::infra::mcp::RequestContext&,
-                                                             const bbt::infra::mcp::JsonValue& arguments)
+/**
+ * prompts/get：取 params.arguments.text（缺省「你好」），回显到单条 user 消息。
+ */
+bbt::infra::result<bbt::infra::mcp::PromptResult>
+EchoPrompt(const bbt::infra::mcp::RequestContext&, const bbt::infra::mcp::JsonValue& arguments)
 {
     std::string text = "你好";
     if (arguments.IsObject()) {
@@ -113,11 +124,15 @@ bbt::infra::result<bbt::infra::mcp::PromptResult> EchoPrompt(const bbt::infra::m
 
 void PrintUsage(std::FILE* out)
 {
-    std::fprintf(out, "用法：Example_mcp_stdio_server --stdio\n"
-                      "  --stdio  逐行 JSON 帧（stdin/stdout 必须是管道）\n");
+    std::fprintf(
+        out,
+        "用法：Example_mcp_stdio_server --stdio\n"
+        "  --stdio  逐行 JSON 帧（stdin/stdout 必须是管道）\n");
 }
 
-} // namespace
+// clang-format off
+}
+// clang-format on
 
 int main(int argc, char** argv)
 {
@@ -126,20 +141,27 @@ int main(int argc, char** argv)
         return 2;
     }
 
-    struct sigaction action{}; // 先装信号，再启动运行时
+    /**
+     * 先装信号，再启动运行时
+     */
+    struct sigaction action{};
     action.sa_handler = OnStopSignal;
     ::sigemptyset(&action.sa_mask);
     ::sigaction(SIGINT, &action, nullptr);
     ::sigaction(SIGTERM, &action, nullptr);
 
-    // 共享协程运行时（transport 的就绪等待与协程派发都落在它上面；与仓内测试同参）：
-    // 纤程栈给到 256KB，避免深调用链撞默认栈保护页。
+    /**
+     * 共享协程运行时（transport 的就绪等待与协程派发都落在它上面；与仓内测试同参）：
+     * 纤程栈给到 256KB，避免深调用链撞默认栈保护页。
+     */
     auto* config = bbt::coroutine::detail::GlobalConfig::GetInstance().get();
     config->m_cfg_static_thread_num = 2;
     config->m_cfg_stack_size = 1024 * 256;
     bbt::coroutine::detail::Scheduler::GetInstance()->Start(bbt::coroutine::SCHE_START_OPT_SCHE_THREAD);
 
-    // server core：注册（Start 前）→ Start 一次冻结快照并开协议接纳。
+    /**
+     * server core：注册（Start 前）→ Start 一次冻结快照并开协议接纳。
+     */
     bbt::infra::mcp::ServerOptions options;
 #ifdef BBT_MCP_SCHEMA_ADAPTER
     options.instructions = "bbtools-infra 示例 server：echo 工具、资源与提示词";
@@ -160,10 +182,12 @@ int main(int argc, char** argv)
     }
     auto input_schema = bbt::infra::mcp::JsonValue::Parse(
         R"({"type":"object","properties":{"message":{"type":"string"}},"required":["message"],"additionalProperties":false})",
-        4096, 16);
+        4096,
+        16);
     auto output_schema = bbt::infra::mcp::JsonValue::Parse(
         R"({"type":"object","properties":{"echo":{"type":"string"},"count":{"type":"integer"}},"required":["echo","count"],"additionalProperties":false})",
-        4096, 16);
+        4096,
+        16);
     if (!input_schema || !output_schema) {
         std::fprintf(stderr, "mcp-example: echo Schema 解析失败\n");
         return 1;
@@ -210,21 +234,33 @@ int main(int argc, char** argv)
     auto started = bbt::infra::mcp::McpStdioTransport::Start(server);
     if (!started) {
         std::fprintf(stderr, "mcp-example: stdio transport 启动失败（stdin/stdout 必须是独占管道）\n");
-        server->Close();
+        (void)server->Close();
         return 1;
     }
     auto transport = std::move(started).value();
     std::fprintf(stderr, "mcp-example: ready mode=stdio\n");
 
-    // stdin EOF 由 transport 自行走同一收口序列；信号则由本线程补一次同步 Close。
+    /**
+     * stdin EOF 由 transport 自行走同一收口序列；信号则由本线程补一次同步 Close。
+     */
     while (!transport->IsClosed() && g_stop == 0)
         ::usleep(20000);
-    transport->Close(); // 幂等：EOF 已收口时等首次真实落定
-    const auto evidence = transport->LastCloseEvidence();
-    std::fprintf(stderr, "mcp-example: stdio closed eof=%d nonblock_restored=%d dropped=%zu\n", evidence.eof ? 1 : 0,
-                 evidence.nonblock_restored ? 1 : 0, evidence.dropped_frames);
 
-    // core 生命周期由业务决定：transport 不代管，这里显式封口（幂等）。
-    server->Close();
+    /**
+     * 幂等：EOF 已收口时等首次真实落定
+     */
+    (void)transport->Close();
+    const auto evidence = transport->LastCloseEvidence();
+    std::fprintf(
+        stderr,
+        "mcp-example: stdio closed eof=%d nonblock_restored=%d dropped=%zu\n",
+        evidence.eof ? 1 : 0,
+        evidence.nonblock_restored ? 1 : 0,
+        evidence.dropped_frames);
+
+    /**
+     * core 生命周期由业务决定：transport 不代管，这里显式封口（幂等）。
+     */
+    (void)server->Close();
     return 0;
 }

@@ -1,5 +1,9 @@
+/**
+ * @file CloseSupport.hpp
+ * @brief config watch 私有关闭支撑；登记与封口共用一把锁，关闭不丢失已登记唤醒。
+ */
 #pragma once
-// config watch 私有关闭支撑；登记与封口共用一把锁，关闭不丢失已登记唤醒。
+
 #include <atomic>
 #include <mutex>
 #include <vector>
@@ -21,18 +25,17 @@ private:
 class ManagedCloseState {
 public:
     bool BeginClose() noexcept;
-    void MarkClosed() noexcept
-    {
-        m_phase.store(kClosed);
-    }
-    bool IsOpen() const noexcept
-    {
-        return m_phase.load() == kOpen;
-    }
+
+    void MarkClosed() noexcept { m_phase.store(kClosed); }
+
+    bool IsOpen() const noexcept { return m_phase.load() == kOpen; }
 
 private:
     enum Phase : int { kOpen, kClosing, kClosed };
+
     std::atomic<int> m_phase{kOpen};
 };
 
-} // namespace bbt::infra::config_detail
+// clang-format off
+}
+// clang-format on

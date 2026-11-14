@@ -9,4 +9,6 @@ std::uint32_t Crc32Checksum(std::string_view bytes) noexcept
     return crc.checksum();
 }
 
-} // namespace bbt::infra::net
+// clang-format off
+}
+// clang-format on

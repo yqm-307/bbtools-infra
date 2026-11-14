@@ -64,16 +64,16 @@ codec/PositionalCodec.hpp                   payload 位置参数 codec，不被�
 
 ## 6. 测试与证据
 
-以下数字引用 `2026-11-08 verify2.md` 的已有实跑证据；本次收尾不重跑行为测试。
+用例注册见 `tests/rpc_net/CMakeLists.txt`、`tests/CMakeLists.txt` 与 `examples/rpc_net/CMakeLists.txt`；label 与执行口径见 [测试策略](../guides/testing.md)。本文不记录通过数，以 CI 实跑为准。
 
-- `rpc.net.*`：61/61 通过（`ctest -j1 -R '^rpc\.net\.'`）；`^rpc\.` 总计 62/62，另含 `rpc.payload`。覆盖并点名：
-  - `v2_protocol_seam`：直接驱动 `RpcFrameProtocol` 的 wire 与帧协议接缝；
-  - `v2s_ordering_ledger`：顺序台账；
-  - `v2s_close_negative_timeout`：负 timeout 拒绝；
-  - `v2s_server_cross_engine`：跨 Engine 装配拒绝；
-  - 会话层 `v2s_*`、`co_lifecycle`、`v1_absent` 公共面负向门禁，以及 Python 父进程驱动的双进程 Call/Send 与收口测试。
+- `rpc.net.*`（`ctest -j1 -R '^rpc\.net\.'`）覆盖并点名：
+  - `rpc.net.v2_protocol_seam`：直接驱动 `RpcFrameProtocol` 的 wire 与帧协议接缝；
+  - `rpc.net.v2s_ordering_ledger`：顺序台账；
+  - `rpc.net.v2s_close_negative_timeout`：负 timeout 拒绝；
+  - `rpc.net.v2s_server_cross_engine`：跨 Engine 装配拒绝；
+  - 会话层 `rpc.net.v2s_*`、`rpc.net.co_lifecycle`、`rpc.net.v1_absent` 公共面负向门禁。
+- `rpc.net.v2_session_consumer`（`examples/rpc_net/session_consumer.py` 驱动）：双进程 Call/Send 与收口测试。
 - `rpc.payload`：PositionalCodec 对旧源 literal 的字节级 golden 比对（smoke/debug 必选）。它不是线上帧的跨语言 fixture。
-- framework 消费者：构建成功；交接中的 88 个增量步骤不是测试数。ctest 25/25 通过，含 `framework.close_gate`、`framework.shutdown`、`framework.rpc_matrix`、`framework.rpc_xlang`。
 
 ## 7. 已删除的旧面
 
@@ -86,7 +86,7 @@ codec/PositionalCodec.hpp                   payload 位置参数 codec，不被�
 
 ## 8. 未落地（不是现状）
 
-以下出现在早期设计稿中，当前代码与测试中**不存在**：
+以下曾在设计中出现，当前代码与测试中**不存在**：
 
 - **HTTP Channel**：RPC 只经 `TcpChannel` 承载；core 不链接 `bbt::infra_http_net`。
 - **`codec_id`**：线上不声明 codec，编码方式由两端本地决定。

@@ -6,7 +6,6 @@
  *
  * 只扩展 infra 的契约，不向上游命名空间复制定义。执行环境每次现查，与对象创建时的身份无关。
  */
-
 #include <cstdint>
 #include <system_error>
 
@@ -21,13 +20,16 @@ namespace bbt::infra::net {
  * coroutine_id 为 0 表示当前不在受管协程中，此时不能挂起。
  */
 struct CoEnvironment {
-    std::uint64_t coroutine_id{0}; ///< 当前受管协程的 id；0 表示不在受管协程中
 
-    /** @brief 当前环境是否允许挂起：只有受管协程（id 非 0）可以挂起。 */
-    BBT_INFRA_NET_NONSUSPENDING bool CanSuspend() const noexcept
-    {
-        return coroutine_id != 0;
-    }
+    /**
+     * 当前受管协程的 id；0 表示不在受管协程中
+     */
+    std::uint64_t coroutine_id{0};
+
+    /**
+     * @brief 当前环境是否允许挂起：只有受管协程（id 非 0）可以挂起。
+     */
+    BBT_INFRA_NET_NONSUSPENDING bool CanSuspend() const noexcept { return coroutine_id != 0; }
 };
 
 /**
@@ -52,4 +54,6 @@ public:
     std::error_code RequireCoroutine() const;
 };
 
-} // namespace bbt::infra::net
+// clang-format off
+}
+// clang-format on

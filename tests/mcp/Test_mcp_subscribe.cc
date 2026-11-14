@@ -1,18 +1,19 @@
-// 2-5 切片 contract 检查：subscriptions/listen（ack/filters/subscriptionId、长请求）
-// 与 MRTR 基础 message patterns（specs S14/S15）。
-//
-//   S14：每订阅第一条 ack（含空支持子集）、accepted 过滤（未支持类型省略）、
-//        subscriptionId 携带与多订阅隔离、事件顺序、cancel 结束流可核验；
-//        请求级 progress 不属于本切片（未实现 progress，无帧落入 listen 流）。
-//   S15：InputRequired wire（id-keyed inputRequests、opaque requestState）、
-//        客户端能力门禁（-32021 + data.requiredCapabilities）、重试请求经真实分派
-//        携带 inputResponses/requestState 到达 handler、新 id 重试、legacy 不发
-//        modern 结构。
-//
-// 边界（不冒充）：真实 stdio/HTTP SSE transport 属 3-x，本文件经内部面 sink 驱动
-// 帧出口；业务 handler 返回 InputRequired 的接线不在本切片（无端到端
-// input_required 产出断言）。无第三方测试框架；经 模块私有头消费实现面。
-
+/**
+ * contract 检查：subscriptions/listen（ack/filters/subscriptionId、长请求）
+ * 与 MRTR 基础 message patterns。
+ *
+ *   每订阅第一条 ack（含空支持子集）、accepted 过滤（未支持类型省略）、
+ *        subscriptionId 携带与多订阅隔离、事件顺序、cancel 结束流可核验；
+ *        请求级 progress 不属于本模块（未实现 progress，无帧落入 listen 流）。
+ *   InputRequired wire（id-keyed inputRequests、opaque requestState）、
+ *        客户端能力门禁（-32021 + data.requiredCapabilities）、重试请求经真实分派
+ *        携带 inputResponses/requestState 到达 handler、新 id 重试、legacy 不发
+ *        modern 结构。
+ *
+ * 边界（不冒充）：真实 stdio/HTTP SSE transport 属 3-x，本文件经内部面 sink 驱动
+ * 帧出口；业务 handler 返回 InputRequired 的接线不在本模块（无端到端
+ * input_required 产出断言）。无第三方测试框架；经 模块私有头消费实现面。
+ */
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -71,8 +72,9 @@ using bbt::infra::mcp::ServerOptions;
 
 constexpr const char* kSubIdKey = "io.modelcontextprotocol/subscriptionId";
 
-// --- 小工具 -------------------------------------------------------------------
-
+/**
+ * 小工具
+ */
 JsonValue ParseOk(const std::string& text)
 {
     auto parsed = JsonValue::Parse(text, 1U << 20, 32);
@@ -103,7 +105,9 @@ std::string Str(const std::optional<JsonValue>& value)
     return std::move(text).value();
 }
 
-// JsonValue::At 返回 result 而非 optional。
+/**
+ * JsonValue::At 返回 result 而非 optional。
+ */
 std::string Str(const result<JsonValue>& value)
 {
     if (!value)
@@ -122,7 +126,9 @@ JsonValue ModernMeta(JsonValue capabilities)
     return meta;
 }
 
-// modern 请求帧（id 为 string）。
+/**
+ * modern 请求帧（id 为 string）。
+ */
 std::string ModernFrame(const std::string& id, const std::string& method, JsonValue params)
 {
     JsonValue frame = JsonValue::Object();
@@ -134,7 +140,9 @@ std::string ModernFrame(const std::string& id, const std::string& method, JsonVa
     return frame.Serialize();
 }
 
-// subscriptions/listen params：notifications 过滤器 + modern _meta（ModernFrame 补）。
+/**
+ * subscriptions/listen params：notifications 过滤器 + modern _meta（ModernFrame 补）。
+ */
 JsonValue ListenParams(JsonValue filter)
 {
     JsonValue params = JsonValue::Object();
@@ -142,7 +150,9 @@ JsonValue ListenParams(JsonValue filter)
     return params;
 }
 
-// legacy 请求帧。
+/**
+ * legacy 请求帧。
+ */
 std::string LegacyFrame(const std::string& id, const std::string& method, JsonValue params)
 {
     JsonValue frame = JsonValue::Object();
@@ -153,24 +163,22 @@ std::string LegacyFrame(const std::string& id, const std::string& method, JsonVa
     return frame.Serialize();
 }
 
-// 帧出口记录器。
+/**
+ * 帧出口记录器。
+ */
 struct SinkLog {
     std::vector<std::string> frames;
-    void Record(const std::string& frame)
-    {
-        frames.push_back(frame);
-    }
-    std::size_t Size() const
-    {
-        return frames.size();
-    }
-    JsonValue Last()
-    {
-        return ParseOk(frames.back());
-    }
+
+    void Record(const std::string& frame) { frames.push_back(frame); }
+
+    std::size_t Size() const { return frames.size(); }
+
+    JsonValue Last() { return ParseOk(frames.back()); }
 };
 
-// 带一个已注册资源 mem://a 的已启动 server + 会话。
+/**
+ * 带一个已注册资源 mem://a 的已启动 server + 会话。
+ */
 struct Rig {
     std::shared_ptr<McpServer> server;
     std::shared_ptr<McpSession> session;
@@ -207,7 +215,9 @@ Rig MakeRig(std::size_t max_inflight = 64)
     return rig;
 }
 
-// 解析 HandleFrame 的响应（断言必须回包）。
+/**
+ * 解析 HandleFrame 的响应（断言必须回包）。
+ */
 JsonValue Respond(McpSession& session, const std::string& frame)
 {
     auto outcome = session.HandleFrame(frame);
@@ -225,7 +235,9 @@ JsonValue Respond(McpSession& session, const std::string& frame)
     return ParseOk(outcome.value().response);
 }
 
-// 断言错误响应的 code。
+/**
+ * 断言错误响应的 code。
+ */
 std::int64_t ErrorCodeOf(McpSession& session, const std::string& frame)
 {
     JsonValue response = Respond(session, frame);
@@ -236,47 +248,80 @@ std::int64_t ErrorCodeOf(McpSession& session, const std::string& frame)
     return number ? number.value() : 0;
 }
 
-} // namespace
+// clang-format off
+}
+// clang-format on
 
 int main()
 {
     using bbt::infra::mcp::JsonRpcErrorCode;
 
-    // ================= S14：subscriptions/listen ==============================
-
+    /**
+     * subscriptions/listen：
+     */
     {
-        // ack 先行 + accepted 子集过滤 + subscriptionId。
+
+        /**
+         * ack 先行 + accepted 子集过滤 + subscriptionId。
+         */
         Rig rig = MakeRig();
         JsonValue filter = JsonValue::Object();
-        filter.Set("toolsListChanged", JsonValue(true)); // server 无 listChanged 机制 → 省略
+
+        /**
+         * server 无 listChanged 机制 → 省略
+         */
+        filter.Set("toolsListChanged", JsonValue(true));
         JsonValue uris = JsonValue::Array();
         uris.Push(JsonValue("mem://a"));
-        uris.Push(JsonValue("mem://unknown")); // 未注册 → 省略
+
+        /**
+         * 未注册 → 省略
+         */
+        uris.Push(JsonValue("mem://unknown"));
         filter.Set("resourceSubscriptions", std::move(uris));
         auto outcome =
             rig.session->HandleFrame(ModernFrame("sub-a", "subscriptions/listen", ListenParams(std::move(filter))));
         CHECK(outcome);
-        CHECK(!outcome.value().has_response); // 长请求：ack 是通知，无即时响应
+
+        /**
+         * 长请求：ack 是通知，无即时响应
+         */
+        CHECK(!outcome.value().has_response);
         CHECK(rig.log->Size() == 1);
         JsonValue ack = rig.log->Last();
         CHECK(Str(Find(ack, "method")) == "notifications/subscriptions/acknowledged");
         const JsonValue ack_params = Find(ack, "params").value_or(JsonValue());
         const JsonValue accepted = Find(ack_params, "notifications").value_or(JsonValue());
         CHECK(accepted.IsObject());
-        CHECK(!Find(accepted, "toolsListChanged")); // 未支持类型被省略
+
+        /**
+         * 未支持类型被省略
+         */
+        CHECK(!Find(accepted, "toolsListChanged"));
         CHECK(!Find(accepted, "promptsListChanged"));
         auto echoed = Find(accepted, "resourceSubscriptions");
         CHECK(echoed && echoed->IsArray() && echoed->Size() == 1);
-        CHECK(Str(echoed->At(0)) == "mem://a"); // 未注册 uri 不被接纳
+
+        /**
+         * 未注册 uri 不被接纳
+         */
+        CHECK(Str(echoed->At(0)) == "mem://a");
         auto sub_meta = Find(ack_params, "_meta");
         CHECK(sub_meta && Str(Find(*sub_meta, kSubIdKey)) == "sub-a");
     }
 
     {
-        // 空支持子集 + 整数 listen id + 第二订阅独立。
+
+        /**
+         * 空支持子集 + 整数 listen id + 第二订阅独立。
+         */
         Rig rig = MakeRig();
         JsonValue filter = JsonValue::Object();
-        filter.Set("promptsListChanged", JsonValue(true)); // server 不支持 → ack 空 object
+
+        /**
+         * server 不支持 → ack 空 object
+         */
+        filter.Set("promptsListChanged", JsonValue(true));
         JsonValue frame = JsonValue::Object();
         frame.Set("jsonrpc", JsonValue("2.0"));
         frame.Set("id", JsonValue(static_cast<std::int64_t>(2)));
@@ -291,16 +336,27 @@ int main()
         JsonValue ack = rig.log->Last();
         const JsonValue accepted =
             Find(Find(ack, "params").value_or(JsonValue()), "notifications").value_or(JsonValue());
-        CHECK(accepted.IsObject() && accepted.Size() == 0); // 空支持子集
+
+        /**
+         * 空支持子集
+         */
+        CHECK(accepted.IsObject() && accepted.Size() == 0);
         auto sub_meta = Find(Find(ack, "params").value_or(JsonValue()), "_meta");
         auto id_value = sub_meta ? Find(*sub_meta, kSubIdKey) : std::nullopt;
         CHECK(id_value);
         auto as_int = id_value->AsInt64();
-        CHECK(as_int && as_int.value() == 2); // subscriptionId = listen 请求 id 原值
+
+        /**
+         * subscriptionId = listen 请求 id 原值
+         */
+        CHECK(as_int && as_int.value() == 2);
     }
 
     {
-        // 发布过滤 + id 隔离 + 事件顺序 + cancel 结束流。
+
+        /**
+         * 发布过滤 + id 隔离 + 事件顺序 + cancel 结束流。
+         */
         Rig rig = MakeRig();
         auto outcome_a = rig.session->HandleFrame(ModernFrame("sub-a", "subscriptions/listen", ListenParams([] {
                                                                   JsonValue filter = JsonValue::Object();
@@ -315,11 +371,19 @@ int main()
                                                                   return filter;
                                                               }())));
         CHECK(outcome_a && outcome_b);
-        CHECK(rig.log->Size() == 2); // 两条 ack
+
+        /**
+         * 两条 ack
+         */
+        CHECK(rig.log->Size() == 2);
 
         auto published = rig.server->PublishResourceChanged("mem://a");
         CHECK(published);
-        CHECK(published.value() == 1); // 只有 sub-a 接纳该 uri
+
+        /**
+         * 只有 sub-a 接纳该 uri
+         */
+        CHECK(published.value() == 1);
         CHECK(rig.log->Size() == 3);
         JsonValue event = rig.log->Last();
         CHECK(Str(Find(event, "method")) == "notifications/resources/updated");
@@ -328,18 +392,24 @@ int main()
         auto event_meta = Find(event_params, "_meta");
         CHECK(event_meta && Str(Find(*event_meta, kSubIdKey)) == "sub-a");
 
-        // 事件顺序：两次发布 → sub-a 依次收到两帧。
+        /**
+         * 事件顺序：两次发布 → sub-a 依次收到两帧。
+         */
         CHECK(rig.server->PublishResourceChanged("mem://a").value() == 1);
         CHECK(rig.log->Size() == 4);
         JsonValue event2 = rig.log->Last();
         CHECK(Str(Find(event2, "method")) == "notifications/resources/updated");
 
-        // 未注册 uri 发布被拒；不产生帧。
+        /**
+         * 未注册 uri 发布被拒；不产生帧。
+         */
         auto bad = rig.server->PublishResourceChanged("mem://ghost");
         CHECK(!bad);
         CHECK(rig.log->Size() == 4);
 
-        // 非订阅 id 的 cancel：静默丢弃，无帧。
+        /**
+         * 非订阅 id 的 cancel：静默丢弃，无帧。
+         */
         auto stray = rig.session->HandleFrame([] {
             JsonValue params = JsonValue::Object();
             params.Set("requestId", JsonValue("sub-nope"));
@@ -352,7 +422,9 @@ int main()
         CHECK(stray && !stray.value().has_response);
         CHECK(rig.log->Size() == 4);
 
-        // cancel sub-a → 流结束响应帧（id 原值 + result._meta.subscriptionId）。
+        /**
+         * cancel sub-a → 流结束响应帧（id 原值 + result._meta.subscriptionId）。
+         */
         auto cancel = rig.session->HandleFrame([] {
             JsonValue params = JsonValue::Object();
             params.Set("requestId", JsonValue("sub-a"));
@@ -371,11 +443,15 @@ int main()
         auto closing_meta = Find(closing_result, "_meta");
         CHECK(closing_meta && Str(Find(*closing_meta, kSubIdKey)) == "sub-a");
 
-        // 结束后发布不再投递。
+        /**
+         * 结束后发布不再投递。
+         */
         CHECK(rig.server->PublishResourceChanged("mem://a").value() == 0);
         CHECK(rig.log->Size() == 5);
 
-        // 同会话重复活动 listen id 被拒（sub-b 仍在册）。
+        /**
+         * 同会话重复活动 listen id 被拒（sub-b 仍在册）。
+         */
         auto duplicate =
             rig.session->HandleFrame(ModernFrame("sub-b", "subscriptions/listen", ListenParams(JsonValue::Object())));
         CHECK(duplicate);
@@ -387,27 +463,45 @@ int main()
     }
 
     {
-        // 非法过滤器 → -32602；legacy 表无 subscriptions/listen → -32601。
+
+        /**
+         * 非法过滤器 → -32602；legacy 表无 subscriptions/listen → -32601。
+         */
         Rig rig = MakeRig();
-        CHECK(ErrorCodeOf(*rig.session, ModernFrame("s1", "subscriptions/listen", JsonValue::Object()))
-              == static_cast<std::int64_t>(JsonRpcErrorCode::InvalidParams));
+        CHECK(
+            ErrorCodeOf(*rig.session, ModernFrame("s1", "subscriptions/listen", JsonValue::Object()))
+            == static_cast<std::int64_t>(JsonRpcErrorCode::InvalidParams));
         JsonValue bad_filter = JsonValue::Object();
-        bad_filter.Set("resourceSubscriptions", JsonValue("mem://a")); // 非 array
-        CHECK(ErrorCodeOf(*rig.session, ModernFrame("s2", "subscriptions/listen", ListenParams(std::move(bad_filter))))
-              == static_cast<std::int64_t>(JsonRpcErrorCode::InvalidParams));
+
+        /**
+         * 非 array
+         */
+        bad_filter.Set("resourceSubscriptions", JsonValue("mem://a"));
+        CHECK(
+            ErrorCodeOf(*rig.session, ModernFrame("s2", "subscriptions/listen", ListenParams(std::move(bad_filter))))
+            == static_cast<std::int64_t>(JsonRpcErrorCode::InvalidParams));
         JsonValue bad_flag = JsonValue::Object();
         bad_flag.Set("toolsListChanged", JsonValue("yes"));
-        CHECK(ErrorCodeOf(*rig.session, ModernFrame("s3", "subscriptions/listen", ListenParams(std::move(bad_flag))))
-              == static_cast<std::int64_t>(JsonRpcErrorCode::InvalidParams));
-        CHECK(ErrorCodeOf(*rig.session, LegacyFrame("s4", "subscriptions/listen", JsonValue::Object()))
-              == static_cast<std::int64_t>(JsonRpcErrorCode::MethodNotFound));
-        CHECK(rig.log->Size() == 0); // 失败路径零帧
+        CHECK(
+            ErrorCodeOf(*rig.session, ModernFrame("s3", "subscriptions/listen", ListenParams(std::move(bad_flag))))
+            == static_cast<std::int64_t>(JsonRpcErrorCode::InvalidParams));
+        CHECK(
+            ErrorCodeOf(*rig.session, LegacyFrame("s4", "subscriptions/listen", JsonValue::Object()))
+            == static_cast<std::int64_t>(JsonRpcErrorCode::MethodNotFound));
+
+        /**
+         * 失败路径零帧
+         */
+        CHECK(rig.log->Size() == 0);
     }
 
     {
-        // 长请求占用在途名额（稳态上界）：max_inflight=1 → 订阅即占满，普通 request
-        // 核心拒绝；通知类帧（cancel）不占名额，仍可准入并结束订阅（I1 回修回归）。
-        Rig saturated = MakeRig(/*max_inflight=*/1);
+
+        /**
+         * 长请求占用在途名额（稳态上界）：max_inflight=1 → 订阅即占满，普通 request
+         * 核心拒绝；通知类帧（cancel）不占名额，仍可准入并结束订阅（I1 回修回归）。
+         */
+        Rig saturated = MakeRig(1);
         auto listen =
             saturated.session->HandleFrame(ModernFrame("solo", "subscriptions/listen", ListenParams([] {
                                                            JsonValue filter = JsonValue::Object();
@@ -418,8 +512,15 @@ int main()
                                                        }())));
         CHECK(listen && !listen.value().has_response);
         auto blocked = saturated.session->HandleFrame(LegacyFrame("x", "ping", JsonValue::Object()));
-        CHECK(!blocked); // 普通 request 超在途上限 → 核心拒绝（准入语义不变）
-        // 饱和通道上 cancel 仍可达（通知不占名额）：流结束帧 + 名额释放。
+
+        /**
+         * 普通 request 超在途上限 → 核心拒绝（准入语义不变）
+         */
+        CHECK(!blocked);
+
+        /**
+         * 饱和通道上 cancel 仍可达（通知不占名额）：流结束帧 + 名额释放。
+         */
         auto cancel = saturated.session->HandleFrame([] {
             JsonValue params = JsonValue::Object();
             params.Set("requestId", JsonValue("solo"));
@@ -430,19 +531,34 @@ int main()
             return frame.Serialize();
         }());
         CHECK(cancel && !cancel.value().has_response);
-        CHECK(saturated.log->Size() == 2); // ack + 流结束响应
+
+        /**
+         * ack + 流结束响应
+         */
+        CHECK(saturated.log->Size() == 2);
         JsonValue closing = saturated.log->Last();
         CHECK(Str(Find(closing, "id")) == "solo");
         CHECK(Str(Find(Find(closing, "result").value_or(JsonValue()), "resultType")) == "complete");
         auto released = saturated.server->PublishResourceChanged("mem://a");
-        CHECK(released && released.value() == 0); // 订阅已结束：0 帧、名额已归还
+
+        /**
+         * 订阅已结束：0 帧、名额已归还
+         */
+        CHECK(released && released.value() == 0);
         auto freed = saturated.session->HandleFrame(LegacyFrame("y", "ping", JsonValue::Object()));
-        CHECK(freed && freed.value().has_response); // 后续 request 可入
+
+        /**
+         * 后续 request 可入
+         */
+        CHECK(freed && freed.value().has_response);
     }
 
     {
-        // cancel 释放长请求名额：max_inflight=2 容纳订阅 + cancel 通知；结束后归位。
-        Rig rig = MakeRig(/*max_inflight=*/2);
+
+        /**
+         * cancel 释放长请求名额：max_inflight=2 容纳订阅 + cancel 通知；结束后归位。
+         */
+        Rig rig = MakeRig(2);
         auto listen = rig.session->HandleFrame(ModernFrame("solo", "subscriptions/listen", ListenParams([] {
                                                                JsonValue filter = JsonValue::Object();
                                                                JsonValue uris = JsonValue::Array();
@@ -462,12 +578,23 @@ int main()
         }());
         CHECK(cancel && !cancel.value().has_response);
         auto freed = rig.session->HandleFrame(LegacyFrame("x", "ping", JsonValue::Object()));
-        CHECK(freed);                // 名额已归还
-        CHECK(rig.log->Size() == 2); // ack + 流结束响应
+
+        /**
+         * 名额已归还
+         */
+        CHECK(freed);
+
+        /**
+         * ack + 流结束响应
+         */
+        CHECK(rig.log->Size() == 2);
     }
 
     {
-        // Close 丢弃在册订阅：发布被拒，不再产生帧。
+
+        /**
+         * Close 丢弃在册订阅：发布被拒，不再产生帧。
+         */
         Rig rig = MakeRig();
         auto listen = rig.session->HandleFrame(ModernFrame("end", "subscriptions/listen", ListenParams([] {
                                                                JsonValue filter = JsonValue::Object();
@@ -477,15 +604,21 @@ int main()
                                                                return filter;
                                                            }())));
         CHECK(listen);
-        rig.server->Close();
+        (void)rig.server->Close();
         auto after = rig.server->PublishResourceChanged("mem://a");
         CHECK(!after);
-        CHECK(rig.log->Size() == 1); // 仅 ack；abrupt 封口不发流结束响应
+
+        /**
+         * 仅 ack；abrupt 封口不发流结束响应
+         */
+        CHECK(rig.log->Size() == 1);
     }
 
-    // 能力只反映真实机制：无 legacy subscribe/unsubscribe handler（FamilyOf 无
-    // resources/subscribe/unsubscribe，SDK 实测 -32601），故不宣告 subscribe；
-    // resources 原语与 modern subscriptions/listen 照常；无 listChanged。
+    /**
+     * 能力只反映真实机制：无 legacy subscribe/unsubscribe handler（FamilyOf 无
+     * resources/subscribe/unsubscribe，SDK 实测 -32601），故不宣告 subscribe；
+     * resources 原语与 modern subscriptions/listen 照常；无 listChanged。
+     */
     {
         Rig rig = MakeRig();
         JsonValue response = Respond(*rig.session, ModernFrame("d1", "server/discover", JsonValue::Object()));
@@ -496,10 +629,14 @@ int main()
         CHECK(!Find(resources, "listChanged"));
     }
 
-    // ================= S15：MRTR 基础 message patterns ========================
-
+    /**
+     * MRTR 基础 message patterns：
+     */
     {
-        // InputRequired::Create：至少其一非空；空键/空 method 拒。
+
+        /**
+         * InputRequired::Create：至少其一非空；空键/空 method 拒。
+         */
         auto empty = InputRequired::Create({}, std::nullopt);
         CHECK(!empty);
         std::map<std::string, ClientInputRequest> requests;
@@ -524,8 +661,11 @@ int main()
     }
 
     {
-        // wire golden：id-keyed inputRequests（value 只含 method+params，无内层
-        // id/jsonrpc）、requestState opaque 原值。
+
+        /**
+         * wire golden：id-keyed inputRequests（value 只含 method+params，无内层
+         * id/jsonrpc）、requestState opaque 原值。
+         */
         std::map<std::string, ClientInputRequest> requests;
         ClientInputRequest sampling;
         sampling.method = "sampling/createMessage";
@@ -551,7 +691,9 @@ int main()
         CHECK(Find(entry, "params") && !Find(entry, "id") && !Find(entry, "jsonrpc"));
         CHECK(Str(Find(parsed, "requestState")) == "st\u00e9-✈|{}");
 
-        // 只有 requestState 的形态。
+        /**
+         * 只有 requestState 的形态。
+         */
         auto state_only = InputRequired::Create({}, std::optional<std::string>("s"));
         auto wire2 = MakeInputRequiredResult(state_only.value());
         CHECK(wire2);
@@ -561,7 +703,10 @@ int main()
     }
 
     {
-        // 能力门禁：缺失 → -32021 + data.requiredCapabilities；具备 → 通过。
+
+        /**
+         * 能力门禁：缺失 → -32021 + data.requiredCapabilities；具备 → 通过。
+         */
         std::map<std::string, ClientInputRequest> requests;
         ClientInputRequest sampling;
         sampling.method = "sampling/createMessage";
@@ -580,7 +725,9 @@ int main()
         caps.Set("sampling", JsonValue::Object());
         CHECK(!CheckInputRequestCapabilities(caps, requests));
 
-        // 显式 null 与缺失同义；elicitation/roots 各自独立门禁。
+        /**
+         * 显式 null 与缺失同义；elicitation/roots 各自独立门禁。
+         */
         std::map<std::string, ClientInputRequest> elicit;
         ClientInputRequest elicitation;
         elicitation.method = "elicitation/create";
@@ -613,7 +760,10 @@ int main()
     }
 
     {
-        // 重试经真实分派：新 id + inputResponses/requestState 到达 handler → complete。
+
+        /**
+         * 重试经真实分派：新 id + inputResponses/requestState 到达 handler → complete。
+         */
         Rig rig = MakeRig();
         JsonValue params = JsonValue::Object();
         params.Set("uri", JsonValue("mem://a"));
@@ -631,7 +781,9 @@ int main()
         const JsonValue result = Find(response, "result").value_or(JsonValue());
         CHECK(Str(Find(result, "resultType")) == "complete");
 
-        // 新 id 重试（服务端无 modern 会话状态）：同载荷原样可达。
+        /**
+         * 新 id 重试（服务端无 modern 会话状态）：同载荷原样可达。
+         */
         JsonValue params2 = JsonValue::Object();
         params2.Set("uri", JsonValue("mem://a"));
         JsonValue responses2 = JsonValue::Object();
@@ -647,35 +799,44 @@ int main()
     }
 
     {
-        // 重试形状非法 → -32602，handler 计数为 0。
+
+        /**
+         * 重试形状非法 → -32602，handler 计数为 0。
+         */
         Rig rig = MakeRig();
         JsonValue bad_entry = JsonValue::Object();
         bad_entry.Set("uri", JsonValue("mem://a"));
         JsonValue responses = JsonValue::Object();
         responses.Set("srv-1", JsonValue("not-an-object"));
         bad_entry.Set("inputResponses", std::move(responses));
-        CHECK(ErrorCodeOf(*rig.session, ModernFrame("200", "resources/read", std::move(bad_entry)))
-              == static_cast<std::int64_t>(JsonRpcErrorCode::InvalidParams));
+        CHECK(
+            ErrorCodeOf(*rig.session, ModernFrame("200", "resources/read", std::move(bad_entry)))
+            == static_cast<std::int64_t>(JsonRpcErrorCode::InvalidParams));
         CHECK(rig.handler_calls == 0);
 
         JsonValue bad_state = JsonValue::Object();
         bad_state.Set("uri", JsonValue("mem://a"));
         bad_state.Set("requestState", JsonValue(static_cast<std::int64_t>(7)));
-        CHECK(ErrorCodeOf(*rig.session, ModernFrame("201", "resources/read", std::move(bad_state)))
-              == static_cast<std::int64_t>(JsonRpcErrorCode::InvalidParams));
+        CHECK(
+            ErrorCodeOf(*rig.session, ModernFrame("201", "resources/read", std::move(bad_state)))
+            == static_cast<std::int64_t>(JsonRpcErrorCode::InvalidParams));
         CHECK(rig.handler_calls == 0);
 
         JsonValue bad_map = JsonValue::Object();
         bad_map.Set("uri", JsonValue("mem://a"));
         bad_map.Set("inputResponses", JsonValue::Array());
-        CHECK(ErrorCodeOf(*rig.session, ModernFrame("202", "resources/read", std::move(bad_map)))
-              == static_cast<std::int64_t>(JsonRpcErrorCode::InvalidParams));
+        CHECK(
+            ErrorCodeOf(*rig.session, ModernFrame("202", "resources/read", std::move(bad_map)))
+            == static_cast<std::int64_t>(JsonRpcErrorCode::InvalidParams));
         CHECK(rig.handler_calls == 0);
     }
 
     {
-        // legacy 不混入 modern 结构：带 inputResponses 的 legacy 请求原样可达 handler，
-        // 上下文恒空，结果无 resultType/ttlMs。
+
+        /**
+         * legacy 不混入 modern 结构：带 inputResponses 的 legacy 请求原样可达 handler，
+         * 上下文恒空，结果无 resultType/ttlMs。
+         */
         Rig rig = MakeRig();
         JsonValue init_params = JsonValue::Object();
         init_params.Set("protocolVersion", JsonValue("2025-11-25"));
@@ -698,25 +859,36 @@ int main()
         CHECK(!rig.seen_request_state);
         const JsonValue result = Find(response, "result").value_or(JsonValue());
         CHECK(!Find(result, "resultType") && !Find(result, "ttlMs"));
-        CHECK(!Find(result, "inputRequests")); // legacy 不会收到 modern 结构
+
+        /**
+         * legacy 不会收到 modern 结构
+         */
+        CHECK(!Find(result, "inputRequests"));
     }
 
-    // ================= C1 回修回归：ack 窗口竞态（cancel/Close）=================
+    /**
+     * ack 窗口竞态回归（cancel/Close）：
+     */
     {
-        // 借复审探针 T6 的确定化写法：sink 睡 20ms 拉长「emplace → 锁外投递 ack →
-        // 置 ack_sent」窗口，主线程 8ms 后 cancel/Close 命中窗口中段；fork 隔离崩溃
-        //（C1 前该写法 cancel-race 6/6 SIGSEGV——operator[] 把 null 插回表内）。
-        // 断言：cancel/Close 两变体各 20 次重复无 SIGSEGV、无异常退出，且事后
-        // 发布（0 帧）/再取消（静默）证明表无污染。
+
+        /**
+         * 借复审探针 T6 的确定化写法：sink 睡 20ms 拉长「emplace → 锁外投递 ack →
+         * 置 ack_sent」窗口，主线程 8ms 后 cancel/Close 命中窗口中段；fork 隔离崩溃
+         * （未修前该写法 cancel-race 6/6 SIGSEGV——operator[] 把 null 插回表内）。
+         * 断言：cancel/Close 两变体各 20 次重复无 SIGSEGV、无异常退出，且事后
+         * 发布（0 帧）/再取消（静默）证明表无污染。
+         */
         struct MutexLog {
             std::mutex m;
             std::vector<std::string> frames;
+
             void Record(const std::string& frame)
             {
                 std::lock_guard<std::mutex> lock(m);
                 frames.push_back(frame);
             }
         };
+
         std::string cancel_raw = [] {
             JsonValue params = JsonValue::Object();
             params.Set("requestId", JsonValue("race"));
@@ -747,7 +919,13 @@ int main()
             auto session = CreateSession(server);
             auto log = std::make_shared<MutexLog>();
             session->SetNotificationSink([log](const std::string& frame) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(20)); // 拉长窗口
+                // clang-format off
+
+                /**
+                 * 拉长窗口
+                 */
+                // clang-format on
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
                 log->Record(frame);
             });
             std::thread listener([&] {
@@ -759,14 +937,21 @@ int main()
                                                            return filter;
                                                        }())));
             });
-            std::this_thread::sleep_for(std::chrono::milliseconds(8)); // 落在窗口中段
+
+            /**
+             * 落在窗口中段
+             */
+            std::this_thread::sleep_for(std::chrono::milliseconds(8));
             if (kind == RaceKind::kCancel)
                 (void)session->HandleFrame(cancel_raw);
             else
-                server->Close();
+                (void)server->Close();
             listener.join();
-            // 事后核验：无崩溃 + 表无污染。cancel 变体：订阅已结束 → 发布 0 帧；
-            // close 变体：封口后再取消 → 静默（命中空表，绝不解引用悬垂条目）。
+
+            /**
+             * 事后核验：无崩溃 + 表无污染。cancel 变体：订阅已结束 → 发布 0 帧；
+             * close 变体：封口后再取消 → 静默（命中空表，绝不解引用悬垂条目）。
+             */
             if (kind == RaceKind::kCancel) {
                 auto published = server->PublishResourceChanged("mem://a");
                 if (!published || published.value() != 0)
@@ -781,8 +966,12 @@ int main()
         for (int rep = 0; rep < 20; ++rep) {
             for (RaceKind kind : {RaceKind::kCancel, RaceKind::kClose}) {
                 pid_t pid = fork();
+
+                /**
+                 * 子进程：崩溃隔离
+                 */
                 if (pid == 0)
-                    _exit(child(kind)); // 子进程：崩溃隔离
+                    _exit(child(kind));
                 int status = 0;
                 waitpid(pid, &status, 0);
                 if (WIFSIGNALED(status) && WTERMSIG(status) == SIGSEGV)
@@ -791,8 +980,16 @@ int main()
                     ++other;
             }
         }
-        CHECK(segv == 0);  // 40 次窗口竞态无一崩溃（C1 前必现）
-        CHECK(other == 0); // 表无污染：事后核验全通过
+
+        /**
+         * 40 次窗口竞态无一崩溃（未修前必现）
+         */
+        CHECK(segv == 0);
+
+        /**
+         * 表无污染：事后核验全通过
+         */
+        CHECK(other == 0);
     }
 
     std::printf("mcp.subscribe: %d checks / %d failures\n", g_checks, g_failures);

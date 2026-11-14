@@ -99,11 +99,14 @@ key/value 二进制安全；拒绝空 key 和空 DEL 列表。PING 只接受 PON
 
 ## 关闭与宿主收尾
 
-Close/析构在短锁内封口，返回前对已发布连接 RequestClose，不等物理 fd、在途 `CoDial` 或任务结束。合法域中此后新操作返回 Closed；IsClosed 只表示逻辑封口。Close 不关闭共享 Engine，关闭 A 后 B 仍能正常操作。
+- 唯一关闭签名是接口的 `result<void> Close(const CloseOptions& options = {})`（单连接与池同签名，没有 `Close(Immediate)`/`Close(wait_release=true)` 形式的重载）。池：`Immediate` 封口、唤醒排队者并同步请求关闭池内全部连接（`_CloseConnections` 交换 `slots`，含在借 slot 的 client），但不 join 在途命令、不假称物理回归；`Graceful` 封口并拒绝排队者，等已借出连接全部归还后才关闭持有连接，到期只返回 `TimedOut` 并保留借出责任，不自动升级；后续或并发 Graceful 使用各自新的有限绝对期限继续等待，不覆盖首因；`wait_release=true` 在同一调用内以同一绝对期限继续等池槽与池自有 client 真实 `Released()`。
+- 单连接 `CoRedisCli` 消费同一 `CloseOptions`，但只支持 `Immediate` 且不支持 `wait_release`：`Graceful`/`wait_release` 在副作用前返回 `InvalidArgument`。`Close()` 无参等价 `CloseOptions{}`（Immediate）；`_CloseConnection` 只做逻辑封口并请求已发布连接关闭，返回不证明 fd、在途拨号或命令任务已回收，物理事实仍由 `Released()` 与宿主排空证明。
+- 借出连接的协程内调用 `Close`（Graceful 或 wait_release=true）是自等待，在副作用前返回 `InvalidContext`；首因固定，`Graceful → Immediate` 升级由任一次 Immediate（同一 `Close(CloseOptions)` 入口）触发。
+- `IsClosed` 在池与单连接上都只表示逻辑封口；任何 `Close` 返回都不替代物理回收证据。
 
 在途 Connect 可能继续到原 deadline/owner 完成；迟到成功在同一锁内复查封口，Close 已胜就请求回收局部连接并返回 Closed。库没有后台 owner 协程或捕获公开句柄的 net 回调。宿主须从提交时就登记所有 API 任务，注册失败也必须明确记为终态。
 
-最终收尾由普通 native 宿主执行：停止接纳业务、Close 所有 client、整体 Engine RequestClose、等待 Run 返回并 join，确认 Phase 是 Stopped 及检查错误；运行时继续推进直至全部登记任务完成、任务捕获与 client 释放，随后核对 fd/driver/未交付拨号等资源。Run 返回但仍 Closing 不构成排空；CountConnections==0 和 IsClosed 也不能单独证明完成。没有 coroutine Stop/restart。示例在所有局部业务资源收口后以 `_Exit` 结束进程寿命 runtime，不验证全局静态析构；测试统一复用 `tests/net/ProcessRuntimeTestMain.hpp` 的退出边界。
+最终收尾由普通 native 宿主执行：停止接纳业务、Close 所有 client、整体 Engine Close(Immediate)、等待 Run 返回并 join，确认 Phase 是 Stopped 及检查错误；运行时继续推进直至全部登记任务完成、任务捕获与 client 释放，随后核对 fd/driver/未交付拨号等资源。Run 返回但仍 Closing 不构成排空；CountConnections==0 和 IsClosed 也不能单独证明完成。没有 coroutine Stop/restart。示例在所有局部业务资源收口后以 `_Exit` 结束进程寿命 runtime，不验证全局静态析构；测试统一复用 `tests/net/ProcessRuntimeTestMain.hpp` 的退出边界。
 
 新类不继承旧 ICoCloseable。framework 原有同步资源关闭视图不能直接使用这个异步 Close；framework owner 仍须明确登记、最终 Engine/任务排空和消费者迁移，再验证其自身集成。
 

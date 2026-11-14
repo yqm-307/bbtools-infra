@@ -52,10 +52,10 @@ SOFTWARE.
 
 ## 纯逻辑包（buffer / Options / LB）移植出处
 
-2026-10 网络纯逻辑包按以下语义移植，全部为自有 C++ 实现（未复制/直译 Go 源码），只保留语义依据：
+以下 C++ 实现依据上述 gnet 语义编写，全部为自有实现（未复制、未直译 Go 源码），此处只保留语义依据：
 
-- `load_balancer.go`（Apache-2.0，gnet.go:128-140 hash 语义）：RoundRobin 顺序（`nextIndex % size`）、LeastConnections 严格小于（同值优先第一个）、SourceAddrHash 对 `net.Addr.String()` 完整字节做 IEEE CRC32 后按 size 取模。未移植其 owner 注册表与并发警告相关结构；C++ 侧单 owner 选择器显式非线程安全，跨域串行化留给 Engine 层（0010 D3）。32 位 Go int 取负再 abs 的路径不复现（0010：不承诺 Go 二进制兼容）。
-- `gnet.go:584-608`（Apache-2.0）：read/write cap 默认 64KiB（`MaxStreamBufferCap`）、正值最小 1024（`ring.DefaultBufferSize`）再向上 2 次幂；ET chunk >0 启用 ET 并向上 2 次幂、ET=true 且 chunk==0 默认 1MiB。C++ 差异：负值严格拒绝（参考 <=0 一律默认）、取整先核 size_t 溢出、CPU 数显式参数（保持纯值层）、LockOSThread 的 10000 上限按解析后 loop 数校验。
-- `pkg/buffer/ring/ring_buffer.go:40`（MIT）：`DefaultBufferSize = 1024` 数值语义参考。未移植 ring 算法本身，内部复用既有 Boost 1.90 circular_buffer（Boost 软件许可）；薄包装仅增长、不覆盖，并支持自身可读 view 安全追加。相对 gnet 的差异是追加超总量在修改前拒绝，不覆盖最旧数据丢字节；上方 MIT 声明仅在将来实质移植该算法时适用。
-- `options.go`（Apache-2.0）：全字段值层映射（Options/With* → 类型化 Options + NormalizeOptions），不移植任意 option 回调语法。
+- `load_balancer.go`（Apache-2.0，gnet.go:128-140 hash 语义）：RoundRobin 顺序（`nextIndex % size`）、LeastConnections 严格小于（同值优先第一个）、SourceAddrHash 对 `net.Addr.String()` 完整字节做 IEEE CRC32 后按 size 取模。未移植其 owner 注册表与并发警告相关结构；C++ 侧单 owner 选择器显式非线程安全，跨域串行化留给 Engine 层（见 [0010](../decisions/0010-gnet-network-foundation.md)）。32 位 Go int 取负再 abs 的路径不复现（0010：不承诺 Go 二进制兼容）。
+- `gnet.go:584-608`（Apache-2.0）：read/write cap、ET chunk 与 LockOSThread 的默认值与取整语义。这些字段已按 [0010](../decisions/0010-gnet-network-foundation.md) 的删除表从公共面去掉，C++ 侧不再有对应实现，本文件不描述其差异。
+- `pkg/buffer/ring/ring_buffer.go`（MIT）：未移植该算法。C++ 侧 `EventRingBuffer` 的存储为 Boost 1.90 `boost::beast::multi_buffer`（Boost 软件许可）；它只增长、不覆盖最旧数据，追加超总量时在修改前拒绝。上方 MIT 声明仅在将来实质移植该算法时适用。
+- `options.go`（Apache-2.0）：只映射到类型化 `Options` 的值层字段（现行字段见 [0010](../decisions/0010-gnet-network-foundation.md) 的「值层与并发接缝的现行口径」），不移植 `With*` 回调语法。
 - CRC32 用 Boost `crc_32_type`（Boost 软件许可，仓内既有依赖）：与 Go `hash/crc32.ChecksumIEEE` 同为 IEEE CRC32；理由是复用成熟实现、不自造 hash、不用 std::hash（跨实现不稳定）、不新增依赖。

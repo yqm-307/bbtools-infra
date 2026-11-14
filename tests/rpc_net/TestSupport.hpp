@@ -1,9 +1,10 @@
 #pragma once
 
-// rpc_net 契约测试支持（V2 单一会话面）：自有进程、动态端口的真实 loopback
-// 对端（raw POSIX 拨号/监听，脚本化 SessionFrame wire 字节），受控 CoWaiter
-// 屏障与有界 watchdog。fixture 只补充时序控制与观察，不 mock RPC 协议本身。
-
+/**
+ * rpc_net 契约测试支持（V2 单一会话面）：自有进程、动态端口的真实 loopback
+ * 对端（raw POSIX 拨号/监听，脚本化 SessionFrame wire 字节），受控 CoWaiter
+ * 屏障与有界 watchdog。fixture 只补充时序控制与观察，不 mock RPC 协议本身。
+ */
 #include <bbt/infra/rpc/Admission.hpp>
 #include <bbt/infra/rpc/CoRpcClient.hpp>
 #include <bbt/infra/rpc/Options.hpp>
@@ -49,12 +50,14 @@ inline void Check(bool value, const char* expression, int line)
         throw std::runtime_error("line " + std::to_string(line) + ": " + expression);
     }
 }
+
 #define CHECK(expression) ::rpc_net_test::Check(static_cast<bool>(expression), #expression, __LINE__)
 
 inline CallOptions Until(std::chrono::milliseconds duration = 3s)
 {
     return {std::chrono::steady_clock::now() + duration};
 }
+
 inline bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds timeout = 3s)
 {
     const auto end = std::chrono::steady_clock::now() + timeout;
@@ -66,30 +69,35 @@ inline bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milli
     }
     return true;
 }
+
 template <class T> T Get(std::future<T>& future)
 {
     CHECK(future.wait_for(5s) == std::future_status::ready);
     return future.get();
 }
+
 template <class T> void ExpectCode(const result<T>& value, ErrorCode code)
 {
     CHECK(!value);
     CHECK(value.error().code == code);
 }
 
-// 测试进程 watchdog：超时仍为失败；不把强制退出当资源清理成功。
+/**
+ * 测试进程 watchdog：超时仍为失败；不把强制退出当资源清理成功。
+ */
 class Watchdog {
 public:
     Watchdog()
         : m_thread([this] {
-              std::unique_lock<std::mutex> lock(m_mutex);
-              if (!m_cv.wait_for(lock, 30s, [this] { return m_done; })) {
-                  std::cerr << "FAIL watchdog: bounded test did not finish\n" << std::flush;
-                  std::_Exit(3);
-              }
-          })
+            std::unique_lock<std::mutex> lock(m_mutex);
+            if (!m_cv.wait_for(lock, 30s, [this] { return m_done; })) {
+                std::cerr << "FAIL watchdog: bounded test did not finish\n" << std::flush;
+                std::_Exit(3);
+            }
+        })
     {
     }
+
     ~Watchdog()
     {
         {
@@ -107,14 +115,19 @@ private:
     std::thread m_thread;
 };
 
-// 业务协程通过 CoWaiter 等待的真实屏障：handler 进入即挂起，测试线程显式放行。
+/**
+ * 业务协程通过 CoWaiter 等待的真实屏障：handler 进入即挂起，测试线程显式放行。
+ */
 struct Gate {
     std::atomic<bool> entered{false};
     std::shared_ptr<bbt::coroutine::sync::CoWaiter> waiter;
-    Gate() : waiter(bbt::coroutine::sync::CoWaiter::Create())
+
+    Gate()
+        : waiter(bbt::coroutine::sync::CoWaiter::Create())
     {
         CHECK(waiter);
     }
+
     void Pause()
     {
         const auto status = waiter->WaitWithCallback({std::chrono::steady_clock::now() + 10s}, [this] {
@@ -123,18 +136,16 @@ struct Gate {
         });
         CHECK(status == bbt::coroutine::WaitStatus::Completed);
     }
-    void Release()
-    {
-        waiter->Notify();
-    }
-    ~Gate()
-    {
-        Release();
-    }
+
+    void Release() { waiter->Notify(); }
+
+    ~Gate() { Release(); }
 };
 
-// 自有 raw loopback TCP 拨号对端：任意分片注入、坏前缀、截断、canned 回复。
-// 协议字节由测试脚本化（不 mock session/adapter）。
+/**
+ * 自有 raw loopback TCP 拨号对端：任意分片注入、坏前缀、截断、canned 回复。
+ * 协议字节由测试脚本化（不 mock session/adapter）。
+ */
 class RawTcpPeer {
 public:
     explicit RawTcpPeer(const net::Address& address)
@@ -152,6 +163,7 @@ public:
         target.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         CHECK(::connect(fd, reinterpret_cast<sockaddr*>(&target), sizeof(target)) == 0);
     }
+
     ~RawTcpPeer()
     {
         if (fd >= 0) {
@@ -168,24 +180,29 @@ public:
             offset += static_cast<std::size_t>(n);
         }
     }
-    // 逐片发送：prefix/body 任意分片（含 1 字节片）。
+
+    /**
+     * 逐片发送：prefix/body 任意分片（含 1 字节片）。
+     */
     void SendFragmented(const std::string& bytes, std::size_t chunk)
     {
         for (std::size_t offset = 0; offset < bytes.size(); offset += chunk) {
             Send(bytes.substr(offset, std::min(chunk, bytes.size() - offset)));
         }
     }
-    void HalfClose()
-    {
-        ::shutdown(fd, SHUT_WR);
-    }
+
+    void HalfClose() { ::shutdown(fd, SHUT_WR); }
+
     bool Eof()
     {
         char bytes[64];
         const auto n = ::recv(fd, bytes, sizeof(bytes), 0);
         return n == 0 || (n < 0 && errno == ECONNRESET);
     }
-    // 读恰好 n 字节（测试响应帧前缀/body）。
+
+    /**
+     * 读恰好 n 字节（测试响应帧前缀/body）。
+     */
     std::string ReadExact(std::size_t n)
     {
         std::string out;
@@ -202,12 +219,15 @@ private:
     int fd{-1};
 };
 
-// 自有 raw loopback TCP 监听对端：以给定 identity 完成 inbound 侧握手，之后
-// 由测试线程逐帧注入任意 Response/垃圾字节——验证客户端对畸形回复的收场。
-// 只用于「对端行为」构造，不替代真实 server 实现。
+/**
+ * 自有 raw loopback TCP 监听对端：以给定 identity 完成 inbound 侧握手，之后
+ * 由测试线程逐帧注入任意 Response/垃圾字节——验证客户端对畸形回复的收场。
+ * 只用于「对端行为」构造，不替代真实 server 实现。
+ */
 class RawTcpListener {
 public:
-    explicit RawTcpListener(std::string identity) : m_identity(std::move(identity))
+    explicit RawTcpListener(std::string identity)
+        : m_identity(std::move(identity))
     {
         m_listener = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
         CHECK(m_listener >= 0);
@@ -222,6 +242,7 @@ public:
         CHECK(::getsockname(m_listener, reinterpret_cast<sockaddr*>(&local), &size) == 0);
         m_port = ntohs(local.sin_port);
     }
+
     ~RawTcpListener()
     {
         if (m_fd >= 0) {
@@ -232,13 +253,12 @@ public:
         }
     }
 
-    std::string Target() const
-    {
-        return "tcp://127.0.0.1:" + std::to_string(m_port);
-    }
+    std::string Target() const { return "tcp://127.0.0.1:" + std::to_string(m_port); }
 
-    // 有界接受一个连接（测试线程调用，不在协程内）：10s 内未连上按失败收场，
-    // 不让 raw 对端把用例挂死到 watchdog。
+    /**
+     * 有界接受一个连接（测试线程调用，不在协程内）：10s 内未连上按失败收场，
+     * 不让 raw 对端把用例挂死到 watchdog。
+     */
     void Accept()
     {
         fd_set readable;
@@ -255,8 +275,10 @@ public:
         (void)::setsockopt(m_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
     }
 
-    // inbound 侧握手：读对端 Hello → 写本端 Hello → 等对端 HelloAck（本端
-    // identity 字典序更大，故对端是 epoch owner）→ echo HelloAck。
+    /**
+     * inbound 侧握手：读对端 Hello → 写本端 Hello → 等对端 HelloAck（本端
+     * identity 字典序更大，故对端是 epoch owner）→ echo HelloAck。
+     */
     std::uint64_t Handshake()
     {
         const auto hello = ReadFrame();
@@ -294,12 +316,14 @@ public:
         CHECK(decoded);
         return std::move(decoded).value();
     }
+
     void SendFrame(const rpc::SessionFrame& frame)
     {
         auto bytes = rpc::EncodeFramedSessionFrame(frame, 8 * 1024 * 1024);
         CHECK(bytes);
         SendRaw(std::string(reinterpret_cast<const char*>(bytes.value().data()), bytes.value().size()));
     }
+
     void SendRaw(const std::string& bytes)
     {
         std::size_t offset = 0;
@@ -309,12 +333,14 @@ public:
             offset += static_cast<std::size_t>(n);
         }
     }
+
     bool Eof()
     {
         char bytes[64];
         const auto n = ::recv(m_fd, bytes, sizeof(bytes), 0);
         return n == 0 || (n < 0 && errno == ECONNRESET);
     }
+
     std::string ReadExact(std::size_t n)
     {
         std::string out;
@@ -334,4 +360,6 @@ private:
     std::string m_identity;
 };
 
-} // namespace rpc_net_test
+// clang-format off
+}
+// clang-format on

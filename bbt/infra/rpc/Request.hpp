@@ -23,7 +23,6 @@
  * 注意：访问器 Metadata() 与别名 rpc::Metadata 同名；类内所有别名使用均以
  * rpc:: 限定，避免成员函数声明隐藏类型名（GCC 「changes meaning」硬错误）。
  */
-
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -45,13 +44,17 @@ enum class TrafficClass : std::uint8_t {
     Actor = 2,
 };
 
-/// wire ReplyMode 对应枚举（序号固定）。
+/**
+ * wire ReplyMode 对应枚举（序号固定）。
+ */
 enum class ReplyMode : std::uint8_t {
     None = 0,
     Required = 1,
 };
 
-/// envelope metadata：顺序保留；前缀白名单/条数/键值上限约束见 SessionCodec.hpp。
+/**
+ * envelope metadata：顺序保留；前缀白名单/条数/键值上限约束见 SessionCodec.hpp。
+ */
 using Metadata = std::vector<std::pair<std::string, std::string>>;
 
 /**
@@ -63,10 +66,21 @@ using Metadata = std::vector<std::pair<std::string, std::string>>;
  * detail::RequestContextAccess 由 infra 填充。
  */
 struct RequestContext {
-    /// 入站时由 infra 按 min(wire remaining budget, 本地 handler 预算) 设置。
+
+    /**
+     * 入站时由 infra 按 min(wire remaining budget, 本地 handler 预算) 设置。
+     */
     bbt::coroutine::Deadline deadline{bbt::coroutine::Deadline::max()};
-    std::string peer_identity;  ///< 远端自报身份（非认证凭据）
-    std::string peer_principal; ///< 可信 transport/adapter 认证的主体
+
+    /**
+     * 远端自报身份（非认证凭据）
+     */
+    std::string peer_identity;
+
+    /**
+     * 可信 transport/adapter 认证的主体
+     */
+    std::string peer_principal;
 };
 
 namespace detail {
@@ -81,147 +95,186 @@ struct RequestContextAccess;
 class Request {
 public:
     Request() = default;
-    /// 以服务名与方法名构造一个空请求。
-    /// @param service 服务名
-    /// @param method 方法名
-    Request(std::string service, std::string method) : m_service(std::move(service)), m_method(std::move(method))
+
+    /**
+     * @brief 以服务名与方法名构造一个空请求。
+     * @param service 服务名
+     * @param method 方法名
+     */
+    Request(std::string service, std::string method)
+        : m_service(std::move(service))
+        , m_method(std::move(method))
     {
     }
 
-    /// 服务名。
-    const std::string& Service() const noexcept
-    {
-        return m_service;
-    }
-    /// 方法名。
-    const std::string& Method() const noexcept
-    {
-        return m_method;
-    }
-    /// 请求 id。
-    const std::string& RequestId() const noexcept
-    {
-        return m_request_id;
-    }
-    /// 消息 id（Send 必填，用于 SendAccepted 关联）。
-    const std::string& MessageId() const noexcept
-    {
-        return m_message_id;
-    }
-    /// 请求 schema 标识。
-    const std::string& RequestSchema() const noexcept
-    {
-        return m_request_schema;
-    }
-    /// 响应 schema 标识。
-    const std::string& ResponseSchema() const noexcept
-    {
-        return m_response_schema;
-    }
-    /// 位置参数 payload（原始字节）。
-    const std::vector<std::uint8_t>& Payload() const noexcept
-    {
-        return m_payload;
-    }
-    /// envelope metadata（顺序保留）。
-    const rpc::Metadata& Metadata() const noexcept
-    {
-        return m_metadata;
-    }
-    /// 流量类别；wire traffic_class 的唯一真源。
-    TrafficClass Traffic() const noexcept
-    {
-        return m_traffic;
-    }
-    /// 回复模式；wire reply_mode 的唯一真源。
-    ReplyMode Reply() const noexcept
-    {
-        return m_reply;
-    }
-    /// 顺序键（opaque bytes，infra 只比较不解析）。
-    const std::string& OrderingKey() const noexcept
-    {
-        return m_ordering_key;
-    }
-    /// 会话内序号。
-    std::uint64_t Sequence() const noexcept
-    {
-        return m_sequence;
-    }
-    /// 入站上下文（期限/对端身份/主体）。
-    const RequestContext& Context() const noexcept
-    {
-        return m_context;
-    }
+    /**
+     * @brief 服务名。
+     */
+    const std::string& Service() const noexcept { return m_service; }
 
-    /// 设置服务名。
+    /**
+     * @brief 方法名。
+     */
+    const std::string& Method() const noexcept { return m_method; }
+
+    /**
+     * @brief 请求 id。
+     */
+    const std::string& RequestId() const noexcept { return m_request_id; }
+
+    /**
+     * @brief 消息 id（Send 必填，用于 SendAccepted 关联）。
+     */
+    const std::string& MessageId() const noexcept { return m_message_id; }
+
+    /**
+     * @brief 请求 schema 标识。
+     */
+    const std::string& RequestSchema() const noexcept { return m_request_schema; }
+
+    /**
+     * @brief 响应 schema 标识。
+     */
+    const std::string& ResponseSchema() const noexcept { return m_response_schema; }
+
+    /**
+     * @brief 位置参数 payload（原始字节）。
+     */
+    const std::vector<std::uint8_t>& Payload() const noexcept { return m_payload; }
+
+    /**
+     * @brief envelope metadata（顺序保留）。
+     */
+    const rpc::Metadata& Metadata() const noexcept { return m_metadata; }
+
+    /**
+     * @brief 流量类别；wire traffic_class 的唯一真源。
+     */
+    TrafficClass Traffic() const noexcept { return m_traffic; }
+
+    /**
+     * @brief 回复模式；wire reply_mode 的唯一真源。
+     */
+    ReplyMode Reply() const noexcept { return m_reply; }
+
+    /**
+     * @brief 顺序键（opaque bytes，infra 只比较不解析）。
+     */
+    const std::string& OrderingKey() const noexcept { return m_ordering_key; }
+
+    /**
+     * @brief 会话内序号。
+     */
+    std::uint64_t Sequence() const noexcept { return m_sequence; }
+
+    /**
+     * @brief 入站上下文（期限/对端身份/主体）。
+     */
+    const RequestContext& Context() const noexcept { return m_context; }
+
+    /**
+     * @brief 设置服务名。
+     */
     Request& SetService(std::string value)
     {
         m_service = std::move(value);
         return *this;
     }
-    /// 设置方法名。
+
+    /**
+     * @brief 设置方法名。
+     */
     Request& SetMethod(std::string value)
     {
         m_method = std::move(value);
         return *this;
     }
-    /// 设置请求 id。
+
+    /**
+     * @brief 设置请求 id。
+     */
     Request& SetRequestId(std::string value)
     {
         m_request_id = std::move(value);
         return *this;
     }
-    /// 设置消息 id（Send 必填）。
+
+    /**
+     * @brief 设置消息 id（Send 必填）。
+     */
     Request& SetMessageId(std::string value)
     {
         m_message_id = std::move(value);
         return *this;
     }
-    /// 设置请求 schema 标识。
+
+    /**
+     * @brief 设置请求 schema 标识。
+     */
     Request& SetRequestSchema(std::string value)
     {
         m_request_schema = std::move(value);
         return *this;
     }
-    /// 设置响应 schema 标识。
+
+    /**
+     * @brief 设置响应 schema 标识。
+     */
     Request& SetResponseSchema(std::string value)
     {
         m_response_schema = std::move(value);
         return *this;
     }
-    /// 设置 payload 字节。
+
+    /**
+     * @brief 设置 payload 字节。
+     */
     Request& SetPayload(std::vector<std::uint8_t> value)
     {
         m_payload = std::move(value);
         return *this;
     }
-    /// 设置 envelope metadata。
+
+    /**
+     * @brief 设置 envelope metadata。
+     */
     Request& SetMetadata(rpc::Metadata value)
     {
         m_metadata = std::move(value);
         return *this;
     }
-    /// 设置流量类别；System 由 session/adapter 边界按契约拒绝业务伪造。
+
+    /**
+     * @brief 设置流量类别；System 由 session/adapter 边界按契约拒绝业务伪造。
+     */
     Request& SetTraffic(TrafficClass value)
     {
         m_traffic = value;
         return *this;
     }
-    /// 设置回复模式（Call 要求 Required，Send 要求 None）。
+
+    /**
+     * @brief 设置回复模式（Call 要求 Required，Send 要求 None）。
+     */
     Request& SetReply(ReplyMode value)
     {
         m_reply = value;
         return *this;
     }
-    // ordering_key 是 opaque bytes；infra 只做长度、相等和同会话比较，不解析。
-    /// 设置顺序键。
+
+    /**
+     * @brief ordering_key 是 opaque bytes；infra 只做长度、相等和同会话比较，不解析。
+     * 设置顺序键。
+     */
     Request& SetOrderingKey(std::string value)
     {
         m_ordering_key = std::move(value);
         return *this;
     }
-    /// 设置会话内序号。
+
+    /**
+     * @brief 设置会话内序号。
+     */
     Request& SetSequence(std::uint64_t value)
     {
         m_sequence = value;
@@ -229,13 +282,13 @@ public:
     }
 
 private:
-    // infra 填充入站 Context 的唯一接缝（session/adapter detail 使用）；
-    // 公共面不提供 setter，业务不能伪造 peer_identity/peer_principal。
+    /**
+     * infra 填充入站 Context 的唯一接缝（session/adapter detail 使用）；
+     * 公共面不提供 setter，业务不能伪造 peer_identity/peer_principal。
+     */
     friend struct detail::RequestContextAccess;
-    void SetContext(RequestContext value)
-    {
-        m_context = std::move(value);
-    }
+
+    void SetContext(RequestContext value) { m_context = std::move(value); }
 
     std::string m_service;
     std::string m_method;
@@ -253,6 +306,7 @@ private:
 };
 
 namespace detail {
+
 /**
  * @brief detail 接缝：infra 内部（Codec decode / session adapter）填充入站
  *        RequestContext；framework/业务无公共 setter 可用。
@@ -260,14 +314,19 @@ namespace detail {
  * 命名 detail:: 表达非业务入口——放公共头是因 Request 私有成员必须在此授权。
  */
 struct RequestContextAccess {
-    /// 以给定上下文覆写入站请求的 Context。
-    /// @param request 目标请求
-    /// @param context 入站期限与对端身份
-    static void Set(Request& request, RequestContext context)
-    {
-        request.SetContext(std::move(context));
-    }
-};
-} // namespace detail
 
-} // namespace bbt::infra::rpc
+    /**
+     * @brief 以给定上下文覆写入站请求的 Context。
+     * @param request 目标请求
+     * @param context 入站期限与对端身份
+     */
+    static void Set(Request& request, RequestContext context) { request.SetContext(std::move(context)); }
+};
+
+// clang-format off
+}
+// clang-format on
+
+// clang-format off
+}
+// clang-format on

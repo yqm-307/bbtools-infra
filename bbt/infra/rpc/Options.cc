@@ -42,4 +42,6 @@ result<void> ServerOptions::Validate() const
     return result<void>::ok();
 }
 
-} // namespace bbt::infra::rpc
+// clang-format off
+}
+// clang-format on

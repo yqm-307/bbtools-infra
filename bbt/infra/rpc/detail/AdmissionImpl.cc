@@ -1,7 +1,9 @@
-// RPC admission 公共类型的不透明实现：AdmissionQueue 单 FIFO worker、
-// ReplyCompletion 写终态、AdmissionLease 单次释放与 AdmissionAccess 构造
-// 接缝。impl 类型见 detail/RpcSessionState.hpp；会话内使用点（reader 的
-// AdmitInbound/拒绝路径）在 detail/RpcSession.cc。
+/**
+ * RPC admission 公共类型的不透明实现：AdmissionQueue 单 FIFO worker、
+ * ReplyCompletion 写终态、AdmissionLease 单次释放与 AdmissionAccess 构造
+ * 接缝。impl 类型见 detail/RpcSessionState.hpp；会话内使用点（reader 的
+ * AdmitInbound/拒绝路径）在 detail/RpcSession.cc。
+ */
 #include <bbt/infra/rpc/Admission.hpp>
 #include <bbt/infra/rpc/detail/RpcSessionState.hpp>
 #include <bbt/infra/rpc/detail/Session.hpp>
@@ -18,6 +20,33 @@ namespace bbt::infra::rpc {
 using namespace std::chrono_literals;
 using bbt::coroutine::WaitStatus;
 using bbt::coroutine::sync::CoWaiter;
+
+namespace {
+
+/**
+ * 回复写终态前保持 server 的排空责任：admission lease 可能在回复入队后立即
+ * 归还，Graceful 不能据此提前 Seal。作用域覆盖 Complete/Fail 的全部退出路径。
+ */
+struct OpenReplyGuard {
+    std::weak_ptr<ServerV2State> server;
+
+    ~OpenReplyGuard()
+    {
+        if (auto state = server.lock()) {
+            std::lock_guard<std::mutex> lock(state->mu);
+            if (state->open_replies != 0) {
+                --state->open_replies;
+            }
+            if (state->close_signal) {
+                state->close_signal->Notify();
+            }
+        }
+    }
+};
+
+// clang-format off
+}
+// clang-format on
 
 void AdmissionWorker(std::shared_ptr<detail::AdmissionQueueImpl> impl)
 {
@@ -70,27 +99,42 @@ void AdmissionWorker(std::shared_ptr<detail::AdmissionQueueImpl> impl)
         }
         if (handled) {
             if (reply && reply->ForSendAcceptance()) {
-                // Send + RequireRemoteAcceptance：mailbox 接纳成功由 infra
-                // 写一次 SendAccepted 终态；Complete({}) 产成功确认。
+
+                /**
+                 * Send + RequireRemoteAcceptance：mailbox 接纳成功由 infra
+                 * 写一次 SendAccepted 终态；Complete({}) 产成功确认。
+                 */
                 (void)reply->Complete(Response{});
             }
             if (!is_call && lease) {
-                // Send：mailbox 接纳即结束 infra 投递责任（ADR §4.2）。
+
+                /**
+                 * Send：mailbox 接纳即结束 infra 投递责任（ADR §4.2）。
+                 */
                 lease->Release();
             }
-            // Call：reply/lease 归 framework，worker 不发布、不减 inflight。
+
+            /**
+             * Call：reply/lease 归 framework，worker 不发布、不减 inflight。
+             */
             continue;
         }
-        // 未接纳：infra 发布一次终态（Call → Response error；带确认 Send →
-        // SendAccepted error），item 未转移（handler 契约：失败即未转移）。
+
+        /**
+         * 未接纳：infra 发布一次终态（Call → Response error；带确认 Send →
+         * SendAccepted error），item 未转移（handler 契约：失败即未转移）。
+         */
         if (reply && !reply->IsTerminal()) {
             auto error = handled.error();
             if (reply->ForSendAcceptance() || is_call) {
                 (void)reply->Fail(std::move(error));
             }
         }
-        // lease 单次结算——Release 内部已完成 inflight-1 与 finished+1，
-        // 这里不再重复 NoteInflight（下溢 UINT64_MAX 会让 Drain 假超时）。
+
+        /**
+         * lease 单次结算——Release 内部已完成 inflight-1 与 finished+1，
+         * 这里不再重复 NoteInflight（下溢 UINT64_MAX 会让 Drain 假超时）。
+         */
         if (lease) {
             lease->Release();
         }
@@ -101,10 +145,11 @@ void AdmissionWorker(std::shared_ptr<detail::AdmissionQueueImpl> impl)
     }
 }
 
-// --- AdmissionQueue 公共方法 -------------------------------------------------
-
-result<std::shared_ptr<AdmissionQueue>> AdmissionQueue::Create(std::size_t max_items, std::size_t max_bytes,
-                                                               AdmissionHandler handler)
+/**
+ * --- AdmissionQueue 公共方法 -------------------------------------------------
+ */
+result<std::shared_ptr<AdmissionQueue>>
+AdmissionQueue::Create(std::size_t max_items, std::size_t max_bytes, AdmissionHandler handler)
 {
     using R = result<std::shared_ptr<AdmissionQueue>>;
     if (max_items == 0 || max_bytes == 0 || !handler) {
@@ -125,8 +170,9 @@ result<std::shared_ptr<AdmissionQueue>> AdmissionQueue::Create(std::size_t max_i
     return R::ok(detail::AdmissionAccess::MakeQueue(std::move(impl)));
 }
 
-// --- detail::AdmissionAccess：不透明实现的唯一构造/收口入口 -------------------
-
+/**
+ * --- detail::AdmissionAccess：不透明实现的唯一构造/收口入口 -------------------
+ */
 std::shared_ptr<AdmissionQueue> detail::AdmissionAccess::MakeQueue(std::shared_ptr<detail::AdmissionQueueImpl> impl)
 {
     return std::shared_ptr<AdmissionQueue>(new AdmissionQueue(std::move(impl)));
@@ -147,8 +193,8 @@ std::shared_ptr<detail::ReplyCompletionImpl> detail::AdmissionAccess::ClaimTermi
     return reply.MarkTerminalForReject();
 }
 
-void detail::AdmissionAccess::AttachQueue(const std::shared_ptr<AdmissionQueue>& queue,
-                                          const std::shared_ptr<ServerV2State>& server)
+void detail::AdmissionAccess::AttachQueue(
+    const std::shared_ptr<AdmissionQueue>& queue, const std::shared_ptr<ServerV2State>& server)
 {
     if (!queue || !queue->m_impl) {
         return;
@@ -178,9 +224,12 @@ result<void> AdmissionQueue::Admit(AdmissionItem item)
             m_impl->queue.push_back(std::move(item));
         }
     }
-    // dropped 记账移出 impl->mu 临界区：锁序统一为 server->mu → impl->mu
-    //（ServerV2Close/Stats 持 server->mu 时可经 queue 观察面取 impl->mu；
-    // 反向在 impl->mu 内再取 server->mu 构成闭环死锁）。
+
+    /**
+     * dropped 记账移出 impl->mu 临界区：锁序统一为 server->mu → impl->mu
+     * （ServerV2Close/Stats 持 server->mu 时可经 queue 观察面取 impl->mu；
+     * 反向在 impl->mu 内再取 server->mu 构成闭环死锁）。
+     */
     if (over_cap) {
         if (auto server = m_impl->server.lock()) {
             std::lock_guard<std::mutex> slock(server->mu);
@@ -249,30 +298,38 @@ std::uint64_t AdmissionQueue::BytesQueued(std::size_t lane) const noexcept
     return m_impl->queued_bytes[lane];
 }
 
-// --- ReplyCompletion / AdmissionLease 公共方法 --------------------------------
-
+/**
+ * --- ReplyCompletion / AdmissionLease 公共方法 --------------------------------
+ */
 bbt_co_async(result<void>) ReplyCompletion::Complete(Response response)
 {
     auto impl = m_impl;
     if (!impl) {
         return ErrV(ErrorCode::InvalidArgument, "reply completion invalid");
     }
-    // 契约要求受管协程挂起等写终态；非协程调用在 terminal/入队等任何
-    // 副作用前拒绝——「无法等待」不得伪报成写成功（写责任唯一结算由
-    // infra 完成，本条不产生任何写责任）。
+
+    /**
+     * 契约要求受管协程挂起等写终态；非协程调用在 terminal/入队等任何
+     * 副作用前拒绝——「无法等待」不得伪报成写成功（写责任唯一结算由
+     * infra 完成，本条不产生任何写责任）。
+     */
     if (!g_bbt_tls_coroutine_co) {
         return ErrV(ErrorCode::InvalidContext, "reply completion requires coroutine context");
     }
     if (impl->terminal.exchange(true)) {
         return ErrV(ErrorCode::InvalidArgument, "reply completion already terminal");
     }
+    OpenReplyGuard reply_guard{impl->server};
     auto session = impl->session.lock();
     if (!session || session->dead.load()) {
         return ErrV(ErrorCode::Closed, "session closed before reply");
     }
     const auto write_deadline = impl->reply_deadline;
-    // 回复写窗口已过：迟到回复对调用方已无交付意义，且把过期期限交给共享
-    // stream 会在接纳后超时并把整条 link 退役。只发布本条终态，不产生写责任。
+
+    /**
+     * 回复写窗口已过：迟到回复对调用方已无交付意义，且把过期期限交给共享
+     * stream 会在接纳后超时并把整条 link 退役。只发布本条终态，不产生写责任。
+     */
     if (write_deadline != RpcClock::time_point::max() && write_deadline <= RpcClock::now()) {
         return ErrV(ErrorCode::TimedOut, "reply deadline expired before write");
     }
@@ -285,8 +342,11 @@ bbt_co_async(result<void>) ReplyCompletion::Complete(Response response)
         frame.traffic = TrafficClass::System;
         frame.message_id = impl->message_id;
     } else {
-        // Response 关联字段必须与 Request 一致（ADR §2.4）；不一致
-        // ProtocolError 并改写为错误终态，不让 handler 改写他人回复。
+
+        /**
+         * Response 关联字段必须与 Request 一致（ADR §2.4）；不一致
+         * ProtocolError 并改写为错误终态，不让 handler 改写他人回复。
+         */
         if (response.RequestId() != impl->request_id || response.Service() != impl->service
             || response.Method() != impl->method || response.RequestSchema() != impl->request_schema
             || response.ResponseSchema() != impl->response_schema) {
@@ -309,9 +369,12 @@ bbt_co_async(result<void>) ReplyCompletion::Complete(Response response)
                 item.deadline = write_deadline;
                 item.settle = std::make_shared<SessionCore::OutItem::Settle>();
                 auto settle = item.settle;
-                // 关联错误终态同样是一条真实写责任：入队失败写责任从未
-                // 产生（Enqueue 只在成功时 +1）；入队成功则等真实写终态
-                // 再返回，写责任如实计入排空。
+
+                /**
+                 * 关联错误终态同样是一条真实写责任：入队失败写责任从未
+                 * 产生（Enqueue 只在成功时 +1）；入队成功则等真实写终态
+                 * 再返回，写责任如实计入排空。
+                 */
                 auto enqueued = session->Enqueue(std::move(item));
                 if (enqueued) {
                     const auto wait_deadline = write_deadline == RpcClock::time_point::max()
@@ -320,8 +383,11 @@ bbt_co_async(result<void>) ReplyCompletion::Complete(Response response)
                     (void)settle->waiter->Wait({wait_deadline});
                 }
             }
-            // 调用方面前始终保留 ProtocolError 语义（关联违规的判定，
-            // 不描述写终态本身）。
+
+            /**
+             * 调用方面前始终保留 ProtocolError 语义（关联违规的判定，
+             * 不描述写终态本身）。
+             */
             return ErrV(ErrorCode::ProtocolError, "response correlation mismatch");
         }
         auto built = ResponseToSessionFrame(response, session->epoch);
@@ -346,9 +412,12 @@ bbt_co_async(result<void>) ReplyCompletion::Complete(Response response)
     if (!enqueued) {
         return enqueued;
     }
-    // Complete 的成功终态对应 socket 真实写终态：等到 WriterLoop 结算
-    // 而非入队即返回。等待与入队共用请求的有限预算（无界时封顶 30s），
-    // 不另起计时。
+
+    /**
+     * Complete 的成功终态对应 socket 真实写终态：等到 WriterLoop 结算
+     * 而非入队即返回。等待与入队共用请求的有限预算（无界时封顶 30s），
+     * 不另起计时。
+     */
     const auto wait_deadline = write_deadline == RpcClock::time_point::max()
                                    ? RpcClock::now() + 30s
                                    : std::min(write_deadline, RpcClock::now() + 30s);
@@ -360,12 +429,18 @@ bbt_co_async(result<void>) ReplyCompletion::Complete(Response response)
         return ErrV(ErrorCode::Cancelled, "reply write wait cancelled");
     }
     if (status == bbt::coroutine::WaitStatus::TimedOut) {
-        // 预算内未观察到写终态：写责任可能仍在途，由 infra 继续结算，
-        // 但本调用不得伪报成功。
+
+        /**
+         * 预算内未观察到写终态：写责任可能仍在途，由 infra 继续结算，
+         * 但本调用不得伪报成功。
+         */
         return ErrV(ErrorCode::TimedOut, "reply write not settled in budget");
     }
-    // InvalidContext/AlreadyWaiting/RuntimeUnavailable：无法观察终态的
-    // 等待基础设施失败——不是写成功，写责任仍由 WriterLoop/Kill 结算。
+
+    /**
+     * InvalidContext/AlreadyWaiting/RuntimeUnavailable：无法观察终态的
+     * 等待基础设施失败——不是写成功，写责任仍由 WriterLoop/Kill 结算。
+     */
     return ErrV(ErrorCode::Unavailable, "reply write wait unavailable");
 }
 
@@ -381,13 +456,17 @@ bbt_co_async(result<void>) ReplyCompletion::Fail(Error error)
     if (impl->terminal.exchange(true)) {
         return ErrV(ErrorCode::InvalidArgument, "reply completion already terminal");
     }
+    OpenReplyGuard reply_guard{impl->server};
     auto session = impl->session.lock();
     if (!session || session->dead.load()) {
         return ErrV(ErrorCode::Closed, "session closed before reply");
     }
     const auto write_deadline = impl->reply_deadline;
-    // 回复写窗口已过：迟到回复对调用方已无交付意义，且把过期期限交给共享
-    // stream 会在接纳后超时并把整条 link 退役。只发布本条终态，不产生写责任。
+
+    /**
+     * 回复写窗口已过：迟到回复对调用方已无交付意义，且把过期期限交给共享
+     * stream 会在接纳后超时并把整条 link 退役。只发布本条终态，不产生写责任。
+     */
     if (write_deadline != RpcClock::time_point::max() && write_deadline <= RpcClock::now()) {
         return ErrV(ErrorCode::TimedOut, "reply deadline expired before write");
     }
@@ -396,12 +475,20 @@ bbt_co_async(result<void>) ReplyCompletion::Fail(Error error)
     frame.has_outcome = true;
     frame.success = false;
     frame.error = std::move(error);
-    frame.reply = ReplyMode::Required; // wire 约束：Call/Response 必 Required
+
+    /**
+     * wire 约束：Call/Response 必 Required
+     */
+    frame.reply = ReplyMode::Required;
     if (impl->kind == FrameKind::SendAccepted) {
         frame.kind = FrameKind::SendAccepted;
         frame.traffic = TrafficClass::System;
         frame.message_id = impl->message_id;
-        frame.reply = ReplyMode::None; // 非 Call/Response kind 必 None
+
+        /**
+         * 非 Call/Response kind 必 None
+         */
+        frame.reply = ReplyMode::None;
     } else {
         frame.kind = FrameKind::Response;
         frame.traffic = impl->lane;
@@ -426,7 +513,10 @@ bbt_co_async(result<void>) ReplyCompletion::Fail(Error error)
     if (!enqueued) {
         return enqueued;
     }
-    // Fail 同 Complete——成功终态对应 socket 真实写终态。
+
+    /**
+     * Fail 同 Complete——成功终态对应 socket 真实写终态。
+     */
     const auto wait_deadline = write_deadline == RpcClock::time_point::max()
                                    ? RpcClock::now() + 30s
                                    : std::min(write_deadline, RpcClock::now() + 30s);
@@ -480,4 +570,6 @@ bool AdmissionLease::IsReleased() const noexcept
     return !m_impl || m_impl->released.load();
 }
 
-} // namespace bbt::infra::rpc
+// clang-format off
+}
+// clang-format on

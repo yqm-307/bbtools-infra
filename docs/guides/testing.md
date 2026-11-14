@@ -10,10 +10,10 @@
 |---|---|---|---|
 | 冒烟 | `smoke` | 构建后快速确认基本可用性；秒级-亚秒级 | 每次代码 PR + main 集成 |
 | 聚焦 | `focused`（测试名正则） | 本次改动行为 + 直接耦合行为 + 对应回归 | 本地开发；必要 focused 进 PR |
-| 完整回归 | `full` | 全部 unit/integration + 本地可跑用例 | 手动调度（`test-depth=extended|full`）、定时、发布 |
-| 真实服务 | `live` | Redis/Mongo 等真实外部服务 | `test-depth=full|live` / 发布 Gate |
-| 性能 | `perf` | 基线、压力、疲劳（`BBT_INFRA_PERF_BENCH=ON`） | 性能相关改动、定时、发布 |
-| 诊断 | 非普通 profile | `BBT_INFRA_STRINGENT_DEBUG` 等 | `test-depth=extended|full`、发布、手动 |
+| 完整回归 | `full` | 全部 unit/integration + 本地可跑用例 | `workflow_dispatch` 的 `test-depth=extended\|full` |
+| 真实服务 | `live` | Redis/Mongo 等真实外部服务 | `workflow_dispatch` 的 `test-depth=full\|live` |
+| 性能 | `perf` | 基线、压力、疲劳（`BBT_INFRA_PERF_BENCH=ON`） | 性能相关改动，本地构建；CI 当前不跑 |
+| 诊断 | 非普通 profile | `BBT_INFRA_STRINGENT_DEBUG` 等 | `workflow_dispatch` 的 `test-depth=extended\|full`（debug_gate） |
 
 `unit`/`integration` 表达测试性质，`smoke/focused/full` 表达执行策略，两层不混用：
 smoke 是各层性质的选集子集（本仓当前 smoke 项均同为 `unit`）。
@@ -92,7 +92,7 @@ skipped/failure/error 一律 FATAL（live 在选集阶段经 `-LE live` 排除�
 风险覆盖矩阵（替代行覆盖率门禁）：正常 API→unit/focused；错误返回→
 unit/focused；状态转换→unit/integration；取消超时→focused/integration；
 并发重入→integration；跨模块协议→integration；外部服务→live；性能→perf。
-代码覆盖率只作定时/发布诊断，不作 PR 门禁（本仓无 gcov/lcov/llvm-cov 配置）。
+代码覆盖率不作门禁，本仓也没有 gcov/lcov/llvm-cov 配置。
 
 ## 6. 本地等价
 

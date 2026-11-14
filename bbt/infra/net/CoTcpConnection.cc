@@ -8,15 +8,17 @@
 #include <bbt/infra/net/detail/CoInternal.hpp>
 #include <bbt/infra/net/detail/ConnectionState.hpp>
 
-// 实现放 .cc：Read/Write/WaitClosed 的等待路径要复用 ConnectionState/
-// ReceiveRing/close hub 与统一 gate；这些是 detail 部件，不进公共头。
-//
-// Read 复制到调用方 Buffer 后才消费接收数据；Busy/WouldBlock 仍使用
-// release 代次、on_registered 登记及谓词复查的原等待协议。
-
+/**
+ * 实现放 .cc：Read/Write/WaitClosed 的等待路径要复用 ConnectionState/
+ * ReceiveRing/close hub 与统一 gate；这些是 detail 部件，不进公共头。
+ *
+ * Read 复制到调用方 Buffer 后才消费接收数据；Busy/WouldBlock 仍使用
+ * release 代次、on_registered 登记及谓词复查的原等待协议。
+ */
 namespace bbt::infra::net {
 
-CoTcpConnection::CoTcpConnection(Connection connection) noexcept : m_conn(std::move(connection))
+CoTcpConnection::CoTcpConnection(Connection connection) noexcept
+    : m_conn(std::move(connection))
 {
 }
 
@@ -48,13 +50,20 @@ ConnectionStatus CoTcpConnection::Status() const
     status.closed = m_conn.Closed();
     status.close_reason = m_conn.CloseReason();
     status.released = m_conn.Released();
-    status.write = m_conn.WriteAcceptance(); // 写接纳状态真源采样
+
+    /**
+     * 写接纳状态真源采样
+     */
+    status.write = m_conn.WriteAcceptance();
     return status;
 }
 
 std::error_code CoTcpConnection::Read(Buffer& out, const bbt::coroutine::WaitOptions& options)
 {
-    // gate 先于任何状态判定与保护的获取。
+
+    /**
+     * gate 先于任何状态判定与保护的获取。
+     */
     if (const auto gate = RequireCoroutineContext()) {
         return gate;
     }
@@ -63,9 +72,12 @@ std::error_code CoTcpConnection::Read(Buffer& out, const bbt::coroutine::WaitOpt
         if (!state) {
             return make_error_code(NetErrc::Closed);
         }
-        // 关键时序：在导致 Busy 的尝试之前采 release 代次，
-        // 否则持锁方可能在「Busy 返回」与「采样」之间释放并推进代次，造成
-        // on_registered 复查相等而永久等下一次 release。
+
+        /**
+         * 关键时序：在导致 Busy 的尝试之前采 release 代次，
+         * 否则持锁方可能在「Busy 返回」与「采样」之间释放并推进代次，造成
+         * on_registered 复查相等而永久等下一次 release。
+         */
         const std::uint64_t generation = state->ring.AccessGeneration();
         const auto error = m_conn.TryRead(out);
         if (error != make_error_code(NetErrc::WouldBlock) && error != make_error_code(NetErrc::Busy)) {
@@ -114,9 +126,12 @@ std::error_code CoTcpConnection::AsyncWrite(std::string data)
 
 WriteReport CoTcpConnection::Write(std::string data, const bbt::coroutine::WaitOptions& options)
 {
-    // 等容量 → 接纳 → 等本地完成，同一绝对 deadline 沿重试保持。
-    // wait_error 只描述等待/调用结果：接纳后 Done+error 落在
-    // outcome.error（不冒充等待失败）；等容量失败为 Rejected+无效 op。
+
+    /**
+     * 等容量 → 接纳 → 等本地完成，同一绝对 deadline 沿重试保持。
+     * wait_error 只描述等待/调用结果：接纳后 Done+error 落在
+     * outcome.error（不冒充等待失败）；等容量失败为 Rejected+无效 op。
+     */
     WriteReport report;
     report.outcome = WriteOutcome{WritePhase::Rejected, 0, {}};
     if (const auto gate = RequireCoroutineContext()) {
@@ -138,12 +153,18 @@ WriteReport CoTcpConnection::Write(std::string data, const bbt::coroutine::WaitO
         const auto error = state->AcceptWrite(data, record);
         if (!error) {
             report.operation = WriteOperation(std::move(record), state);
-            // 等同一 record 终态；超时/取消不撤销已接纳发送，outcome
-            // 是返回时采样（等待首胜后可能已采到 Done）。
+
+            /**
+             * 等同一 record 终态；超时/取消不撤销已接纳发送，outcome
+             * 是返回时采样（等待首胜后可能已采到 Done）。
+             */
             report.wait_error = report.operation.Wait(options, &report.outcome);
             return report;
         }
-        // 能力上永远不可能接纳的超大请求：立即拒绝，绝不无限等。
+
+        /**
+         * 能力上永远不可能接纳的超大请求：立即拒绝，绝不无限等。
+         */
         if (error == no_buffer || error == settling) {
             if (wanted > state->MaxOutboundBytes()) {
                 report.wait_error = no_buffer;
@@ -179,7 +200,10 @@ WriteReport CoTcpConnection::Write(std::string data, const bbt::coroutine::WaitO
                 return report;
             }
             if (status != bbt::coroutine::WaitStatus::Completed) {
-                // 容量等待超时/取消：本次未提交，Rejected+无效 op。
+
+                /**
+                 * 容量等待超时/取消：本次未提交，Rejected+无效 op。
+                 */
                 report.wait_error = WaitStatusError(status);
                 report.outcome.error = report.wait_error;
                 return report;
@@ -194,21 +218,31 @@ WriteReport CoTcpConnection::Write(std::string data, const bbt::coroutine::WaitO
 
 std::error_code CoTcpConnection::WaitClosed(const bbt::coroutine::WaitOptions& options)
 {
-    // gate 先于状态判定。
+
+    /**
+     * gate 先于状态判定。
+     */
     if (const auto gate = RequireCoroutineContext()) {
         return gate;
     }
     const auto state = CoAccess::StateOf(m_conn);
     if (!state) {
-        return {}; // 无效句柄视为已关闭终态
+
+        /**
+         * 无效句柄视为已关闭终态
+         */
+        return {};
     }
     for (;;) {
         if (m_conn.Closed()) {
             return {};
         }
-        // close hub 专用等待：Create/Add 两段（Add 在 on_registered 内），
-        // 不直接用 RegisterCloseWaiter——后者在等待前注册，早到
-        // MarkClosed 的 NotifyAll 会落在未登记事件上丢失。
+
+        /**
+         * close hub 专用等待：Create/Add 两段（Add 在 on_registered 内），
+         * 不直接用 RegisterCloseWaiter——后者在等待前注册，早到
+         * MarkClosed 的 NotifyAll 会落在未登记事件上丢失。
+         */
         auto waiter = state->CreateCloseWaiter();
         if (!waiter) {
             return std::make_error_code(std::errc::no_buffer_space);
@@ -229,14 +263,20 @@ std::error_code CoTcpConnection::WaitClosed(const bbt::coroutine::WaitOptions& o
             return std::make_error_code(std::errc::no_buffer_space);
         }
         if (status != bbt::coroutine::WaitStatus::Completed) {
-            return WaitStatusError(status); // 超时/取消不关闭连接
+
+            /**
+             * 超时/取消不关闭连接
+             */
+            return WaitStatusError(status);
         }
     }
 }
 
-void CoTcpConnection::RequestClose(std::error_code reason)
+std::error_code CoTcpConnection::Close(const CloseOptions& options, std::error_code reason)
 {
-    m_conn.RequestClose(reason);
+    return m_conn.Close(options, reason);
 }
 
-} // namespace bbt::infra::net
+// clang-format off
+}
+// clang-format on

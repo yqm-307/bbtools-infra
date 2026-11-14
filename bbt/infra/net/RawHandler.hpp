@@ -1,4 +1,5 @@
 #pragma once
+#include <bbt/infra/net/ReclaimReceipt.hpp>
 
 /**
  * @file RawHandler.hpp
@@ -9,7 +10,6 @@
  * 用户回调抛出的异常由 Engine 在调用点就地隔离，并累计到 HandlerErrorCount。异常不会逃逸到
  * driver 层，也不会被吞掉并当作成功，同时不会自动关闭任何连接。关闭仍由 owner 收口。
  */
-
 #include <cstddef>
 #include <cstdint>
 #include <system_error>
@@ -24,9 +24,21 @@ namespace bbt::infra::net {
  * sent 为该操作实际交给内核的字节数，即真实前缀。error 为该操作的真实错误，无错误表示本地完成。
  */
 struct WriteResult {
-    std::uint64_t operation{0}; ///< owner 分配的写操作身份，用于终态诊断；AsyncWrite 不返回票据
-    std::size_t sent{0};        ///< 实际交给内核的字节前缀
-    std::error_code error;      ///< 该操作的真实错误；空表示本地完成
+
+    /**
+     * owner 分配的写操作身份，用于终态诊断；AsyncWrite 不返回票据
+     */
+    std::uint64_t operation{0};
+
+    /**
+     * 实际交给内核的字节前缀
+     */
+    std::size_t sent{0};
+
+    /**
+     * 该操作的真实错误；空表示本地完成
+     */
+    std::error_code error;
 };
 
 /**
@@ -38,11 +50,10 @@ class RawHandler {
 public:
     virtual ~RawHandler() = default;
 
-    /// @brief 连接被 owner 接纳并登记后交付稳定句柄；不会自动创建业务协程。
-    virtual void OnAccept(Connection connection)
-    {
-        (void)connection;
-    }
+    /**
+     * @brief 连接被 owner 接纳并登记后交付稳定句柄；不会自动创建业务协程。
+     */
+    virtual void OnAccept(Connection connection) { (void)connection; }
 
     /**
      * @brief 非阻塞建连的终态，成功或失败恰好交付一次。
@@ -57,13 +68,14 @@ public:
         (void)operation;
     }
 
-    /// @brief 只是通知，提示复查同一接收 ring 与持久读状态。多次通知可以合并，它不是数据快照。
-    virtual void OnRead(Connection connection)
-    {
-        (void)connection;
-    }
+    /**
+     * @brief 只是通知，提示复查同一接收 ring 与持久读状态。多次通知可以合并，它不是数据快照。
+     */
+    virtual void OnRead(Connection connection) { (void)connection; }
 
-    /// @brief 每个已接纳操作恰好交付一次终态。在状态发布之后、锁外、非递归地调用。
+    /**
+     * @brief 每个已接纳操作恰好交付一次终态。在状态发布之后、锁外、非递归地调用。
+     */
     virtual void OnWrite(Connection connection, WriteResult result)
     {
         (void)connection;
@@ -85,4 +97,6 @@ public:
     }
 };
 
-} // namespace bbt::infra::net
+// clang-format off
+}
+// clang-format on

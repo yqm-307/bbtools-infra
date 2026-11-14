@@ -1,5 +1,7 @@
-// 会话服务端生命周期；装配合法性与关闭排序仍由 ServerV2State 台账承担，
-// 公共面只有 CoRpcServer：Create/Start/RegisterRpc/Close/Shutdown/观察入口。
+/**
+ * 会话服务端生命周期；装配合法性与关闭排序仍由 ServerV2State 台账承担，
+ * 公共面只有 CoRpcServer：Create/Start/RegisterRpc/Close/Shutdown/观察入口。
+ */
 #include <bbt/infra/rpc/CoRpcServer.hpp>
 #include <bbt/infra/rpc/CoRpcClient.hpp>
 
@@ -11,27 +13,34 @@
 
 namespace bbt::infra::rpc {
 
-CoRpcServer::CoRpcServer(std::shared_ptr<ServerV2State> v2) noexcept : m_v2(std::move(v2))
+CoRpcServer::CoRpcServer(std::shared_ptr<ServerV2State> v2) noexcept
+    : m_v2(std::move(v2))
 {
 }
 
-result<std::shared_ptr<CoRpcServer>> CoRpcServer::Create(std::shared_ptr<net::Engine> engine,
-                                                         std::shared_ptr<CoRpcClient> session_owner,
-                                                         AdmissionHandler admission_handler, ServerOptions options)
+result<std::shared_ptr<CoRpcServer>> CoRpcServer::Create(
+    std::shared_ptr<net::Engine> engine,
+    std::shared_ptr<CoRpcClient> session_owner,
+    AdmissionHandler admission_handler,
+    ServerOptions options)
 {
     using R = result<std::shared_ptr<CoRpcServer>>;
     if (!session_owner) {
         return R::err(Err(ErrorCode::InvalidArgument, "session_owner required"));
     }
-    // CoRpcClient 的 m_owner 访问经 friend class CoRpcServer 授权。
+
+    /**
+     * CoRpcClient 的 m_owner 访问经 friend class CoRpcServer 授权。
+     */
     auto owner = session_owner->m_owner;
     auto made = detail::ServerV2Create(std::move(engine), owner, std::move(admission_handler), std::move(options));
     if (!made) {
         return R::err(made.error());
     }
     auto v2 = std::move(made.value());
-    return R::ok(bbt::coroutine::MakeCoObject<CoRpcServer>(
-        "infra.rpc.CoRpcServer", "", [&] { return std::shared_ptr<CoRpcServer>(new CoRpcServer(std::move(v2))); }));
+    return R::ok(bbt::coroutine::MakeCoObject<CoRpcServer>("infra.rpc.CoRpcServer", "", [&] {
+        return std::shared_ptr<CoRpcServer>(new CoRpcServer(std::move(v2)));
+    }));
 }
 
 result<void> CoRpcServer::RegisterRpc(std::string rpc_name, RpcHandler handler)
@@ -79,14 +88,9 @@ result<void> CoRpcServer::Start()
     return detail::ServerV2Start(m_v2);
 }
 
-bbt_co_async(result<void>) CoRpcServer::Close(CloseFlag flag, std::int64_t timeout_ms, Error reason)
+bbt_co_async(result<void>) CoRpcServer::Close(const CloseOptions& options)
 {
-    return detail::ServerV2Close(m_v2, flag, timeout_ms, std::move(reason));
-}
-
-void CoRpcServer::Shutdown(Error reason) noexcept
-{
-    detail::ServerV2Seal(m_v2, SettleCloseReason(std::move(reason), "rpc server: closed by owner"));
+    return detail::ServerV2Close(m_v2, options);
 }
 
 CoRpcServer::~CoRpcServer() noexcept
@@ -135,10 +139,13 @@ ServerStats CoRpcServer::Stats() const noexcept
     out.active_connections = active;
     out.retiring_connections = v2.links.size() > active ? v2.links.size() - active : 0;
     out.callbacks = v2.callbacks;
-    // queue 计数经 AdmissionQueue 同步观察面读（impl->mu 内取），不得在
-    // 只持 v2.mu 时直读 impl 字段——避免跨锁直读未同步字段。注意 Queued(i)
-    // 与 BytesQueued(i) 是两次独立取锁：本快照只保证每个字段自身读数合法，
-    // 不构成同一时刻的一致视图（见 Stats.hpp 文件头「取样语义」）。
+
+    /**
+     * queue 计数经 AdmissionQueue 同步观察面读（impl->mu 内取），不得在
+     * 只持 v2.mu 时直读 impl 字段——避免跨锁直读未同步字段。注意 Queued(i)
+     * 与 BytesQueued(i) 是两次独立取锁：本快照只保证每个字段自身读数合法，
+     * 不构成同一时刻的一致视图（见 Stats.hpp 文件头「取样语义」）。
+     */
     auto queue = v2.queue;
     std::array<std::uint64_t, kLaneCount> queued_items{};
     std::array<std::uint64_t, kLaneCount> queued_bytes{};
@@ -164,4 +171,6 @@ detail::ServerV2Ledger detail::ServerV2LedgerForTest(const CoRpcServer& server) 
     return detail::ServerV2LedgerOf(server.m_v2);
 }
 
-} // namespace bbt::infra::rpc
+// clang-format off
+}
+// clang-format on

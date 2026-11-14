@@ -66,4 +66,6 @@ result<HookSnapshot> SessionHooks::Snapshot(HookPoint point) const
     return result<HookSnapshot>::ok(out);
 }
 
-} // namespace bbt::infra::rpc
+// clang-format off
+}
+// clang-format on

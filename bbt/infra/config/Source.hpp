@@ -1,9 +1,10 @@
-#pragma once
-/** @file Source.hpp
+/**
+ * @file Source.hpp
  * @brief 配置源抽象：只负责读取带版本的快照，变更监测由 Watcher 在协程域轮询驱动。
  *
  * 契约来源：docs/decisions/0006-infra-foundation-and-dynamic-config.md。
  */
+#pragma once
 
 #include <memory>
 #include <string>
@@ -20,16 +21,27 @@ namespace bbt::infra::config {
  */
 class ISource {
 public:
-    /// @brief 虚析构，供上层按接口持有具体实现。
+    /**
+     * @brief 虚析构，供上层按接口持有具体实现。
+     */
     virtual ~ISource() = default;
 
-    /// @brief 读取当前快照；失败返回错误结果。
+    /**
+     * @brief 读取当前快照；失败返回错误结果。
+     */
     virtual result<Snapshot> Read() = 0;
-    /// @brief 源标识，用于日志与快照的 source 字段。
+
+    /**
+     * @brief 源标识，用于日志与快照的 source 字段。
+     */
     virtual std::string SourceId() const noexcept = 0;
 };
 
-/// @brief 配置源的共享句柄。
+/**
+ * @brief 配置源的共享句柄。
+ */
 using SourcePtr = std::shared_ptr<ISource>;
 
-} // namespace bbt::infra::config
+// clang-format off
+}
+// clang-format on

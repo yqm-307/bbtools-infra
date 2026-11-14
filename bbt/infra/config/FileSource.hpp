@@ -1,5 +1,5 @@
-#pragma once
-/** @file FileSource.hpp
+/**
+ * @file FileSource.hpp
  * @brief 本地文件配置源。
  *
  * 文件格式为逐行文本，不依赖第三方解析库：
@@ -11,6 +11,7 @@
  * version 取自文件内容，revision 为解析后 Value 的内容指纹，二者都不依赖墙钟或 mtime。
  * 读取失败（缺失、格式错误、读取失败）返回错误结果，不发布伪成功快照。文件变更监测由 Watcher 在协程域内轮询完成，不新增 I/O 线程。
  */
+#pragma once
 
 #include <memory>
 #include <string>
@@ -24,7 +25,9 @@ namespace bbt::infra::config {
  */
 class FileSource final : public ISource {
 public:
-    /// @brief 共享句柄类型。
+    /**
+     * @brief 共享句柄类型。
+     */
     using SPtr = std::shared_ptr<FileSource>;
 
     /**
@@ -36,11 +39,19 @@ public:
      */
     static result<SPtr> Create(std::string path, std::string ns, std::string key);
 
-    /// @brief 解析文件并返回快照；失败返回错误结果。
+    /**
+     * @brief 解析文件并返回快照；失败返回错误结果。
+     */
     result<Snapshot> Read() override;
-    /// @brief 源标识，形如 "file:<path>"。
+
+    /**
+     * @brief 源标识，形如 "file:<path>"。
+     */
     std::string SourceId() const noexcept override;
-    /// @brief 文件路径。
+
+    /**
+     * @brief 文件路径。
+     */
     const std::string& Path() const noexcept;
 
 private:
@@ -52,4 +63,6 @@ private:
     std::string m_source;
 };
 
-} // namespace bbt::infra::config
+// clang-format off
+}
+// clang-format on

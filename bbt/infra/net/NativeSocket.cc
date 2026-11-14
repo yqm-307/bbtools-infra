@@ -20,16 +20,20 @@ std::error_code SysError() noexcept
 {
     return {errno, std::generic_category()};
 }
+
 std::error_code Invalid() noexcept
 {
     return std::make_error_code(std::errc::invalid_argument);
 }
+
 std::error_code Unsupported() noexcept
 {
     return std::make_error_code(std::errc::operation_not_supported);
 }
 
-// flags 契约：窄 primitive 只承诺保守子集；未列出位在任何系统调用前拒绝。
+/**
+ * flags 契约：窄 primitive 只承诺保守子集；未列出位在任何系统调用前拒绝。
+ */
 constexpr int kSendAllow = MSG_DONTWAIT | MSG_NOSIGNAL;
 constexpr int kStreamRecvAllow = MSG_DONTWAIT | MSG_PEEK;
 constexpr int kDatagramRecvAllow = kStreamRecvAllow | MSG_TRUNC;
@@ -46,12 +50,17 @@ bool ValidBuffer(const void* data, std::size_t size) noexcept
 {
     return (data || size == 0) && size <= static_cast<std::size_t>(std::numeric_limits<ssize_t>::max());
 }
-} // namespace
+
+// clang-format off
+}
+// clang-format on
 
 namespace bbt::infra::net {
 
 NativeSocket::NativeSocket(int fd, AddressFamily family, SocketType type) noexcept
-    : m_fd(fd), m_family(family), m_type(type)
+    : m_fd(fd)
+    , m_family(family)
+    , m_type(type)
 {
 }
 
@@ -61,7 +70,9 @@ NativeSocket::~NativeSocket()
 }
 
 NativeSocket::NativeSocket(NativeSocket&& other) noexcept
-    : m_fd(other.Release()), m_family(other.m_family), m_type(other.m_type)
+    : m_fd(other.Release())
+    , m_family(other.m_family)
+    , m_type(other.m_type)
 {
 }
 
@@ -115,7 +126,10 @@ int NativeSocket::Release() noexcept
 std::error_code NativeSocket::Close() noexcept
 {
     const int fd = Release();
-    // Linux close(EINTR) 可能已回收 fd；绝不重试一个可被其他资源复用的编号。
+
+    /**
+     * Linux close(EINTR) 可能已回收 fd；绝不重试一个可被其他资源复用的编号。
+     */
     return fd >= 0 && ::close(fd) < 0 ? SysError() : std::error_code{};
 }
 
@@ -155,14 +169,21 @@ NativeSocket NativeSocket::Accept(Address& peer, std::error_code& error) const n
     error.clear();
     Address accepted_peer;
     accepted_peer.m_size = sizeof(accepted_peer.m_storage);
-    // L1：上游 Hook.cc 介入 ::accept4 符号且不因 O_NONBLOCK 直通，会把非挂起
-    // primitive 隐式推进协程等待；Linux 原生边界走 SYS_accept4 绕开符号介入。
-    // errno/NONBLOCK/CLOEXEC/单 fd 所有权不变；close 仍走 Hook 路径（fd waiter/epoch）。
+
+/**
+ * 上游 Hook.cc 介入 ::accept4 符号且不因 O_NONBLOCK 直通，会把非挂起
+ * primitive 隐式推进协程等待；Linux 原生边界走 SYS_accept4 绕开符号介入。
+ * errno/NONBLOCK/CLOEXEC/单 fd 所有权不变；close 仍走 Hook 路径（fd waiter/epoch）。
+ */
 #if !defined(SYS_accept4)
 #error "Linux SYS_accept4 缺失：无法保证 Accept 不经 Hook 隐式挂起"
 #endif
-    const int fd = static_cast<int>(::syscall(SYS_accept4, m_fd, reinterpret_cast<sockaddr*>(&accepted_peer.m_storage),
-                                              &accepted_peer.m_size, SOCK_NONBLOCK | SOCK_CLOEXEC));
+    const int fd = static_cast<int>(::syscall(
+        SYS_accept4,
+        m_fd,
+        reinterpret_cast<sockaddr*>(&accepted_peer.m_storage),
+        &accepted_peer.m_size,
+        SOCK_NONBLOCK | SOCK_CLOEXEC));
     if (fd < 0) {
         error = SysError();
         return {};
@@ -176,8 +197,11 @@ std::error_code NativeSocket::Connect(const Address& address) noexcept
     if (!address.Valid() || address.Family() != m_family) {
         return Invalid();
     }
-    // L1：同 Accept 走 SYS_connect，保留真实非阻塞 pending（loopback 通常 EINPROGRESS），
-    // 之后由调用者 readiness + PendingError 完成连接；Hook 不得隐式等待或改写结果。
+
+/**
+ * 同 Accept 走 SYS_connect，保留真实非阻塞 pending（loopback 通常 EINPROGRESS），
+ * 之后由调用者 readiness + PendingError 完成连接；Hook 不得隐式等待或改写结果。
+ */
 #if !defined(SYS_connect)
 #error "Linux SYS_connect 缺失：无法保证 Connect 不经 Hook 隐式等待/改写结果"
 #endif
@@ -247,7 +271,10 @@ IoResult NativeSocket::Receive(void* data, std::size_t size, int flags) noexcept
         Address unused;
         return ReceiveFrom(data, size, unused, flags);
     }
-    // stream 拒绝 MSG_TRUNC：防 bytes>0 而 buffer 未填的内核 discard 语义。
+
+    /**
+     * stream 拒绝 MSG_TRUNC：防 bytes>0 而 buffer 未填的内核 discard 语义。
+     */
     if (flags & ~kStreamRecvAllow) {
         return {0, Unsupported()};
     }
@@ -292,8 +319,14 @@ IoResult NativeSocket::SendTo(const void* data, std::size_t size, const Address&
     if (flags & ~kSendAllow) {
         return {0, Unsupported()};
     }
-    return TransferResult(::sendto(m_fd, data, size, flags | MSG_DONTWAIT | MSG_NOSIGNAL,
-                                   reinterpret_cast<const sockaddr*>(&peer.m_storage), peer.m_size));
+    return TransferResult(
+        ::sendto(
+            m_fd,
+            data,
+            size,
+            flags | MSG_DONTWAIT | MSG_NOSIGNAL,
+            reinterpret_cast<const sockaddr*>(&peer.m_storage),
+            peer.m_size));
 }
 
 IoResult NativeSocket::ReceiveFrom(void* data, std::size_t size, Address& peer, int flags) noexcept
@@ -304,9 +337,13 @@ IoResult NativeSocket::ReceiveFrom(void* data, std::size_t size, Address& peer, 
     if (!ValidBuffer(data, size)) {
         return {0, Invalid()};
     }
+
+    /**
+     * 拒绝发生在消费报文之前。
+     */
     if (flags & ~kDatagramRecvAllow) {
         return {0, Unsupported()};
-    } // 拒绝发生在消费报文之前
+    }
     Address source;
     source.m_size = sizeof(source.m_storage);
     iovec part{data, size};
@@ -382,8 +419,8 @@ std::error_code NativeSocket::SetLinger(int seconds) noexcept
     return ::setsockopt(m_fd, SOL_SOCKET, SO_LINGER, &option, sizeof(option)) < 0 ? SysError() : std::error_code{};
 }
 
-std::error_code NativeSocket::SetKeepAlive(bool enabled, std::chrono::seconds idle, std::chrono::seconds interval,
-                                           int count) noexcept
+std::error_code
+NativeSocket::SetKeepAlive(bool enabled, std::chrono::seconds idle, std::chrono::seconds interval, int count) noexcept
 {
     if (!IsTcp()) {
         return Unsupported();
@@ -397,7 +434,10 @@ std::error_code NativeSocket::SetKeepAlive(bool enabled, std::chrono::seconds id
     if (error || !enabled) {
         return error;
     }
-    // 多 syscall 不是事务；任意一步失败立即可见，已成功的选项可能保留。
+
+    /**
+     * 多 syscall 不是事务；任意一步失败立即可见，已成功的选项可能保留。
+     */
     error = SetIntOption(IPPROTO_TCP, TCP_KEEPIDLE, static_cast<int>(idle.count()));
     if (error) {
         return error;
@@ -406,4 +446,6 @@ std::error_code NativeSocket::SetKeepAlive(bool enabled, std::chrono::seconds id
     return error ? error : SetIntOption(IPPROTO_TCP, TCP_KEEPCNT, count);
 }
 
-} // namespace bbt::infra::net
+// clang-format off
+}
+// clang-format on

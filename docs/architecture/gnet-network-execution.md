@@ -41,7 +41,7 @@ flowchart TB
 | main Reactor | server 普通布局的 listener、accept、LB、fd 唯一交接 | 一个已登记 P 的 driver 槽；不执行业务等待 |
 | sub Reactor | 归属连接的 native I/O、注册/撤销、物理 close、自有 context | 各占一个 P 槽；同连接 owner 固定；非阻塞推进有预算 |
 | Processer | 在 worker 线程调度业务协程并推进绑定 driver | 不给业务协程提供永久 P/CPU 亲和或实时性保证 |
-| Engine::Run | 调用它的非受管、非 owner native 线程上的启动、控制与收口 | 不暗中创建控制线程或第二 I/O driver |
+| Engine::Run | 由应用入口的 native host hook 在原生 main 线程上调用一次，负责本代启动、控制与收口 | `Run` 本身不创建控制线程或第二 I/O driver；一个应用运行实例只有一个 Engine，main/sub 槽按 §10.1.1 计算 |
 | Conn/operation | 共享数据与持久状态、数据所有权、有界接纳和完成责任 | 不暴露 Asio 对象，不将 shared_ptr 当作对象同步 |
 
 server 普通布局保留一个 main 加 N 个 sub，配置 N 表示 sub 数，启动必须报告包含 main 的实际槽需求。client-only 不创建 accept owner（`EngineConfig::listen_addresses` 为空即为 client-only），ReusePort、UDP 等旧目标不自动加入本次 TCP 实施范围。
@@ -75,7 +75,7 @@ gnet v2.10.0 是接纳交接、owner、读写泵、缓冲及公平性的参考�
 | OnWrite | 报真实交内核进度和唯一终态；非终态进度须可区分，不承诺对端收到/执行 |
 | OnRead | 只是通知，提示复查同一接收 ring 与持久读状态；可合并，不是包数或数据快照 |
 | `Connection` 状态查询 | `ReadEof`/`ReadError`/`ReadableBytes`/`Closed`/`CloseReason`/`LastWriteError`/`WriteAcceptance` 持久可查，通知合并或已发生后仍可观察 |
-| RequestClose / OnClose | 显式封该连接并提交物理收口；关闭后通知，不把普通 fd 错误自动解释成该策略 |
+| Close(Immediate) / OnClose | 显式封该连接并提交物理收口；关闭后通知，不把普通 fd 错误自动解释成该策略 |
 
 同连接接纳次序定义发送次序，一次 AsyncWrite 的字节连续；部分写不插入别的操作字节，多次调用不自动组成业务帧。字节、操作数、命令、在途数据和通知责任统一有界计账，接纳后不能因第二层排队满而丢失完成。
 
@@ -116,23 +116,26 @@ EOF 只终结读取方向，不自动关闭发送侧。尾部仍可消费，耗�
 
 ## 6. 网络关闭，不是 runtime 停机
 
-Engine::Run 占合法宿主 native 线程：校验前提→自动绑定→安装网络资源→发布 Running→控制循环。RequestClose 并发安全、幂等地封 Listen/Connect/Write 等新业务入口并唤醒控制域；返回只表示登记请求，不同步解绑或等待自己。停止新普通业务回调，已有短回调完成，操作结算/关闭通知仍须兑现。
+Engine::Run 占合法宿主 native 线程：校验前提→自动绑定→安装网络资源→发布 Running→控制循环。Close(Immediate) 并发安全、幂等地封 Listen/Connect/Write 等新业务入口并唤醒控制域；返回只表示登记请求，不同步解绑或等待自己。停止新普通业务回调，已有短回调完成，操作结算/关闭通知仍须兑现。
 
 正常收口顺序：原 owner 撤 listener、取消 connect、结算 handoff、关闭连接并完成既有责任→原 owner 推进取消完成项→控制线程同代同步解绑、等待全部 Tick/Wait/Wake lease→必要时控制域独占清理剩余 context 项→context 存活时拆 socket/backend→销毁 context→发布 Stopped、Run 返回。
 
-RequestClose 是服务封口，Run 返回才确认该 Engine 的网络资源、callback 与 driver 已收口；不等待上层业务协程返回、外部 Conn/数据引用归零或业务回包。外部句柄继续查冻结状态、读已有缓冲，后续新网络操作明确拒绝，不访问已销毁 context。
+Close(Immediate) 是服务封口，Run 返回才确认该 Engine 的网络资源、callback 与 driver 已收口；不等待上层业务协程返回、外部 Conn/数据引用归零或业务回包。外部句柄继续查冻结状态、读已有缓冲，后续新网络操作明确拒绝，不访问已销毁 context。
 
-不提供 Engine Close(deadline) 硬返回时限：同步解绑无 deadline，不捏造可取消解绑。调用者先 RequestClose、等 Run 返回再销毁 Engine，不并发销毁仍被 Run 使用的对象。不建后台 reaper、不 terminate，不以 context.stop 丢 callback 或 runtime 停机伪造资源完成。
+不提供 Engine Close(deadline) 硬返回时限：同步解绑无 deadline，不捏造可取消解绑。调用者先 Close(Immediate)、等 Run 返回再销毁 Engine，不并发销毁仍被 Run 使用的对象。不建后台 reaper、不 terminate，不以 context.stop 丢 callback 或 runtime 停机伪造资源完成。
 
-上层适配（http/rpc）在此之上区分两个承诺，不与 Engine 收口混为一谈：
+上层适配（http/rpc/redis/config/consul/mcp/mongo）的统一关闭控制面是
+`Close(CloseOptions{mode, reason, deadline})`；三终态、模式、自等待拒绝和
+各模块责任矩阵只由 [关闭控制面契约](close-options-contract.md) 定义。本文只保留
+网络执行域边界：
 
-- 立即关闭（`Close(reason)`）：封新、发布原因、对自有连接 `RequestClose`，
-  令等待中的调用失败/唤醒；不等待业务 handler，也不要求 Engine 先 `Stopped`。
-- 优雅退出（`Shutdown(deadline)`）：封口后只等本对象承诺的用户可见责任归还
-  （池 active/dialing/waiting、server inflight、RPC admission/写责任、owner
-  已接纳操作计数）；`Retiring` 只是逻辑退役，仍按真实回收凭据出账。
-- 物理收口仍看 `Close()` + `WaitStopped(deadline)`：callback 销毁、连接
-  `Released()`、listener `AcceptingStopped()`；Engine 的 `Run` 返回与其
+- `Immediate`：封新、发布首个原因、对自有连接 `Close(Immediate)`，令等待中的调用
+  失败/唤醒；不等待业务 handler，也不要求 Engine 先 `Stopped`。
+- `Graceful`：封口后只等本对象承诺的用户可见责任归还（池 active/dialing/waiting、
+  server inflight、RPC admission/写责任、owner 已接纳操作计数）；`Retiring` 只是
+  逻辑退役，仍按真实回收凭据出账。
+- 物理收口仍看 `Close()`/`Close()` + `Close(options)（wait_release=true，有限 deadline）`：callback 销毁、
+  连接 `Released()`、listener `AcceptingStopped()`；Engine 的 `Run` 返回与其
   `Stopped` 相位才是网络资源、回调与 driver 的最终凭据。逻辑关闭成功不等于
   物理释放，物理释放也不反过来证明业务排空。
 
@@ -140,7 +143,7 @@ RequestClose 是服务封口，Run 返回才确认该 Engine 的网络资源、c
 
 不假设正常 Reactor 必然失败，不新增自愈/迁移或容错平台。普通 fd errno、EOF、协程超时不升级为 driver Failed。
 
-Run 用有限间隔谓词等待，控制唤醒或到期后通过 QueryProcesserDriver 检查持有 token 的各槽，不无限只等 RequestClose，也不依赖不存在的失败 callback。匹配 Failed 时每代记录一次来源/异常并封入口，再同代同步解绑；全部 callback lease 退出后才独占接管旧 context。代次不符或查询失败明确报控制错误，不能改用新 token 解绑他人。
+Run 用有限间隔谓词等待，控制唤醒或到期后通过 QueryProcesserDriver 检查持有 token 的各槽，不无限只等 Close(Immediate)，也不依赖不存在的失败 callback。匹配 Failed 时每代记录一次来源/异常并封入口，再同代同步解绑；全部 callback lease 退出后才独占接管旧 context。代次不符或查询失败明确报控制错误，不能改用新 token 解绑他人。
 
 正常 OnWrite/OnClose 由 owner 发出；driver 已失败时控制域不伪调用 owner 回调。替代出口为 Engine 控制域错误报告与可查询 Conn/operation 冻结结果；内部完成订阅在发布状态后锁外唤醒。物理与 callback 未收口不发布 Stopped、不释放 context，保持责任可达；持续 OOM、永久阻塞回调、线程不获调度不承诺有界完成。这里维持既有故障底线，不把假设扩为新需求。
 
@@ -182,7 +185,7 @@ bool 仅接受单字节 0/1，浮点数编码 IEEE 754 的大端位表示。
 
 设计依据为 design 期 infra `2cb3ebf60a101bb9cbf93f065db4d41e2130d3cd`、coroutine PR #396 合并提交 `1e9f0e8c25de85dde003def65bb58b90bdac0e0b`；R2 原分析使用的 PR head 为 `8d7b4383c8631f4dccad74df088abe54ca000b87`，不冒充 merge SHA。构建实际消费的 coroutine 版本由 CI 拉取 `coroutine@main` 并在 run 中记录 SHA。
 
-已落地（PR #84 + PR #104，`bbt/infra/net/`）：`detail/ReactorDriver`（真实 Asio context 的 `OnTick/Wait/Wake`、预算、槽绑定/回滚/同代解绑、driver Failed 出口）、`detail/DriverBinder`、`detail/ReceiveRing`（共享并发 ring + 释放代次通知）、`detail/OutboundQueue`（逐操作记账）、`detail/WakeHub`、`Engine`（`Run`/`RequestClose`/`Phase`/`LastError`/`LastFailure`/`LocalAddresses`/`CountConnections`/`HandlerErrorCount`/`ReactorOwnerIds`/`AsyncConnect`/`EnableAcceptHandoff`/`RequestStopAccepting`/`AcceptingStopped`/`CoAccept`/`CoDial`）、`Connection`/`ReclaimReceipt`、`WriteOperation`/`WriteReport`、`RawHandler`、`ICoConnection`/`CoTcpConnection`/`ConnectionResult`/`Buffer`、只读 `ReadView` 与 `Types.hpp`、13 字段 `Options`。
+已落地（PR #84 + PR #104，`bbt/infra/net/`）：`detail/ReactorDriver`（真实 Asio context 的 `OnTick/Wait/Wake`、预算、槽绑定/回滚/同代解绑、driver Failed 出口）、`detail/DriverBinder`、`detail/ReceiveRing`（共享并发 ring + 释放代次通知）、`detail/OutboundQueue`（逐操作记账）、`detail/WakeHub`、`Engine`（`Run`/`Close(Immediate)`/`Phase`/`LastError`/`LastFailure`/`LocalAddresses`/`CountConnections`/`HandlerErrorCount`/`ReactorOwnerIds`/`AsyncConnect`/`EnableAcceptHandoff`/`RequestStopAccepting`/`AcceptingStopped`/`CoAccept`/`CoDial`）、`Connection`/`ReclaimReceipt`、`WriteOperation`/`WriteReport`、`RawHandler`、`ICoConnection`/`CoTcpConnection`/`ConnectionResult`/`Buffer`、只读 `ReadView` 与 `Types.hpp`、13 字段 `Options`。
 
 PR #104 把公共面收口落地：`Connection::State()`、两处内部构造、`AsyncConnectAwaitable`、公开 `WaitConnect`/`WaitAccepted`、公共 `NormalizeOptions` 与 12 个历史 Options 字段被删除或收回内部，测试接缝全部落在 `detail/`；协程消费面改为 `ICoConnection` 成员接口，`CoRead`/`CoWrite`/`CoAccept`/`CoDial` 自由函数删除。空聚合头 `CoConnection.hpp` 已移除；等待票实现归 `WriteOperation.cc`，执行域校验与私有桥接归 `detail/CoInternal.cc`。冻结符号清单、删除迁移表与逐条行为契约见 [决策 0010「冻结公共面与迁移」](../decisions/0010-gnet-network-foundation.md) 与 [决策 0012](../decisions/0012-icoconn-member-interface.md)。
 
@@ -296,7 +299,7 @@ owner 域 StopServiceOwner（封服务 + 物理关闭全部连接，不等待 ha
 
 ### 旧公共 Engine 切片（F1–F8 系列，已删除）
 
-2026-10 的 `ServerEngine`/`EventHandler`/`Action` 实现（含 F1/F2 共享计数、F3 Boot 取消、F6 OnBoot 观测、F7 facade 竞态、F8 停止开始授权、一次性控制/关闭故障收尾等切片）随 PR #84 整体替换：`Engine` 现在只有 `Run`/`RequestClose`，没有 Boot 事件、`OnTick`、`Action`、`Engine::Stop` 或 `ServerEngine` 相位机。当时记录的定向用例名（`net.engine_*`、`net.co_bridge_*`）与计数不再存在于仓库，不能引用为当前通过证据。
+2026-10 的 `ServerEngine`/`EventHandler`/`Action` 实现（含 F1/F2 共享计数、F3 Boot 取消、F6 OnBoot 观测、F7 facade 竞态、F8 停止开始授权、一次性控制/关闭故障收尾等切片）随 PR #84 整体替换：`Engine` 现在只有 `Run`/`Close(Immediate)`，没有 Boot 事件、`OnTick`、`Action`、`Engine::Stop` 或 `ServerEngine` 相位机。当时记录的定向用例名（`net.engine_*`、`net.co_bridge_*`）与计数不再存在于仓库，不能引用为当前通过证据。
 
 仍成立的两条故障边界判断：
 
@@ -319,37 +322,43 @@ native owner（infra）
   CoApp::CoInstall/CoBind/CoStart/CoStop
   Engine::CoAccept/CoDial
   ICoConnection::Read/Write/WaitClosed
-  rpc::CoRpcClient::Call/Send 与 Close(CloseFlag, timeout_ms)
+  rpc::CoRpcClient::Call/Send 与 Close(CloseOptions)
 ```
 
-- `Engine::Run(const EngineConfig&) -> std::error_code` 是唯一控制入口：
-  宿主 native 控制线程调用，自动绑定、进入控制循环，RequestClose 后返回。
-  应用是普通 `main` + 既有 `bbtco` 注册——没有第二 runtime、隐藏 main、
-  native 控制桥或库内常驻线程；详见 §10.1.1（已否决方案仅作历史保留）。
-- `Engine::RequestClose() noexcept`、`RequestStopAccepting() noexcept`、状态快照和 `Connection::RequestClose()` 是跨域的非挂起控制/观察入口；它们只发布请求或值快照，不执行业务 hook、不等待自身、不证明物理释放。
+- `Engine::Run(const EngineConfig&) -> std::error_code` 仍是 Engine 的唯一控制入口：
+  经 framework 使用时，由应用入口的 native host hook（runtime 提交主任务之后、原生 main 线程）
+  调用一次，自动绑定、进入控制循环，`Close(Immediate)` 后返回。既有 Run 不因此变成 Co 入口；
+  framework 不持有 runner/thread/future/join，Engine 的状态等待见
+  [Engine 主线程宿主与共享所有权契约](native-lifecycle-seam-contract.md)。
+- `Engine::Close() noexcept`、`RequestStopAccepting() noexcept`、状态快照和 `Connection::Close()` 是跨域的非挂起控制/观察入口；它们只发布请求或值快照，不执行业务 hook、不等待自身、不证明物理释放。
 - `Engine::CoAccept(const WaitOptions&) -> ConnectionResult`、`Engine::CoDial(const Address&, const WaitOptions&) -> ConnectionResult` 以及 `ICoConnection::Read/Write/WaitClosed` 是 Co 域入口。执行域 gate 先于状态读取、容量消费、连接提交和 waiter 登记；非法域返回既有 `operation_not_permitted`/`InvalidContext`，快路径也不能绕过。
 - `ICoConnection::AsyncWrite`、`Status()`、`Connection` 的状态查询与 `ReclaimReceipt::{Valid,Released}` 是非挂起值/命令面，仍不取得 native owner 锁的长时间占用；`Write/Read/WaitClosed` 的等待只由 `CoWaiter` 等现有原语承接。
 - `OnAccept/OnConnect/OnRead/OnWrite/OnClose` 必须继续在 owner 的 native 非业务协程边界短、非阻塞、不可挂起地执行。回调更新稳定状态并通知 Co waiter，不能直接 `Resume`，不能要求协程回原 P，不能把 raw callback 改成业务 hook。
 
 ### 10.1.1 主入口与 native 控制接入（F17 已定型）
 
-已实现面：应用是普通 `main` + 既有 `bbtco` 注册（`bbtco_main()` 宏生成的
-主协程入口），coroutine 公共 `TryGetTLSInst`/`GetLocalCoroutineId` 做执行域
-判定；`Engine::Run` 是 Engine 的唯一 native 控制入口——宿主线程调用即自动
-绑定、进入控制循环、`RequestClose` 后返回。infra 不为 F17 提供
-RunMainTask/native 控制桥/`Advance` 步进接口，也不新增常驻线程或第二
-runtime；coroutine 公共契约 §12.2 已按同一口径重写，infra 侧不再保留另一套
-启动机制作为实现契约或放行条件。
+入口由 runtime 拥有：应用只写 `int bbtco_main()`（可选 native hook），runtime
+生成薄 native `main` 并负责 Start、hook 顺序、主任务完成与退出码（语义与签名见
+coroutine `docs/architecture/core-runtime-contract.md` §12.2）。coroutine 公共
+`TryGetTLSInst`/`GetLocalCoroutineId` 做执行域判定；Engine 的 `Run` 仍只能由
+native owner 调用。
 
-（已否决方案，仅作历史保留，不再作为实现契约：先前 §10.1.1 曾设计
-`Engine::BeginNativeControl/AdvanceNativeControl` + `MainEngineControl`
-（`IMainNativeControl`/`RegisterMainNativeControl`/`MainNativeWake`/
-`MainNativePoll`/`RunMainTask`）把 Engine 控制拆成可非阻塞推进、由主入口
-原生等待循环驱动的桥接——该方案依赖 coroutine 的
-`TryUnregisterProcesserDriver(Pending)` 拆分与主入口注册槽，已随 F17 定型
-整体否决，相关类型与注册/唤醒 API 不再要求实现。Engine 物理回收/有限
-deadline/CoWaiter 谓词等约束仍由 §6/§10.2 与
-`Engine::Run`/`RequestClose`/`Connection::Released` 承担。）
+**生成式入口的 Engine 消费接缝：主线程直接 Run。** 应用主协程在全部 Idle 阶段装配完成后，把
+`shared_ptr<Engine>` 与完整 `EngineConfig` 发布给 framework 的入口宿主闸门；runtime 提交主任务后，
+native host hook 在原生 main 线程调用一次 `Engine::Run`，主任务在 `Engine::CoWaitRunning` 上等
+Running，关闭时由 host hook 调 `Close(Immediate)`，`Run` 返回即本代收口。不存在 runner/timer/试收割，
+runtime 不感知 Engine；一个应用运行实例只创建一个 Engine，Redis/Mongo/发现/网络组件借用同一实例。
+
+最小 API 形状、两向退出、启动失败与共享所有权规则唯一见
+[Engine 主线程宿主与共享所有权契约](native-lifecycle-seam-contract.md)。`EngineLifecycle` 与
+其 pthread runner 已被本契约取代并删除，不存在 runner/timer/试收割路径；framework 侧消费与真实
+loopback 由后续节点验证，不能把 infra 文档或定向测试当作 framework 已交付证据。
+
+下游必须遵守：区分两种 Start：runtime Start 前冻结 worker/栈值，主 Co 任务内装配并冻结 Engine/资源配置，全部 Idle 阶段 `Create` 完成后才发布并允许 Run；runtime Start 后的同步 hook 只能做短
+发布或校验，不能等待 Ready、调用 Run、join 或物理回收；主任务在 Ready 前只做装配与
+`CoWaitRunning`，Ready 后才启动 Server/Co 消费。旧 `MainEngineControl`、
+`BeginNativeControl`、`AdvanceNativeControl`、`RunMainTask` 等通用桥仍是历史否决方案，
+不恢复为实现目标；新形态是「提交后主线程直接 Run」，不是注册 native 控制槽。
 
 **单 worker 真实 loopback 的可实施布局**：当前 server 布局
 `Engine.cc:2494–2495` 要 main+sub 两槽，`DriverBinder.cc` 在 worker=1 时
@@ -363,7 +372,7 @@ worker server 布局已支持。
 
 `WaitOptions`、RPC `CallOptions`、`SendOptions` 和 framework `LifecycleOptions` 均携带绝对 `bbt::coroutine::Deadline`；下层只取父子预算的最小值，不能在 adapter 层重置为新的完整预算。超时/取消结束调用方等待，不能撤销已接纳的 I/O、强杀 handler、清除 admission/lease、关闭共享 Engine 或把 `Released` 改成 true。
 
-`WaitClosed`/RPC `Client::Close`/`Server::Close(deadline)` 是逻辑状态或有界观察；`Connection::Closed()`、`ICoConnection::Status().closed` 与 `Released()` 分开。只有 owner 已真实关闭 fd/backend、清掉本次责任并发布共享释放记录后，`Connection::Released()` 和 `ReclaimReceipt::Released()` 才为真。有效 receipt 在超时、取消、未交付或握手失败后继续可观察；无效 receipt 的 `Released()==true` 只表示提交前没有责任。物理责任、quota、retiring session、callback lease 未收口时必须保留 owner，不能以句柄清空、map 变空、逻辑 Close 或连接数为零充当证据。
+`WaitClosed`/RPC `Client::Close(CloseOptions)`/`Server::Close(CloseOptions)` 是逻辑状态或有界观察；`Connection::Closed()`、`ICoConnection::Status().closed` 与 `Released()` 分开。只有 owner 已真实关闭 fd/backend、清掉本次责任并发布共享释放记录后，`Connection::Released()` 和 `ReclaimReceipt::Released()` 才为真。有效 receipt 在超时、取消、未交付或握手失败后继续可观察；无效 receipt 的 `Released()==true` 只表示提交前没有责任。物理责任、quota、retiring session、callback lease 未收口时必须保留 owner，不能以句柄清空、map 变空、逻辑 Close 或连接数为零充当证据。
 
 ### 10.3 对象/行为 → reuse、adapt、omit
 
@@ -371,13 +380,13 @@ worker server 布局已支持。
 |---|---|---|---|---|
 | `bbt/infra/ICoObject.hpp` 与 `bbt::coroutine::ICoObject` | reuse | 不复制类型；继续聚合 coroutine 的 `ICoObject/CoObjectInfo/Deadline/WaitOptions` | 不拥有对象；公共类型由 coroutine 真源提供 | 公开头 selfcheck、`Test_contract_basics`；不新增 infra 同名接口 |
 | `rpc::CoRpcClient::Create`、`rpc::CoRpcServer::Create` | adapt | 既有 Create 委托 `MakeCoObject<T>(kind,name,creator)` → coroutine ManagerBase 唯一路径，沿用合法 shared_ptr creator/deleter | CoRpcClient/CoRpcServer owner 仍由 infra/framework AppNetwork 持有；观测索引只存 weak_ptr，Member 析构通知不保活；业务/回收 owner 不改弱 | 工厂构造/观测登记失败不提交计数；已创建后业务发布失败正常 destroyed；测试见 §10.4 实名映射 |
-| `net::Engine` | adapt observation, reuse native execution | 保留 Engine 名与 EnginePhase；`Engine::Run` 是唯一 native 控制入口；R3 创建点统一经 `Engine::Create`（委托 `MakeCoObject<Engine>("infra.net.Engine",name,creator)`），Engine 接 CoObject 身份/Member 实际析构通知 | 保留 native owner 和既有合法 owner/deleter；不继承 CoRuntimeOnly，Run 仍仅 native；物理回收与 G01 不因观测解决 | 创建/实际析构计数一次，RequestClose/Run 返回均不减 alive；观察不保活；现有 net.reactor_driver_*/net.stop_*/net.reclaim_* 另证明原执行/物理语义 |
-| `Connection`/`CoTcpConnection` | reuse behavior, omit factory | `CoTcpConnection` 继续是值语义视图；不新增对象 registry | 视图销毁不关连接；owner 兑现 close；Co 方法在受管协程，状态/RequestClose 可观察 | `WaitClosed` 不等 `Released`；`net.ico_*`、`net.reclaim_*` |
+| `net::Engine` | adapt observation, reuse native execution | 保留 Engine 名与 EnginePhase；`Engine::Run` 是唯一 native 控制入口；R3 创建点统一经 `Engine::Create`（委托 `MakeCoObject<Engine>("infra.net.Engine",name,creator)`），Engine 接 CoObject 身份/Member 实际析构通知 | 保留 native owner 和既有合法 owner/deleter；不继承 CoRuntimeOnly，Run 仍仅 native；物理回收与 G01 不因观测解决 | 创建/实际析构计数一次，Close(Immediate)/Run 返回均不减 alive；观察不保活；现有 net.reactor_driver_*/net.stop_*/net.reclaim_* 另证明原执行/物理语义 |
+| `Connection`/`CoTcpConnection` | reuse behavior, omit factory | `CoTcpConnection` 继续是值语义视图；不新增对象 registry | 视图销毁不关连接；owner 兑现 close；Co 方法在受管协程，状态/Close(Immediate) 可观察 | `WaitClosed` 不等 `Released`；`net.ico_*`、`net.reclaim_*` |
 | `ReclaimReceipt`/`ConnectionResult` | reuse | 保留 `Valid()`、`Released()` 与 `{error, connection, reclaim}` | receipt 只观察，不等待、不取消、不延长 Engine/连接寿命 | 提交前无效、提交后有效且最终 Released；未交付/握手失败/Close 交错窗口 |
 | raw callback 与 native `AsyncConnect` | reuse | 保留 `RawHandler`、`AsyncConnect`；不加 `Co` 前缀 | native owner 短回调；通过状态/通知桥接 Co，不能直接 Resume 或调业务 hook | callback 抛错隔离、投递失败、fd 物理回收；`net.tcp_*`、driver failure |
 | `CoAccept`/`CoDial` 与 `ICoConnection` Co 方法 | adapt | 保留现有成员名；统一调用 coroutine context gate 和 `WaitOptions.deadline` | Co 域等待，native owner 持有连接/receipt/物理责任 | `InvalidContext`/`TimedOut`/`Closed`/`Overloaded`；快路径负例与真实 loopback |
 | RPC `Call`/`Send` | reuse | `bbt_co_async(result<Response>) Call(...)`、`bbt_co_async(result<void>) Send(...)` | 业务 Co handler 与 admission lease 分层；infra session owner 继续推进 callback/写终态 | `Deadline` 取 min；`OutcomeUnknown` 保留；按 `tests/rpc_net/CMakeLists.txt` 的真实 `rpc.net.v2s_*`、`rpc.net.*` 名称映射，不使用未注册的 `rpc.app_session.*` |
-| RPC `Start`/`Close(CloseFlag, timeout_ms)`/`Shutdown(Error)` | adapt | Start 由 native 宿主调用；Close 在受管协程消费，Shutdown 为同步强制关闭；不新增公开排空阶段 | Close 按 Immediate/Timeout/Graceful 处理；仅 Graceful 允许 -1 无限等待，Shutdown 不等待业务或物理释放；现行接口以 [RPC 指南](../guides/rpc-net.md) 为准 | 逻辑关闭、callback、写终态、物理 Released 分别断言；不恢复 RPC StopAccepting/Drain/WaitStopped 入口 |
+| RPC 关闭控制面 | adapt | 目标签名与状态语义唯一见 [CloseOptions 契约](close-options-contract.md) §1–3；Start 仍由 native 宿主调用，不能据此认定生成式入口的宿主接缝已完成 | Close(Immediate) 不等待；逻辑关闭、callback、写终态、物理 Released 分别断言；不恢复 RPC StopAccepting/Drain 入口 |
 | `Session.cc` 物理回收 ledger | reuse/adapt | 保留 `ReclaimReceipt`、retiring/handshake/lease 责任链；只把 framework Co 生命周期接到现有收口入口 | session owner 强持到真实 callback/conn `Released`；不由 coroutine 计数替代 | F6/F9/F10 原有上限不重置；`Test_rpc_v2_session` 定向物理窗口 |
 
 `CoObject` 统计覆盖 CoRpcClient/CoRpcServer 和有独立创建/销毁寿命的 Engine；native 域不是免观测理由。RPC 公开入口使用 CoRpcClient/CoRpcServer，不把 raw callback 或内核一刀切 Co-only；其 Co 业务方法按 §10.1 gate。Connection/CoTcpConnection、receipt、消息/Options、ring 元素和 callback lease 等值/责任记录不强制工厂化，不能把观测统计误报成 fd/任务/物理回收。通用 ManagerBase/MemberBase 放 coroutine，infra 只消费、去旧反射依赖，不为观测恢复 core 依赖；Manager 先销毁/最后引用 native 释放也须安全记账，不用 Co 锁做底层析构通知。
@@ -385,12 +394,12 @@ worker server 布局已支持。
 
 | R3 责任 | 最小文件范围 | 固定签名/改动 | 验证映射 |
 |---|---|---|---|
-| native Engine bridge / 观测 | `bbt/infra/net/Engine.hpp/.cc`、`Options.hpp`、`detail/ReactorDriver.*`、`detail/DriverBinder.*`、`detail/WakeHub.*` 及直接创建点 | 同一 creator/CoObject 接身份和实际析构（`Engine::Create` 委托 `MakeCoObject<Engine>`）；`Engine::Run` 保留为唯一 native 控制入口，RequestClose/StopAccepting/CoAccept/CoDial 保留；不新增 Begin/Advance/MainEngineControl/CoRun/runtime Stop | `net.reactor_driver_*`、`net.stop_*`、`net.tcp_*` 保原断言；R3 另补 Engine 创建/销毁计数及 native 非 Co-only 正例（`net.co_lifecycle`） |
-| connection Co view | `bbt/infra/net/Connection.hpp/.cc`、`ICoConnection.hpp`、`CoTcpConnection.hpp/.cc`、`ConnectionResult.hpp`、`detail/ConnectionState.hpp` | 保留 `Read/TryRead/View/AsyncWrite/Write/RequestClose/WaitClosed/Status/IsReleased`；`Released` 与 receipt 共用物理记录 | `net.ico_*`、`net.reclaim_*`；Read/Write/WaitClosed 非 Co 负例、deadline 后责任仍在途 |
-| RPC consumer | `bbt/infra/rpc/CoRpcClient.hpp/.cc`、`CoRpcServer.hpp/.cc`、`Session.cc`、`SessionCodec.hpp/.cc`、`detail/Session.hpp`、必要 `Admission.hpp` | 保留 `Call/Send` Co 签名与 `Deadline`；关闭仅使用 `Close(CloseFlag, timeout_ms, Error)` 或同步 `Shutdown(Error)`，不保留旧头或复制 session ledger | `tests/rpc_net/Test_rpc_v2_session.cc` 的 `rpc.net.v2s_roundtrip`、`rpc.net.v2s_bidirectional`、`rpc.net.v2s_admission_*`、`rpc.net.v2s_close_*`；`Test_rpc_v2_wire.cc` 的 `rpc.net.v2_*`；`Test_rpc_co_lifecycle.cc` 的 `rpc.net.co_lifecycle`、`rpc.net.v1_absent` 等真实注册项 |
+| native Engine bridge / 观测 | `bbt/infra/net/Engine.hpp/.cc`、`Options.hpp`、`detail/ReactorDriver.*`、`detail/DriverBinder.*`、`detail/WakeHub.*`、Engine 直接创建点 | 同一 creator/CoObject 接身份和实际析构（`Engine::Create` 委托 `MakeCoObject<Engine>`）；`Engine::Run` 保留为唯一 native 控制入口，由应用入口 native host hook 调用一次；Close(Immediate)/StopAccepting/CoAccept/CoDial 保留，新增 `CoWaitRunning`；删除 `EngineLifecycle` 与 runner/timer，不新增 Begin/Advance/MainEngineControl/CoRun/runtime Stop | `net.reactor_driver_*`、`net.stop_*`、`net.tcp_*` 保原断言；R3 另补 Engine 创建/销毁计数及 native 非 Co-only 正例（`net.co_lifecycle`）与主线程 Run/CoWaitRunning 失败观察 |
+| connection Co view | `bbt/infra/net/Connection.hpp/.cc`、`ICoConnection.hpp`、`CoTcpConnection.hpp/.cc`、`ConnectionResult.hpp`、`detail/ConnectionState.hpp` | 保留 `Read/TryRead/View/AsyncWrite/Write/Close(Immediate)/WaitClosed/Status/IsReleased`；`Released` 与 receipt 共用物理记录 | `net.ico_*`、`net.reclaim_*`；Read/Write/WaitClosed 非 Co 负例、deadline 后责任仍在途 |
+| RPC consumer | `bbt/infra/rpc/CoRpcClient.hpp/.cc`、`CoRpcServer.hpp/.cc`、`Session.cc`、`SessionCodec.hpp/.cc`、`detail/Session.hpp`、必要 `Admission.hpp` | 保留 `Call/Send` Co 签名与 `Deadline`；关闭迁移只消费 [CloseOptions 契约](close-options-contract.md) §1–3，不保留冲突旧控制面或复制 session ledger | `tests/rpc_net/Test_rpc_v2_session.cc` 的 `rpc.net.v2s_roundtrip`、`rpc.net.v2s_bidirectional`、`rpc.net.v2s_admission_*`、`rpc.net.v2s_close_*`；`Test_rpc_v2_wire.cc` 的 `rpc.net.v2_*`；`Test_rpc_co_lifecycle.cc` 的 `rpc.net.co_lifecycle`、`rpc.net.v1_absent` 等真实注册项 |
 | framework v2 单 worker loopback | 拟新增 framework `tests/Test_framework_v2_coapp_loopback.cc`、`tests/CMakeLists.txt` 和直接消费点 | 拟新增 target `Test_framework_v2_coapp_loopback` / CTest `framework.v2_coapp_loopback`；真实 Engine/动态端口，单 worker 装配→启动→请求→CoStop/子对象 Join→实际 Released/计数回基线 | 尚未注册/构建/运行；按 §10.1.1 单槽 client-only Engine + 动态端口 peer 子进程；旧 framework.coapp_lifecycle/StubNetHost 不能充数。断言 worker raw I/O 由既有 P driver 推进、waiter 早到不丢、request≠stop、超时保 owner、解绑 Pending 无强制回收，真实 conn Released 后以析构通知而非 sleep 核统计回基线 |
 
-R3 只能在 coroutine R1/R2 的实际公开头、构建 pin 和 CTest 注册已可消费后开始。**仅 R3** 可更新 `infra-v2-r2`、`framework-v2-r2` 的隔离消费 pin/直接依赖引用，绑定本次 coroutine 候选完整源码指纹（包括未提交改动，不拿 HEAD 冒充），使用各自隔离 build/prefix 真实重建、核公开头及链接路径；不改 `infra-framework-base-v3`、`bbtools-coroutine-pin-206772b` 旧只读依赖、任何主仓和共享安装 prefix，本契约节点不改 pin。F17 主入口已定型为普通 `main` + `bbtco` 注册（§10.1.1）；不在 worker 同步 Run、不新增永久线程或第二 runtime。旧 RPC repair/review 上限、deadline、admission/写终态、Released 与 Close 责任均保持原边界。
+R3 只能在 coroutine R1/R2 的实际公开头、构建 pin 和 CTest 注册已可消费后开始。**仅 R3** 可更新 `infra-v2-r2`、`framework-v2-r2` 的隔离消费 pin/直接依赖引用，绑定本次 coroutine 候选完整源码指纹（包括未提交改动，不拿 HEAD 冒充），使用各自隔离 build/prefix 真实重建、核公开头及链接路径；不改 `infra-framework-base-v3`、`bbtools-coroutine-pin-206772b` 旧只读依赖、任何主仓和共享安装 prefix，本契约节点不改 pin。F17 主入口已定型为 runtime 的 `bbtco_main` 生成式入口（§10.1.1）；不在 worker 同步 Run、不新增永久线程或第二 runtime。旧 RPC repair/review 上限、deadline、admission/写终态、Released 与 Close 责任均保持原边界。
 
 CTest 的直接断言映射以当前 `tests/rpc_net/CMakeLists.txt` 为准，不存在 `rpc.app_session.*`：
 

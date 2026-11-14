@@ -5,8 +5,8 @@ namespace bbt::infra {
 result<void> ValidateMongoClientConfig(const MongoClientConfig& cfg)
 {
     if (cfg.uri.empty() || (cfg.uri.rfind("mongodb://", 0) != 0 && cfg.uri.rfind("mongodb+srv://", 0) != 0))
-        return result<void>::err(MakeError(ErrorCode::InvalidArgument,
-                                           "mongo client config: uri must start with mongodb:// or mongodb+srv://"));
+        return result<void>::err(MakeError(
+            ErrorCode::InvalidArgument, "mongo client config: uri must start with mongodb:// or mongodb+srv://"));
     if (cfg.database.empty())
         return result<void>::err(MakeError(ErrorCode::InvalidArgument, "mongo client config: empty database"));
     if (cfg.collection.empty())
@@ -34,4 +34,6 @@ result<void> ValidateMongoClientConfig(const MongoClientConfig& cfg)
     return result<void>::ok();
 }
 
-} // namespace bbt::infra
+// clang-format off
+}
+// clang-format on

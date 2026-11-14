@@ -92,18 +92,27 @@ header 直接返回 `ProtocolError`。
 
 ## 关闭语义
 
-`Close()` 同步、幂等、可在任意线程（含协程上下文）调用：先置封口，拒绝新操作；已接纳
-HTTP 交换完成或失败后，再关闭专属 HTTP Client，最后等待已登记操作全部离开后返回。
-排队者得 `Closed`，在飞交换不由 adapter 主动取消。首个与并发 `Close` 等同一终态：**返回即
-已封口、专属 HTTP Client 已关闭、在飞操作已离开**，不设 `min(request_timeout, 1s)` 之类的提前返回上限
-（`0005` §6.4：不以 drain timeout 放弃等待）。每个已登记操作受 `request_timeout`
-绝对期限约束，因此终态可达；协程上下文内以 `CoWaiter` 协作挂起等待，不占用
-Processer 线程（阻塞 Processer 会让在飞操作无法恢复，并发 `Close` 可占满 worker）。
-当前协程已被 `RequestCancel` 时，`CoWaiter` 入口即返回 `Cancelled`、`Hook_Sleep`
-也在取消态立即返回；该分支改用 `bbtco_yield` 让出当前调度片（不使用线程 sleep），
-但循环会持续占用可运行 worker，不能当作低开销阻塞等待；因此 `Close` 必须在该 Client 的
-调度器/Engine 仍能推进在途操作时调用（框架在 handlers drain 后、网络关闭前调用）；
-已登记操作各自交付自己的终态，`Close` 不替它们取消，也不把「已返回」当成「操作被取消」。
+三层，语义与 [close-options-contract](../architecture/close-options-contract.md) 一致：
+
+- `Close(CloseOptions)`：两种模式都立即封口（拒绝新操作、发布首个原因、唤醒等待者）。
+  `Immediate` 不读 deadline、不等在途交换；`Graceful` 在绝对期限前等已登记操作全部离开
+  （各自 `bbt_co_await` 已拿到结果），到期只返回 `TimedOut` 并保留在途责任与封口，不自动
+  升级。Co 域用 50ms 分片（`CoWaiter`），native 宿主域用同一谓词的有界等待，都不阻塞
+  Processer/worker。
+- `wait_release=true` 时模式工作完成后在同一 `Close` 内继续等专属 HTTP Client 的连接真实退役到
+  同一绝对期限；它同样要求有限期限，参数校验先于封口与首因发布。
+- `Close(CloseOptions::Immediate(reason))`：任意线程/域、非阻塞、幂等，封口、发布首因并立即关闭专属 HTTP Client，中断在途交换；在途 await 返回关闭原因，迟到成功不交付上层。`CloseReason()` 首因固定；Graceful 后仍可显式升级。不能强杀的底层责任保留 owner，直到安全退出。
+- `Close(options)（wait_release=true，有限 deadline）`：物理凭据——专属 HTTP Client 封口后连接真实退役（`http::Client::Close(wait_release=true)`）。
+  前置是先封口，否则 `InvalidArgument`；到期 `TimedOut` 保留连接责任。
+
+`Close()`（无参）等价于默认 `CloseOptions{}`：Immediate、不等待物理回收。Client 不再继承
+`ICoCloseable`，没有另一条同步关闭面；物理凭据只由有限期限的 `Close(wait_release=true)` 证明。
+
+取消域：等待被 `RequestCancel` 打断时，统一分片等待把 `Cancelled` 如实映射为 `Close` 的错误
+返回（不空转重试、不伪造进度），封口保留、在途责任保留，由后续 `Close(wait_release=true)` 收口。因此
+`Close` 必须在该 Client 的调度器/Engine 仍能推进在途操作时调用（框架在 handlers drain 后、
+网络关闭前调用）。Graceful 保留已登记操作各自的结果；Immediate 主动中断专属 HTTP 交换并
+拒绝交付迟到成功。任一非等待关闭的返回都不等于底层责任已经物理回收。
 
 ## 真实后端与 pin
 

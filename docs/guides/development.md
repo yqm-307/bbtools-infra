@@ -2,6 +2,12 @@
 
 本文承接根 [AGENTS.md](../../AGENTS.md) 的操作规范。执行相应任务前阅读相关章节；不新增审批阶段、固定模板或每次必跑的全仓审查。模块交付状态见 [README](../../README.md)，稳定取舍见 [decisions](../decisions/)，CI 实际入口见 [CI 说明](ci.md)与 [workflow](../../.github/workflows/ci.yml)。
 
+## 规范入口
+
+跨仓共用的设计、编码、Review 与用例设计规范固定从 `third-party/bbtools-pub/README.md` 进入，按任务只展开对应职责路径。`AGENTS.md`、本文、`docs/architecture/` 与实际头文件补充 infra 的本地契约；发生冲突时以本仓明确约束和实际实现为准，并记录差异。
+
+干净 clone 后先执行 `git submodule update --init --recursive`，再读取上述入口；submodule 之外的本地 pub 工作树改动不属于本仓规范证据。推送前的本地门禁（review ticket、格式）按 `AGENTS.md` 启用。
+
 ## 开工与隔离
 
 先读目标 Issue、相关决策、实际 Git 状态和消费者，确认目标/非目标、实现负责人、仓库与基线完整 SHA、工作区/分支、允许写入、依赖产物的就绪判据以及验证/交付位置。复用 Issue/PR/交接正文即可；可查信息先查，缺方向或权限才问用户。
@@ -43,7 +49,16 @@ RPC 的现行面见 [ADR 0022](../decisions/0022-rpc-single-protocol.md)（V2 �
 
 优先标准库、Boost 1.90、仓内已有能力，再评估必要的新依赖；成熟能力已能满足时不另造。第三方适配使用 C++17 的现代所有权及错误处理，语言标准、新包管理或系统依赖变更须先确认。选择非 Boost 后端须有正确性、协议完整性或架构匹配的可复核依据与用户确认，不预先锁定未验证的库或版本。
 
-新依赖在 Issue/决策中记录维护活跃度（近期发布/提交、Issue/安全响应）、异步/取消/线程模型、平台与编译器、许可证、安全记录、包体/构建成本，以及替换和退出路径。Stars 或单次 benchmark 不能单独决定；依赖自身通过不代表本仓 adapter 或承诺平台通过。版本锁定、许可证/安全核查和最小真实集成均须落实。
+新依赖在 Issue/决策中记录维护活跃度（近期发布/提交、Issue/安全响应）、异步/取消/线程模型、平台与编译器、许可证、安全记录、包体/构建成本，以及替换和退出路径。Stars 或单次 benchmark 不能单独决定；依赖自身通过不代表本仓 adapter 或承诺平台通过。版本选择、许可证/安全核查和最小真实集成均须落实。
+
+### 依赖版本选择
+
+- 设计时必须指定依赖版本与来源；按指定版本的 API 和契约设计，不凭印象假定最新版能力。
+- 开发与构建有明确指定版本时按指定版本；没有指定时默认使用所选本地源码目录的当前最新内容，允许未提交与未跟踪源码。不要求为联调先提交。
+- “最新”不执行自动 fetch、pull 或 checkout，不更换用户选定的目录，也不等于远端 main。必须核对实际模块、源码目录与链接来源一致。
+- coroutine 用 `BBT_COROUTINE_SOURCE_DIR` 选择本地 Git 检出；可选 `BBT_COROUTINE_PINNED_SHA` 指定完整小写 40 位 commit。留空走最新源码；非空要求 HEAD 命中且消费内容干净，错误时不静默回退。tag 先解析为 commit。
+- `cmake/coroutine.sha` 保留为 CI/发布现有锁版入口，不自动约束本地默认构建；复现该版本时将其内容显式传给 `BBT_COROUTINE_PINNED_SHA`。从指定版本切回最新模式时显式清空该 CMake cache 值。GitHub Actions（`GITHUB_ACTIONS=true`）始终从该文件选择版本并严格核验，空 cache 不放宽 CI，非空指定与该文件冲突时拒绝。
+- 验证记录实际 HEAD 和未提交差异；有差异时，HEAD 只是基线，不是完整候选指纹。最新源码验证不能冒充固定版本、发布或 CI 证据；发布所需的锁定与已有 CI 门禁不因此取消。
 
 使用上游时核对源码 SHA、实际模块、链接路径及对应验证；tag 解析到 SHA，不能把 `/usr/local` 已安装当作版本已固定。协程依据从实际消费 SHA 对应的 [bbtools-coroutine](https://github.com/yqm-307/bbtools-coroutine) `agent-docs/2026-09-07-core-runtime-contract.md`、`api-reference.md`、`user-guide.md` 查起，不把本地 `.sdd` 或旧 README 当唯一真源。`BBT_CORE_SOURCE_DIR` 只是 coroutine 拆分完成前的过渡兼容开关；core 基础模块迁入本仓后同样遵守 infra → coroutine 方向，不新增 core 依赖。
 

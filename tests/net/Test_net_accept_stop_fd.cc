@@ -1,10 +1,12 @@
-// 回归测试：accept4 内核成功后、Engine 接管 fd 前若被 RequestStopAccepting，
-// fd 必须被物理关闭（不仅 CountConnections 为 0，真实 fd 句柄亦不可再用）。
-// 通过 --wrap=syscall 在内核 accept4 返回成功但 Engine 尚未取 fd 的窗口暂停，
-// 与原 accept-stop-fd-probe 同一路径，但以正式用例形式断言并 exit 0。
-//
-// 编译链接需加 -Wl,--wrap=syscall；本文件为唯一使用 wrapped syscall 的 TU，
-// 不与其它测试共享进程，避免污染。
+/**
+ * 回归测试：accept4 内核成功后、Engine 接管 fd 前若被 RequestStopAccepting，
+ * fd 必须被物理关闭（不仅 CountConnections 为 0，真实 fd 句柄亦不可再用）。
+ * 通过 --wrap=syscall 在内核 accept4 返回成功但 Engine 尚未取 fd 的窗口暂停，
+ * 与原 accept-stop-fd-probe 同一路径，但以正式用例形式断言并 exit 0。
+ *
+ * 编译链接需加 -Wl,--wrap=syscall；本文件为唯一使用 wrapped syscall 的 TU，
+ * 不与其它测试共享进程，避免污染。
+ */
 #include <bbt/infra/net/Engine.hpp>
 #include <bbt/infra/net/RawHandler.hpp>
 #include <bbt/coroutine/coroutine.hpp>
@@ -28,6 +30,7 @@ static std::atomic<bool> arm{false}, arrived{false}, release_accept{false};
 static std::atomic<int> acquired{-1};
 
 extern "C" long __real_syscall(long, ...);
+
 extern "C" long __wrap_syscall(long number, ...)
 {
     va_list args;
@@ -41,7 +44,11 @@ extern "C" long __wrap_syscall(long number, ...)
         result = __real_syscall(number, fd, address, length, flags);
         if (result >= 0 && arm.exchange(false)) {
             acquired = static_cast<int>(result);
-            arrived = true; // 内核已建立连接并返回 fd，Engine 尚未见到返回值
+
+            /**
+             * 内核已建立连接并返回 fd，Engine 尚未见到返回值
+             */
+            arrived = true;
             const auto end = std::chrono::steady_clock::now() + 3s;
             while (!release_accept && std::chrono::steady_clock::now() < end) {
                 timespec delay{0, 1000000};
@@ -119,20 +126,25 @@ int main()
                 const bool stopped = Until([&] { return engine.AcceptingStopped(); });
                 std::printf("PHASE accept_stopped=%d connections=%zu\n", stopped, engine.CountConnections());
 
-                // 核心断言：已 accept 但未交付的 fd 必须被物理关闭。
+                /**
+                 * 核心断言：已 accept 但未交付的 fd 必须被物理关闭。
+                 */
                 const int fd = acquired.load();
                 const bool fd_closed = (fd >= 0) && (::fcntl(fd, F_GETFD) < 0);
-                std::printf("RESULT run_error=%d stopped=%d connections=%zu "
-                            "accepted_fd_closed=%d\n",
-                            run_error.value(), engine.Phase() == net::EnginePhase::Stopped, engine.CountConnections(),
-                            fd_closed ? 1 : 0);
+                std::printf(
+                    "RESULT run_error=%d stopped=%d connections=%zu "
+                    "accepted_fd_closed=%d\n",
+                    run_error.value(),
+                    engine.Phase() == net::EnginePhase::Stopped,
+                    engine.CountConnections(),
+                    fd_closed ? 1 : 0);
 
                 result = (stopped && engine.CountConnections() == 0 && fd_closed) ? 0 : 2;
             }
         }
     }
     release_accept = true;
-    engine.RequestClose();
+    (void)engine.Close();
     runner.join();
     if (peer >= 0) {
         ::close(peer);

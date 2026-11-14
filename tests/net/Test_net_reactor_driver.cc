@@ -1,21 +1,23 @@
-// Processer driver 私有适配聚焦测试（批次）。
-//
-// 覆盖：
-// bind —— 真实 driver 绑定已登记 P 槽；OnTick 在目标 worker（非测试线程）
-// 且 LastTickProcesserId 与绑定槽一致；owner context 的 Asio handler
-// 由 P 推进；绑定不新建线程；driver 与业务协程并存；同步解绑后停 tick。
-// wake —— 早到 latch 短路；外线程打断阻塞 Wait；并发/嵌套 Wake；
-// 唤醒计数与 latch 持久。
-// budget —— 单次 OnTick handler 数预算；AfterSchedule 不推进 context。
-// time_budget —— 回调内部耗时计入时间预算，预算耗尽即停。
-// rollback —— 槽不足整体回滚，且不扰动他人已有绑定；回滚后空槽仍可用。
-// unbind —— owner 线程内自解绑被拒（SelfDetach）、绑定保留；控制线程同步解绑；
-// stale token 被拒；解绑后不再 tick。
-// failed —— 注入 OnTick 异常走 runtime 既有 Failed 出口并可查询。
-//
-// 本测试使用动态端口以外的纯 driver 路径（不伪造 fd/TCP 能力）；raw/Conn/Co
-// 真实收发由后续批次补齐。
 
+/**
+ * Processer driver 私有适配聚焦测试（批次）。
+ *
+ * 覆盖：
+ * bind —— 真实 driver 绑定已登记 P 槽；OnTick 在目标 worker（非测试线程）
+ * 且 LastTickProcesserId 与绑定槽一致；owner context 的 Asio handler
+ * 由 P 推进；绑定不新建线程；driver 与业务协程并存；同步解绑后停 tick。
+ * wake —— 早到 latch 短路；外线程打断阻塞 Wait；并发/嵌套 Wake；
+ * 唤醒计数与 latch 持久。
+ * budget —— 单次 OnTick handler 数预算；AfterSchedule 不推进 context。
+ * time_budget —— 回调内部耗时计入时间预算，预算耗尽即停。
+ * rollback —— 槽不足整体回滚，且不扰动他人已有绑定；回滚后空槽仍可用。
+ * unbind —— owner 线程内自解绑被拒（SelfDetach）、绑定保留；控制线程同步解绑；
+ * stale token 被拒；解绑后不再 tick。
+ * failed —— 注入 OnTick 异常走 runtime 既有 Failed 出口并可查询。
+ *
+ * 本测试使用动态端口以外的纯 driver 路径（不伪造 fd/TCP 能力）；raw/Conn/Co
+ * 真实收发由后续批次补齐。
+ */
 #include <bbt/infra/net/detail/DriverBinder.hpp>
 #include <bbt/infra/net/detail/ReactorDriver.hpp>
 
@@ -46,6 +48,7 @@ static void Check(bool value, const char* expression, int line)
         throw std::runtime_error("line " + std::to_string(line) + ": " + expression);
     }
 }
+
 #define CHECK(expression) Check(static_cast<bool>(expression), #expression, __LINE__)
 
 static std::future<void> Task(std::function<void()> callback)
@@ -94,7 +97,11 @@ static void StartRuntime(std::size_t workers)
 {
     g_bbt_coroutine_config->m_cfg_static_thread_num = workers;
     g_bbt_coroutine_config->m_cfg_stack_size = 65536;
-    g_scheduler->Start(); // 每进程一次；无 Stop，进程退出走 RunTestProcessExit 边界。
+
+    /**
+     * 每进程一次；无 Stop，进程退出走 RunTestProcessExit 边界。
+     */
+    g_scheduler->Start();
 }
 
 static void BindCase()
@@ -109,20 +116,28 @@ static void BindCase()
     const auto driver = slots[0].driver;
     const auto main_thread = std::this_thread::get_id();
 
-    // 不新建任何线程：driver 只占已登记 P 的槽。
+    /**
+     * 不新建任何线程：driver 只占已登记 P 的槽。
+     */
     CHECK(CountTasks() == threads_before);
 
-    // OnTick 真在绑定 P 的 worker、非测试线程执行。
+    /**
+     * OnTick 真在绑定 P 的 worker、非测试线程执行。
+     */
     CHECK(WaitUntil([&] { return driver->TickCount() > 0; }, 3000ms));
     CHECK(driver->LastTickThread() != main_thread);
     CHECK(driver->LastTickProcesserId() == slots[0].processer_id);
 
-    // owner context 的 Asio handler 由该 P 推进。
+    /**
+     * owner context 的 Asio handler 由该 P 推进。
+     */
     std::atomic<bool> handler_ran{false};
     boost::asio::post(driver->Context(), [&handler_ran] { handler_ran.store(true); });
     CHECK(WaitUntil([&] { return handler_ran.load(); }, 3000ms));
 
-    // driver 与业务协程并存：业务协程真实让出 P 并推进。
+    /**
+     * driver 与业务协程并存：业务协程真实让出 P 并推进。
+     */
     std::atomic<int> business{0};
     auto task = Task([&business] {
         for (int i = 0; i < 50; ++i) {
@@ -135,7 +150,9 @@ static void BindCase()
     CHECK(business.load() == 50);
     CHECK(driver->TickCount() > 0);
 
-    // 同代同步解绑：控制线程调用，等全部 Tick/Wait/Wake lease 退出。
+    /**
+     * 同代同步解绑：控制线程调用，等全部 Tick/Wait/Wake lease 退出。
+     */
     CHECK(!DriverBinder::UnbindSlots(slots));
     CHECK(slots.empty());
     const auto ticks_at_unbind = driver->TickCount();
@@ -151,13 +168,17 @@ static void WakeCase()
 {
     ReactorDriver driver(4);
 
-    // 早到：Wake 在 Wait 之前，latch 持久，Wait 不睡满 timeout。
+    /**
+     * 早到：Wake 在 Wait 之前，latch 持久，Wait 不睡满 timeout。
+     */
     driver.Wake();
     auto begin = std::chrono::steady_clock::now();
     CHECK(driver.Wait(200ms) == bbt::coroutine::detail::ProcesserDriverResult::Ok);
     CHECK(std::chrono::steady_clock::now() - begin < 100ms);
 
-    // 外线程在 Wait 阻塞期间打断。
+    /**
+     * 外线程在 Wait 阻塞期间打断。
+     */
     std::thread waker([&driver] {
         std::this_thread::sleep_for(30ms);
         driver.Wake();
@@ -168,7 +189,9 @@ static void WakeCase()
     waker.join();
     CHECK(elapsed < 300ms);
 
-    // 并发/嵌套 Wake：noexcept、有界、线程安全。
+    /**
+     * 并发/嵌套 Wake：noexcept、有界、线程安全。
+     */
     const auto wakes_before = driver.WakeCount();
     std::vector<std::thread> wakers;
     for (int w = 0; w < 4; ++w) {
@@ -184,14 +207,18 @@ static void WakeCase()
     }
     CHECK(driver.WakeCount() >= wakes_before + 400);
 
-    // 并发 Wake 后 latch 仍记忆：下一次 Wait 立即返回。
+    /**
+     * 并发 Wake 后 latch 仍记忆：下一次 Wait 立即返回。
+     */
     begin = std::chrono::steady_clock::now();
     CHECK(driver.Wait(200ms) == bbt::coroutine::detail::ProcesserDriverResult::Ok);
     CHECK(std::chrono::steady_clock::now() - begin < 100ms);
 
-    // burst 已被消费（上一步 Wait 已清 latch）后，新的阻塞 Wait 中再来
-    // 一个 Wake：latch 重新置位 + stop 打断当前 run_one_for，不睡满预算。
-    // 这验证"合并重复 stop"不削弱后续独立唤醒的实时性。
+    /**
+     * burst 已被消费（上一步 Wait 已清 latch）后，新的阻塞 Wait 中再来
+     * 一个 Wake：latch 重新置位 + stop 打断当前 run_one_for，不睡满预算。
+     * 这验证"合并重复 stop"不削弱后续独立唤醒的实时性。
+     */
     std::atomic<bool> second_wake_sent{false};
     std::thread late_waker([&driver, &second_wake_sent] {
         std::this_thread::sleep_for(30ms);
@@ -203,7 +230,11 @@ static void WakeCase()
     const auto second_elapsed = std::chrono::steady_clock::now() - begin;
     const bool wake_sent_before_return = second_wake_sent.load();
     late_waker.join();
-    CHECK(wake_sent_before_return); // 不能由旧状态提前返回，再靠 join 等到新 Wake。
+
+    /**
+     * 不能由旧状态提前返回，再靠 join 等到新 Wake。
+     */
+    CHECK(wake_sent_before_return);
     CHECK(second_elapsed < 300ms);
 
     std::cout << "wake wakes=" << driver.WakeCount() << " waits=" << driver.WaitCount()
@@ -212,18 +243,23 @@ static void WakeCase()
 
 static void BudgetCase()
 {
-    // 时间预算置 0 关闭，单独验证 handler 数预算。
+
+    /**
+     * 时间预算置 0 关闭，单独验证 handler 数预算。
+     */
     ReactorDriver driver(4, std::chrono::microseconds(0));
     std::atomic<int> ran{0};
     for (int i = 0; i < 100; ++i) {
         boost::asio::post(driver.Context(), [&ran] { ran.fetch_add(1); });
     }
-    CHECK(driver.OnTick(bbt::coroutine::detail::ProcesserDriverPhase::BeforeSchedule)
-          == bbt::coroutine::detail::ProcesserDriverResult::Ok);
+    CHECK(
+        driver.OnTick(bbt::coroutine::detail::ProcesserDriverPhase::BeforeSchedule)
+        == bbt::coroutine::detail::ProcesserDriverResult::Ok);
     CHECK(ran.load() == 4);
     CHECK(driver.LastTickHandlers() == 4);
-    CHECK(driver.OnTick(bbt::coroutine::detail::ProcesserDriverPhase::BeforeSchedule)
-          == bbt::coroutine::detail::ProcesserDriverResult::Ok);
+    CHECK(
+        driver.OnTick(bbt::coroutine::detail::ProcesserDriverPhase::BeforeSchedule)
+        == bbt::coroutine::detail::ProcesserDriverResult::Ok);
     CHECK(ran.load() == 8);
 
     for (int i = 0; i < 40 && ran.load() < 100; ++i) {
@@ -231,16 +267,22 @@ static void BudgetCase()
     }
     CHECK(ran.load() == 100);
 
-    // AfterSchedule 不推进 context，只计数。
+    /**
+     * AfterSchedule 不推进 context，只计数。
+     */
     boost::asio::post(driver.Context(), [&ran] { ran.fetch_add(1); });
-    CHECK(driver.OnTick(bbt::coroutine::detail::ProcesserDriverPhase::AfterSchedule)
-          == bbt::coroutine::detail::ProcesserDriverResult::Ok);
+    CHECK(
+        driver.OnTick(bbt::coroutine::detail::ProcesserDriverPhase::AfterSchedule)
+        == bbt::coroutine::detail::ProcesserDriverResult::Ok);
     CHECK(ran.load() == 100);
-    CHECK(driver.OnTick(bbt::coroutine::detail::ProcesserDriverPhase::BeforeSchedule)
-          == bbt::coroutine::detail::ProcesserDriverResult::Ok);
+    CHECK(
+        driver.OnTick(bbt::coroutine::detail::ProcesserDriverPhase::BeforeSchedule)
+        == bbt::coroutine::detail::ProcesserDriverResult::Ok);
     CHECK(ran.load() == 101);
 
-    // 回调内部耗时计入时间预算：单次 OnTick 不越过预算继续抽干。
+    /**
+     * 回调内部耗时计入时间预算：单次 OnTick 不越过预算继续抽干。
+     */
     ReactorDriver slow(16, 100us);
     std::atomic<int> slow_ran{0};
     boost::asio::post(slow.Context(), [&slow_ran] {
@@ -251,8 +293,9 @@ static void BudgetCase()
         boost::asio::post(slow.Context(), [&slow_ran] { slow_ran.fetch_add(1); });
     }
     const auto begin = std::chrono::steady_clock::now();
-    CHECK(slow.OnTick(bbt::coroutine::detail::ProcesserDriverPhase::BeforeSchedule)
-          == bbt::coroutine::detail::ProcesserDriverResult::Ok);
+    CHECK(
+        slow.OnTick(bbt::coroutine::detail::ProcesserDriverPhase::BeforeSchedule)
+        == bbt::coroutine::detail::ProcesserDriverResult::Ok);
     const auto elapsed = std::chrono::steady_clock::now() - begin;
     CHECK(slow_ran.load() == 1);
     CHECK(elapsed >= 5ms);
@@ -271,13 +314,17 @@ static void RollbackCase()
     CHECK(first.size() == 2);
     CHECK(WaitUntil([&] { return first[0].driver->TickCount() > 0; }, 3000ms));
 
-    // 只剩 1 个空槽，请求 2：本次已绑定的 1 个必须回滚，不留半成功。
+    /**
+     * 只剩 1 个空槽，请求 2：本次已绑定的 1 个必须回滚，不留半成功。
+     */
     std::vector<DriverSlot> second;
     const auto error = DriverBinder::BindSlots(2, second);
     CHECK(error == std::errc::no_buffer_space);
     CHECK(second.empty());
 
-    // 回滚后那个空槽仍可用；first 的绑定未被扰动。
+    /**
+     * 回滚后那个空槽仍可用；first 的绑定未被扰动。
+     */
     std::vector<DriverSlot> third;
     CHECK(!DriverBinder::BindSlots(1, third));
     CHECK(third.size() == 1);
@@ -285,7 +332,9 @@ static void RollbackCase()
     CHECK(third[0].processer_id != first[1].processer_id);
     CHECK(WaitUntil([&] { return third[0].driver->TickCount() > 0; }, 3000ms));
 
-    // 请求超过全部槽：整体回滚、零绑定。
+    /**
+     * 请求超过全部槽：整体回滚、零绑定。
+     */
     std::vector<DriverSlot> fourth;
     CHECK(DriverBinder::BindSlots(4, fourth) == std::errc::no_buffer_space);
     CHECK(fourth.empty());
@@ -307,7 +356,9 @@ static void UnbindCase()
     const auto token = slots[0].token;
     CHECK(WaitUntil([&] { return driver->TickCount() > 0; }, 3000ms));
 
-    // 在绑定自己的 worker 回调内解绑：任何副作用前被拒，绑定保留。
+    /**
+     * 在绑定自己的 worker 回调内解绑：任何副作用前被拒，绑定保留。
+     */
     std::atomic<int> self_status{-1};
     boost::asio::post(driver->Context(), [&self_status, &token] {
         const auto status = bbt::coroutine::detail::Scheduler::GetInstance()->UnregisterProcesserDriver(token);
@@ -319,11 +370,15 @@ static void UnbindCase()
     const auto ticks_after_self = driver->TickCount();
     CHECK(WaitUntil([&] { return driver->TickCount() > ticks_after_self; }, 3000ms));
 
-    // 控制线程同代同步解绑。
+    /**
+     * 控制线程同代同步解绑。
+     */
     CHECK(!DriverBinder::UnbindSlots(slots));
     CHECK(slots.empty());
 
-    // stale token 不能解绑新一代/已解绑代。
+    /**
+     * stale token 不能解绑新一代/已解绑代。
+     */
     const auto stale = bbt::coroutine::detail::Scheduler::GetInstance()->UnregisterProcesserDriver(token);
     CHECK(stale == bbt::coroutine::detail::ProcesserDriverStatus::StaleToken);
 
@@ -365,7 +420,9 @@ static void FailedCase()
     CHECK(snapshot.m_failure == ProcesserDriverFailure::Tick);
     CHECK(snapshot.m_token == slots[0].token);
 
-    // Failed 仍可合法解绑；解绑后不再 tick。
+    /**
+     * Failed 仍可合法解绑；解绑后不再 tick。
+     */
     CHECK(!DriverBinder::UnbindSlots(slots));
     const auto ticks_at_unbind = driver->TickCount();
     std::this_thread::sleep_for(50ms);
@@ -383,13 +440,17 @@ static void BindPreserveCase()
     const auto first_token = out[0].token;
     const auto first_id = out[0].processer_id;
 
-    // 第二次调用追加，不丢弃调用者既存绑定。
+    /**
+     * 第二次调用追加，不丢弃调用者既存绑定。
+     */
     CHECK(!DriverBinder::BindSlots(1, out));
     CHECK(out.size() == 2);
     CHECK(out[0].token == first_token);
     CHECK(out[0].processer_id == first_id);
 
-    // 槽不足失败时 out 保持原样（不丢既存、不半追加）。
+    /**
+     * 槽不足失败时 out 保持原样（不丢既存、不半追加）。
+     */
     CHECK(DriverBinder::BindSlots(1, out) == std::errc::no_buffer_space);
     CHECK(out.size() == 2);
     CHECK(out[0].token == first_token);
@@ -406,11 +467,14 @@ static void UnbindRefusalCase()
     CHECK(!DriverBinder::BindSlots(1, slots));
     const auto token = slots[0].token;
 
-    // 外部先行同代解绑（模拟竞争/已脱离）：该代归属已不存在，DriverBinder
-    // 依核心契约 / 把 StaleToken 视为安全移出，不伪报仍绑定；
-    // 不存在的旧 token 不能解绑后续新代（另测）。
-    CHECK(bbt::coroutine::detail::Scheduler::GetInstance()->UnregisterProcesserDriver(token)
-          == bbt::coroutine::detail::ProcesserDriverStatus::Ok);
+    /**
+     * 外部先行同代解绑（模拟竞争/已脱离）：该代归属已不存在，DriverBinder
+     * 依核心契约 / 把 StaleToken 视为安全移出，不伪报仍绑定；
+     * 不存在的旧 token 不能解绑后续新代（另测）。
+     */
+    CHECK(
+        bbt::coroutine::detail::Scheduler::GetInstance()->UnregisterProcesserDriver(token)
+        == bbt::coroutine::detail::ProcesserDriverStatus::Ok);
     CHECK(!DriverBinder::UnbindSlots(slots));
     CHECK(slots.empty());
 
@@ -419,11 +483,15 @@ static void UnbindRefusalCase()
 
 static void ExceptionCase()
 {
-    // 逃逸到 driver 层的未分类异常进入 Failed 可观察出口，不被计数抹平。
+
+    /**
+     * 逃逸到 driver 层的未分类异常进入 Failed 可观察出口，不被计数抹平。
+     */
     ReactorDriver driver(4);
     boost::asio::post(driver.Context(), [] { throw std::runtime_error("escaped handler"); });
-    CHECK(driver.OnTick(bbt::coroutine::detail::ProcesserDriverPhase::BeforeSchedule)
-          == bbt::coroutine::detail::ProcesserDriverResult::Failed);
+    CHECK(
+        driver.OnTick(bbt::coroutine::detail::ProcesserDriverPhase::BeforeSchedule)
+        == bbt::coroutine::detail::ProcesserDriverResult::Failed);
     CHECK(driver.UnhandledFailureCount() == 1);
     CHECK(driver.LastFailure() != nullptr);
 
@@ -432,7 +500,10 @@ static void ExceptionCase()
 
 static void StopRestartCase()
 {
-    // Wake 的 stop/restart 不是丢 callback 手段：已登记 readiness 在 restart 后兑现。
+
+    /**
+     * Wake 的 stop/restart 不是丢 callback 手段：已登记 readiness 在 restart 后兑现。
+     */
     ReactorDriver driver(4);
     std::atomic<int> fired{0};
     auto timer = std::make_shared<boost::asio::steady_timer>(driver.Context(), 40ms);
@@ -442,14 +513,27 @@ static void StopRestartCase()
         }
     });
 
-    driver.Wake(); // timer 到期前 stop
+    /**
+     * timer 到期前 stop
+     */
+    driver.Wake();
     auto begin = std::chrono::steady_clock::now();
     CHECK(driver.Wait(200ms) == bbt::coroutine::detail::ProcesserDriverResult::Ok);
     const auto elapsed = std::chrono::steady_clock::now() - begin;
-    CHECK(elapsed < 100ms);   // 早到 latch 立即返回，不靠 timeout
-    CHECK(fired.load() == 0); // timer 未被提前触发，也未被丢弃
 
-    // restart 后 handler 仍会兑现（不是靠 timeout 轮询当正确性证明：这里显式推进）。
+    /**
+     * 早到 latch 立即返回，不靠 timeout
+     */
+    CHECK(elapsed < 100ms);
+
+    /**
+     * timer 未被提前触发，也未被丢弃
+     */
+    CHECK(fired.load() == 0);
+
+    /**
+     * restart 后 handler 仍会兑现（不是靠 timeout 轮询当正确性证明：这里显式推进）。
+     */
     CHECK(WaitUntil(
         [&] {
             driver.OnTick(bbt::coroutine::detail::ProcesserDriverPhase::BeforeSchedule);

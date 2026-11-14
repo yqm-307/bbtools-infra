@@ -18,6 +18,7 @@
 
 #include <bbt/coroutine/syntax/Async.hpp>
 #include <bbt/coroutine/object/CoObject.hpp>
+#include <bbt/infra/CloseOptions.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
 #include <bbt/infra/Result.hpp>
 #include <bbt/infra/net/Address.hpp>
@@ -29,22 +30,32 @@
 
 namespace bbt::infra::net {
 class Engine;
-} // 只前向声明；net::Address 值类型
-//（sockaddr 快照，无物理栈泄漏，leak-check 白名单）经 LocalAddress 返回需要
-// 完整类型（上方 include）。
+}
 
 namespace bbt::infra::rpc {
 
 class CoRpcClient;
 class CoRpcServer;
-struct ServerV2State; // detail：会话入站状态，定义见 detail/RpcSessionState.hpp
+
+/**
+ * detail：会话入站状态，定义见 detail/RpcSessionState.hpp
+ */
+struct ServerV2State;
 
 namespace detail {
-// 完整定义见 detail/RpcSessionState.hpp。
+
+/**
+ * 完整定义见 detail/RpcSessionState.hpp。
+ */
 struct ServerV2Ledger;
-/// 测试接缝：读取会话入站台账快照（仅测试使用）。
+
+/**
+ * 测试接缝：读取会话入站台账快照（仅测试使用）。
+ */
 ServerV2Ledger ServerV2LedgerForTest(const CoRpcServer& server) noexcept;
-} // namespace detail
+// clang-format off
+}
+// clang-format on
 
 /**
  * @brief 双向 RPC 会话入站服务端。
@@ -84,9 +95,11 @@ public:
      * Server 不另建 session registry——完成握手的入站 link 交给同一
      * session_owner（CoRpcClient owner），实现一条双向 link 的 Call/Send 复用。
      */
-    static result<std::shared_ptr<CoRpcServer>> Create(std::shared_ptr<net::Engine> engine,
-                                                       std::shared_ptr<CoRpcClient> session_owner,
-                                                       AdmissionHandler admission_handler, ServerOptions options);
+    static result<std::shared_ptr<CoRpcServer>> Create(
+        std::shared_ptr<net::Engine> engine,
+        std::shared_ptr<CoRpcClient> session_owner,
+        AdmissionHandler admission_handler,
+        ServerOptions options);
 
     /**
      * @brief 注册一条 service/method 路由。
@@ -98,50 +111,56 @@ public:
      */
     result<void> RegisterRpc(std::string rpc_name, RpcHandler handler);
     result<void> RegisterRpc(std::string rpc_name, RpcHandler handler, RouteOptions options);
-    /// @brief 删除一条路由；不存在时返回 NotFound。
+
+    /**
+     * @brief 删除一条路由；不存在时返回 NotFound。
+     */
     result<void> UnregisterRpc(std::string_view rpc_name);
 
-    /// @brief 启动监听（native 宿主上下文；Engine 须 Running 且 scheduler 已启动）。
+    /**
+     * @brief 启动监听（任意域；Engine 须 Running 且 scheduler 已启动）。
+     *
+     * native 线程与受管协程都可直接调用。admission worker 创建与 accept
+     * 任务登记都在 server 状态锁外完成——Co 域栈池未命中会挂起注册，持锁
+     * 会阻塞 Close/Stats/收口观察。成功后重复 Start 幂等；启动窗口内被
+     * Close 时返回 Closed；accept 任务登记失败时启动权与队列全部回滚。
+     */
     result<void> Start();
 
     /**
      * @brief 统一关闭入口（受管协程内 bbt_co_await 消费）。
      *
-     * 三种形态共用同一入口，不再暴露 StopAccepting/Drain/WaitStopped：
-     *   - Close(Immediate, 0)：立即逻辑封口并发布首个关闭原因（幂等、不可
-     *     重开）；停止接纳、admission 封口、在途 link 强制关闭，不等待。
-     *   - Close(Timeout, timeout_ms)：先同上强制收口，再有界等待 listener/
-     *     握手/session/写责任物理收口；超时返回 TimedOut。
-     *   - Close(Graceful, timeout_ms)：先拒新，等 admission 队列、已授权
-     *     reply/lease 与写责任真实归还后封口；timeout_ms==-1 表示无限等待，
-     *     有限期限超时返回 TimedOut 并强制收口。
-     * @param flag 关闭模式。
-     * @param timeout_ms 毫秒；仅 Graceful 允许 -1（无限），其余负值返回
-     *        InvalidArgument 且不启动等待。
-     * @param reason 关闭原因；message 为空时使用默认 Closed 原因。
+     * 模式、首因与绝对期限唯一由 CloseOptions 表达：
+     *   - Immediate：立即逻辑封口并发布首个关闭原因（幂等、不可重开）；停止
+     *     接纳、admission 封口、在途 link 强制关闭，不等待。
+     *   - Graceful：封新并发布首个原因，等 admission 队列、已授权 reply/lease
+     *     与写责任真实归还；到期只返回 TimedOut 并保留责任，不自动升级。
+     *   - wait_release=true：模式工作完成后在同一 Close 内继续等 session 物理
+     *     close 与 retiring lease 出账到同一绝对期限（不续预算）。
+     *
+     * 本 Server 已授权的 handler 任务内调用（自等待）在副作用前返回
+     * InvalidContext。重复调用幂等、首因固定；Graceful → Immediate 升级由任一
+     * 次 Immediate/Close(Immediate) 触发。
+     * @param options 模式、首因与优雅关闭的有限绝对期限。
      */
-    bbt_co_async(result<void>)
-        Close(CloseFlag flag = CloseFlag::Immediate, std::int64_t timeout_ms = 0, Error reason = {});
+    bbt_co_async(result<void>) Close(const CloseOptions& options = {});
 
     /**
-     * @brief 宿主侧同步强制关闭（任意域、不挂起、幂等）。
-     *
-     * 立即拒绝新操作、停止接纳、强制关闭所有 session/link、未终结调用立即
-     * 失败；不等待 handler、reply、队列或物理释放。与 Close(Immediate) 共用
-     * 同一套关闭状态。
-     * @param reason 关闭原因；message 为空时使用默认 Closed 原因。
+     * @brief 查询本 Server 是否已逻辑封口。
      */
-    void Shutdown(Error reason = {}) noexcept;
-
-    /// @brief 查询本 Server 是否已逻辑封口。
     bool IsClosed() const noexcept;
-    /// @brief 已发布的首个关闭原因；未发布为空。
+
+    /**
+     * @brief 已发布的首个关闭原因；未发布为空。
+     */
     std::optional<Error> CloseReason() const noexcept;
 
     /**
      * @brief 实际绑定地址（Start() 成功后有效）。
      *
      * 动态端口返回内核分配的 net::Address；未启动或已不可观察时返回错误。
+     * net::Address 是 sockaddr 快照值类型（无物理栈泄漏，leak-check 白名单），
+     * 所以公共面直接以值返回。
      */
     result<bbt::infra::net::Address> LocalAddress() const;
 
@@ -156,12 +175,16 @@ public:
     CoRpcServer& operator=(const CoRpcServer&) = delete;
 
 private:
-    // 内部接缝读 m_v2：台账快照与 owner 访问都在 detail 下，公共 API 面
-    // 不含它们。
+    /**
+     * 内部接缝读 m_v2：台账快照与 owner 访问都在 detail 下，公共 API 面
+     * 不含它们。
+     */
     friend detail::ServerV2Ledger detail::ServerV2LedgerForTest(const CoRpcServer&) noexcept;
 
     explicit CoRpcServer(std::shared_ptr<ServerV2State> v2) noexcept;
     std::shared_ptr<ServerV2State> m_v2;
 };
 
-} // namespace bbt::infra::rpc
+// clang-format off
+}
+// clang-format on

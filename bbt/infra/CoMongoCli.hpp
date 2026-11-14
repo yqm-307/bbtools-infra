@@ -1,68 +1,55 @@
-/** @file CoMongoCli.hpp
+/**
+ * @file CoMongoCli.hpp
  * @brief 协程原生 MongoDB 客户端的公共面。
  *
  * mongocxx/bsoncxx 类型、驱动线程、连接池与阻塞调用全部隐藏在 bbt/infra/mongo/detail/ 实现中，
- * 本头只出现 infra 与标准库类型。
+ * 本头只出现 infra 与标准库类型。客户端为具体类，独占私有实现，不提供 Mongo 操作的派生扩展点。
  */
 #pragma once
 
-#include <chrono>
-#include <cstddef>
 #include <cstdint>
+
 #include <memory>
+
 #include <optional>
-#include <string>
 
 #include <bbt/infra/ICoCloseable.hpp>
 #include <bbt/infra/ICoNetwork.hpp>
+#include <bbt/infra/MongoClientConfig.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
 #include <bbt/infra/Result.hpp>
-#include <bbt/infra/mongo/Client.hpp>
+#include <bbt/infra/mongo/CoMongoDb.hpp>
 
 namespace bbt::infra {
 
-/// @brief 文档值类型；唯一定义在 bbt/infra/mongo/Bson.hpp（namespace bbt::infra::mongo），此处保持 bbt::infra:: 下的名字可用。
+namespace mongo_detail {
+class CoMongoCliImpl;
+}
+
+/**
+ * @brief 文档值类型；唯一定义在 bbt/infra/mongo/Bson.hpp（namespace bbt::infra::mongo），此处保持 bbt::infra:: 下的名字可用。
+ */
 using mongo::MongoDocument;
-/// @brief 更新回执类型；唯一定义在 bbt/infra/mongo/Bson.hpp。
+
+/**
+ * @brief 更新回执类型；唯一定义在 bbt/infra/mongo/Bson.hpp。
+ */
 using mongo::MongoUpdateResult;
-/// @brief 接纳队列容量上限，取值定义见 bbt/infra/mongo/Client.hpp。
+
+/**
+ * @brief 接纳队列容量上限，取值定义见 bbt/infra/mongo/CoMongoDb.hpp。
+ */
 using mongo::kMongoLimitsMaxQueue;
-/// @brief 驱动层超时上限，取值定义见 bbt/infra/mongo/Client.hpp。
+
+/**
+ * @brief 驱动层超时上限，取值定义见 bbt/infra/mongo/CoMongoDb.hpp。
+ */
 using mongo::kMongoLimitsMaxTimeout;
-/// @brief worker 线程数上限，取值定义见 bbt/infra/mongo/Client.hpp。
+
+/**
+ * @brief worker 线程数上限，取值定义见 bbt/infra/mongo/CoMongoDb.hpp。
+ */
 using mongo::kMongoLimitsMaxWorkerThreads;
-
-/**
- * @brief CoMongoCli 的装配参数：一个 client 绑定一个 db.collection。
- *
- * 内部由独占的 mongo owner（bbt/infra/mongo/detail/MongoRuntime）承载 worker、队列与 pool，
- * 资源归属与 bbt::infra::mongo::CoMongoDb 相同。需要多个集合共享一组 worker 的代码应直接使用
- * mongo::CoMongoDb 加集合句柄。
- *
- * socket_timeout 是单操作的物理上界（driver 阻塞 I/O 不会超过它），FindOne 另以 maxTimeMS 下发同一上界。
- * URI 中已显式给出的同名项不会被覆盖，调用方须自行保证这些值有限。
- */
-struct MongoClientConfig {
-    std::string uri;        ///< mongodb:// 或 mongodb+srv:// 连接串，可能含凭据。
-    std::string database;   ///< 数据库名，不能为空。
-    std::string collection; ///< 集合名，不能为空。
-    std::size_t
-        worker_threads; ///< 执行阻塞 driver 调用的 worker 线程数，范围 (0, kMongoLimitsMaxWorkerThreads]。每项 operation 在同一 worker 上 acquire/use/release pooled client。
-    std::size_t
-        max_queue; ///< 等待 worker 的 operation 队列容量，范围 (0, kMongoLimitsMaxQueue]。耗尽时新命令立即返回 Overloaded，不无限排队。
-    std::chrono::milliseconds server_selection_timeout; ///< 驱动服务器选择超时，注入 serverSelectionTimeoutMS。
-    std::chrono::milliseconds connect_timeout;          ///< 连接超时，注入 connectTimeoutMS。
-    std::chrono::milliseconds socket_timeout;           ///< 单操作物理上界，注入 socketTimeoutMS。
-    std::chrono::milliseconds
-        wait_queue_timeout; ///< pool 等待队列超时，注入 waitQueueTimeoutMS；超时映射为 Overloaded。
-};
-
-/**
- * @brief 校验 MongoClientConfig：URI 前缀、库名与集合名非空，各数值与超时位于对应上限之内。
- * @param cfg 待校验的装配参数。
- * @return 通过返回 ok；违规返回 InvalidArgument。
- */
-result<void> ValidateMongoClientConfig(const MongoClientConfig& cfg);
 
 /**
  * @brief 出站 MongoDB 组件：独占一个 mongo owner 与单个集合句柄。
@@ -84,7 +71,7 @@ result<void> ValidateMongoClientConfig(const MongoClientConfig& cfg);
  *     并发时先封口、再等该次 Start 完成：已封口的 Start 不发布资源并返回 Closed，否则其已建资源由
  *     本次 Close 同步收口。因此 Close 返回时 worker 与 lease 已收口、终态不回退，此后 Start 一律 Closed。
  */
-class CoMongoCli : public ICoNetwork, public ICoCloseable {
+class CoMongoCli final : public ICoNetwork, public ICoCloseable {
 public:
     /**
      * @brief 校验装配参数并取对象身份，不建立任何资源。
@@ -96,12 +83,20 @@ public:
     static result<std::shared_ptr<CoMongoCli>> Create(MongoClientConfig config);
 
     /**
+     * @brief 释放独占实现，由实现完成既有关闭流程。
+     */
+    ~CoMongoCli() override;
+
+    CoMongoCli(const CoMongoCli&) = delete;
+    CoMongoCli& operator=(const CoMongoCli&) = delete;
+
+    /**
      * @brief 建立 worker 线程组并接入进程级 pool。同一 client 只成功启动一次，关闭后不重开。
      *
      * 要求协程运行时已初始化，未初始化返回 RuntimeUnavailable。与 Close 并发时封口优先：
      * Start 不发布资源并返回 Closed。
      */
-    virtual result<void> Start() = 0;
+    result<void> Start();
 
     /**
      * @brief 插入一份文档。
@@ -109,28 +104,51 @@ public:
      * 文档字节必须是完整良构的 BSON，非法返回 InvalidArgument。服务端错误（如 duplicate key）
      * 映射为服务端错误分类，domain_code 为 "DuplicateKey" 等 codeName。
      */
-    virtual result<void> InsertOne(const MongoDocument& doc, const CallOptions& options) = 0;
+    result<void> InsertOne(const MongoDocument& doc, const CallOptions& options);
 
     /**
      * @brief 查询首个命中 filter 的文档。
      *
      * filter 为查询谓词文档。命中返回文档字节拷贝，未命中返回 std::nullopt（ok 分支）。
      */
-    virtual result<std::optional<MongoDocument>> FindOne(const MongoDocument& filter, const CallOptions& options) = 0;
+    result<std::optional<MongoDocument>> FindOne(const MongoDocument& filter, const CallOptions& options);
 
     /**
      * @brief 更新首个命中 filter 的文档。
      *
      * update 为更新文档，须包含 $set 等更新算子。返回 matched、modified、upserted 计数。
      */
-    virtual result<MongoUpdateResult> UpdateOne(const MongoDocument& filter, const MongoDocument& update,
-                                                const CallOptions& options) = 0;
+    result<MongoUpdateResult>
+    UpdateOne(const MongoDocument& filter, const MongoDocument& update, const CallOptions& options);
 
     /**
      * @brief 删除首个命中 filter 的文档。
      * @return 实际删除的数量，0 或 1。
      */
-    virtual result<std::uint64_t> DeleteOne(const MongoDocument& filter, const CallOptions& options) = 0;
+    result<std::uint64_t> DeleteOne(const MongoDocument& filter, const CallOptions& options);
+
+    /**
+     * @brief 按既有 owner 关闭协议封口并收口资源。
+     */
+    void Close() noexcept override;
+
+    /**
+     * @brief 查询实现的物理收口状态。
+     */
+    bool IsClosed() const noexcept override;
+
+    /**
+     * @brief 返回创建时取得的对象身份。
+     */
+    bbt::coroutine::CoObjectInfo GetObjectInfo() const override;
+
+private:
+    friend class mongo_detail::CoMongoCliImpl;
+
+    explicit CoMongoCli(MongoClientConfig config, bbt::coroutine::CoObjectInfo info);
+    std::unique_ptr<mongo_detail::CoMongoCliImpl> m_impl;
 };
 
-} // namespace bbt::infra
+// clang-format off
+}
+// clang-format on

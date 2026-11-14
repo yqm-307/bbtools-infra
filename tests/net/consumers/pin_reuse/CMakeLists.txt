@@ -8,7 +8,7 @@ project(pin_reuse_probe LANGUAGES CXX)
 # bbt_coroutine_pin_verify（声明目录 pin）。
 #   mismatch：ACTUAL=REAL pin 树，DECLARED=stub → verify_existing_target 必须
 #             以「来源…不一致」拒绝；
-#   ok      ：ACTUAL=DECLARED=REAL pin 树 → 复核放行且 pin 命中（输出含标记）。
+#   ok      ：ACTUAL=DECLARED=REAL 树 → 同源复核放行，默认允许本地修改。
 set(REAL_COROUTINE_DIR "" CACHE PATH "已建 target 的真实来源（add_subdirectory）")
 set(STUB_COROUTINE_DIR "" CACHE PATH "BBT_COROUTINE_SOURCE_DIR 声明来源")
 set(PIN_MODULE "" CACHE PATH "CoroutinePin.cmake 路径")

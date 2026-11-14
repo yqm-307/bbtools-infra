@@ -6,7 +6,6 @@
  *
  * 只做数字地址的解析与保存，不做 DNS 查询，也不做任何 I/O。
  */
-
 #include <sys/socket.h>
 
 #include <cstdint>
@@ -15,7 +14,9 @@
 
 namespace bbt::infra::net {
 
-/// @brief 地址族。Unix 指 AF_UNIX 路径，包括 Linux 抽象命名空间。
+/**
+ * @brief 地址族。Unix 指 AF_UNIX 路径，包括 Linux 抽象命名空间。
+ */
 enum class AddressFamily { Unspecified, IPv4, IPv6, Unix };
 
 /**
@@ -63,10 +64,14 @@ public:
      */
     static Address FromNative(const sockaddr* addr, socklen_t length);
 
-    /** @brief 地址族；无效地址返回 Unspecified。 */
+    /**
+     * @brief 地址族；无效地址返回 Unspecified。
+     */
     AddressFamily Family() const noexcept;
 
-    /** @brief 端口号，已从网络字节序转为主机字节序；Unix 地址与无效地址返回 0。 */
+    /**
+     * @brief 端口号，已从网络字节序转为主机字节序；Unix 地址与无效地址返回 0。
+     */
     std::uint16_t Port() const noexcept;
 
     /**
@@ -77,11 +82,10 @@ public:
      */
     std::string ToString() const;
 
-    /** @brief 地址是否有效，即保存了非零长度的 sockaddr。 */
-    bool Valid() const noexcept
-    {
-        return m_size != 0;
-    }
+    /**
+     * @brief 地址是否有效，即保存了非零长度的 sockaddr。
+     */
+    bool Valid() const noexcept { return m_size != 0; }
 
     /**
      * @brief 地址是否仅限本机可达。
@@ -98,4 +102,6 @@ private:
     socklen_t m_size{0};
 };
 
-} // namespace bbt::infra::net
+// clang-format off
+}
+// clang-format on

@@ -1,6 +1,8 @@
-// V2 公共面正对照：只用公开头使用保留符号（唯一 RPC 消费面）。
-// 由 consumers/expect_rpc_v2_surface.cmake 以 -fsyntax-only 编译；
-// 该 TU 通过是全部负对照成立的前提。
+/**
+ * V2 公共面正对照：只用公开头使用保留符号（唯一 RPC 消费面）。
+ * 由 consumers/expect_rpc_v2_surface.cmake 以 -fsyntax-only 编译；
+ * 该 TU 通过是全部负对照成立的前提。
+ */
 #include <bbt/infra/rpc/Admission.hpp>
 #include <bbt/infra/rpc/CoRpcClient.hpp>
 #include <bbt/infra/rpc/CoRpcServer.hpp>
@@ -11,6 +13,7 @@
 #include <bbt/infra/rpc/SessionCodec.hpp>
 #include <bbt/infra/rpc/Stats.hpp>
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -18,14 +21,18 @@
 
 namespace {
 
-// 唯一入站 handler：admission 转移 owning item（同步接纳，不挂起）。
+/**
+ * 唯一入站 handler：admission 转移 owning item（同步接纳，不挂起）。
+ */
 bbt::infra::result<void> Admit(bbt::infra::rpc::AdmissionItem&& item)
 {
     (void)item;
     return bbt::infra::result<void>::ok();
 }
 
-// 唯一注册路由 handler 别名（V2 保留面，与旧 bbt::infra::RpcHandler 不同名）。
+/**
+ * 唯一注册路由 handler 别名（V2 保留面，与旧 bbt::infra::RpcHandler 不同名）。
+ */
 bbt::infra::rpc::CoRpcServer::RpcHandler Route()
 {
     return [](bbt::infra::rpc::Request request) -> bbt_co_async(bbt::infra::result<bbt::infra::rpc::Response>) {
@@ -87,7 +94,9 @@ void UseAll()
     (void)ValidateSessionFrame(frame);
     (void)Route();
 
-    // 统一关闭面：Co 命名类型与 CloseFlag 三态是唯一保留的关闭入口。
+    /**
+     * 统一关闭面：CloseOptions 是唯一保留的关闭输入。
+     */
     bbt::infra::rpc::CoRpcClient* client_owner = nullptr;
     bbt::infra::rpc::CoRpcServer* server_owner = nullptr;
     (void)client_owner;
@@ -96,9 +105,13 @@ void UseAll()
     route_limit.burst_tokens = 1;
     route_limit.refill_per_second = 1.0;
     (void)route_limit;
-    for (const auto flag : {CloseFlag::Immediate, CloseFlag::Timeout, CloseFlag::Graceful}) {
-        (void)flag;
-    }
+    const auto immediate = bbt::infra::CloseOptions::Immediate();
+    const auto graceful =
+        bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::milliseconds(100));
+    (void)immediate;
+    (void)graceful;
 }
 
-} // namespace
+// clang-format off
+}
+// clang-format on

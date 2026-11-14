@@ -1,13 +1,11 @@
-// 回归测试：Server::Submit 在与 Stop 同一 mutex 的任务登记预约处校验 stopping，
-// 封口后不再预约/登记新任务，WaitStopped 后不再复活；TaskLease 未计数回退不下溢。
-// 覆盖已进入 Submit 的迟到 Start 被拒绝，以及停止后的重复公开 Start；不模拟 session Submit。
-//
-// 通过 --wrap=_Znwm 在 TaskLease（48 字节）分配处暂停，制造 Start 与 Close/WaitStopped
-// 的确定性竞态窗口。与原 start-stop-task-probe 同一路径，但以正式用例形式断言并 exit 0。
-//
-// 编译链接需加 -Wl,--wrap=_Znwm；本文件为唯一使用 wrapped operator new 的 TU，
-// 不与其它测试共享进程，避免污染。
+/**
+ * 回归测试：任务登记窗口与 Stop/WaitStopped 的竞争。Start 在私有登记屏障处
+ * 被扣住（尚未计数、尚未检查封口），此时 RequestClose/WaitStopped 先完成；屏障
+ * 释放后迟到登记必须看到封口并失败，不再预约任务，WaitStopped 后不复活。
+ * 覆盖已进入登记的迟到 Start 被拒绝，以及停止后的重复公开 Start。
+ */
 #include <bbt/infra/http/Server.hpp>
+#include <bbt/infra/http/detail/ServerTestAccess.hpp>
 #include <bbt/coroutine/coroutine.hpp>
 
 #include <atomic>
@@ -21,27 +19,7 @@ using namespace std::chrono_literals;
 namespace http = bbt::infra::http;
 namespace net = bbt::infra::net;
 
-static thread_local int allocation_phase = 0;
 static std::atomic<int> stage{0}, permit{0};
-
-extern "C" void* __real__Znwm(std::size_t);
-extern "C" void* __wrap__Znwm(std::size_t size)
-{
-    if (allocation_phase != 0) {
-        if ((allocation_phase == 1 && size == 48) || allocation_phase == 2) {
-            const int current = allocation_phase++;
-            if (current == 2) {
-                allocation_phase = 0;
-            }
-            stage = current;
-            const auto end = std::chrono::steady_clock::now() + 3s;
-            while (permit.load() < current && std::chrono::steady_clock::now() < end) {
-                std::this_thread::sleep_for(1ms);
-            }
-        }
-    }
-    return __real__Znwm(size);
-}
 
 template <class P> static bool Until(P predicate)
 {
@@ -81,35 +59,48 @@ int main()
 
     std::thread runner([&] { run_error = engine->Run(config); });
     if (!Until([&] { return engine->Phase() == net::EnginePhase::Running; })) {
-        engine->RequestClose();
+        (void)engine->Close();
         runner.join();
         std::_Exit(2);
     }
 
     int result = 2;
 
-    // ---- 阶段 A：Submit 分配屏障内 Close/WaitStopped，迟到 Start 必须失败 ----
+    /**
+     * 阶段 A：登记屏障内 Close/WaitStopped，迟到 Start 必须失败
+     */
     {
         bool start_ok = false;
-        std::thread starter([&] {
-            allocation_phase = 1;
-            start_ok = bool(server->Start());
-            allocation_phase = 0;
+        http::ServerTestAccess::SetRegistrationBarrierOnce(*server, [] {
+            stage = 1;
+            const auto end = std::chrono::steady_clock::now() + 3s;
+            while (permit.load() < 1 && std::chrono::steady_clock::now() < end) {
+                std::this_thread::sleep_for(1ms);
+            }
         });
+        std::thread starter([&] { start_ok = bool(server->Start()); });
         if (Until([] { return stage.load() == 1; })) {
-            std::size_t tasks_at_submit = server->Stats().tasks;
-            std::printf("PHASE-A before_submit_allocation=1 tasks=%zu\n", tasks_at_submit);
-            server->Close();
-            bool first_wait = bool(server->WaitStopped(std::chrono::steady_clock::now() + 2s));
-            std::size_t tasks_after_wait = server->Stats().tasks;
-            std::printf("PHASE-A first_wait_stopped=%d tasks_after_wait=%zu listener_stopped=%d\n", first_wait ? 1 : 0,
-                        tasks_after_wait, engine->AcceptingStopped() ? 1 : 0);
+            const std::size_t tasks_at_submit = server->Stats().tasks;
+            std::printf("PHASE-A before_stop tasks=%zu\n", tasks_at_submit);
+            (void)server->Close(bbt::infra::CloseOptions::Immediate());
+            const bool first_wait = bool(server->Close(
+                bbt::infra::CloseOptions{
+                    bbt::infra::CloseMode::Immediate, true, {}, std::chrono::steady_clock::now() + 2s}));
+            const std::size_t tasks_after_wait = server->Stats().tasks;
             const bool listener_stopped = engine->AcceptingStopped();
-            permit = 2;
+            std::printf(
+                "PHASE-A first_wait_stopped=%d tasks_after_wait=%zu listener_stopped=%d\n",
+                first_wait ? 1 : 0,
+                tasks_after_wait,
+                listener_stopped ? 1 : 0);
+            permit = 1;
             starter.join();
             const auto tasks_after_start = server->Stats().tasks;
             std::printf("PHASE-A start_ok=%d tasks_after_start=%zu\n", start_ok ? 1 : 0, tasks_after_start);
-            // 即使错误实现已自行回收任务，迟到 Start 成功仍必须使回归失败。
+
+            /**
+             * 即使错误实现已自行回收任务，迟到 Start 成功仍必须使回归失败。
+             */
             if (tasks_at_submit == 0 && first_wait && tasks_after_wait == 0 && listener_stopped && !start_ok
                 && tasks_after_start == 0) {
                 result = 0;
@@ -117,14 +108,16 @@ int main()
                 result = 2;
             }
         } else {
+            permit = 1;
             starter.join();
             std::_Exit(2);
         }
     }
 
-    // ---- 阶段 B：停止后的重复公开 Start 必须被外层检查拒绝，不计数 ----
+    /**
+     * 阶段 B：停止后的重复公开 Start 必须被外层检查拒绝，不计数
+     */
     {
-        // 再次 Start 应失败（已 stopping/closed）
         bool second_start = bool(server->Start());
         std::size_t tasks_b = server->Stats().tasks;
         std::printf("PHASE-B second_start=%d tasks=%zu\n", second_start ? 1 : 0, tasks_b);
@@ -133,22 +126,31 @@ int main()
         }
     }
 
-    // ---- 阶段 C：最终 WaitStopped 与资源收口 ----
+    /**
+     * 阶段 C：最终 WaitStopped 与资源收口
+     */
     {
-        bool final_wait = bool(server->WaitStopped(std::chrono::steady_clock::now() + 2s));
-        engine->RequestClose();
+        bool final_wait = bool(server->Close(
+            bbt::infra::CloseOptions{
+                bbt::infra::CloseMode::Immediate, true, {}, std::chrono::steady_clock::now() + 2s}));
+        (void)engine->Close();
         runner.join();
         auto stats = server->Stats();
         const bool stopped = engine->Phase() == net::EnginePhase::Stopped;
         const auto connections = engine->CountConnections();
-        std::printf("RESULT-C final_wait=%d final_tasks=%zu run_error=%d stopped=%d connections=%zu\n",
-                    final_wait ? 1 : 0, stats.tasks, run_error.value(), stopped ? 1 : 0, connections);
+        std::printf(
+            "RESULT-C final_wait=%d final_tasks=%zu run_error=%d stopped=%d connections=%zu\n",
+            final_wait ? 1 : 0,
+            stats.tasks,
+            run_error.value(),
+            stopped ? 1 : 0,
+            connections);
         if (!final_wait || stats.tasks != 0 || run_error || !stopped || connections != 0) {
             result = 2;
         }
     }
 
-    std::printf("F1 regression: stop-before-submit rejected and resources drained=%d\n", result == 0);
+    std::printf("F1 regression: stop-before-registration rejected and resources drained=%d\n", result == 0);
     std::fflush(nullptr);
     std::_Exit(result);
 }

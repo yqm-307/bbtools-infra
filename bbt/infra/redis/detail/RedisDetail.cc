@@ -25,8 +25,11 @@ result<RawReply> DecodeReply(const redisReply* reply)
         return result<RawReply>::err(std::move(e));
     }
     case REDIS_REPLY_ARRAY: {
-        // 只支持一维扁平数组：嵌套数组与其他元素类型整体拒绝为
-        // ProtocolError，不截断后继续；元素与负载字节总量有界。
+
+        /**
+         * 只支持一维扁平数组：嵌套数组与其他元素类型整体拒绝为
+         * ProtocolError，不截断后继续；元素与负载字节总量有界。
+         */
         if (reply->elements > kMaxArrayElements) {
             return result<RawReply>::err(
                 MakeError(ErrorCode::ProtocolError, "redis: array reply exceeds max elements"));
@@ -43,8 +46,11 @@ result<RawReply> DecodeReply(const redisReply* reply)
             switch (element->type) {
             case REDIS_REPLY_STRING:
             case REDIS_REPLY_STATUS:
-                // 复制前先按剩余预算校验本元素字节数，checked-add 累计：
-                // 单个超限元素不产生分配，累计值不可能回绕越过上限。
+
+                /**
+                 * 复制前先按剩余预算校验本元素字节数，checked-add 累计：
+                 * 单个超限元素不产生分配，累计值不可能回绕越过上限。
+                 */
                 if (element->str == nullptr && element->len != 0) {
                     return result<RawReply>::err(MakeError(ErrorCode::ProtocolError, "redis: malformed array element"));
                 }
@@ -99,7 +105,10 @@ Error ClassifyHiredisError(int err, const char* errstr, std::string fallback_mes
         e.domain_code = "oom";
         break;
     case REDIS_ERR_OTHER:
-        // getaddrinfo/参数类失败落在 OTHER：按对端不可达归类。
+
+        /**
+         * getaddrinfo/参数类失败落在 OTHER：按对端不可达归类。
+         */
         e.code = ErrorCode::Unavailable;
         e.domain_code = "resolve_or_other";
         break;
@@ -111,4 +120,6 @@ Error ClassifyHiredisError(int err, const char* errstr, std::string fallback_mes
     return e;
 }
 
-} // namespace bbt::infra::redis_detail
+// clang-format off
+}
+// clang-format on

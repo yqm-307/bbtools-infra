@@ -1,4 +1,5 @@
-/** @file ICoObject.hpp
+/**
+ * @file ICoObject.hpp
  * @brief 协程受管对象的身份与等待参数：聚合 coroutine 的公开头，不复制上游类型定义。
  *
  * 上游 coroutine 已收敛到进程寿命运行时，本头只做聚合：

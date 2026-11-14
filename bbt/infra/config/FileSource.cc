@@ -44,8 +44,8 @@ ParseResult Parse(std::string_view content)
         const std::size_t eq = trimmed.find('=');
         if (eq == std::string_view::npos) {
             out.ok = false;
-            out.error = MakeError(ErrorCode::ProtocolError,
-                                  "config file parse: line " + std::to_string(lineno) + " has no '='");
+            out.error = MakeError(
+                ErrorCode::ProtocolError, "config file parse: line " + std::to_string(lineno) + " has no '='");
             return out;
         }
         std::string key(Trim(trimmed.substr(0, eq)));
@@ -63,8 +63,9 @@ ParseResult Parse(std::string_view content)
             const auto [ptr, ec] = std::from_chars(begin, end, v);
             if (ec != std::errc() || ptr != end) {
                 out.ok = false;
-                out.error = MakeError(ErrorCode::ProtocolError,
-                                      "config file parse: version not a uint64 at line " + std::to_string(lineno));
+                out.error = MakeError(
+                    ErrorCode::ProtocolError,
+                    "config file parse: version not a uint64 at line " + std::to_string(lineno));
                 return out;
             }
             out.version = v;
@@ -72,8 +73,9 @@ ParseResult Parse(std::string_view content)
         }
         if (entries.find(key) != entries.end()) {
             out.ok = false;
-            out.error = MakeError(ErrorCode::ProtocolError,
-                                  "config file parse: duplicate key '" + key + "' at line " + std::to_string(lineno));
+            out.error = MakeError(
+                ErrorCode::ProtocolError,
+                "config file parse: duplicate key '" + key + "' at line " + std::to_string(lineno));
             return out;
         }
         entries.emplace(std::move(key), std::move(value));
@@ -82,10 +84,15 @@ ParseResult Parse(std::string_view content)
     return out;
 }
 
-} // namespace
+// clang-format off
+}
+// clang-format on
 
 FileSource::FileSource(std::string path, std::string ns, std::string key)
-    : m_path(std::move(path)), m_ns(std::move(ns)), m_key(std::move(key)), m_source("file:" + m_path)
+    : m_path(std::move(path))
+    , m_ns(std::move(ns))
+    , m_key(std::move(key))
+    , m_source("file:" + m_path)
 {
 }
 
@@ -103,8 +110,11 @@ result<Snapshot> FileSource::Read()
     std::ifstream in(m_path, std::ios::binary);
     if (!in.is_open())
         return result<Snapshot>::err(MakeError(ErrorCode::NotFound, "config file source: cannot open " + m_path));
-    // 目录路径 open 成功但非普通文件：peek() 使其进入读取路径，目录读取置 bad；
-    // 空文件则只置 eof、bad 保持 0——两者必须区分（目录不得发布伪成功空快照）。
+
+    /**
+     * 目录路径 open 成功但非普通文件：peek() 使其进入读取路径，目录读取置 bad；
+     * 空文件则只置 eof、bad 保持 0——两者必须区分（目录不得发布伪成功空快照）。
+     */
     in.peek();
     std::ostringstream ss;
     ss << in.rdbuf();
@@ -136,4 +146,6 @@ const std::string& FileSource::Path() const noexcept
     return m_path;
 }
 
-} // namespace bbt::infra::config
+// clang-format off
+}
+// clang-format on

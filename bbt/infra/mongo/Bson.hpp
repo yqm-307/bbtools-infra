@@ -1,11 +1,12 @@
-/** @file Bson.hpp
+/**
+ * @file Bson.hpp
  * @brief mongo BSON 公共值类型：BSON 文档的 owning 字节载体 + JSON 构造/读取的最薄入口。
  *
  * bsoncxx 类型不出现在本头——构造走 libbson 的 JSON 解析（不手写编解码），读取走
  * Extended JSON 序列化 + 4 个顶层标量 getter。
  *
  * 定位：MongoDocument / MongoUpdateResult 的**唯一**定义在本头，namespace 为
- * bbt::infra::mongo；旧头 <bbt/infra/CoMongoCli.hpp> 用 using 别名指回此处，历史代码与
+ * bbt::infra::mongo；<bbt/infra/CoMongoCli.hpp> 用 using 别名指回此处，兼容别名与
  * `MongoDocument{{0x05, ...}}` 聚合直写仍然合法（bytes 依旧是唯一真源）。
  *
  * 数值保真（实测 libbson 2.5.4，见 tests/Test_mongo_unit.cc 的 mongo_bson 套件）：
@@ -35,8 +36,16 @@ namespace bbt::infra::mongo {
  * @brief ToJson 的 Extended JSON 形态。
  */
 enum class MongoJsonMode {
-    k_canonical = 0, ///< 默认：保留 BSON 类型（$numberInt/$numberLong/$numberDouble）。
-    k_relaxed,       ///< 人读：int64 塌成裸数字，类型信息丢失。
+
+    /**
+     * 默认：保留 BSON 类型（$numberInt/$numberLong/$numberDouble）。
+     */
+    k_canonical = 0,
+
+    /**
+     * 人读：int64 塌成裸数字，类型信息丢失。
+     */
+    k_relaxed,
 };
 
 /**
@@ -47,7 +56,11 @@ enum class MongoJsonMode {
  * 非法输入返回 InvalidArgument。
  */
 struct MongoDocument {
-    std::vector<std::uint8_t> bytes; ///< 完整 BSON 字节，唯一真源。
+
+    /**
+     * @brief 完整 BSON 字节，唯一真源。
+     */
+    std::vector<std::uint8_t> bytes;
 
     /**
      * @brief JSON（含 Extended JSON）→ 完整 BSON。
@@ -79,11 +92,20 @@ struct MongoDocument {
      * 只接受同名类型。
      */
     result<std::string> GetString(std::string_view field) const;
-    /// @brief 读取顶层 int32/int64 字段，统一以 int64 返回。
+
+    /**
+     * @brief 读取顶层 int32/int64 字段，统一以 int64 返回。
+     */
     result<std::int64_t> GetInt64(std::string_view field) const;
-    /// @brief 读取顶层 double 字段，只接受 BSON double。
+
+    /**
+     * @brief 读取顶层 double 字段，只接受 BSON double。
+     */
     result<double> GetDouble(std::string_view field) const;
-    /// @brief 读取顶层 bool 字段，只接受 BSON bool。
+
+    /**
+     * @brief 读取顶层 bool 字段，只接受 BSON bool。
+     */
     result<bool> GetBool(std::string_view field) const;
 };
 
@@ -91,9 +113,23 @@ struct MongoDocument {
  * @brief UpdateOne 的写回执（acknowledged write concern 下由驱动给出）。
  */
 struct MongoUpdateResult {
-    std::int64_t matched = 0;  ///< 命中 filter 的文档数。
-    std::int64_t modified = 0; ///< 实际被改动的文档数。
-    std::int64_t upserted = 0; ///< 由 upsert 新建的文档数。
+
+    /**
+     * @brief 命中 filter 的文档数。
+     */
+    std::int64_t matched = 0;
+
+    /**
+     * @brief 实际被改动的文档数。
+     */
+    std::int64_t modified = 0;
+
+    /**
+     * @brief 由 upsert 新建的文档数。
+     */
+    std::int64_t upserted = 0;
 };
 
-} // namespace bbt::infra::mongo
+// clang-format off
+}
+// clang-format on

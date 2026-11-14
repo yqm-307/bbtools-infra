@@ -1,4 +1,5 @@
-/** @file NetError.hpp
+/**
+ * @file NetError.hpp
  * @brief net 层错误到协议层 Error 的桥接：把 std::error_code 折成携带后端事实的基础分类。
  *
  * 本头是 result<T>/Error 与 net 原语之间的接缝：只有协议或适配层（HTTP、Redis 及后续适配器）包含它；
@@ -28,15 +29,21 @@ namespace bbt::infra {
 
 namespace detail {
 
-/// @brief 表驱动基础分类：同一底层 cause 在所有 adapter 得到同一基础 code。
-/// 只覆盖「底层分类」，不掺入协议阶段判断。
+/**
+ * @brief 表驱动基础分类：同一底层 cause 在所有 adapter 得到同一基础 code。
+ * 只覆盖「底层分类」，不掺入协议阶段判断。
+ */
 ErrorCode NetBaseErrorCode(const std::error_code& ec) noexcept;
 
-/// @brief bbt.net 类别的稳定 domain_code 语义名；与 NetErrc 枚举一一对应，
-/// 只表达「net 域内发生了什么」，不携带协议阶段含义。
+/**
+ * @brief bbt.net 类别的稳定 domain_code 语义名；与 NetErrc 枚举一一对应，
+ * 只表达「net 域内发生了什么」，不携带协议阶段含义。
+ */
 const char* NetDomainCode(const std::error_code& ec) noexcept;
 
-} // namespace detail
+// clang-format off
+}
+// clang-format on
 
 /**
  * @brief 把 net 返回的 error_code 折成携带后端事实的基础 Error，是本桥唯一的公共入口。
@@ -46,4 +53,6 @@ const char* NetDomainCode(const std::error_code& ec) noexcept;
  */
 Error NetToError(const std::error_code& ec, std::string message);
 
-} // namespace bbt::infra
+// clang-format off
+}
+// clang-format on

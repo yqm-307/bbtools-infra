@@ -1,20 +1,20 @@
-// MCP tools 契约测试（2-6 切片，替换原 speculative gateway 假设的 914 行未实现测试；
-// 真源：specs/design proposal-rev12 与公共头契约，非旧测试反推）：
-//   - AddTool：Schema 未接通 fail-closed、接通后注册、坏 schema/外部 ref 注册整体拒绝、
-//     重复名/空名/Start 后拒绝（fail-closed 无半条记录）；
-//   - tools/list：稳定分页 + nextCursor + resultType/ttlMs/cacheScope（modern）；
-//   - tools/call：真实 input Schema 校验（缺 required/错类型/额外字段 → -32602、
-//     handler 0 次）、未知 tool → -32602、isError 业务错误、handler 异常 → 固定 -32603、
-//     output Schema 校验（未声明却给 structuredContent / 不匹配 → 固定 -32603）；
-//   - 业务 MRTR：Deferred(InputRequired) → 缺 sampling 能力 -32021+data.requiredCapabilities、
-//     有能力 → resultType=input_required + inputRequests/requestState、
-//     重试 inputResponses/requestState 进 handler 上下文、legacy Deferred → 固定 -32603；
-//   - capabilities：真实注册事实（无 tool 不宣告 tools，有 tool 宣告）。
-//
-// 全部经真实 core 入口 McpSession::HandleFrame；Schema 校验经公共
-// EnableToolsSchemaValidation + 私有 adapter（bbt_infra_mcp_schema，真实编译 validator：
-// 官方 metaschema 全文校验 / ref 策略 / 复杂度上限），非 stub 冒充。
-
+/**
+ * MCP tools 契约测试（经真实 core 与公共业务入口验证）：
+ *   - AddTool：Schema 未接通 fail-closed、接通后注册、坏 schema/外部 ref 注册整体拒绝、
+ *     重复名/空名/Start 后拒绝（fail-closed 无半条记录）；
+ *   - tools/list：稳定分页 + nextCursor + resultType/ttlMs/cacheScope（modern）；
+ *   - tools/call：真实 input Schema 校验（缺 required/错类型/额外字段 → -32602、
+ *     handler 0 次）、未知 tool → -32602、isError 业务错误、handler 异常 → 固定 -32603、
+ *     output Schema 校验（未声明却给 structuredContent / 不匹配 → 固定 -32603）；
+ *   - 业务 MRTR：Deferred(InputRequired) → 缺 sampling 能力 -32021+data.requiredCapabilities、
+ *     有能力 → resultType=input_required + inputRequests/requestState、
+ *     重试 inputResponses/requestState 进 handler 上下文、legacy Deferred → 固定 -32603；
+ *   - capabilities：真实注册事实（无 tool 不宣告 tools，有 tool 宣告）。
+ *
+ * 全部经真实 core 入口 McpSession::HandleFrame；Schema 校验经公共
+ * EnableToolsSchemaValidation + 私有 adapter（bbt_infra_mcp_schema，真实编译 validator：
+ * 官方 metaschema 全文校验 / ref 策略 / 复杂度上限），非 stub 冒充。
+ */
 #include <cstdint>
 #include <cstdio>
 #include <map>
@@ -115,14 +115,21 @@ JsonValue ModernMeta(const std::string& capabilities_json = "{}")
     return params;
 }
 
-// 带 sampling 能力的 modern tools/call 帧（params._meta 两键 + name[/arguments/extra]）。
-std::string ModernCall(int id, const std::string& name, const std::string& arguments_json,
-                       const std::string& caps = "{\"sampling\":{}}", const std::string& extra_params = "")
+/**
+ * 带 sampling 能力的 modern tools/call 帧（params._meta 两键 + name[/arguments/extra]）。
+ */
+std::string ModernCall(
+    int id,
+    const std::string& name,
+    const std::string& arguments_json,
+    const std::string& caps = "{\"sampling\":{}}",
+    const std::string& extra_params = "")
 {
     std::string params = ModernMeta(caps).Serialize();
-    params.insert(params.size() - 1, ",\"name\":\"" + name + "\""
-                                         + (arguments_json.empty() ? "" : ",\"arguments\":" + arguments_json)
-                                         + extra_params);
+    params.insert(
+        params.size() - 1,
+        ",\"name\":\"" + name + "\"" + (arguments_json.empty() ? "" : ",\"arguments\":" + arguments_json)
+            + extra_params);
     return "{\"jsonrpc\":\"2.0\",\"id\":" + std::to_string(id) + ",\"method\":\"tools/call\",\"params\":" + params
            + "}";
 }
@@ -142,7 +149,9 @@ std::string LegacyCall(int id, const std::string& name, const std::string& argum
            + name + "\"" + args + "}}";
 }
 
-// echo 工具：原样回显 message（真实 handler，全流程实调）。
+/**
+ * echo 工具：原样回显 message（真实 handler，全流程实调）。
+ */
 ToolHandler EchoHandler(int* counter)
 {
     return [counter](const RequestContext&, JsonValue arguments) -> result<HandlerResult<ToolResult>> {
@@ -160,18 +169,27 @@ ToolHandler EchoHandler(int* counter)
 const char* kEchoInputSchema =
     R"({"type":"object","properties":{"message":{"type":"string"}},"required":["message"],"additionalProperties":false})";
 const char* kBadInputSchema = R"({"type":"strng"})";
-// R5：根 type 必须 string "object" 的拒绝样本（{} / 缺 type / type:string / type:array）。
+
+/**
+ * 根 type 必须 string "object" 的拒绝样本（{} / 缺 type / type:string / type:array）。
+ */
 const char* kRootEmptySchema = R"({})";
 const char* kRootStringSchema = R"({"type":"string"})";
 const char* kRootMissingTypeSchema = R"({"properties":{"message":{"type":"string"}}})";
 const char* kRootArrayTypeSchema = R"({"type":["object","null"]})";
 const char* kExternalRefSchema = R"({"type":"object","properties":{"x":{"$ref":"https://example.invalid/schema"}}})";
 
-} // namespace
+// clang-format off
+}
+// clang-format on
 
 int main()
 {
-    // ---- 1. 未接通 Schema：AddTool fail-closed --------------------------------
+
+    /**
+     * @name 1. 未接通 Schema：AddTool fail-closed
+     * @{
+     */
     {
         auto server = McpServer::Create(ServerOptions{}).value();
         ToolDefinition def;
@@ -179,14 +197,27 @@ int main()
         def.input_schema = JsonValue::Parse(kEchoInputSchema, 1U << 20, 32).value();
         int count = 0;
         auto refused = server->AddTool(std::move(def), EchoHandler(&count));
-        CHECK(!refused); // fail-closed：不注册未校验工具
+
+        /**
+         * fail-closed：不注册未校验工具
+         */
+        CHECK(!refused);
     }
 
-    // ---- 2. 接通 + 注册 + tools/list + echo 调用 + 输入校验 --------------------
+    /**
+     * @}
+     *
+     * @name 2. 接通 + 注册 + tools/list + echo 调用 + 输入校验
+     * @{
+     */
     {
         auto server = McpServer::Create(ServerOptions{}).value();
         CHECK(EnableToolsSchemaValidation(*server));
-        CHECK(!EnableToolsSchemaValidation(*server)); // 重复接通拒绝
+
+        /**
+         * 重复接通拒绝
+         */
+        CHECK(!EnableToolsSchemaValidation(*server));
 
         ToolDefinition echo;
         echo.name = "echo";
@@ -196,7 +227,9 @@ int main()
         int count = 0;
         CHECK(server->AddTool(std::move(echo), EchoHandler(&count)));
 
-        // 坏 schema / 外部 ref：注册整体拒绝（S10 fail-closed，无网络请求）。
+        /**
+         * 坏 schema / 外部 ref：注册整体拒绝（fail-closed，无网络请求）。
+         */
         ToolDefinition bad;
         bad.name = "bad";
         bad.input_schema = JsonValue::Parse(kBadInputSchema, 1U << 20, 32).value();
@@ -205,11 +238,14 @@ int main()
         external.name = "external";
         external.input_schema = JsonValue::Parse(kExternalRefSchema, 1U << 20, 32).value();
         CHECK(!server->AddTool(std::move(external), EchoHandler(&count)));
-        // R5：input_schema 根 type 必须是 string "object"——{}、缺 type、type:string、
-        // type:array 一律 InvalidArgument 拒绝；拒绝先于任何 mutation，不消耗
-        // 名字/容量，随后同名合法注册仍成功（事务性）。
-        const char* rejected_root_schemas[] = {kRootEmptySchema, kRootStringSchema, kRootMissingTypeSchema,
-                                               kRootArrayTypeSchema};
+
+        /**
+         * input_schema 根 type 必须是 string "object"——{}、缺 type、type:string、
+         * type:array 一律 InvalidArgument 拒绝；拒绝先于任何 mutation，不消耗
+         * 名字/容量，随后同名合法注册仍成功（事务性）。
+         */
+        const char* rejected_root_schemas[] = {
+            kRootEmptySchema, kRootStringSchema, kRootMissingTypeSchema, kRootArrayTypeSchema};
         for (const char* schema_json : rejected_root_schemas) {
             ToolDefinition rejected_root;
             rejected_root.name = "rootcheck";
@@ -220,7 +256,10 @@ int main()
         root_ok.name = "rootcheck";
         root_ok.input_schema = JsonValue::Parse(kEchoInputSchema, 1U << 20, 32).value();
         CHECK(server->AddTool(std::move(root_ok), EchoHandler(&count)));
-        // 重复名 / 空名拒绝。
+
+        /**
+         * 重复名 / 空名拒绝。
+         */
         ToolDefinition dup;
         dup.name = "echo";
         dup.input_schema = JsonValue::Parse(kEchoInputSchema, 1U << 20, 32).value();
@@ -230,9 +269,11 @@ int main()
         empty.input_schema = JsonValue::Parse(kEchoInputSchema, 1U << 20, 32).value();
         CHECK(!server->AddTool(std::move(empty), EchoHandler(&count)));
 
-        // architecture §8.4 [G]：x-mcp-header 注册拒绝（v1 不实现 Mcp-Param-*
-        // 头↔参数映射）。顶层 x-mcp-header 与 properties.<name>.x-mcp-header
-        // 两个标准注解位置都拒绝。
+        /**
+         * x-mcp-header 注册拒绝（不实现 Mcp-Param-*
+         * 头↔参数映射）。顶层 x-mcp-header 与 properties.<name>.x-mcp-header
+         * 两个标准注解位置都拒绝。
+         */
         const char* rejected_x_mcp_header_schemas[] = {
             R"({"type":"object","x-mcp-header":"X-Token","properties":{"a":{"type":"string"}}})",
             R"({"type":"object","properties":{"token":{"type":"string","x-mcp-header":"X-Token"}}})",
@@ -243,14 +284,20 @@ int main()
             x_header.input_schema = JsonValue::Parse(schema_json, 1U << 20, 32).value();
             CHECK(!server->AddTool(std::move(x_header), EchoHandler(&count)));
         }
-        // 无注解的同名注册仍成功（拒绝不消耗名字/容量，事务性）。
+
+        /**
+         * 无注解的同名注册仍成功（拒绝不消耗名字/容量，事务性）。
+         */
         ToolDefinition x_ok;
         x_ok.name = "xheader";
         x_ok.input_schema = JsonValue::Parse(kEchoInputSchema, 1U << 20, 32).value();
         CHECK(server->AddTool(std::move(x_ok), EchoHandler(&count)));
 
         CHECK(server->Start());
-        // Start 后注册拒绝（快照冻结）。
+
+        /**
+         * Start 后注册拒绝（快照冻结）。
+         */
         ToolDefinition late;
         late.name = "late";
         late.input_schema = JsonValue::Parse(kEchoInputSchema, 1U << 20, 32).value();
@@ -258,7 +305,9 @@ int main()
 
         auto session = CreateSession(server);
 
-        // capabilities：有 tool 注册 → 宣告 tools（真实注册事实）。
+        /**
+         * capabilities：有 tool 注册 → 宣告 tools（真实注册事实）。
+         */
         auto discover = Respond(
             *session,
             R"({"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}})");
@@ -266,7 +315,9 @@ int main()
         auto caps = Find(Find(*discover, "result").value(), "capabilities");
         CHECK(Find(*caps, "tools"));
 
-        // tools/list：单个工具、title/description/inputSchema、cacheable 字段。
+        /**
+         * tools/list：单个工具、title/description/inputSchema、cacheable 字段。
+         */
         auto list = Respond(*session, ModernList(2));
         CHECK(list);
         CHECK(!ErrorCodeOf(*list));
@@ -285,7 +336,9 @@ int main()
         auto ttl = Find(*result_value, "ttlMs");
         CHECK(ttl);
 
-        // 正常调用：handler 恰 1 次，content 原样回显。
+        /**
+         * 正常调用：handler 恰 1 次，content 原样回显。
+         */
         auto ok_call = Respond(*session, ModernCall(3, "echo", R"({"message":"hello"})"));
         CHECK(ok_call);
         CHECK(!ErrorCodeOf(*ok_call));
@@ -296,32 +349,52 @@ int main()
         CHECK(block0);
         auto text0 = Find(*block0, "text");
         CHECK(text0 && text0->AsString() && text0->AsString().value() == "hello");
-        CHECK(!Find(*ok_result, "isError")); // false 不写
+
+        /**
+         * false 不写
+         */
+        CHECK(!Find(*ok_result, "isError"));
         CHECK(count == 1);
 
-        // 缺 required → -32602、handler 0 次（S9）。
+        /**
+         * 缺 required → -32602、handler 0 次。
+         */
         auto missing = Respond(*session, ModernCall(4, "echo", "{}"));
         CHECK(missing);
         CHECK(ErrorCodeOf(*missing) == -32602);
         CHECK(count == 1);
-        // 错类型 → -32602、handler 0 次（无隐式转换）。
+
+        /**
+         * 错类型 → -32602、handler 0 次（无隐式转换）。
+         */
         auto wrong_type = Respond(*session, ModernCall(5, "echo", R"({"message":42})"));
         CHECK(wrong_type);
         CHECK(ErrorCodeOf(*wrong_type) == -32602);
         CHECK(count == 1);
-        // 额外字段（additionalProperties:false）→ -32602。
+
+        /**
+         * 额外字段（additionalProperties:false）→ -32602。
+         */
         auto extra = Respond(*session, ModernCall(6, "echo", R"({"message":"x","zzz":1})"));
         CHECK(extra);
         CHECK(ErrorCodeOf(*extra) == -32602);
         CHECK(count == 1);
-        // 未知 tool → -32602，handler 0 次。
+
+        /**
+         * 未知 tool → -32602，handler 0 次。
+         */
         auto unknown = Respond(*session, ModernCall(7, "nope", "{}"));
         CHECK(unknown);
         CHECK(ErrorCodeOf(*unknown) == -32602);
         CHECK(count == 1);
     }
 
-    // ---- 3. output Schema 校验 / isError / 异常脱敏 ----------------------------
+    /**
+     * @}
+     *
+     * @name 3. output Schema 校验 / isError / 异常脱敏
+     * @{
+     */
     {
         auto server = McpServer::Create(ServerOptions{}).value();
         CHECK(EnableToolsSchemaValidation(*server));
@@ -329,8 +402,8 @@ int main()
         def.name = "calc";
         def.input_schema = JsonValue::Parse(R"({"type":"object"})", 1U << 20, 32).value();
         def.output_schema =
-            JsonValue::Parse(R"({"type":"object","properties":{"n":{"type":"integer"}},"required":["n"]})", 1U << 20,
-                             32)
+            JsonValue::Parse(
+                R"({"type":"object","properties":{"n":{"type":"integer"}},"required":["n"]})", 1U << 20, 32)
                 .value();
         int count = 0;
         ToolHandler calc = [&count](const RequestContext&, JsonValue arguments) -> result<HandlerResult<ToolResult>> {
@@ -364,28 +437,43 @@ int main()
         auto structured = Find(*good_result, "structuredContent");
         CHECK(structured && Find(*structured, "n"));
 
-        // 输出不满足 output schema → 固定 -32603（S11：不回显原始输出）。
+        /**
+         * 输出不满足 output schema → 固定 -32603（不回显原始输出）。
+         */
         auto bad_out = Respond(*session, ModernCall(11, "calc", R"({"op":"badoutput"})"));
         CHECK(bad_out);
         CHECK(ErrorCodeOf(*bad_out) == -32603);
         CHECK(bad_out->Serialize().find("not-an-integer") == std::string::npos);
 
-        // 业务 isError → 结果 isError=true，仍是非 error 帧（业务错误分层）。
+        /**
+         * 业务 isError → 结果 isError=true，仍是非 error 帧（业务错误分层）。
+         */
         auto is_error = Respond(*session, ModernCall(12, "calc", R"({"op":"iserror"})"));
         CHECK(is_error);
         CHECK(!ErrorCodeOf(*is_error));
         auto error_flag = Find(Find(*is_error, "result").value(), "isError");
         CHECK(error_flag && error_flag->AsBool() && error_flag->AsBool().value());
 
-        // handler 异常 → 固定 -32603，异常文本不回显（脱敏）。
+        /**
+         * handler 异常 → 固定 -32603，异常文本不回显（脱敏）。
+         */
         auto boom = Respond(*session, ModernCall(13, "calc", R"({"op":"boom"})"));
         CHECK(boom);
         CHECK(ErrorCodeOf(*boom) == -32603);
         CHECK(boom->Serialize().find("secret boom") == std::string::npos);
-        CHECK(count == 4); // good/badoutput/iserror/boom 全部进入 handler（输出校验在出口）
+
+        /**
+         * good/badoutput/iserror/boom 全部进入 handler（输出校验在出口）
+         */
+        CHECK(count == 4);
     }
 
-    // ---- 4. 业务 MRTR：Deferred(InputRequired) ---------------------------------
+    /**
+     * @}
+     *
+     * @name 4. 业务 MRTR：Deferred(InputRequired)
+     * @{
+     */
     {
         auto server = McpServer::Create(ServerOptions{}).value();
         CHECK(EnableToolsSchemaValidation(*server));
@@ -395,7 +483,10 @@ int main()
         int count = 0;
         ToolHandler confirm = [&count](const RequestContext& context, JsonValue) -> result<HandlerResult<ToolResult>> {
             ++count;
-            // 重试请求（第二轮）：库把 owned inputResponses/requestState 放进上下文。
+
+            /**
+             * 重试请求（第二轮）：库把 owned inputResponses/requestState 放进上下文。
+             */
             if (!context.InputResponses().empty()) {
                 CHECK(context.RequestState().has_value());
                 ToolResult produced;
@@ -412,7 +503,9 @@ int main()
         CHECK(server->Start());
         auto session = CreateSession(server);
 
-        // 客户端缺 sampling 能力 → -32021 + data.requiredCapabilities.sampling（S15）。
+        /**
+         * 客户端缺 sampling 能力 → -32021 + data.requiredCapabilities.sampling。
+         */
         auto missing_caps = Respond(*session, ModernCall(20, "confirm", "{}", "{}"));
         CHECK(missing_caps);
         CHECK(ErrorCodeOf(*missing_caps) == -32021);
@@ -423,7 +516,9 @@ int main()
         CHECK(sampling);
         CHECK(count == 1);
 
-        // 有 sampling 能力 → resultType=input_required + inputRequests + requestState。
+        /**
+         * 有 sampling 能力 → resultType=input_required + inputRequests + requestState。
+         */
         auto deferred = Respond(*session, ModernCall(21, "confirm", "{}"));
         CHECK(deferred);
         CHECK(!ErrorCodeOf(*deferred));
@@ -440,7 +535,9 @@ int main()
         CHECK(state && state->AsString() && state->AsString().value() == "state-1");
         CHECK(count == 2);
 
-        // MRTR 重试：inputResponses + requestState → handler 观察到 owned 输入（新 id）。
+        /**
+         * MRTR 重试：inputResponses + requestState → handler 观察到 owned 输入（新 id）。
+         */
         std::string retry_extra = ",\"inputResponses\":{\"srv1\":{\"text\":\"yes\"}},\"requestState\":\"state-1\"";
         auto retry = Respond(*session, ModernCall(22, "confirm", "{}", "{\"sampling\":{}}", retry_extra));
         CHECK(retry);
@@ -451,15 +548,17 @@ int main()
         CHECK(retry_text && retry_text->AsString() && retry_text->AsString().value() == "resumed");
         CHECK(count == 3);
 
-        // legacy 路径 Deferred → 固定 -32603（不产生 modern input_required 结构）。
+        /**
+         * legacy 路径 Deferred → 固定 -32603（不产生 modern input_required 结构）。
+         */
         auto legacy_server = McpServer::Create(ServerOptions{}).value();
         CHECK(EnableToolsSchemaValidation(*legacy_server));
         ToolDefinition legacy_def;
         legacy_def.name = "confirm";
         legacy_def.input_schema = JsonValue::Parse(R"({"type":"object"})", 1U << 20, 32).value();
         int legacy_count = 0;
-        ToolHandler legacy_handler = [&legacy_count](const RequestContext&,
-                                                     JsonValue) -> result<HandlerResult<ToolResult>> {
+        ToolHandler legacy_handler =
+            [&legacy_count](const RequestContext&, JsonValue) -> result<HandlerResult<ToolResult>> {
             ++legacy_count;
             std::map<std::string, ClientInputRequest> requests;
             requests.emplace("srv1", ClientInputRequest{"sampling/createMessage", JsonValue::Object()});
@@ -480,7 +579,12 @@ int main()
         CHECK(legacy_count == 1);
     }
 
-    // ---- 5. tools/list 稳定分页 + 无 tool 不宣告 tools --------------------------
+    /**
+     * @}
+     *
+     * @name 5. tools/list 稳定分页 + 无 tool 不宣告 tools
+     * @{
+     */
     {
         ServerOptions options;
         options.page_size = 1;
@@ -509,14 +613,24 @@ int main()
         auto r2 = Find(*page2, "result");
         auto t2 = Find(*r2, "tools");
         CHECK(t2);
-        CHECK(!Find(*r2, "nextCursor")); // 末页无 nextCursor
-        // 非法 cursor → -32602。
+
+        /**
+         * 末页无 nextCursor
+         */
+        CHECK(!Find(*r2, "nextCursor"));
+
+        /**
+         * 非法 cursor → -32602。
+         */
         auto bad_cursor = Respond(*session, ModernList(42, ",\"cursor\":\"zz\""));
         CHECK(bad_cursor);
         CHECK(ErrorCodeOf(*bad_cursor) == -32602);
     }
     {
-        // 无 tool 注册 → capabilities 不宣告 tools；tools/list → -32601（P4）。
+
+        /**
+         * 无 tool 注册 → capabilities 不宣告 tools；tools/list → -32601。
+         */
         auto server = McpServer::Create(ServerOptions{}).value();
         CHECK(server->Start());
         auto session = CreateSession(server);
@@ -532,5 +646,9 @@ int main()
     }
 
     std::printf("mcp.tools: %d checks / %d failures\n", g_checks, g_failures);
+
+    /**
+     * @}
+     */
     return g_failures == 0 ? 0 : 1;
 }

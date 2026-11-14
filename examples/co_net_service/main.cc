@@ -1,13 +1,15 @@
-// 协程网络最小示例（只消费公开 API：bbt::infra_net + bbtools-coroutine）。
-//
-// 真实 TCP 回环：Engine server（main + 1 sub owner，各自绑定已登记 Processer
-// driver 槽，不新建网络线程）→ Engine::CoAccept 取连接 →
-// conn.Read/conn.Write 回显（成员化 ICoConnection 形态）。
-// client 用 NativeSocket 直连服务端实际绑定地址（port 0 由内核分配）。
-//
-// 退出约定：runtime 无 Stop/优雅停机，本进程业务收口后 flush 并以 std::_Exit
-// 结束，不展开栈；这不是 runtime 资源回收证据。
 
+/**
+ * 协程网络最小示例（只消费公开 API：bbt::infra_net + bbtools-coroutine）。
+ *
+ * 真实 TCP 回环：Engine server（main + 1 sub owner，各自绑定已登记 Processer
+ * driver 槽，不新建网络线程）→ Engine::CoAccept 取连接 →
+ * conn.Read/conn.Write 回显（成员化 ICoConnection 形态）。
+ * client 用 NativeSocket 直连服务端实际绑定地址（port 0 由内核分配）。
+ *
+ * 退出约定：runtime 无 Stop/优雅停机，本进程业务收口后 flush 并以 std::_Exit
+ * 结束，不展开栈；这不是 runtime 资源回收证据。
+ */
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -51,7 +53,9 @@ bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds
     return predicate();
 }
 
-} // namespace
+// clang-format off
+}
+// clang-format on
 
 int main()
 {
@@ -85,7 +89,11 @@ int main()
     check(!engine.LocalAddresses(addresses) && addresses.size() == 1, "local addresses");
 
     std::atomic<int> echo_ok{0};
-    std::atomic<int> echo_drained{0}; // 尾部读空后的非等待状态断言
+
+    /**
+     * 尾部读空后的非等待状态断言
+     */
+    std::atomic<int> echo_drained{0};
     auto server_task = [&] {
         auto accepted = engine.CoAccept(Until(3000ms));
         if (accepted.error) {
@@ -102,16 +110,22 @@ int main()
         if (report.wait_error) {
             return;
         }
-        // Done 只表示该次发送已到终态，成功还须 error 为空。
+
+        /**
+         * Done 只表示该次发送已到终态，成功还须 error 为空。
+         */
         if (report.outcome.phase == net::WritePhase::Done && !report.outcome.error && data == "hello") {
             echo_ok.store(1);
         }
-        // 非等待读取同样移交 owning Buffer；读空后明确返回 WouldBlock。
+
+        /**
+         * 非等待读取同样移交 owning Buffer；读空后明确返回 WouldBlock。
+         */
         auto [drained, error] = connection.TryRead();
         if (error == net::make_error_code(net::NetErrc::WouldBlock) && drained.Empty()) {
             echo_drained.store(1);
         }
-        conn.RequestClose();
+        (void)conn.Close();
     };
     auto promise = std::make_shared<std::promise<void>>();
     auto future = promise->get_future();
@@ -133,16 +147,17 @@ int main()
 
     std::string echoed;
     char buffer[64];
-    check(WaitUntil(
-              [&] {
-                  const auto result = client.Receive(buffer, sizeof(buffer));
-                  if (result.bytes > 0) {
-                      echoed.append(buffer, result.bytes);
-                  }
-                  return echoed.size() >= 5;
-              },
-              3000ms),
-          "client recv");
+    check(
+        WaitUntil(
+            [&] {
+                const auto result = client.Receive(buffer, sizeof(buffer));
+                if (result.bytes > 0) {
+                    echoed.append(buffer, result.bytes);
+                }
+                return echoed.size() >= 5;
+            },
+            3000ms),
+        "client recv");
     check(echoed == "hello", "echo content");
     if (future.wait_for(5s) == std::future_status::ready) {
         future.get();
@@ -151,7 +166,7 @@ int main()
     }
 
     (void)client.Close();
-    engine.RequestClose();
+    (void)engine.Close();
     runner.join();
     check(!run_error, "engine run clean");
 

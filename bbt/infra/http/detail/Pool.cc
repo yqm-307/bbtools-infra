@@ -1,5 +1,7 @@
 #include <bbt/infra/http/detail/Pool.hpp>
 
+#include <bbt/infra/detail/CloseWait.hpp>
+
 namespace bbt::infra::http {
 namespace detail {
 
@@ -9,18 +11,22 @@ ConnectionPool::Lease& ConnectionPool::Lease::operator=(Lease&& other) noexcept
         Release(false);
         connection = std::move(other.connection);
         m_state = std::move(other.m_state);
+        m_task = other.m_task;
     }
     return *this;
 }
 
-ConnectionPool::ConnectionPool(std::shared_ptr<net::Engine> engine, PoolLimits limits, std::uint64_t max_body_bytes,
-                               std::optional<std::uint64_t> max_header_bytes)
+ConnectionPool::ConnectionPool(
+    std::shared_ptr<net::Engine> engine,
+    PoolLimits limits,
+    std::uint64_t max_body_bytes,
+    std::optional<std::uint64_t> max_header_bytes)
     : m_state(std::make_shared<State>(std::move(engine), limits, max_body_bytes, max_header_bytes))
 {
 }
 
-bbt_co_async(result<ConnectionPool::Lease>) ConnectionPool::Acquire(const Origin& origin, const net::Address& address,
-                                                                    const PhaseDeadlines& deadlines)
+bbt_co_async(result<ConnectionPool::Lease>)
+    ConnectionPool::Acquire(const Origin& origin, const net::Address& address, const PhaseDeadlines& deadlines)
 {
     const auto state = m_state;
     if (bbt::coroutine::GetLocalCoroutineId() == 0) {
@@ -32,18 +38,25 @@ bbt_co_async(result<ConnectionPool::Lease>) ConnectionPool::Acquire(const Origin
             return result<Lease>::err(state->ClosedErrorLocked());
         }
         ++state->inflight;
+        ++state->operation_tasks[bbt::coroutine::GetLocalCoroutineId()];
     }
     auto lease_result = AcquireBody(state, origin, address, deadlines);
     if (!lease_result) {
-        // 唯一出口归还本操作的在途名额；成功路径的责任已随租借移交。
+
+        /**
+         * 唯一出口归还本操作的在途名额；成功路径的责任已随租借移交。
+         */
         std::lock_guard<std::mutex> lock(state->mutex);
         --state->inflight;
+        auto task = state->operation_tasks.find(bbt::coroutine::GetLocalCoroutineId());
+        if (--task->second == 0)
+            state->operation_tasks.erase(task);
         state->cv.notify_all();
     }
     return lease_result;
 }
 
-void ConnectionPool::Close(Error reason) noexcept
+void ConnectionPool::RequestClose(Error reason) noexcept
 {
     const auto state = m_state;
     std::deque<std::shared_ptr<Waiter>> pending;
@@ -53,8 +66,11 @@ void ConnectionPool::Close(Error reason) noexcept
             state->close_reason = std::move(reason);
         }
         if (state->phase == Phase::Closed) {
-            // 幂等：物理退役已执行过；首个原因固定，唤醒兜底仍发。
-            state->cv.notify_all();
+
+            /**
+             * 幂等：物理退役已执行过；首个原因固定，唤醒兜底仍发。
+             */
+            state->NotifyLocked();
             return;
         }
         state->phase = Phase::Closed;
@@ -65,54 +81,151 @@ void ConnectionPool::Close(Error reason) noexcept
         for (auto& waiter : pending) {
             waiter->in_queue = false;
         }
-        state->cv.notify_all();
+        state->NotifyLocked();
     }
     for (auto& waiter : pending) {
         waiter->gate->Notify();
     }
 }
 
-result<void> ConnectionPool::Shutdown(bbt::coroutine::Deadline deadline)
+result<void> ConnectionPool::Close(const CloseOptions& options)
 {
     const auto state = m_state;
+    if (const auto valid = bbt::infra::detail::ValidateCloseOptions(options); !valid) {
+        return result<void>::err(valid.error());
+    }
+    const bool waits = options.mode == CloseMode::Graceful || options.wait_release;
+    const auto domain = bbt::infra::detail::CurrentCloseWaitDomain();
+    if (waits && domain == bbt::infra::detail::CloseWaitDomain::Invalid) {
+        return result<void>::err(
+            MakeError(ErrorCode::InvalidContext, "http pool: Close requires coroutine or native host domain"));
+    }
+    if (options.mode == CloseMode::Graceful || options.wait_release) {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        const auto self = bbt::coroutine::GetLocalCoroutineId();
+        if (self != 0 && state->operation_tasks.count(self) != 0)
+            return result<void>::err(MakeError(ErrorCode::InvalidContext, "http pool: Close waits on own lease"));
+    }
+    const auto reason = bbt::infra::detail::SettleCloseError(options.reason, "http client: closed by owner");
+    if (options.mode == CloseMode::Immediate) {
+        RequestClose(reason);
+        return bbt::infra::detail::FinishCloseWithRelease(
+            options, [this](bbt::coroutine::Deadline deadline) { return WaitStopped(deadline); });
+    }
     std::deque<std::shared_ptr<Waiter>> pending;
     {
         std::lock_guard<std::mutex> lock(state->mutex);
-        if (state->phase == Phase::Closed) {
-            return result<void>::err(state->ClosedErrorLocked());
+        if (!state->close_reason) {
+            state->close_reason = reason;
         }
-        if (state->phase == Phase::Draining) {
-            if (state->inflight == 0) {
-                return result<void>::ok();
+        if (state->phase == Phase::Open) {
+            state->phase = Phase::Draining;
+            pending.swap(state->waiters);
+            for (auto& waiter : pending) {
+                waiter->in_queue = false;
             }
-            return result<void>::err(MakeError(ErrorCode::Overloaded, "http pool: shutdown already in progress"));
+            state->NotifyLocked();
         }
-        state->phase = Phase::Draining;
-        pending.swap(state->waiters);
-        for (auto& waiter : pending) {
-            waiter->in_queue = false;
-        }
-        state->cv.notify_all();
     }
-    // 排队者已被拒绝：唤醒它们让出等待名额（其恢复路径只读 phase）。
     for (auto& waiter : pending) {
         waiter->gate->Notify();
     }
 
-    std::unique_lock<std::mutex> lock(state->mutex);
+    if (domain == bbt::infra::detail::CloseWaitDomain::NativeHost) {
+        std::unique_lock<std::mutex> lock(state->mutex);
+        for (;;) {
+            if (state->inflight == 0) {
+                break;
+            }
+            if (state->phase == Phase::Closed) {
+                return result<void>::err(state->ClosedErrorLocked());
+            }
+            if (std::chrono::steady_clock::now() >= options.deadline) {
+                return result<void>::err(MakeError(
+                    ErrorCode::TimedOut, "http pool: graceful close deadline expired; responsibility retained"));
+            }
+            state->cv.wait_until(lock, bbt::infra::detail::NextCloseSlice(options.deadline));
+        }
+    } else {
+        for (;;) {
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                if (state->inflight == 0) {
+                    break;
+                }
+                if (state->phase == Phase::Closed) {
+                    return result<void>::err(state->ClosedErrorLocked());
+                }
+            }
+            if (std::chrono::steady_clock::now() >= options.deadline) {
+                return result<void>::err(MakeError(
+                    ErrorCode::TimedOut, "http pool: graceful close deadline expired; responsibility retained"));
+            }
+            auto waited = bbt::infra::detail::WaitCloseSlice(
+                state->close_signal, bbt::infra::detail::NextCloseSlice(options.deadline));
+            if (!waited) {
+                return result<void>::err(waited.error());
+            }
+        }
+    }
+
+    /**
+     * 责任已归零：退役全部剩余条目，物理回收由 WaitStopped 观察。
+     */
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        for (auto& entry : state->entries) {
+            state->RetireLocked(*entry);
+        }
+        state->NotifyLocked();
+    }
+    return bbt::infra::detail::FinishCloseWithRelease(
+        options, [this](bbt::coroutine::Deadline deadline) { return WaitStopped(deadline); });
+}
+
+result<void> ConnectionPool::WaitStopped(bbt::coroutine::Deadline deadline)
+{
+    const auto state = m_state;
+    const auto domain = bbt::infra::detail::CurrentCloseWaitDomain();
+    if (domain == bbt::infra::detail::CloseWaitDomain::Invalid) {
+        return result<void>::err(
+            MakeError(ErrorCode::InvalidContext, "http pool: WaitStopped requires coroutine or native host domain"));
+    }
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->phase == Phase::Open) {
+            return result<void>::err(MakeError(ErrorCode::InvalidArgument, "http pool: close before WaitStopped"));
+        }
+    }
+    if (domain == bbt::infra::detail::CloseWaitDomain::NativeHost) {
+        std::unique_lock<std::mutex> lock(state->mutex);
+        for (;;) {
+            state->SweepLocked();
+            if (state->entries.empty()) {
+                return result<void>::ok();
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return result<void>::err(MakeError(ErrorCode::TimedOut, "http pool: physical stop deadline expired"));
+            }
+            state->cv.wait_until(lock, bbt::infra::detail::NextCloseSlice(deadline));
+        }
+    }
     for (;;) {
-        // 先排空先胜：当前已排空即 ok，不被随后到达的 Close 追改；
-        // 等待中被 Close 且仍有在途 → 返回首个关闭原因。
-        if (state->inflight == 0) {
-            return result<void>::ok();
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->SweepLocked();
+            if (state->entries.empty()) {
+                return result<void>::ok();
+            }
         }
-        if (state->close_reason) {
-            return result<void>::err(*state->close_reason);
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return result<void>::err(MakeError(ErrorCode::TimedOut, "http pool: physical stop deadline expired"));
         }
-        if (deadline != bbt::coroutine::Deadline::max() && std::chrono::steady_clock::now() >= deadline) {
-            return result<void>::err(MakeError(ErrorCode::TimedOut, "http pool: shutdown deadline expired"));
+        auto waited =
+            bbt::infra::detail::WaitCloseSlice(state->close_signal, bbt::infra::detail::NextCloseSlice(deadline));
+        if (!waited) {
+            return result<void>::err(waited.error());
         }
-        state->cv.wait_until(lock, deadline);
     }
 }
 
@@ -134,8 +247,11 @@ PoolStats ConnectionPool::Stats() const noexcept
 {
     const auto state = m_state;
     std::lock_guard<std::mutex> lock(state->mutex);
-    // 内省触发同一惰性维护（sweep 只做本地状态检查与 RequestClose，不挂起、
-    // 不做 I/O），使退役出账在没有新请求时也可观察。
+
+    /**
+     * 内省触发同一惰性维护（sweep 只做本地状态检查与 RequestClose，不挂起、
+     * 不做 I/O），使退役出账在没有新请求时也可观察。
+     */
     state->SweepLocked();
     PoolStats stats;
     for (const auto& entry : state->entries) {
@@ -159,10 +275,24 @@ PoolStats ConnectionPool::Stats() const noexcept
     return stats;
 }
 
-ConnectionPool::State::State(std::shared_ptr<net::Engine> engine_arg, PoolLimits limits_arg, std::uint64_t body,
-                             std::optional<std::uint64_t> header)
-    : engine(std::move(engine_arg)), limits(limits_arg), body_limit(body), header_limit(header)
+ConnectionPool::State::State(
+    std::shared_ptr<net::Engine> engine_arg,
+    PoolLimits limits_arg,
+    std::uint64_t body,
+    std::optional<std::uint64_t> header)
+    : engine(std::move(engine_arg))
+    , limits(limits_arg)
+    , body_limit(body)
+    , header_limit(header)
 {
+}
+
+void ConnectionPool::State::NotifyLocked() noexcept
+{
+    cv.notify_all();
+    if (close_signal) {
+        close_signal->Notify();
+    }
 }
 
 Error ConnectionPool::State::ClosedErrorLocked() const
@@ -200,11 +330,14 @@ void ConnectionPool::State::DequeueLocked(const std::shared_ptr<Waiter>& waiter)
 
 void ConnectionPool::State::RetireLocked(Entry& entry)
 {
-    // 已 Reserving 的拨号条目在拨号成功后才拿到连接：此处仍要请求
-    // 关闭一次（幂等），不能让封口后的新连接逃过退役。
+
+    /**
+     * 已 Reserving 的拨号条目在拨号成功后才拿到连接：此处仍要请求
+     * 关闭一次（幂等），不能让封口后的新连接逃过退役。
+     */
     entry.phase = Entry::Phase::Retiring;
     if (entry.connection.Valid()) {
-        entry.connection.RequestClose();
+        (void)entry.connection.Close();
     }
     cv.notify_all();
 }
@@ -238,9 +371,9 @@ void ConnectionPool::State::AdmitToIdleLocked(Entry& entry)
     }
     if (idle < limits.max_keepalive_connections) {
         entry.phase = Entry::Phase::Idle;
-        entry.expire_at = limits.keepalive_expiry ? StageDeadline(PhaseTimeout::Milliseconds(*limits.keepalive_expiry),
-                                                                  bbt::coroutine::Deadline::max())
-                                                  : std::chrono::steady_clock::time_point::max();
+        entry.expire_at = limits.keepalive_expiry
+                              ? StageDeadline(*limits.keepalive_expiry, bbt::coroutine::Deadline::max())
+                              : std::chrono::steady_clock::time_point::max();
         cv.notify_all();
     } else {
         RetireLocked(entry);
@@ -264,7 +397,10 @@ void ConnectionPool::State::AdmitHandedLocked(const std::shared_ptr<Waiter>& wai
     }
     for (auto next : waiters) {
         if (next->origin == entry->origin) {
-            // 责任转交下一个等待者，仍算在途。
+
+            /**
+             * 责任转交下一个等待者，仍算在途。
+             */
             entry->phase = Entry::Phase::Active;
             next->handed = std::move(connection);
             next->has_handed = true;
@@ -293,9 +429,12 @@ void ConnectionPool::State::SweepLocked()
         auto& entry = *it;
         if (entry->phase == Entry::Phase::Retiring) {
             const bool released = entry->connection.Valid() ? entry->connection.Released() : entry->reclaim.Released();
-            // 只消费 net 真实物理回收凭据，逻辑 Closed 不释放名额；
-            // 条目出账后仍在途的租借只由 inflight 记账，归还时按
-            // conn.Id 找不到条目也只结算名额（见 Release/Retire）。
+
+            /**
+             * 只消费 net 真实物理回收凭据，逻辑 Closed 不释放名额；
+             * 条目出账后仍在途的租借只由 inflight 记账，归还时按
+             * conn.Id 找不到条目也只结算名额（见 Release/Retire）。
+             */
             if (released) {
                 it = entries.erase(it);
                 continue;
@@ -312,15 +451,21 @@ void ConnectionPool::State::SweepLocked()
     }
 }
 
-result<ConnectionPool::Lease> ConnectionPool::AcquireBody(const std::shared_ptr<State>& state, const Origin& origin,
-                                                          const net::Address& address, const PhaseDeadlines& deadlines)
+result<ConnectionPool::Lease> ConnectionPool::AcquireBody(
+    const std::shared_ptr<State>& state,
+    const Origin& origin,
+    const net::Address& address,
+    const PhaseDeadlines& deadlines)
 {
     if (const auto gate = CheckCall(deadlines.total)) {
-        return result<Lease>::err(
-            MakeError(gate == std::errc::operation_canceled ? ErrorCode::Cancelled : ErrorCode::TimedOut,
-                      "http pool: call ended before acquisition"));
+        return result<Lease>::err(MakeError(
+            gate == std::errc::operation_canceled ? ErrorCode::Cancelled : ErrorCode::TimedOut,
+            "http pool: call ended before acquisition"));
     }
-    // 快路径：sweep 后直接取同 origin 空闲。
+
+    /**
+     * 快路径：sweep 后直接取同 origin 空闲。
+     */
     {
         std::lock_guard<std::mutex> lock(state->mutex);
         if (state->phase != Phase::Open) {
@@ -332,7 +477,10 @@ result<ConnectionPool::Lease> ConnectionPool::AcquireBody(const std::shared_ptr<
             return result<Lease>::ok(Lease(state, std::move(connection)));
         }
     }
-    // 预算内新建（Dialing 名额锁内预留、锁外 Engine::CoDial）。
+
+    /**
+     * 预算内新建（Dialing 名额锁内预留、锁外 Engine::CoDial）。
+     */
     {
         std::unique_lock<std::mutex> lock(state->mutex);
         if (state->phase != Phase::Open) {
@@ -344,13 +492,20 @@ result<ConnectionPool::Lease> ConnectionPool::AcquireBody(const std::shared_ptr<
             entry->origin = origin;
             entry->address = address;
             state->entries.push_back(std::move(entry));
-            Entry* dial_entry = state->entries.back().get(); // deque 引用稳定
+
+            /**
+             * deque 引用稳定
+             */
+            Entry* dial_entry = state->entries.back().get();
             lock.unlock();
             return DialReserved(state, dial_entry, deadlines);
         }
     }
-    // 排队：有界队列 + 分片等待。片内事件：handoff / 封口 / 预算释放重试；
-    // 片间重查（sweep 出账没有事件源，见文件头说明）。
+
+    /**
+     * 排队：有界队列 + 分片等待。片内事件：handoff / 封口 / 预算释放重试；
+     * 片间重查（sweep 出账没有事件源，见文件头说明）。
+     */
     const auto pool_deadline = deadlines.pool;
     for (;;) {
         const auto now = std::chrono::steady_clock::now();
@@ -394,7 +549,10 @@ result<ConnectionPool::Lease> ConnectionPool::AcquireBody(const std::shared_ptr<
             state->waiters.push_back(waiter);
             waiter->in_queue = true;
         }
-        // 登记→锁内复查→Notify；Notify 不等于获得，恢复后锁内领取。
+
+        /**
+         * 登记→锁内复查→Notify；Notify 不等于获得，恢复后锁内领取。
+         */
         const auto status = waiter->gate->WaitWithCallback({slice_end}, [state, waiter] {
             std::lock_guard<std::mutex> lock(state->mutex);
             if (waiter->has_handed || state->phase != Phase::Open) {
@@ -411,7 +569,10 @@ result<ConnectionPool::Lease> ConnectionPool::AcquireBody(const std::shared_ptr<
                 return true;
             }
             if (state->entries.size() < state->limits.max_connections) {
-                // 预算已释放：唤醒本等待者走重试（自建连接）。
+
+                /**
+                 * 预算已释放：唤醒本等待者走重试（自建连接）。
+                 */
                 waiter->gate->Notify();
             }
             return true;
@@ -425,7 +586,10 @@ result<ConnectionPool::Lease> ConnectionPool::AcquireBody(const std::shared_ptr<
                 return result<Lease>::ok(Lease(state, std::move(connection)));
             }
             if (waiter->has_handed) {
-                // 首胜不是本等待者（超时/取消/封口赢）：孤儿 handoff 回池。
+
+                /**
+                 * 首胜不是本等待者（超时/取消/封口赢）：孤儿 handoff 回池。
+                 */
                 state->AdmitHandedLocked(waiter);
             }
         }
@@ -439,18 +603,21 @@ result<ConnectionPool::Lease> ConnectionPool::AcquireBody(const std::shared_ptr<
         if (status != bbt::coroutine::WaitStatus::Completed && status != bbt::coroutine::WaitStatus::TimedOut) {
             return result<Lease>::err(MakeError(ErrorCode::InternalError, "http pool: wait unavailable"));
         }
-        // Completed（预算释放重试）或切片到点：重查。
+
+        /**
+         * Completed（预算释放重试）或切片到点：重查。
+         */
     }
 }
 
-result<ConnectionPool::Lease> ConnectionPool::DialReserved(const std::shared_ptr<State>& state, Entry* dial_entry,
-                                                           const PhaseDeadlines& deadlines)
+result<ConnectionPool::Lease>
+ConnectionPool::DialReserved(const std::shared_ptr<State>& state, Entry* dial_entry, const PhaseDeadlines& deadlines)
 {
     net::ConnectionResult dialed;
     auto error = CheckCall(deadlines.total);
     if (!error) {
         dialed =
-            state->engine->CoDial(dial_entry->address, {StageDeadline(deadlines.timeout.connect, deadlines.total)});
+            state->engine->CoDial(dial_entry->address, {StageDeadline(deadlines.connect_timeout, deadlines.total)});
         error = dialed.error;
     }
     std::lock_guard<std::mutex> lock(state->mutex);
@@ -463,9 +630,12 @@ result<ConnectionPool::Lease> ConnectionPool::DialReserved(const std::shared_ptr
         if (error == std::errc::timed_out) {
             return result<Lease>::err(MakeError(ErrorCode::TimedOut, "http pool: connect timeout"));
         }
-        // 拨号错误走公共桥 NetToError：容量满（no_buffer_space）归
-        // Overloaded 而非 TransportError；backend_category/backend_code
-        // 保留底层事实。pool 只覆盖 canceled/timed_out/closed 阶段语义。
+
+        /**
+         * 拨号错误走公共桥 NetToError：容量满（no_buffer_space）归
+         * Overloaded 而非 TransportError；backend_category/backend_code
+         * 保留底层事实。pool 只覆盖 canceled/timed_out/closed 阶段语义。
+         */
         return result<Lease>::err(NetToError(error, "http pool: connect failed: " + error.message()));
     }
     dial_entry->connection = dialed.connection.Raw();
@@ -494,7 +664,10 @@ Error ConnectionPool::ClosedError()
 
 void ConnectionPool::Lease::Release(bool healthy) noexcept
 {
-    // 先取走责任；重复调用、移动源与析构都不再结算。锁内只做本地状态变更。
+
+    /**
+     * 先取走责任；重复调用、移动源与析构都不再结算。锁内只做本地状态变更。
+     */
     const auto state = std::move(m_state);
     auto http = std::move(connection);
     if (!state) {
@@ -502,6 +675,9 @@ void ConnectionPool::Lease::Release(bool healthy) noexcept
     }
     std::lock_guard<std::mutex> lock(state->mutex);
     --state->inflight;
+    auto task = state->operation_tasks.find(m_task);
+    if (--task->second == 0)
+        state->operation_tasks.erase(task);
     auto* entry = state->FindLocked(http->Net().Id());
     if (!entry) {
         state->cv.notify_all();
@@ -513,7 +689,10 @@ void ConnectionPool::Lease::Release(bool healthy) noexcept
     }
     for (auto waiter : state->waiters) {
         if (waiter->origin == entry->origin) {
-            // 连接转交等待者；其在途名额仍属于自己的 Acquire，未领取前不造 Lease。
+
+            /**
+             * 连接转交等待者；其在途名额仍属于自己的 Acquire，未领取前不造 Lease。
+             */
             entry->phase = Entry::Phase::Active;
             waiter->handed = std::move(http);
             waiter->has_handed = true;
@@ -525,5 +704,10 @@ void ConnectionPool::Lease::Release(bool healthy) noexcept
     state->AdmitToIdleLocked(*entry);
 }
 
-} // namespace detail
-} // namespace bbt::infra::http
+// clang-format off
+}
+// clang-format on
+
+// clang-format off
+}
+// clang-format on
