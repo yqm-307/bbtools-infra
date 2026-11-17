@@ -1,6 +1,6 @@
 add_library(bbt_infra_net STATIC
     CoObject.cc Address.cc NativeSocket.cc LoadBalancing.cc
-    Connection.cc ReclaimReceipt.cc WriteOperation.cc CoTcpConnection.cc detail/CoInternal.cc
+    Connection.cc ReclaimReceipt.cc CoTcpConnection.cc detail/CoInternal.cc
     Engine.cc detail/EngineState.cc detail/Reactor.cc detail/ConnCore.cc
     detail/EngineTestAccess.cc detail/ReactorDriver.cc detail/DriverBinder.cc detail/OptionsNormalize.cc
     detail/TestAccess.cc
@@ -24,7 +24,7 @@ target_compile_options(bbt_infra_net PRIVATE -Wall -Wextra -Wpedantic)
 set(_headers Annotations.hpp ICoObject.hpp CoObject.hpp Address.hpp NativeSocket.hpp
     Options.hpp LoadBalancing.hpp Types.hpp ReadView.hpp Connection.hpp RawHandler.hpp
     Engine.hpp Error.hpp
-    Buffer.hpp ReclaimReceipt.hpp WriteOperation.hpp ConnectionResult.hpp ICoConnection.hpp
+    Buffer.hpp ReclaimReceipt.hpp ConnectionResult.hpp ICoConnection.hpp
     CoTcpConnection.hpp)
 set(_selfcheck_sources "")
 foreach(_header IN LISTS _headers)

@@ -1,5 +1,7 @@
 #include <bbt/infra/net/detail/OutboundQueue.hpp>
 
+#include <algorithm>
+
 namespace bbt::infra::net {
 
 OutboundQueue::OutboundQueue(std::size_t ring_bytes, std::size_t max_total_bytes, std::size_t max_segments)
@@ -22,6 +24,10 @@ OutboundQueue::OutboundQueue(OutboundQueue&& other)
     ring_head_ = std::exchange(other.ring_head_, 0);
     ring_size_ = std::exchange(other.ring_size_, 0);
     list_bytes_ = std::exchange(other.list_bytes_, 0);
+    m_append_cursor = std::exchange(other.m_append_cursor, 0);
+    m_consumed_cursor = std::exchange(other.m_consumed_cursor, 0);
+    m_revoked_bytes = std::exchange(other.m_revoked_bytes, 0);
+    m_revoked.swap(other.m_revoked);
 }
 
 OutboundQueue& OutboundQueue::operator=(OutboundQueue&& other) noexcept
@@ -35,6 +41,11 @@ OutboundQueue& OutboundQueue::operator=(OutboundQueue&& other) noexcept
         ring_head_ = std::exchange(other.ring_head_, 0);
         ring_size_ = std::exchange(other.ring_size_, 0);
         list_bytes_ = std::exchange(other.list_bytes_, 0);
+        m_append_cursor = std::exchange(other.m_append_cursor, 0);
+        m_consumed_cursor = std::exchange(other.m_consumed_cursor, 0);
+        m_revoked_bytes = std::exchange(other.m_revoked_bytes, 0);
+        m_revoked = std::move(other.m_revoked);
+        other.m_revoked.clear();
     }
     return *this;
 }
@@ -44,15 +55,20 @@ std::size_t OutboundQueue::SegmentCount() const noexcept
     return (ring_size_ != 0 ? 1 : 0) + spill_.size();
 }
 
-std::error_code OutboundQueue::Append(std::string_view data)
+std::error_code OutboundQueue::Append(std::string_view data, std::size_t* out_begin, std::size_t* out_end)
 {
     if (data.empty()) {
+        if (out_begin)
+            *out_begin = m_append_cursor;
+        if (out_end)
+            *out_end = m_append_cursor;
         return {};
     }
     if (!geometry_valid_) {
         return std::make_error_code(std::errc::no_buffer_space);
     }
-    if (data.size() > max_total_bytes_ - TotalBytes()) {
+    if (data.size() > max_total_bytes_ - (TotalBytes() - RevokedBytes())
+        || data.size() > std::numeric_limits<std::size_t>::max() - m_append_cursor) {
         return std::make_error_code(std::errc::no_buffer_space);
     }
     const std::size_t ring_space = spill_.empty() ? ring_.size() - ring_size_ : 0;
@@ -82,33 +98,100 @@ std::error_code OutboundQueue::Append(std::string_view data)
         }
         ring_size_ += to_ring;
     }
+    if (out_begin)
+        *out_begin = m_append_cursor;
+    m_append_cursor += data.size();
+    if (out_end)
+        *out_end = m_append_cursor;
     return {};
 }
 
 std::size_t OutboundQueue::GatherViews(std::string_view* views, std::size_t max_views) const
 {
     std::size_t filled = 0;
-    if (ring_size_ != 0 && filled < max_views) {
-        const std::size_t contiguous = ring_size_ < ring_.size() - ring_head_ ? ring_size_ : ring_.size() - ring_head_;
-        views[filled++] = std::string_view(reinterpret_cast<const char*>(ring_.data() + ring_head_), contiguous);
-        if (ring_size_ > contiguous && filled < max_views) {
-            views[filled++] = std::string_view(reinterpret_cast<const char*>(ring_.data()), ring_size_ - contiguous);
+    std::size_t position = m_consumed_cursor;
+    auto revoked = m_revoked.begin();
+    const auto gather = [&](std::string_view segment) {
+        const auto end = position + segment.size();
+        while (position < end && filled < max_views) {
+            while (revoked != m_revoked.end() && revoked->second <= position)
+                ++revoked;
+            if (revoked != m_revoked.end() && revoked->first <= position) {
+                const auto skip = std::min(end, revoked->second) - position;
+                segment.remove_prefix(skip);
+                position += skip;
+                continue;
+            }
+            const auto limit = revoked == m_revoked.end() ? end : std::min(end, revoked->first);
+            const auto take = limit - position;
+            views[filled++] = segment.substr(0, take);
+            segment.remove_prefix(take);
+            position += take;
+        }
+        position = end;
+    };
+    if (ring_size_ != 0) {
+        const auto contiguous = std::min(ring_size_, ring_.size() - ring_head_);
+        gather(std::string_view(reinterpret_cast<const char*>(ring_.data() + ring_head_), contiguous));
+        if (ring_size_ > contiguous) {
+            gather(std::string_view(reinterpret_cast<const char*>(ring_.data()), ring_size_ - contiguous));
         }
     }
     for (const auto& segment : spill_) {
-        if (filled >= max_views) {
+        if (filled >= max_views)
             break;
-        }
-        views[filled++] = std::string_view(segment.data(), segment.size());
+        gather(segment);
     }
     return filled;
 }
 
+void OutboundQueue::ReserveRevocations(std::size_t active_writes)
+{
+    m_revoked.reserve(m_revoked.size() + active_writes);
+}
+
+void OutboundQueue::RevokeStreamRange(std::size_t begin, std::size_t end)
+{
+    begin = std::max(begin, m_consumed_cursor);
+    end = std::min(end, m_append_cursor);
+    if (begin >= end)
+        return;
+    auto where =
+        std::lower_bound(m_revoked.begin(), m_revoked.end(), begin, [](const auto& interval, std::size_t value) {
+            return interval.first < value;
+        });
+    m_revoked.insert(where, {begin, end});
+    m_revoked_bytes += end - begin;
+    ConsumeSent(0);
+}
+
 std::error_code OutboundQueue::ConsumeSent(std::size_t n)
 {
-    if (n > TotalBytes()) {
+    if (n > TotalBytes() - RevokedBytes()) {
         return std::make_error_code(std::errc::result_out_of_range);
     }
+    for (;;) {
+        if (!m_revoked.empty() && m_revoked.front().first == m_consumed_cursor) {
+            const auto skip = m_revoked.front().second - m_consumed_cursor;
+            ConsumeStorage(skip);
+            m_consumed_cursor += skip;
+            m_revoked_bytes -= skip;
+            m_revoked.erase(m_revoked.begin());
+            continue;
+        }
+        if (n == 0)
+            break;
+        const auto available = m_revoked.empty() ? n : m_revoked.front().first - m_consumed_cursor;
+        const auto take = std::min(n, available);
+        ConsumeStorage(take);
+        m_consumed_cursor += take;
+        n -= take;
+    }
+    return {};
+}
+
+void OutboundQueue::ConsumeStorage(std::size_t n)
+{
     if (n != 0 && ring_size_ != 0) {
         const std::size_t contiguous = ring_size_ < ring_.size() - ring_head_ ? ring_size_ : ring_.size() - ring_head_;
         const std::size_t first = n < contiguous ? n : contiguous;
@@ -142,7 +225,6 @@ std::error_code OutboundQueue::ConsumeSent(std::size_t n)
             spill_.pop_front();
         }
     }
-    return {};
 }
 
 // clang-format off

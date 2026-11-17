@@ -1,6 +1,6 @@
 # ICoConnection 成员化收口消费示例：只链接公开 target（bbt::infra_net
 # + bbtools-coroutine），不触碰 net detail。真实 TCP 回环覆盖
-# Engine::CoAccept/CoDial → conn.Read→Buffer / conn.Write→WriteReport /
+# Engine::CoAccept/CoDial → conn.Read→Buffer / conn.Write→(n, err) /
 # conn.WaitClosed / conn.Status 全部成员形态。
 add_executable(Example_ico_connection main.cc)
 target_link_libraries(Example_ico_connection PRIVATE bbt::infra_net Threads::Threads)

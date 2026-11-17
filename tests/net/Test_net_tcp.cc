@@ -21,7 +21,7 @@
 #include <bbt/infra/net/CoTcpConnection.hpp>
 #include <bbt/infra/net/Engine.hpp>
 #include <bbt/infra/net/ICoConnection.hpp>
-#include <bbt/infra/net/WriteOperation.hpp>
+#include "WriteProbe.hpp"
 #include <bbt/infra/net/NativeSocket.hpp>
 #include <bbt/infra/net/RawHandler.hpp>
 #include <bbt/infra/net/detail/ConnectionState.hpp>
@@ -330,16 +330,11 @@ static double PingPong(const Address& address, int iterations, long long& p99_ns
 }
 
 /**
- * 单元测试用：AcceptWrite 输出记录 -> WriteOperation 句柄。
+ * 单元测试用：AcceptWrite 输出记录 -> WriteProbe 句柄。
  */
-static std::error_code TryAccept(ConnectionState& state, std::string data, WriteOperation& out)
+static std::error_code TryAccept(ConnectionState& state, std::string data, WriteProbe& out)
 {
-    std::shared_ptr<WriteOpRecord> record;
-    const auto error = state.AcceptWrite(std::move(data), record);
-    if (!error) {
-        out = ConnectionTestAccess::MakeWrite(std::move(record));
-    }
-    return error;
+    return out.Submit(state, data);
 }
 
 /**
@@ -418,7 +413,7 @@ static void CoAcceptReadWrite()
             return;
         }
         auto report = connection.Write(read_data.CopyTo(), Until(3000ms));
-        if (report.wait_error || report.outcome.phase != WritePhase::Done) {
+        if (std::get<1>(report) || bool(std::get<1>(report))) {
             result.store(3);
             return;
         }
@@ -464,7 +459,7 @@ static void CoDial()
         }
         CoTcpConnection connection = res.connection;
         auto report = connection.Write("dial", Until(3000ms));
-        if (report.wait_error || report.outcome.phase != WritePhase::Done) {
+        if (std::get<1>(report) || bool(std::get<1>(report))) {
             result.store(2);
             return;
         }
@@ -578,8 +573,7 @@ static void WriteTimeout()
         auto task = Task([&] {
             CoTcpConnection co_conn{connection};
             const auto report = co_conn.Write(std::string(1, 'c'), Until(30ms));
-            if (report.wait_error == std::make_error_code(std::errc::timed_out)
-                && report.outcome.phase == WritePhase::Rejected && !report.operation.Valid()) {
+            if (std::get<1>(report) == std::make_error_code(std::errc::timed_out) && std::get<0>(report) == 0) {
                 result.store(0);
             }
         });
@@ -590,22 +584,19 @@ static void WriteTimeout()
         auto state = std::make_shared<ConnectionState>(2, 4096, 4096, 16, nullptr);
         Connection connection = ConnectionTestAccess::Make(state);
         std::atomic<int> result{-1};
-        auto operation_holder = std::make_shared<WriteOperation>();
         auto task = Task([&] {
             CoTcpConnection co_conn{connection};
             const auto report = co_conn.Write(std::string(8, 'd'), Until(30ms));
-            *operation_holder = report.operation;
-            if (report.wait_error == std::make_error_code(std::errc::timed_out)
-                && report.outcome.phase == WritePhase::InFlight && operation_holder->Valid()) {
+            if (std::get<1>(report) == std::make_error_code(std::errc::timed_out) && std::get<0>(report) == 0) {
                 result.store(0);
             }
         });
         Get(task);
         CHECK(result.load() == 0);
-        CHECK(operation_holder->Query().phase == WritePhase::InFlight);
+        CHECK(!state->HasPendingWrites());
         CHECK(connection.WriteAcceptance() != AcceptanceState::Closed);
     }
-    std::cout << "write_timeout capacity=unsubmitted completion=inflight queryable=ok\n";
+    std::cout << "write_timeout capacity=unsubmitted completion=revoked\n";
 }
 
 static void MultiListener()
@@ -658,7 +649,7 @@ static void CloseWaitersSettle()
     auto write_task = Task([&] {
         CoTcpConnection co_conn{connection};
         const auto report = co_conn.Write(std::string(8, 'y'), bbt::coroutine::WaitOptions{});
-        if (report.wait_error == make_error_code(NetErrc::Closed) && report.outcome.phase == WritePhase::Rejected) {
+        if (std::get<1>(report) == make_error_code(NetErrc::Closed) && std::get<0>(report) == 0) {
             write_result.store(0);
         }
     });
@@ -697,8 +688,8 @@ static void WriteFifoPrefix()
 {
     {
         ConnectionState state(1, 4096, 1024, 4, nullptr);
-        WriteOperation first;
-        WriteOperation second;
+        WriteProbe first;
+        WriteProbe second;
         CHECK(!TryAccept(state, "AAAA", first));
         CHECK(!TryAccept(state, "BB", second));
         int calls = 0;
@@ -715,22 +706,22 @@ static void WriteFifoPrefix()
         };
         const auto partial = state.PumpWrites(8, 4096, sink);
         CHECK(partial.bytes == 2 && partial.need_write_wait);
-        CHECK(first.Query().phase == WritePhase::InFlight && first.Query().sent == 2);
+        CHECK(!first.Query().terminal && first.Query().sent == 2);
         auto drain = [](const std::string_view* views, std::size_t, std::size_t budget) -> ssize_t {
             return static_cast<ssize_t>(std::min(views[0].size(), budget));
         };
         state.PumpWrites(8, 4096, drain);
         state.PumpWrites(8, 4096, drain);
-        CHECK(first.Query().phase == WritePhase::Done && first.Query().sent == 4);
-        CHECK(second.Query().phase == WritePhase::Done && second.Query().sent == 2);
+        CHECK(first.Query().terminal && first.Query().sent == 4);
+        CHECK(second.Query().terminal && second.Query().sent == 2);
         const auto terminals = state.DrainTerminal();
         CHECK(terminals.size() == 2);
         CHECK(terminals[0].id == first.Id() && terminals[1].id == second.Id());
     }
     {
         ConnectionState state(2, 4096, 1024, 4, nullptr);
-        WriteOperation first;
-        WriteOperation second;
+        WriteProbe first;
+        WriteProbe second;
         CHECK(!TryAccept(state, "XXXX", first));
         CHECK(!TryAccept(state, "YY", second));
         int calls = 0;
@@ -745,15 +736,15 @@ static void WriteFifoPrefix()
         };
         state.PumpWrites(8, 4096, sink);
         const auto reset = std::error_code(ECONNRESET, std::system_category());
-        CHECK(first.Query().phase == WritePhase::Done && first.Query().sent == 2 && first.Query().error == reset);
-        CHECK(second.Query().phase == WritePhase::Done && second.Query().sent == 0 && second.Query().error == reset);
+        CHECK(first.Query().terminal && first.Query().sent == 2 && first.Query().error == reset);
+        CHECK(second.Query().terminal && second.Query().sent == 0 && second.Query().error == reset);
         CHECK(state.LastWriteError() == reset);
         CHECK(state.Acceptance() == AcceptanceState::Open);
-        WriteOperation fresh;
+        WriteProbe fresh;
         CHECK(!TryAccept(state, "ZZ", fresh));
         state.MarkClosed(std::make_error_code(std::errc::operation_canceled));
         CHECK(state.Acceptance() == AcceptanceState::Closed);
-        WriteOperation after;
+        WriteProbe after;
         CHECK(TryAccept(state, "Q", after) == make_error_code(NetErrc::Closed));
     }
     std::cout << "write_fifo_prefix partial/FIFO/error/Settling/close=ok\n";

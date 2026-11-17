@@ -7,7 +7,7 @@
  * async_write_fire AsyncWrite 只返回接纳错误，不等待，FIFO 与终态通知保持
  * write_unsubmitted_timeout 容量等待超时未提交（Rejected+无效 op）
  * write_accepted_timeout 已接纳超时仍在途，op 终态后可查
- * write_accepted_cancel 已接纳等待被协程取消，发送不撤销
+ * write_accepted_cancel 已接纳等待被协程取消，撤销未发部分
  * op_wait_partial_error 部分发送后错误结算 Done+error+真实前缀
  * write_zero_len 零长写立即可采 Done
  * close_default_reason RequestClose({}) 未发完写 Done+非空错误
@@ -228,8 +228,7 @@ static void MemberWriteDone()
     std::atomic<int> result{-1};
     auto task = Task([&] {
         auto report = conn.Write("hello", bbt::coroutine::WaitOptions{});
-        if (!report.wait_error && report.outcome.phase == WritePhase::Done && !report.outcome.error
-            && report.outcome.sent == 5 && report.operation.Valid() && report.operation.Id() != 0) {
+        if (!std::get<1>(report) && std::get<0>(report) == 5) {
             result.store(0);
         } else {
             result.store(1);
@@ -288,8 +287,6 @@ static void AsyncWriteFire()
     (void)conn.Close({}, make_error_code(NetErrc::Closed));
     CHECK(conn.AsyncWrite("x") == make_error_code(NetErrc::Closed));
     CHECK(CoTcpConnection{}.AsyncWrite("x") == make_error_code(NetErrc::Closed));
-    WriteOperation empty;
-    CHECK(empty.Query().phase == WritePhase::Unknown);
     std::cout << "async_write_fire immediate_accept=ok fifo=ok reject=error\n";
 }
 
@@ -303,9 +300,7 @@ static void WriteUnsubmittedTimeout()
     std::atomic<int> result{-1};
     auto task = Task([&] {
         auto report = conn.Write(std::string(1, 'c'), Until(30ms));
-        if (report.wait_error == std::make_error_code(std::errc::timed_out)
-            && report.outcome.phase == WritePhase::Rejected && report.outcome.error == report.wait_error
-            && !report.operation.Valid()) {
+        if (std::get<1>(report) == std::make_error_code(std::errc::timed_out) && std::get<0>(report) == 0) {
             result.store(0);
         } else {
             result.store(1);
@@ -321,13 +316,10 @@ static void WriteAcceptedTimeout()
     StartRuntime(1);
     auto state = std::make_shared<ConnectionState>(4, 4096, 4096, 8, nullptr);
     auto conn = FacadeOf(state);
-    auto holder = std::make_shared<WriteOperation>();
     std::atomic<int> result{-1};
     auto task = Task([&] {
         auto report = conn.Write(std::string(8, 'd'), Until(30ms));
-        *holder = report.operation;
-        if (report.wait_error == std::make_error_code(std::errc::timed_out)
-            && report.outcome.phase == WritePhase::InFlight && report.operation.Valid()) {
+        if (std::get<1>(report) == std::make_error_code(std::errc::timed_out) && std::get<0>(report) == 0) {
             result.store(0);
         } else {
             result.store(1);
@@ -337,16 +329,16 @@ static void WriteAcceptedTimeout()
     CHECK(result.load() == 0);
 
     /**
-     * 超时不撤销：op 仍在途可查；推进后终态落到同一 record。
+     * 超时撤销未发部分，后续 pump 不会继续发送。
      */
-    CHECK(holder->Query().phase == WritePhase::InFlight);
+    CHECK(!state->HasPendingWrites());
     auto sink = [](const std::string_view* views, std::size_t, std::size_t budget) -> ssize_t {
         return static_cast<ssize_t>(std::min(views[0].size(), budget));
     };
     state->PumpWrites(8, 4096, sink);
-    const auto done = holder->Query();
-    CHECK(done.phase == WritePhase::Done && done.sent == 8 && !done.error);
-    std::cout << "write_accepted_timeout inflight_then_done=ok\n";
+    const auto done = state->DrainTerminal();
+    CHECK(done.size() == 1 && done[0].sent == 0 && done[0].error == std::errc::timed_out);
+    std::cout << "write_accepted_timeout revoked=ok\n";
 }
 
 static void WriteAcceptedCancel()
@@ -358,13 +350,11 @@ static void WriteAcceptedCancel()
     flag.ArmWriteAdd();
     auto self = std::make_shared<std::promise<bbt::coroutine::detail::Coroutine*>>();
     auto self_future = self->get_future();
-    auto holder = std::make_shared<WriteOperation>();
     std::atomic<int> result{-1};
     auto task = Task([&] {
         self->set_value(g_bbt_tls_coroutine_co);
         auto report = conn.Write(std::string(8, 'e'), bbt::coroutine::WaitOptions{});
-        *holder = report.operation;
-        if (report.wait_error == std::make_error_code(std::errc::operation_canceled) && report.operation.Valid()) {
+        if (std::get<1>(report) == std::make_error_code(std::errc::operation_canceled) && std::get<0>(report) == 0) {
             result.store(0);
         } else {
             result.store(1);
@@ -382,14 +372,15 @@ static void WriteAcceptedCancel()
     CHECK(result.load() == 0);
 
     /**
-     * 取消不撤销发送：record 仍可推进到 Done。
+     * 取消撤销未发部分，完成事件保留最终错误。
      */
     auto sink = [](const std::string_view* views, std::size_t, std::size_t budget) -> ssize_t {
         return static_cast<ssize_t>(std::min(views[0].size(), budget));
     };
     state->PumpWrites(8, 4096, sink);
-    CHECK(holder->Query().phase == WritePhase::Done && holder->Query().sent == 8);
-    std::cout << "write_accepted_cancel wait=cancelled op=still_done\n";
+    const auto done = state->DrainTerminal();
+    CHECK(done.size() == 1 && done[0].sent == 0 && done[0].error == std::errc::operation_canceled);
+    std::cout << "write_accepted_cancel wait=cancelled unsent=revoked\n";
 }
 
 static void OpWaitPartialError()
@@ -397,16 +388,12 @@ static void OpWaitPartialError()
     StartRuntime(1);
     auto state = std::make_shared<ConnectionState>(6, 4096, 4096, 8, nullptr);
     auto conn = FacadeOf(state);
-    WriteOperation ticket;
     ArmedFlag flag;
     flag.ArmWriteAdd();
     std::atomic<int> result{-1};
     auto task = Task([&] {
         const auto report = conn.Write(std::string(64, 'p'), bbt::coroutine::WaitOptions{});
-        ticket = report.operation;
-        const auto& outcome = report.outcome;
-        if (!report.wait_error && outcome.phase == WritePhase::Done && outcome.error.value() == EPIPE
-            && outcome.sent == 8) {
+        if (std::get<1>(report).value() == EPIPE && std::get<0>(report) == 8) {
             result.store(0);
         } else {
             result.store(1);
@@ -430,8 +417,8 @@ static void OpWaitPartialError()
     state->PumpWrites(8, 4096, sink);
     Get(task);
     CHECK(result.load() == 0);
-    const auto terminal = ticket.Query();
-    CHECK(terminal.phase == WritePhase::Done && terminal.sent == 8 && terminal.error.value() == EPIPE);
+    const auto terminal = state->DrainTerminal();
+    CHECK(terminal.size() == 1 && terminal[0].sent == 8 && terminal[0].error.value() == EPIPE);
     std::cout << "op_wait_partial_error sent=8 epipe=ok\n";
 }
 
@@ -450,8 +437,7 @@ static void WriteZeroLen()
     std::atomic<int> result{-1};
     auto task = Task([&] {
         auto report = conn.Write("", Until(500ms));
-        if (!report.wait_error && report.outcome.phase == WritePhase::Done && !report.outcome.error
-            && report.operation.Valid()) {
+        if (!std::get<1>(report) && std::get<0>(report) == 0) {
             result.store(0);
         } else {
             result.store(1);
@@ -501,41 +487,18 @@ static void FacadeReleasedOpQueryable()
 {
     StartRuntime(1);
     auto state = std::make_shared<ConnectionState>(10, 4096, 4096, 8, nullptr);
-    WriteOperation op;
+    std::tuple<std::size_t, std::error_code> result;
     auto submitted = Task([&] {
         auto conn = FacadeOf(state);
-        const auto report = conn.Write(std::string(16, 'f'), Until(30ms));
-        CHECK(report.wait_error == std::make_error_code(std::errc::timed_out));
-        op = report.operation;
-        CHECK(op.Valid());
+        result = conn.Write(std::string(16, 'f'), Until(30ms));
     });
-
-    /**
-     * facade 释放：Write 返回的 op 终态仍可查，发送未被超时撤销。
-     */
     Get(submitted);
-    CHECK(op.Query().phase == WritePhase::InFlight);
-    ArmedFlag flag;
-    flag.ArmWriteAdd();
-    std::atomic<int> result{-1};
-    auto task = Task([&] {
-        WriteOutcome outcome;
-        const auto error = op.Wait(Until(2000ms), &outcome);
-        if (!error && outcome.phase == WritePhase::Done && outcome.sent == 16) {
-            result.store(0);
-        } else {
-            result.store(1);
-        }
-    });
-    CHECK(WaitUntil([&] { return flag.armed.load() >= 1; }, 3000ms));
-    flag.Clear();
-    auto sink = [](const std::string_view* views, std::size_t, std::size_t budget) -> ssize_t {
-        return static_cast<ssize_t>(std::min(views[0].size(), budget));
-    };
-    state->PumpWrites(8, 4096, sink);
-    Get(task);
-    CHECK(result.load() == 0);
-    std::cout << "facade_released_op_queryable wait_after_release=done\n";
+    CHECK(std::get<0>(result) == 0 && std::get<1>(result) == std::errc::timed_out);
+    const auto pumped = state->PumpWrites(
+        8, 4096, [](const std::string_view*, std::size_t, std::size_t budget) -> ssize_t { return budget; });
+    CHECK(pumped.bytes == 0);
+    const auto terminal = state->DrainTerminal();
+    CHECK(terminal.size() == 1 && terminal[0].sent == 0 && terminal[0].error == std::errc::timed_out);
 }
 
 static void WaitClosedDriverFailed()

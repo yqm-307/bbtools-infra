@@ -10,7 +10,7 @@
 #include <bbt/infra/net/detail/ReceiveRing.hpp>
 
 /**
- * 实现放 .cc：Connection/WriteOperation 的转发需要 ConnectionState/ReceiveRing
+ * 实现放 .cc：Connection 的转发需要 ConnectionState/ReceiveRing
  * 完整定义，放在公共头会把 state/ring 布局与内部枚举经公共面传出。
  */
 namespace bbt::infra::net {
@@ -39,8 +39,7 @@ std::error_code Connection::AsyncWrite(std::string data)
     /**
      * 记录只供 owner 做 FIFO/部分发送及 OnWrite 结算，不创建等待者或交付票据。
      */
-    std::shared_ptr<WriteOpRecord> record;
-    return m_state->AcceptWrite(std::move(data), record);
+    return m_state->AcceptFire(data);
 }
 
 ReadResult Connection::TryRead(std::string& out)

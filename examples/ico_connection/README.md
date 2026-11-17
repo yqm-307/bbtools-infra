@@ -1,6 +1,6 @@
 # ICoConnection 成员化收口消费示例：只链接公开 target `bbt::infra_net` + bbtools-coroutine。
 
-本示例演示真实 TCP 回环，两端都是本仓 Engine：server `EnableAcceptHandoff` → 协程 `CoAccept` → `conn.Read()` → `conn.Write(回显)` → `RequestClose` → `WaitClosed`；client `CoDial` → `conn.Write("hello")` → `conn.Read()` 回显 → `RequestClose` → `WaitClosed` → `Status` 采样。覆盖全部成员形态：Read/Buffer、Write/WriteReport、WaitClosed、Status 投影。不触碰 net detail 或 raw ring 接口。
+本示例演示真实 TCP 回环，两端都是本仓 Engine：server `EnableAcceptHandoff` → 协程 `CoAccept` → `conn.Read()` → `conn.Write(回显)` → `RequestClose` → `WaitClosed`；client `CoDial` → `conn.Write("hello")` → `conn.Read()` 回显 → `RequestClose` → `WaitClosed` → `Status` 采样。覆盖全部成员形态：Read/Buffer、Write/(n, err)、WaitClosed、Status 投影。不触碰 net detail 或 raw ring 接口。
 
 只链接 `bbt::infra_net`，无外部服务依赖，loopback 自给自足。
 

@@ -13,13 +13,11 @@ void Probe(Engine& engine, Connection& connection, const Address& address)
      * 已删除：协程读是 conn.Read()
      */
     (void)CoRead(connection, out, {});
-    WriteOutcome outcome;
-    WriteOperation op;
 
     /**
      * 已删除：conn.Write()
      */
-    (void)CoWrite(connection, "x", {}, outcome, op);
+    (void)CoWrite(connection, "x", {});
 
     /**
      * 已删除：engine.CoAccept()

@@ -8,6 +8,10 @@ ConnectionState::PumpWrites(std::size_t max_rounds, std::size_t byte_budget, Sin
 {
     SendResult result;
     {
+        /**
+         * 撤销也取此锁：可能等待整个有界发送批次；取锁即无在途发送，
+         * GatherViews 的借用不跨解锁，返回的已发前缀因此为终值。
+         */
         std::unique_lock<std::mutex> lock(m_write_mutex);
         for (std::size_t round = 0; round < max_rounds && result.bytes < byte_budget; ++round) {
             std::string_view views[kMaxViews];

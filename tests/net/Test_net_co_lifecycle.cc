@@ -98,9 +98,8 @@ BOOST_AUTO_TEST_CASE(non_co_connection_ready_paths_do_not_consume)
     const auto written = connection.Write("payload", {});
     BOOST_CHECK(std::get<1>(read) == std::errc::operation_not_permitted);
     BOOST_CHECK(std::get<0>(read).Empty());
-    BOOST_CHECK(written.wait_error == std::errc::operation_not_permitted);
-    BOOST_CHECK(!written.operation.Valid());
-    BOOST_CHECK_EQUAL(written.outcome.sent, 0U);
+    BOOST_CHECK(std::get<1>(written) == std::errc::operation_not_permitted);
+    BOOST_CHECK_EQUAL(std::get<0>(written), 0U);
     BOOST_CHECK(connection.WaitClosed({}) == std::errc::operation_not_permitted);
     const auto after = connection.Status();
     BOOST_CHECK_EQUAL(after.readable_bytes, before.readable_bytes);
@@ -108,17 +107,14 @@ BOOST_AUTO_TEST_CASE(non_co_connection_ready_paths_do_not_consume)
     BOOST_CHECK(!after.closed);
 
     /**
-     * fire 提交可在 native 域调用；等待票只从协程 Write 取得，仍遵守等待门禁。
+     * fire 提交可在 native 域调用；协程 Write 仍遵守等待门禁。
      */
     BOOST_REQUIRE(!connection.AsyncWrite(""));
-    net::WriteOperation operation;
     OnCo([&] {
-        const auto report = connection.Write("");
-        BOOST_REQUIRE(!report.wait_error);
-        operation = report.operation;
+        const auto [sent, error] = connection.Write("");
+        BOOST_REQUIRE(!error);
+        BOOST_CHECK_EQUAL(sent, 0U);
     });
-    BOOST_REQUIRE(operation.Valid());
-    BOOST_CHECK(operation.Wait({}, nullptr) == std::errc::operation_not_permitted);
     (void)connection.Close();
     (void)connection.Close();
     BOOST_CHECK(connection.Status().closed);

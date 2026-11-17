@@ -130,22 +130,14 @@ result<void> Http11Connection::WriteRequest(const std::string& bytes, bbt::corou
         return result<void>::err(CallError(gate, "write rejected before submission", false));
     }
     net::CoTcpConnection connection{m_connection};
-    const auto report = connection.Write(bytes, {deadline});
-    const auto& outcome = report.outcome;
-    if (!report.wait_error && outcome.phase == net::WritePhase::Done && !outcome.error) {
+    const auto [sent, error] = connection.Write(bytes, {deadline});
+    if (!error && sent == bytes.size())
         return result<void>::ok();
-    }
-    const bool committed = outcome.phase == net::WritePhase::Done && !outcome.error;
-    auto failure =
-        CallError(report.wait_error ? report.wait_error : outcome.error, "write did not complete", committed);
+    const bool committed = sent == bytes.size();
+    auto failure = CallError(error, "write did not complete", committed);
     if (!committed) {
         failure.request_phase = RequestPhase::Writing;
-
-        /**
-         * 已接纳仍在发送，等待结束不等于撤销；不能诱导调用方当作零提交重试。
-         */
-        if (report.operation.Valid() && outcome.phase == net::WritePhase::InFlight
-            && failure.code != ErrorCode::Cancelled) {
+        if (sent > 0 && failure.code != ErrorCode::Cancelled) {
             failure.code = ErrorCode::OutcomeUnknown;
         }
     }

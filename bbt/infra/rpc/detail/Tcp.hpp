@@ -14,7 +14,7 @@
 #include <bbt/infra/Result.hpp>
 #include <bbt/infra/net/Address.hpp>
 #include <bbt/infra/net/Error.hpp>
-#include <bbt/infra/net/WriteOperation.hpp>
+#include <tuple>
 
 namespace bbt::infra::rpc {
 namespace detail {
@@ -46,14 +46,11 @@ result<void> ParseTcpEndpoint(const std::string& endpoint, std::string& out_host
 Error TcpCallError(std::error_code cause, const char* message, bool committed);
 
 /**
- * @brief 写报告结算（ICoConnection::Write 三元组 → Error）：
- *   - wait_error 非空 + Rejected/无 operation = 零提交，确定失败；
- *   - InFlight（已接纳未终态）= 不能认定零发送 → OutcomeUnknown
- *     （Cancelled 保留取消码，等待结束不撤销已接纳发送）；
- *   - Done+error / wait_error = 写路径失败（未全量 committed）；
- *   - Done 且无错 = 成功（committed 由调用方推进阶段）。
+ * @brief 按已发前缀结算写结果。零字节未提交，部分发送为未知结果，全部发送成功。
+ * 调用方取消保留原取消码；连接作废仍由会话负责。
  */
-result<void> TcpSettleWrite(const net::WriteReport& report, const char* message);
+result<void>
+TcpSettleWrite(const std::tuple<std::size_t, std::error_code>& report, std::size_t total, const char* message);
 
 // clang-format off
 }

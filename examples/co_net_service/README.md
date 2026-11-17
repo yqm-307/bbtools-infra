@@ -19,8 +19,7 @@
 实际绑定地址（请求 port 0，由内核分配真实端口）。
 
 本示例消费的语义中，两条容易写错的：
-- `WritePhase::Done` 只表示该次发送已到终态，**成功还须 `outcome.error` 为空**；
-  `conn.Write` 的 `wait_error` 只描述本次等待，不代替发送终态。
+- `Write` 返回 `(n, err)`：n 为交给内核的前缀，err 为空且 n 等于数据长度时完成；超时/取消撤销未发部分。
 - `Read`/`TryRead` 的成功结果持有独立 owning Buffer；连接关闭不使其数据失效，持有数据不阻碍 socket 物理回收。失败零消费，出参重载保持已有 Buffer。
 
 构建与运行（network-only，独立构建目录）：

@@ -321,3 +321,5 @@ Engine 通常贯穿进程寿命，关闭只承诺停止服务及后续操作安�
 AsyncWrite 的票据返回/出参约定已由 [0018：AsyncWrite 只提交](0018-async-write-fire.md) 取代；Write 的等待语义保留。
 
 读取 backing 移交与 `TryAccess`/`ReadAccess` 约定已由 [0019：读取面收敛为 Read 与只读 View](0019-read-view.md) 取代。
+
+已被 [0024：协程 Write 采用系统调用语义](0024-co-write-syscall-semantics.md) 部分取代：协程 Write 返回 `(n, err)`，超时/取消撤销本次未发部分；删除写操作票据、报告与阶段类型。其余契约保持。

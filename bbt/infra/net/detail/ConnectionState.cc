@@ -17,90 +17,100 @@ ConnectionState::ConnectionState(
     , m_service_sealed(std::move(service_sealed))
     , m_owner_released(owner_released ? std::move(owner_released) : std::make_shared<ReclaimRecord>(true))
 {
+    m_writeIntervals.set_capacity(max_ops);
     m_pending_terminal.set_capacity(std::max<std::size_t>(1, max_ops));
 }
 
-std::error_code ConnectionState::AcceptWrite(std::string data, std::shared_ptr<WriteOpRecord>& out)
+std::error_code ConnectionState::AcceptFire(std::string_view data)
+{
+    std::uint64_t id = 0;
+    return SubmitWrite(data, id);
+}
+
+std::error_code ConnectionState::SubmitWrite(std::string_view data, std::uint64_t& out_id, WriteWait* waiter)
 {
     if (m_service_sealed && m_service_sealed->load(std::memory_order_acquire)) {
         return make_error_code(NetErrc::Closed);
     }
     std::unique_lock<std::mutex> lock(m_write_mutex);
-    if (m_close_requested) {
-
-        /**
-         * 关闭意图从首次请求起永久拒绝
-         */
-        return make_error_code(NetErrc::Closed);
-    }
-    if (m_acceptance == AcceptanceState::Closed) {
+    if (m_close_requested || m_acceptance == AcceptanceState::Closed) {
         return make_error_code(NetErrc::Closed);
     }
     if (m_acceptance == AcceptanceState::Settling) {
         return make_error_code(NetErrc::WriteSettling);
     }
-
-    /**
-     * 普通 + 零长 + 已终结未派发合计责任上限。
-     */
-    if (m_ops.size() + PendingCountLocked() >= m_max_ops) {
+    if (m_writeIntervals.size() + PendingCountLocked() >= m_max_ops
+        || data.size() > m_outbound_max - (m_queue.TotalBytes() - m_queue.RevokedBytes())) {
         return std::make_error_code(std::errc::no_buffer_space);
     }
-    if (data.empty()) {
-        std::shared_ptr<WriteOpRecord> record;
-        try {
-            record = std::make_shared<WriteOpRecord>();
-            record->id = m_next_op++;
-            {
-                std::lock_guard<std::mutex> record_lock(record->mutex);
-                record->terminal = true;
-            }
-            m_pending_terminal.push_back(CompletedWrite{record->id, 0, {}});
-        } catch (...) {
-            return std::make_error_code(std::errc::not_enough_memory);
-        }
-        out = std::move(record);
-        lock.unlock();
-        m_write_hub.NotifyAll();
-        WakeOwner();
-        return {};
-    }
-    const std::size_t bytes = data.size();
-    if (bytes > m_outbound_max - m_queue.TotalBytes()) {
-        return std::make_error_code(std::errc::no_buffer_space);
-    }
-    std::shared_ptr<WriteOpRecord> record;
+    std::size_t begin = 0, end = 0;
     try {
-        record = std::make_shared<WriteOpRecord>();
-        record->id = m_next_op++;
-        record->total = bytes;
-        record->remaining = bytes;
-
-        /**
-         * 先占活动责任，再接纳字节
-         */
-        m_ops.push_back(record);
-    } catch (...) {
+        if (waiter && !data.empty()) {
+            std::size_t observed = 1;
+            for (const auto& entry : m_writeIntervals)
+                observed += entry.waiter != nullptr;
+            m_queue.ReserveRevocations(observed);
+        }
+        if (const auto error = m_queue.Append(data, &begin, &end))
+            return error;
+    } catch (const std::bad_alloc&) {
         return std::make_error_code(std::errc::not_enough_memory);
     }
-    std::error_code append_error;
-    try {
-        append_error = m_queue.Append(data);
-    } catch (...) {
-        append_error = std::make_error_code(std::errc::not_enough_memory);
+    WriteEntry entry{m_next_op++, begin, end, 0, waiter};
+    out_id = entry.id;
+    if (waiter)
+        *waiter = {};
+    if (data.empty()) {
+        CompleteLocked(entry, {});
+    } else {
+        m_writeIntervals.push_back(entry);
     }
-    if (append_error) {
-
-        /**
-         * 事务撤销：没有字节入队，记录未发布
-         */
-        m_ops.pop_back();
-        return append_error;
-    }
-    out = std::move(record);
     lock.unlock();
+    if (data.empty())
+        m_write_hub.NotifyAll();
     WakeOwner();
     return {};
+}
+
+WriteWait ConnectionState::QueryWrite(const WriteWait& waiter)
+{
+    std::lock_guard<std::mutex> lock(m_write_mutex);
+    return waiter;
+}
+
+std::tuple<std::size_t, std::error_code>
+ConnectionState::CancelWrite(std::uint64_t id, WriteWait& waiter, std::error_code error)
+{
+    std::unique_lock<std::mutex> lock(m_write_mutex);
+    if (!waiter.terminal) {
+        /**
+         * ponytail: 撤销冷路径在 max_ops 有界账本内线性查找；只有实测该扫描
+         * 成为瓶颈时再加 id 索引，避免 raw 提交引入逐写分配。
+         */
+        const auto entry = std::find_if(
+            m_writeIntervals.begin(), m_writeIntervals.end(), [id](const auto& write) { return write.id == id; });
+        if (entry != m_writeIntervals.end()) {
+            /**
+             * PumpWrites 的整个发送批次与终态发布均持同一写锁；取得锁后
+             * 没有在途发送。撤销槽在接纳时预留，撤销与解绑不分配也不抛。
+             */
+            m_queue.RevokeStreamRange(entry->begin + entry->sent, entry->end);
+            CompleteLocked(*entry, error);
+            m_writeIntervals.erase(entry);
+        }
+    }
+    const auto result = std::make_tuple(waiter.sent, waiter.error);
+    lock.unlock();
+    m_write_hub.NotifyAll();
+    WakeOwner();
+    return result;
+}
+
+void ConnectionState::CompleteLocked(WriteEntry& entry, std::error_code error)
+{
+    if (entry.waiter)
+        *entry.waiter = WriteWait{true, entry.sent, error};
+    m_pending_terminal.push_back(CompletedWrite{entry.id, entry.sent, error});
 }
 
 bool ConnectionState::TryPopTerminal(CompletedWrite& out)
@@ -133,13 +143,13 @@ std::vector<CompletedWrite> ConnectionState::DrainTerminal()
 bool ConnectionState::HasPendingWrites()
 {
     std::lock_guard<std::mutex> lock(m_write_mutex);
-    return !m_ops.empty();
+    return !m_writeIntervals.empty();
 }
 
 std::size_t ConnectionState::ActiveOpCount()
 {
     std::lock_guard<std::mutex> lock(m_write_mutex);
-    return m_ops.size();
+    return m_writeIntervals.size();
 }
 
 bool ConnectionState::CanAcceptWrite(std::size_t bytes)
@@ -151,7 +161,8 @@ bool ConnectionState::CanAcceptWrite(std::size_t bytes)
     if (m_close_requested || m_acceptance != AcceptanceState::Open) {
         return false;
     }
-    return m_ops.size() + PendingCountLocked() < m_max_ops && bytes <= m_outbound_max - m_queue.TotalBytes();
+    return m_writeIntervals.size() + PendingCountLocked() < m_max_ops
+           && bytes <= m_outbound_max - (m_queue.TotalBytes() - m_queue.RevokedBytes());
 }
 
 void ConnectionState::RequestClose(std::error_code reason)
@@ -205,7 +216,7 @@ void ConnectionState::MarkClosed(std::error_code reason)
     bool publish_read_closed = false;
     {
         std::lock_guard<std::mutex> lock(m_write_mutex);
-        if (m_acceptance == AcceptanceState::Closed && m_ops.empty() && m_read_closed_published) {
+        if (m_acceptance == AcceptanceState::Closed && m_writeIntervals.empty() && m_read_closed_published) {
             return;
         }
         if (m_close_requested) {
@@ -226,15 +237,10 @@ void ConnectionState::MarkClosed(std::error_code reason)
          */
         const std::error_code settle = reason ? reason : std::make_error_code(std::errc::operation_canceled);
         bool settled_any = false;
-        while (!m_ops.empty()) {
-            auto& op = m_ops.front();
-            {
-                std::lock_guard<std::mutex> record_lock(op->mutex);
-                op->terminal = true;
-                op->error = settle;
-            }
-            m_pending_terminal.push_back(CompletedWrite{op->id, op->sent, settle});
-            m_ops.pop_front();
+        while (!m_writeIntervals.empty()) {
+            auto& op = m_writeIntervals.front();
+            CompleteLocked(op, settle);
+            m_writeIntervals.pop_front();
             settled_any = true;
         }
 
@@ -243,7 +249,7 @@ void ConnectionState::MarkClosed(std::error_code reason)
          */
         m_acceptance = AcceptanceState::Closed;
         if (m_queue.TotalBytes() != 0) {
-            m_queue.ConsumeSent(m_queue.TotalBytes());
+            m_queue.ConsumeSent(m_queue.TotalBytes() - m_queue.RevokedBytes());
         }
 
         /**
@@ -352,24 +358,16 @@ std::function<void()>& ConnectionState::CloseAddHookForTest()
 bool ConnectionState::AttributeSentLocked(std::size_t bytes)
 {
     bool changed = false;
-    while (bytes != 0 && !m_ops.empty()) {
-        auto& op = m_ops.front();
-        const std::size_t take = bytes < op->remaining ? bytes : op->remaining;
-        bool complete = false;
-        {
-            std::lock_guard<std::mutex> record_lock(op->mutex);
-            op->remaining -= take;
-            op->sent += take;
-            if (op->remaining == 0) {
-                op->terminal = true;
-                op->error = {};
-                complete = true;
-            }
-        }
+    while (bytes != 0 && !m_writeIntervals.empty()) {
+        auto& entry = m_writeIntervals.front();
+        const auto take = std::min(bytes, entry.end - entry.begin - entry.sent);
+        entry.sent += take;
         bytes -= take;
-        if (complete) {
-            m_pending_terminal.push_back(CompletedWrite{op->id, op->sent, {}});
-            m_ops.pop_front();
+        if (entry.waiter)
+            entry.waiter->sent = entry.sent;
+        if (entry.sent == entry.end - entry.begin) {
+            CompleteLocked(entry, {});
+            m_writeIntervals.pop_front();
             changed = true;
         }
     }
@@ -378,31 +376,17 @@ bool ConnectionState::AttributeSentLocked(std::size_t bytes)
 
 void ConnectionState::FailCurrentLocked(std::error_code error)
 {
-    if (m_ops.empty()) {
+    if (m_writeIntervals.empty())
         return;
-    }
     m_acceptance = AcceptanceState::Settling;
     m_last_error = error;
-    while (!m_ops.empty()) {
-        auto& op = m_ops.front();
-        {
-            std::lock_guard<std::mutex> record_lock(op->mutex);
-            op->terminal = true;
-            op->error = error;
-            op->remaining = 0;
-        }
-        m_last_error_op = op->id;
-        m_pending_terminal.push_back(CompletedWrite{op->id, op->sent, error});
-        m_ops.pop_front();
+    while (!m_writeIntervals.empty()) {
+        auto& entry = m_writeIntervals.front();
+        m_last_error_op = entry.id;
+        CompleteLocked(entry, error);
+        m_writeIntervals.pop_front();
     }
-    if (m_queue.TotalBytes() != 0) {
-        m_queue.ConsumeSent(m_queue.TotalBytes());
-    }
-
-    /**
-     * 有关闭意图时保持 Settling，等 owner stage 后发布最终终态；普通 I/O
-     * 错误只结算写责任，不升级为自动关闭。
-     */
+    m_queue.ConsumeSent(m_queue.TotalBytes() - m_queue.RevokedBytes());
     if (!m_close_requested) {
         const bool sealed = m_service_sealed && m_service_sealed->load(std::memory_order_acquire);
         m_acceptance = sealed ? AcceptanceState::Closed : AcceptanceState::Open;

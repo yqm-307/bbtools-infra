@@ -124,64 +124,60 @@ std::error_code CoTcpConnection::AsyncWrite(std::string data)
     return m_conn.AsyncWrite(std::move(data));
 }
 
-WriteReport CoTcpConnection::Write(std::string data, const bbt::coroutine::WaitOptions& options)
+std::tuple<std::size_t, std::error_code>
+CoTcpConnection::Write(std::string data, const bbt::coroutine::WaitOptions& options)
 {
-
-    /**
-     * 等容量 → 接纳 → 等本地完成，同一绝对 deadline 沿重试保持。
-     * wait_error 只描述等待/调用结果：接纳后 Done+error 落在
-     * outcome.error（不冒充等待失败）；等容量失败为 Rejected+无效 op。
-     */
-    WriteReport report;
-    report.outcome = WriteOutcome{WritePhase::Rejected, 0, {}};
-    if (const auto gate = RequireCoroutineContext()) {
-        report.wait_error = gate;
-        report.outcome.error = gate;
-        return report;
-    }
+    if (const auto gate = RequireCoroutineContext())
+        return {0, gate};
     const auto state = CoAccess::StateOf(m_conn);
-    if (!state) {
-        report.wait_error = make_error_code(NetErrc::Closed);
-        report.outcome.error = report.wait_error;
-        return report;
-    }
-    const std::size_t wanted = data.size();
+    if (!state)
+        return {0, make_error_code(NetErrc::Closed)};
+    const auto wanted = data.size();
     const auto no_buffer = std::make_error_code(std::errc::no_buffer_space);
     const auto settling = make_error_code(NetErrc::WriteSettling);
+    WriteWait result;
+    std::uint64_t id = 0;
     for (;;) {
-        std::shared_ptr<WriteOpRecord> record;
-        const auto error = state->AcceptWrite(data, record);
-        if (!error) {
-            report.operation = WriteOperation(std::move(record), state);
-
-            /**
-             * 等同一 record 终态；超时/取消不撤销已接纳发送，outcome
-             * 是返回时采样（等待首胜后可能已采到 Done）。
-             */
-            report.wait_error = report.operation.Wait(options, &report.outcome);
-            return report;
-        }
-
-        /**
-         * 能力上永远不可能接纳的超大请求：立即拒绝，绝不无限等。
-         */
-        if (error == no_buffer || error == settling) {
-            if (wanted > state->MaxOutboundBytes()) {
-                report.wait_error = no_buffer;
-                report.outcome.error = no_buffer;
-                return report;
+        const auto error = state->SubmitWrite(data, id, &result);
+        if (!error)
+            break;
+        if (error != no_buffer && error != settling)
+            return {0, error};
+        if (wanted > state->MaxOutboundBytes())
+            return {0, no_buffer};
+        if (state->Closed())
+            return {0, make_error_code(NetErrc::Closed)};
+        auto waiter = state->CreateWriteWaiter();
+        if (!waiter)
+            return {0, no_buffer};
+        bool add_failed = false;
+        const auto status = waiter->WaitWithCallback(options, [&] {
+            if (!state->AddWriteWaiter(waiter)) {
+                add_failed = true;
+                waiter->Notify();
+                return true;
             }
-            if (m_conn.Closed()) {
-                report.wait_error = make_error_code(NetErrc::Closed);
-                report.outcome.error = report.wait_error;
-                return report;
-            }
+            if (state->CanAcceptWrite(wanted) || state->Closed())
+                waiter->Notify();
+            return true;
+        });
+        if (add_failed)
+            return {0, no_buffer};
+        if (status != bbt::coroutine::WaitStatus::Completed)
+            return {0, WaitStatusError(status)};
+    }
+    /**
+     * 接纳后的每个出口均在写锁内完成或撤销，解除对本调用栈的借用。
+     * 容量与完成等待复用同一绝对 deadline；已发布终态先于撤销。
+     */
+    try {
+        for (;;) {
+            const auto sample = state->QueryWrite(result);
+            if (sample.terminal)
+                return {sample.sent, sample.error};
             auto waiter = state->CreateWriteWaiter();
-            if (!waiter) {
-                report.wait_error = no_buffer;
-                report.outcome.error = no_buffer;
-                return report;
-            }
+            if (!waiter)
+                return state->CancelWrite(id, result, no_buffer);
             bool add_failed = false;
             const auto status = waiter->WaitWithCallback(options, [&] {
                 if (!state->AddWriteWaiter(waiter)) {
@@ -189,30 +185,19 @@ WriteReport CoTcpConnection::Write(std::string data, const bbt::coroutine::WaitO
                     waiter->Notify();
                     return true;
                 }
-                if (state->CanAcceptWrite(wanted) || state->Closed()) {
+                if (state->QueryWrite(result).terminal)
                     waiter->Notify();
-                }
                 return true;
             });
-            if (add_failed) {
-                report.wait_error = no_buffer;
-                report.outcome.error = no_buffer;
-                return report;
-            }
+            if (add_failed)
+                return state->CancelWrite(id, result, no_buffer);
             if (status != bbt::coroutine::WaitStatus::Completed) {
-
-                /**
-                 * 容量等待超时/取消：本次未提交，Rejected+无效 op。
-                 */
-                report.wait_error = WaitStatusError(status);
-                report.outcome.error = report.wait_error;
-                return report;
+                return state->CancelWrite(id, result, WaitStatusError(status));
             }
-            continue;
         }
-        report.wait_error = error;
-        report.outcome.error = error;
-        return report;
+    } catch (...) {
+        state->CancelWrite(id, result, std::make_error_code(std::errc::operation_canceled));
+        throw;
     }
 }
 

@@ -21,7 +21,7 @@
 #include <bbt/infra/net/Engine.hpp>
 #include <bbt/infra/net/ICoConnection.hpp>
 #include <bbt/infra/net/ConnectionResult.hpp>
-#include <bbt/infra/net/WriteOperation.hpp>
+#include "WriteProbe.hpp"
 #include <bbt/infra/net/NativeSocket.hpp>
 #include <bbt/infra/net/RawHandler.hpp>
 #include <bbt/infra/net/detail/CoInternal.hpp>
@@ -333,14 +333,9 @@ struct StoreHandler : RawHandler {
     void OnClose(Connection, std::error_code) override { closed.fetch_add(1); }
 };
 
-static std::error_code TryAccept(ConnectionState& state, std::string data, WriteOperation& out)
+static std::error_code TryAccept(ConnectionState& state, std::string data, WriteProbe& out)
 {
-    std::shared_ptr<WriteOpRecord> record;
-    const auto error = state.AcceptWrite(std::move(data), record);
-    if (!error) {
-        out = ConnectionTestAccess::MakeWrite(std::move(record));
-    }
-    return error;
+    return out.Submit(state, data);
 }
 
 static EngineConfig ServerConfig(const Address& listen, std::size_t subs = 1)
@@ -439,7 +434,7 @@ static void HubEarlyNotifyRetained()
 static void WriteTotalOpsBound()
 {
     ConnectionState state(1, 4096, 4096, 4, nullptr);
-    WriteOperation a, b, c, d, e;
+    WriteProbe a, b, c, d, e;
     CHECK(!TryAccept(state, "aa", a));
 
     /**
@@ -461,7 +456,7 @@ static void WriteTotalOpsBound()
 static void WriteQueryMonotonic()
 {
     ConnectionState state(1, 4096, 8192, 16, nullptr);
-    WriteOperation operation;
+    WriteProbe operation;
     CHECK(!TryAccept(state, std::string(4096, 'x'), operation));
     std::atomic<bool> stop{false};
     auto sink = [](const std::string_view* views, std::size_t, std::size_t budget) -> ssize_t {
@@ -471,7 +466,7 @@ static void WriteQueryMonotonic()
         while (!stop.load()) {
             state.PumpWrites(1, 512, sink);
         }
-        while (operation.Query().phase == WritePhase::InFlight) {
+        while (!operation.Query().terminal) {
             state.PumpWrites(1, 512, sink);
         }
     });
@@ -480,14 +475,14 @@ static void WriteQueryMonotonic()
         const auto outcome = operation.Query();
         CHECK(outcome.sent >= previous);
         previous = outcome.sent;
-        if (outcome.phase == WritePhase::Done) {
+        if (outcome.terminal) {
             break;
         }
     }
     stop.store(true);
     pump.join();
     const auto final = operation.Query();
-    CHECK(final.phase == WritePhase::Done && final.sent == 4096);
+    CHECK(final.terminal && final.sent == 4096);
     CHECK(state.DrainTerminal().size() == 1);
     std::cout << "write_query_monotonic sent=" << final.sent << " terminal_once=ok\n";
 }
@@ -1354,7 +1349,7 @@ static void CoReadRapid()
 static void WriteTerminalNoAlloc()
 {
     auto state = std::make_shared<ConnectionState>(1, 4096, 4096, 4, nullptr);
-    WriteOperation operation;
+    WriteProbe operation;
     CHECK(!TryAccept(*state, "abcdef", operation));
     auto sink = [](const std::string_view* views, std::size_t, std::size_t budget) -> ssize_t {
         return static_cast<ssize_t>(std::min(views[0].size(), budget));
@@ -1363,7 +1358,7 @@ static void WriteTerminalNoAlloc()
     const auto result = state->PumpWrites(8, 4096, sink);
     g_fail_alloc = false;
     CHECK(result.terminal_changed);
-    CHECK(operation.Query().phase == WritePhase::Done && operation.Query().sent == 6);
+    CHECK(operation.Query().terminal && operation.Query().sent == 6);
     g_fail_alloc = true;
     CompletedWrite item;
     const bool popped = state->TryPopTerminal(item);
@@ -1374,13 +1369,13 @@ static void WriteTerminalNoAlloc()
      * MarkClosed 在单次分配失败下仍逐项结算全部责任。
      */
     auto closed = std::make_shared<ConnectionState>(2, 4096, 4096, 4, nullptr);
-    WriteOperation a, b;
+    WriteProbe a, b;
     CHECK(!TryAccept(*closed, "aa", a));
     CHECK(!TryAccept(*closed, "bb", b));
     g_fail_alloc = true;
     closed->MarkClosed(std::make_error_code(std::errc::operation_canceled));
     g_fail_alloc = false;
-    CHECK(a.Query().phase == WritePhase::Done && b.Query().phase == WritePhase::Done);
+    CHECK(a.Query().terminal && b.Query().terminal);
     int count = 0;
     while (closed->TryPopTerminal(item)) {
         ++count;
@@ -1403,7 +1398,7 @@ static void WriteCapacityAfterDrain()
     auto task_a = Task([&] {
         CoTcpConnection conn{connection};
         const auto report = conn.Write("a", Until(2000ms));
-        if (!report.wait_error && report.outcome.phase == WritePhase::Done) {
+        if (!std::get<1>(report)) {
             a_result.store(0);
         }
     });
@@ -1411,7 +1406,7 @@ static void WriteCapacityAfterDrain()
     auto task_b = Task([&] {
         CoTcpConnection conn{connection};
         const auto report = conn.Write("b", Until(2000ms));
-        if (!report.wait_error && report.outcome.phase == WritePhase::Done) {
+        if (!std::get<1>(report)) {
             b_result.store(0);
         }
     });
@@ -1456,13 +1451,13 @@ static void WriteCapacityAfterPartial()
     StartRuntime(1);
     auto state = std::make_shared<ConnectionState>(1, 4096, 8, 4, nullptr);
     Connection connection = ConnectionTestAccess::Make(state);
-    WriteOperation first;
+    WriteProbe first;
     CHECK(!TryAccept(*state, std::string(8, 'x'), first));
     std::atomic<int> second_result{-1};
     auto task = Task([&] {
         CoTcpConnection conn{connection};
         const auto report = conn.Write("y", Until(2000ms));
-        if (!report.wait_error && report.outcome.phase == WritePhase::Done) {
+        if (!std::get<1>(report)) {
             second_result.store(0);
         }
     });
@@ -1498,7 +1493,7 @@ static void WriteCapacityAfterPartial()
     state->PumpWrites(8, 4096, drain);
     Get(task);
     CHECK(second_result.load() == 0);
-    CHECK(first.Query().phase == WritePhase::Done && first.Query().sent == 8);
+    CHECK(first.Query().terminal && first.Query().sent == 8);
     std::cout << "write_capacity_after_partial small_request_woken=ok\n";
 }
 
@@ -2036,7 +2031,7 @@ static void CoPingpongStrict()
                 read_data.AppendTo(data);
             }
             const auto report = conn.Write(data, At(deadline));
-            if (report.wait_error || report.outcome.phase != WritePhase::Done) {
+            if (std::get<1>(report)) {
                 server_error.store(3);
                 return;
             }
@@ -2055,7 +2050,7 @@ static void CoPingpongStrict()
         for (int i = 0; i < kRounds; ++i) {
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
             const auto report = conn.Write(payload, At(deadline));
-            if (report.wait_error || report.outcome.phase != WritePhase::Done) {
+            if (std::get<1>(report)) {
                 client_error.store(2);
                 return;
             }
@@ -2090,7 +2085,7 @@ static void WriteTerminalInterleavedNoAlloc()
     auto sink = [](const std::string_view* views, std::size_t, std::size_t budget) -> ssize_t {
         return static_cast<ssize_t>(std::min(views[0].size(), budget));
     };
-    WriteOperation a, b;
+    WriteProbe a, b;
     CHECK(!TryAccept(*state, "a", a));
     CHECK(!TryAccept(*state, "b", b));
 
@@ -2104,7 +2099,7 @@ static void WriteTerminalInterleavedNoAlloc()
      * pop1 → pending=1，旧实现 backing 仍 2
      */
     CHECK(state->TryPopTerminal(item));
-    WriteOperation c;
+    WriteProbe c;
 
     /**
      * ops1 + pending1 合法
@@ -2128,16 +2123,16 @@ static void WriteTerminalInterleavedNoAlloc()
     /**
      * 交错累积：先弹回一项，零长终态再 push，仍在原容量内迁移。
      */
-    WriteOperation zero;
+    WriteProbe zero;
 
     /**
      * 零长接纳的记录分配是提交前允许的；终态迁移 push 本身必须无分配（由
      * circular_buffer 容量保证），故这里不再对接纳注入失败。
      */
     const auto zero_error = TryAccept(*state, "", zero);
-    CHECK(!zero_error && zero.Query().phase == WritePhase::Done);
-    CHECK(a.Query().phase == WritePhase::Done && b.Query().phase == WritePhase::Done);
-    CHECK(c.Query().phase == WritePhase::Done);
+    CHECK(!zero_error && zero.Query().terminal);
+    CHECK(a.Query().terminal && b.Query().terminal);
+    CHECK(c.Query().terminal);
 
     /**
      * 已显式 pop a、b
@@ -3457,8 +3452,8 @@ static void RequestCloseWriteErrorIntent()
     ConnectionState requested(1001, 64, 64, 4, sealed);
     requested.owner_dirty = [] {
     };
-    std::shared_ptr<WriteOpRecord> pending;
-    CHECK(!requested.AcceptWrite("pending", pending));
+    WriteProbe pending;
+    CHECK(!TryAccept(requested, "pending", pending));
 
     /**
      * owner already passed its close gate
@@ -3475,14 +3470,11 @@ static void RequestCloseWriteErrorIntent()
     });
     CHECK(requested.CloseRequested());
     CHECK(!requested.CanAcceptWrite(1));
-    std::shared_ptr<WriteOpRecord> rejected;
-    CHECK(requested.AcceptWrite("new", rejected) == make_error_code(NetErrc::Closed));
-    {
-        std::lock_guard<std::mutex> lock(pending->mutex);
-        CHECK(pending->terminal && pending->error.value() == EPIPE);
-    }
+    WriteProbe rejected;
+    CHECK(TryAccept(requested, "new", rejected) == make_error_code(NetErrc::Closed));
+    CHECK(pending.Query().terminal && pending.Query().error.value() == EPIPE);
     CompletedWrite terminal;
-    CHECK(requested.TryPopTerminal(terminal) && terminal.id == pending->id);
+    CHECK(requested.TryPopTerminal(terminal) && terminal.id == pending.Id());
     CHECK(!requested.TryPopTerminal(terminal));
     requested.MarkClosed({});
 
@@ -3495,7 +3487,7 @@ static void RequestCloseWriteErrorIntent()
      * owner final 不重复发布已结算写
      */
     CHECK(!requested.TryPopTerminal(terminal));
-    CHECK(ConnectionTestAccess::MakeWrite(pending).Query().error.value() == EPIPE);
+    CHECK(pending.Query().error.value() == EPIPE);
 
     ConnectionState default_reason(1003, 64, 64, 4, sealed);
     default_reason.owner_dirty = [] {
@@ -3517,16 +3509,16 @@ static void RequestCloseWriteErrorIntent()
     ConnectionState ordinary(1002, 64, 64, 4, sealed);
     ordinary.owner_dirty = [] {
     };
-    std::shared_ptr<WriteOpRecord> failed;
-    CHECK(!ordinary.AcceptWrite("pending", failed));
+    WriteProbe failed;
+    CHECK(!TryAccept(ordinary, "pending", failed));
     ordinary.PumpWrites(1, 64, [](const std::string_view*, std::size_t, std::size_t) -> ssize_t {
         errno = EPIPE;
         return -1;
     });
     CHECK(!ordinary.CloseRequested());
     CHECK(ordinary.Acceptance() == AcceptanceState::Open);
-    std::shared_ptr<WriteOpRecord> after_error;
-    CHECK(!ordinary.AcceptWrite("still-open", after_error));
+    WriteProbe after_error;
+    CHECK(!TryAccept(ordinary, "still-open", after_error));
     std::cout << "request_close_write_error_intent retained=true rejected=true ordinary_error_open=true\n";
 }
 
@@ -3537,8 +3529,8 @@ static void SealedWriteErrorReadPublication()
     ConnectionState state(1004, 64, 64, 4, sealed);
     state.owner_dirty = [] {
     };
-    std::shared_ptr<WriteOpRecord> pending;
-    CHECK(!state.AcceptWrite("pending", pending));
+    WriteProbe pending;
+    CHECK(!TryAccept(state, "pending", pending));
     sealed->store(true);
     state.PumpWrites(1, 64, [](const std::string_view*, std::size_t, std::size_t) -> ssize_t {
         errno = EPIPE;

@@ -79,6 +79,20 @@ foreach(_case raw_roundtrip co_accept_read_write co_dial close_retained
         WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/runtime")
 endforeach()
 
+# 协程 Write (n, err) 与超时/取消撤销未发部分（ADR 0024 / S1a）：
+# 真实 loopback 对端字节 + state 级确定性撤销交错，不依赖外部服务，label unit。
+add_executable(Test_net_co_write Test_net_co_write.cc)
+target_link_libraries(Test_net_co_write PRIVATE bbt::infra_net Boost::headers)
+target_compile_options(Test_net_co_write PRIVATE -Wall -Wextra -Wpedantic)
+target_link_options(Test_net_co_write PRIVATE -rdynamic)
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/runtime")
+foreach(_case full partial capacity_zero revoke_interleaved async_prefix_revoke order_after_mid_revoke after_close zero_len onwrite_once queue_capacity)
+    add_test(NAME net.co_write_${_case} COMMAND Test_net_co_write ${_case})
+    set_tests_properties(net.co_write_${_case} PROPERTIES TIMEOUT 60
+        LABELS "unit"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/runtime")
+endforeach()
+
 # owning 移交与真实 TCP 物理回收，保留 Buffer 跨挂起和关闭。
 add_test(NAME net.read_overload_contract COMMAND Test_net_tcp read_overload_contract)
 set_tests_properties(net.read_overload_contract PROPERTIES TIMEOUT 60
@@ -110,7 +124,7 @@ foreach(_case co_context_gate options_contract write_output_reuse
 endforeach()
 
 # 成员化 ICoConnection 写/关闭观察：AsyncWrite fire 提交、成员 Write
-# （等容量→接纳→等本地完成）、WriteOperation::Wait、WaitClosed close hub、
+# （等容量→接纳→等本地完成）、WaitClosed close hub、
 # Status 投影、RequestClose 默认 reason 下未发完写非成功、facade 释放后 op
 # 可查、driver Failed 唤醒。所有等待挂起由 ConnectionState 的
 # Write/CloseAddHookForTest 屏障证明后才触发终态，不靠 sleep。

@@ -14,11 +14,11 @@
  *   - Read、Write、WaitClosed 必须在受管协程内调用。非受管协程（普通线程、runtime idle、
  *     raw owner 回调）返回 operation_not_permitted，包括有现成数据、零长写或连接已就绪的快路径。
  *     门禁先于任何状态判定与副作用。
- *   - options 的 deadline 只影响本次等待。超时或取消不撤销已接纳的 I/O，不影响之后的快路径，
- *     也不释放供其它等待者取得的资源。
+ *   - Write 的超时或取消撤销本次写的未发部分；Read 与 WaitClosed 只结束本次等待。
+ *     不消费供其它等待者取得的资源。
  *
- * 输出语义：Read 失败不交付 Buffer，也不消费数据。Write 返回的 WriteReport 每次调用覆盖本次
- * 结果，不保留上次结果。WaitClosed 成功只表示观察到 closed 终态，不代表物理资源已回收；
+ * 输出语义：Read 失败不交付 Buffer，也不消费数据。Write 返回本次已发前缀与最终错误。
+ * WaitClosed 成功只表示观察到 closed 终态，不代表物理资源已回收；
  * 物理回收由 IsReleased 体现。
  *
  * 生命周期：ICoConnection 是接口，其实现（如 CoTcpConnection）是值语义的视图。销毁视图不关闭
@@ -37,7 +37,6 @@
 #include <bbt/infra/net/Connection.hpp>
 #include <bbt/infra/net/ReadView.hpp>
 #include <bbt/infra/net/Types.hpp>
-#include <bbt/infra/net/WriteOperation.hpp>
 
 namespace bbt::infra::net {
 
@@ -152,10 +151,17 @@ public:
      * ---- 写：协程组合等待 ----
      * @brief 同一绝对 deadline 依次等待容量、接纳与本地完成，不等待业务回包。
      *
-     * 仅业务协程可调用，可挂起。等容量失败时结果为 Rejected。接纳后即使等待结束，也返回 op 与
-     * 真实采样。
+     * 仅业务协程可调用，可挂起。返回 (n, err)：n 是本次交给内核的前缀字节数，
+     * 返回即终值，不表示对端已收到。超时或取消在写锁内撤销本次未发后缀，
+     * 前后其他写不受影响；撤销不关闭连接，也不记录为传输错误。
+     * 写锁内已经发布终态时返回该终态。零长写返回 (0, {})。
+     *
+     * @param data 本次待发数据，接纳时取得其所有权。
+     * @param options 容量与完成等待共用的绝对期限和取消条件。
+     * @return 已交给内核的字节数与最终错误；部分发送后的协议收口由调用方决定。
      */
-    virtual WriteReport Write(std::string data, const bbt::coroutine::WaitOptions& options = {}) = 0;
+    virtual std::tuple<std::size_t, std::error_code>
+    Write(std::string data, const bbt::coroutine::WaitOptions& options = {}) = 0;
 
     /**
      * ---- 关闭 ----

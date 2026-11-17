@@ -11,13 +11,9 @@
  * - owner 线程：PumpWrites 推真实发送、AttributeSent 归属前缀、FailCurrent
  * 结算、DrainTerminal 兑现 OnWrite 终态。
  *
- * 操作记录同步：每个 WriteOpRecord 的字段由 `record.mutex` 保护；writers 在
- * 持 `m_write_mutex` 时再锁 record（锁序 m_write_mutex → record.mutex），
- * `WriteOperation::Query` 只锁 record.mutex，保证读写共锁、终态只一次。
- * 普通 + 零长 + 已终结未派发合计受 max_ops 约束。
- *
- * 接纳事务：先分配操作记录并入活动表，再 Append 字节；Append 失败弹出记录，
- * 不做“从头 ConsumeSent”的错误回滚。
+ * 写锁同时保护发送、撤销与等待结果发布。协程等待结果借用调用栈存储，
+ * 返回前必须完成或撤销并解除借用；OnWrite 使用独立的有界终态队列。
+ * 普通、零长和已终结未派发责任合计受 max_ops 约束。
  */
 #include <algorithm>
 
@@ -34,6 +30,7 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <tuple>
 #include <vector>
 
 #include <bbt/coroutine/sync/CoWaiter.hpp>
@@ -47,14 +44,21 @@
 
 namespace bbt::infra::net {
 
-struct WriteOpRecord {
-    std::uint64_t id{0};
-    std::size_t total{0};
-    mutable std::mutex mutex;
+/**
+ * 协程调用栈上的等待结果；所有访问通过 ConnectionState 在写锁内完成。
+ */
+struct WriteWait {
     bool terminal{false};
     std::size_t sent{0};
-    std::size_t remaining{0};
     std::error_code error;
+};
+
+struct WriteEntry {
+    std::uint64_t id{0};
+    std::size_t begin{0};
+    std::size_t end{0};
+    std::size_t sent{0};
+    WriteWait* waiter{nullptr};
 };
 
 struct CompletedWrite {
@@ -107,7 +111,10 @@ public:
     /**
      * ---- 接纳（任意线程）----
      */
-    std::error_code AcceptWrite(std::string data, std::shared_ptr<WriteOpRecord>& out);
+    std::error_code AcceptFire(std::string_view data);
+    std::error_code SubmitWrite(std::string_view data, std::uint64_t& out_id, WriteWait* waiter = nullptr);
+    WriteWait QueryWrite(const WriteWait& waiter);
+    std::tuple<std::size_t, std::error_code> CancelWrite(std::uint64_t id, WriteWait& waiter, std::error_code error);
 
     /**
      * ---- owner：有界发送 ----
@@ -194,11 +201,12 @@ private:
     std::size_t PendingCountLocked() const noexcept { return m_pending_terminal.size(); }
 
     bool AttributeSentLocked(std::size_t bytes);
+    void CompleteLocked(WriteEntry& entry, std::error_code error);
 
     void FailCurrentLocked(std::error_code error);
 
     std::mutex m_write_mutex;
-    std::deque<std::shared_ptr<WriteOpRecord>> m_ops;
+    boost::circular_buffer<WriteEntry> m_writeIntervals;
     OutboundQueue m_queue;
     std::size_t m_outbound_max;
     std::size_t m_max_ops;

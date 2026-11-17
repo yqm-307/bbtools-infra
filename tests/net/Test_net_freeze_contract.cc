@@ -264,8 +264,7 @@ struct GateProbe {
     std::error_code write_error;
     std::error_code accept_error;
     std::error_code dial_error;
-    WriteOutcome outcome;
-    bool operation_valid{true};
+    std::size_t sent{0};
     std::string read_out;
 };
 
@@ -284,9 +283,8 @@ RunAllCoEntries(Connection& connection, Engine& accept_engine, Engine& dial_engi
         read_data.AppendTo(probe.read_out);
     }
     const auto report = co_conn.Write(std::string(4, 'w'), Until(50ms));
-    probe.write_error = report.wait_error;
-    probe.outcome = report.outcome;
-    probe.operation_valid = report.operation.Valid();
+    probe.write_error = std::get<1>(report);
+    probe.sent = std::get<0>(report);
     const auto accepted = accept_engine.CoAccept(Until(50ms));
     probe.accept_error = accepted.error;
     const auto dialed = dial_engine.CoDial(dial_address, Until(50ms));
@@ -301,10 +299,7 @@ void CheckGateProbe(const GateProbe& probe, const char* domain)
     CHECK(probe.write_error == not_permitted);
     CHECK(probe.accept_error == not_permitted);
     CHECK(probe.dial_error == not_permitted);
-    CHECK(probe.outcome.phase == WritePhase::Rejected);
-    CHECK(probe.outcome.sent == 0);
-    CHECK(probe.outcome.error == not_permitted);
-    CHECK(!probe.operation_valid);
+    CHECK(probe.sent == 0);
 
     /**
      * CoRead 失败不改 out
@@ -350,8 +345,8 @@ static void CoContextGate()
     auto state = std::make_shared<ConnectionState>(7, 4096, 1024, 4, nullptr);
     CHECK(state->ring.TryAppend("pending-bytes").status == ReadStatus::Ok);
     Connection connection = ConnectionTestAccess::Make(state);
-    std::shared_ptr<WriteOpRecord> warm_record;
-    CHECK(!state->AcceptWrite("queued", warm_record));
+    std::uint64_t warm_id = 0;
+    CHECK(!state->SubmitWrite("queued", warm_id));
     const std::size_t ring_before = state->ring.Size();
     const std::size_t ops_before = state->ActiveOpCount();
     const auto queue_before = state->ring.AccessGeneration();
@@ -457,16 +452,12 @@ static void CoContextGate()
         }
 
         /**
-         * 已接纳后无 owner 推进：允许 timed_out + InFlight（本次 op 有效可查）。
+         * 已接纳后无 owner 推进：超时返回零字节并撤销未发部分。
          */
         const auto report = co_pos.Write("x", Until(300ms));
-        const auto write_error = report.wait_error;
-        const auto outcome = report.outcome;
-        const auto operation = report.operation;
-        const bool accepted_in_flight = write_error == std::make_error_code(std::errc::timed_out)
-                                        && outcome.phase == WritePhase::InFlight && operation.Valid();
-        const bool done_locally = !write_error && outcome.phase == WritePhase::Done && operation.Valid();
-        if (!accepted_in_flight && !done_locally) {
+        const auto write_error = std::get<1>(report);
+        const auto sent = std::get<0>(report);
+        if (!((write_error == std::errc::timed_out && sent == 0) || (!write_error && sent == 1))) {
             return;
         }
         auto res = host.CoDial(server_addresses[0], Until(3000ms));
@@ -722,16 +713,17 @@ static void WriteOutputReuse()
     };
 
     /**
-     * 1) 先取得一次真实成功的结果，把它留在 outcome/operation 里（复用变量的起点）。
+     * 1) 先取得一次真实成功的结果，把它留在 返回元组 里（复用变量的起点）。
      */
-    std::shared_ptr<WriteOpRecord> done_record;
+    WriteWait done_record;
+    std::uint64_t done_id = 0;
 
     /**
      * 真实接纳路径
      */
-    CHECK(!state->AcceptWrite("hello", done_record));
+    CHECK(!state->SubmitWrite("hello", done_id, &done_record));
     state->PumpWrites(8, 4096, sink);
-    CHECK(ConnectionTestAccess::MakeWrite(done_record).Query().phase == WritePhase::Done);
+    CHECK(state->QueryWrite(done_record).terminal);
 
     std::atomic<int> result{-1};
 
@@ -740,60 +732,47 @@ static void WriteOutputReuse()
      */
     std::atomic<int> progress{0};
     auto task = Task([&] {
-        WriteOutcome outcome = ConnectionTestAccess::MakeWrite(done_record).Query();
-        WriteOperation operation = ConnectionTestAccess::MakeWrite(done_record);
-        if (outcome.phase != WritePhase::Done || outcome.sent != 5 || !operation.Valid() || outcome.error) {
-
-            /**
-             * 起点不成立，后面的"覆盖"就没有判别力
-             */
+        const auto sample = state->QueryWrite(done_record);
+        std::tuple<std::size_t, std::error_code> output{sample.sent, sample.error};
+        if (!sample.terminal || sample.sent != 5 || sample.error)
             return;
-        }
-        const auto first_id = operation.Id();
         progress.store(2);
 
         /**
-         * 2) 无效连接：必须覆盖为本次 Rejected + op 无效，不泄露上次 Done。
+         * 2) 无效连接：必须覆盖为本次 零字节与错误，不泄露上次 Done。
          */
         Connection invalid;
         const auto invalid_report = CoTcpConnection{invalid}.Write("x", Until(50ms));
-        const auto invalid_error = invalid_report.wait_error;
-        outcome = invalid_report.outcome;
-        operation = invalid_report.operation;
-        if (invalid_error != make_error_code(NetErrc::Closed) || outcome.phase != WritePhase::Rejected
-            || operation.Valid()) {
+        const auto invalid_error = std::get<1>(invalid_report);
+        output = invalid_report;
+        if (invalid_error != make_error_code(NetErrc::Closed) || std::get<0>(output) != 0) {
             return;
         }
 
         /**
-         * 3) 超大写（> max_outbound_bytes）：Rejected/no_buffer_space，op 无效。
+         * 3) 超大写（> max_outbound_bytes）：零字节与 no_buffer_space。
          */
         progress.store(4);
         const std::string oversized(257, 'o');
         const auto oversized_report = CoTcpConnection{connection}.Write(oversized, Until(500ms));
-        const auto oversized_error = oversized_report.wait_error;
-        outcome = oversized_report.outcome;
-        operation = oversized_report.operation;
-        if (oversized_error != std::make_error_code(std::errc::no_buffer_space) || outcome.phase != WritePhase::Rejected
-            || operation.Valid()) {
+        const auto oversized_error = std::get<1>(oversized_report);
+        output = oversized_report;
+        if (oversized_error != std::make_error_code(std::errc::no_buffer_space) || std::get<0>(output) != 0) {
             return;
         }
 
         /**
-         * 4) 已封口连接：Rejected/Closed，op 无效。
+         * 4) 已封口连接：零字节与 Closed。
          */
         progress.store(5);
         Connection closed_conn = ConnectionTestAccess::Make(state);
         state->MarkClosed(std::make_error_code(std::errc::operation_canceled));
         const auto closed_report = CoTcpConnection{closed_conn}.Write("y", Until(50ms));
-        const auto closed_error = closed_report.wait_error;
-        outcome = closed_report.outcome;
-        operation = closed_report.operation;
-        if (closed_error != make_error_code(NetErrc::Closed) || outcome.phase != WritePhase::Rejected
-            || operation.Valid()) {
+        const auto closed_error = std::get<1>(closed_report);
+        output = closed_report;
+        if (closed_error != make_error_code(NetErrc::Closed) || std::get<0>(output) != 0) {
             return;
         }
-        (void)first_id;
         progress.store(6);
         result.store(0);
     });
@@ -804,7 +783,7 @@ static void WriteOutputReuse()
     CHECK(result.load() == 0);
 
     /**
-     * 5) 接纳后等待失败保留本次 op：无 owner 推进的 state 上必然超时且在途。
+     * 5) 接纳后等待失败撤销本次未发部分，无 owner 推进时返回零字节。
      */
     {
         auto in_flight_state = std::make_shared<ConnectionState>(2, 4096, 4096, 16, nullptr);
@@ -812,11 +791,9 @@ static void WriteOutputReuse()
         std::atomic<int> inflight_result{-1};
         auto inflight_task = Task([&] {
             const auto report = CoTcpConnection{in_flight}.Write(std::string(8, 'd'), Until(30ms));
-            const auto error = report.wait_error;
-            const auto outcome = report.outcome;
-            const auto operation = report.operation;
-            if (error == std::make_error_code(std::errc::timed_out) && outcome.phase == WritePhase::InFlight
-                && operation.Valid()) {
+            const auto error = std::get<1>(report);
+            const auto sent = std::get<0>(report);
+            if (error == std::make_error_code(std::errc::timed_out) && sent == 0) {
                 inflight_result.store(0);
             }
         });
@@ -825,7 +802,7 @@ static void WriteOutputReuse()
     }
 
     /**
-     * 6) Write 的接纳分配失败：not_enough_memory → 本次 Rejected + op 无效。
+     * 6) Write 的接纳分配失败：not_enough_memory → 本次 零字节与错误。
      */
     {
         auto alloc_state = std::make_shared<ConnectionState>(3, 4096, 4096, 4, nullptr);
@@ -835,12 +812,10 @@ static void WriteOutputReuse()
             g_fail_alloc = true;
             const auto report = CoTcpConnection{alloc_conn}.Write("zz", Until(500ms));
             g_fail_alloc = false;
-            const auto error = report.wait_error;
-            const auto outcome = report.outcome;
-            const auto operation = report.operation;
-            if (error == std::make_error_code(std::errc::not_enough_memory) && outcome.phase == WritePhase::Rejected
-                && outcome.sent == 0 && outcome.error == std::make_error_code(std::errc::not_enough_memory)
-                && !operation.Valid() && alloc_state->ActiveOpCount() == 0) {
+            const auto error = std::get<1>(report);
+            const auto sent = std::get<0>(report);
+            if (error == std::make_error_code(std::errc::not_enough_memory) && sent == 0
+                && alloc_state->ActiveOpCount() == 0) {
                 alloc_result.store(0);
             }
         });
@@ -849,17 +824,17 @@ static void WriteOutputReuse()
     }
 
     /**
-     * 7) 容量等待名额满（hub 256）：Rejected/no_buffer_space，零接纳、op 无效。
+     * 7) 容量等待名额满（hub 256）：no_buffer_space，零接纳。
      */
     {
         auto full_state = std::make_shared<ConnectionState>(4, 4096, 4, 4, nullptr);
         Connection full_conn = ConnectionTestAccess::Make(full_state);
-        std::shared_ptr<WriteOpRecord> warm_record;
+        std::uint64_t warm_id = 0;
 
         /**
          * 占满 outbound=8
          */
-        CHECK(!full_state->AcceptWrite("warm", warm_record));
+        CHECK(!full_state->SubmitWrite("warm", warm_id));
         std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>> keep;
         for (std::size_t i = 0; i < WakeHub::kMaxWaiters; ++i) {
             auto waiter = full_state->CreateWriteWaiter();
@@ -869,11 +844,9 @@ static void WriteOutputReuse()
         std::atomic<int> full_result{-1};
         auto full_task = Task([&] {
             const auto report = CoTcpConnection{full_conn}.Write("yy", Until(500ms));
-            const auto error = report.wait_error;
-            const auto outcome = report.outcome;
-            const auto operation = report.operation;
-            if (error == std::make_error_code(std::errc::no_buffer_space) && outcome.phase == WritePhase::Rejected
-                && !operation.Valid()) {
+            const auto error = std::get<1>(report);
+            const auto sent = std::get<0>(report);
+            if (error == std::make_error_code(std::errc::no_buffer_space) && sent == 0) {
                 full_result.store(0);
             }
         });
@@ -887,8 +860,7 @@ static void WriteOutputReuse()
     }
 
     /**
-     * 8) Done + error（失败结算）与等待错误分开：等待返回空表示本地终态，
-     * outcome.error 才是发送结果。用 EPIPE sink 制造真实写失败。
+     * 8) 发送错误直接由返回元组表达，用 EPIPE sink 制造真实写失败。
      */
     {
         auto failed_state = std::make_shared<ConnectionState>(4, 4096, 4096, 4, nullptr);
@@ -904,16 +876,13 @@ static void WriteOutputReuse()
             });
             const auto report = CoTcpConnection{failed_conn}.Write("boom", Until(2000ms));
             pump.join();
-            const auto wait_error = report.wait_error;
-            const auto outcome = report.outcome;
-            const auto operation = report.operation;
+            const auto wait_error = std::get<1>(report);
+            const auto sent = std::get<0>(report);
 
             /**
-             * 本地完成路径：等待正常结束（wait_error 为空），发送错误落在
-             * outcome.error（EPIPE）；这与"等待超时但仍在途"是不同的两个结果。
+             * 发送失败路径直接返回 EPIPE 与已发字节数。
              */
-            if (!wait_error && outcome.phase == WritePhase::Done && outcome.error.value() == EPIPE && outcome.sent == 0
-                && operation.Valid()) {
+            if (wait_error.value() == EPIPE && sent == 0) {
                 failed_result.store(0);
             }
         });
