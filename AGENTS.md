@@ -12,12 +12,14 @@
 
 先按任务选一条路径，不全量预载。
 
-| 任务 | 公共规范（pub submodule） | 本仓真源 |
+上游公共规范统一从 `third-party/bbtools-pub/README.md` 根路由进入：bbtools 家族特有约定在 pub `docs/cpp/`；设计、编码、Review、用例设计的通用方法由 pub 指向 `third-party/bbt-agent-toolkit/`，本仓不直接固定 toolkit 路径。
+
+| 任务 | 公共规范（pub 根路由） | 本仓真源 |
 |---|---|---|
-| 设计 API、模块边界、失败与关闭语义 | `third-party/bbtools-pub/docs/10-design/README.md` | `docs/architecture/`（执行域、关闭、生命周期接缝、RPC 分层等契约）；稳定取舍见 `docs/decisions/` |
-| 写或改实现 | `third-party/bbtools-pub/docs/20-coding/README.md`（C++、注释、文档专项按入口展开） | `docs/conventions.md`（命名、目录、依赖、所有权、执行域与 Co-only 入口、示例）；格式以 `.clang-format`、`.editorconfig` 为真源 |
-| 评审 | `third-party/bbtools-pub/docs/30-review/README.md` | 本文「审查门禁」；`docs/guides/development.md`「审查与交付」 |
-| 设计测试、选择运行范围 | `third-party/bbtools-pub/docs/40-testcase/README.md` | `docs/guides/testing.md`、`docs/conventions.md` §6 |
+| 设计 API、模块边界、失败与关闭语义 | `third-party/bbtools-pub/README.md`「选择一条阅读路径」 | `docs/architecture/`（执行域、关闭、生命周期接缝、RPC 分层等契约）；稳定取舍见 `docs/decisions/` |
+| 写或改实现 | `third-party/bbtools-pub/README.md`「选择一条阅读路径」；家族 C++ 约定见 `third-party/bbtools-pub/docs/cpp/` | `docs/conventions.md`（命名、目录、依赖、所有权、执行域与 Co-only 入口、示例）；格式以 `.clang-format`、`.editorconfig` 为真源 |
+| 评审 | `third-party/bbtools-pub/README.md`「选择一条阅读路径」 | 本文「审查门禁」；`docs/guides/development.md`「审查与交付」 |
+| 设计测试、选择运行范围 | `third-party/bbtools-pub/README.md`「选择一条阅读路径」 | `docs/guides/testing.md`、`docs/conventions.md` §6 |
 | 使用或改某个模块 | — | `README.md` 模块表（交付状态真源，链到各模块 `docs/guides/*.md`）、`examples/` |
 | 开发流程、验证、发布 | — | `docs/guides/development.md`（隔离、接口职责、依赖版本、本地验证、审查交付、旧仓迁移）、`docs/guides/ci.md` |
 
@@ -79,5 +81,5 @@
 ### 仓库卫生
 
 - 文档一事一处，随代码在同一 PR 更新；README 只保留状态与入口（≤200 行，`docs-check` 校验）；ADR 编号唯一递增，合入后只追加取代关系。细则见 `docs/conventions.md` §8。
-- 注释说明 WHY，不重复 WHAT；必须保留时序与所有权约束，公开头文件开头说明职责；不留 Issue/PR、审查/阶段代号、契约行号或临时版本号；形态规则见 `third-party/bbtools-pub/docs/20-coding/documentation.md`。
+- 注释说明 WHY，不重复 WHAT；必须保留时序与所有权约束，公开头文件开头说明职责；不留 Issue/PR、审查/阶段代号、契约行号或临时版本号；形态规则见 `third-party/bbtools-pub/docs/cpp/comments.md`。
 - 构建产物只进已忽略的 `build/`、`build-*/`；运行证据、原始日志、私有依赖前缀（`.deps/`）不入仓。
