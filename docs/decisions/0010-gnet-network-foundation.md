@@ -323,3 +323,5 @@ AsyncWrite 的票据返回/出参约定已由 [0018：AsyncWrite 只提交](0018
 读取 backing 移交与 `TryAccess`/`ReadAccess` 约定已由 [0019：读取面收敛为 Read 与只读 View](0019-read-view.md) 取代。
 
 已被 [0024：协程 Write 采用系统调用语义](0024-co-write-syscall-semantics.md) 部分取代：协程 Write 返回 `(n, err)`，超时/取消撤销本次未发部分；删除写操作票据、报告与阶段类型。其余契约保持。
+
+「删除与迁移表」中 `Connection::State()` 行的维护者入口 `ConnectionTestAccess::StateOf` 已删除：测试不再取得内部连接状态，改用 `ConnectionTestAccess` 的意图方法（如 `ExerciseReadContention`）。
