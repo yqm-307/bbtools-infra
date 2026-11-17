@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-18",
+  "commit": "9b7a2ee1feb1ecffabcfde7910cde2c5dea44f73",
+  "base": "08f9f1b28337c012528b6081e62a3762f55ae0fa",
+  "result": "pass",
+  "reviewer": "Alice (协调者) + 独立验收 swe-2 (deleg_b6db76ea)",
+  "summary": "net S1：Engine.cc 按职责机械拆分为 detail/Reactor、ConnCore、EngineState（.hpp/.cc）、EngineSupport.hpp、EngineTestAccess.cc，Engine.cc 4734→1338 行；零行为变更，22 个公共头字节不变，只改 net 私有 source 列表。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "未参与编写的验收者核对搬移等价：非搬移差异仅 include/命名空间包裹/限定名/前置声明/CMake 列表；跨文件符号单一定义无 ODR 冲突，未复制静态状态；公共头 git diff --quiet 退出 0。",
+      "evidence": {
+        "reviewer": "swe-2 / new-api-free (deleg_b6db76ea, sa-0-c3f85d9e, 634s)",
+        "report": "/home/yqm/.hermes/profiles/alice/reports/net-redesign/runs/verify-s1.md",
+        "report_sha256": "1bca8a1e1be58f2b1e5b02bcbb16d6f0e40688104c6fa2123decdf74c0ade759",
+        "scope": "08f9f1b..9b7a2ee 全部 10 个文件（bbt/infra/net/Engine.cc、detail/ 8 个新文件、net/CMakeLists.txt）"
+      }
+    },
+    {
+      "id": "net-tests",
+      "kind": "auto",
+      "status": "pass",
+      "summary": "干净重建 build-verify：ctest -j1 -R '^net\\.' 197/197 通过，与基线 08f9f1b 一致；编译 warning 1 条与基线同签名（Test_net_foundation.cc:769 a_bound）。"
+    },
+    {
+      "id": "format",
+      "kind": "auto",
+      "status": "pass",
+      "summary": "clang-format --dry-run --Werror 对 10 个改动文件退出 0；git diff --check 退出 0。"
+    }
+  ]
+}
