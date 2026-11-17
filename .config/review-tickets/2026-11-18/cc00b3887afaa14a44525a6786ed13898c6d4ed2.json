@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-18",
+  "commit": "cc00b3887afaa14a44525a6786ed13898c6d4ed2",
+  "base": "23a93416a7f0bbebf86e48c24cc77078abbf2e15",
+  "result": "pass",
+  "reviewer": "Alice (协调者) + 独立审查 gpt-6-astra (deleg_ada48548) + 独立验收 deepseek-flash (deleg_584c27e9)",
+  "summary": "net S1a：协程 Write 改为返回 (n, err)，超时/取消在写锁内撤销本次未发部分（ADR 0024）；OutboundQueue 增加按写区间撤销；删除 WriteOperation/WriteReport/WriteOpRecord 与无人使用的 WritePhase/WriteOutcome；rpc/http/redis 四处按 n 三档迁移；新增 net.co_write_* 10 例；ADR 0010/0012/0018 追加取代关系。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "未参与编写的审查者结论可合入：撤销与 PumpWrites/Close 同一写锁裁决，n 为已归属前缀终值；无 UAF/丢唤醒，OnWrite 恰一次；撤销不进 Settling/LastWriteError；无撤销热路径无新增分配；四处迁移保持原关闭/复用/错误码判断。blocker 0 / major 0。cc00b38 为审查后追加的 ADR 0018 取代说明（仅文档一段，由协调者核对）。",
+      "evidence": {
+        "reviewer": "gpt-6-astra / openai-api (deleg_ada48548, sa-0-0db29080, 954s)",
+        "report": "/home/yqm/.hermes/profiles/alice/reports/net-redesign/runs/review-s1a.md",
+        "report_sha256": "e6ebf4c62bc8e107e281a232b88d23b6a2acd52af75b2b62aab0e09d87b34be8",
+        "scope": "23a9341..13d198a 全部 47 个文件（代码 e307f57 + 测试 13d198a）；cc00b38 仅 docs/decisions/0018-async-write-fire.md 追加一段"
+      }
+    },
+    {
+      "id": "tests",
+      "kind": "auto",
+      "status": "pass",
+      "summary": "干净重建 build-verify：258/258 编译，warning 仅基线 Test_net_foundation.cc:769 a_bound；ctest -j1 -LE live 367/367 通过（net108/rpc68/http70/redis15 + 其余非 live），含 net.co_write_* 10 例。",
+      "evidence": {
+        "report": "/home/yqm/.hermes/profiles/alice/reports/net-redesign/runs/verify-s1a.md",
+        "report_sha256": "28584876ac253f6b684bfd681b299f31e45ccd5325cc5c4743453e3561a8f379"
+      }
+    },
+    {
+      "id": "format",
+      "kind": "auto",
+      "status": "pass",
+      "summary": "32 个改动 C++ 文件 clang-format 23.1.3 --dry-run --Werror exit 0；git diff --check exit 0。"
+    }
+  ]
+}
