@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-17",
+  "commit": "6109e4fcd9ee2932fff5da47043f601c518a09c3",
+  "base": "e7abbf799fb5e85b566f53e82c6e0bc878078b0d",
+  "result": "pass",
+  "reviewer": "Alice (协调者)；上游内容的独立审查：gpt-6-astra (deleg_4ed170f8)、claude-opus-5-5 (deleg_23ecbe57)、gpt-6-astra (pub #6)",
+  "summary": "只把 third-party/bbtools-pub gitlink 从 7f530e3 升到 pub main 已合入的 c30b191（嵌套 toolkit 随之到 400268a）。上游变更：pub #6（引用方向第 4 条、submodule 描述修正）、pub #8（toolkit 升到 400268a，含 toolkit #9 规范正文），均已独立审查并合入。本仓代码、配置、文档未改；本仓侧未另做独立审查，只做下列机械核对。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "gitlink 指向的上游内容已在上游 PR 中独立审查并合入；hook 入口 tools/git-hooks/stages/push/main.py 与 schema 1 配置兼容已在审查中实测。",
+      "evidence": {
+        "reviewer": "gpt-6-astra (deleg_4ed170f8) / claude-opus-5-5 (deleg_23ecbe57) / gpt-6-astra (pub #6)",
+        "report": "/home/yqm/.hermes/profiles/alice/cache/scratch/lint-review/review.md; /home/yqm/.hermes/profiles/alice/cache/scratch/lint-rereview/review.md; /home/yqm/.hermes/profiles/alice/cache/scratch/pub-note-fix-review.md",
+        "scope": "third-party/bbtools-pub gitlink 7f530e34 -> c30b191c（pub main 合并提交）"
+      }
+    },
+    {
+      "id": "diff-check",
+      "kind": "auto",
+      "status": "pass",
+      "summary": "git diff --check 退出 0。"
+    },
+    {
+      "id": "refs-exist",
+      "kind": "auto",
+      "status": "pass",
+      "summary": "本仓 main 上所有 third-party/bbtools-pub/... 路径引用在 pub c30b191（及 toolkit 400268a）中逐个存在，0 缺失。"
+    }
+  ]
+}
