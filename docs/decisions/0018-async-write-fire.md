@@ -23,3 +23,7 @@
 raw OnWrite 的 operation 仍是 owner 分配的诊断身份，不再与提交时返回的票据关联。
 
 仓外实现 ICoConnection 的类需更新 override 返回类型；跨仓消费者迁移另行授权。
+
+## 取代关系
+
+「决定」最后一条中 Write 的 `WriteReport` 与「超时/取消只结束等待、不撤销已接纳发送」已被 [0024：协程 Write 采用系统调用语义](0024-co-write-syscall-semantics.md) 取代：协程 Write 返回 `(n, err)`，超时/取消撤销本次未发部分。AsyncWrite 只提交的决定不变。
