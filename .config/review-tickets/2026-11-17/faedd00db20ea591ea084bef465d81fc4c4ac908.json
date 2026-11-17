@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-17",
+  "commit": "faedd00db20ea591ea084bef465d81fc4c4ac908",
+  "base": "9ee92f0152b7f6424492ecc59b7f2d0f5bd52027",
+  "result": "pass",
+  "reviewer": "Alice (协调者) + 独立审查 gpt-6-astra (deleg_4ed170f8) + 复审 claude-opus-5-5 (deleg_23ecbe57)",
+  "summary": "docs/conventions.md §5 注释形态改为指向 third-party/bbtools-pub/docs/cpp/comments.md（唯一正文），不在本仓复制排版规则；third-party/bbtools-pub 升到已合入的 7f530e34（pub #7：通用 lint 框架与注释规范放宽）。首轮审查指出本仓丢失工具/法律指令豁免，已在 pub comments.md 补回并经复审确认只写在 pub 一处。不改代码与门禁。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "首轮独立审查结论“修复后可合入”，Major 1（豁免条款丢失）已在 pub 修复；换模型复审确认豁免仅在 pub comments.md:24、infra 不重复，可合入。",
+      "evidence": {
+        "reviewer": "gpt-6-astra (deleg_4ed170f8) / claude-opus-5-5 (deleg_23ecbe57)",
+        "report": "/home/yqm/.hermes/profiles/alice/cache/scratch/lint-review/review.md; /home/yqm/.hermes/profiles/alice/cache/scratch/lint-rereview/review.md",
+        "scope": "docs/conventions.md §5 一行；third-party/bbtools-pub gitlink fd497203 -> 7f530e34（内容即已审 pub #7）"
+      }
+    },
+    {
+      "id": "diff-check",
+      "kind": "auto",
+      "status": "pass",
+      "summary": "git diff --cached --check 退出 0。"
+    },
+    {
+      "id": "refs-exist",
+      "kind": "auto",
+      "status": "pass",
+      "summary": "仓内 third-party/bbtools-pub/... 路径引用逐个存在性核对，0 缺失；无 stages/*/rules、tools/taste 旧路径引用。"
+    }
+  ]
+}
