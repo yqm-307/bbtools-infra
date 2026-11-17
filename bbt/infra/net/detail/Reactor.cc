@@ -538,12 +538,7 @@ void Reactor::AdoptFdOnOwner(
             }
         }
     };
-    state->owner_dirty = mark_dirty;
-
-    /**
-     * 消费释放容量/终态也唤醒 owner 恢复读
-     */
-    state->ring.SetOwnerWake(mark_dirty);
+    state->AttachOwner(mark_dirty);
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_conns.emplace(id, core);
@@ -943,7 +938,7 @@ void Reactor::MarkDirty(const std::shared_ptr<ConnCore>& core)
         }
         {
             std::lock_guard<std::mutex> reg_lock(m_mutex);
-            if (m_conns.find(core->State()->m_id) == m_conns.end()) {
+            if (m_conns.find(core->Identity()) == m_conns.end()) {
                 core->m_dirty_queued.store(false);
 
                 /**
@@ -995,7 +990,7 @@ void Reactor::PumpOwner()
         std::shared_ptr<ConnCore> core;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            const auto it = m_conns.find(raw->State()->m_id);
+            const auto it = m_conns.find(raw->Identity());
             if (it != m_conns.end()) {
                 core = it->second;
             }
@@ -1040,7 +1035,7 @@ void Reactor::RemoveConn(const std::shared_ptr<ConnCore>& core)
     if (!core) {
         return;
     }
-    const std::uint64_t id = core->State()->m_id;
+    const std::uint64_t id = core->Identity();
     bool removed = false;
     {
 

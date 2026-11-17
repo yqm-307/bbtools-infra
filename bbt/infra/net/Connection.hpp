@@ -167,6 +167,15 @@ private:
 
     explicit Connection(std::shared_ptr<ConnectionState> state);
 
+    std::error_code ReadCo(Buffer& out, const bbt::coroutine::WaitOptions& options) const;
+    std::tuple<std::size_t, std::error_code>
+    WriteCo(std::string data, const bbt::coroutine::WaitOptions& options) const;
+    std::error_code WaitClosedCo(const bbt::coroutine::WaitOptions& options) const;
+    std::shared_ptr<ReclaimRecord> ReclaimForOwner() const;
+    std::tuple<std::uintptr_t, std::size_t, std::size_t, std::uint64_t, bool, bool> InspectForTest() const;
+    bool ExerciseReadContentionForTest(void (*during)(const void*), const void* context) const;
+    bool DeferReceivedForTest(const std::string& data) const;
+
     std::shared_ptr<ConnectionState> m_state;
 };
 

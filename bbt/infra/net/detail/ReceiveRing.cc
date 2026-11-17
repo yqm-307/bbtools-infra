@@ -1,5 +1,7 @@
 #include <bbt/infra/net/detail/ReceiveRing.hpp>
 
+#include <bbt/infra/net/detail/CoInternal.hpp>
+
 namespace bbt::infra::net {
 
 ReceiveRing::ReceiveRing(std::size_t max_bytes)
@@ -264,9 +266,89 @@ ReadView ReceiveRing::TryView()
     return ReadView(ReadStatus::Ok, view, {});
 }
 
-std::unique_lock<std::mutex> ReceiveRing::TryHoldForTest()
+std::error_code ReceiveRing::TryRead(Buffer& out)
 {
-    return std::unique_lock<std::mutex>(m_mutex, std::try_to_lock);
+    const auto result = TryCopyConsume(out);
+    if (result.status != ReadStatus::Ok) {
+        switch (result.status) {
+        case ReadStatus::WouldBlock:
+            return make_error_code(NetErrc::WouldBlock);
+        case ReadStatus::Busy:
+            return make_error_code(NetErrc::Busy);
+        case ReadStatus::Eof:
+            return make_error_code(NetErrc::Eof);
+        default:
+            return result.error;
+        }
+    }
+    return {};
+}
+
+std::error_code ReceiveRing::Read(Buffer& out, const bbt::coroutine::WaitOptions& options)
+{
+    for (;;) {
+        /**
+         * 关键时序：在导致 Busy 的尝试之前采 release 代次，
+         * 否则持锁方可能在「Busy 返回」与「采样」之间释放并推进代次，造成
+         * on_registered 复查相等而永久等下一次 release。
+         */
+        const std::uint64_t generation = AccessGeneration();
+        const auto error = TryRead(out);
+        if (error != make_error_code(NetErrc::WouldBlock) && error != make_error_code(NetErrc::Busy)) {
+            return error;
+        }
+        const bool busy = error == make_error_code(NetErrc::Busy);
+        if (busy) {
+            InvokeBusyBeforeWaiterHookForTest();
+        } else {
+            InvokeWouldBlockBeforeWaiterHookForTest();
+        }
+        auto waiter = busy ? CreateReleaseWaiter() : CreateDataWaiter();
+        if (!waiter) {
+            return std::make_error_code(std::errc::no_buffer_space);
+        }
+        bool add_failed = false;
+        const auto status = waiter->WaitWithCallback(options, [&] {
+            const bool added = busy ? AddReleaseWaiter(waiter) : AddDataWaiter(waiter);
+            if (!added) {
+                add_failed = true;
+                waiter->Notify();
+                return true;
+            }
+            InvokeAfterAddHookForTest();
+            const bool ready =
+                busy ? (AccessGeneration() != generation) : (Size() > 0 || ReadEof() || HasReadError() || ReadClosed());
+            if (ready) {
+                waiter->Notify();
+            }
+            return true;
+        });
+        if (add_failed) {
+            return std::make_error_code(std::errc::no_buffer_space);
+        }
+        if (status != bbt::coroutine::WaitStatus::Completed) {
+            return WaitStatusError(status);
+        }
+    }
+}
+
+bool ReceiveRing::ExerciseReadContentionForTest(const std::function<void()>& during)
+{
+    std::unique_lock<std::mutex> lock(m_mutex, std::try_to_lock);
+    if (!lock.owns_lock())
+        return false;
+    try {
+        during();
+    } catch (...) {
+        lock.unlock();
+        NotifyRelease();
+        WakeOwnerOnly();
+        throw;
+    }
+    lock.unlock();
+    NotifyRelease();
+    WakeOwnerOnly();
+    return true;
 }
 
 void ReceiveRing::SetBusyBeforeWaiterHookForTest(std::function<void()> hook)

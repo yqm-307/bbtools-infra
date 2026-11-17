@@ -241,7 +241,7 @@ struct RawEchoHandler : RawHandler {
         /**
          * 身份：防 Id 复用后误删后继 slot
          */
-        std::shared_ptr<ConnectionState> state;
+        Connection connection;
 
         /**
          * 下一帧期望 seq（帧序完整性）
@@ -282,10 +282,9 @@ struct RawEchoHandler : RawHandler {
         auto slot = std::make_shared<Slot>();
 
         /**
-         * 身份令牌：公共面已删除 Connection::State()，经测试接缝取同一
-         * shared_ptr 身份防 Id 复用后误删后继 slot（语义不变）。
+         * 保留连接句柄的共享寿命，经测试值观察比对状态身份，避免 Id 复用误删后继 slot。
          */
-        slot->state = ConnectionTestAccess::StateOf(connection);
+        slot->connection = connection;
         std::lock_guard<std::mutex> lk(mu);
 
         /**
@@ -491,7 +490,9 @@ struct RawEchoHandler : RawHandler {
          * 登记时，表中 slot 属于新连接，不得擦除（否则新连接 OnRead 提前返回，
          * echo 永远不到 → 对端 3s 超时，conns 负载尾部稳定丢 clients 个连接）。
          */
-        if (it != parsers.end() && it->second->state == ConnectionTestAccess::StateOf(connection)) {
+        if (it != parsers.end()
+            && ConnectionTestAccess::Inspect(it->second->connection).identity
+                   == ConnectionTestAccess::Inspect(connection).identity) {
 
             /**
              * 丢弃未发出的 echo（对端已走）；如实计数不静默。
@@ -503,7 +504,9 @@ struct RawEchoHandler : RawHandler {
             parsers.erase(it);
         }
         const auto eit = eof_pending.find(connection.Id());
-        if (eit != eof_pending.end() && eit->second->state == ConnectionTestAccess::StateOf(connection)) {
+        if (eit != eof_pending.end()
+            && ConnectionTestAccess::Inspect(eit->second->connection).identity
+                   == ConnectionTestAccess::Inspect(connection).identity) {
             eof_pending.erase(eit);
         }
         {

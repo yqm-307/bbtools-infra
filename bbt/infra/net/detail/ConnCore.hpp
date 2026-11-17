@@ -23,7 +23,7 @@ public:
 
     ~ConnCore();
 
-    const std::shared_ptr<ConnectionState>& State() const;
+    std::uint64_t Identity() const noexcept;
 
     std::size_t RecvHold() const;
 

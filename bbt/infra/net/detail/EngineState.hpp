@@ -436,8 +436,7 @@ struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
              * 未转移且未释放的记录必须留在表内，等控制域收尾兜底补标记；
              * 否则「lambda 未执行的提交」会随擦表丢失唯一可达的记录句柄。
              */
-            erase = op->done && !op->waiter_attached
-                    && (!op->reclaim || op->reclaim->released.load(std::memory_order_acquire));
+            erase = op->done && !op->waiter_attached && (!op->reclaim || op->reclaim->Released());
         }
         if (!erase) {
             return;

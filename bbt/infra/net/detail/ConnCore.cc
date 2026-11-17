@@ -107,9 +107,9 @@ ConnCore::~ConnCore()
     m_state->MarkOwnerReleased();
 }
 
-const std::shared_ptr<ConnectionState>& ConnCore::State() const
+std::uint64_t ConnCore::Identity() const noexcept
 {
-    return m_state;
+    return m_state->Id();
 }
 
 std::size_t ConnCore::RecvHold() const
@@ -135,8 +135,7 @@ void ConnCore::StartOwner()
      */
     try {
         m_recv_buf = std::make_unique<char[]>(kReadChunk);
-        m_state->ring.ReserveDeferred(kReadChunk);
-        m_state->ring.ReserveDetached(kReadChunk);
+        m_state->PrepareReceiveStorage(kReadChunk);
     } catch (...) {
         ShutdownOwner(std::make_error_code(std::errc::not_enough_memory));
         return;
@@ -160,7 +159,7 @@ void ConnCore::PumpOwner()
         return;
     }
     PumpWritesOwner();
-    if (m_read_paused && m_state->ring.Size() < m_owner->ReadLowWater()) {
+    if (m_read_paused && m_state->Inspect().readable_bytes < m_owner->ReadLowWater()) {
         m_read_paused = false;
     }
     if (!m_read_paused && !m_read_stopped) {
@@ -174,7 +173,7 @@ void ConnCore::PumpOwner()
      * raw 消费者此前 TryRead Busy：保护释放已唤 owner，这里合并非递归补投
      * OnRead（无新字节也可取原 ring 数据）。
      */
-    if (m_state->ring.TakeRawRetry()) {
+    if (m_state->TakeReadRetry()) {
         NotifyReadOwner();
     }
 }
@@ -185,7 +184,7 @@ bool ConnCore::StageHoldToRing()
     if (held == 0) {
         return true;
     }
-    if (!m_state->ring.StageDetached(std::string_view(m_recv_buf.get(), held))) {
+    if (!m_state->PreserveCloseTail(std::string_view(m_recv_buf.get(), held))) {
         return false;
     }
     m_recv_hold.store(0, std::memory_order_release);
@@ -286,7 +285,7 @@ void ConnCore::ArmReadOwner()
                 return;
             }
             self->m_read_stopped = true;
-            self->m_state->ring.MarkError(FromBoost(error));
+            self->m_state->FinishRead(FromBoost(error));
             self->NotifyReadOwner();
             return;
         }
@@ -336,7 +335,7 @@ bool ConnCore::SubmitReceivedOwner(const char* data, std::size_t size)
      */
     ReadResult appended;
     try {
-        appended = m_state->ring.TryAppend(received);
+        appended = m_state->AppendReceived(received);
     } catch (...) {
         m_recv_hold.store(size, std::memory_order_release);
         return false;
@@ -347,7 +346,7 @@ bool ConnCore::SubmitReceivedOwner(const char* data, std::size_t size)
          * 测试：Busy 后/deferred 前（正常为空）
          */
         m_owner->InvokeAppendBusyHook();
-        if (!m_state->ring.AppendDeferred(received)) {
+        if (!m_state->DeferReceived(received)) {
             m_recv_hold.store(size, std::memory_order_release);
             return false;
         }
@@ -380,19 +379,19 @@ void ConnCore::DoReadsOwner()
     /**
      * pending 尚未被消费者合入时不再读内核；不 spin，等消费者取锁 flush。
      */
-    if (m_state->ring.PendingSize() != 0) {
+    if (m_state->Inspect().pending_bytes != 0) {
         if (notified) {
             NotifyReadOwner();
         }
         return;
     }
     for (int i = 0; i < kReadBudget; ++i) {
-        const std::size_t max_bytes = m_state->ring.MaxBytes();
+        const std::size_t max_bytes = m_state->Inspect().max_bytes;
 
         /**
          * 含 pending
          */
-        const std::size_t used = m_state->ring.Size();
+        const std::size_t used = m_state->Inspect().readable_bytes;
         const std::size_t available = max_bytes > used ? max_bytes - used : 0;
         if (available == 0) {
 
@@ -403,7 +402,7 @@ void ConnCore::DoReadsOwner()
             break;
         }
         const std::size_t want = std::min(kReadChunk, available);
-        const auto grant = m_state->ring.TryReserveForAppend(want);
+        const auto grant = m_state->ReserveReceive(want);
         if (grant.status == ReadStatus::Busy) {
             break;
         }
@@ -438,7 +437,7 @@ void ConnCore::DoReadsOwner()
              * 形成热自旋。暂停后由消费者合入时的 data 通知唤醒 PumpOwner，
              * 经 ring.Size() < ReadLowWater 解除（见 PumpOwner 的恢复分支）。
              */
-            if (m_state->ring.PendingSize() != 0) {
+            if (m_state->Inspect().pending_bytes != 0) {
                 m_read_paused = true;
                 break;
             }
@@ -446,7 +445,7 @@ void ConnCore::DoReadsOwner()
         }
         if (bytes == 0) {
             m_read_stopped = true;
-            m_state->ring.MarkEof();
+            m_state->FinishRead();
             NotifyReadOwner();
             return;
         }
@@ -457,7 +456,7 @@ void ConnCore::DoReadsOwner()
             continue;
         }
         m_read_stopped = true;
-        m_state->ring.MarkError(std::error_code(errno, std::system_category()));
+        m_state->FinishRead(std::error_code(errno, std::system_category()));
         NotifyReadOwner();
         return;
     }
