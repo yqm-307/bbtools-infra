@@ -2,7 +2,7 @@
 
 /**
  * @file Types.hpp
- * @brief 公共网络值类型：读状态与读结果、写阶段与写结果、写方向接纳状态。
+ * @brief 公共网络值类型：读状态与读结果、写方向接纳状态。
  *
  * 这些值的语义与成员含义属于公共契约。它们不放在 detail 中，是为了让公共头不必间接暴露
  * 接收环的布局或内部枚举的位置；内部存储、通知与游标策略不属于契约，调用方不应依赖。
@@ -39,40 +39,6 @@ struct ReadResult {
 
     /**
      * 持久错误原因，仅 Error 状态有意义
-     */
-    std::error_code error;
-};
-
-/**
- * @brief 写操作所处的阶段。
- *
- * - InFlight：已接纳，仍在途，尚未到达终态。
- * - Done：已到达终态。是否成功要看 error 是否为空；Done 且 error 为空只表示本地完成，
- *   并不代表对端已收到或处理。
- * - Rejected：未提交，没有任何副作用。
- * - Unknown：只来自无效写句柄的 Query，没有可识别的身份。
- */
-enum class WritePhase { InFlight, Done, Rejected, Unknown };
-
-/**
- * @brief 写操作在某一时刻的观察结果。
- *
- * 这是采样值，表示返回那一刻的状态；调用返回时操作未必仍在途。
- */
-struct WriteOutcome {
-
-    /**
-     * 采样时的阶段
-     */
-    WritePhase phase{WritePhase::Unknown};
-
-    /**
-     * 该操作实际交给内核的字节前缀
-     */
-    std::size_t sent{0};
-
-    /**
-     * 该操作的真实错误
      */
     std::error_code error;
 };

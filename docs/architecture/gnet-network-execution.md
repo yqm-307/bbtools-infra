@@ -79,9 +79,9 @@ gnet v2.10.0 是接纳交接、owner、读写泵、缓冲及公平性的参考�
 
 同连接接纳次序定义发送次序，一次 AsyncWrite 的字节连续；部分写不插入别的操作字节，多次调用不自动组成业务帧。字节、操作数、命令、在途数据和通知责任统一有界计账，接纳后不能因第二层排队满而丢失完成。
 
-容量满立即明确拒绝且零接纳；`ICoConnection::Write` 可无限或带绝对 deadline 等容量/本地完成，等待名额同样有界。容量等待超时=未提交；已接纳后的等待超时/取消仅结束等待，`WriteReport` 返回操作身份、采样进度及仍在途标记，owner 继续持有和推进，最终状态可查。采样不是冻结前缀，不可据此自动重发后缀。等待业务回包始终归上层。
+容量满立即明确拒绝且零接纳；`ICoConnection::Write` 可无限或带绝对 deadline 等容量/本地完成，等待名额同样有界。返回 `(n, err)`，n 是本次已交给内核的前缀，返回即终值，不表示对端已收到。容量等待失败返回零字节；接纳后超时/取消在写锁内撤销本次未发部分，前后写不受影响，不进入 Settling、不写 LastWriteError、不自动关闭连接。写锁内先发布的终态优先。等待业务回包始终归上层。
 
-`WritePhase::Done` 只表示该次发送已到终态，**成功还须 `outcome.error` 为空**（`Done` + 非空 `error` 是失败结算）；`InFlight` 是已接纳未终态，`Rejected` 是未提交，`Unknown` 只来自无效写句柄的 `Query`。`WriteOutcome` 是「回 X 时采样」，不表示调用返回时仍在途。同理，`WaitOptions` 的 deadline 只约束本次等待，不撤销已接纳的 I/O。
+发送和撤销共用写锁，撤销可能等待当前持锁的整个有界发送批次。每个已接纳写（含撤销）恰一次经 `OnWrite` 交付最终 sent/error；raw `AsyncWrite` 只提交的规则不变。部分发送留下的协议半帧由上层决定关闭。完整决定见 [ADR 0024](../decisions/0024-co-write-syscall-semantics.md)。
 
 真实写错误结算当前操作已发前缀与本轮后续未发操作；结算期间明确拒绝新写，不能跳过失败前缀继续旧队列。结算完且未关闭时允许新的 AsyncWrite，该调用本身表示上层新尝试；不续发旧操作，最近错误持久保留。关闭与结算同序仲裁，错误结算不能重开关闭状态。
 
@@ -185,9 +185,9 @@ bool 仅接受单字节 0/1，浮点数编码 IEEE 754 的大端位表示。
 
 设计依据为 design 期 infra `2cb3ebf60a101bb9cbf93f065db4d41e2130d3cd`、coroutine PR #396 合并提交 `1e9f0e8c25de85dde003def65bb58b90bdac0e0b`；R2 原分析使用的 PR head 为 `8d7b4383c8631f4dccad74df088abe54ca000b87`，不冒充 merge SHA。构建实际消费的 coroutine 版本由 CI 拉取 `coroutine@main` 并在 run 中记录 SHA。
 
-已落地（PR #84 + PR #104，`bbt/infra/net/`）：`detail/ReactorDriver`（真实 Asio context 的 `OnTick/Wait/Wake`、预算、槽绑定/回滚/同代解绑、driver Failed 出口）、`detail/DriverBinder`、`detail/ReceiveRing`（共享并发 ring + 释放代次通知）、`detail/OutboundQueue`（逐操作记账）、`detail/WakeHub`、`Engine`（`Run`/`Close(Immediate)`/`Phase`/`LastError`/`LastFailure`/`LocalAddresses`/`CountConnections`/`HandlerErrorCount`/`ReactorOwnerIds`/`AsyncConnect`/`EnableAcceptHandoff`/`RequestStopAccepting`/`AcceptingStopped`/`CoAccept`/`CoDial`）、`Connection`/`ReclaimReceipt`、`WriteOperation`/`WriteReport`、`RawHandler`、`ICoConnection`/`CoTcpConnection`/`ConnectionResult`/`Buffer`、只读 `ReadView` 与 `Types.hpp`、13 字段 `Options`。
+已落地（PR #84 + PR #104，`bbt/infra/net/`）：`detail/ReactorDriver`（真实 Asio context 的 `OnTick/Wait/Wake`、预算、槽绑定/回滚/同代解绑、driver Failed 出口）、`detail/DriverBinder`、`detail/ReceiveRing`（共享并发 ring + 释放代次通知）、`detail/OutboundQueue`（逐操作记账）、`detail/WakeHub`、`Engine`（`Run`/`Close(Immediate)`/`Phase`/`LastError`/`LastFailure`/`LocalAddresses`/`CountConnections`/`HandlerErrorCount`/`ReactorOwnerIds`/`AsyncConnect`/`EnableAcceptHandoff`/`RequestStopAccepting`/`AcceptingStopped`/`CoAccept`/`CoDial`）、`Connection`/`ReclaimReceipt`、`RawHandler`、`ICoConnection`/`CoTcpConnection`/`ConnectionResult`/`Buffer`、只读 `ReadView` 与 `Types.hpp`、13 字段 `Options`。
 
-PR #104 把公共面收口落地：`Connection::State()`、两处内部构造、`AsyncConnectAwaitable`、公开 `WaitConnect`/`WaitAccepted`、公共 `NormalizeOptions` 与 12 个历史 Options 字段被删除或收回内部，测试接缝全部落在 `detail/`；协程消费面改为 `ICoConnection` 成员接口，`CoRead`/`CoWrite`/`CoAccept`/`CoDial` 自由函数删除。空聚合头 `CoConnection.hpp` 已移除；等待票实现归 `WriteOperation.cc`，执行域校验与私有桥接归 `detail/CoInternal.cc`。冻结符号清单、删除迁移表与逐条行为契约见 [决策 0010「冻结公共面与迁移」](../decisions/0010-gnet-network-foundation.md) 与 [决策 0012](../decisions/0012-icoconn-member-interface.md)。
+PR #104 把公共面收口落地：`Connection::State()`、两处内部构造、`AsyncConnectAwaitable`、公开 `WaitConnect`/`WaitAccepted`、公共 `NormalizeOptions` 与 12 个历史 Options 字段被删除或收回内部，测试接缝全部落在 `detail/`；协程消费面改为 `ICoConnection` 成员接口，`CoRead`/`CoWrite`/`CoAccept`/`CoDial` 自由函数删除。空聚合头 `CoConnection.hpp` 已移除；写等待与撤销实现在 `CoTcpConnection.cc`/`detail/ConnectionState.cc`，执行域校验与私有桥接归 `detail/CoInternal.cc`。冻结符号清单、删除迁移表与逐条行为契约见 [决策 0010「冻结公共面与迁移」](../decisions/0010-gnet-network-foundation.md) 与 [决策 0012](../decisions/0012-icoconn-member-interface.md)。
 
 验证面：`tests/net/` 的 `Test_net_foundation`、`Test_net_primitives`、`Test_net_allocation`、`net.reactor_driver_*`、`net.tcp_*`、`net.freeze_*`、`net.ico_*`、`net.stop_*`、`net.reclaim_*`、`net_foundation_consumer`、`example_co_net_service_roundtrip`、契约回归 `net.<case>`（`Test_net_contract_regressions` 分发），以及 `net.consumer_coroutine_first_{configure,build,run}` 与 `net.consumer_source_dir_mismatch` 负向配置；CI 的 `build-and-gates` job（`network_gate.sh` step）用 `scripts/ci/check_network_tests.py` 强制注册集与 JUnit 实跑集一致、零跳过。合入后主线 run `39305113509` 的该 job 为 success —— 该 success 属于 PR #84 的形态；PR #104 的 CI 结果以该 PR run 为准。
 

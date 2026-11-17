@@ -336,8 +336,9 @@ void SessionCore::WriterLoop()
                     }
                 }
                 write_attempted = true;
+                const auto total = item.bytes.size();
                 const auto report = channel->WriteBytes(std::move(item.bytes), {deadline});
-                const auto settled = detail::TcpSettleWrite(report, "frame write failed");
+                const auto settled = detail::TcpSettleWrite(report, total, "frame write failed");
                 if (!settled) {
                     failure = settled.error();
                 }
@@ -1131,8 +1132,9 @@ result<void> WriteHandshakeFrame(
         return result<void>::err(bytes.error());
     }
     std::string out(reinterpret_cast<const char*>(bytes.value().data()), bytes.value().size());
+    const auto total = out.size();
     const auto report = channel.WriteBytes(std::move(out), {deadline});
-    return detail::TcpSettleWrite(report, "handshake write failed");
+    return detail::TcpSettleWrite(report, total, "handshake write failed");
 }
 
 SessionFrame MakeHello(const ClientOptions& options, std::uint64_t epoch, std::uint64_t nonce)

@@ -51,3 +51,5 @@ AsyncWrite 的票据返回/出参约定已由 [0018：AsyncWrite 只提交](0018
 ## 取代关系
 
 关闭公开入口由 [ADR 0023](0023-single-close.md) 取代；本文其余历史决策保留。
+
+已被 [0024：协程 Write 采用系统调用语义](0024-co-write-syscall-semantics.md) 部分取代：协程 Write 返回 `(n, err)`，超时/取消撤销本次未发部分；删除写操作票据、报告与阶段类型。其余契约保持。

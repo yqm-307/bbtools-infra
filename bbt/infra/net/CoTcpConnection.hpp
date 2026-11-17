@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <string>
 #include <system_error>
+#include <tuple>
 
 #include <bbt/coroutine/sync/CoWaiter.hpp>
 
@@ -26,7 +27,6 @@
 #include <bbt/infra/net/Connection.hpp>
 #include <bbt/infra/net/ICoConnection.hpp>
 #include <bbt/infra/net/Types.hpp>
-#include <bbt/infra/net/WriteOperation.hpp>
 
 namespace bbt::infra::net {
 
@@ -89,7 +89,8 @@ public:
     /**
      * @brief 协程内组合等待写；契约见 ICoConnection::Write。
      */
-    WriteReport Write(std::string data, const bbt::coroutine::WaitOptions& options = {}) override;
+    std::tuple<std::size_t, std::error_code>
+    Write(std::string data, const bbt::coroutine::WaitOptions& options = {}) override;
 
     /**
      * @brief 等待逻辑关闭终态；契约见 ICoConnection::WaitClosed。

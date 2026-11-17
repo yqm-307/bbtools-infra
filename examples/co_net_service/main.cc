@@ -107,14 +107,14 @@ int main()
         }
         const auto data = read_data.CopyTo();
         const auto report = conn.Write(data, Until(3000ms));
-        if (report.wait_error) {
+        if (std::get<1>(report)) {
             return;
         }
 
         /**
          * Done 只表示该次发送已到终态，成功还须 error 为空。
          */
-        if (report.outcome.phase == net::WritePhase::Done && !report.outcome.error && data == "hello") {
+        if (!std::get<1>(report) && data == "hello") {
             echo_ok.store(1);
         }
 

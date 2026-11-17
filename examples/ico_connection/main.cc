@@ -14,7 +14,7 @@
  * 每个成员形态均有真实调用断言：
  * - Read → tuple<owning Buffer, error_code>，Buffer.CopyTo
  * 得到真实回显字节；
- * - Write → WriteReport{wait_error 空, outcome=Done+sent, operation 有效}；
+ * - Write → (n, err)；
  * - WaitClosed → RequestClose 后观察到逻辑 closed 终态；
  * - Status → ConnectionStatus 聚合投影（closed=true, write=Closed 等）。
  *
@@ -159,16 +159,14 @@ int main()
                     server_read_ok.store(1);
 
                     /**
-                     * Write → WriteReport。
+                     * Write → (n, err)。
                      */
                     auto report = conn.Write(payload, Until(3000ms));
-                    if (!report.wait_error && report.outcome.phase == net::WritePhase::Done && !report.outcome.error
-                        && report.outcome.sent == payload.size() && report.operation.Valid()) {
+                    if (!std::get<1>(report) && std::get<0>(report) == payload.size()) {
                         server_write_ok.store(1);
                     } else {
-                        std::cerr << "server Write: wait_error=" << report.wait_error.message()
-                                  << " phase=" << static_cast<int>(report.outcome.phase)
-                                  << " sent=" << report.outcome.sent << '\n';
+                        std::cerr << "server Write: wait_error=" << std::get<1>(report).message()
+                                  << " sent=" << std::get<0>(report) << " sent=" << std::get<0>(report) << '\n';
                     }
                 }
             } else {
@@ -235,15 +233,14 @@ int main()
             check(dialed.reclaim.Valid() == dialed.reclaim.Valid(), "reclaim usable");
 
             /**
-             * Write → WriteReport{wait_error, outcome, operation}。
+             * Write → (n, err)。
              */
             auto sent = conn.Write("hello", Until(3000ms));
-            if (!sent.wait_error && sent.outcome.phase == net::WritePhase::Done && !sent.outcome.error
-                && sent.outcome.sent == 5 && sent.operation.Valid()) {
+            if (!std::get<1>(sent) && std::get<0>(sent) == 5) {
                 client_write_ok.store(1);
             } else {
-                std::cerr << "client Write: wait_error=" << sent.wait_error.message()
-                          << " phase=" << static_cast<int>(sent.outcome.phase) << '\n';
+                std::cerr << "client Write: wait_error=" << std::get<1>(sent).message() << " sent=" << std::get<0>(sent)
+                          << '\n';
             }
 
             /**
@@ -294,7 +291,7 @@ int main()
     check(!client_run_error, "client run clean");
 
     check(dial_ok.load() == 1, "CoDial member");
-    check(client_write_ok.load() == 1, "conn.Write WriteReport");
+    check(client_write_ok.load() == 1, "conn.Write (n, err)");
     check(client_read_ok.load() == 1, "conn.Read Buffer echo");
     check(client_waitclosed_ok.load() == 1, "conn.WaitClosed");
     check(client_status_ok.load() == 1, "conn.Status projection");

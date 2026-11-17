@@ -1208,16 +1208,14 @@ public:
 
     std::error_code AsyncWrite(std::string) override { return {}; }
 
-    net::WriteReport Write(std::string data, const bbt::coroutine::WaitOptions&) override
+    std::tuple<std::size_t, std::error_code> Write(std::string data, const bbt::coroutine::WaitOptions&) override
     {
         {
             std::lock_guard<std::mutex> lock(mu);
             written.append(data);
         }
         ++writes;
-        net::WriteReport report;
-        report.outcome = net::WriteOutcome{net::WritePhase::Done, data.size(), {}};
-        return report;
+        return {data.size(), {}};
     }
 
     std::error_code Close(const bbt::infra::CloseOptions& = {}, std::error_code = {}) override { return {}; }
@@ -1255,7 +1253,8 @@ public:
 
     std::error_code WriteBytes(std::string bytes) override { return m_conn.AsyncWrite(std::move(bytes)); }
 
-    net::WriteReport WriteBytes(std::string bytes, const bbt::coroutine::WaitOptions& options) override
+    std::tuple<std::size_t, std::error_code>
+    WriteBytes(std::string bytes, const bbt::coroutine::WaitOptions& options) override
     {
         return m_conn.Write(std::move(bytes), options);
     }

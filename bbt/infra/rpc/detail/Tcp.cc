@@ -77,26 +77,16 @@ Error TcpCallError(std::error_code cause, const char* message, bool committed)
     return error;
 }
 
-result<void> TcpSettleWrite(const net::WriteReport& report, const char* message)
+result<void>
+TcpSettleWrite(const std::tuple<std::size_t, std::error_code>& report, std::size_t total, const char* message)
 {
-    const auto& outcome = report.outcome;
-    if (!report.wait_error && outcome.phase == net::WritePhase::Done && !outcome.error) {
+    const auto [sent, cause] = report;
+    if (!cause && sent == total)
         return result<void>::ok();
-    }
-    const auto cause = report.wait_error ? report.wait_error : outcome.error;
-
-    /**
-     * committed = false。
-     */
-    auto error = TcpCallError(cause, message, false);
-    if (!error.request_phase.has_value()) {
+    auto error = TcpCallError(cause, message, sent == total);
+    if (!error.request_phase.has_value())
         error.request_phase = RequestPhase::Writing;
-    }
-
-    /**
-     * 已接纳仍在发送：等待结束不等于撤销；除调用方取消外不得当作零提交。
-     */
-    if (report.operation.Valid() && outcome.phase == net::WritePhase::InFlight && error.code != ErrorCode::Cancelled) {
+    if (sent > 0 && sent < total && error.code != ErrorCode::Cancelled) {
         error.code = ErrorCode::OutcomeUnknown;
     }
     return result<void>::err(std::move(error));

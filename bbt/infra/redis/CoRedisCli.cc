@@ -356,15 +356,15 @@ struct CoRedisCli::State {
         const std::string command(formatted, static_cast<std::size_t>(size));
         const bbt::coroutine::WaitOptions wait{options.deadline};
         net::CoTcpConnection co{local};
-        const auto report = co.Write(command, wait);
-        if (report.wait_error) {
+        const auto [sent, write_error] = co.Write(command, wait);
+        if (write_error) {
             bool sealed;
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 sealed = closed;
             }
-            auto cause = NetError(report.wait_error, sealed);
-            if (report.operation.Valid() || report.outcome.phase != net::WritePhase::Rejected) {
+            auto cause = NetError(write_error, sealed);
+            if (sent > 0) {
                 return result<RawReply>::err(Fail(std::move(cause), true));
             }
             if (cause.code == ErrorCode::Closed || cause.code == ErrorCode::TransportError) {

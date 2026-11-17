@@ -80,8 +80,8 @@ key/value 二进制安全；拒绝空 key 和空 DEL 列表。PING 只接受 PON
 | 非协程 / 未连接 / 已封口 | InvalidContext / RuntimeUnavailable / Closed，零提交 |
 | `Engine::CoDial` 拒连 / deadline / 取消 | TransportError / TimedOut / Cancelled，不发布连接；失败不代表 fd 已回收 |
 | Engine 不可用或有 RawHandler | RuntimeUnavailable，保留 net 原始错误码 |
-| 写未接纳 | 按原因 Closed、TimedOut、Cancelled、Overloaded 或 TransportError，不一概映射 Overloaded |
-| 写已接纳，没有可信完整回复 | OutcomeUnknown，`details["cause"]` 保存物理错误类别，`backend_category/backend_code` 保留后端原因；不填 request_phase，不推断 Redis 未执行 |
+| 写返回 n=0 且有错误（含已接纳后零发送即撤销） | 按原因 Closed、TimedOut、Cancelled、Overloaded 或 TransportError，不一概映射 Overloaded |
+| 写返回 n>0，没有可信完整回复 | OutcomeUnknown，`details["cause"]` 保存物理错误类别，`backend_category/backend_code` 保留后端原因；不填 request_phase，不推断 Redis 未执行 |
 | 完整 Redis ERROR | RemoteError，`domain_code` 为 WRONGTYPE 等首词，`backend_category="redis"`；连接继续同步 |
 | 握手 AUTH/SELECT 失败 | `Connect` 返回原样错误（服务端拒绝为 RemoteError，消息不含密码），连接退役；后续命令按「显式 Connect required」处理，client 仍可 Close |
 | 分帧回复 | 同一绝对 deadline 循环读和 Feed/解析，空 reply 继续等待 |

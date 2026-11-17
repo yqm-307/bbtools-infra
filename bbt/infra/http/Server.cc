@@ -888,19 +888,17 @@ struct Server::State : std::enable_shared_from_this<Server::State> {
             }
             const auto count = std::min(chunk, bytes.size() - offset);
             net::CoTcpConnection connection{session->connection};
-            const auto report = connection.Write(bytes.substr(offset, count), {deadline});
-            const auto& outcome = report.outcome;
+            const auto [sent, error] = connection.Write(bytes.substr(offset, count), {deadline});
 
             /**
-             * 公开 Rejected + 无 operation = 零提交；有界减半探到 net 可接纳上限。
+             * 已发字节为零时可安全重试；有界减半探到 net 可接纳上限。
              * 不在已接纳/可能发送的路径重试，也不假设 Engine 默认写额度。
              */
-            if (report.wait_error == std::errc::no_buffer_space && outcome.phase == net::WritePhase::Rejected
-                && !report.operation.Valid() && count > 1) {
+            if (error == std::errc::no_buffer_space && sent == 0 && count > 1) {
                 chunk = count / 2;
                 continue;
             }
-            if (report.wait_error || outcome.phase != net::WritePhase::Done || outcome.error) {
+            if (error || sent != count) {
                 return false;
             }
             offset += count;

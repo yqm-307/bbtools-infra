@@ -23,12 +23,6 @@ std::shared_ptr<ConnectionState> ConnectionTestAccess::StateOf(const Connection&
     return connection.m_state;
 }
 
-WriteOperation
-ConnectionTestAccess::MakeWrite(std::shared_ptr<WriteOpRecord> record, std::shared_ptr<ConnectionState> state)
-{
-    return WriteOperation(std::move(record), std::move(state));
-}
-
 std::unique_lock<std::mutex> ConnectionTestAccess::HoldForTest(std::shared_ptr<ConnectionState> state)
 {
     return state ? state->ring.TryHoldForTest() : std::unique_lock<std::mutex>();

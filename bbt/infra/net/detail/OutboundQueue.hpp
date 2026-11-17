@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -76,7 +77,7 @@ public:
     /**
      * 拷贝追加。空数据合法且不产生任何段。无效几何、超总量界，或溢出
      * 部分既不能合并进尾段又已达到段数界时，在修改前拒绝
-     * （no_buffer_space），已有数据不变。
+     * （no_buffer_space），已有数据不变。容量按 TotalBytes() - RevokedBytes() 计算。
      *
      * 保序（FIFO）：数据只能追加到逻辑队尾。ring 段是逻辑队首，仅当
      * spill 为空（没有更早的未发数据）时新数据才可进入 ring；spill 非空
@@ -86,7 +87,19 @@ public:
      * 异常边界：可能抛 bad_alloc 的溢出段提交先于 noexcept 的 ring 拷贝
      * 提交，提交失败时队列保持原样，无半提交状态。
      */
-    std::error_code Append(std::string_view data);
+    std::error_code Append(std::string_view data, std::size_t* out_begin = nullptr, std::size_t* out_end = nullptr);
+
+    std::size_t AppendCursor() const noexcept { return m_append_cursor; }
+
+    std::size_t ConsumedCursor() const noexcept { return m_consumed_cursor; }
+
+    std::size_t RevokedBytes() const noexcept { return m_revoked_bytes; }
+
+    /**
+     * 接纳协程写前预留撤销槽；撤销在写锁内执行且不分配，避免等待者离开时遗留借用。
+     */
+    void ReserveRevocations(std::size_t active_writes);
+    void RevokeStreamRange(std::size_t begin, std::size_t end);
 
     /**
      * writev 浏览：按发送顺序填最多 max_views 个连续段（ring 绕环时至多
@@ -98,11 +111,18 @@ public:
 
     /**
      * 消费已发送前缀 n 字节：先 ring（可跨绕环），再按序消费 list 段；
-     * 支持段内部分消费。n > TotalBytes 拒绝且不变；n == 0 合法。
+     * 支持段内部分消费。队首撤销字节直接丢弃，不计入 n。n > TotalBytes() - RevokedBytes() 拒绝且不变。
      */
     std::error_code ConsumeSent(std::size_t n);
 
 private:
+    void ConsumeStorage(std::size_t n);
+
+    std::size_t m_append_cursor{0};
+    std::size_t m_consumed_cursor{0};
+    std::size_t m_revoked_bytes{0};
+    std::vector<std::pair<std::size_t, std::size_t>> m_revoked;
+
     std::vector<unsigned char> ring_;
     std::size_t ring_head_{0};
     std::size_t ring_size_{0};

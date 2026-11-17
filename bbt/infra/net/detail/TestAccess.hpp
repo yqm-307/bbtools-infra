@@ -4,7 +4,7 @@
  * 内部测试/故障注入接缝（不列入公共头自检，不属公共冻结面）。
  *
  * 这些入口只给仓内测试建立确定性交错与直接状态注入用：产品代码不使用，
- * 也不承诺任何源码兼容。对应产品面分别是 Connection/WriteOperation 的私有
+ * 也不承诺任何源码兼容。对应产品面分别是 Connection 的私有
  * 构造，以及 CoInternal.cc 内的 CoDial 屏障。
  */
 #include <cstddef>
@@ -18,7 +18,6 @@
 namespace bbt::infra::net {
 
 class ConnectionState;
-struct WriteOpRecord;
 
 class ConnectionTestAccess {
 public:
@@ -27,7 +26,6 @@ public:
      */
     static Connection Make(std::shared_ptr<ConnectionState> state);
     static std::shared_ptr<ConnectionState> StateOf(const Connection& connection);
-    static WriteOperation MakeWrite(std::shared_ptr<WriteOpRecord> record, std::shared_ptr<ConnectionState> state = {});
     static std::unique_lock<std::mutex> HoldForTest(std::shared_ptr<ConnectionState> state);
     static void Reset(const std::shared_ptr<ConnectionState>& state, std::unique_lock<std::mutex>& lock);
 };

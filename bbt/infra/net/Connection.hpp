@@ -30,7 +30,6 @@
 
 #include <bbt/infra/net/ReadView.hpp>
 #include <bbt/infra/net/Types.hpp>
-#include <bbt/infra/net/WriteOperation.hpp>
 
 namespace bbt::infra::net {
 

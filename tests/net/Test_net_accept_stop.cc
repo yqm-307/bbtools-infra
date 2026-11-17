@@ -284,8 +284,8 @@ void StopRunningDeliveredConnRW()
         }
         data = read_data.CopyTo();
         auto report = co_conn.Write(data, Until(3000ms));
-        if (report.wait_error || report.outcome.phase != WritePhase::Done || report.outcome.error) {
-            rw_result.store(report.wait_error ? report.wait_error.value() : -2);
+        if (std::get<1>(report)) {
+            rw_result.store(std::get<1>(report) ? std::get<1>(report).value() : -2);
             return;
         }
         rw_result.store(0);
@@ -498,7 +498,7 @@ void StopClientOnlyDialContinues(bool before_run = false)
         connection = res.connection.Raw();
         CoTcpConnection co_conn{connection};
         auto report = co_conn.Write("ping", Until(3000ms));
-        if (report.wait_error || report.outcome.phase != WritePhase::Done || report.outcome.error) {
+        if (std::get<1>(report)) {
             exchange_result.store(-1);
             return;
         }

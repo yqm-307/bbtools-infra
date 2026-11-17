@@ -110,7 +110,7 @@ foreach(_case co_context_gate options_contract write_output_reuse
 endforeach()
 
 # 成员化 ICoConnection 写/关闭观察：AsyncWrite fire 提交、成员 Write
-# （等容量→接纳→等本地完成）、WriteOperation::Wait、WaitClosed close hub、
+# （等容量→接纳→等本地完成）、WaitClosed close hub、
 # Status 投影、RequestClose 默认 reason 下未发完写非成功、facade 释放后 op
 # 可查、driver Failed 唤醒。所有等待挂起由 ConnectionState 的
 # Write/CloseAddHookForTest 屏障证明后才触发终态，不靠 sleep。
