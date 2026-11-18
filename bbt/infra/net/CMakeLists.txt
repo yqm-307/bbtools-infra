@@ -6,7 +6,7 @@ add_library(bbt_infra_net STATIC
     detail/TestAccess.cc detail/TestHooks.cc
     Buffer.cc Error.cc ../NetError.cc ICoConnection.cc detail/SourceAddrHash.cc
     detail/ConnectionState.cc detail/EventRingBuffer.cc detail/OutboundQueue.cc
-    detail/ReceiveRing.cc detail/WakeHub.cc)
+    detail/ReceiveRing.cc detail/WaitSet.cc)
 add_library(bbt::infra_net ALIAS bbt_infra_net)
 target_include_directories(bbt_infra_net PUBLIC
     "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>")

@@ -43,7 +43,7 @@
 #include <bbt/infra/net/detail/ReactorDriver.hpp>
 #include <bbt/infra/net/detail/ReclaimRecord.hpp>
 #include <bbt/infra/net/detail/ReceiveRing.hpp>
-#include <bbt/infra/net/detail/WakeHub.hpp>
+#include <bbt/infra/net/detail/WaitSet.hpp>
 
 namespace bbt::infra::net {
 
@@ -569,7 +569,7 @@ ConnectOp::ConnectOp(
     m_reactor = std::move(owner);
     m_reclaim = std::move(record);
     m_waiter_attached = awaitable;
-    m_hub.SetHooksForTest(hooks);
+    m_testHooks = hooks;
 }
 
 bool ConnectOp::Removable()
@@ -596,7 +596,7 @@ bool ConnectOp::Seal()
 
 void ConnectOp::Notify()
 {
-    m_hub.NotifyAll();
+    m_hub.Notify(WaitLane::Connect);
 }
 
 void ConnectOp::AuthorizeDelivery()
@@ -634,9 +634,9 @@ ConnectTestSnapshot ConnectOp::InspectForTest()
 std::size_t ConnectOp::OccupyWaitersForTest(std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>>& keep)
 {
     std::size_t added = 0;
-    for (std::size_t i = 0; i < WakeHub::kMaxWaiters + 1; ++i) {
-        auto waiter = m_hub.Create();
-        if (!m_hub.Add(waiter))
+    for (std::size_t i = 0; i < WaitSet::kMaxWaiters + 1; ++i) {
+        auto waiter = CreateWaiter(m_testHooks);
+        if (!m_hub.Add(WaitLane::Connect, waiter))
             break;
         keep.push_back(std::move(waiter));
         ++added;
@@ -679,7 +679,7 @@ bool ConnectOp::Complete(Connection connection, std::error_code result_error, bo
     if (recycle) {
         (void)connection.Close({}, std::make_error_code(std::errc::operation_canceled));
     }
-    m_hub.NotifyAll();
+    m_hub.Notify(WaitLane::Connect);
 
     return delivered;
 }
@@ -831,31 +831,17 @@ std::error_code ConnectOp::Wait(
             status = static_cast<bbt::coroutine::WaitStatus>(injected_wait_status);
         } else {
             try {
-                auto waiter = m_hub.Create();
-                status = waiter->WaitWithCallback(options, [&] {
-                    if (!m_hub.Add(waiter)) {
-
-                        /**
-                         * 满额：有界拒绝，不自激重试
-                         */
-                        add_failed = true;
-                        waiter->Notify();
-                        return true;
-                    }
-                    bool done = false;
-                    {
+                const auto wait = WaitChange(
+                    m_hub,
+                    WaitLane::Connect,
+                    options,
+                    [&] {
                         std::lock_guard<std::mutex> lock(m_mutex);
-                        done = m_done;
-                    }
-                    if (done) {
-
-                        /**
-                         * 锁外 Notify
-                         */
-                        waiter->Notify();
-                    }
-                    return true;
-                });
+                        return m_done;
+                    },
+                    m_testHooks);
+                status = wait.status;
+                add_failed = wait.problem != WaitProblem::None;
             } catch (...) {
 
                 /**
@@ -1144,7 +1130,7 @@ void AcceptQueue::MarkPhysicallyStopped()
 
 void AcceptQueue::SetHooksLocked(const EngineControl::Guard&, const std::shared_ptr<TestHooks>& hooks)
 {
-    accept_hub.SetHooksForTest(hooks);
+    m_testHooks = hooks;
 }
 
 void AcceptQueue::Seal()
@@ -1162,7 +1148,7 @@ void AcceptQueue::Seal()
 
 void AcceptQueue::Notify()
 {
-    accept_hub.NotifyAll();
+    accept_hub.Notify(WaitLane::Accept);
 }
 
 void AcceptQueue::SealForStop()
@@ -1172,7 +1158,7 @@ void AcceptQueue::SealForStop()
         handoff_closed = true;
         handoff_reserved = 0;
     }
-    accept_hub.NotifyAll();
+    accept_hub.Notify(WaitLane::Accept);
     for (;;) {
         Connection connection;
         {
@@ -1258,7 +1244,7 @@ bool AcceptQueue::CommitHandoff(Connection connection, const std::shared_ptr<Han
         }
         handoff.push_back(std::move(connection));
     }
-    accept_hub.NotifyAll();
+    accept_hub.Notify(WaitLane::Accept);
     return true;
 }
 
@@ -1288,32 +1274,18 @@ std::error_code AcceptQueue::WaitAccepted(Connection& out, const bbt::coroutine:
         if (sealed) {
             return std::make_error_code(std::errc::operation_canceled);
         }
-        auto waiter = accept_hub.Create();
-        if (!waiter) {
-            return std::make_error_code(std::errc::no_buffer_space);
-        }
-        bool add_failed = false;
-        const auto status = waiter->WaitWithCallback(options, [&] {
-            if (!accept_hub.Add(waiter)) {
-                add_failed = true;
-                waiter->Notify();
-                return true;
-            }
-            m_engine->InvokeHook(HookPoint::AfterAcceptRegistered);
-            bool ready = false;
-            {
+        const auto wait = WaitChange(
+            accept_hub,
+            WaitLane::Accept,
+            options,
+            [&] {
                 std::lock_guard<std::mutex> lock(handoff_mutex);
-                ready = !handoff.empty() || m_engine->IsSealed() || StopRequested();
-            }
-            if (ready) {
-
-                /**
-                 * 锁外 Notify
-                 */
-                waiter->Notify();
-            }
-            return true;
-        });
+                return !handoff.empty() || m_engine->IsSealed() || StopRequested();
+            },
+            m_testHooks,
+            [&] { m_engine->InvokeHook(HookPoint::AfterAcceptRegistered); });
+        const bool add_failed = wait.problem != WaitProblem::None;
+        const auto status = wait.status;
         if (add_failed) {
             return std::make_error_code(std::errc::no_buffer_space);
         }

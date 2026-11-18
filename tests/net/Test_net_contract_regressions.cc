@@ -29,7 +29,7 @@
 #include <bbt/infra/net/detail/ConnectionState.hpp>
 #include <bbt/infra/net/detail/ReceiveRing.hpp>
 #include <bbt/infra/net/detail/TestAccess.hpp>
-#include <bbt/infra/net/detail/WakeHub.hpp>
+#include <bbt/infra/net/detail/WaitSet.hpp>
 #include <bbt/infra/net/detail/EngineTestAccess.hpp>
 
 #include <algorithm>
@@ -404,14 +404,15 @@ static void RingReleaseNotify()
 static void HubEarlyNotifyRetained()
 {
     StartRuntime(1);
-    WakeHub hub;
-    auto waiter = hub.Register();
+    WaitSet hub;
+    auto waiter = CreateWaiter();
+    CHECK(hub.Add(WaitLane::Data, waiter));
     CHECK(waiter != nullptr);
 
     /**
      * 等待前通知：无法交付，但 weak 项必须保留
      */
-    hub.NotifyAll();
+    hub.Notify(WaitLane::Data);
     std::atomic<int> result{-1};
     auto task = Task([&] {
         const auto status = waiter->WaitWithCallback(Until(300ms), [] { return true; });
@@ -426,7 +427,7 @@ static void HubEarlyNotifyRetained()
     /**
      * 真正的完成事件
      */
-    hub.NotifyAll();
+    hub.Notify(WaitLane::Data);
     Get(task);
     CHECK(result.load() == 0);
     std::cout << "hub_early_notify_retained completed=ok\n";
@@ -2337,30 +2338,30 @@ static void SealPostFailureRetries()
 
 static void WakeHubCapacityBounded()
 {
-    WakeHub hub;
+    WaitSet hub;
     std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>> keep;
-    for (std::size_t i = 0; i < WakeHub::kMaxWaiters; ++i) {
-        auto waiter = hub.Create();
-        CHECK(hub.Add(waiter));
+    for (std::size_t i = 0; i < WaitSet::kMaxWaiters; ++i) {
+        auto waiter = CreateWaiter();
+        CHECK(hub.Add(WaitLane::Data, waiter));
         keep.push_back(std::move(waiter));
     }
-    auto extra = hub.Create();
+    auto extra = CreateWaiter();
 
     /**
      * 第 257 个：有界拒绝
      */
-    CHECK(!hub.Add(extra));
+    CHECK(!hub.Add(WaitLane::Data, extra));
 
     /**
      * 锁外 Notify，不越界
      */
-    hub.NotifyAll();
+    hub.Notify(WaitLane::Data);
 
     /**
      * 清理一个后 Add 可 prune 并成功
      */
     keep.back().reset();
-    CHECK(hub.Add(extra));
+    CHECK(hub.Add(WaitLane::Data, extra));
     keep.clear();
     std::cout << "wakehub_capacity_bounded add256=true add257=false\n";
 }
@@ -2371,7 +2372,7 @@ static void CoReadHubFullBounded()
     auto state = std::make_shared<ConnectionState>(1, 4096, 1024, 4, nullptr);
     Connection connection = ConnectionTestAccess::Make(state);
     std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>> keep;
-    for (std::size_t i = 0; i < WakeHub::kMaxWaiters; ++i) {
+    for (std::size_t i = 0; i < WaitSet::kMaxWaiters; ++i) {
         auto waiter = state->CreateReadWaiterForTest();
         CHECK(state->AddReadWaiterForTest(waiter));
         keep.push_back(std::move(waiter));
@@ -2917,7 +2918,7 @@ static void WaitConnectAddFailureRecycles()
     std::uint64_t id = 0;
     CHECK(!CoAccess::SubmitConnect(client, address, id));
     std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>> keep;
-    CHECK(EngineTestAccess::FillConnectHub(client, id, keep) == WakeHub::kMaxWaiters);
+    CHECK(EngineTestAccess::FillConnectHub(client, id, keep) == WaitSet::kMaxWaiters);
     std::atomic<int> result{-2};
     auto task = Task([&] {
         Connection connection;
@@ -3584,7 +3585,8 @@ static void SealedWriteErrorReadPublication()
     CHECK(!state.Inspect().read_eof);
     std::promise<void> registered;
     auto ready = registered.get_future();
-    auto waiter = state.RegisterCloseWaiter();
+    auto waiter = state.CreateCloseWaiter();
+    CHECK(state.AddCloseWaiter(waiter));
     std::atomic<bool> notified{false};
     auto task = Task([&] {
         const auto status = waiter->WaitWithCallback(Until(2000ms), [&] {

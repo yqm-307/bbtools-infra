@@ -841,7 +841,7 @@ static void WriteOutputReuse()
          */
         CHECK(!full_state->SubmitWrite("warm", warm_id));
         std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>> keep;
-        for (std::size_t i = 0; i < WakeHub::kMaxWaiters; ++i) {
+        for (std::size_t i = 0; i < WaitSet::kMaxWaiters; ++i) {
             auto waiter = full_state->CreateWriteWaiter();
             CHECK(full_state->AddWriteWaiter(waiter));
             keep.push_back(std::move(waiter));
@@ -1513,7 +1513,7 @@ static void ConnectFailureCleanup()
         std::uint64_t id = 0;
         CHECK(!CoAccess::SubmitConnect(client, address, id));
         std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>> keep;
-        CHECK(EngineTestAccess::FillConnectHub(client, id, keep) == WakeHub::kMaxWaiters);
+        CHECK(EngineTestAccess::FillConnectHub(client, id, keep) == WaitSet::kMaxWaiters);
         std::atomic<int> full{-2};
         auto task = Task([&] {
             Connection out;

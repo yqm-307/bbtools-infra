@@ -40,7 +40,7 @@
 #include <bbt/infra/net/detail/OutboundQueue.hpp>
 #include <bbt/infra/net/detail/ReclaimRecord.hpp>
 #include <bbt/infra/net/detail/ReceiveRing.hpp>
-#include <bbt/infra/net/detail/WakeHub.hpp>
+#include <bbt/infra/net/detail/WaitSet.hpp>
 
 namespace bbt::infra::net {
 
@@ -207,19 +207,9 @@ public:
     std::error_code LastWriteError(std::uint64_t* operation = nullptr);
     std::shared_ptr<bbt::coroutine::sync::CoWaiter> CreateWriteWaiter();
     bool AddWriteWaiter(const std::shared_ptr<bbt::coroutine::sync::CoWaiter>& waiter);
-    std::shared_ptr<bbt::coroutine::sync::CoWaiter> RegisterWriteWaiter();
 
-    /**
-     * close hub 的等待订阅必须走 Create/Add 两段：Add 放进
-     * WaitWithCallback 的 on_registered（此时 runtime 已登记事件），
-     * 不能直接拿 RegisterCloseWaiter 在登记前注册——否则早到
-     * MarkClosed 的 NotifyAll 落在未登记事件上丢失（与 ring/write hub
-     * 同一模式）。
-     */
     std::shared_ptr<bbt::coroutine::sync::CoWaiter> CreateCloseWaiter();
     bool AddCloseWaiter(const std::shared_ptr<bbt::coroutine::sync::CoWaiter>& waiter);
-    std::shared_ptr<bbt::coroutine::sync::CoWaiter> RegisterCloseWaiter();
-    std::shared_ptr<bbt::coroutine::sync::CoWaiter> RegisterReadWaiter();
 
     /**
      * 测试接缝：对应 hub Add 成功后调用（在 on_registered 内、等待者
@@ -268,8 +258,8 @@ private:
     std::shared_ptr<std::atomic<bool>> m_service_sealed;
     std::shared_ptr<ReclaimRecord> m_owner_released;
     std::shared_ptr<TestHooks> m_testHooks;
-    WakeHub m_write_hub;
-    WakeHub m_close_hub;
+    WaitSet m_write_hub;
+    WaitSet m_close_hub;
 };
 
 // clang-format off
