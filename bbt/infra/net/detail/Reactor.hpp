@@ -109,6 +109,7 @@ public:
     std::size_t DirtyCount();
     std::size_t RecvHoldBytes();
     int FirstConnFd();
+    bool RemoveConnForTest(std::uint64_t id);
 
     void InvokeReadAppendHook() { InvokeHook(HookPoint::AfterReceiveBeforeAppend); }
 

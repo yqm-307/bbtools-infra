@@ -7,6 +7,11 @@
 
 namespace bbt::infra::net {
 
+bool EngineTestAccess::RemoveConn(Engine& engine, std::uint64_t id)
+{
+    return engine.RemoveConnForTest(id);
+}
+
 void EngineTestAccess::ArmFault(Engine& engine, FaultPoint point)
 {
     engine.ArmFaultForTest(static_cast<std::size_t>(point));

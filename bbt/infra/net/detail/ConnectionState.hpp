@@ -115,6 +115,9 @@ public:
     ReadResult AppendReceived(std::string_view data);
     bool DeferReceived(std::string_view data);
     bool PreserveCloseTail(std::string_view data);
+
+    TestHooks* Hooks() const noexcept { return m_testHooks.get(); }
+
     void FinishRead(std::error_code error = {});
     bool TakeReadRetry();
     ReadResult CopyConsume(Buffer& out);

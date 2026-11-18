@@ -7,6 +7,7 @@
  */
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <system_error>
@@ -103,6 +104,12 @@ public:
      * 一次性 dirty 屏障：MarkDirty weak-lock 之后、登记/入链之前。
      */
     static void SetDirtyBarrierOnce(Engine& engine, std::function<void()> barrier);
+
+    /**
+     * 在 AfterDirtyWeakLock 内按 Connection::Id() 同步撤销登记。返回是否找到登记。
+     * 测试须协调目标连接的关闭和 driver 寿命。
+     */
+    static bool RemoveConn(Engine& engine, std::uint64_t id);
 
     /**
      * 一次性屏障：RemoveConn 撤链后、registry 擦除前（仍持 dirty+registry）。

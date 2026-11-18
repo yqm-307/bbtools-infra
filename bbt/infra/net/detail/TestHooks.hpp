@@ -46,6 +46,11 @@ enum class FaultPoint : std::size_t {
     SealThrow,
     AcceptStopPost,
     WaitDriverFailed,
+    CloseStageHold,
+    CloseBackend,
+    PublishCloseState,
+    DeliverCloseCallbacks,
+    PublishOwnerReleased,
     Count
 };
 enum class DelayPoint : std::size_t { ConnectDelivery, ConnectStart, Seal, Install, Count };

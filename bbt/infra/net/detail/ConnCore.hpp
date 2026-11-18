@@ -65,7 +65,7 @@ private:
     bool StageHoldToRing();
 
     void _CloseBackend();
-    bool _PublishCloseState(std::error_code reason);
+    bool _PublishCloseState(std::error_code reason, TestHooks* hooks = nullptr);
 
     void ArmReadOwner();
 

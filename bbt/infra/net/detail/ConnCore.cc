@@ -197,20 +197,26 @@ void ConnCore::_CloseBackend()
     m_observedFd.store(-1, std::memory_order_release);
 }
 
-bool ConnCore::_PublishCloseState(std::error_code reason)
+bool ConnCore::_PublishCloseState(std::error_code reason, TestHooks* hooks)
 {
     if (m_closeStage == CloseStage::Open) {
-        if (!StageHoldToRing()) {
+        if ((hooks && hooks->TakeFault(FaultPoint::CloseStageHold)) || !StageHoldToRing()) {
             // 保留尚未转入 state 的已收字节，让下一次关闭重试。
             return false;
         }
         m_closeStage = CloseStage::HoldStaged;
     }
     if (m_closeStage == CloseStage::HoldStaged) {
+        if (hooks && hooks->TakeFault(FaultPoint::CloseBackend)) {
+            return false;
+        }
         _CloseBackend();
         m_closeStage = CloseStage::BackendClosed;
     }
     if (m_closeStage == CloseStage::BackendClosed) {
+        if (hooks && hooks->TakeFault(FaultPoint::PublishCloseState)) {
+            return false;
+        }
         // hold 已进入 state，才发布读终态及结算写。
         m_state->MarkClosed(reason);
         m_closeStage = CloseStage::StatePublished;
@@ -224,10 +230,14 @@ void ConnCore::ShutdownOwner(std::error_code reason)
         return;
     }
     m_owner->InvokeShutdownBarrier();
-    if (!_PublishCloseState(reason)) {
+    auto* const hooks = m_state->Hooks();
+    if (!_PublishCloseState(reason, hooks)) {
         return;
     }
     if (m_closeStage == CloseStage::StatePublished) {
+        if (hooks && hooks->TakeFault(FaultPoint::DeliverCloseCallbacks)) {
+            return;
+        }
         reason = m_state->CloseReason();
         DeliverTerminalOwner();
         if (m_handler) {
@@ -235,6 +245,9 @@ void ConnCore::ShutdownOwner(std::error_code reason)
             m_owner->SafeHandler([this, connection, reason] { m_handler->OnClose(connection, reason); });
         }
         m_closeStage = CloseStage::CallbacksDone;
+    }
+    if (hooks && hooks->TakeFault(FaultPoint::PublishOwnerReleased)) {
+        return;
     }
     // backend 已物理关闭，且 owner 的回调责任已兑现，才能发布回收。
     m_closeStage = CloseStage::Finished;

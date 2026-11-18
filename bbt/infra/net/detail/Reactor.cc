@@ -975,6 +975,22 @@ void Reactor::PumpAllConnsOwner()
     }
 }
 
+bool Reactor::RemoveConnForTest(std::uint64_t id)
+{
+    std::shared_ptr<ConnCore> core;
+    {
+        std::lock_guard<std::mutex> lock(m_membersMutex);
+        const auto it = m_conns.find(id);
+        if (it == m_conns.end()) {
+            return false;
+        }
+        core = it->second.core;
+    }
+    // RemoveConn 自行取成员锁并重新核对 core 身份。
+    RemoveConn(core);
+    return true;
+}
+
 void Reactor::RemoveConn(const std::shared_ptr<ConnCore>& core)
 {
     if (!core) {

@@ -62,6 +62,11 @@ EngineTestSnapshot Engine::InspectForTest()
     return m_impl->InspectForTest();
 }
 
+bool Engine::RemoveConnForTest(std::uint64_t id)
+{
+    return m_impl->RemoveConnForTest(id);
+}
+
 ConnectTestSnapshot Engine::InspectConnectForTest(std::uint64_t id)
 {
     return m_impl->InspectConnectForTest(id);
@@ -146,6 +151,21 @@ EngineTestSnapshot EngineImpl::InspectForTest()
             snapshot.m_firstFd = owner->FirstConnFd();
     }
     return snapshot;
+}
+
+bool EngineImpl::RemoveConnForTest(std::uint64_t id)
+{
+    std::vector<std::shared_ptr<Reactor>> reactors;
+    {
+        auto guard = control.Acquire();
+        reactors = owners.SnapshotLocked(guard);
+    }
+    for (auto& reactor : reactors) {
+        if (reactor->RemoveConnForTest(id)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 ConnectTestSnapshot EngineImpl::InspectConnectForTest(std::uint64_t id)
