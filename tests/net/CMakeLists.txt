@@ -253,6 +253,22 @@ foreach(_case pending_not_flushed_before_next_recv pending_without_next_recv_is_
         LABELS "unit")
 endforeach()
 
+# S5 Reactor 确定性交错：成员锁合一后的 dirty 登记去重、OwnerWake 弱绑定
+# 的寿命边界（Reactor 销毁 / driver 解绑 / 晚 Wake）、CloseStage 分段收口。
+# 直构用例不启动 runtime，端到端用例用真实 loopback TCP；竞态全部由
+# EngineTestAccess 的一次性屏障在目标阶段内制造，不睡眠。
+add_executable(Test_net_s5_reactor Test_net_s5_reactor.cc)
+target_link_libraries(Test_net_s5_reactor PRIVATE bbt::infra_net Boost::headers)
+target_compile_options(Test_net_s5_reactor PRIVATE -Wall -Wextra -Wpedantic)
+target_link_options(Test_net_s5_reactor PRIVATE -rdynamic)
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/runtime")
+foreach(_case wake_registered_once wake_late_window wake_reactor_destroyed
+          wake_driver_unbound shutdownowner_stages)
+    add_test(NAME net.s5_${_case} COMMAND Test_net_s5_reactor ${_case})
+    set_tests_properties(net.s5_${_case} PROPERTIES TIMEOUT 120 LABELS "unit"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/runtime")
+endforeach()
+
 # 复制读取契约：跨段/pending/detached FIFO、Busy 零消费、即时释放额度、
 # 分配失败不变、关闭后尾部及输出独立寿命；Co Read 的 gate/挂起/超时/EOF。
 add_executable(Test_net_copy_consume detail/Test_net_copy_consume.cc)
