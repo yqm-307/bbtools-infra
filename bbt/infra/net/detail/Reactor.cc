@@ -155,6 +155,9 @@ Reactor::Reactor(EngineImpl* impl, std::size_t index, std::shared_ptr<ReactorDri
     : m_impl(impl)
     , m_index(index)
     , m_driver(std::move(driver))
+    , m_contextLease(m_driver)
+    , m_serviceSeal(impl->SealToken())
+    , m_wakeHooks(impl->Hooks())
 {
 }
 
@@ -529,16 +532,7 @@ void Reactor::AdoptFdOnOwner(
         std::move(owner_record),
         m_impl->Hooks());
     auto core = std::make_shared<ConnCore>(state, std::move(descriptor), this, m_impl->Handler());
-    std::weak_ptr<Reactor> weak_self = weak_from_this();
-    std::weak_ptr<ConnCore> weak_core = core;
-    auto mark_dirty = [weak_self, weak_core] {
-        if (auto reactor = weak_self.lock()) {
-            if (auto conn = weak_core.lock()) {
-                reactor->MarkDirty(conn);
-            }
-        }
-    };
-    state->AttachOwner(mark_dirty);
+    state->AttachOwner(weak_from_this(), core);
     {
         std::lock_guard<std::mutex> lock(m_membersMutex);
         m_conns.emplace(id, DispatchEntry{core});
@@ -883,12 +877,27 @@ void Reactor::StartConnectSocketOnOwner(
     }
 }
 
-void Reactor::MarkDirty(const std::shared_ptr<ConnCore>& core)
+void Reactor::MarkDirty(const std::weak_ptr<ConnCore>& weakCore)
 {
-    if (!core || m_sealed.load() || m_impl->IsSealed()) {
+    // core 的 descriptor 析构需要 context。先取得它，并让它晚于临时 core 释放。
+    const auto contextLease = m_contextLease.lock();
+    if (!contextLease) {
         return;
     }
-    InvokeHook(HookPoint::AfterDirtyWeakLock);
+    if (const auto core = weakCore.lock()) {
+        MarkDirty(core);
+    }
+}
+
+void Reactor::MarkDirty(const std::shared_ptr<ConnCore>& core)
+{
+    // 业务线程持有的 Reactor 可能比 EngineImpl 活得更久。
+    if (!core || m_sealed.load() || m_serviceSeal->load(std::memory_order_acquire)) {
+        return;
+    }
+    if (m_wakeHooks) {
+        m_wakeHooks->InvokeOwner(HookPoint::AfterDirtyWeakLock, m_index);
+    }
     const auto id = core->Identity();
     {
         std::lock_guard<std::mutex> lock(m_membersMutex);

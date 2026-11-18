@@ -34,6 +34,7 @@ enum class HookPoint : std::size_t {
     BeforeOutputAppend,
     AfterAcceptStopPostFailure,
     DuringReadProtection,
+    BeforeOwnerWake,
     Count
 };
 enum class FaultPoint : std::size_t {

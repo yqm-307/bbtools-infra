@@ -3499,7 +3499,7 @@ static void RequestCloseWriteErrorIntent()
 {
     auto sealed = std::make_shared<std::atomic<bool>>(false);
     ConnectionState requested(1001, 64, 64, 4, sealed);
-    requested.AttachOwner([] {});
+    requested.AttachOwner({}, {});
     WriteProbe pending;
     CHECK(!TryAccept(requested, "pending", pending));
 
@@ -3538,7 +3538,7 @@ static void RequestCloseWriteErrorIntent()
     CHECK(pending.Query().error.value() == EPIPE);
 
     ConnectionState default_reason(1003, 64, 64, 4, sealed);
-    default_reason.AttachOwner([] {});
+    default_reason.AttachOwner({}, {});
     default_reason.RequestClose({});
     default_reason.RequestClose(reason);
     default_reason.MarkClosed(reason);
@@ -3554,7 +3554,7 @@ static void RequestCloseWriteErrorIntent()
     CHECK(no_owner.Closed() && no_owner.CloseRequested() && !no_owner.CloseReason());
 
     ConnectionState ordinary(1002, 64, 64, 4, sealed);
-    ordinary.AttachOwner([] {});
+    ordinary.AttachOwner({}, {});
     WriteProbe failed;
     CHECK(!TryAccept(ordinary, "pending", failed));
     ordinary.PumpWrites(1, 64, [](const std::string_view*, std::size_t, std::size_t) -> ssize_t {
@@ -3573,7 +3573,7 @@ static void SealedWriteErrorReadPublication()
     StartRuntime(1);
     auto sealed = std::make_shared<std::atomic<bool>>(false);
     ConnectionState state(1004, 64, 64, 4, sealed);
-    state.AttachOwner([] {});
+    state.AttachOwner({}, {});
     WriteProbe pending;
     CHECK(!TryAccept(state, "pending", pending));
     sealed->store(true);

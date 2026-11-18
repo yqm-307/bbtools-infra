@@ -45,6 +45,8 @@
 
 namespace bbt::infra::net {
 
+class OwnerWake;
+
 class ReceiveRing {
 public:
     struct AppendGrant {
@@ -54,10 +56,13 @@ public:
     };
 
     /**
-     * waiters 由所属连接或独立测试持有，必须覆盖本 ring 的整个寿命。
+     * waiters 和可选 ownerWake 均由调用者持有，必须覆盖本 ring 的整个寿命。
      */
     ReceiveRing(
-        std::size_t max_bytes, WaitSet& waiters, std::shared_ptr<TestHooks> hooks = std::make_shared<TestHooks>());
+        std::size_t max_bytes,
+        WaitSet& waiters,
+        std::shared_ptr<TestHooks> hooks = std::make_shared<TestHooks>(),
+        const OwnerWake* ownerWake = nullptr);
     ReceiveRing(const ReceiveRing&) = delete;
     ReceiveRing& operator=(const ReceiveRing&) = delete;
 
@@ -162,8 +167,6 @@ public:
 
     std::uint64_t AccessGeneration() const noexcept { return m_access_generation.load(std::memory_order_acquire); }
 
-    void SetOwnerWake(std::function<void()> wake);
-
     std::error_code ReadError() const;
 
     bool ReadEof() const noexcept { return m_eof.load(std::memory_order_acquire); }
@@ -219,8 +222,7 @@ private:
     std::atomic<std::uint64_t> m_access_generation{0};
     std::atomic<bool> m_raw_retry{false};
     WaitSet& m_waiters;
-    std::mutex m_wake_mutex;
-    std::shared_ptr<const std::function<void()>> m_owner_wake;
+    const OwnerWake* const m_ownerWake;
     std::atomic<bool> m_notify_pending{false};
     std::atomic<bool> m_wake_pending{false};
     std::shared_ptr<TestHooks> m_testHooks;

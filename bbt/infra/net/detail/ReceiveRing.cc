@@ -1,13 +1,17 @@
 #include <bbt/infra/net/detail/ReceiveRing.hpp>
 
+#include <bbt/infra/net/detail/OwnerWake.hpp>
+
 #include <bbt/infra/net/detail/CoInternal.hpp>
 
 namespace bbt::infra::net {
 
-ReceiveRing::ReceiveRing(std::size_t max_bytes, WaitSet& waiters, std::shared_ptr<TestHooks> hooks)
+ReceiveRing::ReceiveRing(
+    std::size_t max_bytes, WaitSet& waiters, std::shared_ptr<TestHooks> hooks, const OwnerWake* ownerWake)
     : m_ring(max_bytes)
     , m_max_bytes(max_bytes)
     , m_waiters(waiters)
+    , m_ownerWake(ownerWake)
     , m_testHooks(std::move(hooks))
 {
 }
@@ -376,17 +380,6 @@ void ReceiveRing::InvokeAfterAddHookForTest()
         m_testHooks->Invoke(HookPoint::AfterReadRegistered);
 }
 
-void ReceiveRing::SetOwnerWake(std::function<void()> wake)
-{
-
-    /**
-     * 启动期只构造一次稳定句柄；通知热路径仅复制 shared_ptr（不分配）。
-     */
-    auto handle = std::make_shared<const std::function<void()>>(std::move(wake));
-    std::lock_guard<std::mutex> lock(m_wake_mutex);
-    m_owner_wake = std::move(handle);
-}
-
 std::error_code ReceiveRing::ReadError() const
 {
     const std::uint64_t packed = m_error.load(std::memory_order_acquire);
@@ -481,25 +474,16 @@ ReadResult ReceiveRing::TerminalLocked() const
 
 void ReceiveRing::WakeOwnerOnly()
 {
-    std::shared_ptr<const std::function<void()>> owner_wake;
-    {
-        std::lock_guard<std::mutex> lock(m_wake_mutex);
-
-        /**
-         * shared_ptr copy：不分配
-         */
-        owner_wake = m_owner_wake;
-    }
-    if (owner_wake) {
-        try {
-            (*owner_wake)();
-        } catch (...) {
-
-            /**
-             * 可达推进责任：下次读/终态通知重试
-             */
-            m_wake_pending.store(true);
+    try {
+        if (m_testHooks) {
+            m_testHooks->Invoke(HookPoint::BeforeOwnerWake);
         }
+        if (m_ownerWake) {
+            m_ownerWake->Wake();
+        }
+    } catch (...) {
+        // 可达推进责任留给下一次读或终态通知重试。
+        m_wake_pending.store(true);
     }
 }
 
@@ -529,15 +513,6 @@ void ReceiveRing::NotifyRelease()
 
 void ReceiveRing::NotifyDataChanged()
 {
-    std::shared_ptr<const std::function<void()>> owner_wake;
-    {
-        std::lock_guard<std::mutex> lock(m_wake_mutex);
-
-        /**
-         * 不复制 std::function/不分配
-         */
-        owner_wake = m_owner_wake;
-    }
     if (m_testHooks && m_testHooks->TakeFault(FaultPoint::NotifyData)) {
 
         /**
@@ -551,13 +526,7 @@ void ReceiveRing::NotifyDataChanged()
             m_notify_pending.store(true);
         }
     }
-    if (owner_wake) {
-        try {
-            (*owner_wake)();
-        } catch (...) {
-            m_wake_pending.store(true);
-        }
-    }
+    WakeOwnerOnly();
 }
 
 std::shared_ptr<bbt::coroutine::sync::CoWaiter> ReceiveRing::CreateDataWaiter()

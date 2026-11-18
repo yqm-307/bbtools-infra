@@ -72,6 +72,7 @@ public:
     void CancelAllRequestedOnOwner();
 
     void MarkDirty(const std::shared_ptr<ConnCore>& core);
+    void MarkDirty(const std::weak_ptr<ConnCore>& core);
 
     void ArmHookForTest(HookPoint point, std::function<void()> hook, bool once)
     {
@@ -150,6 +151,9 @@ private:
     std::size_t m_index;
     std::mutex m_driver_mutex;
     std::shared_ptr<ReactorDriver> m_driver;
+    const std::weak_ptr<ReactorDriver> m_contextLease;
+    const std::shared_ptr<std::atomic<bool>> m_serviceSeal;
+    const std::shared_ptr<TestHooks> m_wakeHooks;
     std::atomic<bool> m_installed{false};
     std::atomic<bool> m_sealed{false};
     std::vector<std::shared_ptr<Listener>> m_listeners;
