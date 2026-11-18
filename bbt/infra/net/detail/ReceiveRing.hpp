@@ -53,7 +53,11 @@ public:
         std::error_code error;
     };
 
-    explicit ReceiveRing(std::size_t max_bytes, std::shared_ptr<TestHooks> hooks = std::make_shared<TestHooks>());
+    /**
+     * waiters 由所属连接或独立测试持有，必须覆盖本 ring 的整个寿命。
+     */
+    ReceiveRing(
+        std::size_t max_bytes, WaitSet& waiters, std::shared_ptr<TestHooks> hooks = std::make_shared<TestHooks>());
     ReceiveRing(const ReceiveRing&) = delete;
     ReceiveRing& operator=(const ReceiveRing&) = delete;
 
@@ -214,8 +218,7 @@ private:
     std::atomic<std::uint64_t> m_error{0};
     std::atomic<std::uint64_t> m_access_generation{0};
     std::atomic<bool> m_raw_retry{false};
-    WaitSet m_data_hub;
-    WaitSet m_release_hub;
+    WaitSet& m_waiters;
     std::mutex m_wake_mutex;
     std::shared_ptr<const std::function<void()>> m_owner_wake;
     std::atomic<bool> m_notify_pending{false};

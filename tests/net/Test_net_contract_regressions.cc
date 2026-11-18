@@ -353,7 +353,8 @@ static EngineConfig ServerConfig(const Address& listen, std::size_t subs = 1)
  */
 static void RingAllocNoConsume()
 {
-    ReceiveRing ring(256);
+    WaitSet ring_waiters;
+    ReceiveRing ring(256, ring_waiters);
     const std::string payload(64, 'z');
     CHECK(ring.TryAppend(payload).status == ReadStatus::Ok);
     CHECK(ring.Size() == payload.size());
@@ -839,7 +840,8 @@ static std::size_t CountFds()
 
 static void RingAppendFaultSharedOut()
 {
-    ReceiveRing ring(64);
+    WaitSet ring_waiters;
+    ReceiveRing ring(64, ring_waiters);
     CHECK(ring.TryAppend("abcdef").status == ReadStatus::Ok);
     const std::string original = "prefix";
     std::string out = original;
@@ -923,7 +925,8 @@ static void CoReadAppendFaultNonEmptyOut()
 
 static void BufferCopyConsumeFault()
 {
-    ReceiveRing ring(4096);
+    WaitSet ring_waiters;
+    ReceiveRing ring(4096, ring_waiters);
     const std::string payload(4096, 'a');
     CHECK(ring.TryAppend(payload).status == ReadStatus::Ok);
     Buffer out;
@@ -1807,7 +1810,8 @@ static void RingDeferredNonblockingTry()
 
 static void RingDeferredBackingReuse()
 {
-    ReceiveRing ring(1024);
+    WaitSet ring_waiters;
+    ReceiveRing ring(1024, ring_waiters);
     ring.ReserveDeferred(64);
     const std::string payload(32, 'a');
     for (int round = 0; round < 2; ++round) {
@@ -3808,7 +3812,8 @@ static void RequestCloseReadTerminalOrder()
 
 static void StageDetachedNotifyFaultNoDuplicate()
 {
-    ReceiveRing ring(64);
+    WaitSet ring_waiters;
+    ReceiveRing ring(64, ring_waiters);
     ring.ReserveDetached(8);
     ring.SetNotifyFaultOnceForTest();
 

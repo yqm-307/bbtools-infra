@@ -149,9 +149,9 @@ bbt::coroutine::WaitOptions Until(std::chrono::milliseconds duration)
  * 连续追加填满每个增长块，构造大量分段输入以覆盖动态段表。
  * ReceiveRing 不可移动（mutex+atomic），用 unique_ptr 返回。
  */
-std::unique_ptr<ReceiveRing> MakeSegmentedRing(std::string& expected)
+std::unique_ptr<ReceiveRing> MakeSegmentedRing(std::string& expected, WaitSet& waiters)
 {
-    auto ring = std::make_unique<ReceiveRing>(64 * 1024);
+    auto ring = std::make_unique<ReceiveRing>(64 * 1024, waiters);
     for (int i = 0; i < 5; ++i) {
         const std::string chunk((std::max<std::size_t>)(512, ring->Size() * 2), static_cast<char>('A' + i));
         BOOST_REQUIRE(ring->TryAppend(chunk).status == ReadStatus::Ok);
@@ -169,7 +169,8 @@ BOOST_AUTO_TEST_SUITE(net_copy_consume)
 BOOST_AUTO_TEST_CASE(multiple_segments_fifo)
 {
     std::string expected;
-    auto ring = MakeSegmentedRing(expected);
+    WaitSet waiters;
+    auto ring = MakeSegmentedRing(expected, waiters);
     Buffer out;
     BOOST_REQUIRE(out.WriteBytes("prefix"));
     const auto result = ring->TryCopyConsume(out);
@@ -240,7 +241,8 @@ BOOST_AUTO_TEST_CASE(busy_contention_zero_consume)
 
 BOOST_AUTO_TEST_CASE(quota_releases_immediately)
 {
-    ReceiveRing ring(64);
+    WaitSet ring_waiters;
+    ReceiveRing ring(64, ring_waiters);
     BOOST_REQUIRE(ring.TryAppend(std::string(64, 'q')).status == ReadStatus::Ok);
     BOOST_CHECK(ring.TryReserveForAppend(1).status == ReadStatus::WouldBlock);
     Buffer out;

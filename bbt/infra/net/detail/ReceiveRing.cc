@@ -4,9 +4,10 @@
 
 namespace bbt::infra::net {
 
-ReceiveRing::ReceiveRing(std::size_t max_bytes, std::shared_ptr<TestHooks> hooks)
+ReceiveRing::ReceiveRing(std::size_t max_bytes, WaitSet& waiters, std::shared_ptr<TestHooks> hooks)
     : m_ring(max_bytes)
     , m_max_bytes(max_bytes)
+    , m_waiters(waiters)
     , m_testHooks(std::move(hooks))
 {
 }
@@ -305,7 +306,7 @@ std::error_code ReceiveRing::Read(Buffer& out, const bbt::coroutine::WaitOptions
             InvokeWouldBlockBeforeWaiterHookForTest();
         }
         const auto wait = WaitChange(
-            busy ? m_release_hub : m_data_hub,
+            m_waiters,
             busy ? WaitLane::Release : WaitLane::Data,
             options,
             [&] {
@@ -506,7 +507,7 @@ void ReceiveRing::RetryPendingNotification()
 {
     if (m_notify_pending.exchange(false)) {
         try {
-            m_data_hub.Notify(WaitLane::Data);
+            m_waiters.Notify(WaitLane::Data);
         } catch (...) {
             m_notify_pending.store(true);
         }
@@ -523,7 +524,7 @@ void ReceiveRing::NotifyRelease()
     /**
      * Busy 等待者按代次复查
      */
-    m_release_hub.Notify(WaitLane::Release);
+    m_waiters.Notify(WaitLane::Release);
 }
 
 void ReceiveRing::NotifyDataChanged()
@@ -545,7 +546,7 @@ void ReceiveRing::NotifyDataChanged()
         m_notify_pending.store(true);
     } else {
         try {
-            m_data_hub.Notify(WaitLane::Data);
+            m_waiters.Notify(WaitLane::Data);
         } catch (...) {
             m_notify_pending.store(true);
         }
@@ -566,7 +567,7 @@ std::shared_ptr<bbt::coroutine::sync::CoWaiter> ReceiveRing::CreateDataWaiter()
 
 bool ReceiveRing::AddDataWaiter(const std::shared_ptr<bbt::coroutine::sync::CoWaiter>& waiter)
 {
-    return m_data_hub.Add(WaitLane::Data, waiter);
+    return m_waiters.Add(WaitLane::Data, waiter);
 }
 
 std::shared_ptr<bbt::coroutine::sync::CoWaiter> ReceiveRing::CreateReleaseWaiter()
@@ -576,7 +577,7 @@ std::shared_ptr<bbt::coroutine::sync::CoWaiter> ReceiveRing::CreateReleaseWaiter
 
 bool ReceiveRing::AddReleaseWaiter(const std::shared_ptr<bbt::coroutine::sync::CoWaiter>& waiter)
 {
-    return m_release_hub.Add(WaitLane::Release, waiter);
+    return m_waiters.Add(WaitLane::Release, waiter);
 }
 
 // clang-format off

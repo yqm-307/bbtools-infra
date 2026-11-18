@@ -66,7 +66,7 @@ ConnectionState::Write(std::string data, const bbt::coroutine::WaitOptions& opti
         if (Closed())
             return {0, make_error_code(NetErrc::Closed)};
         const auto wait = WaitChange(
-            m_write_hub,
+            m_waiters,
             WaitLane::Write,
             options,
             [&] { return CanAcceptWrite(wanted) || Closed(); },
@@ -90,7 +90,7 @@ ConnectionState::Write(std::string data, const bbt::coroutine::WaitOptions& opti
             if (sample.terminal)
                 return {sample.sent, sample.error};
             const auto wait = WaitChange(
-                m_write_hub,
+                m_waiters,
                 WaitLane::Write,
                 options,
                 [&] { return QueryWrite(result).terminal; },
@@ -119,7 +119,7 @@ std::error_code ConnectionState::WaitClosed(const bbt::coroutine::WaitOptions& o
         }
 
         const auto wait = WaitChange(
-            m_close_hub,
+            m_waiters,
             WaitLane::Close,
             options,
             [&] { return Closed(); },
@@ -220,7 +220,7 @@ ConnectionState::ConnectionState(
     std::shared_ptr<ReclaimRecord> owner_released,
     std::shared_ptr<TestHooks> hooks)
     : m_id(id)
-    , ring(inbound_max, hooks)
+    , ring(inbound_max, m_waiters, hooks)
     , m_queue(std::min<std::size_t>(outbound_max, 64 * 1024), outbound_max, max_ops)
     , m_outbound_max(outbound_max)
     , m_max_ops(max_ops)
@@ -278,7 +278,7 @@ std::error_code ConnectionState::SubmitWrite(std::string_view data, std::uint64_
     }
     lock.unlock();
     if (data.empty())
-        m_write_hub.Notify(WaitLane::Write);
+        m_waiters.Notify(WaitLane::Write);
     WakeOwner();
     return {};
 }
@@ -312,7 +312,7 @@ ConnectionState::CancelWrite(std::uint64_t id, WriteWait& waiter, std::error_cod
     }
     const auto result = std::make_tuple(waiter.sent, waiter.error);
     lock.unlock();
-    m_write_hub.Notify(WaitLane::Write);
+    m_waiters.Notify(WaitLane::Write);
     WakeOwner();
     return result;
 }
@@ -336,7 +336,7 @@ bool ConnectionState::TryPopTerminal(CompletedWrite& out)
         }
     }
     if (popped) {
-        m_write_hub.Notify(WaitLane::Write);
+        m_waiters.Notify(WaitLane::Write);
     }
     return popped;
 }
@@ -482,8 +482,8 @@ void ConnectionState::MarkClosed(std::error_code reason)
         m_read_closed_published = true;
     }
     if (notify || publish_read_closed) {
-        m_write_hub.Notify(WaitLane::Write);
-        m_close_hub.Notify(WaitLane::Close);
+        m_waiters.Notify(WaitLane::Write);
+        m_waiters.Notify(WaitLane::Close);
     }
     WakeOwner();
 }
@@ -517,7 +517,7 @@ std::error_code ConnectionState::LastWriteError(std::uint64_t* operation)
 
 bool ConnectionState::AddWriteWaiter(const std::shared_ptr<bbt::coroutine::sync::CoWaiter>& waiter)
 {
-    const bool added = m_write_hub.Add(WaitLane::Write, waiter);
+    const bool added = m_waiters.Add(WaitLane::Write, waiter);
     if (added) {
         if (m_testHooks)
             m_testHooks->Invoke(HookPoint::AfterWriteRegistered);
@@ -527,7 +527,7 @@ bool ConnectionState::AddWriteWaiter(const std::shared_ptr<bbt::coroutine::sync:
 
 bool ConnectionState::AddCloseWaiter(const std::shared_ptr<bbt::coroutine::sync::CoWaiter>& waiter)
 {
-    const bool added = m_close_hub.Add(WaitLane::Close, waiter);
+    const bool added = m_waiters.Add(WaitLane::Close, waiter);
     if (added) {
         if (m_testHooks)
             m_testHooks->Invoke(HookPoint::AfterCloseRegistered);

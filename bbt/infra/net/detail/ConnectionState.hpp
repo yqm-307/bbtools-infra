@@ -136,6 +136,10 @@ public:
 private:
     const std::uint64_t m_id;
 
+    /**
+     * 先于 ring 构造、晚于 ring 析构，读写四通道借用同一订阅锁。
+     */
+    WaitSet m_waiters;
     ReceiveRing ring;
 
     /**
@@ -258,8 +262,6 @@ private:
     std::shared_ptr<std::atomic<bool>> m_service_sealed;
     std::shared_ptr<ReclaimRecord> m_owner_released;
     std::shared_ptr<TestHooks> m_testHooks;
-    WaitSet m_write_hub;
-    WaitSet m_close_hub;
 };
 
 // clang-format off
