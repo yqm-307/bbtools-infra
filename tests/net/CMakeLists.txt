@@ -263,7 +263,8 @@ target_compile_options(Test_net_s5_reactor PRIVATE -Wall -Wextra -Wpedantic)
 target_link_options(Test_net_s5_reactor PRIVATE -rdynamic)
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/runtime")
 foreach(_case wake_registered_once wake_late_window wake_reactor_destroyed
-          wake_driver_unbound shutdownowner_stages)
+          wake_driver_unbound shutdownowner_stages shutdownowner_stage_faults
+          removeconn_dirty_window)
     add_test(NAME net.s5_${_case} COMMAND Test_net_s5_reactor ${_case})
     set_tests_properties(net.s5_${_case} PROPERTIES TIMEOUT 120 LABELS "unit"
         WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/runtime")

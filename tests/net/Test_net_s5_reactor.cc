@@ -14,6 +14,11 @@
  *   s5_shutdownowner_stages    ShutdownOwner 分段推进到 Finished、OnClose 恰
  *                              一、幂等；OnClose 抛出仍收口；CancelControl 不
  *                              回调且 owner 路径短路
+ *   s5_shutdownowner_stage_faults 每个 CloseStage 阶段注入故障后停在该阶段，
+ *                                 续推至 Finished，OnClose 恰一次；控制域不
+ *                                 伪造回调
+ *   s5_removeconn_dirty_window  AfterDirtyWeakLock 窗口内真实 RemoveConn，晚
+ *                                Wake 不入链、DirtyCount 归 0、不访问已拆对象
  */
 #define BOOST_TEST_NO_MAIN
 #define BOOST_TEST_ALTERNATIVE_INIT_API
@@ -28,6 +33,7 @@
 #include <bbt/infra/net/detail/ConnectionState.hpp>
 #include <bbt/infra/net/detail/EngineState.hpp>
 #include <bbt/infra/net/detail/EngineTestAccess.hpp>
+#include <bbt/infra/net/detail/TestHooks.hpp>
 #include <bbt/infra/net/detail/Reactor.hpp>
 #include <bbt/infra/net/detail/ReactorDriver.hpp>
 #include <bbt/infra/net/detail/ReclaimRecord.hpp>
@@ -243,6 +249,38 @@ struct ReactorDirect {
 };
 
 /* ----------------------------------------------------------------
+ * 直构 CloseStage 故障注入夹具：自备 TestHooks，FaultPoint 经 FailOnce
+ * 装入后，ConnCore::ShutdownOwner 在对应阶段一次性停住；再次调用从故障
+ * 阶段续做。直构夹具不启动 runtime，ShutdownOwner 及回调同步执行，
+ * 阶段边界可直接断言，不靠睡眠。
+ * ---------------------------------------------------------------- */
+struct StageFaultFixture {
+    std::shared_ptr<EngineImpl> impl;
+    std::shared_ptr<ReactorDriver> driver;
+    std::shared_ptr<Reactor> reactor;
+    std::shared_ptr<ReclaimRecord> reclaim;
+    std::shared_ptr<TestHooks> hooks;
+    std::shared_ptr<ConnectionState> state;
+    std::shared_ptr<ConnCore> core;
+    std::shared_ptr<CountingHandler> handler;
+
+    StageFaultFixture(std::shared_ptr<CountingHandler> h, std::shared_ptr<TestHooks> testHooks)
+        : hooks(std::move(testHooks))
+        , handler(std::move(h))
+    {
+        impl = std::make_shared<EngineImpl>(handler);
+        driver = std::make_shared<ReactorDriver>();
+        reactor = std::make_shared<Reactor>(impl.get(), 0, driver);
+        reclaim = std::make_shared<ReclaimRecord>(false);
+        state = std::make_shared<ConnectionState>(1, 4096, 1024, 4, impl->SealToken(), reclaim, hooks);
+        boost::asio::io_context ctx;
+        TcpWait desc(ctx);
+        core = std::make_shared<ConnCore>(state, std::move(desc), reactor.get(), handler);
+        state->AttachOwner(reactor, core);
+    }
+};
+
+/* ----------------------------------------------------------------
  * 直构用例：各断言同步成立
  * ---------------------------------------------------------------- */
 
@@ -329,6 +367,171 @@ static void S5ShutdownOwnerStages()
     CHECK(h3->onClose == 0);
 }
 
+/** CloseStage 各阶段注入一次故障：在故障阶段停住；下次 ShutdownOwner 从
+ * 故障阶段续做至 Finished，OnClose 恰好一次，不重复派发；控制域
+ * CancelControl 不回调，且已收口后 owner 推进短路，不伪造 OnClose。
+ * 直构，同步断言，不睡眠。
+ */
+static void S5ShutdownOwnerStageFaults()
+{
+    auto run_stage = [](FaultPoint point) {
+        auto hooks = std::make_shared<TestHooks>();
+        hooks->FailOnce(point);
+        StageFaultFixture fx(std::make_shared<CountingHandler>(), hooks);
+        fx.core->ShutdownOwner(kCloseReason);
+        // 第一次推进在注入阶段停住：未收口、未回调、未回收
+        CHECK(!fx.core->Closed());
+        CHECK(fx.handler->onClose == 0);
+        CHECK(!fx.state->OwnerReleased());
+        // 续推：从故障阶段重做，到 Finished，OnClose 恰好一次
+        fx.core->ShutdownOwner(kCloseReason);
+        CHECK(fx.core->Closed());
+        CHECK(fx.state->OwnerReleased());
+        CHECK(fx.handler->onClose == 1);
+        // 再次推进短路，不伪造重复回调
+        fx.core->ShutdownOwner(kCloseReason);
+        CHECK(fx.handler->onClose == 1);
+    };
+
+    // CloseStageHold / CloseBackend：前置阶段注入，state 终态尚未发布
+    run_stage(FaultPoint::CloseStageHold);
+    run_stage(FaultPoint::CloseBackend);
+
+    // PublishCloseState：backend 已物理关闭，state 终态尚未发布
+    {
+        auto hooks = std::make_shared<TestHooks>();
+        hooks->FailOnce(FaultPoint::PublishCloseState);
+        StageFaultFixture fx(std::make_shared<CountingHandler>(), hooks);
+        fx.core->ShutdownOwner(kCloseReason);
+        CHECK(!fx.core->Closed());
+        CHECK(!fx.state->Closed());
+        CHECK(fx.handler->onClose == 0);
+        fx.core->ShutdownOwner(kCloseReason);
+        CHECK(fx.core->Closed());
+        CHECK(fx.state->OwnerReleased());
+        CHECK(fx.handler->onClose == 1);
+    }
+
+    // DeliverCloseCallbacks：state 终态已发布，OnClose 尚未派发
+    {
+        auto hooks = std::make_shared<TestHooks>();
+        hooks->FailOnce(FaultPoint::DeliverCloseCallbacks);
+        StageFaultFixture fx(std::make_shared<CountingHandler>(), hooks);
+        fx.core->ShutdownOwner(kCloseReason);
+        CHECK(!fx.core->Closed());
+        CHECK(fx.state->Closed());
+        CHECK(fx.handler->onClose == 0);
+        CHECK(!fx.state->OwnerReleased());
+        fx.core->ShutdownOwner(kCloseReason);
+        CHECK(fx.core->Closed());
+        CHECK(fx.state->OwnerReleased());
+        CHECK(fx.handler->onClose == 1);
+    }
+
+    // PublishOwnerReleased：OnClose 已派发，回收尚未发布
+    {
+        auto hooks = std::make_shared<TestHooks>();
+        hooks->FailOnce(FaultPoint::PublishOwnerReleased);
+        StageFaultFixture fx(std::make_shared<CountingHandler>(), hooks);
+        fx.core->ShutdownOwner(kCloseReason);
+        CHECK(!fx.core->Closed());
+        CHECK(fx.state->Closed());
+        CHECK(fx.handler->onClose == 1);
+        CHECK(!fx.state->OwnerReleased());
+        fx.core->ShutdownOwner(kCloseReason);
+        CHECK(fx.core->Closed());
+        CHECK(fx.state->OwnerReleased());
+        CHECK(fx.handler->onClose == 1);
+    }
+
+    // 控制域 CancelControl：终结连接但不调用用户回调；后续 owner 推进
+    // 短路，不伪造 OnClose。
+    {
+        auto hooks = std::make_shared<TestHooks>();
+        StageFaultFixture fx(std::make_shared<CountingHandler>(), hooks);
+        fx.core->CancelControl();
+        CHECK(fx.core->Closed());
+        CHECK(fx.state->OwnerReleased());
+        CHECK(fx.handler->onClose == 0);
+        fx.core->ShutdownOwner(kCloseReason);
+        CHECK(fx.handler->onClose == 0);
+    }
+}
+
+/** AfterDirtyWeakLock 窗口内真实 RemoveConn：屏障命中后同步撤销登记再放行，
+ * 晚 Wake 不重复入链、DirtyCount 归 0、不访问已拆对象、进程不崩溃。
+ * 先由屏障钩子证明进入目标阶段；客户端断开使服务端读 EOF、核心析构
+ * 并回收，再提交晚 Wake 证明对已撤销核心的唤醒不入链；不睡眠。
+ */
+static void S5RemoveConnDirtyWindow()
+{
+    StartRuntime(2);
+
+    auto handler = std::make_shared<CountingHandler>();
+    Engine engine(handler);
+    // Idle 阶段预装 test_hooks：Running 后 owner 才创建，owner-hook 才分发到 reactor。
+    EngineTestAccess::SetDirtyBarrierOnce(engine, [] {});
+    EngineRunner runner(engine, ServerConfig(Loopback(0)));
+    CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 10000ms));
+
+    std::vector<Address> addresses;
+    CHECK(!engine.LocalAddresses(addresses));
+    CHECK(!addresses.empty());
+
+    bool ok = false;
+    NativeSocket client = ConnectClient(addresses[0], ok);
+    CHECK(ok);
+
+    CHECK(WaitUntil([&] { return handler->accepted.load() >= 1; }, 10000ms));
+
+    std::shared_ptr<Connection> conn;
+    {
+        std::lock_guard<std::mutex> lock(handler->mutex);
+        conn = handler->stored;
+    }
+    CHECK(conn);
+
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::atomic<bool> hook_entered{false};
+    std::atomic<bool> release{false};
+    std::atomic<bool> removed{false};
+
+    EngineTestAccess::SetDirtyBarrierOnce(engine, [&] {
+        removed = EngineTestAccess::RemoveConn(engine, conn->Id()); // 窗口内真实同步撤销登记
+        hook_entered = true; // 已取得 core shared，尚未登记入链（在 RemoveConn 之后置位，避免竞态）
+        std::unique_lock<std::mutex> lock(mtx);
+        cv.wait(lock, [&] { return release.load(); }); // 放行前扣住窗口
+    });
+
+    // Wake #1 阻塞于 AfterDirtyWeakLock 窗口；先证明进入目标阶段
+    CHECK(SendAll(client, "x", 5000ms));
+
+    CHECK(WaitUntil([&] { return hook_entered.load(); }, 10000ms));
+    CHECK(removed); // 登记在窗口内被同步撤销
+
+    // 放行：被扣住的 MarkDirty 续行发现登记已不在，不入链。
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        release = true;
+    }
+    cv.notify_all();
+
+    // 客户端断开：服务端读 EOF 后不再重发读注册，挂起的 weak 推进完成、
+    // 核心析构并回收，晚 Wake 不再访问已拆对象。
+    client.Close();
+    CHECK(WaitUntil([&] { return conn->Released(); }, 10000ms));
+
+    // 晚 Wake：核心已撤销/已析构，RequestClose -> WakeOwner -> MarkDirty
+    // 不得重复入链、不崩溃。
+    CHECK(!conn->Close());
+    CHECK(EngineTestAccess::DirtyCount(engine) == 0); // 归零，未重复入链
+    CHECK(handler->onClose == 0);                     // 未走 graceful 关闭回调
+
+    runner.CloseAndJoin();
+    CHECK(!runner.error);
+}
+
 /* ----------------------------------------------------------------
  * 端到端用例：真实 Engine + loopback TCP，竞态由屏障在目标阶段内制造
  * ---------------------------------------------------------------- */
@@ -357,7 +560,9 @@ static void S5WakeRegisteredOnce()
     bool ok = false;
     NativeSocket client = ConnectClient(addresses[0], ok);
     CHECK(ok);
+
     CHECK(WaitUntil([&] { return handler->accepted.load() >= 1; }, 10000ms));
+
     std::shared_ptr<Connection> conn;
     {
         std::lock_guard<std::mutex> lock(handler->mutex);
@@ -379,6 +584,7 @@ static void S5WakeRegisteredOnce()
     // Wake #1：服务端读入 'x' → NotifyDataChanged → WakeOwner → MarkDirty
     // → 阻塞于登记前。
     CHECK(SendAll(client, "x", 5000ms));
+
     CHECK(WaitUntil([&] { return hook_entered.load(); }, 10000ms));
 
     // Wake #2：同一连接 Close() → RequestClose → WakeOwner，在 Wake #1 登记前完成。
@@ -430,7 +636,9 @@ static void S5WakeLateWindow()
     bool ok = false;
     NativeSocket client = ConnectClient(addresses[0], ok);
     CHECK(ok);
+
     CHECK(WaitUntil([&] { return handler->accepted.load() >= 1; }, 10000ms));
+
     std::shared_ptr<Connection> conn;
     {
         std::lock_guard<std::mutex> lock(handler->mutex);
@@ -446,6 +654,7 @@ static void S5WakeLateWindow()
     });
 
     CHECK(SendAll(client, "x", 5000ms));
+
     CHECK(WaitUntil([&] { return hook_entered.load(); }, 10000ms)); // 进入目标阶段
 
     // 晚 Wake 不重复入链：脏链最终被收口清零，绝不出现第二条链节点。
@@ -472,6 +681,10 @@ static int RunCases(int argc, char** argv)
             S5WakeDriverUnbound();
         } else if (test == "shutdownowner_stages") {
             S5ShutdownOwnerStages();
+        } else if (test == "shutdownowner_stage_faults") {
+            S5ShutdownOwnerStageFaults();
+        } else if (test == "removeconn_dirty_window") {
+            S5RemoveConnDirtyWindow();
         } else {
             throw std::runtime_error("unknown test: " + test);
         }
