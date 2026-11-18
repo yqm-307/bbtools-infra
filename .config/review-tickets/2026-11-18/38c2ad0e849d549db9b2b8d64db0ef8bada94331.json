@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-18",
+  "commit": "38c2ad0e849d549db9b2b8d64db0ef8bada94331",
+  "base": "911b75f4eb427dec0165780eaee64d4ca86c77e5",
+  "result": "pass",
+  "reviewer": "Alice (协调者) + 独立审查 gpt-6-astra (deleg_42d8e0be) + 独立验收 deepseek-flash (deleg_8a570774)",
+  "summary": "net S3：删除三个运行配置额度副本；EngineImpl 字段归入 EngineControl/DriverBindings/ReactorSet/AcceptQueue/ConnectRegistry 并私有化，跨组件字段仍由原控制锁保护，经 EngineControl::Guard 凭证调用 ...Locked 方法；error 锁并入控制锁，停接纳改为 StopStage 阶段机。公共头、CMake、测试零 diff，零行为变更。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "未参与编写的审查者结论可合入：锁清单与范围不变；Guard 不可拷贝/移动、不泄露 mutex；...Locked 方法内不加锁、不通知、不回调、不解绑；首因与 LastError 行为不变；Close 锁内发布 service_sealed、锁外 SealService，顺序同基线；StopStage CAS 失败回滚不覆盖 Done。blocker 0 / major 0 / minor 2（design.md 在仓外；PublishSeal 为幂等公开方法）。",
+      "evidence": {
+        "reviewer": "gpt-6-astra (deleg_42d8e0be, 1052s)",
+        "report": "/home/yqm/.hermes/profiles/alice/reports/net-redesign/runs/review-s3.md",
+        "report_sha256": "9a92a49e008f5e103f1b00db97a902ac7c3e1c871cfb40589cc67bba7efc8213",
+        "scope": "911b75f..38c2ad0 三个提交、5 个文件"
+      }
+    },
+    {
+      "id": "tests",
+      "kind": "auto",
+      "status": "pass",
+      "summary": "独立验收干净重建（开 RPC/REDIS/HTTP）259/259，warning 仅基线 Test_net_foundation.cc:769 a_bound；ctest -j1 -LE live 末次 367/367。http.net.client_shutdown_interrupted_by_close 偶发失败经基线 911b75f 对照为既有竞争（满载各 1000 轮：S3 289 / 基线 288）。",
+      "evidence": {
+        "report": "/home/yqm/.hermes/profiles/alice/reports/net-redesign/runs/verify-s3.md",
+        "report_sha256": "4b65ad58bf9a02006150738ad9991cee03279fdccc5ffb7c6c71aef3b48dc9d2",
+        "baseline_ab": "/home/yqm/.hermes/profiles/alice/reports/net-redesign/runs/ab-shutdown-s3.md"
+      }
+    },
+    {
+      "id": "format",
+      "kind": "auto",
+      "status": "pass",
+      "summary": "5 个改动 C++ 文件 clang-format --dry-run --Werror 通过；git diff --check 通过。"
+    }
+  ]
+}
