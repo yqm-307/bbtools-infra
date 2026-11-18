@@ -27,7 +27,7 @@ class ConnCore;
 struct Listener;
 struct ConnectPending;
 struct EngineImpl;
-struct HandoffReservation;
+class HandoffReservation;
 
 void DetailNoteHandlerError(EngineImpl* impl);
 
@@ -49,97 +49,259 @@ struct ConnectPending {
     bool canceled{false};
 };
 
-/**
- * handoff 预留：先预留容量再 accept；析构未提交则释放预留。
- */
-struct HandoffReservation {
-    EngineImpl* impl{nullptr};
-    bool counted{false};
-    bool committed{false};
-    ~HandoffReservation();
+class AcceptQueue;
+class ConnectRegistry;
 
-    void Commit() { committed = true; }
+class HandoffReservation {
+public:
+    ~HandoffReservation();
+    HandoffReservation(const HandoffReservation&) = delete;
+    HandoffReservation& operator=(const HandoffReservation&) = delete;
+    void Commit();
+
+private:
+    friend class AcceptQueue;
+    HandoffReservation(AcceptQueue& queue, bool counted);
+    bool ConsumeCredit();
+    AcceptQueue* m_queue;
+    std::atomic<bool> m_credit;
 };
 
-struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
-    explicit EngineImpl(std::shared_ptr<RawHandler> raw_handler)
-        : handler(std::move(raw_handler))
-        , service_sealed(std::make_shared<std::atomic<bool>>(false))
-    {
-    }
+class EngineControl {
+public:
+    class Guard {
+    public:
+        explicit Guard(const EngineControl& control)
+            : m_lock(control.Lock())
+        {
+        }
 
-    std::shared_ptr<RawHandler> handler;
-    mutable std::mutex mutex;
+        Guard(const Guard&) = delete;
+        Guard& operator=(const Guard&) = delete;
+        Guard(Guard&&) = delete;
+        Guard& operator=(Guard&&) = delete;
+
+        void Wait(std::condition_variable& cv, const bool& close_requested)
+        {
+            cv.wait_for(m_lock, std::chrono::milliseconds(50), [&] { return close_requested; });
+        }
+
+    private:
+        std::unique_lock<std::mutex> m_lock;
+    };
+
+    Guard Acquire() const;
+    EnginePhase PhaseLocked(const Guard&) const;
+    void PublishPhaseLocked(const Guard&, EnginePhase value);
+    void RequestCloseLocked(const Guard&);
+    bool CloseRequestedLocked(const Guard&) const;
+    void FinishRunLocked(const Guard&);
+    bool RunFinishedLocked(const Guard&) const;
+    bool TryClaimRun();
+    void NotifyNative();
+    void NotifyNativeLocked(const Guard&);
+    void WaitCloseLocked(Guard& guard);
+    void PublishAddressesLocked(const Guard&, std::vector<Address> local);
+    std::vector<Address> AddressesLocked(const Guard&) const;
+    void PublishSeal();
+    std::shared_ptr<std::atomic<bool>> SealToken() const;
+    void NoteOwnerFailure();
+    bool OwnerFailed() const;
+    result<bool> WaitPhaseSlice(const bbt::coroutine::WaitOptions& options);
+    void NotifyPhaseWaiters() noexcept;
+    void RecordError(std::error_code error);
+    void NoteHandlerError();
+    std::size_t HandlerErrorCount() const;
+    std::error_code LastError() const;
+    void RecordControlFailure(std::exception_ptr failure);
+    std::exception_ptr LastFailure() const;
+    bool IsSealed() const;
+
+private:
+    std::unique_lock<std::mutex> Lock() const { return std::unique_lock<std::mutex>(m_mutex); }
+
+    mutable std::mutex m_mutex;
     std::condition_variable control_cv;
     EnginePhase phase{EnginePhase::Idle};
     bool close_requested{false};
-
-    /**
-     * 唯一控制门：false=未占用、true=Run 已占用（成功后不释放，禁止重开）。
-     */
     std::atomic<bool> control_claimed{false};
-
-    /**
-     * Run 已返回（含仍 Closing 的失败收口）
-     */
     bool run_finished{false};
-
-    /**
-     * Running/Stopped 发布点的 Co 唤醒位；等待者以 Phase 为持久谓词，
-     * 先通知后等待的丢唤醒窗口由登记后的谓词复查关闭。
-     */
     std::shared_ptr<bbt::coroutine::sync::CoWaiter> phase_signal = bbt::coroutine::sync::CoWaiter::Create();
-    std::shared_ptr<std::atomic<bool>> service_sealed;
-
-    void NotifyPhaseWaiters() noexcept
-    {
-        try {
-            if (phase_signal) {
-                phase_signal->Notify();
-            }
-        } catch (...) {
-        }
-    }
-
+    std::shared_ptr<std::atomic<bool>> service_sealed = std::make_shared<std::atomic<bool>>(false);
     mutable std::mutex error_mutex;
     std::error_code last_error;
     std::exception_ptr control_failure;
-
-    std::vector<DriverSlot> slots;
-
-    /**
-     * 解绑失败保留的责任
-     */
-    std::vector<DriverSlot> residual_slots;
-    std::vector<std::shared_ptr<Reactor>> reactors;
-    std::shared_ptr<Reactor> main_reactor;
-    std::vector<std::shared_ptr<Reactor>> subs;
     std::vector<Address> local_addresses;
+    std::atomic<bool> seal_error{false};
+    std::atomic<std::size_t> handler_errors{0};
+};
 
-    std::atomic<std::uint64_t> next_conn_id{1};
-    std::atomic<std::uint64_t> next_connect_id{1};
-    std::atomic<std::size_t> conn_count{0};
+class DriverBindings {
+public:
+    std::error_code Bind(std::size_t count, std::vector<DriverSlot>& out);
+    bool HasResidual() const;
+    std::vector<DriverSlot> TakeOwnedLocked(const EngineControl::Guard&);
+    void PublishLocked(const EngineControl::Guard&, std::vector<DriverSlot> value);
+    std::vector<DriverSlot> SnapshotLocked(const EngineControl::Guard&) const;
+    std::size_t CountLocked(const EngineControl::Guard&) const;
+    DriverSlot SlotLocked(const EngineControl::Guard&, std::size_t index) const;
+    std::error_code InjectFailureLocked(const EngineControl::Guard&);
+    void OwnerIdsLocked(
+        const EngineControl::Guard&,
+        bool has_main,
+        std::vector<std::uint64_t>& main,
+        std::vector<std::uint64_t>& subs) const;
+
+private:
+    std::vector<DriverSlot> slots;
+    std::vector<DriverSlot> residual_slots;
+};
+
+class ReactorSet {
+public:
+    void PublishBalancerLocked(const EngineControl::Guard&, std::unique_ptr<LoadBalancer> value);
+    void AddLocked(const EngineControl::Guard&, std::shared_ptr<Reactor> reactor);
+    void PublishLayoutLocked(const EngineControl::Guard&, bool server);
+    std::vector<std::shared_ptr<Reactor>> SnapshotLocked(const EngineControl::Guard&) const;
+    std::shared_ptr<Reactor> MainLocked(const EngineControl::Guard&) const;
+    bool HasSubsLocked(const EngineControl::Guard&) const;
+    std::vector<std::shared_ptr<Reactor>> SubsLocked(const EngineControl::Guard&) const;
+    void ClearLocked(const EngineControl::Guard&);
+    std::shared_ptr<Reactor> Select(
+        const Address& peer,
+        const std::vector<std::shared_ptr<Reactor>>& snapshot,
+        const std::atomic<std::uint64_t>& next_conn_id);
+
+private:
+    std::vector<std::shared_ptr<Reactor>> reactors;
+    std::size_t main_index{static_cast<std::size_t>(-1)};
+    std::size_t sub_begin{0};
+    std::size_t sub_count{0};
+    std::unique_ptr<LoadBalancer> balancer;
+    std::mutex balancer_mutex;
+};
+
+class ConnectOp : public std::enable_shared_from_this<ConnectOp> {
+public:
+    ConnectOp(
+        std::shared_ptr<Reactor> owner,
+        std::shared_ptr<ReclaimRecord> record,
+        bool awaitable,
+        const std::shared_ptr<TestHooks>& hooks);
+    bool Removable();
+    void DetachAfterPostFailure();
+    bool Seal();
+    void Notify();
+    void AuthorizeDelivery();
+    bool CancelRequested() const;
+    bool SettleReclaim();
+    ConnectTestSnapshot InspectForTest();
+    std::size_t OccupyWaitersForTest(std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>>& keep);
+    bool Complete(Connection connection, std::error_code result_error, bool raw);
+    std::error_code Wait(
+        ConnectRegistry& registry,
+        EngineImpl& engine,
+        std::uint64_t connect_id,
+        Connection& out,
+        const bbt::coroutine::WaitOptions& options);
+
+private:
+    std::mutex m_mutex;
+    bool m_done{false};
+    bool m_abandoned{false};
+    bool m_waiter_attached{false};
 
     /**
-     * 仅封监听/交接授权的停止：由 RequestStopAccepting 置位的不可逆 latch；
-     * accept_stop_done 仅在 owner 物理关闭全部本代 listener（或控制域同代
-     * 解绑后确认无 listener）后置位，才作为 AcceptingStopped 的凭据。
+     * raw handler 已真实交付（不得再由 WaitConnect 领取）
      */
+    bool m_raw_delivered{false};
+
+    /**
+     * 每个 op 只允许一个 WaitConnect 接收者
+     */
+    bool m_receiver_claimed{false};
+    std::atomic<bool> m_cancel_requested{false};
+
+    /**
+     * owner 已进入授权交付段（seal 不得抢先终态）
+     */
+    bool m_owner_delivering{false};
+    std::shared_ptr<Reactor> m_reactor;
+
+    /**
+     * 控制域兜底句柄：主标记沿 owner 捕获链在各真实 close 点置位；此处
+     * 副本仅供 Run 收口/析构兜底在 owner 链路未执行时补标记（幂等）。
+     */
+    std::shared_ptr<ReclaimRecord> m_reclaim;
+    Connection m_connection;
+    std::error_code m_error;
+    WakeHub m_hub;
+};
+
+class ConnectRegistry {
+public:
+    std::uint64_t NextIdLocked(const EngineControl::Guard&);
+    void RestrictCapacityLocked(const EngineControl::Guard&, std::size_t limit);
+    void RequestCancelRetry();
+    bool TakeCancelRetry();
+    void MaybeErase(std::uint64_t id, const std::shared_ptr<ConnectOp>& op);
+    void Seal();
+    void SettleReclaim();
+    std::error_code Insert(
+        std::uint64_t id,
+        const std::shared_ptr<Reactor>& reactor,
+        const std::shared_ptr<ReclaimRecord>& reclaim,
+        bool awaitable,
+        const std::shared_ptr<TestHooks>& hooks);
+    void RollbackPost(std::uint64_t id);
+    bool Complete(std::uint64_t id, Connection connection, std::error_code error, bool raw);
+    void AuthorizeDelivery(std::uint64_t id);
+    bool CancelRequested(std::uint64_t id);
+    std::error_code
+    Wait(EngineImpl& engine, std::uint64_t id, Connection& out, const bbt::coroutine::WaitOptions& options);
+    EngineTestSnapshot InspectForTest();
+    ConnectTestSnapshot InspectConnectForTest(std::uint64_t id);
+    std::size_t
+    OccupyWaitersForTest(std::uint64_t id, std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>>& keep);
+
+private:
+    std::shared_ptr<ConnectOp> Find(std::uint64_t id);
+    std::atomic<std::uint64_t> next_connect_id{1};
+    std::size_t connect_limit{1024};
+    std::atomic<bool> cancel_retry_needed{false};
+    std::mutex connect_mutex;
+    std::unordered_map<std::uint64_t, std::shared_ptr<ConnectOp>> connects;
+};
+
+class AcceptQueue {
+public:
+    AcceptQueue(EngineImpl& engine);
+    void EnableLocked(const EngineControl::Guard&, std::size_t capacity);
+    bool EnabledLocked(const EngineControl::Guard&) const;
+    bool Enabled() const;
+    bool RequestStop();
+    bool StopRequested() const;
+    bool Stopped() const;
+    bool TryMarkPosted();
+    void RestoreRequestedAfterPostFailure();
+    void MarkPhysicallyStopped();
+    void SetHooksLocked(const EngineControl::Guard&, const std::shared_ptr<TestHooks>& hooks);
+    void Seal();
+    void Notify();
+    void SealForStop();
+    bool AuthorizeDelivery();
+    bool TryBeginResume();
+    void FinishResume();
+    std::shared_ptr<HandoffReservation> TryReserveHandoff();
+    void ReleaseHandoffReservation();
+    bool CommitHandoff(Connection connection, const std::shared_ptr<HandoffReservation>& reservation);
+    std::error_code WaitAccepted(Connection& out, const bbt::coroutine::WaitOptions& options);
+
+private:
+    EngineImpl* m_engine;
     std::atomic<bool> accept_stop_requested{false};
     std::atomic<bool> accept_stop_posted{false};
     std::atomic<bool> accept_stop_done{false};
-
-    NormalizedOptions options;
-    std::unique_ptr<LoadBalancer> balancer;
-    std::mutex balancer_mutex;
-    std::size_t connect_limit{1024};
-    std::atomic<bool> cancel_retry_needed{false};
-
-    /**
-     * seal handler 捕获到异常
-     */
-    std::atomic<bool> seal_error{false};
-
     std::mutex handoff_mutex;
     std::deque<Connection> handoff;
     std::size_t handoff_capacity{0};
@@ -147,8 +309,102 @@ struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
     bool handoff_enabled{false};
     bool handoff_closed{false};
     std::atomic<bool> resume_pending{false};
-    std::shared_ptr<TestHooks> test_hooks;
     WakeHub accept_hub;
+};
+
+struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
+public:
+    explicit EngineImpl(std::shared_ptr<RawHandler> raw_handler);
+    std::error_code Close(const CloseOptions& options) noexcept;
+    void RequestStopAccepting() noexcept;
+    bool AcceptingStopped() const noexcept;
+    EnginePhase Phase() const noexcept;
+    std::error_code EnableAcceptHandoff(std::size_t capacity);
+    std::error_code Run(const EngineConfig& config);
+    std::error_code FinalizeNative();
+    std::error_code RunImpl(const EngineConfig& config);
+    std::error_code LocalAddresses(std::vector<Address>& out) const;
+    std::size_t CountConnections() const;
+    std::error_code
+    ReactorOwnerIds(std::vector<std::uint64_t>& main_owners, std::vector<std::uint64_t>& sub_owners) const;
+    result<void> CoWaitRunning(const bbt::coroutine::WaitOptions& options);
+    std::error_code CoWaitAccepted(Connection& out, const bbt::coroutine::WaitOptions& options);
+    std::error_code
+    CoWaitConnect(std::uint64_t connect_id, Connection& out, const bbt::coroutine::WaitOptions& options);
+    std::error_code StartConnect(
+        const Address& address,
+        std::uint64_t& out_connect_id,
+        bool awaitable,
+        const std::shared_ptr<ReclaimRecord>& reclaim = {});
+
+    std::shared_ptr<RawHandler> Handler() const { return handler; }
+
+    NormalizedOptions Options() const { return options; }
+
+    std::shared_ptr<TestHooks> Hooks() const { return test_hooks; }
+
+    std::shared_ptr<std::atomic<bool>> SealToken() const { return control.SealToken(); }
+
+    std::uint64_t NextConnectionId() { return next_conn_id.fetch_add(1, std::memory_order_relaxed); }
+
+    void AddConnection() { conn_count.fetch_add(1, std::memory_order_relaxed); }
+
+    void RemoveConnection()
+    {
+        if (conn_count.load() > 0)
+            conn_count.fetch_sub(1);
+    }
+
+    void PublishConnectionCount(std::size_t count) { conn_count.store(count); }
+
+    bool AcceptEnabled() const { return accepts.Enabled(); }
+
+    bool AcceptStopRequested() const { return accepts.StopRequested(); }
+
+    bool AuthorizeAccept() { return accepts.AuthorizeDelivery(); }
+
+    void AuthorizeConnect(std::uint64_t id) { connects.AuthorizeDelivery(id); }
+
+    bool ConnectCancelRequested(std::uint64_t id) { return connects.CancelRequested(id); }
+
+    std::shared_ptr<Reactor> MainReactor();
+    void ResumeAcceptIfFree();
+    std::shared_ptr<Reactor> PickSub(const Address& peer);
+    void TryPostAcceptStop(const std::shared_ptr<Reactor>& main);
+    void MarkAcceptStopDone();
+    void SealService();
+
+    std::shared_ptr<HandoffReservation> TryReserveHandoff() { return accepts.TryReserveHandoff(); }
+
+    bool CommitHandoff(Connection connection, const std::shared_ptr<HandoffReservation>& reservation)
+    {
+        return accepts.CommitHandoff(std::move(connection), reservation);
+    }
+
+    bool ResolveConnect(std::uint64_t id, Connection connection, std::error_code error)
+    {
+        return connects.Complete(id, std::move(connection), error, handler != nullptr);
+    }
+
+    void SettleAbandonedConnectReclaim() { connects.SettleReclaim(); }
+
+    void RecordError(std::error_code error) { control.RecordError(error); }
+
+    void NoteHandlerError() { control.NoteHandlerError(); }
+
+    std::size_t HandlerErrorCount() const { return control.HandlerErrorCount(); }
+
+    std::error_code LastError() const { return control.LastError(); }
+
+    void RecordControlFailure(std::exception_ptr error) { control.RecordControlFailure(std::move(error)); }
+
+    std::exception_ptr LastFailure() const { return control.LastFailure(); }
+
+    bool IsSealed() const { return control.IsSealed(); }
+
+    void NotifyPhaseWaiters() { control.NotifyPhaseWaiters(); }
+
+    int TakeConnectWaitStatus() { return test_hooks ? test_hooks->TakeConnectWaitStatus() : -1; }
 
     void InvokeHook(HookPoint point) const
     {
@@ -160,349 +416,17 @@ struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
 
     std::int64_t DelayCount(DelayPoint point) const { return test_hooks ? test_hooks->Delay(point).count() : 0; }
 
-    struct ConnectOp {
-        ConnectTestSnapshot InspectForTest()
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            return {true, done, receiver_claimed};
-        }
-
-        std::size_t OccupyWaitersForTest(std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>>& keep)
-        {
-            std::size_t added = 0;
-            for (std::size_t i = 0; i < WakeHub::kMaxWaiters + 1; ++i) {
-                auto waiter = hub.Create();
-                if (!hub.Add(waiter))
-                    break;
-                keep.push_back(std::move(waiter));
-                ++added;
-            }
-            return added;
-        }
-
-        std::mutex mutex;
-        bool done{false};
-        bool abandoned{false};
-        bool waiter_attached{false};
-
-        /**
-         * raw handler 已真实交付（不得再由 WaitConnect 领取）
-         */
-        bool raw_delivered{false};
-
-        /**
-         * 每个 op 只允许一个 WaitConnect 接收者
-         */
-        bool receiver_claimed{false};
-        std::atomic<bool> cancel_requested{false};
-
-        /**
-         * owner 已进入授权交付段（seal 不得抢先终态）
-         */
-        bool owner_delivering{false};
-        std::shared_ptr<Reactor> reactor;
-
-        /**
-         * 控制域兜底句柄：主标记沿 owner 捕获链在各真实 close 点置位；此处
-         * 副本仅供 Run 收口/析构兜底在 owner 链路未执行时补标记（幂等）。
-         */
-        std::shared_ptr<ReclaimRecord> reclaim;
-        Connection connection;
-        std::error_code error;
-        WakeHub hub;
-    };
-
-    std::mutex connect_mutex;
-    std::unordered_map<std::uint64_t, std::shared_ptr<ConnectOp>> connects;
-
-    std::atomic<std::size_t> handler_errors{0};
-
-    /**
-     * ---- service seal ----
-     */
-    void SealService()
-    {
-        if (service_sealed) {
-            service_sealed->store(true, std::memory_order_release);
-        }
-        std::deque<Connection> undelivered;
-        {
-            std::lock_guard<std::mutex> lock(handoff_mutex);
-            handoff_closed = true;
-
-            /**
-             * 关闭对 queue 与 inflight 共同封口
-             */
-            handoff_reserved = 0;
-            undelivered.swap(handoff);
-        }
-        for (auto& connection : undelivered) {
-            (void)connection.Close({}, std::make_error_code(std::errc::operation_canceled));
-        }
-        {
-
-            /**
-             * 不建临时 vector：同一 connect_mutex 下逐项结算并 Notify（不重入
-             * connect_mutex），避免 seal 前置路径的分配抛异常。
-             */
-            std::lock_guard<std::mutex> lock(connect_mutex);
-            for (auto& entry : connects) {
-                auto& op = entry.second;
-                {
-                    std::lock_guard<std::mutex> op_lock(op->mutex);
-                    if (op->done || op->owner_delivering) {
-
-                        /**
-                         * 已完成/已进入 owner 授权交付段：由原 owner 兑现终态。
-                         */
-                        continue;
-                    }
-                    op->done = true;
-                    op->error = std::make_error_code(std::errc::operation_canceled);
-                }
-                op->hub.NotifyAll();
-            }
-        }
-        accept_hub.NotifyAll();
-    }
-
-    /**
-     * ---- handoff reservation ----
-     */
-    std::shared_ptr<HandoffReservation> TryReserveHandoff()
-    {
-        std::lock_guard<std::mutex> lock(handoff_mutex);
-        if (handoff_closed || IsSealed()) {
-
-            /**
-             * RequestClose/Seal 与 accept 共门
-             */
-            return nullptr;
-        }
-        if (!handoff_enabled) {
-            auto reservation = std::make_shared<HandoffReservation>();
-            reservation->impl = this;
-            reservation->counted = false;
-            return reservation;
-        }
-        if (handoff_closed || handoff.size() + handoff_reserved >= handoff_capacity) {
-            return nullptr;
-        }
-        ++handoff_reserved;
-        auto reservation = std::make_shared<HandoffReservation>();
-        reservation->impl = this;
-        reservation->counted = true;
-        return reservation;
-    }
-
-    void ReleaseHandoffReservation()
-    {
-        {
-            std::lock_guard<std::mutex> lock(handoff_mutex);
-            if (handoff_closed) {
-                return;
-            }
-            if (handoff_reserved > 0) {
-                --handoff_reserved;
-            }
-        }
-        ResumeAcceptIfFree();
-    }
-
-    bool CommitHandoff(Connection connection, const std::shared_ptr<HandoffReservation>& reservation)
-    {
-        {
-            std::lock_guard<std::mutex> lock(handoff_mutex);
-            if (!handoff_enabled || handoff_closed) {
-                return false;
-            }
-            if (reservation) {
-
-                /**
-                 * 只扣减一次
-                 */
-                reservation->committed = true;
-            }
-            if (handoff_reserved > 0) {
-                --handoff_reserved;
-            }
-            handoff.push_back(std::move(connection));
-        }
-        accept_hub.NotifyAll();
-        return true;
-    }
-
-    void ResumeAcceptIfFree();
-
-    std::shared_ptr<ConnectOp> FindConnect(std::uint64_t id)
-    {
-        std::lock_guard<std::mutex> lock(connect_mutex);
-        const auto it = connects.find(id);
-        return it == connects.end() ? nullptr : it->second;
-    }
-
-    /**
-     * 同一 op 锁内仲裁「交付 / 回收」。返回是否已交付（raw 或等待者）。
-     */
-    bool ResolveConnect(std::uint64_t id, Connection connection, std::error_code error)
-    {
-        auto op = FindConnect(id);
-        if (!op) {
-            if (connection.Valid()) {
-                (void)connection.Close({}, std::make_error_code(std::errc::operation_canceled));
-            }
-            return false;
-        }
-        bool recycle = false;
-        bool delivered = false;
-        {
-            std::lock_guard<std::mutex> lock(op->mutex);
-            if (op->done) {
-
-                /**
-                 * 等待者已超时或已取消，本次完成的连接无人接收 → 回收已交付的 fd。
-                 */
-                recycle = connection.Valid();
-            } else if (op->abandoned && !op->waiter_attached && handler == nullptr) {
-                op->done = true;
-                op->error = std::make_error_code(std::errc::operation_canceled);
-                recycle = connection.Valid();
-            } else {
-                op->done = true;
-                op->connection = std::move(connection);
-                op->error = error;
-                if (handler != nullptr) {
-
-                    /**
-                     * raw 已真实交付：清可等待意图，raw-only 清理不被 Co 等待阻塞；
-                     * 也不得再由 WaitConnect 二次领取。
-                     */
-                    op->raw_delivered = true;
-                    op->waiter_attached = false;
-                }
-                delivered = true;
-            }
-        }
-        if (recycle) {
-            (void)connection.Close({}, std::make_error_code(std::errc::operation_canceled));
-        }
-        op->hub.NotifyAll();
-        MaybeEraseConnect(id, op);
-        return delivered;
-    }
-
-    void MaybeEraseConnect(std::uint64_t id, const std::shared_ptr<ConnectOp>& op)
-    {
-        bool erase = false;
-        {
-            std::lock_guard<std::mutex> lock(op->mutex);
-
-            /**
-             * 未转移且未释放的记录必须留在表内，等控制域收尾兜底补标记；
-             * 否则「lambda 未执行的提交」会随擦表丢失唯一可达的记录句柄。
-             */
-            erase = op->done && !op->waiter_attached && (!op->reclaim || op->reclaim->Released());
-        }
-        if (!erase) {
-            return;
-        }
-        std::lock_guard<std::mutex> lock(connect_mutex);
-        const auto it = connects.find(id);
-        if (it != connects.end() && it->second == op) {
-
-            /**
-             * 完成且无人等待：释放活动登记
-             */
-            connects.erase(it);
-        }
-    }
-
-    /**
-     * 控制域收尾兜底（幂等）：仅在 unbind/FinalizeControl 之后调用——此刻
-     * owner 链路不再执行；FinalizeControl 已显式关闭 pending descriptor、
-     * delivery holder 和连接 backend，不依赖异步捕获或 context 的最终析构。
-     * 因此未转移的建连记录此刻已无真实 fd，才可补标记为释放；
-     * 已完结且无人等待的表项随后正常擦除，保持活动登记语义不变。
-     */
-    void SettleAbandonedConnectReclaim()
-    {
-        std::lock_guard<std::mutex> lock(connect_mutex);
-        for (auto it = connects.begin(); it != connects.end();) {
-            auto& op = it->second;
-            {
-                std::lock_guard<std::mutex> op_lock(op->mutex);
-                MarkReclaimReleased(op->reclaim);
-            }
-            bool removable = false;
-            {
-                std::lock_guard<std::mutex> op_lock(op->mutex);
-                removable = op->done && !op->waiter_attached;
-            }
-            it = removable ? connects.erase(it) : std::next(it);
-        }
-    }
-
-    void RecordError(std::error_code error)
-    {
-        if (!error) {
-            return;
-        }
-        std::lock_guard<std::mutex> lock(error_mutex);
-        if (!last_error) {
-            last_error = error;
-        }
-    }
-
-    void NoteHandlerError()
-    {
-
-        /**
-         * 用户原始回调异常：隔离并计数，不升级为 engine/ driver 故障，
-         * 不影响其它终态/关闭回调兑现。
-         */
-        handler_errors.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    std::size_t HandlerErrorCount() const { return handler_errors.load(std::memory_order_relaxed); }
-
-    std::error_code LastError() const
-    {
-        std::lock_guard<std::mutex> lock(error_mutex);
-        return last_error;
-    }
-
-    void RecordControlFailure(std::exception_ptr failure)
-    {
-        std::lock_guard<std::mutex> lock(error_mutex);
-        if (!control_failure) {
-            control_failure = std::move(failure);
-        }
-    }
-
-    std::exception_ptr LastFailure() const
-    {
-        std::lock_guard<std::mutex> lock(error_mutex);
-        return control_failure;
-    }
-
-    std::shared_ptr<Reactor> PickSub(const Address& peer);
-
-    bool IsSealed() const { return service_sealed && service_sealed->load(std::memory_order_acquire); }
-
-    /**
-     * 仅在 owner 物理关闭全部本代 listener，或控制域同代同步解绑后确认无
-     * listener 时置位；幂等、可重入，并唤醒 AcceptingStopped 观测者。
-     */
-    void TryPostAcceptStop(const std::shared_ptr<Reactor>& main);
-
-    void MarkAcceptStopDone()
-    {
-        accept_stop_done.store(true, std::memory_order_release);
-        std::lock_guard<std::mutex> lock(mutex);
-        control_cv.notify_all();
-    }
-
 private:
+    std::shared_ptr<RawHandler> handler;
+    EngineControl control;
+    DriverBindings bindings;
+    ReactorSet owners;
+    AcceptQueue accepts;
+    ConnectRegistry connects;
+    std::atomic<std::uint64_t> next_conn_id{1};
+    std::atomic<std::size_t> conn_count{0};
+    NormalizedOptions options;
+    std::shared_ptr<TestHooks> test_hooks;
     friend class Engine;
     std::error_code InjectDriverFailureForTest();
     void RestrictConnectCapacityForTest(std::size_t limit);
