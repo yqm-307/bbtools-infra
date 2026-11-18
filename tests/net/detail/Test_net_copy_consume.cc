@@ -218,7 +218,7 @@ BOOST_AUTO_TEST_CASE(busy_contention_zero_consume)
     auto state = MakeState(1024);
     BOOST_REQUIRE(state->AppendReceived("xyz").status == ReadStatus::Ok);
     std::size_t wakes = 0;
-    state->AttachOwner([&] { ++wakes; });
+    state->ArmReadHookForTest(HookPoint::BeforeOwnerWake, [&] { ++wakes; });
     const auto generation = state->Inspect().access_generation;
     Buffer out;
     BOOST_REQUIRE(out.WriteBytes("keep"));

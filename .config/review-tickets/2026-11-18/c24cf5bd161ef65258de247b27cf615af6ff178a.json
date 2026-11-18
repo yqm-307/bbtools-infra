@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-18",
+  "commit": "c24cf5bd161ef65258de247b27cf615af6ff178a",
+  "base": "4ce7951b47b341dbae6ad952540d6da2fc27f93c",
+  "result": "pass",
+  "reviewer": "Alice (协调者) + 独立审查 gpt-6.2-astra (r1 deleg_f26f02fa, r2 deleg_5bc852c0, r3 deleg_8e5581ba, r4 deleg_d38f887b) + 独立验收 deepseek-flash (deleg_b88af373)",
+  "summary": "net S5：Reactor dirty 锁与 registry 锁合为一把成员锁，派发账目移入 Reactor 自持的 DispatchEntry，ConnCore 不再有 dirty 字段；OwnerWake 在连接发布前弱绑定一次，ReceiveRing 去掉 wake 锁与每次 std::function 分配并保留补偿；CloseStage 取代四个关闭 bool。新增 7 个 net.s5_* 确定性交错用例与 detail/ 私有测试入口。公共直接头与 CMake 公共导出零 diff；EngineTestAccess::RemoveConn 读 m_impl + EngineImpl friend 为用户批准的测试入口豁免。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "四轮独立审查：生产路径无新增 UAF、无成员锁与 driver 锁嵌套、无重复 OnClose；r1–r3 指出的测试夹具寿命、过期负例观测、socketpair 归属等问题经 qa3–qa5 修正，r4 定向复审判可合入，新问题 blocker 0 / major 0 / minor 0；r3 的 m_impl friend Major 按用户批准的测试入口豁免关闭。",
+      "evidence": {
+        "reviewer": "gpt-6.2-astra (deleg_d38f887b, 157s)",
+        "report": "/home/yqm/.hermes/profiles/alice/reports/net-redesign/runs/review-s5-r4.md",
+        "report_sha256": "b900b715f3f24a01332a4d1352e3a57b684874bff4ecbe6905ae47daf31d1e4b",
+        "scope": "4ce7951..c24cf5b 十一个提交（实现 3、私有测试入口 2、测试 6）；r4 只核 d499bbf..c24cf5b 的 r3 遗留项"
+      }
+    },
+    {
+      "id": "tests",
+      "kind": "auto",
+      "status": "pass",
+      "summary": "独立验收干净重建（开 RPC/REDIS/HTTP）262/262，warning 仅基线 Test_net_foundation.cc:769 a_bound；ctest -j1 -LE live 381/381（374 基线 + 7 新增）；既有测试 0 处断言增删改。",
+      "evidence": {
+        "report": "/home/yqm/.hermes/profiles/alice/reports/net-redesign/runs/verify-s5.md",
+        "report_sha256": "e6516f6495eaec35223d660d88cf64fb7c1c90efeb6279328a387849a7631bdd"
+      }
+    },
+    {
+      "id": "perf",
+      "kind": "auto",
+      "status": "pass",
+      "summary": "H5 Release 对照 4ce7951：吞吐 B/A co M1 +0.80%、co M2 +0.47%、raw R1 +0.65%，均在 A/A 噪声内无退化；p99 判 INCONCLUSIVE（按 8192 reservoir 计算，M1/R1 同臂噪声 >5%）；54/54 次 ok。",
+      "evidence": {
+        "report": "/home/yqm/.hermes/profiles/alice/reports/net-redesign/runs/perf-s5-h5.md",
+        "report_sha256": "40ce80da7bbee9c07674a1a3cc2eb3847db87721dff112d32b9bd8a94337fe58"
+      }
+    },
+    {
+      "id": "format",
+      "kind": "auto",
+      "status": "pass",
+      "summary": "20 个改动 C++ 文件 clang-format --dry-run --Werror 通过；git diff --check 通过。"
+    }
+  ]
+}

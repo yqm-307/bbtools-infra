@@ -105,7 +105,7 @@ void Engine::ClearConnectInjectionForTest()
 
 void EngineImpl::PrepareHooksForTest()
 {
-    // 所有 fixture 在 Run 发布 Reactor 前调用 ClearConnectInjection 完成装配。
+    // Run 夹具通过 ClearConnectInjection 装配；直构夹具须在构造 Reactor 前显式装配。
     // 后续 setter 只修改 TestHooks 内部槽，连接持有的 shared_ptr 始终不变。
     if (!test_hooks) {
         auto guard = control.Acquire();
@@ -146,6 +146,21 @@ EngineTestSnapshot EngineImpl::InspectForTest()
             snapshot.m_firstFd = owner->FirstConnFd();
     }
     return snapshot;
+}
+
+bool EngineImpl::RemoveConnForTest(std::uint64_t id)
+{
+    std::vector<std::shared_ptr<Reactor>> reactors;
+    {
+        auto guard = control.Acquire();
+        reactors = owners.SnapshotLocked(guard);
+    }
+    for (auto& reactor : reactors) {
+        if (reactor->RemoveConnForTest(id)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 ConnectTestSnapshot EngineImpl::InspectConnectForTest(std::uint64_t id)

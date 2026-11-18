@@ -72,6 +72,7 @@ public:
     void CancelAllRequestedOnOwner();
 
     void MarkDirty(const std::shared_ptr<ConnCore>& core);
+    void MarkDirty(const std::weak_ptr<ConnCore>& core);
 
     void ArmHookForTest(HookPoint point, std::function<void()> hook, bool once)
     {
@@ -108,6 +109,7 @@ public:
     std::size_t DirtyCount();
     std::size_t RecvHoldBytes();
     int FirstConnFd();
+    bool RemoveConnForTest(std::uint64_t id);
 
     void InvokeReadAppendHook() { InvokeHook(HookPoint::AfterReceiveBeforeAppend); }
 
@@ -144,11 +146,15 @@ private:
     void RemoveConn(const std::shared_ptr<ConnCore>& core);
     void PumpOwner();
     void PumpAllConnsOwner();
+    void _SealMembers();
 
     EngineImpl* m_impl;
     std::size_t m_index;
     std::mutex m_driver_mutex;
     std::shared_ptr<ReactorDriver> m_driver;
+    const std::weak_ptr<ReactorDriver> m_contextLease;
+    const std::shared_ptr<std::atomic<bool>> m_serviceSeal;
+    const std::shared_ptr<TestHooks> m_wakeHooks;
     std::atomic<bool> m_installed{false};
     std::atomic<bool> m_sealed{false};
     std::vector<std::shared_ptr<Listener>> m_listeners;
@@ -163,11 +169,17 @@ private:
      * 不能靠 driver/context 最后一个强引用析构来证明物理关闭。
      */
     std::vector<std::shared_ptr<FdHandle>> m_delivery_fds;
-    std::mutex m_mutex;
-    std::unordered_map<std::uint64_t, std::shared_ptr<ConnCore>> m_conns;
-    std::mutex m_dirty_mutex;
-    ConnCore* m_dirty_head{nullptr};
-    ConnCore* m_dirty_tail{nullptr};
+
+    struct DispatchEntry {
+        std::shared_ptr<ConnCore> core;
+        std::uint64_t next{0};
+        bool queued{false};
+    };
+
+    std::mutex m_membersMutex;
+    std::unordered_map<std::uint64_t, DispatchEntry> m_conns;
+    std::uint64_t m_dirtyHead{0};
+    std::uint64_t m_dirtyTail{0};
 
     /**
      * owner-only

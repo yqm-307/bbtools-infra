@@ -38,6 +38,7 @@
 #include <bbt/infra/net/Error.hpp>
 #include <bbt/infra/net/Types.hpp>
 #include <bbt/infra/net/detail/OutboundQueue.hpp>
+#include <bbt/infra/net/detail/OwnerWake.hpp>
 #include <bbt/infra/net/detail/ReclaimRecord.hpp>
 #include <bbt/infra/net/detail/ReceiveRing.hpp>
 #include <bbt/infra/net/detail/WaitSet.hpp>
@@ -102,7 +103,7 @@ public:
 
     std::uint64_t Id() const noexcept { return m_id; }
 
-    void AttachOwner(const std::function<void()>& wake);
+    void AttachOwner(std::weak_ptr<Reactor> reactor, std::weak_ptr<ConnCore> core);
     ReadResult TryRead(std::string& out);
     std::error_code TryRead(Buffer& out);
     ReadView View();
@@ -114,6 +115,9 @@ public:
     ReadResult AppendReceived(std::string_view data);
     bool DeferReceived(std::string_view data);
     bool PreserveCloseTail(std::string_view data);
+
+    TestHooks* Hooks() const noexcept { return m_testHooks.get(); }
+
     void FinishRead(std::error_code error = {});
     bool TakeReadRetry();
     ReadResult CopyConsume(Buffer& out);
@@ -137,15 +141,11 @@ private:
     const std::uint64_t m_id;
 
     /**
-     * 先于 ring 构造、晚于 ring 析构，读写四通道借用同一订阅锁。
+     * ring 借用 m_waiters 与 m_ownerWake，二者均须晚于 ring 析构。
      */
     WaitSet m_waiters;
+    OwnerWake m_ownerWake;
     ReceiveRing ring;
-
-    /**
-     * owner 设置：把本连接加入可达推进集合
-     */
-    std::function<void()> owner_dirty;
 
 public:
     /**

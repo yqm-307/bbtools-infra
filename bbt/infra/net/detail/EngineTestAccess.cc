@@ -3,9 +3,15 @@
 #include <utility>
 
 #include <bbt/infra/net/Engine.hpp>
+#include <bbt/infra/net/detail/EngineState.hpp>
 #include <bbt/infra/net/detail/TestHooks.hpp>
 
 namespace bbt::infra::net {
+
+bool EngineTestAccess::RemoveConn(Engine& engine, std::uint64_t id)
+{
+    return engine.m_impl->RemoveConnForTest(id);
+}
 
 void EngineTestAccess::ArmFault(Engine& engine, FaultPoint point)
 {

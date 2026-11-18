@@ -85,6 +85,7 @@ ConnCore::ConnCore(
     std::shared_ptr<ConnectionState> state, TcpWait descriptor, Reactor* owner, std::shared_ptr<RawHandler> handler)
     : m_state(std::move(state))
     , m_desc(std::move(descriptor))
+    , m_observedFd(m_desc.native_handle())
     , m_owner(owner)
     , m_handler(std::move(handler))
 {
@@ -98,11 +99,8 @@ ConnCore::~ConnCore()
      * 释放；若核心仍带未关 fd 被析构（异常/收口竞态），这里显式关闭并标记，
      * 不把「released」留给 native 对象析构的隐式时序。
      */
-    if (!m_backend_closed) {
-        boost::system::error_code ignored;
-        m_desc.cancel(ignored);
-        m_desc.close(ignored);
-        m_backend_closed = true;
+    if (m_closeStage < CloseStage::BackendClosed) {
+        _CloseBackend();
     }
     m_state->MarkOwnerReleased();
 }
@@ -117,14 +115,30 @@ std::size_t ConnCore::RecvHold() const
     return m_recv_hold.load(std::memory_order_acquire);
 }
 
-bool ConnCore::Closed() const
+void ConnCore::SeedRecvHoldForTest(std::string_view bytes)
 {
-    return m_closed;
+    if (bytes.empty() || bytes.size() > kReadChunk) {
+        throw std::invalid_argument("recv hold seed must fit in one read chunk");
+    }
+    if (m_recv_buf || m_closeStage != CloseStage::Open) {
+        throw std::logic_error("recv hold seed requires a fresh ConnCore");
+    }
+
+    auto buffer = std::make_unique<char[]>(kReadChunk);
+    m_state->PrepareReceiveStorage(kReadChunk);
+    std::memcpy(buffer.get(), bytes.data(), bytes.size());
+    m_recv_buf = std::move(buffer);
+    m_recv_hold.store(bytes.size(), std::memory_order_release);
 }
 
-int ConnCore::Fd()
+bool ConnCore::Closed() const
 {
-    return m_desc.native_handle();
+    return m_closeStage >= CloseStage::Finished;
+}
+
+int ConnCore::Fd() const noexcept
+{
+    return m_observedFd.load(std::memory_order_acquire);
 }
 
 void ConnCore::StartOwner()
@@ -147,7 +161,7 @@ void ConnCore::StartOwner()
 
 void ConnCore::PumpOwner()
 {
-    if (m_closed) {
+    if (Closed()) {
         return;
     }
     if (m_state->CloseRequested()) {
@@ -191,93 +205,91 @@ bool ConnCore::StageHoldToRing()
     return true;
 }
 
+void ConnCore::_CloseBackend()
+{
+    boost::system::error_code ignored;
+    m_desc.cancel(ignored);
+    m_desc.close(ignored);
+    m_observedFd.store(-1, std::memory_order_release);
+}
+
+bool ConnCore::_PublishCloseState(std::error_code reason, TestHooks* hooks)
+{
+    if (m_closeStage == CloseStage::Open) {
+        if ((hooks && hooks->TakeFault(FaultPoint::CloseStageHold)) || !StageHoldToRing()) {
+            // 保留尚未转入 state 的已收字节，让下一次关闭重试。
+            return false;
+        }
+        m_closeStage = CloseStage::HoldStaged;
+    }
+    if (m_closeStage == CloseStage::HoldStaged) {
+        if (hooks && hooks->TakeFault(FaultPoint::CloseBackend)) {
+            return false;
+        }
+        _CloseBackend();
+        m_closeStage = CloseStage::BackendClosed;
+    }
+    if (m_closeStage == CloseStage::BackendClosed) {
+        if (hooks && hooks->TakeFault(FaultPoint::PublishCloseState)) {
+            return false;
+        }
+        // hold 已进入 state，才发布读终态及结算写。
+        m_state->MarkClosed(reason);
+        m_closeStage = CloseStage::StatePublished;
+    }
+    return true;
+}
+
 void ConnCore::ShutdownOwner(std::error_code reason)
 {
-    if (m_closed) {
+    if (Closed()) {
         return;
     }
-
-    /**
-     * 测试：stage 之前
-     */
     m_owner->InvokeShutdownBarrier();
-    if (!m_backend_closed) {
-        if (!StageHoldToRing()) {
-
-            /**
-             * 不丢已 recv 字节；下次 owner 推进重试
-             */
+    auto* const hooks = m_state->Hooks();
+    if (!_PublishCloseState(reason, hooks)) {
+        return;
+    }
+    if (m_closeStage == CloseStage::StatePublished) {
+        if (hooks && hooks->TakeFault(FaultPoint::DeliverCloseCallbacks)) {
             return;
         }
-        boost::system::error_code ignored;
-        m_desc.cancel(ignored);
-        m_desc.close(ignored);
-        m_backend_closed = true;
+        reason = m_state->CloseReason();
+        DeliverTerminalOwner();
+        if (m_handler) {
+            Connection connection(m_state);
+            m_owner->SafeHandler([this, connection, reason] { m_handler->OnClose(connection, reason); });
+        }
+        m_closeStage = CloseStage::CallbacksDone;
     }
-    if (!m_ring_closed) {
-
-        /**
-         * hold 已在真源后才发布 EOF/结算写
-         */
-        m_state->MarkClosed(reason);
-        m_ring_closed = true;
+    if (hooks && hooks->TakeFault(FaultPoint::PublishOwnerReleased)) {
+        return;
     }
-    reason = m_state->CloseReason();
-    DeliverTerminalOwner();
-    if (m_handler && !m_onclose_done) {
-        Connection connection(m_state);
-        m_owner->SafeHandler([this, connection, reason] { m_handler->OnClose(connection, reason); });
-        m_onclose_done = true;
-    }
-    m_closed = true;
-
-    /**
-     * fd 已在上方 m_desc.close() 物理关闭，终态与 OnClose 责任已兑现：
-     * 此刻起本连接无存活物理资源责任。
-     */
+    // backend 已物理关闭，且 owner 的回调责任已兑现，才能发布回收。
+    m_closeStage = CloseStage::Finished;
     m_state->MarkOwnerReleased();
 }
 
 void ConnCore::CancelControl()
 {
-    if (m_closed) {
+    if (Closed() || !_PublishCloseState(std::make_error_code(std::errc::operation_canceled))) {
         return;
     }
-    if (!m_backend_closed) {
-        if (!StageHoldToRing()) {
-
-            /**
-             * 控制域失败也保留已 recv 字节，不静默丢
-             */
-            return;
-        }
-        boost::system::error_code ignored;
-        m_desc.cancel(ignored);
-        m_desc.close(ignored);
-        m_backend_closed = true;
-    }
-    if (!m_ring_closed) {
-        m_state->MarkClosed(std::make_error_code(std::errc::operation_canceled));
-        m_ring_closed = true;
-    }
-    m_closed = true;
-
-    /**
-     * 控制域不调用户回调：fd 已物理关闭且内部责任收口，标记释放。
-     */
+    // 同步解绑后控制域独占，终结连接时跳过用户回调。
+    m_closeStage = CloseStage::CallbacksSkipped;
     m_state->MarkOwnerReleased();
 }
 
 void ConnCore::ArmReadOwner()
 {
-    if (m_read_waiting || m_read_stopped || m_closed) {
+    if (m_read_waiting || m_read_stopped || Closed()) {
         return;
     }
     m_read_waiting = true;
     auto self = shared_from_this();
     m_desc.async_wait(TcpWait::wait_read, [self](const boost::system::error_code& error) {
         self->m_read_waiting = false;
-        if (self->m_closed) {
+        if (self->Closed()) {
             return;
         }
         if (error) {
@@ -298,14 +310,14 @@ void ConnCore::ArmReadOwner()
 
 void ConnCore::ArmWriteOwner()
 {
-    if (m_write_waiting || m_closed) {
+    if (m_write_waiting || Closed()) {
         return;
     }
     m_write_waiting = true;
     auto self = shared_from_this();
     m_desc.async_wait(TcpWait::wait_write, [self](const boost::system::error_code& error) {
         self->m_write_waiting = false;
-        if (self->m_closed) {
+        if (self->Closed()) {
             return;
         }
         if (error) {
@@ -360,7 +372,7 @@ bool ConnCore::SubmitReceivedOwner(const char* data, std::size_t size)
 
 void ConnCore::DoReadsOwner()
 {
-    if (m_closed || m_read_paused || m_read_stopped || !m_recv_buf) {
+    if (Closed() || m_read_paused || m_read_stopped || !m_recv_buf) {
         return;
     }
     bool notified = false;
@@ -494,7 +506,7 @@ void ConnCore::NotifyReadOwner()
 
 void ConnCore::PumpWritesOwner()
 {
-    if (m_closed) {
+    if (Closed()) {
         return;
     }
     auto sink = [this](const std::string_view* views, std::size_t count, std::size_t budget) -> ssize_t {
@@ -502,7 +514,7 @@ void ConnCore::PumpWritesOwner()
     };
     const auto result = m_state->PumpWrites(kWriteRounds, kWriteByteBudget, sink);
     DeliverTerminalOwner();
-    if (m_closed) {
+    if (Closed()) {
         return;
     }
     if (result.need_write_wait && m_state->HasPendingWrites()) {

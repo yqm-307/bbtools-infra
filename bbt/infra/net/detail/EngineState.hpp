@@ -417,6 +417,9 @@ public:
 
     std::int64_t DelayCount(DelayPoint point) const { return test_hooks ? test_hooks->Delay(point).count() : 0; }
 
+    // 仅测试装配：在 Idle 且尚未构造 Reactor 时串行调用，供 Reactor 快照钩子槽。
+    void PrepareHooksForTest();
+
 private:
     std::shared_ptr<RawHandler> handler;
     EngineControl control;
@@ -429,9 +432,11 @@ private:
     NormalizedOptions options;
     std::shared_ptr<TestHooks> test_hooks;
     friend class Engine;
+    friend class EngineTestAccess;
     std::error_code InjectDriverFailureForTest();
     void RestrictConnectCapacityForTest(std::size_t limit);
     struct EngineTestSnapshot InspectForTest();
+    bool RemoveConnForTest(std::uint64_t id);
     struct ConnectTestSnapshot InspectConnectForTest(std::uint64_t id);
     void DelayForTest(std::size_t point, std::chrono::milliseconds delay);
     void ArmHookForTest(std::size_t point, std::function<void()> hook, bool once);
@@ -441,7 +446,6 @@ private:
     void RequestOwnerPumpForTest();
     void OverrideWaitOnceForTest(int status);
     void ClearConnectInjectionForTest();
-    void PrepareHooksForTest();
 };
 
 std::error_code StartConnectImpl(

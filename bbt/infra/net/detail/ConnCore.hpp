@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <memory>
+#include <string_view>
 #include <bbt/infra/net/RawHandler.hpp>
 #include <bbt/infra/net/detail/ConnectionState.hpp>
 #include <bbt/infra/net/detail/EngineSupport.hpp>
@@ -27,23 +28,16 @@ public:
 
     std::size_t RecvHold() const;
 
+    // 仅供 owner 独占、未启动的直构夹具一次性注入非空尾字节，至多一个读块。
+    void SeedRecvHoldForTest(std::string_view bytes);
+
     bool Closed() const;
 
-    int Fd();
-
-    std::atomic<bool> m_dirty_queued{false};
-    ConnCore* m_dirty_next{nullptr};
-    bool m_dirty_linked{false};
+    int Fd() const noexcept;
 
     void StartOwner();
 
     void PumpOwner();
-
-    /**
-     * 关闭前把 m_recv_hold 以不取 ring 数据锁的方式转入 state 寿命的 detached；
-     * 失败则保留 hold 并返回 false（调用者本次不关闭，等下一次推进重试）。
-     */
-    bool StageHoldToRing();
 
     /**
      * owner：正常收口。分阶段幂等：stage hold → 关 backend → 发布读终态/结算写
@@ -58,6 +52,25 @@ public:
     void CancelControl();
 
 private:
+    enum class CloseStage {
+        Open,
+        HoldStaged,
+        BackendClosed,
+        StatePublished,
+        CallbacksDone,
+        Finished,
+        CallbacksSkipped
+    };
+
+    /**
+     * 关闭前把 m_recv_hold 以不取 ring 数据锁的方式转入 state 寿命的 detached；
+     * 失败则保留 hold 并返回 false（调用者本次不关闭，等下一次推进重试）。
+     */
+    bool StageHoldToRing();
+
+    void _CloseBackend();
+    bool _PublishCloseState(std::error_code reason, TestHooks* hooks = nullptr);
+
     void ArmReadOwner();
 
     void ArmWriteOwner();
@@ -78,6 +91,7 @@ private:
 
     std::shared_ptr<ConnectionState> m_state;
     TcpWait m_desc;
+    std::atomic<int> m_observedFd;
     Reactor* m_owner;
     std::shared_ptr<RawHandler> m_handler;
     bool m_read_waiting{false};
@@ -85,13 +99,8 @@ private:
     bool m_read_paused{false};
     bool m_read_stopped{false};
 
-    /**
-     * terminal done：OnWrite/OnClose 已兑现
-     */
-    bool m_closed{false};
-    bool m_backend_closed{false};
-    bool m_ring_closed{false};
-    bool m_onclose_done{false};
+    // owner 与同步解绑后的控制域独占推进，读取阶段也限于这两个执行域。
+    CloseStage m_closeStage{CloseStage::Open};
     std::unique_ptr<char[]> m_recv_buf;
     std::atomic<std::size_t> m_recv_hold{0};
 };
