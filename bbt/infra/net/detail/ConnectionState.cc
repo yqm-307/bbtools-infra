@@ -301,7 +301,7 @@ ConnectionState::CancelWrite(std::uint64_t id, WriteWait& waiter, std::error_cod
             m_writeIntervals.begin(), m_writeIntervals.end(), [id](const auto& write) { return write.id == id; });
         if (entry != m_writeIntervals.end()) {
             /**
-             * PumpWrites 的整个发送批次与终态发布均持同一写锁；取得锁后
+             * PumpWrites 的单轮发送与归属均持同一写锁；取得锁后
              * 没有在途发送。撤销槽在接纳时预留，撤销与解绑不分配也不抛。
              */
             m_queue.RevokeStreamRange(entry->begin + entry->sent, entry->end);

@@ -7,47 +7,51 @@ inline ConnectionState::SendResult
 ConnectionState::PumpWrites(std::size_t max_rounds, std::size_t byte_budget, Sink&& sink)
 {
     SendResult result;
-    {
+    for (std::size_t round = 0; round == 0 || (round < max_rounds && result.bytes < byte_budget); ++round) {
+        if (round != 0 && m_testHooks) {
+            m_testHooks->Invoke(HookPoint::BetweenWriteRounds);
+        }
         /**
-         * 撤销也取此锁：可能等待整个有界发送批次；取锁即无在途发送，
-         * GatherViews 的借用不跨解锁，返回的已发前缀因此为终值。
+         * 撤销取同一把锁：每次持锁只覆盖一轮发送及其归属，借用 views
+         * 不跨解锁；撤销取得锁时没有在途发送，已发前缀为终值。
          */
-        std::unique_lock<std::mutex> lock(m_write_mutex);
-        for (std::size_t round = 0; round < max_rounds && result.bytes < byte_budget; ++round) {
-            std::string_view views[kMaxViews];
-            const std::size_t count = m_queue.GatherViews(views, kMaxViews);
-            if (count == 0) {
-                break;
-            }
-            std::size_t offered = 0;
-            for (std::size_t i = 0; i < count; ++i) {
-                offered += views[i].size();
-            }
-            const std::size_t allowed = std::min(offered, byte_budget - result.bytes);
-            const ssize_t sent = sink(views, count, allowed);
-            if (sent > 0) {
-                m_queue.ConsumeSent(static_cast<std::size_t>(sent));
-                result.terminal_changed |= AttributeSentLocked(static_cast<std::size_t>(sent));
-                result.bytes += static_cast<std::size_t>(sent);
-
-                /**
-                 * 部分发送也释放字节额度
-                 */
-                result.capacity_freed = true;
-                continue;
-            }
-            if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                result.need_write_wait = true;
-                break;
-            }
-            if (sent < 0 && errno == EINTR) {
-                continue;
-            }
-            FailCurrentLocked(std::error_code(errno, std::system_category()));
-            result.terminal_changed = true;
+        std::lock_guard<std::mutex> lock(m_write_mutex);
+        result.terminal_changed |= (PendingCountLocked() != 0);
+        if (max_rounds == 0 || byte_budget == 0) {
             break;
         }
-        result.terminal_changed |= (PendingCountLocked() != 0);
+        std::string_view views[kMaxViews];
+        const std::size_t count = m_queue.GatherViews(views, kMaxViews);
+        if (count == 0) {
+            break;
+        }
+        std::size_t offered = 0;
+        for (std::size_t i = 0; i < count; ++i) {
+            offered += views[i].size();
+        }
+        const std::size_t allowed = std::min(offered, byte_budget - result.bytes);
+        const ssize_t sent = sink(views, count, allowed);
+        if (sent > 0) {
+            m_queue.ConsumeSent(static_cast<std::size_t>(sent));
+            result.terminal_changed |= AttributeSentLocked(static_cast<std::size_t>(sent));
+            result.bytes += static_cast<std::size_t>(sent);
+
+            /**
+             * 部分发送也释放字节额度
+             */
+            result.capacity_freed = true;
+            continue;
+        }
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            result.need_write_wait = true;
+            break;
+        }
+        if (sent < 0 && errno == EINTR) {
+            continue;
+        }
+        FailCurrentLocked(std::error_code(errno, std::system_category()));
+        result.terminal_changed = true;
+        break;
     }
 
     /**

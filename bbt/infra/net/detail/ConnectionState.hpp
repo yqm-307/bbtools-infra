@@ -170,7 +170,7 @@ public:
 
     /**
      * sink(views,count) 必须非阻塞，返回实际发送字节数或 -1（errno 表达）。
-     * 单次调用受 rounds 与 byte_budget 双重约束。
+     * 单次调用受 rounds 与 byte_budget 双重约束；每轮独立持锁。
      */
     template <class Sink> SendResult PumpWrites(std::size_t max_rounds, std::size_t byte_budget, Sink&& sink);
 
