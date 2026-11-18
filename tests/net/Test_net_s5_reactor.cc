@@ -17,8 +17,17 @@
  *   s5_shutdownowner_stage_faults 每个 CloseStage 阶段注入故障后停在该阶段，
  *                                 续推至 Finished，OnClose 恰一次；控制域不
  *                                 伪造回调
- *   s5_removeconn_dirty_window  AfterDirtyWeakLock 窗口内真实 RemoveConn，晚
+ *   s5_removeconn_dirty_window AfterDirtyWeakLock 窗口内真实 RemoveConn，晚
  *                                Wake 不入链、DirtyCount 归 0、不访问已拆对象
+ *
+ * 接缝缺口（记录于 net-s5r/qa3.md，不改产品代码、不放宽断言）：
+ *   - 直构夹具的 EngineImpl test_hooks 惰性初始化，Reactor 于构造时已将其
+ *     空快照进 m_wakeHooks，故 AfterDirtyWeakLock 钩子在直构夹具中不可装配；
+ *     wake_driver_unbound 的（b）「扣在钩子时解绑」只能做弱租约过期的
+ *     可观测子集，动态驻守分支需 product 侧装配入口。
+ *   - m_recv_hold 仅在 owner 读路径追加失败时写入，直构夹具现有公共接缝
+ *     无法确定性造 hold；shutdownowner_stage_faults 的「尾字节未移交」不以
+ *     RecvHold()>0 断言，改以 Fd()/RecvHold() 观测阶段边界。
  */
 #define BOOST_TEST_NO_MAIN
 #define BOOST_TEST_ALTERNATIVE_INIT_API
@@ -84,6 +93,21 @@ static bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milli
     }
     return predicate();
 }
+
+/** 屏障守卫：析构时先放行（release 并 notify），再由 runner 析构执行 join。
+ * 声明在屏障状态之后，故析构在 runner 之前；CHECK 抛异常时，正在
+ * cv.wait 的 owner 线程能被放行，避免与已析构的同步对象相遇或
+ * join 永久阻塞。 */
+struct BarrierGuard {
+    std::atomic<bool>& release;
+    std::condition_variable& cv;
+
+    ~BarrierGuard() noexcept
+    {
+        release.store(true, std::memory_order_release);
+        cv.notify_all();
+    }
+};
 
 Address Loopback(int port)
 {
@@ -186,9 +210,12 @@ struct CountingHandler : RawHandler {
 
     void OnAccept(Connection connection) override
     {
-        accepted.fetch_add(1);
+        std::shared_ptr<Connection> stored_connection = std::make_shared<Connection>(connection);
         std::lock_guard<std::mutex> lock(mutex);
-        stored = std::make_shared<Connection>(connection);
+        // 先在锁内发布句柄，再置就绪：accepted>=1 时必可读到非空 stored，
+        // 避免等待线程在句柄发布前拿到空句柄。
+        stored = std::move(stored_connection);
+        accepted.fetch_add(1, std::memory_order_release);
     }
 
     void OnRead(Connection) override {}
@@ -225,6 +252,9 @@ const std::error_code kCloseReason = std::make_error_code(std::errc::operation_c
  * 查找会失败；用来验证「取得 shared、未登记」的早退路径与寿命边界。
  * ---------------------------------------------------------------- */
 struct ReactorDirect {
+    /** io_context 先声明、后析构：须活到 core 及其 descriptor 析构之后，
+     * 避免 descriptor 析构时 service 已失效（与生产一致的 context 寿命）。 */
+    boost::asio::io_context ctx_;
     std::shared_ptr<EngineImpl> impl;
     std::shared_ptr<ReactorDriver> driver;
     std::shared_ptr<Reactor> reactor;
@@ -241,8 +271,7 @@ struct ReactorDirect {
         reactor = std::make_shared<Reactor>(impl.get(), 0, driver);
         reclaim = std::make_shared<ReclaimRecord>(false);
         state = std::make_shared<ConnectionState>(1, 4096, 1024, 4, impl->SealToken(), reclaim);
-        boost::asio::io_context ctx;
-        TcpWait desc(ctx);
+        TcpWait desc(ctx_); // 未分配 fd，供寿命边界测试使用
         core = std::make_shared<ConnCore>(state, std::move(desc), reactor.get(), h);
         state->AttachOwner(reactor, core);
     }
@@ -255,6 +284,7 @@ struct ReactorDirect {
  * 阶段边界可直接断言，不靠睡眠。
  * ---------------------------------------------------------------- */
 struct StageFaultFixture {
+    boost::asio::io_context ctx_; // 同上：先声明、后析构
     std::shared_ptr<EngineImpl> impl;
     std::shared_ptr<ReactorDriver> driver;
     std::shared_ptr<Reactor> reactor;
@@ -263,6 +293,8 @@ struct StageFaultFixture {
     std::shared_ptr<ConnectionState> state;
     std::shared_ptr<ConnCore> core;
     std::shared_ptr<CountingHandler> handler;
+    int m_ownFd{-1}; // descriptor 接管的 socketpair fd，析构时兜底关闭
+    int m_peer{-1};  // socketpair 对端 fd，析构时关闭
 
     StageFaultFixture(std::shared_ptr<CountingHandler> h, std::shared_ptr<TestHooks> testHooks)
         : hooks(std::move(testHooks))
@@ -273,10 +305,36 @@ struct StageFaultFixture {
         reactor = std::make_shared<Reactor>(impl.get(), 0, driver);
         reclaim = std::make_shared<ReclaimRecord>(false);
         state = std::make_shared<ConnectionState>(1, 4096, 1024, 4, impl->SealToken(), reclaim, hooks);
-        boost::asio::io_context ctx;
-        TcpWait desc(ctx);
+        int fds[2];
+        if (::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+            throw std::runtime_error("socketpair failed");
+        }
+        m_ownFd = fds[0];
+        m_peer = fds[1];
+        boost::system::error_code ec;
+        TcpWait desc(ctx_);
+        desc.assign(fds[0], ec);
+        if (ec) {
+            ::close(fds[0]);
+            ::close(fds[1]);
+            m_ownFd = -1;
+            m_peer = -1;
+            throw std::runtime_error("TcpWait::assign failed: " + ec.message());
+        }
         core = std::make_shared<ConnCore>(state, std::move(desc), reactor.get(), handler);
         state->AttachOwner(reactor, core);
+    }
+
+    ~StageFaultFixture()
+    {
+        if (m_peer >= 0) {
+            ::close(m_peer);
+            m_peer = -1;
+        }
+        if (m_ownFd >= 0) {
+            ::close(m_ownFd);
+            m_ownFd = -1;
+        }
     }
 };
 
@@ -306,30 +364,54 @@ static void S5WakeReactorDestroyed()
     CHECK(fx2.reactor->DirtyCount() == 0);
 }
 
-/** driver 解绑：跨域 Wake 的临时弱租约提升失败后不登记、不唤醒、不崩溃。 */
+/** driver 解绑与弱租约过期。
+ *
+ * (a) 租约已过期：夹具与 Reactor 均不再强持 driver，m_contextLease.lock()
+ *     失败，Wake 在 contextLease 检查（登记前钩子之前）即早退，不登记、
+ *     不唤醒；不保留 driver 强引用做观测，仅以 weak_ptr 观测租约。
+ * (b) 仅弱观察，不持 driver 强引用：Wake 调用期内 context 尚活，夹具
+ *     释放全部 driver 强引用后，Wake 退出时租约已过期。
+ *
+ * 直构，同步断言，不睡眠。注：直构夹具的 EngineImpl test_hooks 未经装配，
+ * AfterDirtyWeakLock 钩子槽为空（接缝缺口，见文件头说明），故（b）的
+ * 「扣在钩子时解绑」动态驻守分支在此不作动态断言，只保留可观测的弱
+ * 租约过期子集。
+ */
 static void S5WakeDriverUnbound()
 {
     auto h = std::make_shared<CountingHandler>();
     ReactorDirect fx(h);
 
-    // 驾驶员在线，核心未登记：Wake 取得 shared，登记查找失败，不入链，
-    // 也不唤醒驾驶员。
+    // 驱动在线，核心未登记：Wake 取得 shared，登记查找失败，不入链，也不唤醒。
     fx.state->WakeOwner();
     CHECK(fx.reactor->DirtyCount() == 0);
     CHECK(fx.driver->WakeCount() == 0);
 
-    // 解绑驾驶员：临时弱租约提升失败，Wake 更早早退，不动脏链也不唤醒。
-    fx.reactor->ReleaseDriver();
-    fx.state->WakeOwner();
-    CHECK(fx.reactor->DirtyCount() == 0);
-    CHECK(fx.driver->WakeCount() == 0);
+    // (a) 租约已过期：释放夹具与 Reactor 的全部 driver 强引用。
+    {
+        std::weak_ptr<ReactorDriver> lease = fx.driver;
+        fx.driver.reset();              // 释放夹具最后持有的强引用
+        fx.reactor->ReleaseDriver();    // 释放 Reactor 副本
+        CHECK(lease.lock() == nullptr); // 租约已过期；不保留 driver 强引用做观测
 
-    // 另一组实例：driver 先解绑后再 Wake，结果相同。
-    ReactorDirect fx2(h);
-    fx2.reactor->ReleaseDriver();
-    fx2.state->WakeOwner();
-    CHECK(fx2.reactor->DirtyCount() == 0);
-    CHECK(fx2.driver->WakeCount() == 0);
+        std::atomic<bool> hookEntered{false};
+        fx.reactor->ArmHookForTest(HookPoint::AfterDirtyWeakLock, [&] { hookEntered = true; }, true);
+        fx.state->WakeOwner(); // contextLease.lock() 失败，早退，不登记、不唤醒
+        CHECK(fx.reactor->DirtyCount() == 0);
+        CHECK(!hookEntered);   // 未到登记前钩子（直构夹具钩子槽为空，见文件头说明）
+    }
+
+    // (b) 仅弱观察，不保留 driver 强引用。
+    {
+        ReactorDirect fx2(h);
+        std::weak_ptr<ReactorDriver> weakDriver = fx2.driver;
+        fx2.state->WakeOwner(); // driver 尚强持：本次调用内 context 活
+        CHECK(weakDriver.lock() != nullptr);
+        fx2.driver.reset();
+        fx2.reactor->ReleaseDriver();
+        CHECK(weakDriver.lock() == nullptr); // 退出后租约过期
+        CHECK(fx2.reactor->DirtyCount() == 0);
+    }
 }
 
 /** ShutdownOwner：分段推进到 Finished，OnClose 恰一次，重复推进幂等；
@@ -367,52 +449,82 @@ static void S5ShutdownOwnerStages()
     CHECK(h3->onClose == 0);
 }
 
-/** CloseStage 各阶段注入一次故障：在故障阶段停住；下次 ShutdownOwner 从
+/** CloseStage 各阶段注入一次故障：在 stage 入口停住；下次 ShutdownOwner 从
  * 故障阶段续做至 Finished，OnClose 恰好一次，不重复派发；控制域
  * CancelControl 不回调，且已收口后 owner 推进短路，不伪造 OnClose。
  * 直构，同步断言，不睡眠。
+ *
+ * 前三个故障点以有效 fd（socketpair）与 RecvHold()/Fd() 观测区分阶段边界：
+ *   CloseStageHold：尾字节尚未移交，fd 仍活；
+ *   CloseBackend：hold 已移交（RecvHold 归零），fd 仍活；
+ *   PublishCloseState：fd 已物理关闭（Fd()==-1），state 终态尚未发布。
+ * 续推后尾字节恰转入 state 一次（RecvHold 归零，Closed、OwnerReleased、
+ * OnClose 恰 1）。
+ * 注：直构夹具现有公共接缝无法确定性注入 hold 字节（m_recv_hold 仅在
+ * owner 读路径的追加失败分支写入），故 RecvHold() 在此断言为 0；“尾字节
+ * 未移交”的字节级区分需 product 侧装配 hold 注入接缝（见 qa3.md）。
  */
 static void S5ShutdownOwnerStageFaults()
 {
-    auto run_stage = [](FaultPoint point) {
-        auto hooks = std::make_shared<TestHooks>();
-        hooks->FailOnce(point);
-        StageFaultFixture fx(std::make_shared<CountingHandler>(), hooks);
-        fx.core->ShutdownOwner(kCloseReason);
-        // 第一次推进在注入阶段停住：未收口、未回调、未回收
-        CHECK(!fx.core->Closed());
-        CHECK(fx.handler->onClose == 0);
-        CHECK(!fx.state->OwnerReleased());
-        // 续推：从故障阶段重做，到 Finished，OnClose 恰好一次
+    auto finish = [](StageFaultFixture& fx) {
         fx.core->ShutdownOwner(kCloseReason);
         CHECK(fx.core->Closed());
         CHECK(fx.state->OwnerReleased());
         CHECK(fx.handler->onClose == 1);
-        // 再次推进短路，不伪造重复回调
         fx.core->ShutdownOwner(kCloseReason);
-        CHECK(fx.handler->onClose == 1);
+        CHECK(fx.handler->onClose == 1); // 短路，不伪造重复回调
     };
 
-    // CloseStageHold / CloseBackend：前置阶段注入，state 终态尚未发布
-    run_stage(FaultPoint::CloseStageHold);
-    run_stage(FaultPoint::CloseBackend);
+    // CloseStageHold：在 hold 转入 state 前停住，fd 尚未关闭。
+    {
+        auto hooks = std::make_shared<TestHooks>();
+        hooks->FailOnce(FaultPoint::CloseStageHold);
+        StageFaultFixture fx(std::make_shared<CountingHandler>(), hooks);
+        fx.core->ShutdownOwner(kCloseReason);
+        // 第一次推进在注入阶段停住：未收口、无回调、无回收、state 终态未发布
+        CHECK(!fx.core->Closed());
+        CHECK(!fx.state->Closed());
+        CHECK(fx.handler->onClose == 0);
+        CHECK(!fx.state->OwnerReleased());
+        CHECK(fx.core->Fd() >= 0);       // fd 仍活
+        CHECK(fx.core->RecvHold() == 0); // 见上文 hold 注入缺口说明
+        finish(fx);                      // 续推至 Finished
+        CHECK(fx.core->Fd() == -1);      // 续推中 backend 已物理关闭
+    }
 
-    // PublishCloseState：backend 已物理关闭，state 终态尚未发布
+    // CloseBackend：hold 已移交，fd 仍活；续推中关闭 backend。
+    {
+        auto hooks = std::make_shared<TestHooks>();
+        hooks->FailOnce(FaultPoint::CloseBackend);
+        StageFaultFixture fx(std::make_shared<CountingHandler>(), hooks);
+        fx.core->ShutdownOwner(kCloseReason);
+        CHECK(!fx.core->Closed());
+        CHECK(!fx.state->Closed());
+        CHECK(fx.handler->onClose == 0);
+        CHECK(!fx.state->OwnerReleased());
+        CHECK(fx.core->Fd() >= 0);       // fd 仍活（_CloseBackend 未执行）
+        CHECK(fx.core->RecvHold() == 0); // hold 已转出
+        finish(fx);
+        CHECK(fx.core->Fd() == -1);
+    }
+
+    // PublishCloseState：backend 已物理关闭，state 终态尚未发布。
     {
         auto hooks = std::make_shared<TestHooks>();
         hooks->FailOnce(FaultPoint::PublishCloseState);
         StageFaultFixture fx(std::make_shared<CountingHandler>(), hooks);
         fx.core->ShutdownOwner(kCloseReason);
         CHECK(!fx.core->Closed());
-        CHECK(!fx.state->Closed());
+        CHECK(!fx.state->Closed()); // state 终态尚未发布
         CHECK(fx.handler->onClose == 0);
-        fx.core->ShutdownOwner(kCloseReason);
-        CHECK(fx.core->Closed());
-        CHECK(fx.state->OwnerReleased());
-        CHECK(fx.handler->onClose == 1);
+        CHECK(!fx.state->OwnerReleased());
+        CHECK(fx.core->Fd() == -1); // fd 已关
+        CHECK(fx.core->RecvHold() == 0);
+        finish(fx);
+        CHECK(fx.state->Closed());
     }
 
-    // DeliverCloseCallbacks：state 终态已发布，OnClose 尚未派发
+    // DeliverCloseCallbacks：state 终态已发布，OnClose 尚未派发。
     {
         auto hooks = std::make_shared<TestHooks>();
         hooks->FailOnce(FaultPoint::DeliverCloseCallbacks);
@@ -428,7 +540,7 @@ static void S5ShutdownOwnerStageFaults()
         CHECK(fx.handler->onClose == 1);
     }
 
-    // PublishOwnerReleased：OnClose 已派发，回收尚未发布
+    // PublishOwnerReleased：OnClose 已派发，回收尚未发布。
     {
         auto hooks = std::make_shared<TestHooks>();
         hooks->FailOnce(FaultPoint::PublishOwnerReleased);
@@ -496,6 +608,7 @@ static void S5RemoveConnDirtyWindow()
     std::atomic<bool> hook_entered{false};
     std::atomic<bool> release{false};
     std::atomic<bool> removed{false};
+    BarrierGuard guard{release, cv}; // 先放行再 join：异常时不挂 owner 于已析构的 CV
 
     EngineTestAccess::SetDirtyBarrierOnce(engine, [&] {
         removed = EngineTestAccess::RemoveConn(engine, conn->Id()); // 窗口内真实同步撤销登记
@@ -542,7 +655,8 @@ static void S5RemoveConnDirtyWindow()
  * 窗口并被屏障阻塞（已取得 shared，尚未登记）；测试线程再发起 Close()
  * 导致第二次 Wake 登记该核心；释放屏障后，第一次 Wake 重入发现已入链，
  * 不重复登记。阻塞期 driver 线程被占据，脏链不被泵走，DirtyCount 恒
- * 等于 1，确定性证明「重复 Wake 只入链一次」。 */
+ * 等于 1，确定性证明「重复 Wake 只入链一次」。
+ */
 static void S5WakeRegisteredOnce()
 {
     StartRuntime(2);
@@ -574,6 +688,7 @@ static void S5WakeRegisteredOnce()
     std::condition_variable cv;
     std::atomic<bool> hook_entered{false};
     std::atomic<bool> release{false};
+    BarrierGuard guard{release, cv}; // 先放行再 join：异常时不挂 owner 于已析构的 CV
 
     EngineTestAccess::SetDirtyBarrierOnce(engine, [&] {
         hook_entered = true; // 已取得 core shared，尚未登记
@@ -591,6 +706,8 @@ static void S5WakeRegisteredOnce()
     CHECK(!conn->Close());
 
     // 脏链必须恒等于 1：两次 Wake 只登记一条，绝不出现第二条链节点。
+    // Wake #1 阻塞于登记前钩子，Wake #2 完成唯一登记；屏障释放后，重入的
+    // Wake #1 发现已入链，不重复登记；泵后脏链归 0。
     CHECK(WaitUntil([&] { return EngineTestAccess::DirtyCount(engine) == 1; }, 10000ms));
     for (int i = 0; i < 2000; ++i) {
         CHECK(EngineTestAccess::DirtyCount(engine) <= 1);
