@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-18",
+  "commit": "3b73373db0435553b769c55a0c70fe53f34bfccf",
+  "base": "8f22ea9a7c6ff55fa3ce203b7373a9f31bcefa63",
+  "result": "pass",
+  "reviewer": "Alice (协调者) + 独立审查 gpt-6-astra (deleg_eecbabd0) + 独立验收 deepseek-flash (deleg_5403fcfd)",
+  "summary": "net S4：新增 detail/WaitSet 与 WaitChange 等价替换 WakeHub 并删除之；Read/Write/WaitClosed/CoDial/CoAccept 等待形态、登记复查顺序、钩子位置与错误映射不变；同一连接读/释放/写/关闭四通道共用一把等待锁，每通道仍 256 额度；新增 7 个 net.waitset_* 等待竞争用例；文档同步。公共头与 CMake 公共导出零 diff。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "未参与编写的审查者结论可合入：Notify 锁内有界快照、锁外唤醒；Remove 只删本次注册；四通道合锁后额度独立、锁内不跑谓词/hook/Notify；WaitSet 先于 ring 构造、晚于 ring 析构，无迟到 Notify UAF；错误映射不变。多 writer 接纳顺序不保证登记序，与基线 WakeHub 相同，判非缺陷。blocker 0 / major 0 / minor 2。",
+      "evidence": {
+        "reviewer": "gpt-6-astra (deleg_eecbabd0, 494s)",
+        "report": "/home/yqm/.hermes/profiles/alice/reports/net-redesign/runs/review-s4.md",
+        "report_sha256": "4848cfd4152c34a5b7b2a25e68790b357ce58a3610cd6ad6827ff26625b1b61c",
+        "scope": "8f22ea9..3b73373 四个提交（实现 2、测试 1、文档 1）"
+      }
+    },
+    {
+      "id": "tests",
+      "kind": "auto",
+      "status": "pass",
+      "summary": "独立验收干净重建（开 RPC/REDIS/HTTP）259/259，warning 仅基线 Test_net_foundation.cc:769 a_bound；ctest -j1 -LE live 374/374（367 基线 + 7 新增）。",
+      "evidence": {
+        "report": "/home/yqm/.hermes/profiles/alice/reports/net-redesign/runs/verify-s4.md",
+        "report_sha256": "cce90ab869d792b9420de8760c5651a7e98ee89f007636063fbc8c552e50a00b"
+      }
+    },
+    {
+      "id": "format",
+      "kind": "auto",
+      "status": "pass",
+      "summary": "16 个改动 C++ 文件 clang-format --dry-run --Werror 通过；git diff --check 通过；check_docs.py 通过。"
+    }
+  ]
+}
