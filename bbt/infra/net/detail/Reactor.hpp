@@ -75,14 +75,14 @@ public:
 
     void ArmHookForTest(HookPoint point, std::function<void()> hook, bool once)
     {
-        if (m_impl->test_hooks)
-            m_impl->test_hooks->ArmOwner(point, m_index, std::move(hook), once);
+        if (m_impl->Hooks())
+            m_impl->Hooks()->ArmOwner(point, m_index, std::move(hook), once);
     }
 
     void InvokeHook(HookPoint point)
     {
-        if (m_impl->test_hooks)
-            m_impl->test_hooks->InvokeOwner(point, m_index);
+        if (m_impl->Hooks())
+            m_impl->Hooks()->InvokeOwner(point, m_index);
     }
 
     void InvokeWriteReadyBarrier() { InvokeHook(HookPoint::BeforeWriteReadyPump); }

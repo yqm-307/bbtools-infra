@@ -173,7 +173,7 @@ std::size_t Reactor::ConnCount()
 
 std::size_t Reactor::ReadLowWater() const
 {
-    return m_impl->max_inbound_bytes / 2;
+    return m_impl->Options().max_inbound_bytes / 2;
 }
 
 std::error_code Reactor::InstallOnOwner(const std::vector<Address>& addresses)
@@ -185,7 +185,7 @@ std::error_code Reactor::InstallOnOwner(const std::vector<Address>& addresses)
         ts.tv_nsec = (install_delay % 1000) * 1000000L;
         (void)::syscall(SYS_nanosleep, &ts, nullptr);
     }
-    if (!addresses.empty() && m_impl->accept_stop_requested.load(std::memory_order_acquire)) {
+    if (!addresses.empty() && m_impl->AcceptStopRequested()) {
         return std::make_error_code(std::errc::operation_canceled);
     }
     if (m_installed.load()) {
@@ -197,7 +197,7 @@ std::error_code Reactor::InstallOnOwner(const std::vector<Address>& addresses)
         std::error_code error;
         NativeSocket socket = NativeSocket::Open(address.Family(), SocketType::Stream, error);
         if (!error) {
-            error = ApplyListenerOptions(socket, m_impl->options);
+            error = ApplyListenerOptions(socket, m_impl->Options());
         }
         if (!error) {
             error = socket.Bind(address);
@@ -239,7 +239,7 @@ std::error_code Reactor::InstallOnOwner(const std::vector<Address>& addresses)
         return first;
     }
     m_installed.store(true);
-    if (!addresses.empty() && m_impl->accept_stop_requested.load(std::memory_order_acquire)) {
+    if (!addresses.empty() && m_impl->AcceptStopRequested()) {
 
         /**
          * Run 前/安装中已封口：本次安装不得留存监听，把已打开的 fd 关闭、
@@ -268,8 +268,7 @@ std::vector<Address> Reactor::LocalAddresses() const
 
 void Reactor::ArmAcceptAll()
 {
-    if (!m_installed.load() || m_sealed.load() || m_impl->IsSealed()
-        || m_impl->accept_stop_requested.load(std::memory_order_acquire)) {
+    if (!m_installed.load() || m_sealed.load() || m_impl->IsSealed() || m_impl->AcceptStopRequested()) {
 
         /**
          * 接收域已独立封口：不再重挂监听
@@ -283,8 +282,7 @@ void Reactor::ArmAcceptAll()
 
 void Reactor::ArmAccept(const std::shared_ptr<Listener>& listener)
 {
-    if (!m_installed.load() || m_sealed.load() || m_impl->IsSealed()
-        || m_impl->accept_stop_requested.load(std::memory_order_acquire)) {
+    if (!m_installed.load() || m_sealed.load() || m_impl->IsSealed() || m_impl->AcceptStopRequested()) {
 
         /**
          * 封口后不再 arm，释放的预留由 Reservation 析构回收
@@ -352,7 +350,7 @@ void Reactor::DoAccept(const std::shared_ptr<Listener>& listener, std::shared_pt
         return;
     }
     FdHandle handle(fd);
-    if (m_impl->accept_stop_requested.load(std::memory_order_acquire)) {
+    if (m_impl->AcceptStopRequested()) {
 
         /**
          * fd 由 handle 析构物理关闭，预留随 reservation 析构释放，不重挂监听。
@@ -413,8 +411,9 @@ void Reactor::AdoptFdOnOwner(
              */
             (void)fd.Close();
             MarkReclaimReleased(reclaim);
-            if (m_impl->handler) {
-                SafeHandler([this, connect_id, error] { m_impl->handler->OnConnect(Connection(), error, connect_id); });
+            if (m_impl->Handler()) {
+                SafeHandler(
+                    [this, connect_id, error] { m_impl->Handler()->OnConnect(Connection(), error, connect_id); });
             }
             m_impl->ResolveConnect(connect_id, Connection(), error);
             FinishConnectCallback();
@@ -480,9 +479,9 @@ void Reactor::AdoptFdOnOwner(
         m_impl->RecordError(FromBoost(boost_error));
         if (is_connect) {
             MarkReclaimReleased(reclaim);
-            if (m_impl->handler) {
+            if (m_impl->Handler()) {
                 SafeHandler([this, connect_id, boost_error] {
-                    m_impl->handler->OnConnect(Connection(), FromBoost(boost_error), connect_id);
+                    m_impl->Handler()->OnConnect(Connection(), FromBoost(boost_error), connect_id);
                 });
             }
             m_impl->ResolveConnect(connect_id, Connection(), FromBoost(boost_error));
@@ -501,9 +500,9 @@ void Reactor::AdoptFdOnOwner(
         m_impl->RecordError(FromBoost(boost_error));
         if (is_connect) {
             MarkReclaimReleased(reclaim);
-            if (m_impl->handler) {
+            if (m_impl->Handler()) {
                 SafeHandler([this, connect_id, boost_error] {
-                    m_impl->handler->OnConnect(Connection(), FromBoost(boost_error), connect_id);
+                    m_impl->Handler()->OnConnect(Connection(), FromBoost(boost_error), connect_id);
                 });
             }
             m_impl->ResolveConnect(connect_id, Connection(), FromBoost(boost_error));
@@ -511,10 +510,10 @@ void Reactor::AdoptFdOnOwner(
         }
         return;
     }
-    if (const auto option_error = ApplyStreamOptions(descriptor.native_handle(), m_impl->options)) {
+    if (const auto option_error = ApplyStreamOptions(descriptor.native_handle(), m_impl->Options())) {
         m_impl->RecordError(option_error);
     }
-    const std::uint64_t id = m_impl->next_conn_id.fetch_add(1, std::memory_order_relaxed);
+    const std::uint64_t id = m_impl->NextConnectionId();
 
     /**
      * 责任转交：带句柄 CoDial 的记录原样随连接转入 owner 责任（不提前标释放）；
@@ -523,13 +522,13 @@ void Reactor::AdoptFdOnOwner(
     auto owner_record = reclaim ? reclaim : std::make_shared<ReclaimRecord>(false);
     auto state = std::make_shared<ConnectionState>(
         id,
-        m_impl->max_inbound_bytes,
-        m_impl->max_outbound_bytes,
-        m_impl->max_ops,
-        m_impl->service_sealed,
+        m_impl->Options().max_inbound_bytes,
+        m_impl->Options().max_outbound_bytes,
+        m_impl->Options().max_pending_events,
+        m_impl->SealToken(),
         std::move(owner_record),
-        m_impl->test_hooks);
-    auto core = std::make_shared<ConnCore>(state, std::move(descriptor), this, m_impl->handler);
+        m_impl->Hooks());
+    auto core = std::make_shared<ConnCore>(state, std::move(descriptor), this, m_impl->Handler());
     std::weak_ptr<Reactor> weak_self = weak_from_this();
     std::weak_ptr<ConnCore> weak_core = core;
     auto mark_dirty = [weak_self, weak_core] {
@@ -544,24 +543,11 @@ void Reactor::AdoptFdOnOwner(
         std::lock_guard<std::mutex> lock(m_mutex);
         m_conns.emplace(id, core);
     }
-    m_impl->conn_count.fetch_add(1, std::memory_order_relaxed);
+    m_impl->AddConnection();
     Connection connection(state);
 
     if (is_connect) {
-        if (auto pending_op = m_impl->FindConnect(connect_id)) {
-            std::lock_guard<std::mutex> lock(pending_op->mutex);
-
-            /**
-             * 授权交付段开始，seal 让位
-             */
-            pending_op->owner_delivering = true;
-
-            /**
-             * 责任已随连接转入 state（released 由连接收口标记）：清除 op 侧
-             * 兜底副本，让 op 按既有条件正常擦表，不影响连接期观察。
-             */
-            pending_op->reclaim = nullptr;
-        }
+        m_impl->AuthorizeConnect(connect_id);
 
         /**
          * 开始授权点：紧邻交付的同一原子检查（构造窗口内封口不启动成功回调）。
@@ -569,9 +555,9 @@ void Reactor::AdoptFdOnOwner(
         InvokePreAuthBarrier();
         if (m_impl->IsSealed()) {
             const auto canceled = std::make_error_code(std::errc::operation_canceled);
-            if (m_impl->handler) {
+            if (m_impl->Handler()) {
                 SafeHandler(
-                    [this, connect_id, canceled] { m_impl->handler->OnConnect(Connection(), canceled, connect_id); });
+                    [this, connect_id, canceled] { m_impl->Handler()->OnConnect(Connection(), canceled, connect_id); });
             }
             m_impl->ResolveConnect(connect_id, Connection(), canceled);
             core->CancelControl();
@@ -588,8 +574,8 @@ void Reactor::AdoptFdOnOwner(
             FinishConnectCallback();
             return;
         }
-        if (m_impl->handler) {
-            SafeHandler([this, connection, connect_id] { m_impl->handler->OnConnect(connection, {}, connect_id); });
+        if (m_impl->Handler()) {
+            SafeHandler([this, connection, connect_id] { m_impl->Handler()->OnConnect(connection, {}, connect_id); });
         }
         FinishConnectCallback();
     } else {
@@ -599,18 +585,14 @@ void Reactor::AdoptFdOnOwner(
          * 原子检查才与封口线性化。
          */
         InvokePreAuthBarrier();
-        bool authorized;
-        {
-            std::lock_guard<std::mutex> lock(m_impl->handoff_mutex);
-            authorized = !m_impl->handoff_closed && !m_impl->IsSealed();
-        }
+        const bool authorized = m_impl->AuthorizeAccept();
         if (!authorized) {
             core->CancelControl();
             RemoveConn(core);
             return;
         }
         InvokePostAuthBarrier();
-        if (m_impl->handoff_enabled && reservation) {
+        if (m_impl->AcceptEnabled() && reservation) {
             if (!m_impl->CommitHandoff(connection, reservation)) {
                 core->ShutdownOwner(std::make_error_code(std::errc::operation_canceled));
                 return;
@@ -622,8 +604,8 @@ void Reactor::AdoptFdOnOwner(
         /**
          * handoff 与 raw 不互吞：raw 有 handler 仍交付 OnAccept。
          */
-        if (m_impl->handler) {
-            SafeHandler([this, connection] { m_impl->handler->OnAccept(connection); });
+        if (m_impl->Handler()) {
+            SafeHandler([this, connection] { m_impl->Handler()->OnAccept(connection); });
         }
     }
     core->StartOwner();
@@ -641,9 +623,9 @@ void Reactor::BeginConnectOnOwner(
          * 尚未创建任何 fd：本次责任即时收口。
          */
         MarkReclaimReleased(reclaim);
-        if (m_impl->handler) {
+        if (m_impl->Handler()) {
             SafeHandler([this, connect_id] {
-                m_impl->handler->OnConnect(
+                m_impl->Handler()->OnConnect(
                     Connection(), std::make_error_code(std::errc::operation_canceled), connect_id);
             });
         }
@@ -673,9 +655,9 @@ void Reactor::BeginConnectOnOwner(
                  * 定时器真实失败：未创建 fd，责任即时收口。
                  */
                 MarkReclaimReleased(reclaim);
-                if (self->m_impl->handler) {
+                if (self->m_impl->Handler()) {
                     self->SafeHandler([self, connect_id, from_boost] {
-                        self->m_impl->handler->OnConnect(Connection(), from_boost, connect_id);
+                        self->m_impl->Handler()->OnConnect(Connection(), from_boost, connect_id);
                     });
                 }
                 self->m_impl->ResolveConnect(connect_id, Connection(), from_boost);
@@ -689,9 +671,9 @@ void Reactor::BeginConnectOnOwner(
                  * 占位被取消/封口：未创建 fd，责任即时收口。
                  */
                 MarkReclaimReleased(reclaim);
-                if (self->m_impl->handler) {
+                if (self->m_impl->Handler()) {
                     self->SafeHandler([self, connect_id, canceled] {
-                        self->m_impl->handler->OnConnect(Connection(), canceled, connect_id);
+                        self->m_impl->Handler()->OnConnect(Connection(), canceled, connect_id);
                     });
                 }
                 self->m_impl->ResolveConnect(connect_id, Connection(), canceled);
@@ -720,9 +702,9 @@ void Reactor::StartConnectSocketOnOwner(
          * 未创建 fd：责任即时收口。
          */
         MarkReclaimReleased(reclaim);
-        if (m_impl->handler) {
+        if (m_impl->Handler()) {
             SafeHandler([this, connect_id] {
-                m_impl->handler->OnConnect(
+                m_impl->Handler()->OnConnect(
                     Connection(), std::make_error_code(std::errc::operation_canceled), connect_id);
             });
         }
@@ -740,7 +722,7 @@ void Reactor::StartConnectSocketOnOwner(
     std::error_code error;
     NativeSocket socket = NativeSocket::Open(address.Family(), SocketType::Stream, error);
     if (!error) {
-        error = ApplyStreamOptions(socket.Fd(), m_impl->options);
+        error = ApplyStreamOptions(socket.Fd(), m_impl->Options());
     }
     if (!error) {
         error = socket.Connect(address);
@@ -761,8 +743,8 @@ void Reactor::StartConnectSocketOnOwner(
          */
         (void)socket.Close();
         MarkReclaimReleased(reclaim);
-        if (m_impl->handler) {
-            SafeHandler([this, connect_id, error] { m_impl->handler->OnConnect(Connection(), error, connect_id); });
+        if (m_impl->Handler()) {
+            SafeHandler([this, connect_id, error] { m_impl->Handler()->OnConnect(Connection(), error, connect_id); });
         }
         m_impl->ResolveConnect(connect_id, Connection(), error);
         FinishConnectCallback();
@@ -779,9 +761,9 @@ void Reactor::StartConnectSocketOnOwner(
          */
         ::close(fd);
         MarkReclaimReleased(reclaim);
-        if (m_impl->handler) {
+        if (m_impl->Handler()) {
             SafeHandler([this, connect_id, boost_error] {
-                m_impl->handler->OnConnect(Connection(), FromBoost(boost_error), connect_id);
+                m_impl->Handler()->OnConnect(Connection(), FromBoost(boost_error), connect_id);
             });
         }
         m_impl->ResolveConnect(connect_id, Connection(), FromBoost(boost_error));
@@ -815,9 +797,9 @@ void Reactor::StartConnectSocketOnOwner(
                     boost::system::error_code close_ignored;
                     descriptor->close(close_ignored);
                     MarkReclaimReleased(reclaim);
-                    if (self->m_impl->handler) {
+                    if (self->m_impl->Handler()) {
                         self->SafeHandler([self, connect_id] {
-                            self->m_impl->handler->OnConnect(
+                            self->m_impl->Handler()->OnConnect(
                                 Connection(), std::make_error_code(std::errc::operation_canceled), connect_id);
                         });
                     }
@@ -835,9 +817,9 @@ void Reactor::StartConnectSocketOnOwner(
                     boost::system::error_code close_ignored;
                     descriptor->close(close_ignored);
                     MarkReclaimReleased(reclaim);
-                    if (self->m_impl->handler) {
+                    if (self->m_impl->Handler()) {
                         self->SafeHandler([self, connect_id, error] {
-                            self->m_impl->handler->OnConnect(Connection(), error, connect_id);
+                            self->m_impl->Handler()->OnConnect(Connection(), error, connect_id);
                         });
                     }
                     self->m_impl->ResolveConnect(connect_id, Connection(), error);
@@ -854,9 +836,9 @@ void Reactor::StartConnectSocketOnOwner(
                     boost::system::error_code close_ignored;
                     descriptor->close(close_ignored);
                     MarkReclaimReleased(reclaim);
-                    if (self->m_impl->handler) {
+                    if (self->m_impl->Handler()) {
                         self->SafeHandler([self, connect_id, error] {
-                            self->m_impl->handler->OnConnect(Connection(), error, connect_id);
+                            self->m_impl->Handler()->OnConnect(Connection(), error, connect_id);
                         });
                     }
                     self->m_impl->ResolveConnect(connect_id, Connection(), error);
@@ -894,8 +876,8 @@ void Reactor::StartConnectSocketOnOwner(
         MarkReclaimReleased(reclaim);
         FinishConnectCallback();
         const auto error = std::make_error_code(std::errc::not_enough_memory);
-        if (m_impl->handler) {
-            SafeHandler([this, connect_id, error] { m_impl->handler->OnConnect(Connection(), error, connect_id); });
+        if (m_impl->Handler()) {
+            SafeHandler([this, connect_id, error] { m_impl->Handler()->OnConnect(Connection(), error, connect_id); });
         }
         m_impl->ResolveConnect(connect_id, Connection(), error);
     }
@@ -1061,8 +1043,8 @@ void Reactor::RemoveConn(const std::shared_ptr<ConnCore>& core)
         InvokeRemoveBarrier();
         removed = m_conns.erase(id) != 0;
     }
-    if (removed && m_impl->conn_count.load() > 0) {
-        m_impl->conn_count.fetch_sub(1);
+    if (removed) {
+        m_impl->RemoveConnection();
     }
 }
 
@@ -1165,7 +1147,7 @@ void Reactor::SealServiceOnOwner(std::function<void()> on_done)
     }
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        m_impl->conn_count.store(m_conns.size());
+        m_impl->PublishConnectionCount(m_conns.size());
     }
     if (m_pending_connect_callbacks == 0) {
         if (on_done) {
@@ -1264,7 +1246,7 @@ void Reactor::FinalizeControl()
     for (auto& core : snapshot) {
         core->CancelControl();
     }
-    m_impl->conn_count.store(0);
+    m_impl->PublishConnectionCount(0);
 }
 
 void Reactor::ReleaseDriver()
@@ -1297,8 +1279,7 @@ void Reactor::CancelConnectOnOwner(std::uint64_t connect_id)
 void Reactor::CancelAllRequestedOnOwner()
 {
     for (auto& pending : m_pending_connects) {
-        auto op = m_impl->FindConnect(pending->connect_id);
-        if (!op || !op->cancel_requested.load()) {
+        if (!m_impl->ConnectCancelRequested(pending->connect_id)) {
             continue;
         }
         pending->canceled = true;
@@ -1314,11 +1295,7 @@ void Reactor::CancelAllRequestedOnOwner()
 
 void Reactor::ResumeMainAccept()
 {
-    std::shared_ptr<Reactor> main;
-    {
-        std::lock_guard<std::mutex> lock(m_impl->mutex);
-        main = m_impl->main_reactor;
-    }
+    auto main = m_impl->MainReactor();
     if (main) {
         (void)main->TryPost([main] { main->ArmAcceptAll(); });
     }
