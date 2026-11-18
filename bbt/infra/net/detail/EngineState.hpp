@@ -81,9 +81,9 @@ public:
         Guard(Guard&&) = delete;
         Guard& operator=(Guard&&) = delete;
 
-        void Wait(std::condition_variable& cv, const bool& close_requested)
+        void Wait(std::condition_variable& cv, const std::atomic<bool>& sealed)
         {
-            cv.wait_for(m_lock, std::chrono::milliseconds(50), [&] { return close_requested; });
+            cv.wait_for(m_lock, std::chrono::milliseconds(50), [&] { return sealed.load(std::memory_order_acquire); });
         }
 
     private:
@@ -93,8 +93,8 @@ public:
     Guard Acquire() const;
     EnginePhase PhaseLocked(const Guard&) const;
     void PublishPhaseLocked(const Guard&, EnginePhase value);
-    void RequestCloseLocked(const Guard&);
-    bool CloseRequestedLocked(const Guard&) const;
+    void RequestSealLocked(const Guard&);
+    bool SealRequestedLocked(const Guard&) const;
     void FinishRunLocked(const Guard&);
     bool RunFinishedLocked(const Guard&) const;
     bool TryClaimRun();
@@ -110,9 +110,11 @@ public:
     result<bool> WaitPhaseSlice(const bbt::coroutine::WaitOptions& options);
     void NotifyPhaseWaiters() noexcept;
     void RecordError(std::error_code error);
+    void RecordErrorLocked(const Guard&, std::error_code error);
     void NoteHandlerError();
     std::size_t HandlerErrorCount() const;
     std::error_code LastError() const;
+    std::error_code LastErrorLocked(const Guard&) const;
     void RecordControlFailure(std::exception_ptr failure);
     std::exception_ptr LastFailure() const;
     bool IsSealed() const;
@@ -123,12 +125,10 @@ private:
     mutable std::mutex m_mutex;
     std::condition_variable control_cv;
     EnginePhase phase{EnginePhase::Idle};
-    bool close_requested{false};
     std::atomic<bool> control_claimed{false};
     bool run_finished{false};
     std::shared_ptr<bbt::coroutine::sync::CoWaiter> phase_signal = bbt::coroutine::sync::CoWaiter::Create();
     std::shared_ptr<std::atomic<bool>> service_sealed = std::make_shared<std::atomic<bool>>(false);
-    mutable std::mutex error_mutex;
     std::error_code last_error;
     std::exception_ptr control_failure;
     std::vector<Address> local_addresses;
@@ -299,9 +299,8 @@ public:
 
 private:
     EngineImpl* m_engine;
-    std::atomic<bool> accept_stop_requested{false};
-    std::atomic<bool> accept_stop_posted{false};
-    std::atomic<bool> accept_stop_done{false};
+    enum class StopStage { Open, Requested, Posted, Done };
+    std::atomic<StopStage> m_stopStage{StopStage::Open};
     std::mutex handoff_mutex;
     std::deque<Connection> handoff;
     std::size_t handoff_capacity{0};

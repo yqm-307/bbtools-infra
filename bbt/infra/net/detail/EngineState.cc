@@ -282,14 +282,14 @@ void EngineControl::PublishPhaseLocked(const Guard&, EnginePhase value)
     phase = value;
 }
 
-void EngineControl::RequestCloseLocked(const Guard&)
+void EngineControl::RequestSealLocked(const Guard&)
 {
-    close_requested = true;
+    PublishSeal();
 }
 
-bool EngineControl::CloseRequestedLocked(const Guard&) const
+bool EngineControl::SealRequestedLocked(const Guard&) const
 {
-    return close_requested;
+    return IsSealed();
 }
 
 void EngineControl::FinishRunLocked(const Guard&)
@@ -320,7 +320,7 @@ void EngineControl::NotifyNativeLocked(const Guard&)
 
 void EngineControl::WaitCloseLocked(Guard& guard)
 {
-    guard.Wait(control_cv, close_requested);
+    guard.Wait(control_cv, *service_sealed);
 }
 
 void EngineControl::PublishAddressesLocked(const Guard&, std::vector<Address> local)
@@ -371,13 +371,16 @@ void EngineControl::NotifyPhaseWaiters() noexcept
 
 void EngineControl::RecordError(std::error_code error)
 {
-    if (!error) {
+    if (!error)
         return;
-    }
-    std::lock_guard<std::mutex> lock(error_mutex);
-    if (!last_error) {
+    auto guard = Acquire();
+    RecordErrorLocked(guard, error);
+}
+
+void EngineControl::RecordErrorLocked(const Guard&, std::error_code error)
+{
+    if (error && !last_error)
         last_error = error;
-    }
 }
 
 void EngineControl::NoteHandlerError()
@@ -397,13 +400,18 @@ std::size_t EngineControl::HandlerErrorCount() const
 
 std::error_code EngineControl::LastError() const
 {
-    std::lock_guard<std::mutex> lock(error_mutex);
+    auto guard = Acquire();
+    return LastErrorLocked(guard);
+}
+
+std::error_code EngineControl::LastErrorLocked(const Guard&) const
+{
     return last_error;
 }
 
 void EngineControl::RecordControlFailure(std::exception_ptr failure)
 {
-    std::lock_guard<std::mutex> lock(error_mutex);
+    auto guard = Acquire();
     if (!control_failure) {
         control_failure = std::move(failure);
     }
@@ -411,7 +419,7 @@ void EngineControl::RecordControlFailure(std::exception_ptr failure)
 
 std::exception_ptr EngineControl::LastFailure() const
 {
-    std::lock_guard<std::mutex> lock(error_mutex);
+    auto guard = Acquire();
     return control_failure;
 }
 
@@ -1099,33 +1107,39 @@ bool AcceptQueue::Enabled() const
 
 bool AcceptQueue::RequestStop()
 {
-    return !accept_stop_requested.exchange(true, std::memory_order_acq_rel);
+    auto expected = StopStage::Open;
+    return m_stopStage.compare_exchange_strong(
+        expected, StopStage::Requested, std::memory_order_acq_rel, std::memory_order_acquire);
 }
 
 bool AcceptQueue::StopRequested() const
 {
-    return accept_stop_requested.load(std::memory_order_acquire);
+    return m_stopStage.load(std::memory_order_acquire) != StopStage::Open;
 }
 
 bool AcceptQueue::Stopped() const
 {
-    return accept_stop_requested.load(std::memory_order_acquire) && accept_stop_done.load(std::memory_order_acquire);
+    return m_stopStage.load(std::memory_order_acquire) == StopStage::Done;
 }
 
 bool AcceptQueue::TryMarkPosted()
 {
-    return !accept_stop_done.load(std::memory_order_acquire)
-           && !accept_stop_posted.exchange(true, std::memory_order_acq_rel);
+    auto expected = StopStage::Requested;
+    return m_stopStage.compare_exchange_strong(
+        expected, StopStage::Posted, std::memory_order_acq_rel, std::memory_order_acquire);
 }
 
 void AcceptQueue::RestoreRequestedAfterPostFailure()
 {
-    accept_stop_posted.store(false, std::memory_order_release);
+    // owner 可能已物理停服；失败回退不能覆盖并发发布的 Done。
+    auto expected = StopStage::Posted;
+    (void)m_stopStage.compare_exchange_strong(
+        expected, StopStage::Requested, std::memory_order_acq_rel, std::memory_order_acquire);
 }
 
 void AcceptQueue::MarkPhysicallyStopped()
 {
-    accept_stop_done.store(true, std::memory_order_release);
+    m_stopStage.store(StopStage::Done, std::memory_order_release);
 }
 
 void AcceptQueue::SetHooksLocked(const EngineControl::Guard&, const std::shared_ptr<TestHooks>& hooks)
@@ -1370,7 +1384,7 @@ std::error_code EngineImpl::Close(const CloseOptions& options) noexcept
     try {
         {
             auto guard = control.Acquire();
-            control.RequestCloseLocked(guard);
+            control.RequestSealLocked(guard);
         }
         SealService();
         control.NotifyNative();
@@ -1543,12 +1557,12 @@ std::error_code EngineImpl::RunImpl(const EngineConfig& config)
                        ? std::make_error_code(std::errc::operation_canceled)
                        : std::make_error_code(std::errc::device_or_resource_busy);
         }
-        if (control.CloseRequestedLocked(guard)) {
+        if (control.SealRequestedLocked(guard)) {
 
             /**
              * Run 之前已收到关闭请求：不伪造 Running，按真实 Stopped + 首因收口。
              */
-            RecordError(std::make_error_code(std::errc::operation_canceled));
+            control.RecordErrorLocked(guard, std::make_error_code(std::errc::operation_canceled));
             control.PublishPhaseLocked(guard, EnginePhase::Stopped);
             early_close = true;
         } else {
@@ -1563,7 +1577,7 @@ std::error_code EngineImpl::RunImpl(const EngineConfig& config)
     auto fail = [&](std::error_code error) {
         {
             auto guard = control.Acquire();
-            RecordError(error);
+            control.RecordErrorLocked(guard, error);
             control.PublishPhaseLocked(guard, EnginePhase::Stopped);
             control.NotifyNative();
         }
@@ -1596,7 +1610,7 @@ std::error_code EngineImpl::RunImpl(const EngineConfig& config)
         if (unbind_error || !to_unbind.empty()) {
             auto guard = control.Acquire();
             bindings.PublishLocked(guard, std::move(to_unbind));
-            RecordError(unbind_error ? unbind_error : error);
+            control.RecordErrorLocked(guard, unbind_error ? unbind_error : error);
             control.PublishPhaseLocked(guard, EnginePhase::Closing);
             return unbind_error ? unbind_error : error;
         }
@@ -1663,7 +1677,7 @@ std::error_code EngineImpl::RunImpl(const EngineConfig& config)
              * 回滚失败：责任仍可达，保持 Closing，不伪报 Stopped。
              */
             auto guard = control.Acquire();
-            RecordError(error);
+            control.RecordErrorLocked(guard, error);
             control.PublishPhaseLocked(guard, EnginePhase::Closing);
             return error;
         }
@@ -1764,7 +1778,7 @@ std::error_code EngineImpl::RunImpl(const EngineConfig& config)
              * 销毁 context 或伪报 Stopped，保留 Closing 由合法控制域析构兜底。
              */
             auto guard = control.Acquire();
-            RecordError(install_error);
+            control.RecordErrorLocked(guard, install_error);
             control.PublishPhaseLocked(guard, EnginePhase::Closing);
             return install_error;
         }
@@ -1808,7 +1822,7 @@ std::error_code EngineImpl::RunImpl(const EngineConfig& config)
         {
             auto guard = control.Acquire();
             control.WaitCloseLocked(guard);
-            close = control.CloseRequestedLocked(guard);
+            close = control.SealRequestedLocked(guard);
         }
         if (close) {
             break;
@@ -1944,7 +1958,7 @@ std::error_code EngineImpl::RunImpl(const EngineConfig& config)
         }
         if (!owner_seal_complete) {
             auto guard = control.Acquire();
-            RecordError(final_error);
+            control.RecordErrorLocked(guard, final_error);
         }
     }
 
@@ -1960,9 +1974,9 @@ std::error_code EngineImpl::RunImpl(const EngineConfig& config)
     if (unbind_error || !to_unbind.empty()) {
         auto guard = control.Acquire();
         bindings.PublishLocked(guard, std::move(to_unbind));
-        RecordError(unbind_error ? unbind_error : std::make_error_code(std::errc::io_error));
+        control.RecordErrorLocked(guard, unbind_error ? unbind_error : std::make_error_code(std::errc::io_error));
         control.PublishPhaseLocked(guard, EnginePhase::Closing);
-        return LastError();
+        return control.LastErrorLocked(guard);
     }
 
     /**
