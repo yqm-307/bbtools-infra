@@ -1,5 +1,6 @@
 #include <bbt/infra/net/detail/ConnectionState.hpp>
 
+#include <pthread.h>
 #include <bbt/infra/net/detail/CoInternal.hpp>
 
 namespace bbt::infra::net {
@@ -231,6 +232,63 @@ ConnectionState::ConnectionState(
     m_pending_terminal.set_capacity(std::max<std::size_t>(1, max_ops));
 }
 
+ConnectionState::WriteGuard::WriteGuard(ConnectionState& state, bool try_lock)
+    : m_state(state)
+{
+    if (try_lock) {
+        m_ownsLock = m_state._TryWriteLock();
+    } else {
+        m_state.m_write_mutex.lock();
+        m_ownsLock = true;
+    }
+}
+
+ConnectionState::WriteGuard::~WriteGuard()
+{
+    if (m_ownsLock) {
+        Unlock();
+    }
+}
+
+void ConnectionState::WriteGuard::Unlock() noexcept
+{
+    m_ownsLock = false;
+    m_state._UnlockWrite();
+}
+
+bool ConnectionState::_TryWriteLock()
+{
+    m_writeRetry.store(true);
+    /**
+     * std::mutex::try_lock 允许虚假失败：若此时没有持锁者，就无人接手 retry。
+     * POSIX trylock 对这把普通 mutex 只在锁已被占用时报告 EBUSY。
+     */
+    const int error = pthread_mutex_trylock(m_write_mutex.native_handle());
+    if (error == 0) {
+        m_writeRetry.store(false);
+        return true;
+    }
+    if (error != EBUSY) {
+        throw std::system_error(error, std::system_category());
+    }
+    return false;
+}
+
+void ConnectionState::_UnlockWrite() noexcept
+{
+    m_write_mutex.unlock();
+    if (m_testHooks) {
+        m_testHooks->Invoke(HookPoint::AfterWriteUnlockBeforeRetry);
+    }
+    /**
+     * 先解锁再认领 retry：早到的登记由本次释放接走，晚到的登记会
+     * 取得空闲锁，或由下一任占用者释放时接走。
+     */
+    if (m_writeRetry.exchange(false)) {
+        WakeOwner();
+    }
+}
+
 std::error_code ConnectionState::AcceptFire(std::string_view data)
 {
     std::uint64_t id = 0;
@@ -242,7 +300,7 @@ std::error_code ConnectionState::SubmitWrite(std::string_view data, std::uint64_
     if (m_service_sealed && m_service_sealed->load(std::memory_order_acquire)) {
         return make_error_code(NetErrc::Closed);
     }
-    std::unique_lock<std::mutex> lock(m_write_mutex);
+    WriteGuard lock(*this);
     if (m_close_requested || m_acceptance == AcceptanceState::Closed) {
         return make_error_code(NetErrc::Closed);
     }
@@ -275,7 +333,7 @@ std::error_code ConnectionState::SubmitWrite(std::string_view data, std::uint64_
     } else {
         m_writeIntervals.push_back(entry);
     }
-    lock.unlock();
+    lock.Unlock();
     if (data.empty())
         m_waiters.Notify(WaitLane::Write);
     WakeOwner();
@@ -284,14 +342,14 @@ std::error_code ConnectionState::SubmitWrite(std::string_view data, std::uint64_
 
 WriteWait ConnectionState::QueryWrite(const WriteWait& waiter)
 {
-    std::lock_guard<std::mutex> lock(m_write_mutex);
+    WriteGuard lock(*this);
     return waiter;
 }
 
 std::tuple<std::size_t, std::error_code>
 ConnectionState::CancelWrite(std::uint64_t id, WriteWait& waiter, std::error_code error)
 {
-    std::unique_lock<std::mutex> lock(m_write_mutex);
+    WriteGuard lock(*this);
     if (!waiter.terminal) {
         /**
          * ponytail: 撤销冷路径在 max_ops 有界账本内线性查找；只有实测该扫描
@@ -310,7 +368,7 @@ ConnectionState::CancelWrite(std::uint64_t id, WriteWait& waiter, std::error_cod
         }
     }
     const auto result = std::make_tuple(waiter.sent, waiter.error);
-    lock.unlock();
+    lock.Unlock();
     m_waiters.Notify(WaitLane::Write);
     WakeOwner();
     return result;
@@ -327,7 +385,7 @@ bool ConnectionState::TryPopTerminal(CompletedWrite& out)
 {
     bool popped = false;
     {
-        std::lock_guard<std::mutex> lock(m_write_mutex);
+        WriteGuard lock(*this);
         if (!m_pending_terminal.empty()) {
             out = m_pending_terminal.front();
             m_pending_terminal.pop_front();
@@ -352,13 +410,13 @@ std::vector<CompletedWrite> ConnectionState::DrainTerminal()
 
 bool ConnectionState::HasPendingWrites()
 {
-    std::lock_guard<std::mutex> lock(m_write_mutex);
+    WriteGuard lock(*this);
     return !m_writeIntervals.empty();
 }
 
 std::size_t ConnectionState::ActiveOpCount()
 {
-    std::lock_guard<std::mutex> lock(m_write_mutex);
+    WriteGuard lock(*this);
     return m_writeIntervals.size();
 }
 
@@ -367,7 +425,7 @@ bool ConnectionState::CanAcceptWrite(std::size_t bytes)
     if (m_service_sealed && m_service_sealed->load(std::memory_order_acquire)) {
         return false;
     }
-    std::lock_guard<std::mutex> lock(m_write_mutex);
+    WriteGuard lock(*this);
     if (m_close_requested || m_acceptance != AcceptanceState::Open) {
         return false;
     }
@@ -378,7 +436,7 @@ bool ConnectionState::CanAcceptWrite(std::size_t bytes)
 void ConnectionState::RequestClose(std::error_code reason)
 {
     {
-        std::lock_guard<std::mutex> lock(m_write_mutex);
+        WriteGuard lock(*this);
         if (m_read_closed_published) {
 
             /**
@@ -412,7 +470,7 @@ void ConnectionState::RequestClose(std::error_code reason)
 
 bool ConnectionState::CloseRequested()
 {
-    std::lock_guard<std::mutex> lock(m_write_mutex);
+    WriteGuard lock(*this);
 
     /**
      * 持久 intent，不被写结算暂态清除
@@ -425,7 +483,7 @@ void ConnectionState::MarkClosed(std::error_code reason)
     bool notify = false;
     bool publish_read_closed = false;
     {
-        std::lock_guard<std::mutex> lock(m_write_mutex);
+        WriteGuard lock(*this);
         if (m_acceptance == AcceptanceState::Closed && m_writeIntervals.empty() && m_read_closed_published) {
             return;
         }
@@ -477,7 +535,7 @@ void ConnectionState::MarkClosed(std::error_code reason)
          * 即使 acceptance 已因 sealed 写失败置 Closed，也要发布读 EOF
          */
         ring.MarkClosed();
-        std::lock_guard<std::mutex> lock(m_write_mutex);
+        WriteGuard lock(*this);
         m_read_closed_published = true;
     }
     if (notify || publish_read_closed) {
@@ -489,25 +547,25 @@ void ConnectionState::MarkClosed(std::error_code reason)
 
 bool ConnectionState::Closed()
 {
-    std::lock_guard<std::mutex> lock(m_write_mutex);
+    WriteGuard lock(*this);
     return m_acceptance == AcceptanceState::Closed;
 }
 
 std::error_code ConnectionState::CloseReason()
 {
-    std::lock_guard<std::mutex> lock(m_write_mutex);
+    WriteGuard lock(*this);
     return m_close_reason;
 }
 
 AcceptanceState ConnectionState::Acceptance()
 {
-    std::lock_guard<std::mutex> lock(m_write_mutex);
+    WriteGuard lock(*this);
     return m_acceptance;
 }
 
 std::error_code ConnectionState::LastWriteError(std::uint64_t* operation)
 {
-    std::lock_guard<std::mutex> lock(m_write_mutex);
+    WriteGuard lock(*this);
     if (operation != nullptr) {
         *operation = m_last_error_op;
     }

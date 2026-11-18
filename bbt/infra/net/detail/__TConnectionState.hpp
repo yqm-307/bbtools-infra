@@ -6,6 +6,20 @@ template <class Sink>
 inline ConnectionState::SendResult
 ConnectionState::PumpWrites(std::size_t max_rounds, std::size_t byte_budget, Sink&& sink)
 {
+    return _PumpWrites(max_rounds, byte_budget, std::forward<Sink>(sink), false);
+}
+
+template <class Sink>
+inline ConnectionState::SendResult
+ConnectionState::TryPumpWrites(std::size_t max_rounds, std::size_t byte_budget, Sink&& sink)
+{
+    return _PumpWrites(max_rounds, byte_budget, std::forward<Sink>(sink), true);
+}
+
+template <class Sink>
+inline ConnectionState::SendResult
+ConnectionState::_PumpWrites(std::size_t max_rounds, std::size_t byte_budget, Sink&& sink, bool try_lock)
+{
     SendResult result;
     for (std::size_t round = 0; round == 0 || (round < max_rounds && result.bytes < byte_budget); ++round) {
         if (round != 0 && m_testHooks) {
@@ -15,7 +29,11 @@ ConnectionState::PumpWrites(std::size_t max_rounds, std::size_t byte_budget, Sin
          * 撤销取同一把锁：每次持锁只覆盖一轮发送及其归属，借用 views
          * 不跨解锁；撤销取得锁时没有在途发送，已发前缀为终值。
          */
-        std::lock_guard<std::mutex> lock(m_write_mutex);
+        WriteGuard lock(*this, try_lock);
+        if (!lock.OwnsLock()) {
+            result.lock_busy = true;
+            break;
+        }
         result.terminal_changed |= (PendingCountLocked() != 0);
         if (max_rounds == 0 || byte_budget == 0) {
             break;
@@ -63,6 +81,9 @@ ConnectionState::PumpWrites(std::size_t max_rounds, std::size_t byte_budget, Sin
     }
     if (result.terminal_changed) {
         WakeOwner();
+    }
+    if (result.lock_busy && m_testHooks) {
+        m_testHooks->Invoke(HookPoint::AfterWriteTryLockBusy);
     }
     return result;
 }
