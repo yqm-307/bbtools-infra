@@ -282,12 +282,14 @@ const std::error_code kCloseReason = std::make_error_code(std::errc::operation_c
  * core 不经 AdoptFdOnOwner 登记进 Reactor 目录，故 MarkDirty 的 registry
  * 查找会失败；用来验证「取得 shared、未登记」的早退路径与寿命边界。
  * 夹具在 Idle 串行调用 PrepareHooksForTest（早于 Reactor 构造，供
- * Reactor 忙拓钩子槽），descriptor 用 driver->Context()（与生产 Ctx()
- * 一致的 io_context）。
+ * Reactor 忙拓钩子槽）。descriptor 绑夹具自有 ctx_（声明最先、析构最晚）：
+ * core 会在 driver 释放后才析构，绑 driver context 将在析构时触及已销毁
+ * service（Boost move 保留源 service 指针，析构无条件 destroy）。
  * ---------------------------------------------------------------- */
 struct ReactorDirect {
-    /** io_context 先声明、后析构：须活到 core 及其 descriptor 析构之后，
-     * 避免 descriptor 析构时 service 已失效（与生产一致的 context 寿命）。 */
+    /** io_context 先声明、后析构：core 的 descriptor 绑此 context，须活到
+     * core 及 descriptor 析构之后；driver 释放早于 core 析构，故不绑 driver
+     * context（moved-from 源对象析构亦需有效 service）。 */
     boost::asio::io_context ctx_;
     std::shared_ptr<EngineImpl> impl;
     std::shared_ptr<ReactorDriver> driver;
@@ -307,9 +309,61 @@ struct ReactorDirect {
         reactor = std::make_shared<Reactor>(impl.get(), 0, driver);
         reclaim = std::make_shared<ReclaimRecord>(false);
         state = std::make_shared<ConnectionState>(1, 4096, 1024, 4, impl->SealToken(), reclaim);
-        TcpWait desc(driver->Context()); // 未分配 fd，供寿命边界测试使用
+        TcpWait desc(ctx_); // 未分配 fd，绑夹具自有 context，供寿命边界测试使用
         core = std::make_shared<ConnCore>(state, std::move(desc), reactor.get(), h);
         state->AttachOwner(reactor, core);
+    }
+};
+
+/** 独立 fd RAII：socketpair 两端从取得起各自由一个对象托管，assign 成功
+ * 只移交本端。夹具构造函数抛出时不调用夹具析构，故不能依赖夹具析构关 peer：
+ * 构造中任何抛出（TcpWait 构造、assign 失败、ConnCore 分配失败）都由这些
+ * 局部/成员 RAII 收尾，不泄漏任一端。 */
+struct UniqueFd {
+    int fd{-1};
+
+    explicit UniqueFd(int v = -1) noexcept
+        : fd(v)
+    {
+    }
+
+    UniqueFd(const UniqueFd&) = delete;
+    UniqueFd& operator=(const UniqueFd&) = delete;
+
+    UniqueFd(UniqueFd&& other) noexcept
+        : fd(other.fd)
+    {
+        other.fd = -1;
+    }
+
+    UniqueFd& operator=(UniqueFd&& other) noexcept
+    {
+        if (this != &other) {
+            Close();
+            fd = other.fd;
+            other.fd = -1;
+        }
+        return *this;
+    }
+
+    ~UniqueFd() { Close(); }
+
+    int get() const noexcept { return fd; }
+
+    /** 移交所有权：assign 成功后本端调用，之后由 descriptor/core 托管。 */
+    int release() noexcept
+    {
+        const int value = fd;
+        fd = -1;
+        return value;
+    }
+
+    void Close() noexcept
+    {
+        if (fd >= 0) {
+            ::close(fd);
+            fd = -1;
+        }
     }
 };
 
@@ -329,8 +383,8 @@ struct StageFaultFixture {
     std::shared_ptr<ConnectionState> state;
     std::shared_ptr<ConnCore> core;
     std::shared_ptr<CountingHandler> handler;
-    int peerFd{-1}; // socketpair 对端 fd，由本夹具独占 RAII，析构时关闭；
-                    // 本端（fds[0]）assign 成功后归 descriptor/core 托管，夹具不再按缓存 fd 数值 close
+    UniqueFd peerFd_; // socketpair 对端 fd，由本夹具独占；本端 assign 成功后
+                      // 已 release 移交 descriptor/core，夹具不再按缓存 fd 数值 close
 
     StageFaultFixture(std::shared_ptr<CountingHandler> h, std::shared_ptr<TestHooks> testHooks)
         : hooks(std::move(testHooks))
@@ -345,29 +399,22 @@ struct StageFaultFixture {
         if (::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
             throw std::runtime_error("socketpair failed");
         }
-        peerFd = fds[1]; // 对端由本夹具独占
+        UniqueFd selfFd(fds[0]);    // 本端：从取得起托管，assign 成功才移交
+        peerFd_ = UniqueFd(fds[1]); // 对端：成员已构造，构造抛出时亦析构关闭
         boost::system::error_code ec;
-        TcpWait desc(ctx_);
-        desc.assign(fds[0], ec); // 成功后本端归 descriptor/core 托管
+        TcpWait desc(ctx_);         // 若此构造抛出，两端由 selfFd/peerFd_ 关闭，不泄漏
+        desc.assign(selfFd.get(), ec);
         if (ec) {
-            ::close(fds[0]);
-            ::close(fds[1]);
-            peerFd = -1;
+            // selfFd/peerFd_ 析构关闭两端；不手动 close，避免重复关闭
             throw std::runtime_error("TcpWait::assign failed: " + ec.message());
         }
+        (void)selfFd.release(); // 成功后本端归 descriptor/core 托管
         core = std::make_shared<ConnCore>(state, std::move(desc), reactor.get(), handler);
+        // 若分配抛出：desc 析构关闭本端，peerFd_ 关闭对端
         state->AttachOwner(reactor, core);
     }
 
-    ~StageFaultFixture()
-    {
-        if (peerFd >= 0) {
-            ::close(peerFd);
-            peerFd = -1;
-        }
-        // fds[0] 由 descriptor/core 托管，析构随 ConnCore 一并关闭；
-        // 夹具不再按缓存 fd 数值 close，避免复用后误关无关 fd
-    }
+    // 默认析构：peerFd_ 关闭对端；本端随 ConnCore 析构关闭。
 };
 
 /* ----------------------------------------------------------------
@@ -398,12 +445,14 @@ static void S5WakeReactorDestroyed()
 
 /** driver 解绑与弱租约过期。
  *
- * (a) 租约已过期：夹具与 Reactor 均不再强持 driver，m_contextLease.lock()
- *     失败，Wake 在 contextLease 检查（登记前钩子之前）即早退，不登记、
- *     不唤醒；不保留 driver 强引用做观测，仅以 weak_ptr 观测租约。
- * (b) 动态子例：descriptor 用 driver->Context()，AfterDirtyWeakLock 扣住
- *     Wake，释放 core/driver 强引用并解绑，仅 weak 观察；core deleter
- *     记录删除 core 时 driver 未过期；放行、join 后断言两者都过期。
+ * 在线正例与过期负例共用同一已装配夹具：先装 AfterDirtyWeakLock 证明同一
+ * 钩子槽可命中（hookEntered、DirtyCount==0、WakeCount()==0）；再在同一夹具
+ * 上重新装钩子、释放全部 driver 强引用后 Wake，断言 !hookEntered——早退在
+ * 租约检查处（MarkDirty(weak) 取不到 contextLease 即返回），而非查表处。
+ * (b) 动态子例：descriptor 直接在 make 处以临时量构造（不留 moved-from 源
+ *     对象），AfterDirtyWeakLock 扣住 Wake，释放 core/driver 强引用并解绑，
+ *     仅 weak 观察；core deleter 记录删除 core 时 driver 未过期；放行、join
+ *     后断言两者都过期。
  * (c) 旧对照：解绑后外部仍持 driver，Wake 后旧 driver WakeCount 仍为 0。
  *
  * 直构，同步断言，不睡眠。
@@ -412,7 +461,7 @@ static void S5WakeDriverUnbound()
 {
     auto h = std::make_shared<CountingHandler>();
 
-    // 在线 Wake 证明同一钩子槽可命中：装 AfterDirtyWeakLock，Wake 命中。
+    // 在线正例与过期负例：同一已装配夹具，先证钩子槽可命中，再证过期早退。
     {
         ReactorDirect fx(h);
         std::atomic<bool> hookEntered{false};
@@ -420,17 +469,18 @@ static void S5WakeDriverUnbound()
         fx.state->WakeOwner();                // driver 在线，core 未登记：命中钩子，查找失败，不入链
         CHECK(hookEntered);                   // 同一钩子槽可命中
         CHECK(fx.reactor->DirtyCount() == 0); // core 未登记，不入链
-    }
+        CHECK(fx.driver->WakeCount() == 0);   // 在线 Wake 不唤醒旧 driver
 
-    // (a) 租约已过期：释放夹具与 Reactor 的全部 driver 强引用，Wake 早退。
-    {
-        ReactorDirect fx(h);
+        // (a) 租约已过期：同一夹具重新装钩子，释放全部 driver 强引用后 Wake。
+        std::atomic<bool> hookEnteredAfterRelease{false};
+        fx.reactor->ArmHookForTest(HookPoint::AfterDirtyWeakLock, [&] { hookEnteredAfterRelease = true; }, true);
         std::weak_ptr<ReactorDriver> lease = fx.driver;
-        fx.driver.reset();              // 释放夹具最后持有的强引用
-        fx.reactor->ReleaseDriver();    // 释放 Reactor 副本
-        CHECK(lease.lock() == nullptr); // 租约已过期；不保留 driver 强引用做观测
+        fx.driver.reset();               // 释放夹具最后持有的强引用
+        fx.reactor->ReleaseDriver();     // 释放 Reactor 副本
+        CHECK(lease.lock() == nullptr);  // 租约已过期；不保留 driver 强引用做观测
 
-        fx.state->WakeOwner();          // contextLease.lock() 失败，早退，不登记、不唤醒
+        fx.state->WakeOwner();           // contextLease.lock() 失败，早退，不登记、不唤醒
+        CHECK(!hookEnteredAfterRelease); // 未到登记前钩子：早退在租约检查处，而非查表处
         CHECK(fx.reactor->DirtyCount() == 0);
     }
 
@@ -439,6 +489,8 @@ static void S5WakeDriverUnbound()
     // reactor2->ReleaseDriver()：此时除被扣住的 Wake 外无人强持 driver，
     // 仅 weakDriver2 观察（!weakDriver2.expired() 证明在途 Wake 在撑着它）。
     // 放行、join 后断言 driverAliveAtCoreDelete==true 且两者都过期。
+    // descriptor 直接在 make 处以临时量构造，不留 moved-from 源对象：
+    // 临时量在完整表达式末析构，driver context 仍 alive。
     {
         auto h2 = std::make_shared<CountingHandler>();
         auto impl2 = std::make_shared<EngineImpl>(h2);
@@ -448,13 +500,12 @@ static void S5WakeDriverUnbound()
         auto reactor2 = std::make_shared<Reactor>(impl2.get(), 0, driver2);
         auto reclaim2 = std::make_shared<ReclaimRecord>(false);
         auto state2 = std::make_shared<ConnectionState>(1, 4096, 1024, 4, impl2->SealToken(), reclaim2);
-        TcpWait desc2(driver2->Context()); // descriptor 用 driver->Context()
 
         std::atomic<bool> driverAliveAtCoreDelete{false};
         std::weak_ptr<ConnCore> weakCore2;
         {
-            auto core2 =
-                std::shared_ptr<ConnCore>(new ConnCore(state2, std::move(desc2), reactor2.get(), h2), [&](ConnCore* c) {
+            auto core2 = std::shared_ptr<ConnCore>(
+                new ConnCore(state2, TcpWait(driver2->Context()), reactor2.get(), h2), [&](ConnCore* c) {
                     driverAliveAtCoreDelete = (weakDriver2.lock() != nullptr); // 删除 core 时 driver 未过期
                     delete c;
                 });
@@ -795,9 +846,9 @@ static void S5RemoveConnDirtyWindow()
  *
  * 时序：服务端读入字段后，OwnerWake 唤醒进入 AfterDirtyWeakLock
  * 窗口并被屏障阻塞（已取得 shared，尚未登记）；测试线程再发起 Close()
- * 导致第二次 Wake。阻塞期脏链不被泵走，DirtyCount 恒等于 1，释放屏障
- * 后第一次 Wake 重入发现已入链，不重复登记；泵后脏链归 0、OnClose 恰
- * 1。两次 Wake 只登记一条，绝不出现第二条链节点。
+ * 导致第二次 Wake。阻塞期脏链不被泵走：放行前采样一次 DirtyCount==1，
+ * 随后连续采样 DirtyCount<=1；释放屏障后第一次 Wake 重入发现已入链，
+ * 不重复登记；泵后脏链归 0、OnClose 恰 1。
  */
 static void S5WakeRegisteredOnce()
 {
@@ -847,7 +898,7 @@ static void S5WakeRegisteredOnce()
     // Wake #2：同一连接 Close() → RequestClose → WakeOwner，在 Wake #1 登记前完成。
     CHECK(!conn->Close());
 
-    // 脏链必须恒等于 1：两次 Wake 只登记一条，绝不出现第二条链节点。
+    // 阻塞期采样：放行前一次 ==1，随后连续采样 <=1（脏链未被泵走）。
     // Wake #1 阻塞于登记前钩子，Wake #2 完成唯一登记；屏障释放后，重入的
     // Wake #1 发现已入链，不重复登记；泵后脏链归 0。
     CHECK(WaitUntil([&] { return EngineTestAccess::DirtyCount(engine) == 1; }, 10000ms));
@@ -909,14 +960,14 @@ static void S5WakeLateWindow()
     EngineTestAccess::SetDirtyBarrierOnce(engine, [&] {
         hook_entered = true;                 // 已取得 core shared，尚未登记
         (void)!conn->Close();                // 窗口内驱逐连接：RequestClose 并登记本次
-        EngineTestAccess::KickOwner(engine); // 同步驱动收口
+        EngineTestAccess::KickOwner(engine); // 泵一次，推进收口
     });
 
     CHECK(SendAll(client, "x", 5000ms));
 
     CHECK(WaitUntil([&] { return hook_entered.load(); }, 10000ms)); // 进入目标阶段
 
-    // 晚 Wake 不重复入链：脏链最终被收口清零，绝不出现第二条链节点。
+    // 晚 Wake 不重复入链：脏链最终被收口清零。
     CHECK(WaitUntil([&] { return EngineTestAccess::DirtyCount(engine) == 0; }, 10000ms));
     CHECK(WaitUntil([&] { return conn->Released(); }, 10000ms)); // 对象已收口，晚 Wake 不访问已拆对象
     CHECK(handler->onClose == 1);                                // OnClose 恰一次
