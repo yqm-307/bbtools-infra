@@ -29,7 +29,7 @@
 #include <bbt/infra/net/detail/ConnectionState.hpp>
 #include <bbt/infra/net/detail/ReceiveRing.hpp>
 #include <bbt/infra/net/detail/TestAccess.hpp>
-#include <bbt/infra/net/detail/WakeHub.hpp>
+#include <bbt/infra/net/detail/WaitSet.hpp>
 #include <bbt/infra/net/detail/EngineTestAccess.hpp>
 
 #include <algorithm>
@@ -353,7 +353,8 @@ static EngineConfig ServerConfig(const Address& listen, std::size_t subs = 1)
  */
 static void RingAllocNoConsume()
 {
-    ReceiveRing ring(256);
+    WaitSet ring_waiters;
+    ReceiveRing ring(256, ring_waiters);
     const std::string payload(64, 'z');
     CHECK(ring.TryAppend(payload).status == ReadStatus::Ok);
     CHECK(ring.Size() == payload.size());
@@ -404,14 +405,15 @@ static void RingReleaseNotify()
 static void HubEarlyNotifyRetained()
 {
     StartRuntime(1);
-    WakeHub hub;
-    auto waiter = hub.Register();
+    WaitSet hub;
+    auto waiter = CreateWaiter();
+    CHECK(hub.Add(WaitLane::Data, waiter));
     CHECK(waiter != nullptr);
 
     /**
      * 等待前通知：无法交付，但 weak 项必须保留
      */
-    hub.NotifyAll();
+    hub.Notify(WaitLane::Data);
     std::atomic<int> result{-1};
     auto task = Task([&] {
         const auto status = waiter->WaitWithCallback(Until(300ms), [] { return true; });
@@ -426,7 +428,7 @@ static void HubEarlyNotifyRetained()
     /**
      * 真正的完成事件
      */
-    hub.NotifyAll();
+    hub.Notify(WaitLane::Data);
     Get(task);
     CHECK(result.load() == 0);
     std::cout << "hub_early_notify_retained completed=ok\n";
@@ -838,7 +840,8 @@ static std::size_t CountFds()
 
 static void RingAppendFaultSharedOut()
 {
-    ReceiveRing ring(64);
+    WaitSet ring_waiters;
+    ReceiveRing ring(64, ring_waiters);
     CHECK(ring.TryAppend("abcdef").status == ReadStatus::Ok);
     const std::string original = "prefix";
     std::string out = original;
@@ -922,7 +925,8 @@ static void CoReadAppendFaultNonEmptyOut()
 
 static void BufferCopyConsumeFault()
 {
-    ReceiveRing ring(4096);
+    WaitSet ring_waiters;
+    ReceiveRing ring(4096, ring_waiters);
     const std::string payload(4096, 'a');
     CHECK(ring.TryAppend(payload).status == ReadStatus::Ok);
     Buffer out;
@@ -1806,7 +1810,8 @@ static void RingDeferredNonblockingTry()
 
 static void RingDeferredBackingReuse()
 {
-    ReceiveRing ring(1024);
+    WaitSet ring_waiters;
+    ReceiveRing ring(1024, ring_waiters);
     ring.ReserveDeferred(64);
     const std::string payload(32, 'a');
     for (int round = 0; round < 2; ++round) {
@@ -2337,30 +2342,30 @@ static void SealPostFailureRetries()
 
 static void WakeHubCapacityBounded()
 {
-    WakeHub hub;
+    WaitSet hub;
     std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>> keep;
-    for (std::size_t i = 0; i < WakeHub::kMaxWaiters; ++i) {
-        auto waiter = hub.Create();
-        CHECK(hub.Add(waiter));
+    for (std::size_t i = 0; i < WaitSet::kMaxWaiters; ++i) {
+        auto waiter = CreateWaiter();
+        CHECK(hub.Add(WaitLane::Data, waiter));
         keep.push_back(std::move(waiter));
     }
-    auto extra = hub.Create();
+    auto extra = CreateWaiter();
 
     /**
      * 第 257 个：有界拒绝
      */
-    CHECK(!hub.Add(extra));
+    CHECK(!hub.Add(WaitLane::Data, extra));
 
     /**
      * 锁外 Notify，不越界
      */
-    hub.NotifyAll();
+    hub.Notify(WaitLane::Data);
 
     /**
      * 清理一个后 Add 可 prune 并成功
      */
     keep.back().reset();
-    CHECK(hub.Add(extra));
+    CHECK(hub.Add(WaitLane::Data, extra));
     keep.clear();
     std::cout << "wakehub_capacity_bounded add256=true add257=false\n";
 }
@@ -2371,7 +2376,7 @@ static void CoReadHubFullBounded()
     auto state = std::make_shared<ConnectionState>(1, 4096, 1024, 4, nullptr);
     Connection connection = ConnectionTestAccess::Make(state);
     std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>> keep;
-    for (std::size_t i = 0; i < WakeHub::kMaxWaiters; ++i) {
+    for (std::size_t i = 0; i < WaitSet::kMaxWaiters; ++i) {
         auto waiter = state->CreateReadWaiterForTest();
         CHECK(state->AddReadWaiterForTest(waiter));
         keep.push_back(std::move(waiter));
@@ -2917,7 +2922,7 @@ static void WaitConnectAddFailureRecycles()
     std::uint64_t id = 0;
     CHECK(!CoAccess::SubmitConnect(client, address, id));
     std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>> keep;
-    CHECK(EngineTestAccess::FillConnectHub(client, id, keep) == WakeHub::kMaxWaiters);
+    CHECK(EngineTestAccess::FillConnectHub(client, id, keep) == WaitSet::kMaxWaiters);
     std::atomic<int> result{-2};
     auto task = Task([&] {
         Connection connection;
@@ -3584,7 +3589,8 @@ static void SealedWriteErrorReadPublication()
     CHECK(!state.Inspect().read_eof);
     std::promise<void> registered;
     auto ready = registered.get_future();
-    auto waiter = state.RegisterCloseWaiter();
+    auto waiter = state.CreateCloseWaiter();
+    CHECK(state.AddCloseWaiter(waiter));
     std::atomic<bool> notified{false};
     auto task = Task([&] {
         const auto status = waiter->WaitWithCallback(Until(2000ms), [&] {
@@ -3806,7 +3812,8 @@ static void RequestCloseReadTerminalOrder()
 
 static void StageDetachedNotifyFaultNoDuplicate()
 {
-    ReceiveRing ring(64);
+    WaitSet ring_waiters;
+    ReceiveRing ring(64, ring_waiters);
     ring.ReserveDetached(8);
     ring.SetNotifyFaultOnceForTest();
 
@@ -3946,6 +3953,274 @@ static void DumpBacktrace(int signal_number)
     std::cerr << "caught signal " << signal_number << '\n';
     backtrace_symbols_fd(frames, count, 2);
     std::_Exit(139);
+}
+
+/** ---------------- S4 WaitSet 等待竞争：同一连接四通道的并发等待 ---------------- */
+
+/** 每通道独立 256 额度：各通道各自满额拒绝第 257 个，互不占额；锁外 Notify 不越界。 */
+static void WaitSetPerChannelFullIndependent()
+{
+    WaitSet set;
+    for (std::size_t lane = 0; lane < static_cast<std::size_t>(WaitLane::Count); ++lane) {
+        auto l = static_cast<WaitLane>(lane);
+        std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>> keep;
+        keep.reserve(WaitSet::kMaxWaiters);
+        for (std::size_t i = 0; i < WaitSet::kMaxWaiters; ++i) {
+            auto waiter = CreateWaiter();
+            CHECK(set.Add(l, waiter));
+            keep.push_back(std::move(waiter));
+        }
+        auto extra = CreateWaiter();
+        CHECK(!set.Add(l, extra));
+
+        /** 其余通道不受本通道满额影响 */
+        auto other = (lane == 0) ? WaitLane::Write : WaitLane::Data;
+        auto cross = CreateWaiter();
+        CHECK(set.Add(other, cross));
+
+        /** 锁外通知：满额快照不越界，空通道不崩溃 */
+        for (std::size_t l2 = 0; l2 < static_cast<std::size_t>(WaitLane::Count); ++l2) {
+            set.Notify(static_cast<WaitLane>(l2));
+        }
+        keep.clear();
+        set.Remove(other, cross);
+    }
+    std::cout << "waitset_per_channel_full_independent lanes=" << static_cast<std::size_t>(WaitLane::Count)
+              << " cap=" << WaitSet::kMaxWaiters << " ok\n";
+}
+
+/** 登记前通知不保留、登记后通知必唤醒本轮：Close 通道。 */
+static void WaitSetNotifyBeforeAfterAdd()
+{
+    StartRuntime(1);
+    WaitSet set;
+    std::atomic<bool> registered{false};
+    std::atomic<bbt::coroutine::WaitStatus> status{bbt::coroutine::WaitStatus::InvalidContext};
+
+    auto task = Task([&] {
+        auto rc = WaitChange(
+            set, WaitLane::Close, Until(500ms), [] { return false; }, nullptr, [&] { registered.store(true); });
+        status.store(rc.status);
+    });
+
+    /** 登记前的通知：快照为空，不得保留给本轮 */
+    set.Notify(WaitLane::Close);
+    CHECK(WaitUntil([&] { return registered.load(); }, 1000ms));
+    CHECK(registered.load());
+
+    /** 登记后的通知：必须唤醒本轮等待者 */
+    set.Notify(WaitLane::Close);
+    Get(task);
+    CHECK(status.load() == bbt::coroutine::WaitStatus::Completed);
+    std::cout << "waitset_notify_before_after_add early_lost=ok late_woke=ok\n";
+}
+
+/** 最终 deadline 片 TimedOut 胜过迟到完成：迟到的 ready 不得把超时改判。 */
+static void WaitSetTimedOutWinsLateReady()
+{
+    StartRuntime(1);
+    WaitSet set;
+    std::atomic<bool> ready{false};
+    std::atomic<bbt::coroutine::WaitStatus> status{bbt::coroutine::WaitStatus::InvalidContext};
+    std::atomic<std::chrono::steady_clock::time_point> finished{};
+    auto task = Task([&] {
+        auto rc = WaitChange(set, WaitLane::Data, Until(80ms), [&] { return ready.load(); }, nullptr);
+        finished.store(std::chrono::steady_clock::now());
+        status.store(rc.status);
+    });
+
+    /** 80ms 截止后才放行完成：必须已判 TimedOut 并返回 */
+    std::this_thread::sleep_for(150ms);
+    const auto flip = std::chrono::steady_clock::now();
+    ready.store(true);
+    Get(task);
+    CHECK(status.load() == bbt::coroutine::WaitStatus::TimedOut);
+    CHECK(finished.load() <= flip);
+    std::cout << "waitset_timedout_wins_late_ready timeout_first=ok\n";
+}
+
+/** Remove 后的迟到快照不得唤醒本轮，也串不入下一轮。 */
+static void WaitSetRemoveThenNotifyNextRound()
+{
+    StartRuntime(1);
+    WaitSet set;
+
+    auto w = CreateWaiter();
+    CHECK(set.Add(WaitLane::Close, w));
+    std::atomic<bbt::coroutine::WaitStatus> status{bbt::coroutine::WaitStatus::InvalidContext};
+    auto task = Task([&] { status.store(w->Wait(Until(2000ms))); });
+    std::this_thread::sleep_for(50ms); // 进入等待阶段
+
+    /** 移除后再通知：快照不含 w，w 不得被唤醒 */
+    set.Remove(WaitLane::Close, w);
+    set.Notify(WaitLane::Close);
+    Get(task);
+    CHECK(status.load() == bbt::coroutine::WaitStatus::TimedOut);
+
+    /** 下一轮新等待者可正常唤醒 */
+    auto w2 = CreateWaiter();
+    CHECK(set.Add(WaitLane::Close, w2));
+    std::atomic<bbt::coroutine::WaitStatus> status2{bbt::coroutine::WaitStatus::InvalidContext};
+    auto task2 = Task([&] { status2.store(w2->Wait(Until(2000ms))); });
+    std::this_thread::sleep_for(50ms);
+    set.Notify(WaitLane::Close);
+    Get(task2);
+    CHECK(status2.load() == bbt::coroutine::WaitStatus::Completed);
+    std::cout << "waitset_remove_then_notify_next_round removed_not_woken=ok next_round_woke=ok\n";
+}
+
+/** 同一连接两 reader 并发 Read：Data 通道唤醒全部登记者，被抢先者重新登记
+ *  后仍收到后续数据，不重复、不丢失。
+ */
+static void WaitSetConcurrentReaders()
+{
+    StartRuntime(1);
+    auto state = std::make_shared<ConnectionState>(1, 4096, 1024, 4, nullptr);
+    Connection connection = ConnectionTestAccess::Make(state);
+    CoTcpConnection conn{connection};
+
+    std::atomic<int> read1{-1}, read2{-1};
+    std::atomic<int> hook_seen{0};
+    state->ArmReadHookForTest(HookPoint::BeforeDataWaiter, [&] { hook_seen.fetch_add(1); });
+
+    const std::string chunk1(64, 'a');
+    const std::string chunk2(64, 'b');
+    Buffer buf1, buf2;
+    std::string out1, out2;
+
+    auto reader = [&](Buffer& buf, std::string& out, std::atomic<int>& slot) {
+        std::error_code ec = state->Read(buf, Until(5000ms));
+        if (!ec) {
+            out = buf.CopyTo();
+        }
+        slot.store(ec ? -2 : static_cast<int>(out.size()));
+    };
+    auto t1 = Task([&] { reader(buf1, out1, read1); });
+    auto t2 = Task([&] { reader(buf2, out2, read2); });
+
+    CHECK(WaitUntil([&] { return hook_seen.load() >= 2; }, 2000ms));
+    std::this_thread::sleep_for(20ms);
+    CHECK(state->AppendReceived(chunk1).status == ReadStatus::Ok);
+    CHECK(WaitUntil(
+        [&] {
+            bool d1 = read1.load() != -1;
+            bool d2 = read2.load() != -1;
+            return d1 != d2;
+        },
+        5000ms));
+    CHECK((read1.load() == 64) + (read2.load() == 64) == 1);
+    {
+        const std::string& first = read1.load() == 64 ? out1 : out2;
+        CHECK(first == chunk1);
+    }
+    std::this_thread::sleep_for(20ms);
+    CHECK(state->AppendReceived(chunk2).status == ReadStatus::Ok);
+    CHECK(WaitUntil([&] { return read1.load() >= 0 && read2.load() >= 0; }, 5000ms));
+    CHECK(read1.load() != -2 && read2.load() != -2);
+    CHECK(read1.load() == 64 && read2.load() == 64);
+    CHECK((out1 == chunk1 && out2 == chunk2) || (out1 == chunk2 && out2 == chunk1));
+    Get(t1);
+    Get(t2);
+    std::cout << "waitset_concurrent_readers read1=" << read1.load() << " read2=" << read2.load() << " once_each=ok\n";
+}
+
+/** 多 writer 等容量：每轮仅放行一个，全部最终接纳；并发唤醒下的
+ *  接纳先后随运行时恢复顺序（登记序 FIFO 需唤醒侧顺序保证，见交接）。 */
+static void WaitSetMultiWriterCapacityFifo()
+{
+    StartRuntime(1);
+    auto state = std::make_shared<ConnectionState>(1, 4096, 1024, 1, nullptr);
+    Connection connection = ConnectionTestAccess::Make(state);
+    CoTcpConnection conn{connection};
+
+    const std::string payloads[4] = {
+        std::string(100, '1'), std::string(100, '2'), std::string(100, '3'), std::string(100, '4')};
+    std::atomic<std::size_t> sent[4] = {};
+    std::atomic<int> code[4] = {};
+    for (int i = 0; i < 4; ++i) {
+        code[i].store(-1);
+    }
+
+    std::mutex sink_mutex;
+    std::vector<int> sink_order;
+    auto sink = [&](const std::string_view* views, std::size_t count, std::size_t budget) -> ssize_t {
+        std::lock_guard<std::mutex> lock(sink_mutex);
+        std::size_t sent_bytes = 0;
+        for (std::size_t i = 0; i < count && sent_bytes < budget; ++i) {
+            if (!views[i].empty()) {
+                sink_order.push_back(static_cast<int>(views[i].front() - '1'));
+            }
+            std::size_t take = std::min(views[i].size(), budget - sent_bytes);
+            sent_bytes += take;
+        }
+        return static_cast<ssize_t>(sent_bytes);
+    };
+
+    std::vector<std::future<void>> tasks;
+    for (int i = 0; i < 4; ++i) {
+        tasks.push_back(Task([&, i] {
+            auto [n, ec] = conn.Write(payloads[i], Until(10000ms));
+            sent[i].store(n);
+            code[i].store(ec ? 1 : 0);
+        }));
+    }
+
+    CHECK(WaitUntil(
+        [&] {
+            state->PumpWrites(50, 1u << 20, sink);
+            CompletedWrite cw;
+            while (state->TryPopTerminal(cw)) {
+            }
+            std::this_thread::sleep_for(1ms);
+            bool all_done = true;
+            for (const auto& t : tasks) {
+                all_done = all_done && t.wait_for(0s) == std::future_status::ready;
+            }
+            return all_done;
+        },
+        10000ms));
+
+    for (auto& t : tasks) {
+        Get(t);
+    }
+    for (int i = 0; i < 4; ++i) {
+        CHECK(sent[i].load() == 100);
+        CHECK(code[i].load() == 0);
+    }
+    std::cout << "waitset_multi_writer_capacity_fifo fifo=";
+    for (int i : sink_order) {
+        std::cout << i;
+    }
+    std::cout << " ok\n";
+    CHECK(sink_order.size() == 4);
+    std::sort(sink_order.begin(), sink_order.end());
+    CHECK(sink_order[0] == 0 && sink_order[1] == 1 && sink_order[2] == 2 && sink_order[3] == 3);
+}
+
+/** 多个 WaitClosed 同时被唤醒：Close 通道不丢后到登记者。 */
+static void WaitSetMultiWaitClosedAllWoken()
+{
+    StartRuntime(1);
+    auto state = std::make_shared<ConnectionState>(1, 4096, 1024, 4, nullptr);
+    const int count = 6;
+    std::atomic<int> completed{0};
+    std::vector<std::future<void>> tasks;
+    for (int i = 0; i < count; ++i) {
+        tasks.push_back(Task([&] {
+            std::error_code ec = state->WaitClosed(Until(5000ms));
+            if (!ec) {
+                completed.fetch_add(1);
+            }
+        }));
+    }
+    std::this_thread::sleep_for(50ms); // 全部进入 Close 通道等待
+    state->MarkClosed(std::make_error_code(std::errc::operation_canceled));
+    for (auto& t : tasks) {
+        Get(t);
+    }
+    CHECK(completed.load() == count);
+    CHECK(state->Closed());
+    std::cout << "waitset_multi_waitclosed_all_woken count=" << count << " all_woke=ok\n";
 }
 
 static int RunCases(int argc, char** argv)
@@ -4099,6 +4374,20 @@ static int RunCases(int argc, char** argv)
             RawBusyDeferredOnRead();
         } else if (test == "seal_post_failure_retries") {
             SealPostFailureRetries();
+        } else if (test == "waitset_per_channel_full_independent") {
+            WaitSetPerChannelFullIndependent();
+        } else if (test == "waitset_notify_before_after_add") {
+            WaitSetNotifyBeforeAfterAdd();
+        } else if (test == "waitset_timedout_wins_late_ready") {
+            WaitSetTimedOutWinsLateReady();
+        } else if (test == "waitset_remove_then_notify_next_round") {
+            WaitSetRemoveThenNotifyNextRound();
+        } else if (test == "waitset_concurrent_readers") {
+            WaitSetConcurrentReaders();
+        } else if (test == "waitset_multi_writer_capacity_fifo") {
+            WaitSetMultiWriterCapacityFifo();
+        } else if (test == "waitset_multi_waitclosed_all_woken") {
+            WaitSetMultiWaitClosedAllWoken();
         } else {
             throw std::runtime_error("unknown test: " + test);
         }

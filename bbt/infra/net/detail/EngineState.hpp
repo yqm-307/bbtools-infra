@@ -17,7 +17,7 @@
 #include <bbt/infra/net/detail/DriverBinder.hpp>
 #include <bbt/infra/net/detail/EngineSupport.hpp>
 #include <bbt/infra/net/detail/OptionsNormalize.hpp>
-#include <bbt/infra/net/detail/WakeHub.hpp>
+#include <bbt/infra/net/detail/WaitSet.hpp>
 #include <bbt/infra/net/detail/TestHooks.hpp>
 
 namespace bbt::infra::net {
@@ -235,7 +235,8 @@ private:
     std::shared_ptr<ReclaimRecord> m_reclaim;
     Connection m_connection;
     std::error_code m_error;
-    WakeHub m_hub;
+    WaitSet m_hub;
+    std::shared_ptr<TestHooks> m_testHooks;
 };
 
 class ConnectRegistry {
@@ -308,7 +309,8 @@ private:
     bool handoff_enabled{false};
     bool handoff_closed{false};
     std::atomic<bool> resume_pending{false};
-    WakeHub accept_hub;
+    WaitSet accept_hub;
+    std::shared_ptr<TestHooks> m_testHooks;
 };
 
 struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {

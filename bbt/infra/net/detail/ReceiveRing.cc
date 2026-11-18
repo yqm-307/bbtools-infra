@@ -4,13 +4,12 @@
 
 namespace bbt::infra::net {
 
-ReceiveRing::ReceiveRing(std::size_t max_bytes, std::shared_ptr<TestHooks> hooks)
+ReceiveRing::ReceiveRing(std::size_t max_bytes, WaitSet& waiters, std::shared_ptr<TestHooks> hooks)
     : m_ring(max_bytes)
     , m_max_bytes(max_bytes)
+    , m_waiters(waiters)
     , m_testHooks(std::move(hooks))
 {
-    m_data_hub.SetHooksForTest(m_testHooks);
-    m_release_hub.SetHooksForTest(m_testHooks);
 }
 
 void ReceiveRing::SetAppendFaultForTest(std::function<void()> hook)
@@ -306,31 +305,21 @@ std::error_code ReceiveRing::Read(Buffer& out, const bbt::coroutine::WaitOptions
         } else {
             InvokeWouldBlockBeforeWaiterHookForTest();
         }
-        auto waiter = busy ? CreateReleaseWaiter() : CreateDataWaiter();
-        if (!waiter) {
+        const auto wait = WaitChange(
+            m_waiters,
+            busy ? WaitLane::Release : WaitLane::Data,
+            options,
+            [&] {
+                return busy ? (AccessGeneration() != generation)
+                            : (Size() > 0 || ReadEof() || HasReadError() || ReadClosed());
+            },
+            m_testHooks,
+            [&] { InvokeAfterAddHookForTest(); });
+        if (wait.problem != WaitProblem::None) {
             return std::make_error_code(std::errc::no_buffer_space);
         }
-        bool add_failed = false;
-        const auto status = waiter->WaitWithCallback(options, [&] {
-            const bool added = busy ? AddReleaseWaiter(waiter) : AddDataWaiter(waiter);
-            if (!added) {
-                add_failed = true;
-                waiter->Notify();
-                return true;
-            }
-            InvokeAfterAddHookForTest();
-            const bool ready =
-                busy ? (AccessGeneration() != generation) : (Size() > 0 || ReadEof() || HasReadError() || ReadClosed());
-            if (ready) {
-                waiter->Notify();
-            }
-            return true;
-        });
-        if (add_failed) {
-            return std::make_error_code(std::errc::no_buffer_space);
-        }
-        if (status != bbt::coroutine::WaitStatus::Completed) {
-            return WaitStatusError(status);
+        if (wait.status != bbt::coroutine::WaitStatus::Completed) {
+            return WaitStatusError(wait.status);
         }
     }
 }
@@ -518,7 +507,7 @@ void ReceiveRing::RetryPendingNotification()
 {
     if (m_notify_pending.exchange(false)) {
         try {
-            m_data_hub.NotifyAll();
+            m_waiters.Notify(WaitLane::Data);
         } catch (...) {
             m_notify_pending.store(true);
         }
@@ -535,7 +524,7 @@ void ReceiveRing::NotifyRelease()
     /**
      * Busy 等待者按代次复查
      */
-    m_release_hub.NotifyAll();
+    m_waiters.Notify(WaitLane::Release);
 }
 
 void ReceiveRing::NotifyDataChanged()
@@ -557,7 +546,7 @@ void ReceiveRing::NotifyDataChanged()
         m_notify_pending.store(true);
     } else {
         try {
-            m_data_hub.NotifyAll();
+            m_waiters.Notify(WaitLane::Data);
         } catch (...) {
             m_notify_pending.store(true);
         }
@@ -573,37 +562,22 @@ void ReceiveRing::NotifyDataChanged()
 
 std::shared_ptr<bbt::coroutine::sync::CoWaiter> ReceiveRing::CreateDataWaiter()
 {
-    return m_data_hub.Create();
+    return CreateWaiter(m_testHooks);
 }
 
 bool ReceiveRing::AddDataWaiter(const std::shared_ptr<bbt::coroutine::sync::CoWaiter>& waiter)
 {
-    return m_data_hub.Add(waiter);
+    return m_waiters.Add(WaitLane::Data, waiter);
 }
 
 std::shared_ptr<bbt::coroutine::sync::CoWaiter> ReceiveRing::CreateReleaseWaiter()
 {
-    return m_release_hub.Create();
+    return CreateWaiter(m_testHooks);
 }
 
 bool ReceiveRing::AddReleaseWaiter(const std::shared_ptr<bbt::coroutine::sync::CoWaiter>& waiter)
 {
-    return m_release_hub.Add(waiter);
-}
-
-std::shared_ptr<bbt::coroutine::sync::CoWaiter> ReceiveRing::RegisterDataWaiter()
-{
-    return m_data_hub.Register();
-}
-
-std::shared_ptr<bbt::coroutine::sync::CoWaiter> ReceiveRing::RegisterWaiter()
-{
-    return RegisterDataWaiter();
-}
-
-std::shared_ptr<bbt::coroutine::sync::CoWaiter> ReceiveRing::RegisterReleaseWaiter()
-{
-    return m_release_hub.Register();
+    return m_waiters.Add(WaitLane::Release, waiter);
 }
 
 // clang-format off

@@ -43,7 +43,7 @@
 #include <bbt/infra/net/detail/ReactorDriver.hpp>
 #include <bbt/infra/net/detail/ReclaimRecord.hpp>
 #include <bbt/infra/net/detail/ReceiveRing.hpp>
-#include <bbt/infra/net/detail/WakeHub.hpp>
+#include <bbt/infra/net/detail/WaitSet.hpp>
 
 namespace bbt::infra::net {
 

@@ -55,7 +55,7 @@ ConnectionState::PumpWrites(std::size_t max_rounds, std::size_t byte_budget, Sin
      * waiter 与完成 waiter 共用 write hub，按各自谓词复查。
      */
     if (result.terminal_changed || result.capacity_freed) {
-        m_write_hub.NotifyAll();
+        m_waiters.Notify(WaitLane::Write);
     }
     if (result.terminal_changed) {
         WakeOwner();

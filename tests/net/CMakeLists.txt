@@ -180,7 +180,10 @@ foreach(_case        ring_alloc_no_consume hub_early_notify_retained
         co_read_hub_full_bounded dirty_lifetime_across_removeconn submit_gate_paused_before_post codial_fast_complete codial_timeout_recycles
         codial_cancel_post_failure write_terminal_interleaved_no_alloc
         raw_busy_deferred_onread seal_post_failure_retries seal_delay_beyond_deadline callback_auth_barriers
-        request_close_write_error_intent request_close_write_readiness sealed_write_error_read_publication)
+        request_close_write_error_intent request_close_write_readiness sealed_write_error_read_publication
+        waitset_per_channel_full_independent waitset_notify_before_after_add waitset_timedout_wins_late_ready
+        waitset_remove_then_notify_next_round waitset_concurrent_readers waitset_multi_writer_capacity_fifo
+        waitset_multi_waitclosed_all_woken)
     add_test(NAME net.${_case} COMMAND Test_net_contract_regressions ${_case})
     set_tests_properties(net.${_case} PROPERTIES TIMEOUT 45
         LABELS "unit")

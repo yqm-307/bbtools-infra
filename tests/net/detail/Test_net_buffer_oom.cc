@@ -239,7 +239,8 @@ BOOST_AUTO_TEST_CASE(read_copy_oom_no_loss)
  */
 BOOST_AUTO_TEST_CASE(grant_copy_append_oom_no_throw)
 {
-    ReceiveRing ring(4096);
+    WaitSet ring_waiters;
+    ReceiveRing ring(4096, ring_waiters);
     BOOST_REQUIRE(ring.TryAppend("old").status == ReadStatus::Ok);
     BOOST_REQUIRE(ring.TryReserveForAppend(64).status == ReadStatus::Ok);
     Buffer out;
@@ -267,7 +268,8 @@ BOOST_AUTO_TEST_CASE(staging_append_failure_keeps_bytes)
 {
     const std::string payload(2048, 'Q');
     for (bool detached : {false, true}) {
-        ReceiveRing ring(4096);
+        WaitSet ring_waiters;
+        ReceiveRing ring(4096, ring_waiters);
         const auto append = [&](std::string_view bytes) {
             return detached ? ring.StageDetached(bytes) : ring.AppendDeferred(bytes);
         };
@@ -291,7 +293,8 @@ BOOST_AUTO_TEST_CASE(staging_reserved_capacity_reused)
 {
     const std::string payload(64, 'S');
     for (bool detached : {false, true}) {
-        ReceiveRing ring(256);
+        WaitSet ring_waiters;
+        ReceiveRing ring(256, ring_waiters);
         if (detached) {
             ring.ReserveDetached(payload.size());
         } else {
@@ -308,7 +311,8 @@ BOOST_AUTO_TEST_CASE(staging_reserved_capacity_reused)
             BOOST_CHECK_EQUAL(out.CopyTo(), payload);
         }
     }
-    ReceiveRing ring(256);
+    WaitSet ring_waiters;
+    ReceiveRing ring(256, ring_waiters);
     BOOST_REQUIRE(ring.TryReserveForAppend(64).status == ReadStatus::Ok);
     for (int round = 0; round < 2; ++round) {
         Arm(1);
@@ -335,7 +339,8 @@ BOOST_AUTO_TEST_CASE(copy_assign_deleted)
     /**
      * 移动语义仍可用：move 后来源为空、目标持有全部段。
      */
-    ReceiveRing one(256);
+    WaitSet one_waiters;
+    ReceiveRing one(256, one_waiters);
     BOOST_REQUIRE(one.TryAppend(std::string(64, 'A')).status == ReadStatus::Ok);
     Buffer dest;
     BOOST_REQUIRE(one.TryCopyConsume(dest).status == ReadStatus::Ok);
