@@ -389,9 +389,6 @@ std::error_code Engine::RunImpl(const EngineConfig& config)
          */
         return fail(std::make_error_code(std::errc::operation_not_permitted));
     }
-    impl->max_inbound_bytes = normalized.max_inbound_bytes;
-    impl->max_outbound_bytes = normalized.max_outbound_bytes;
-    impl->max_ops = normalized.max_pending_events;
     impl->options = normalized;
 
     const std::size_t sub_count = std::max<std::size_t>(1, normalized.num_event_loop);
@@ -427,9 +424,6 @@ std::error_code Engine::RunImpl(const EngineConfig& config)
         std::lock_guard<std::mutex> lock(impl->mutex);
         impl->slots = std::move(slots);
         impl->balancer = std::move(balancer);
-        impl->max_inbound_bytes = normalized.max_inbound_bytes;
-        impl->max_outbound_bytes = normalized.max_outbound_bytes;
-        impl->max_ops = normalized.max_pending_events;
         for (std::size_t i = 0; i < impl->slots.size(); ++i) {
             impl->reactors.push_back(std::make_shared<Reactor>(impl.get(), i, impl->slots[i].driver));
         }

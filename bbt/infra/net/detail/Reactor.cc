@@ -173,7 +173,7 @@ std::size_t Reactor::ConnCount()
 
 std::size_t Reactor::ReadLowWater() const
 {
-    return m_impl->max_inbound_bytes / 2;
+    return m_impl->options.max_inbound_bytes / 2;
 }
 
 std::error_code Reactor::InstallOnOwner(const std::vector<Address>& addresses)
@@ -523,9 +523,9 @@ void Reactor::AdoptFdOnOwner(
     auto owner_record = reclaim ? reclaim : std::make_shared<ReclaimRecord>(false);
     auto state = std::make_shared<ConnectionState>(
         id,
-        m_impl->max_inbound_bytes,
-        m_impl->max_outbound_bytes,
-        m_impl->max_ops,
+        m_impl->options.max_inbound_bytes,
+        m_impl->options.max_outbound_bytes,
+        m_impl->options.max_pending_events,
         m_impl->service_sealed,
         std::move(owner_record),
         m_impl->test_hooks);

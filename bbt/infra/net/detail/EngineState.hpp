@@ -129,9 +129,6 @@ struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
     std::atomic<bool> accept_stop_posted{false};
     std::atomic<bool> accept_stop_done{false};
 
-    std::size_t max_inbound_bytes{1024 * 1024};
-    std::size_t max_outbound_bytes{1024 * 1024};
-    std::size_t max_ops{1024};
     NormalizedOptions options;
     std::unique_ptr<LoadBalancer> balancer;
     std::mutex balancer_mutex;
