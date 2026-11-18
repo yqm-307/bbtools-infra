@@ -253,6 +253,29 @@ foreach(_case pending_not_flushed_before_next_recv pending_without_next_recv_is_
         LABELS "unit")
 endforeach()
 
+# S7 写泵按轮持锁 / owner try-lock 重试的确定性交错：直构 ConnectionState，
+# 以线程 + TestHooks 屏障驱动，不靠 sleep 判定。
+add_executable(Test_net_s7_write_lock detail/Test_net_s7_write_lock.cc)
+target_link_libraries(Test_net_s7_write_lock PRIVATE bbt::infra_net Boost::headers)
+target_compile_options(Test_net_s7_write_lock PRIVATE -Wall -Wextra -Wpedantic)
+target_link_options(Test_net_s7_write_lock PRIVATE -rdynamic)
+foreach(_case
+    try_busy_retry_delivers_all
+    uncontended_try_succeeds_after_unlock
+    two_contentions_next_holder_claims
+    every_locked_exit_passes_retry_point
+    cancel_between_rounds_terminal_zero
+    cancel_partial_sent_terminal_prefix
+    rounds_byte_budget_and_fairness
+)
+    add_test(NAME net.s7_write_lock_${_case}
+        COMMAND Test_net_s7_write_lock --run_test=net_s7_write_lock/${_case})
+    set_tests_properties(net.s7_write_lock_${_case} PROPERTIES TIMEOUT 60 LABELS "unit")
+endforeach()
+add_test(NAME net.s7_concurrent_connect
+    COMMAND Test_net_s7_write_lock --run_test=net_s7_concurrent_connect)
+set_tests_properties(net.s7_concurrent_connect PROPERTIES TIMEOUT 120 LABELS "unit")
+
 # S5 Reactor 确定性交错：成员锁合一后的 dirty 登记去重、OwnerWake 弱绑定
 # 的寿命边界（Reactor 销毁 / driver 解绑 / 晚 Wake）、CloseStage 分段收口。
 # 直构用例不启动 runtime，端到端用例用真实 loopback TCP；竞态全部由
