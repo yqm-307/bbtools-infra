@@ -4,7 +4,7 @@ namespace bbt::infra::net {
 
 std::shared_ptr<bbt::coroutine::sync::CoWaiter> WakeHub::Create()
 {
-    if (s_create_fault_once.exchange(false)) {
+    if (m_testHooks && m_testHooks->TakeFault(FaultPoint::CreateWaiter)) {
 
         /**
          * 私有 test：等待对象建立单次失败

@@ -400,6 +400,7 @@ Outcome RunInterleave(bool send_c, bool tight = false)
 
     auto handler = std::make_shared<StoreHandler>();
     Engine engine(handler);
+    EngineTestAccess::ClearConnectInjection(engine);
     EngineRunner runner(engine, tight ? TightServerConfig(Loopback(0)) : ServerConfig(Loopback(0)));
     BOOST_REQUIRE(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
     std::vector<Address> addresses;

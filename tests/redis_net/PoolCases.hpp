@@ -377,7 +377,7 @@ void PoolConnectRollback()
     Host host;
     Endpoint listener(true);
     unsigned dials = 0;
-    net::CoTestAccess::SetDialBarrier([&] {
+    net::CoTestAccess::SetDialBarrier(*host.engine, [&] {
         if (++dials == 2) {
             g_bbt_tls_coroutine_co->RequestCancel();
         }
@@ -392,7 +392,7 @@ void PoolConnectRollback()
      * 第二次拨号前第一条已成功；取消只作用于第二次。
      */
     CHECK(dials == 2);
-    net::CoTestAccess::SetDialBarrier({});
+    net::CoTestAccess::SetDialBarrier(*host.engine, {});
     ExpectCode(host.Call([&] { return bbt_co_await pool->Ping(Until()); }), ErrorCode::RuntimeUnavailable);
     CHECK(
         WaitUntil([&] { return host.engine->CountConnections() == 0 && Access::ConnectTableSize(*host.engine) == 0; }));

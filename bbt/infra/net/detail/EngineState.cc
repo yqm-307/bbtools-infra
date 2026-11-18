@@ -47,6 +47,193 @@
 
 namespace bbt::infra::net {
 
+std::error_code Engine::InjectDriverFailureForTest()
+{
+    return m_impl->InjectDriverFailureForTest();
+}
+
+void Engine::RestrictConnectCapacityForTest(std::size_t limit)
+{
+    m_impl->RestrictConnectCapacityForTest(limit);
+}
+
+EngineTestSnapshot Engine::InspectForTest()
+{
+    return m_impl->InspectForTest();
+}
+
+ConnectTestSnapshot Engine::InspectConnectForTest(std::uint64_t id)
+{
+    return m_impl->InspectConnectForTest(id);
+}
+
+void Engine::DelayForTest(std::size_t point, std::chrono::milliseconds delay)
+{
+    m_impl->DelayForTest(point, delay);
+}
+
+void Engine::ArmHookForTest(std::size_t point, std::function<void()> hook, bool once)
+{
+    m_impl->ArmHookForTest(point, std::move(hook), once);
+}
+
+void Engine::ArmFaultForTest(std::size_t point)
+{
+    m_impl->ArmFaultForTest(point);
+}
+
+std::size_t Engine::OccupyConnectWaitersForTest(
+    std::uint64_t id, std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>>& keep)
+{
+    return m_impl->OccupyConnectWaitersForTest(id, keep);
+}
+
+void Engine::RequestOwnerPumpForTest()
+{
+    m_impl->RequestOwnerPumpForTest();
+}
+
+void Engine::OverrideWaitOnceForTest(int status)
+{
+    m_impl->OverrideWaitOnceForTest(status);
+}
+
+void Engine::ClearConnectInjectionForTest()
+{
+    m_impl->ClearConnectInjectionForTest();
+}
+
+void EngineImpl::PrepareHooksForTest()
+{
+    // 所有 fixture 在 Run 发布 Reactor 前调用 ClearConnectInjection 完成装配。
+    // 后续 setter 只修改 TestHooks 内部槽，连接持有的 shared_ptr 始终不变。
+    if (!test_hooks) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (phase != EnginePhase::Idle)
+            throw std::logic_error("test hooks must be installed before Run");
+        test_hooks = std::make_shared<TestHooks>();
+        accept_hub.SetHooksForTest(test_hooks);
+    }
+}
+
+std::error_code EngineImpl::InjectDriverFailureForTest()
+{
+    std::lock_guard<std::mutex> lock(mutex);
+    if (phase != EnginePhase::Running || slots.empty())
+        return std::make_error_code(std::errc::operation_not_permitted);
+    slots.back().driver->InjectTickFailureOnce();
+    return {};
+}
+
+void EngineImpl::RestrictConnectCapacityForTest(std::size_t limit)
+{
+    std::lock_guard<std::mutex> lock(mutex);
+    connect_limit = limit == 0 ? 1 : limit;
+}
+
+EngineTestSnapshot EngineImpl::InspectForTest()
+{
+    EngineTestSnapshot snapshot;
+    {
+        std::lock_guard<std::mutex> lock(connect_mutex);
+        snapshot.m_connects = connects.size();
+        for (auto& entry : connects)
+            if (!entry.second->InspectForTest().m_done)
+                ++snapshot.m_pendingConnects;
+    }
+    std::vector<std::shared_ptr<Reactor>> owners;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        owners = reactors;
+    }
+    for (auto& owner : owners) {
+        snapshot.m_connections += owner->ConnCount();
+        snapshot.m_dirty += owner->DirtyCount();
+        snapshot.m_recvHold += owner->RecvHoldBytes();
+        if (snapshot.m_firstFd < 0)
+            snapshot.m_firstFd = owner->FirstConnFd();
+    }
+    return snapshot;
+}
+
+ConnectTestSnapshot EngineImpl::InspectConnectForTest(std::uint64_t id)
+{
+    auto op = FindConnect(id);
+    return op ? op->InspectForTest() : ConnectTestSnapshot{};
+}
+
+void EngineImpl::DelayForTest(std::size_t point, std::chrono::milliseconds delay)
+{
+    PrepareHooksForTest();
+    test_hooks->DelayAt(static_cast<DelayPoint>(point), delay);
+}
+
+void EngineImpl::ArmHookForTest(std::size_t point, std::function<void()> hook, bool once)
+{
+    PrepareHooksForTest();
+    const auto hook_point = static_cast<HookPoint>(point);
+    switch (hook_point) {
+    case HookPoint::BeforeCallbackAuthorization:
+    case HookPoint::AfterCallbackAuthorization:
+    case HookPoint::AfterReceiveBeforeAppend:
+    case HookPoint::AfterAppendBusy:
+    case HookPoint::AfterDirtyWeakLock:
+    case HookPoint::AfterDirtyUnlinkBeforeErase:
+    case HookPoint::BeforeShutdownStage:
+    case HookPoint::BeforeWriteReadyPump:
+    case HookPoint::BeforeDriverPost:
+    case HookPoint::BeforeConnectStartAuthorization: {
+        std::vector<std::shared_ptr<Reactor>> owners;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            owners = reactors;
+        }
+        for (auto& owner : owners)
+            owner->ArmHookForTest(hook_point, hook, once);
+        break;
+    }
+    default:
+        test_hooks->Arm(hook_point, std::move(hook), once);
+        break;
+    }
+}
+
+void EngineImpl::ArmFaultForTest(std::size_t point)
+{
+    PrepareHooksForTest();
+    test_hooks->FailOnce(static_cast<FaultPoint>(point));
+}
+
+std::size_t EngineImpl::OccupyConnectWaitersForTest(
+    std::uint64_t id, std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>>& keep)
+{
+    auto op = FindConnect(id);
+    return op ? op->OccupyWaitersForTest(keep) : 0;
+}
+
+void EngineImpl::RequestOwnerPumpForTest()
+{
+    std::vector<std::shared_ptr<Reactor>> owners;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        owners = reactors;
+    }
+    for (auto& owner : owners)
+        owner->KickPumpOwner();
+}
+
+void EngineImpl::OverrideWaitOnceForTest(int status)
+{
+    PrepareHooksForTest();
+    test_hooks->OverrideConnectWaitOnce(status);
+}
+
+void EngineImpl::ClearConnectInjectionForTest()
+{
+    PrepareHooksForTest();
+    test_hooks->ClearConnectInjection();
+}
+
 constexpr std::size_t kMaxConnectOps = 1024;
 
 /**
@@ -112,10 +299,10 @@ void EngineImpl::TryPostAcceptStop(const std::shared_ptr<Reactor>& main)
         || accept_stop_posted.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
-    const bool inject_failure = accept_stop_post_fail_once.exchange(false);
+    const bool inject_failure = TakeFault(FaultPoint::AcceptStopPost);
     if (inject_failure || !main->TryPostInternal([main] { main->StopAcceptingOnOwner(); })) {
-        if (inject_failure && accept_stop_failure_hook) {
-            accept_stop_failure_hook();
+        if (inject_failure) {
+            InvokeHook(HookPoint::AfterAcceptStopPostFailure);
         }
 
         /**
@@ -195,6 +382,7 @@ std::error_code StartConnectImpl(
             return std::make_error_code(std::errc::no_buffer_space);
         }
         auto op = std::make_shared<EngineImpl::ConnectOp>();
+        op->hub.SetHooksForTest(impl->test_hooks);
         op->reactor = reactor;
         op->reclaim = reclaim;
 
@@ -210,7 +398,7 @@ std::error_code StartConnectImpl(
      * receiver 意图、ResolveConnect 取消、清表项、out_id 不变、零回调），
      * 不构造假网络响应；未武装时行为与产品完全一致。
      */
-    const bool force_post_failure = impl->connect_post_fail_once.exchange(false);
+    const bool force_post_failure = impl->TakeFault(FaultPoint::ConnectPost);
     if (force_post_failure || !reactor->TryPost([impl, reactor, address, id, reclaim] {
             reactor->BeginConnectOnOwner(address, id, reclaim);
         })) {
@@ -236,15 +424,7 @@ std::error_code StartConnectImpl(
          * 私有 test 屏障：已成功 TryPost（owner 可能立即完成并回调）、尚未写
          * out_connect_id。不持任何 impl 锁，owner 线程可自由推进。
          */
-        std::function<void()> barrier;
-        {
-            std::lock_guard<std::mutex> barrier_lock(impl->connect_submit_barrier_mutex);
-            barrier = std::move(impl->connect_submit_barrier);
-            impl->connect_submit_barrier = {};
-        }
-        if (barrier) {
-            barrier();
-        }
+        impl->InvokeHook(HookPoint::AfterConnectPostBeforeOutput);
     }
     out_connect_id = id;
     return {};

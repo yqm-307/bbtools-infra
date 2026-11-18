@@ -236,6 +236,7 @@ void StopRunningDeliveredConnRW()
     const Address address = BindTempPort();
     auto handler = std::make_shared<NullHandler>();
     Engine engine(handler);
+    EngineTestAccess::ClearConnectInjection(engine);
     CHECK(!engine.EnableAcceptHandoff(4));
     EngineRunner runner(engine, ServerConfig(address));
     CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
@@ -333,6 +334,7 @@ void StopWakesCoAcceptWaiters()
     const Address address = BindTempPort();
     auto handler = std::make_shared<NullHandler>();
     Engine engine(handler);
+    EngineTestAccess::ClearConnectInjection(engine);
     CHECK(!engine.EnableAcceptHandoff(4));
     EngineRunner runner(engine, ServerConfig(address));
     CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
@@ -382,6 +384,7 @@ void StopLateCoAcceptRejected()
     {
         const Address address = BindTempPort();
         Engine idle(std::make_shared<NullHandler>());
+        EngineTestAccess::ClearConnectInjection(idle);
         CHECK(!idle.EnableAcceptHandoff(4));
         idle.RequestStopAccepting();
         CHECK(idle.AcceptingStopped());
@@ -416,6 +419,7 @@ void StopLateCoAcceptRejected()
         const Address address = BindTempPort();
         auto handler = std::make_shared<NullHandler>();
         Engine engine(handler);
+        EngineTestAccess::ClearConnectInjection(engine);
         CHECK(!engine.EnableAcceptHandoff(4));
         EngineRunner runner(engine, ServerConfig(address));
         CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
@@ -451,6 +455,7 @@ void StopBeforeRunNoListener()
      */
     const Address address = BindTempPort();
     Engine engine(std::make_shared<NullHandler>());
+    EngineTestAccess::ClearConnectInjection(engine);
     CHECK(!engine.EnableAcceptHandoff(4));
     engine.RequestStopAccepting();
     CHECK(engine.Phase() == EnginePhase::Idle);
@@ -478,6 +483,8 @@ void StopClientOnlyDialContinues(bool before_run = false)
     CHECK(!error);
 
     Engine client{std::shared_ptr<RawHandler>()};
+
+    EngineTestAccess::ClearConnectInjection(client);
     if (before_run) {
         client.RequestStopAccepting();
         CHECK(client.AcceptingStopped());
@@ -559,6 +566,7 @@ void StopPostFailureRetry()
 {
     StartRuntime(2);
     Engine engine(std::make_shared<NullHandler>());
+    EngineTestAccess::ClearConnectInjection(engine);
     CHECK(!engine.EnableAcceptHandoff(4));
     std::atomic<bool> failure_observed{false};
     Address address;
@@ -594,6 +602,7 @@ void StopRepeatAndConcurrent()
     const Address address = BindTempPort();
     auto handler = std::make_shared<NullHandler>();
     Engine engine(handler);
+    EngineTestAccess::ClearConnectInjection(engine);
     CHECK(!engine.EnableAcceptHandoff(4));
     EngineRunner runner(engine, ServerConfig(address));
     CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
@@ -633,6 +642,7 @@ void StopDuringStartingRace()
     StartRuntime(2);
     const Address address = BindTempPort();
     Engine engine(std::make_shared<NullHandler>());
+    EngineTestAccess::ClearConnectInjection(engine);
     CHECK(!engine.EnableAcceptHandoff(4));
 
     /**
@@ -661,6 +671,7 @@ void StopWithDriverFailed()
     const Address address = BindTempPort();
     auto handler = std::make_shared<NullHandler>();
     Engine engine(handler);
+    EngineTestAccess::ClearConnectInjection(engine);
     CHECK(!engine.EnableAcceptHandoff(4));
     EngineRunner runner(engine, ServerConfig(address));
     CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
@@ -691,6 +702,7 @@ void StopUndeliveredHandoffReclaimed()
     const Address address = BindTempPort();
     auto handler = std::make_shared<NullHandler>();
     Engine engine(handler);
+    EngineTestAccess::ClearConnectInjection(engine);
     CHECK(!engine.EnableAcceptHandoff(4));
     EngineRunner runner(engine, ServerConfig(address));
     CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));

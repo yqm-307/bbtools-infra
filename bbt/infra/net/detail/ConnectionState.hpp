@@ -81,7 +81,8 @@ public:
         std::size_t outbound_max,
         std::size_t max_ops,
         std::shared_ptr<std::atomic<bool>> service_sealed,
-        std::shared_ptr<ReclaimRecord> owner_released = {});
+        std::shared_ptr<ReclaimRecord> owner_released = {},
+        std::shared_ptr<TestHooks> hooks = std::make_shared<TestHooks>());
 
     /**
      * ---- 物理回收观察 ----
@@ -225,8 +226,9 @@ public:
      * 已随 runtime 登记），用于确定性制造「等待已挂起后再触发事件」的
      * 屏障，替代 sleep（正常为空）。与 ReceiveRing 的 AfterAddHook 同模式。
      */
-    static void SetWriteAddHookForTest(std::function<void()> hook);
-    static void SetCloseAddHookForTest(std::function<void()> hook);
+    void ArmReadHookForTest(HookPoint point, std::function<void()> hook);
+    void SetWriteAddHookForTest(std::function<void()> hook);
+    void SetCloseAddHookForTest(std::function<void()> hook);
     void WakeOwner();
 
 private:
@@ -234,9 +236,6 @@ private:
     friend class ConnectionTestAccess;
     std::tuple<std::uintptr_t, std::size_t, std::size_t, std::uint64_t, bool, bool> InspectForTest();
     bool ExerciseReadContentionForTest(const std::function<void()>& during);
-
-    static std::function<void()>& WriteAddHookForTest();
-    static std::function<void()>& CloseAddHookForTest();
 
     std::size_t PendingCountLocked() const noexcept { return m_pending_terminal.size(); }
 
@@ -268,6 +267,7 @@ private:
     boost::circular_buffer<CompletedWrite> m_pending_terminal;
     std::shared_ptr<std::atomic<bool>> m_service_sealed;
     std::shared_ptr<ReclaimRecord> m_owner_released;
+    std::shared_ptr<TestHooks> m_testHooks;
     WakeHub m_write_hub;
     WakeHub m_close_hub;
 };

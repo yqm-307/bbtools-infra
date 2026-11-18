@@ -466,7 +466,7 @@ std::error_code Engine::RunImpl(const EngineConfig& config)
      * 控制域识别并走既定错误出口（不把超时冒 Failed）。
      */
     auto driver_failed = [&]() -> bool {
-        if (impl->test_wait_driver_failed.exchange(false)) {
+        if (impl->TakeFault(FaultPoint::WaitDriverFailed)) {
             impl->RecordError(std::make_error_code(std::errc::io_error));
             return true;
         }
@@ -650,13 +650,13 @@ std::error_code Engine::RunImpl(const EngineConfig& config)
              * 直到原 owner 兑现全部已接纳回调（正常完成条件是 owner 结算，而非 2s）。
              */
             for (;;) {
-                if (impl->seal_post_fail_once.exchange(false)) {
+                if (impl->TakeFault(FaultPoint::SealPost)) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                     continue;
                 }
                 if (reactor->TryPostInternal([reactor, promise, impl] {
                         try {
-                            if (impl->seal_throw_once.exchange(false)) {
+                            if (impl->TakeFault(FaultPoint::SealThrow)) {
                                 throw std::runtime_error("seal-throw-test");
                             }
                             reactor->SealServiceOnOwner([promise] { promise->set_value(std::error_code{}); });
@@ -888,7 +888,7 @@ ConnectionResult Engine::CoDial(const Address& address, const bbt::coroutine::Wa
         result.reclaim = ReclaimReceipt{};
         return result;
     }
-    InvokeDialBarrierForTest();
+    m_impl->InvokeHook(HookPoint::AfterDialSubmitBeforeAttach);
     Connection conn;
     result.error = CoWaitConnect(id, conn, options);
     result.reclaim = CoAccess::MakeReceipt(std::move(record));
@@ -1017,7 +1017,7 @@ Engine::CoWaitConnect(std::uint64_t connect_id, Connection& out, const bbt::coro
             return;
         }
         if (reactor) {
-            if (impl->cancel_post_fail_once.exchange(false)
+            if (impl->TakeFault(FaultPoint::CancelPost)
                 || !reactor->TryPost([reactor, connect_id] { reactor->CancelConnectOnOwner(connect_id); })) {
                 impl->cancel_retry_needed.store(true);
             }
@@ -1097,7 +1097,7 @@ Engine::CoWaitConnect(std::uint64_t connect_id, Connection& out, const bbt::coro
          * Completed 不可注入：它表示"被通知后复查"，注入会在 op 仍 pending 时
          * 原地重试；夹带 Completed 的调用退化为真实等待，避免测试写出死循环。
          */
-        const int injected_wait_status = impl->connect_wait_status_once.exchange(-1);
+        const int injected_wait_status = (impl->test_hooks ? impl->test_hooks->TakeConnectWaitStatus() : -1);
         const bool inject_wait = injected_wait_status >= 0
                                  && injected_wait_status != static_cast<int>(bbt::coroutine::WaitStatus::Completed);
         if (inject_wait) {
@@ -1300,9 +1300,7 @@ std::error_code Engine::CoWaitAccepted(Connection& out, const bbt::coroutine::Wa
                 waiter->Notify();
                 return true;
             }
-            if (impl->accept_waiter_hook) {
-                impl->accept_waiter_hook();
-            }
+            impl->InvokeHook(HookPoint::AfterAcceptRegistered);
             bool ready = false;
             {
                 std::lock_guard<std::mutex> lock(impl->handoff_mutex);

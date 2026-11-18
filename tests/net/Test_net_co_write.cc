@@ -151,14 +151,21 @@ struct EngineRunner {
 
 /** 协程等待已挂起的证据：ConnectionState::AddWriteWaiter 成功后触发，无需 sleep 等时序。 */
 struct WriteWaitArmed {
+    std::shared_ptr<ConnectionState> state;
+
+    explicit WriteWaitArmed(std::shared_ptr<ConnectionState> target)
+        : state(std::move(target))
+    {
+    }
+
     std::atomic<int> armed{0};
 
     void arm()
     {
-        ConnectionState::SetWriteAddHookForTest([this] { armed.fetch_add(1); });
+        state->SetWriteAddHookForTest([this] { armed.fetch_add(1); });
     }
 
-    void clear() { ConnectionState::SetWriteAddHookForTest({}); }
+    void clear() { state->SetWriteAddHookForTest({}); }
 
     ~WriteWaitArmed() { clear(); }
 };
@@ -336,6 +343,7 @@ static void CoWriteFull()
     client_config.runtime_progress = RuntimeProgress::Independent;
     client_config.options.num_event_loop = 1;
     Engine client{std::shared_ptr<RawHandler>()};
+    EngineTestAccess::ClearConnectInjection(client);
     EngineRunner client_runner(client, client_config);
     CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
 
@@ -706,7 +714,7 @@ static void CoWriteZeroLen()
     CHECK(state->ActiveOpCount() == 0);
 
     /** 不阻塞后续写：再次写入并泵发完成 */
-    WriteWaitArmed armed;
+    WriteWaitArmed armed{state};
     armed.arm();
     std::tuple<std::size_t, std::error_code> report2;
     auto task2 = Task([&] {
@@ -740,6 +748,7 @@ static void CoWriteOnWriteOnce()
     auto handler = std::make_shared<CountingHandler>();
     EngineConfig server_config = ServerConfig(Loopback(0), 1);
     Engine server_engine(handler);
+    EngineTestAccess::ClearConnectInjection(server_engine);
     EngineRunner server_runner(server_engine, server_config);
     CHECK(WaitUntil([&] { return server_engine.Phase() == EnginePhase::Running; }, 3000ms));
     std::vector<Address> addresses;

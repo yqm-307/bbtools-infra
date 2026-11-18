@@ -18,6 +18,7 @@
 #include <bbt/infra/net/detail/EngineSupport.hpp>
 #include <bbt/infra/net/detail/OptionsNormalize.hpp>
 #include <bbt/infra/net/detail/WakeHub.hpp>
+#include <bbt/infra/net/detail/TestHooks.hpp>
 
 namespace bbt::infra::net {
 
@@ -127,12 +128,6 @@ struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
     std::atomic<bool> accept_stop_requested{false};
     std::atomic<bool> accept_stop_posted{false};
     std::atomic<bool> accept_stop_done{false};
-    std::atomic<bool> accept_stop_post_fail_once{false};
-
-    /**
-     * 仅测试，运行前装配
-     */
-    std::function<void()> accept_stop_failure_hook;
 
     std::size_t max_inbound_bytes{1024 * 1024};
     std::size_t max_outbound_bytes{1024 * 1024};
@@ -141,64 +136,12 @@ struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
     std::unique_ptr<LoadBalancer> balancer;
     std::mutex balancer_mutex;
     std::size_t connect_limit{1024};
-    std::atomic<std::int64_t> connect_delivery_delay_ms{0};
-    std::atomic<std::int64_t> connect_start_delay_ms{0};
     std::atomic<bool> cancel_retry_needed{false};
-
-    /**
-     * 私有 test 故障注入
-     */
-    std::atomic<bool> cancel_post_fail_once{false};
-
-    /**
-     * 私有 test：本 Engine 下一次 connect 提交不投递
-     */
-    std::atomic<bool> connect_post_fail_once{false};
-
-    /**
-     * 私有 test：下一次领取的等待返回值（-1 未武装）
-     */
-    std::atomic<int> connect_wait_status_once{-1};
-
-    /**
-     * 私有 test 屏障（一次性）
-     */
-    std::mutex connect_submit_barrier_mutex;
-
-    /**
-     * post 成功、写 out_id 之前
-     */
-    std::function<void()> connect_submit_barrier;
-
-    /**
-     * 私有 test 延迟
-     */
-    std::atomic<std::int64_t> seal_delay_ms{0};
-
-    /**
-     * 私有 test 故障注入
-     */
-    std::atomic<bool> seal_post_fail_once{false};
-
-    /**
-     * 私有 test：seal handler 抛一次
-     */
-    std::atomic<bool> seal_throw_once{false};
 
     /**
      * seal handler 捕获到异常
      */
     std::atomic<bool> seal_error{false};
-
-    /**
-     * 私有 test：等待期真实 Failed 谓词
-     */
-    std::atomic<bool> test_wait_driver_failed{false};
-
-    /**
-     * 私有 test：install owner 延迟
-     */
-    std::atomic<std::int64_t> install_delay_ms{0};
 
     std::mutex handoff_mutex;
     std::deque<Connection> handoff;
@@ -207,14 +150,39 @@ struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
     bool handoff_enabled{false};
     bool handoff_closed{false};
     std::atomic<bool> resume_pending{false};
+    std::shared_ptr<TestHooks> test_hooks;
     WakeHub accept_hub;
 
-    /**
-     * 私有测试，消费前装配
-     */
-    std::function<void()> accept_waiter_hook;
+    void InvokeHook(HookPoint point) const
+    {
+        if (test_hooks)
+            test_hooks->Invoke(point);
+    }
+
+    bool TakeFault(FaultPoint point) const { return test_hooks && test_hooks->TakeFault(point); }
+
+    std::int64_t DelayCount(DelayPoint point) const { return test_hooks ? test_hooks->Delay(point).count() : 0; }
 
     struct ConnectOp {
+        ConnectTestSnapshot InspectForTest()
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            return {true, done, receiver_claimed};
+        }
+
+        std::size_t OccupyWaitersForTest(std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>>& keep)
+        {
+            std::size_t added = 0;
+            for (std::size_t i = 0; i < WakeHub::kMaxWaiters + 1; ++i) {
+                auto waiter = hub.Create();
+                if (!hub.Add(waiter))
+                    break;
+                keep.push_back(std::move(waiter));
+                ++added;
+            }
+            return added;
+        }
+
         std::mutex mutex;
         bool done{false};
         bool abandoned{false};
@@ -536,6 +504,22 @@ struct EngineImpl : public std::enable_shared_from_this<EngineImpl> {
         std::lock_guard<std::mutex> lock(mutex);
         control_cv.notify_all();
     }
+
+private:
+    friend class Engine;
+    std::error_code InjectDriverFailureForTest();
+    void RestrictConnectCapacityForTest(std::size_t limit);
+    struct EngineTestSnapshot InspectForTest();
+    struct ConnectTestSnapshot InspectConnectForTest(std::uint64_t id);
+    void DelayForTest(std::size_t point, std::chrono::milliseconds delay);
+    void ArmHookForTest(std::size_t point, std::function<void()> hook, bool once);
+    void ArmFaultForTest(std::size_t point);
+    std::size_t
+    OccupyConnectWaitersForTest(std::uint64_t id, std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>>& keep);
+    void RequestOwnerPumpForTest();
+    void OverrideWaitOnceForTest(int status);
+    void ClearConnectInjectionForTest();
+    void PrepareHooksForTest();
 };
 
 std::error_code StartConnectImpl(

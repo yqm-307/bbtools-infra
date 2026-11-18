@@ -47,8 +47,6 @@ std::error_code RequireCoroutineContext();
  */
 std::error_code WaitStatusError(bbt::coroutine::WaitStatus status);
 
-void InvokeDialBarrierForTest();
-
 /**
  * Engine 私有 Co 步骤与连接内部状态的门面；owning 读取将非等待移交和
  * 协程等待分开，两者不各自构造 Buffer。两段式建连（提交 → 领取）

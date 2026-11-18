@@ -179,6 +179,7 @@ public:
     Host()
         : engine(net::Engine::Create(std::shared_ptr<net::RawHandler>{}))
     {
+        Access::ClearConnectInjection(*engine);
         net::EngineConfig config;
         config.runtime_progress = net::RuntimeProgress::Independent;
         config.options.num_event_loop = 1;

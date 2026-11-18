@@ -333,11 +333,13 @@ BOOST_AUTO_TEST_CASE(read_waits_and_delivers_across_wakeup)
     CoTcpConnection ico(conn);
     StartRuntime(2);
     std::atomic<bool> registered{false};
-    ReceiveRing::SetAfterAddHookForTest([&] { registered.store(true); });
+    state->ArmReadHookForTest(HookPoint::AfterReadRegistered, [&] { registered.store(true); });
 
     struct HookGuard {
-        ~HookGuard() { ReceiveRing::SetAfterAddHookForTest({}); }
-    } hook_guard;
+        std::shared_ptr<ConnectionState> state;
+
+        ~HookGuard() { state->ArmReadHookForTest(HookPoint::AfterReadRegistered, {}); }
+    } hook_guard{state};
 
     std::atomic<int> result{-1};
     auto task = Task([&] {

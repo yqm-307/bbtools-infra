@@ -23,6 +23,7 @@ struct ServerHost {
         std::int64_t outbound = 1024 * 1024,
         unsigned loops = 1)
     {
+        Access::ClearConnectInjection(*engine);
         auto made = http::Server::Create(engine, std::move(handler), options);
         CHECK(made);
         server = std::move(made).value();

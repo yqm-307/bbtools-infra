@@ -325,6 +325,7 @@ static void CoContextGate()
      */
     auto handler = std::make_shared<NullHandler>();
     Engine server(handler);
+    EngineTestAccess::ClearConnectInjection(server);
     CHECK(!server.EnableAcceptHandoff(4));
     EngineRunner server_runner(server, ServerConfig(Loopback(0), 1));
     CHECK(WaitUntil([&] { return server.Phase() == EnginePhase::Running; }, 3000ms));
@@ -336,6 +337,7 @@ static void CoContextGate()
      * 合法域下的结果，这里只关心 gate 先行，所以另建一个已配置 handoff 的 server）。
      */
     Engine host{std::shared_ptr<RawHandler>()};
+    EngineTestAccess::ClearConnectInjection(host);
     EngineRunner host_runner(host, ClientConfig());
     CHECK(WaitUntil([&] { return host.Phase() == EnginePhase::Running; }, 3000ms));
 
@@ -659,6 +661,7 @@ static void OptionsContract()
     for (const auto loops_value : extreme_loops) {
         {
             Engine client{std::shared_ptr<RawHandler>()};
+            EngineTestAccess::ClearConnectInjection(client);
             std::error_code error;
             bool threw = false;
             try {
@@ -673,6 +676,7 @@ static void OptionsContract()
         {
             auto handler = std::make_shared<NullHandler>();
             Engine server(handler);
+            EngineTestAccess::ClearConnectInjection(server);
             CHECK(!server.EnableAcceptHandoff(4));
             std::error_code error;
             bool threw = false;
@@ -693,6 +697,7 @@ static void OptionsContract()
      */
     {
         Engine normal{std::shared_ptr<RawHandler>()};
+        EngineTestAccess::ClearConnectInjection(normal);
         EngineRunner normal_runner(normal, ClientConfig());
         CHECK(WaitUntil([&] { return normal.Phase() == EnginePhase::Running; }, 3000ms));
     }
@@ -958,6 +963,7 @@ static void OutputPreservation()
     {
         auto stack_handler = std::make_shared<NullHandler>();
         Engine engine(stack_handler);
+        EngineTestAccess::ClearConnectInjection(engine);
         EngineRunner runner(engine, ServerConfig(Loopback(0), 1));
         CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
 
@@ -983,6 +989,7 @@ static void OutputPreservation()
      */
     {
         Engine host{std::shared_ptr<RawHandler>()};
+        EngineTestAccess::ClearConnectInjection(host);
         EngineRunner runner(host, ClientConfig());
         CHECK(WaitUntil([&] { return host.Phase() == EnginePhase::Running; }, 3000ms));
         Address dead;
@@ -1062,6 +1069,7 @@ static void ConnectDelivery()
     {
         auto handler = std::make_shared<Recorder>();
         Engine client(handler);
+        EngineTestAccess::ClearConnectInjection(client);
         EngineRunner runner(client, ClientConfig());
         CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
         std::uint64_t id = 0;
@@ -1092,6 +1100,7 @@ static void ConnectDelivery()
     {
         auto handler = std::make_shared<Recorder>();
         Engine client(handler);
+        EngineTestAccess::ClearConnectInjection(client);
         EngineRunner runner(client, ClientConfig());
         CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
         std::atomic<bool> callback_inside_barrier{false};
@@ -1151,6 +1160,7 @@ static void ConnectDelivery()
          */
         auto handler = std::make_shared<Recorder>();
         Engine client(handler);
+        EngineTestAccess::ClearConnectInjection(client);
         EngineRunner runner(client, ClientConfig());
         CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
 
@@ -1178,6 +1188,7 @@ static void ConnectDelivery()
     {
         auto handler = std::make_shared<Recorder>();
         Engine client(handler);
+        EngineTestAccess::ClearConnectInjection(client);
         EngineRunner runner(client, ClientConfig());
         CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
         EngineTestAccess::SetConnectPostFailureOnce(client);
@@ -1219,6 +1230,7 @@ static void ConnectDelivery()
     {
         auto handler = std::make_shared<Recorder>();
         Engine client(handler);
+        EngineTestAccess::ClearConnectInjection(client);
         CHECK(client.Phase() == EnginePhase::Idle);
         const std::uint64_t sentinel = 0x3c3c;
         std::uint64_t id = sentinel;
@@ -1245,6 +1257,7 @@ static void ConnectDelivery()
     {
         auto handler = std::make_shared<Recorder>();
         Engine client(handler);
+        EngineTestAccess::ClearConnectInjection(client);
         EngineRunner runner(client, ClientConfig());
         CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
         Address dead;
@@ -1282,6 +1295,7 @@ static void ConnectDelivery()
     {
         auto handler = std::make_shared<Recorder>();
         Engine client(handler);
+        EngineTestAccess::ClearConnectInjection(client);
         EngineRunner runner(client, ClientConfig());
         CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
         const std::uint64_t sentinel = 0x1234;
@@ -1291,6 +1305,7 @@ static void ConnectDelivery()
          * 有 handler 时是合法 raw 提交；此处换到无 handler 的 Engine 验证拒绝。
          */
         Engine co_only{std::shared_ptr<RawHandler>()};
+        EngineTestAccess::ClearConnectInjection(co_only);
         EngineRunner co_runner(co_only, ClientConfig());
         CHECK(WaitUntil([&] { return co_only.Phase() == EnginePhase::Running; }, 3000ms));
         CHECK(co_only.AsyncConnect(address, id) == std::make_error_code(std::errc::operation_not_supported));
@@ -1313,6 +1328,7 @@ static void ConnectDelivery()
     {
         auto handler = std::make_shared<Recorder>();
         Engine client(handler);
+        EngineTestAccess::ClearConnectInjection(client);
         EngineRunner runner(client, ClientConfig());
         CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
         (void)client.Close();
@@ -1332,6 +1348,7 @@ static void ConnectDelivery()
     {
         auto handler = std::make_shared<Recorder>();
         Engine client(handler);
+        EngineTestAccess::ClearConnectInjection(client);
         EngineRunner runner(client, ClientConfig());
         CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
         EngineTestAccess::SetConnectLimit(client, 1);
@@ -1358,6 +1375,7 @@ static void ConnectDelivery()
          * client-only（无 listen）Engine。
          */
         Engine co_client{std::shared_ptr<RawHandler>()};
+        EngineTestAccess::ClearConnectInjection(co_client);
         EngineRunner client_runner(co_client, ClientConfig());
         CHECK(WaitUntil([&] { return co_client.Phase() == EnginePhase::Running; }, 3000ms));
         std::atomic<int> client_result{-1};
@@ -1376,6 +1394,7 @@ static void ConnectDelivery()
          * server 布局（有 listener）+ handoff，无 handler：CoDial 也支持。
          */
         Engine co_server{std::shared_ptr<RawHandler>()};
+        EngineTestAccess::ClearConnectInjection(co_server);
         CHECK(!co_server.EnableAcceptHandoff(4));
         EngineRunner server_runner(co_server, ServerConfig(Loopback(0), 1));
         CHECK(WaitUntil([&] { return co_server.Phase() == EnginePhase::Running; }, 3000ms));
@@ -1396,6 +1415,7 @@ static void ConnectDelivery()
          */
         auto raw_handler = std::make_shared<Recorder>();
         Engine raw_client(raw_handler);
+        EngineTestAccess::ClearConnectInjection(raw_client);
         EngineRunner raw_runner(raw_client, ClientConfig());
         CHECK(WaitUntil([&] { return raw_client.Phase() == EnginePhase::Running; }, 3000ms));
         std::atomic<int> rejected{-1};
@@ -1438,6 +1458,7 @@ static void ConnectFailureCleanup()
      */
     {
         Engine client{std::shared_ptr<RawHandler>()};
+        EngineTestAccess::ClearConnectInjection(client);
         EngineRunner runner(client, ClientConfig());
         CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
         EngineTestAccess::SetConnectDeliveryDelay(client, std::chrono::milliseconds(200));
@@ -1485,6 +1506,7 @@ static void ConnectFailureCleanup()
      */
     {
         Engine client{std::shared_ptr<RawHandler>()};
+        EngineTestAccess::ClearConnectInjection(client);
         EngineRunner runner(client, ClientConfig());
         CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
         EngineTestAccess::SetConnectDeliveryDelay(client, std::chrono::milliseconds(2000));
@@ -1513,6 +1535,7 @@ static void ConnectFailureCleanup()
      */
     {
         Engine client{std::shared_ptr<RawHandler>()};
+        EngineTestAccess::ClearConnectInjection(client);
         EngineRunner runner(client, ClientConfig());
         CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
         EngineTestAccess::SetConnectDeliveryDelay(client, std::chrono::milliseconds(200));
@@ -1543,6 +1566,7 @@ static void ConnectFailureCleanup()
      */
     {
         Engine client{std::shared_ptr<RawHandler>()};
+        EngineTestAccess::ClearConnectInjection(client);
         EngineRunner runner(client, ClientConfig());
         CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
         EngineTestAccess::SetConnectStartDelay(client, std::chrono::milliseconds(5000));
@@ -1582,6 +1606,7 @@ static void ConnectFailureCleanup()
 
         auto handler = std::make_shared<RawDelivery>();
         Engine client(handler);
+        EngineTestAccess::ClearConnectInjection(client);
         EngineRunner runner(client, ClientConfig());
         CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
         std::uint64_t id = 0;
@@ -1658,6 +1683,7 @@ static void ConnectFailureCleanup()
              * 都只能表现为连接数/表项/fd 异常。
              */
             Engine client{std::shared_ptr<RawHandler>()};
+            EngineTestAccess::ClearConnectInjection(client);
             EngineRunner runner(client, ClientConfig());
             CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
 
@@ -1848,6 +1874,7 @@ static void AcceptConfiguration()
     {
         const auto fds_before = CountFds();
         Engine engine{std::shared_ptr<RawHandler>()};
+        EngineTestAccess::ClearConnectInjection(engine);
         EngineConfig config = ServerConfig(Loopback(0), 1);
         const auto error = engine.Run(config);
         CHECK(error == std::make_error_code(std::errc::operation_not_permitted));
@@ -1906,6 +1933,7 @@ static void AcceptConfiguration()
      */
     {
         Engine engine{std::shared_ptr<RawHandler>()};
+        EngineTestAccess::ClearConnectInjection(engine);
         CHECK(!engine.EnableAcceptHandoff(2));
         CHECK(engine.Phase() == EnginePhase::Idle);
         expect_accept_rejection(engine, std::make_error_code(std::errc::operation_not_permitted), "idle", 101);
@@ -1918,6 +1946,7 @@ static void AcceptConfiguration()
     {
         auto handler = std::make_shared<NullHandler>();
         Engine engine(handler);
+        EngineTestAccess::ClearConnectInjection(engine);
         CHECK(!engine.EnableAcceptHandoff(2));
 
         /**
@@ -1937,6 +1966,7 @@ static void AcceptConfiguration()
     {
         auto handler = std::make_shared<NullHandler>();
         Engine engine(handler);
+        EngineTestAccess::ClearConnectInjection(engine);
         EngineRunner runner(engine, ServerConfig(Loopback(0), 1));
         CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
         expect_accept_rejection(
@@ -1949,6 +1979,7 @@ static void AcceptConfiguration()
      */
     {
         Engine engine{std::shared_ptr<RawHandler>()};
+        EngineTestAccess::ClearConnectInjection(engine);
         CHECK(!engine.EnableAcceptHandoff(2));
         EngineRunner runner(engine, ClientConfig());
         CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
@@ -1963,6 +1994,7 @@ static void AcceptConfiguration()
     {
         auto handler = std::make_shared<NullHandler>();
         Engine engine(handler);
+        EngineTestAccess::ClearConnectInjection(engine);
         CHECK(!engine.EnableAcceptHandoff(2));
         EngineRunner runner(engine, ServerConfig(Loopback(0), 1));
         CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
@@ -1980,6 +2012,7 @@ static void AcceptConfiguration()
     {
         auto handler = std::make_shared<NullHandler>();
         Engine engine(handler);
+        EngineTestAccess::ClearConnectInjection(engine);
         CHECK(!engine.EnableAcceptHandoff(2));
         EngineRunner runner(engine, ServerConfig(Loopback(0), 1));
         CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
@@ -2008,6 +2041,7 @@ static void AcceptConfiguration()
 
         auto handler = std::make_shared<CountingHandler>();
         Engine engine(handler);
+        EngineTestAccess::ClearConnectInjection(engine);
         CHECK(!engine.EnableAcceptHandoff(4));
         EngineRunner runner(engine, ServerConfig(Loopback(0), 1));
         CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
@@ -2050,6 +2084,7 @@ static void AcceptConfiguration()
     {
         auto handler = std::make_shared<NullHandler>();
         Engine engine(handler);
+        EngineTestAccess::ClearConnectInjection(engine);
         CHECK(!engine.EnableAcceptHandoff(1));
         EngineRunner runner(engine, ServerConfig(Loopback(0), 1));
         CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
@@ -2086,6 +2121,7 @@ static void AcceptConfiguration()
     {
         auto handler = std::make_shared<NullHandler>();
         Engine engine(handler);
+        EngineTestAccess::ClearConnectInjection(engine);
         CHECK(!engine.EnableAcceptHandoff(4));
         EngineRunner runner(engine, ServerConfig(Loopback(0), 1));
         CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
