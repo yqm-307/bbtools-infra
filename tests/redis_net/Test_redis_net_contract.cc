@@ -275,7 +275,7 @@ void ConnectFailureOwned()
     std::promise<bbt::coroutine::detail::Coroutine*> coroutine;
     auto current = coroutine.get_future();
     std::atomic<bool> submitted{false};
-    net::CoTestAccess::SetDialBarrier([&] { submitted.store(true); });
+    net::CoTestAccess::SetDialBarrier(*host.engine, [&] { submitted.store(true); });
     cli = host.Make(listener.address);
     auto pending = host.Submit([&] {
         coroutine.set_value(g_bbt_tls_coroutine_co);
@@ -288,7 +288,7 @@ void ConnectFailureOwned()
     ExpectCode(cancelled, ErrorCode::Cancelled);
     task = nullptr;
     cli.reset();
-    net::CoTestAccess::SetDialBarrier({});
+    net::CoTestAccess::SetDialBarrier(*host.engine, {});
     Access::SetConnectStartDelay(*host.engine, 0ms);
     host.Finish();
 
@@ -420,7 +420,7 @@ void CloseDuringConnect()
     Host host;
     auto cli = host.Make(listener.address);
     Gate barrier;
-    net::CoTestAccess::SetDialBarrier([&] { barrier.Pause(); });
+    net::CoTestAccess::SetDialBarrier(*host.engine, [&] { barrier.Pause(); });
     auto pending = host.Submit([&] { return bbt_co_await cli->Connect(Until()); });
     CHECK(WaitUntil([&] { return barrier.entered.load(); }));
     CHECK(WaitUntil(
@@ -430,7 +430,7 @@ void CloseDuringConnect()
     CHECK(std::chrono::steady_clock::now() - start < 100ms);
     barrier.Release();
     ExpectCode(Get(pending), ErrorCode::Closed);
-    net::CoTestAccess::SetDialBarrier({});
+    net::CoTestAccess::SetDialBarrier(*host.engine, {});
     ExpectCode(host.Call([&] { return bbt_co_await cli->Ping(Until()); }), ErrorCode::Closed);
     CHECK(WaitUntil([&] { return host.engine->CountConnections() == 0; }));
     cli.reset();
@@ -531,7 +531,7 @@ void DestroyLateCallback()
     auto dial = connecting.Make(listener.address);
     std::weak_ptr<Client> weak_dial = dial;
     Gate dial_barrier;
-    net::CoTestAccess::SetDialBarrier([&] { dial_barrier.Pause(); });
+    net::CoTestAccess::SetDialBarrier(*connecting.engine, [&] { dial_barrier.Pause(); });
     Client* raw_dial = dial.get();
     auto dialing = connecting.Submit([raw_dial] { return bbt_co_await raw_dial->Connect(Until()); });
     CHECK(WaitUntil([&] { return dial_barrier.entered.load(); }));
@@ -539,7 +539,7 @@ void DestroyLateCallback()
     CHECK(weak_dial.expired());
     dial_barrier.Release();
     ExpectCode(Get(dialing), ErrorCode::Closed);
-    net::CoTestAccess::SetDialBarrier({});
+    net::CoTestAccess::SetDialBarrier(*connecting.engine, {});
     connecting.Finish();
     std::cout
         << "destroy_late public_weak_expired=1 readers=0 owner_removal_pending_at_destroy=1 late_completion_terminal_count=1 suspended_connect_state_owned=1\n";

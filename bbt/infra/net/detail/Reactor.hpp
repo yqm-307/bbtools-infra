@@ -73,134 +73,29 @@ public:
 
     void MarkDirty(const std::shared_ptr<ConnCore>& core);
 
-    void SetDirtyBarrier(std::function<void()> barrier)
+    void ArmHookForTest(HookPoint point, std::function<void()> hook, bool once)
     {
-        std::lock_guard<std::mutex> lock(m_barrier_mutex);
-        m_dirty_barrier = std::move(barrier);
+        if (m_impl->test_hooks)
+            m_impl->test_hooks->ArmOwner(point, m_index, std::move(hook), once);
     }
 
-    void SetShutdownBarrier(std::function<void()> barrier)
+    void InvokeHook(HookPoint point)
     {
-        std::lock_guard<std::mutex> lock(m_shutdown_barrier_mutex);
-        m_shutdown_barrier = std::move(barrier);
+        if (m_impl->test_hooks)
+            m_impl->test_hooks->InvokeOwner(point, m_index);
     }
 
-    void SetWriteReadyBarrier(std::function<void()> barrier)
-    {
-        std::lock_guard<std::mutex> lock(m_write_ready_barrier_mutex);
-        m_write_ready_barrier = std::move(barrier);
-    }
+    void InvokeWriteReadyBarrier() { InvokeHook(HookPoint::BeforeWriteReadyPump); }
 
-    void InvokeWriteReadyBarrier()
-    {
-        std::function<void()> barrier;
-        {
-            std::lock_guard<std::mutex> lock(m_write_ready_barrier_mutex);
-            barrier = std::move(m_write_ready_barrier);
-            m_write_ready_barrier = {};
-        }
-        if (barrier) {
-            barrier();
-        }
-    }
+    void InvokeShutdownBarrier() { InvokeHook(HookPoint::BeforeShutdownStage); }
 
-    void InvokeShutdownBarrier()
-    {
-        std::function<void()> barrier;
-        {
-            std::lock_guard<std::mutex> lock(m_shutdown_barrier_mutex);
-            barrier = std::move(m_shutdown_barrier);
-            m_shutdown_barrier = {};
-        }
-        if (barrier) {
-            barrier();
-        }
-    }
+    void InvokeRemoveBarrier() { InvokeHook(HookPoint::AfterDirtyUnlinkBeforeErase); }
 
-    void SetRemoveBarrier(std::function<void()> barrier)
-    {
-        std::lock_guard<std::mutex> lock(m_remove_barrier_mutex);
-        m_remove_barrier = std::move(barrier);
-    }
+    void InvokePreAuthBarrier() { InvokeHook(HookPoint::BeforeCallbackAuthorization); }
 
-    void InvokeRemoveBarrier()
-    {
-        std::function<void()> barrier;
-        {
-            std::lock_guard<std::mutex> lock(m_remove_barrier_mutex);
-            barrier = std::move(m_remove_barrier);
-            m_remove_barrier = {};
-        }
-        if (barrier) {
-            barrier();
-        }
-    }
+    void InvokePostAuthBarrier() { InvokeHook(HookPoint::AfterCallbackAuthorization); }
 
-    void SetPreAuthBarrier(std::function<void()> barrier)
-    {
-        std::lock_guard<std::mutex> lock(m_auth_barrier_mutex);
-        m_pre_auth_barrier = std::move(barrier);
-    }
-
-    void SetConnectStartBarrier(std::function<void()> barrier)
-    {
-        std::lock_guard<std::mutex> lock(m_connect_start_barrier_mutex);
-        m_connect_start_barrier = std::move(barrier);
-    }
-
-    /**
-     * owner 已占用本次 pending connect 回调预算、尚未做起点封口检查时调用。
-     */
-    void InvokeConnectStartBarrier()
-    {
-        std::function<void()> barrier;
-        {
-            std::lock_guard<std::mutex> lock(m_connect_start_barrier_mutex);
-            barrier = std::move(m_connect_start_barrier);
-            m_connect_start_barrier = {};
-        }
-        if (barrier) {
-            barrier();
-        }
-    }
-
-    void SetPostAuthBarrier(std::function<void()> barrier)
-    {
-        std::lock_guard<std::mutex> lock(m_auth_barrier_mutex);
-        m_post_auth_barrier = std::move(barrier);
-    }
-
-    void InvokePreAuthBarrier()
-    {
-        std::function<void()> barrier;
-        {
-            std::lock_guard<std::mutex> lock(m_auth_barrier_mutex);
-            barrier = std::move(m_pre_auth_barrier);
-            m_pre_auth_barrier = {};
-        }
-        if (barrier) {
-            barrier();
-        }
-    }
-
-    void InvokePostAuthBarrier()
-    {
-        std::function<void()> barrier;
-        {
-            std::lock_guard<std::mutex> lock(m_auth_barrier_mutex);
-            barrier = std::move(m_post_auth_barrier);
-            m_post_auth_barrier = {};
-        }
-        if (barrier) {
-            barrier();
-        }
-    }
-
-    void SetSubmitBarrier(std::function<void()> barrier)
-    {
-        std::lock_guard<std::mutex> lock(m_submit_barrier_mutex);
-        m_submit_barrier = std::move(barrier);
-    }
+    void InvokeConnectStartBarrier() { InvokeHook(HookPoint::BeforeConnectStartAuthorization); }
 
     void KickPumpOwner()
     {
@@ -214,30 +109,9 @@ public:
     std::size_t RecvHoldBytes();
     int FirstConnFd();
 
-    /**
-     * 私有 test 屏障：owner recv 后、ring append 前调用（正常为空）。
-     */
-    void SetReadAppendHook(std::function<void()> hook) { m_read_append_hook = std::move(hook); }
+    void InvokeReadAppendHook() { InvokeHook(HookPoint::AfterReceiveBeforeAppend); }
 
-    void InvokeReadAppendHook()
-    {
-        if (m_read_append_hook) {
-            m_read_append_hook();
-        }
-    }
-
-    /**
-     * 私有 test 接缝：TryAppend 观测 Busy 之后、AppendDeferred 之前调用（正常为空）。
-     * 用于确定性制造「Busy 已发生 → 读者释放 → deferred 成功」的交错；产品路径为空时无差异。
-     */
-    void SetAppendBusyHook(std::function<void()> hook) { m_append_busy_hook = std::move(hook); }
-
-    void InvokeAppendBusyHook()
-    {
-        if (m_append_busy_hook) {
-            m_append_busy_hook();
-        }
-    }
+    void InvokeAppendBusyHook() { InvokeHook(HookPoint::AfterAppendBusy); }
 
     /**
      * 不构造 std::function（避免回调派发前的分配/抛出）；用户异常仍隔离。
@@ -300,51 +174,6 @@ private:
      */
     std::size_t m_pending_connect_callbacks{0};
     std::function<void()> m_on_pending_zero;
-    std::mutex m_barrier_mutex;
-
-    /**
-     * 私有 test 屏障（一次性）
-     */
-    std::function<void()> m_dirty_barrier;
-    std::mutex m_remove_barrier_mutex;
-
-    /**
-     * 撤链后/擦表前（一次性）
-     */
-    std::function<void()> m_remove_barrier;
-    std::mutex m_shutdown_barrier_mutex;
-
-    /**
-     * Shutdown stage 前（一次性）
-     */
-    std::function<void()> m_shutdown_barrier;
-    std::mutex m_write_ready_barrier_mutex;
-
-    /**
-     * 写泵持锁前（一次性）
-     */
-    std::function<void()> m_write_ready_barrier;
-    std::mutex m_submit_barrier_mutex;
-
-    /**
-     * 私有 test 屏障（一次性）
-     */
-    std::function<void()> m_submit_barrier;
-    std::mutex m_connect_start_barrier_mutex;
-
-    /**
-     * 建连起点/封口检查前（一次性）
-     */
-    std::function<void()> m_connect_start_barrier;
-    std::mutex m_auth_barrier_mutex;
-    std::function<void()> m_pre_auth_barrier;
-    std::function<void()> m_post_auth_barrier;
-    std::function<void()> m_read_append_hook;
-
-    /**
-     * 私有 test：TryAppend Busy 后/deferred 前（正常为空）
-     */
-    std::function<void()> m_append_busy_hook;
 };
 
 template <class Handler> bool Reactor::TryPostInternal(Handler&& handler)
@@ -383,21 +212,8 @@ template <class Handler> bool Reactor::TryPost(Handler&& handler)
          */
         return false;
     }
-    {
-        std::function<void()> barrier;
-        {
-            std::lock_guard<std::mutex> barrier_lock(m_submit_barrier_mutex);
-            barrier = std::move(m_submit_barrier);
-            m_submit_barrier = {};
-        }
-        if (barrier) {
+    InvokeHook(HookPoint::BeforeDriverPost);
 
-            /**
-             * 测试屏障：已取得提交资格、尚未 post（仍持 driver 锁）
-             */
-            barrier();
-        }
-    }
     try {
         asio::post(m_driver->Context(), std::forward<Handler>(handler));
         return true;

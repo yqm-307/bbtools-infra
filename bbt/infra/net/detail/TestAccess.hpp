@@ -18,6 +18,7 @@
 namespace bbt::infra::net {
 
 class ConnectionState;
+class Engine;
 
 class ConnectionTestAccess {
 public:
@@ -48,7 +49,7 @@ public:
      * 私有 test 屏障：CoDial 提交之后、内部等待 attach 之前（正常为空）。
      * 传空 function 即清除。
      */
-    static void SetDialBarrier(std::function<void()> barrier);
+    static void SetDialBarrier(Engine& engine, std::function<void()> barrier);
 };
 
 /**

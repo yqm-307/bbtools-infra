@@ -1,3 +1,4 @@
+#include <bbt/infra/net/detail/EngineTestAccess.hpp>
 
 /**
  * TCP/Co 聚焦验证（契约行为，不是“跑过”）。
@@ -346,6 +347,7 @@ static void RawRoundtrip()
     const auto tasks_before = CountTasks();
     auto handler = std::make_shared<EchoHandler>();
     Engine engine(handler);
+    EngineTestAccess::ClearConnectInjection(engine);
     EngineRunner runner(engine, ServerConfig(Loopback(0)));
     CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
     std::vector<Address> addresses;
@@ -393,6 +395,7 @@ static void CoAcceptReadWrite()
     StartRuntime(2);
     auto handler = std::make_shared<NullHandler>();
     Engine engine(handler);
+    EngineTestAccess::ClearConnectInjection(engine);
     CHECK(!engine.EnableAcceptHandoff(4));
     EngineRunner runner(engine, ServerConfig(Loopback(0)));
     CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
@@ -435,6 +438,7 @@ static void CoDial()
     StartRuntime(4);
     auto handler = std::make_shared<EchoHandler>();
     Engine server(handler);
+    EngineTestAccess::ClearConnectInjection(server);
     EngineRunner server_runner(server, ServerConfig(Loopback(0)));
     CHECK(WaitUntil([&] { return server.Phase() == EnginePhase::Running; }, 3000ms));
     std::vector<Address> addresses;
@@ -444,6 +448,7 @@ static void CoDial()
      * Co-only：超时可回收未交付 fd
      */
     Engine client{std::shared_ptr<RawHandler>()};
+    EngineTestAccess::ClearConnectInjection(client);
     EngineConfig client_config;
     client_config.runtime_progress = RuntimeProgress::Independent;
     client_config.options.num_event_loop = 1;
@@ -484,6 +489,7 @@ static void CloseRetained()
     StartRuntime(2);
     auto handler = std::make_shared<StoreHandler>();
     Engine engine(handler);
+    EngineTestAccess::ClearConnectInjection(engine);
     EngineRunner runner(engine, ServerConfig(Loopback(0)));
     CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
     std::vector<Address> addresses;
@@ -524,6 +530,7 @@ static void WriteBackpressure()
     StartRuntime(2);
     auto handler = std::make_shared<EchoHandler>();
     Engine engine(handler);
+    EngineTestAccess::ClearConnectInjection(engine);
     EngineRunner runner(engine, ServerConfig(Loopback(0)));
     CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
     std::vector<Address> addresses;
@@ -604,6 +611,7 @@ static void MultiListener()
     StartRuntime(3);
     auto handler = std::make_shared<EchoHandler>();
     Engine engine(handler);
+    EngineTestAccess::ClearConnectInjection(engine);
     EngineRunner runner(engine, ServerConfig(std::vector<Address>{Loopback(0), Loopback(0)}));
     CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
     std::vector<Address> addresses;
@@ -628,6 +636,7 @@ static void CloseWaitersSettle()
     StartRuntime(2);
     auto handler = std::make_shared<NullHandler>();
     Engine engine(handler);
+    EngineTestAccess::ClearConnectInjection(engine);
     CHECK(!engine.EnableAcceptHandoff(2));
     EngineRunner runner(engine, ServerConfig(Loopback(0)));
     CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
@@ -813,6 +822,7 @@ static void BufferTransferLifetime()
     const auto baseline = sockets();
     auto handler = std::make_shared<StoreHandler>();
     Engine engine(handler);
+    EngineTestAccess::ClearConnectInjection(engine);
     auto config = ServerConfig(Loopback(0));
     config.options.max_inbound_bytes = 4096;
     EngineRunner runner(engine, config);
@@ -844,7 +854,7 @@ static void BufferTransferLifetime()
      * 读等待已注册后再发送；首个 Buffer 跨实际挂起和下一批容量复用保留。
      */
     std::atomic<bool> waiting{false};
-    ReceiveRing::SetAfterAddHookForTest([&] { waiting.store(true); });
+    EngineTestAccess::ArmHook(engine, HookPoint::AfterReadRegistered, [&] { waiting.store(true); });
     Buffer co_buffer;
     auto reader = Task([&] {
         CoTcpConnection co{connection};
@@ -857,7 +867,7 @@ static void BufferTransferLifetime()
     const std::string next(4096, 'b');
     CHECK(client.Send(next.data(), next.size()).bytes == next.size());
     Get(reader);
-    ReceiveRing::SetAfterAddHookForTest({});
+    EngineTestAccess::ArmHook(engine, HookPoint::AfterReadRegistered, {});
     CHECK(co_buffer.CopyTo() == next);
     CHECK(transferred.CopyTo() == first);
     (void)connection.Close();
@@ -927,7 +937,7 @@ static void ReadOverloadContract()
      * 证明等待已登记后再取消，校验原错误及已有 Buffer 的 backing 不变。
      */
     std::atomic<bool> registered{false};
-    ReceiveRing::SetAfterAddHookForTest([&] { registered.store(true); });
+    state->ArmReadHookForTest(HookPoint::AfterReadRegistered, [&] { registered.store(true); });
     std::promise<bbt::coroutine::detail::Coroutine*> self;
     auto self_future = self.get_future();
     auto cancelled = Task([&] {
@@ -940,7 +950,7 @@ static void ReadOverloadContract()
     CHECK(WaitUntil([&] { return registered.load(); }, 3000ms));
     self_future.get()->RequestCancel();
     Get(cancelled);
-    ReceiveRing::SetAfterAddHookForTest({});
+    state->ArmReadHookForTest(HookPoint::AfterReadRegistered, {});
     CHECK(state->Inspect().readable_bytes == 0);
 
     /**
@@ -991,6 +1001,7 @@ static void PerfBaseline()
     double raw_ops = 0.0;
     auto handler = std::make_shared<EchoHandler>();
     Engine engine(handler);
+    EngineTestAccess::ClearConnectInjection(engine);
     EngineRunner runner(engine, ServerConfig(Loopback(0)));
     CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
     std::vector<Address> addresses;

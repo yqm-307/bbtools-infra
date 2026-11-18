@@ -688,12 +688,12 @@ void PhysicalCancel()
     /**
      * 已提交且真实对端已 accept，才在同一协程置取消；不是入口预取消。
      */
-    net::CoTestAccess::SetDialBarrier([&] {
+    net::CoTestAccess::SetDialBarrier(*f.host.engine, [&] {
         CHECK(WaitUntil([&] { return f.peer.accept_total() == 1; }));
         g_bbt_tls_coroutine_co->RequestCancel();
     });
     auto cancelled = f.host.Call([&] { return bbt_co_await f.client->Get("/cancel-dial", {}, Until()); });
-    net::CoTestAccess::SetDialBarrier({});
+    net::CoTestAccess::SetDialBarrier(*f.host.engine, {});
     ExpectCode(cancelled, ErrorCode::Cancelled);
     CHECK(f.client->Stats().budget <= 1);
     Access::SetConnectDeliveryDelay(*f.host.engine, 0ms);

@@ -194,24 +194,48 @@ static CoTcpConnection FacadeOf(const std::shared_ptr<ConnectionState>& state)
 }
 
 struct ArmedFlag {
+    std::shared_ptr<ConnectionState> state;
+    Engine* engine{nullptr};
+
+    explicit ArmedFlag(Engine& target)
+        : engine(&target)
+    {
+    }
+
+    explicit ArmedFlag(std::shared_ptr<ConnectionState> target)
+        : state(std::move(target))
+    {
+    }
+
     std::atomic<int> armed{0};
 
     ~ArmedFlag() { Clear(); }
 
     void ArmWriteAdd()
     {
-        ConnectionState::SetWriteAddHookForTest([this] { armed.fetch_add(1); });
+        if (state)
+            state->SetWriteAddHookForTest([this] { armed.fetch_add(1); });
+        else
+            EngineTestAccess::ArmHook(*engine, HookPoint::AfterWriteRegistered, [this] { armed.fetch_add(1); });
     }
 
     void ArmCloseAdd()
     {
-        ConnectionState::SetCloseAddHookForTest([this] { armed.fetch_add(1); });
+        if (state)
+            state->SetCloseAddHookForTest([this] { armed.fetch_add(1); });
+        else
+            EngineTestAccess::ArmHook(*engine, HookPoint::AfterCloseRegistered, [this] { armed.fetch_add(1); });
     }
 
     void Clear()
     {
-        ConnectionState::SetWriteAddHookForTest({});
-        ConnectionState::SetCloseAddHookForTest({});
+        if (state) {
+            state->SetWriteAddHookForTest({});
+            state->SetCloseAddHookForTest({});
+        } else {
+            EngineTestAccess::ArmHook(*engine, HookPoint::AfterWriteRegistered, {});
+            EngineTestAccess::ArmHook(*engine, HookPoint::AfterCloseRegistered, {});
+        }
     }
 };
 
@@ -223,7 +247,7 @@ static void MemberWriteDone()
     StartRuntime(2);
     auto state = std::make_shared<ConnectionState>(1, 4096, 4096, 8, nullptr);
     auto conn = FacadeOf(state);
-    ArmedFlag flag;
+    ArmedFlag flag{state};
     flag.ArmWriteAdd();
     std::atomic<int> result{-1};
     auto task = Task([&] {
@@ -346,7 +370,7 @@ static void WriteAcceptedCancel()
     StartRuntime(2);
     auto state = std::make_shared<ConnectionState>(5, 4096, 4096, 8, nullptr);
     auto conn = FacadeOf(state);
-    ArmedFlag flag;
+    ArmedFlag flag{state};
     flag.ArmWriteAdd();
     auto self = std::make_shared<std::promise<bbt::coroutine::detail::Coroutine*>>();
     auto self_future = self->get_future();
@@ -388,7 +412,7 @@ static void OpWaitPartialError()
     StartRuntime(1);
     auto state = std::make_shared<ConnectionState>(6, 4096, 4096, 8, nullptr);
     auto conn = FacadeOf(state);
-    ArmedFlag flag;
+    ArmedFlag flag{state};
     flag.ArmWriteAdd();
     std::atomic<int> result{-1};
     auto task = Task([&] {
@@ -506,6 +530,7 @@ static void WaitClosedDriverFailed()
     StartRuntime(2);
     auto handler = std::make_shared<StoreHandler>();
     Engine engine(handler);
+    EngineTestAccess::ClearConnectInjection(engine);
     EngineRunner runner(engine, ServerConfig(Loopback(0)));
     CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
     std::vector<Address> addresses;
@@ -523,7 +548,7 @@ static void WaitClosedDriverFailed()
         raw = handler->stored;
     }
     CoTcpConnection conn(*raw);
-    ArmedFlag flag;
+    ArmedFlag flag{engine};
     flag.ArmCloseAdd();
     std::atomic<int> result{-1};
     auto task = Task([&] {

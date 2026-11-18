@@ -53,7 +53,7 @@ public:
         std::error_code error;
     };
 
-    explicit ReceiveRing(std::size_t max_bytes);
+    explicit ReceiveRing(std::size_t max_bytes, std::shared_ptr<TestHooks> hooks = std::make_shared<TestHooks>());
     ReceiveRing(const ReceiveRing&) = delete;
     ReceiveRing& operator=(const ReceiveRing&) = delete;
 
@@ -71,12 +71,12 @@ public:
 
     std::size_t PendingSize() const noexcept { return m_pending_size.load(std::memory_order_acquire); }
 
-    static void SetNotifyFaultOnceForTest() { s_notify_fault_once.store(true); }
+    void SetNotifyFaultOnceForTest() { m_testHooks->FailOnce(FaultPoint::NotifyData); }
 
     /**
      * 测试接缝：在最终 out.append 前调用；测试抛出以验证 out/ring 双不变。
      */
-    static void SetAppendFaultForTest(std::function<void()> hook);
+    void SetAppendFaultForTest(std::function<void()> hook);
 
     /**
      * owner：为 deferred 追加预留容量（在 StartOwner 一次完成，热路径不再分配）。
@@ -135,12 +135,12 @@ public:
      * 确定性时序测试接缝（正常为空）：分别落在 Busy/WouldBlock 分支创建 waiter
      * 之前、以及 on_registered 加入 hub 之后、复查谓词之前。
      */
-    static void SetBusyBeforeWaiterHookForTest(std::function<void()> hook);
-    static void SetWouldBlockBeforeWaiterHookForTest(std::function<void()> hook);
-    static void SetAfterAddHookForTest(std::function<void()> hook);
-    static void InvokeBusyBeforeWaiterHookForTest();
-    static void InvokeWouldBlockBeforeWaiterHookForTest();
-    static void InvokeAfterAddHookForTest();
+    void SetBusyBeforeWaiterHookForTest(std::function<void()> hook);
+    void SetWouldBlockBeforeWaiterHookForTest(std::function<void()> hook);
+    void SetAfterAddHookForTest(std::function<void()> hook);
+    void InvokeBusyBeforeWaiterHookForTest();
+    void InvokeWouldBlockBeforeWaiterHookForTest();
+    void InvokeAfterAddHookForTest();
 
     /**
      * raw 消费者 TryRead 遇 Busy：登记一次合并非递归的补通知责任，owner 在
@@ -178,11 +178,6 @@ public:
 private:
     friend class ConnectionState;
     bool ExerciseReadContentionForTest(const std::function<void()>& during);
-
-    static std::function<void()>& BusyBeforeWaiterHookForTest();
-    static std::function<void()>& WouldBlockBeforeWaiterHookForTest();
-    static std::function<void()>& AfterAddHookForTest();
-    static std::function<void()>& AppendFaultHook();
 
     /**
      * 调用者持数据锁。先全量快照（本地、跨绕环），再 out.append（强保证），
@@ -232,7 +227,7 @@ private:
     std::shared_ptr<const std::function<void()>> m_owner_wake;
     std::atomic<bool> m_notify_pending{false};
     std::atomic<bool> m_wake_pending{false};
-    inline static std::atomic<bool> s_notify_fault_once{false};
+    std::shared_ptr<TestHooks> m_testHooks;
 
     /**
      * 与 m_ring 同受 m_mutex

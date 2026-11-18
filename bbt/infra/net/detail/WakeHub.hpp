@@ -17,6 +17,7 @@
 #include <vector>
 
 #include <bbt/coroutine/sync/CoWaiter.hpp>
+#include <bbt/infra/net/detail/TestHooks.hpp>
 
 namespace bbt::infra::net {
 
@@ -29,7 +30,7 @@ public:
      * runtime 已 _RegistAwaitEvent），避免「创建后、真正登记事件前」的 Notify
      * 在未注册事件上丢失。
      */
-    static void SetCreateFaultOnceForTest() { s_create_fault_once.store(true); }
+    void SetHooksForTest(std::shared_ptr<TestHooks> hooks) { m_testHooks = std::move(hooks); }
 
     std::shared_ptr<bbt::coroutine::sync::CoWaiter> Create();
     bool Add(const std::shared_ptr<bbt::coroutine::sync::CoWaiter>& waiter);
@@ -61,7 +62,7 @@ private:
 
     mutable std::mutex m_mutex;
     std::vector<std::weak_ptr<bbt::coroutine::sync::CoWaiter>> m_waiters;
-    inline static std::atomic<bool> s_create_fault_once{false};
+    std::shared_ptr<TestHooks> m_testHooks;
 };
 
 // clang-format off

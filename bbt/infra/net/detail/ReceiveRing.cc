@@ -4,15 +4,18 @@
 
 namespace bbt::infra::net {
 
-ReceiveRing::ReceiveRing(std::size_t max_bytes)
+ReceiveRing::ReceiveRing(std::size_t max_bytes, std::shared_ptr<TestHooks> hooks)
     : m_ring(max_bytes)
     , m_max_bytes(max_bytes)
+    , m_testHooks(std::move(hooks))
 {
+    m_data_hub.SetHooksForTest(m_testHooks);
+    m_release_hub.SetHooksForTest(m_testHooks);
 }
 
 void ReceiveRing::SetAppendFaultForTest(std::function<void()> hook)
 {
-    AppendFaultHook() = std::move(hook);
+    m_testHooks->Arm(HookPoint::BeforeOutputAppend, std::move(hook), false);
 }
 
 void ReceiveRing::ReserveDeferred(std::size_t capacity)
@@ -353,38 +356,35 @@ bool ReceiveRing::ExerciseReadContentionForTest(const std::function<void()>& dur
 
 void ReceiveRing::SetBusyBeforeWaiterHookForTest(std::function<void()> hook)
 {
-    BusyBeforeWaiterHookForTest() = std::move(hook);
+    m_testHooks->Arm(HookPoint::BeforeBusyWaiter, std::move(hook), false);
 }
 
 void ReceiveRing::SetWouldBlockBeforeWaiterHookForTest(std::function<void()> hook)
 {
-    WouldBlockBeforeWaiterHookForTest() = std::move(hook);
+    m_testHooks->Arm(HookPoint::BeforeDataWaiter, std::move(hook), false);
 }
 
 void ReceiveRing::SetAfterAddHookForTest(std::function<void()> hook)
 {
-    AfterAddHookForTest() = std::move(hook);
+    m_testHooks->Arm(HookPoint::AfterReadRegistered, std::move(hook), false);
 }
 
 void ReceiveRing::InvokeBusyBeforeWaiterHookForTest()
 {
-    if (auto& hook = BusyBeforeWaiterHookForTest()) {
-        hook();
-    }
+    if (m_testHooks)
+        m_testHooks->Invoke(HookPoint::BeforeBusyWaiter);
 }
 
 void ReceiveRing::InvokeWouldBlockBeforeWaiterHookForTest()
 {
-    if (auto& hook = WouldBlockBeforeWaiterHookForTest()) {
-        hook();
-    }
+    if (m_testHooks)
+        m_testHooks->Invoke(HookPoint::BeforeDataWaiter);
 }
 
 void ReceiveRing::InvokeAfterAddHookForTest()
 {
-    if (auto& hook = AfterAddHookForTest()) {
-        hook();
-    }
+    if (m_testHooks)
+        m_testHooks->Invoke(HookPoint::AfterReadRegistered);
 }
 
 void ReceiveRing::SetOwnerWake(std::function<void()> wake)
@@ -412,38 +412,13 @@ std::error_code ReceiveRing::ReadError() const
     return std::error_code(value, std::system_category());
 }
 
-std::function<void()>& ReceiveRing::BusyBeforeWaiterHookForTest()
-{
-    static std::function<void()> hook;
-    return hook;
-}
-
-std::function<void()>& ReceiveRing::WouldBlockBeforeWaiterHookForTest()
-{
-    static std::function<void()> hook;
-    return hook;
-}
-
-std::function<void()>& ReceiveRing::AfterAddHookForTest()
-{
-    static std::function<void()> hook;
-    return hook;
-}
-
-std::function<void()>& ReceiveRing::AppendFaultHook()
-{
-    static std::function<void()> hook;
-    return hook;
-}
-
 std::error_code ReceiveRing::CopyConsumeLocked(std::string& out, std::size_t& consumed)
 {
     const std::size_t available = m_ring.Size();
     EventSnapshot snapshot = m_ring.TakeSnapshot();
     const auto view = snapshot.Peek();
-    if (auto& hook = AppendFaultHook()) {
-        hook();
-    }
+    if (m_testHooks)
+        m_testHooks->Invoke(HookPoint::BeforeOutputAppend);
     out.append(view.data(), view.size());
     const auto error = m_ring.Discard(available);
     if (!error) {
@@ -574,7 +549,7 @@ void ReceiveRing::NotifyDataChanged()
          */
         owner_wake = m_owner_wake;
     }
-    if (s_notify_fault_once.exchange(false)) {
+    if (m_testHooks && m_testHooks->TakeFault(FaultPoint::NotifyData)) {
 
         /**
          * 测试：通知失败仍不影响已提交数据

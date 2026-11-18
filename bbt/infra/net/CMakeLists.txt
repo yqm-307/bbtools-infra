@@ -3,7 +3,7 @@ add_library(bbt_infra_net STATIC
     Connection.cc ReclaimReceipt.cc CoTcpConnection.cc detail/CoInternal.cc
     Engine.cc detail/EngineState.cc detail/Reactor.cc detail/ConnCore.cc
     detail/EngineTestAccess.cc detail/ReactorDriver.cc detail/DriverBinder.cc detail/OptionsNormalize.cc
-    detail/TestAccess.cc
+    detail/TestAccess.cc detail/TestHooks.cc
     Buffer.cc Error.cc ../NetError.cc ICoConnection.cc detail/SourceAddrHash.cc
     detail/ConnectionState.cc detail/EventRingBuffer.cc detail/OutboundQueue.cc
     detail/ReceiveRing.cc detail/WakeHub.cc)

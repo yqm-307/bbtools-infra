@@ -18,10 +18,15 @@ class CoWaiter;
 
 namespace bbt::infra::net {
 
+enum class HookPoint : std::size_t;
+enum class FaultPoint : std::size_t;
+
 class Engine;
 
 class EngineTestAccess {
 public:
+    static void ArmHook(Engine& engine, HookPoint point, std::function<void()> hook, bool once = false);
+    static void ArmFault(Engine& engine, FaultPoint point);
     static std::error_code InjectDriverFailure(Engine& engine);
     static void SetConnectLimit(Engine& engine, std::size_t limit);
     static std::size_t ConnectTableSize(Engine& engine);

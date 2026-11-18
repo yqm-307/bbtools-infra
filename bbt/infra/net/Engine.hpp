@@ -281,6 +281,19 @@ public:
     result<void> CoWaitRunning(const bbt::coroutine::WaitOptions& options);
 
 private:
+    std::error_code InjectDriverFailureForTest();
+    void RestrictConnectCapacityForTest(std::size_t limit);
+    struct EngineTestSnapshot InspectForTest();
+    struct ConnectTestSnapshot InspectConnectForTest(std::uint64_t id);
+    void DelayForTest(std::size_t point, std::chrono::milliseconds delay);
+    void ArmHookForTest(std::size_t point, std::function<void()> hook, bool once);
+    void ArmFaultForTest(std::size_t point);
+    std::size_t
+    OccupyConnectWaitersForTest(std::uint64_t id, std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>>& keep);
+    void RequestOwnerPumpForTest();
+    void OverrideWaitOnceForTest(int status);
+    void ClearConnectInjectionForTest();
+
     friend class EngineTestAccess;
     friend struct CoAccess;
 

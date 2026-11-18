@@ -7,6 +7,8 @@
 #include <bbt/infra/net/Engine.hpp>
 #include <bbt/infra/net/detail/ReclaimRecord.hpp>
 #include <bbt/infra/net/detail/TestAccess.hpp>
+#include <bbt/infra/net/detail/EngineTestAccess.hpp>
+#include <bbt/infra/net/detail/TestHooks.hpp>
 
 namespace bbt::infra::net {
 
@@ -20,24 +22,6 @@ std::error_code InvalidContext()
 // clang-format off
 }
 // clang-format on
-
-/**
- * 拨号私有 test 屏障（正常为空）：Engine::CoDial 提交之后、领取 attach 之前调用。
- */
-namespace {
-std::function<void()>& DialBarrierForTest()
-{
-    static std::function<void()> barrier;
-    return barrier;
-}
-
-} // namespace
-
-void InvokeDialBarrierForTest()
-{
-    if (auto& barrier = DialBarrierForTest())
-        barrier();
-}
 
 std::error_code RequireCoroutineContext()
 {
@@ -71,9 +55,9 @@ std::error_code WaitStatusError(bbt::coroutine::WaitStatus status)
     return std::make_error_code(std::errc::operation_not_supported);
 }
 
-void CoTestAccess::SetDialBarrier(std::function<void()> barrier)
+void CoTestAccess::SetDialBarrier(Engine& engine, std::function<void()> barrier)
 {
-    DialBarrierForTest() = std::move(barrier);
+    EngineTestAccess::ArmHook(engine, HookPoint::AfterDialSubmitBeforeAttach, std::move(barrier));
 }
 
 std::error_code CoAccess::Read(const Connection& connection, Buffer& out, const bbt::coroutine::WaitOptions& options)

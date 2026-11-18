@@ -178,7 +178,7 @@ std::size_t Reactor::ReadLowWater() const
 
 std::error_code Reactor::InstallOnOwner(const std::vector<Address>& addresses)
 {
-    const auto install_delay = m_impl->install_delay_ms.load();
+    const auto install_delay = m_impl->DelayCount(DelayPoint::Install);
     if (install_delay > 0) {
         timespec ts{};
         ts.tv_sec = install_delay / 1000;
@@ -428,7 +428,7 @@ void Reactor::AdoptFdOnOwner(
         return;
     }
     if (is_connect && !delayed_delivery) {
-        const auto delay_ms = m_impl->connect_delivery_delay_ms.load();
+        const auto delay_ms = m_impl->DelayCount(DelayPoint::ConnectDelivery);
         if (delay_ms > 0) {
 
             /**
@@ -527,7 +527,8 @@ void Reactor::AdoptFdOnOwner(
         m_impl->max_outbound_bytes,
         m_impl->max_ops,
         m_impl->service_sealed,
-        std::move(owner_record));
+        std::move(owner_record),
+        m_impl->test_hooks);
     auto core = std::make_shared<ConnCore>(state, std::move(descriptor), this, m_impl->handler);
     std::weak_ptr<Reactor> weak_self = weak_from_this();
     std::weak_ptr<ConnCore> weak_core = core;
@@ -649,7 +650,7 @@ void Reactor::BeginConnectOnOwner(
         m_impl->ResolveConnect(connect_id, Connection(), std::make_error_code(std::errc::operation_canceled));
         return;
     }
-    const auto start_delay = m_impl->connect_start_delay_ms.load();
+    const auto start_delay = m_impl->DelayCount(DelayPoint::ConnectStart);
     if (start_delay > 0) {
 
         /**
@@ -909,21 +910,7 @@ void Reactor::MarkDirty(const std::shared_ptr<ConnCore>& core)
     if (!core->m_dirty_queued.compare_exchange_strong(expected, true)) {
         return;
     }
-    {
-        std::function<void()> barrier;
-        {
-            std::lock_guard<std::mutex> barrier_lock(m_barrier_mutex);
-            barrier = std::move(m_dirty_barrier);
-            m_dirty_barrier = {};
-        }
-        if (barrier) {
-
-            /**
-             * 测试屏障：weak-lock 之后、登记/入链之前
-             */
-            barrier();
-        }
-    }
+    InvokeHook(HookPoint::AfterDirtyWeakLock);
     {
 
         /**
@@ -1098,7 +1085,7 @@ void Reactor::FinishConnectCallback()
 
 void Reactor::SealServiceOnOwner(std::function<void()> on_done)
 {
-    const auto seal_delay = m_impl->seal_delay_ms.load();
+    const auto seal_delay = m_impl->DelayCount(DelayPoint::Seal);
     if (seal_delay > 0) {
 
         /**

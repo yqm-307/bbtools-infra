@@ -237,15 +237,19 @@ ConnectionState::ConnectionState(
     std::size_t outbound_max,
     std::size_t max_ops,
     std::shared_ptr<std::atomic<bool>> service_sealed,
-    std::shared_ptr<ReclaimRecord> owner_released)
+    std::shared_ptr<ReclaimRecord> owner_released,
+    std::shared_ptr<TestHooks> hooks)
     : m_id(id)
-    , ring(inbound_max)
+    , ring(inbound_max, hooks)
     , m_queue(std::min<std::size_t>(outbound_max, 64 * 1024), outbound_max, max_ops)
     , m_outbound_max(outbound_max)
     , m_max_ops(max_ops)
     , m_service_sealed(std::move(service_sealed))
     , m_owner_released(owner_released ? std::move(owner_released) : std::make_shared<ReclaimRecord>(true))
+    , m_testHooks(std::move(hooks))
 {
+    m_write_hub.SetHooksForTest(m_testHooks);
+    m_close_hub.SetHooksForTest(m_testHooks);
     m_writeIntervals.set_capacity(max_ops);
     m_pending_terminal.set_capacity(std::max<std::size_t>(1, max_ops));
 }
@@ -537,9 +541,8 @@ bool ConnectionState::AddWriteWaiter(const std::shared_ptr<bbt::coroutine::sync:
 {
     const bool added = m_write_hub.Add(waiter);
     if (added) {
-        if (auto& hook = WriteAddHookForTest()) {
-            hook();
-        }
+        if (m_testHooks)
+            m_testHooks->Invoke(HookPoint::AfterWriteRegistered);
     }
     return added;
 }
@@ -548,21 +551,25 @@ bool ConnectionState::AddCloseWaiter(const std::shared_ptr<bbt::coroutine::sync:
 {
     const bool added = m_close_hub.Add(waiter);
     if (added) {
-        if (auto& hook = CloseAddHookForTest()) {
-            hook();
-        }
+        if (m_testHooks)
+            m_testHooks->Invoke(HookPoint::AfterCloseRegistered);
     }
     return added;
 }
 
+void ConnectionState::ArmReadHookForTest(HookPoint point, std::function<void()> hook)
+{
+    m_testHooks->Arm(point, std::move(hook), false);
+}
+
 void ConnectionState::SetWriteAddHookForTest(std::function<void()> hook)
 {
-    WriteAddHookForTest() = std::move(hook);
+    m_testHooks->Arm(HookPoint::AfterWriteRegistered, std::move(hook), false);
 }
 
 void ConnectionState::SetCloseAddHookForTest(std::function<void()> hook)
 {
-    CloseAddHookForTest() = std::move(hook);
+    m_testHooks->Arm(HookPoint::AfterCloseRegistered, std::move(hook), false);
 }
 
 void ConnectionState::WakeOwner()
@@ -570,18 +577,6 @@ void ConnectionState::WakeOwner()
     if (owner_dirty) {
         owner_dirty();
     }
-}
-
-std::function<void()>& ConnectionState::WriteAddHookForTest()
-{
-    static std::function<void()> hook;
-    return hook;
-}
-
-std::function<void()>& ConnectionState::CloseAddHookForTest()
-{
-    static std::function<void()> hook;
-    return hook;
 }
 
 bool ConnectionState::AttributeSentLocked(std::size_t bytes)

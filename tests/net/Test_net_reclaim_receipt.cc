@@ -193,6 +193,7 @@ void CoDialSuccessCloseReleased()
     Address address;
     auto listener = MakeListener(address);
     Engine client{std::shared_ptr<RawHandler>()};
+    EngineTestAccess::ClearConnectInjection(client);
     EngineRunner runner(client, ClientConfig());
     CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
     std::atomic<int> result{-2};
@@ -259,6 +260,7 @@ void CoDialTimeoutUndelivered()
     Address address;
     auto listener = MakeListener(address);
     Engine client{std::shared_ptr<RawHandler>()};
+    EngineTestAccess::ClearConnectInjection(client);
     EngineRunner runner(client, ClientConfig());
     CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
 
@@ -339,6 +341,7 @@ void DialRefusedReleased()
         (void)dead.Close();
     }
     Engine client{std::shared_ptr<RawHandler>()};
+    EngineTestAccess::ClearConnectInjection(client);
     EngineRunner runner(client, ClientConfig());
     CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
     std::atomic<int> result{-2};
@@ -384,6 +387,7 @@ void DialPreSubmitRejections()
      */
     {
         Engine idle{std::shared_ptr<RawHandler>()};
+        EngineTestAccess::ClearConnectInjection(idle);
         auto res = idle.CoDial(Loopback(1), Until(50ms));
         CHECK(res.error == std::make_error_code(std::errc::operation_not_permitted));
         CHECK(!res.reclaim.Valid());
@@ -394,6 +398,7 @@ void DialPreSubmitRejections()
     Address address;
     auto listener = MakeListener(address);
     Engine client{std::shared_ptr<RawHandler>()};
+    EngineTestAccess::ClearConnectInjection(client);
     EngineRunner runner(client, ClientConfig());
     CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
 
@@ -462,6 +467,7 @@ void ReleasedNotBeforePhysicalClose()
     Address address;
     auto listener = MakeListener(address);
     Engine client{std::shared_ptr<RawHandler>()};
+    EngineTestAccess::ClearConnectInjection(client);
     EngineRunner runner(client, ClientConfig());
     CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
     std::atomic<bool> barrier_entered{false};
@@ -520,6 +526,7 @@ void EngineStopReleases()
     Address address;
     auto listener = MakeListener(address);
     Engine client{std::shared_ptr<RawHandler>()};
+    EngineTestAccess::ClearConnectInjection(client);
     EngineRunner runner(client, ClientConfig());
     CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
     std::atomic<int> delivered_result{-2};
@@ -582,6 +589,7 @@ void DriverFailedReleases()
     Address address;
     auto listener = MakeListener(address);
     Engine client{std::shared_ptr<RawHandler>()};
+    EngineTestAccess::ClearConnectInjection(client);
     EngineRunner runner(client, ClientConfig());
     CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
     EngineTestAccess::SetConnectStartDelay(client, std::chrono::milliseconds(5000));
@@ -641,6 +649,7 @@ void DriverFailedWithLiveFd()
         Address address;
         auto listener = MakeListener(address);
         Engine client{std::shared_ptr<RawHandler>()};
+        EngineTestAccess::ClearConnectInjection(client);
         EngineRunner runner(client, ClientConfig());
         CHECK(WaitUntil([&] { return client.Phase() == EnginePhase::Running; }, 3000ms));
         EngineTestAccess::SetConnectDeliveryDelay(client, 5000ms);

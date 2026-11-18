@@ -205,6 +205,7 @@ public:
     explicit Host(std::shared_ptr<net::RawHandler> handler = {}, net::Options options = {})
         : engine(net::Engine::Create(std::move(handler)))
     {
+        Access::ClearConnectInjection(*engine);
         net::EngineConfig config;
         config.runtime_progress = net::RuntimeProgress::Independent;
         config.options = options;
