@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-18",
+  "commit": "52b802ad02df06f714bfd7deb40e120acb32d5ad",
+  "base": "9d707f907ebdb2a63564aebbec8d5ac0554ffe62",
+  "result": "pass",
+  "reviewer": "Alice（自审；仅性能 harness，非产品代码，不属于须独立审查类别）",
+  "summary": "tests/net/perf/tcp_echo_server.cc 适配协程 Write 的 (n, err) 返回：S1a 改返回类型时漏改该文件（BBT_INFRA_PERF_BENCH 默认 OFF，CI 不编译）。错误或未全量发送均按原分支处理。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "自审：语义对照 ICoConnection::Write 契约（n 为交给内核的前缀，err 为终态）；原 wait_error/outcome.error 二选一合并为 err，另把 n≠帧长视为失败，Closed/Eof 仍按良性拆除计数。",
+      "evidence": {
+        "reviewer": "Alice self-review",
+        "scope": "9d707f9..52b802a，1 文件 +2/-8"
+      }
+    },
+    {
+      "id": "tests",
+      "kind": "auto",
+      "status": "pass",
+      "summary": "Release + BBT_INFRA_PERF_BENCH=ON 编译 bbt_net_tcp_echo_server/bbt_net_tcp_loadgen 通过、0 warning；ctest net.perf_smoke_raw / net.perf_smoke_co 2/2 通过。"
+    },
+    {
+      "id": "format",
+      "kind": "auto",
+      "status": "pass",
+      "summary": "check_format.sh --staged 通过；git diff --check 通过。"
+    }
+  ]
+}
