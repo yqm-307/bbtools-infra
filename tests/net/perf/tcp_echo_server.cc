@@ -595,14 +595,8 @@ void CoServeConnection(Connection connection)
             }
             bbt::coroutine::WaitOptions wopts;
             wopts.deadline = std::chrono::steady_clock::now() + 5000ms;
-            const auto report = co_conn.Write(frame, wopts);
-
-            /**
-             * 有效写错误：等待失败取 wait_error；等待完成但发送未确认取
-             * outcome.error（与旧 CoWrite err+outcome 终态同口径）。
-             */
-            const auto werr = report.wait_error ? report.wait_error : report.outcome.error;
-            if (werr) {
+            const auto [sent, werr] = co_conn.Write(frame, wopts);
+            if (werr || sent != frame.size()) {
                 if (werr == make_error_code(NetErrc::Closed) || werr == make_error_code(NetErrc::Eof)) {
                     ++g_write_closed;
                     (void)connection.Close();
