@@ -92,21 +92,6 @@ static bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milli
     return predicate();
 }
 
-/** 屏障守卫：析构时先放行（release 并 notify），再由 runner 析构执行 join。
- * 声明在屏障状态之后，故析构在 runner 之前；CHECK 抛异常时，正在
- * cv.wait 的 owner 线程能被放行，避免与已析构的同步对象相遇或
- * join 永久阻塞。 */
-struct BarrierGuard {
-    std::atomic<bool>& release;
-    std::condition_variable& cv;
-
-    ~BarrierGuard() noexcept
-    {
-        release.store(true, std::memory_order_release);
-        cv.notify_all();
-    }
-};
-
 Address Loopback(int port)
 {
     std::error_code error;
@@ -150,6 +135,54 @@ struct EngineRunner {
     }
 
     ~EngineRunner() { CloseAndJoin(); }
+};
+
+/** 屏障守卫：持有 mtx/release/cv/runner，析构时先同锁置位 release、再
+ * 解锁 notify_all、最后 runner.CloseAndJoin()。guard 声明在所有被钩子
+ * 捕获的对象（mtx/cv/release/hook_entered/removed/conn）之后，故它最
+ * 先析构：CHECK 抛异常时，owner 线程会被放行并由 runner join，不会
+ * 与已析构的同步对象相遇，也不会阻塞在 join；CloseAndJoin 按
+ * thread.joinable() 保护，runner 析构时再次调用是幂等的。 */
+struct BarrierGuard {
+    std::mutex& mtx;
+    std::atomic<bool>& release;
+    std::condition_variable& cv;
+    EngineRunner& runner;
+
+    ~BarrierGuard() noexcept
+    {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            release.store(true, std::memory_order_release);
+        }
+        cv.notify_all();
+        runner.CloseAndJoin();
+    }
+};
+
+/** 唤醒线程守卫：析构时先同锁置位 release、再 notify_all、最后 join。
+ * 用于 wakeThread2：若中间 CHECK 抛异常，避免 joinable std::thread
+ * 析构时 terminate；正常路径 join 已完成，析构时为幂等无操作。 */
+struct WakeThreadGuard {
+    std::thread& thread;
+    std::mutex& mtx;
+    std::atomic<bool>& release;
+    std::condition_variable& cv;
+
+    ~WakeThreadGuard() noexcept
+    {
+        try {
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                release.store(true, std::memory_order_release);
+            }
+            cv.notify_all();
+            if (thread.joinable()) {
+                thread.join();
+            }
+        } catch (...) {
+        }
+    }
 };
 
 NativeSocket ConnectClient(const Address& address, bool& ok)
@@ -401,9 +434,11 @@ static void S5WakeDriverUnbound()
         CHECK(fx.reactor->DirtyCount() == 0);
     }
 
-    // (b) 动态子例：AfterDirtyWeakLock 扣住 Wake，释放 core/driver 引用并解绑，
-    //     仅 weak 观察；core deleter 记录删除 core 时 driver 未过期；
-    //     放行、join 后断言两者都过期。
+    // (b) 动态子例：AfterDirtyWeakLock 扣住 Wake，WaitUntil(hookEntered2)
+    // 之后、放行之前，依次 core2.reset()、driver2.reset()、
+    // reactor2->ReleaseDriver()：此时除被扣住的 Wake 外无人强持 driver，
+    // 仅 weakDriver2 观察（!weakDriver2.expired() 证明在途 Wake 在撑着它）。
+    // 放行、join 后断言 driverAliveAtCoreDelete==true 且两者都过期。
     {
         auto h2 = std::make_shared<CountingHandler>();
         auto impl2 = std::make_shared<EngineImpl>(h2);
@@ -440,18 +475,21 @@ static void S5WakeDriverUnbound()
                 },
                 true);
 
-            // Wake 在单独线程执行，阻塞于钩子
-            std::atomic<bool> wakeDone2{false};
-            std::thread wakeThread2([&] {
-                state2->WakeOwner();
-                wakeDone2 = true;
-            });
+            // Wake 在单独线程执行，阻塞于钩子；异常时先放行再 join，避免
+            // joinable 线程析构 terminate。
+            std::thread wakeThread2([&] { state2->WakeOwner(); });
+            WakeThreadGuard threadGuard{wakeThread2, mtx, release2, cv};
             CHECK(WaitUntil([&] { return hookEntered2.load(); }, 10000ms));
 
-            // 扣住期间：先释放核心引用（MarkDirty 的 shared 参数仍持核心，
-            // 真正析构在钩子返回后）；放行、join，此时 deleter 运行且
-            // driver2 尚未 reset，记录 driver 未过期。
+            // 扣住期间：先释放核心，再释放 driver 并解绑。此时 MarkDirty
+            // 内的 contextLease 仍由在途 Wake 持有，weakDriver2 未过期；
+            // core 的真正析构在钩子返回后，deleter 此时应记录 driver 未过期。
             core2.reset();
+            driver2.reset();
+            reactor2->ReleaseDriver();
+            CHECK(!weakDriver2.expired()); // 在途 Wake 仍持 driver
+
+            // 放行、join
             {
                 std::lock_guard<std::mutex> lock(mtx);
                 release2 = true;
@@ -459,12 +497,8 @@ static void S5WakeDriverUnbound()
             cv.notify_all();
             wakeThread2.join();
 
-            // 钩子返回后核心已析构，driver2 尚活，deleter 应记录 driver 未过期。
+            // 钩子返回后核心已析构：deleter 记录 driver 未过期，两者均已过期。
             CHECK(driverAliveAtCoreDelete.load());
-
-            // 现在释放 driver 并解绑，再断言两者都过期。
-            driver2.reset();
-            reactor2->ReleaseDriver();
             CHECK(weakDriver2.lock() == nullptr); // driver 已过期
             CHECK(weakCore2.lock() == nullptr);   // core 已析构
         }
@@ -716,7 +750,7 @@ static void S5RemoveConnDirtyWindow()
     std::atomic<bool> hook_entered{false};
     std::atomic<bool> release{false};
     std::atomic<bool> removed{false};
-    BarrierGuard guard{release, cv}; // 先放行再 join：异常时不挂 owner 于已析构的 CV
+    BarrierGuard guard{mtx, release, cv, runner}; // 声明在被钩子捕获的对象之后，最先析构
 
     EngineTestAccess::SetDirtyBarrierOnce(engine, [&] {
         removed = EngineTestAccess::RemoveConn(engine, conn->Id()); // 窗口内真实同步撤销登记
@@ -796,7 +830,7 @@ static void S5WakeRegisteredOnce()
     std::condition_variable cv;
     std::atomic<bool> hook_entered{false};
     std::atomic<bool> release{false};
-    BarrierGuard guard{release, cv}; // 先放行再 join：异常时不挂 owner 于已析构的 CV
+    BarrierGuard guard{mtx, release, cv, runner}; // 声明在被钩子捕获的对象之后，最先析构
 
     EngineTestAccess::SetDirtyBarrierOnce(engine, [&] {
         hook_entered = true; // 已取得 core shared，尚未登记
