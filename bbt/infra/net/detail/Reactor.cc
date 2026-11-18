@@ -167,7 +167,7 @@ bool Reactor::ImplSealed() const
 
 std::size_t Reactor::ConnCount()
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::mutex> lock(m_membersMutex);
     return m_conns.size();
 }
 
@@ -540,8 +540,8 @@ void Reactor::AdoptFdOnOwner(
     };
     state->AttachOwner(mark_dirty);
     {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_conns.emplace(id, core);
+        std::lock_guard<std::mutex> lock(m_membersMutex);
+        m_conns.emplace(id, DispatchEntry{core});
     }
     m_impl->AddConnection();
     Connection connection(state);
@@ -888,42 +888,21 @@ void Reactor::MarkDirty(const std::shared_ptr<ConnCore>& core)
     if (!core || m_sealed.load() || m_impl->IsSealed()) {
         return;
     }
-    bool expected = false;
-    if (!core->m_dirty_queued.compare_exchange_strong(expected, true)) {
-        return;
-    }
     InvokeHook(HookPoint::AfterDirtyWeakLock);
+    const auto id = core->Identity();
     {
-
-        /**
-         * 复用连接登记的窄节点：入队不分配。registry 移除与 dirty 入链
-         * 用同一锁序（dirty -> m_mutex）共同登记/撤销：节点已 RemoveConn 时拒绝
-         * 入链，避免晚 Wake 把已析构 core 裸指针挂链。
-         */
-        std::lock_guard<std::mutex> dirty_lock(m_dirty_mutex);
-        if (m_sealed.load()) {
-            core->m_dirty_queued.store(false);
+        std::lock_guard<std::mutex> lock(m_membersMutex);
+        const auto it = m_conns.find(id);
+        if (m_sealed.load() || it == m_conns.end() || it->second.core != core || it->second.queued) {
             return;
         }
-        {
-            std::lock_guard<std::mutex> reg_lock(m_mutex);
-            if (m_conns.find(core->Identity()) == m_conns.end()) {
-                core->m_dirty_queued.store(false);
-
-                /**
-                 * 已撤销登记：明确拒绝晚 Wake
-                 */
-                return;
-            }
-            core->m_dirty_next = nullptr;
-            if (m_dirty_tail != nullptr) {
-                m_dirty_tail->m_dirty_next = core.get();
-            } else {
-                m_dirty_head = core.get();
-            }
-            m_dirty_tail = core.get();
-            core->m_dirty_linked = true;
+        if (m_dirtyTail != 0) {
+            m_conns.at(m_dirtyTail).next = id;
+        } else {
+            m_dirtyHead = id;
         }
+        m_dirtyTail = id;
+        it->second.queued = true;
     }
     {
         std::lock_guard<std::mutex> lock(m_driver_mutex);
@@ -941,31 +920,19 @@ void Reactor::PumpOwner()
     const auto begin = std::chrono::steady_clock::now();
     std::size_t pumped = 0;
     while (pumped < kPumpBudget) {
-        ConnCore* raw = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(m_dirty_mutex);
-            raw = m_dirty_head;
-            if (raw == nullptr) {
-                break;
-            }
-            m_dirty_head = raw->m_dirty_next;
-            if (m_dirty_head == nullptr) {
-                m_dirty_tail = nullptr;
-            }
-            raw->m_dirty_next = nullptr;
-            raw->m_dirty_linked = false;
-            raw->m_dirty_queued.store(false);
-        }
         std::shared_ptr<ConnCore> core;
         {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            const auto it = m_conns.find(raw->Identity());
-            if (it != m_conns.end()) {
-                core = it->second;
+            std::lock_guard<std::mutex> lock(m_membersMutex);
+            if (m_dirtyHead == 0) {
+                break;
             }
-        }
-        if (!core) {
-            continue;
+            auto& entry = m_conns.at(m_dirtyHead);
+            core = entry.core;
+            m_dirtyHead = std::exchange(entry.next, 0);
+            if (m_dirtyHead == 0) {
+                m_dirtyTail = 0;
+            }
+            entry.queued = false;
         }
         core->PumpOwner();
         if (core->Closed()) {
@@ -986,9 +953,9 @@ void Reactor::PumpAllConnsOwner()
 {
     std::vector<std::shared_ptr<ConnCore>> conns;
     {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        std::lock_guard<std::mutex> lock(m_membersMutex);
         for (auto& entry : m_conns) {
-            conns.push_back(entry.second);
+            conns.push_back(entry.second.core);
         }
     }
     for (auto& core : conns) {
@@ -1005,47 +972,30 @@ void Reactor::RemoveConn(const std::shared_ptr<ConnCore>& core)
         return;
     }
     const std::uint64_t id = core->Identity();
-    bool removed = false;
     {
-
-        /**
-         * 与 MarkDirty 真正共门：解链与 registry 擦除在同一 dirty→registry
-         * 锁域内原子完成。若两段之间释放 dirty 锁，MarkDirty 可看到 registry
-         * 仍在而重新入链，随后 erase 使裸节点悬空。
-         */
-        std::lock_guard<std::mutex> dirty_lock(m_dirty_mutex);
-        if (core->m_dirty_linked) {
-            ConnCore* node = m_dirty_head;
-            ConnCore* prev = nullptr;
-            while (node != nullptr && node != core.get()) {
-                prev = node;
-                node = node->m_dirty_next;
-            }
-            if (node == core.get()) {
-                if (prev != nullptr) {
-                    prev->m_dirty_next = node->m_dirty_next;
-                } else {
-                    m_dirty_head = node->m_dirty_next;
-                }
-                if (m_dirty_tail == node) {
-                    m_dirty_tail = prev;
-                }
-                node->m_dirty_next = nullptr;
-                node->m_dirty_linked = false;
-            }
+        std::lock_guard<std::mutex> lock(m_membersMutex);
+        const auto it = m_conns.find(id);
+        if (it == m_conns.end() || it->second.core != core) {
+            return;
         }
-        core->m_dirty_queued.store(false);
-        std::lock_guard<std::mutex> reg_lock(m_mutex);
-
-        /**
-         * 测试：撤链后、擦表前（仍持 dirty+registry）
-         */
+        if (it->second.queued) {
+            auto* link = &m_dirtyHead;
+            std::uint64_t prev = 0;
+            while (*link != id) {
+                prev = *link;
+                link = &m_conns.at(prev).next;
+            }
+            *link = std::exchange(it->second.next, 0);
+            if (m_dirtyTail == id) {
+                m_dirtyTail = prev;
+            }
+            it->second.queued = false;
+        }
+        // 测试屏障保留在撤链与擦表之间，阻止晚 Wake 重新入链。
         InvokeRemoveBarrier();
-        removed = m_conns.erase(id) != 0;
+        m_conns.erase(it);
     }
-    if (removed) {
-        m_impl->RemoveConnection();
-    }
+    m_impl->RemoveConnection();
 }
 
 void Reactor::FinishConnectCallback()
@@ -1065,6 +1015,19 @@ void Reactor::FinishConnectCallback()
     }
 }
 
+void Reactor::_SealMembers()
+{
+    std::lock_guard<std::mutex> lock(m_membersMutex);
+    // 封口和清链使用同一事务，晚 Wake 不能在关闭期间重新入链。
+    m_sealed.store(true);
+    while (m_dirtyHead != 0) {
+        auto& entry = m_conns.at(m_dirtyHead);
+        m_dirtyHead = std::exchange(entry.next, 0);
+        entry.queued = false;
+    }
+    m_dirtyTail = 0;
+}
+
 void Reactor::SealServiceOnOwner(std::function<void()> on_done)
 {
     const auto seal_delay = m_impl->DelayCount(DelayPoint::Seal);
@@ -1078,24 +1041,7 @@ void Reactor::SealServiceOnOwner(std::function<void()> on_done)
         ts.tv_nsec = (seal_delay % 1000) * 1000000L;
         (void)::syscall(SYS_nanosleep, &ts, nullptr);
     }
-    {
-
-        /**
-         * 先解除 dirty 链（不分配），再关闭/清空 conns，避免裸链节点悬空。
-         */
-        std::lock_guard<std::mutex> lock(m_dirty_mutex);
-        ConnCore* node = m_dirty_head;
-        while (node != nullptr) {
-            ConnCore* next = node->m_dirty_next;
-            node->m_dirty_next = nullptr;
-            node->m_dirty_linked = false;
-            node->m_dirty_queued.store(false);
-            node = next;
-        }
-        m_dirty_head = nullptr;
-        m_dirty_tail = nullptr;
-    }
-    m_sealed.store(true);
+    _SealMembers();
 
     /**
      * 幂等：重试/重复调用仍完成剩余 conns 与 pending 收口（ShutdownOwner 幂等），
@@ -1121,13 +1067,13 @@ void Reactor::SealServiceOnOwner(std::function<void()> on_done)
         std::shared_ptr<ConnCore> core;
         std::uint64_t id = 0;
         {
-            std::lock_guard<std::mutex> lock(m_mutex);
+            std::lock_guard<std::mutex> lock(m_membersMutex);
             if (m_conns.empty()) {
                 break;
             }
             auto it = m_conns.begin();
             id = it->first;
-            core = it->second;
+            core = it->second.core;
         }
         core->ShutdownOwner(std::make_error_code(std::errc::operation_canceled));
         if (!core->Closed()) {
@@ -1138,15 +1084,15 @@ void Reactor::SealServiceOnOwner(std::function<void()> on_done)
             break;
         }
         {
-            std::lock_guard<std::mutex> lock(m_mutex);
+            std::lock_guard<std::mutex> lock(m_membersMutex);
             const auto it = m_conns.find(id);
-            if (it != m_conns.end() && it->second == core) {
+            if (it != m_conns.end() && it->second.core == core) {
                 m_conns.erase(it);
             }
         }
     }
     {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        std::lock_guard<std::mutex> lock(m_membersMutex);
         m_impl->PublishConnectionCount(m_conns.size());
     }
     if (m_pending_connect_callbacks == 0) {
@@ -1187,29 +1133,7 @@ void Reactor::StopAcceptingOnOwner()
 
 void Reactor::FinalizeControl()
 {
-    {
-
-        /**
-         * 先解除 dirty 链（不分配），再关闭/清空 conns，避免裸链节点悬空。
-         */
-        std::lock_guard<std::mutex> lock(m_dirty_mutex);
-        ConnCore* node = m_dirty_head;
-        while (node != nullptr) {
-            ConnCore* next = node->m_dirty_next;
-            node->m_dirty_next = nullptr;
-            node->m_dirty_linked = false;
-            node->m_dirty_queued.store(false);
-            node = next;
-        }
-        m_dirty_head = nullptr;
-        m_dirty_tail = nullptr;
-    }
-    if (m_sealed.exchange(true)) {
-
-        /**
-     * 仍确保资源关闭（幂等）。
-     */
-    }
+    _SealMembers();
     boost::system::error_code ignored;
     for (auto& listener : m_listeners) {
         listener->desc.close(ignored);
@@ -1237,9 +1161,9 @@ void Reactor::FinalizeControl()
     m_delivery_fds.clear();
     std::vector<std::shared_ptr<ConnCore>> snapshot;
     {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        std::lock_guard<std::mutex> lock(m_membersMutex);
         for (auto& entry : m_conns) {
-            snapshot.push_back(entry.second);
+            snapshot.push_back(entry.second.core);
         }
         m_conns.clear();
     }
@@ -1303,19 +1227,19 @@ void Reactor::ResumeMainAccept()
 
 std::size_t Reactor::RecvHoldBytes()
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::mutex> lock(m_membersMutex);
     std::size_t total = 0;
     for (auto& entry : m_conns) {
-        total += entry.second->RecvHold();
+        total += entry.second.core->RecvHold();
     }
     return total;
 }
 
 std::size_t Reactor::DirtyCount()
 {
-    std::lock_guard<std::mutex> lock(m_dirty_mutex);
+    std::lock_guard<std::mutex> lock(m_membersMutex);
     std::size_t count = 0;
-    for (ConnCore* node = m_dirty_head; node != nullptr; node = node->m_dirty_next) {
+    for (auto id = m_dirtyHead; id != 0; id = m_conns.at(id).next) {
         ++count;
     }
     return count;
@@ -1323,9 +1247,9 @@ std::size_t Reactor::DirtyCount()
 
 int Reactor::FirstConnFd()
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::mutex> lock(m_membersMutex);
     for (auto& entry : m_conns) {
-        return entry.second->Fd();
+        return entry.second.core->Fd();
     }
     return -1;
 }

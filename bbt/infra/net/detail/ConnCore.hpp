@@ -29,11 +29,7 @@ public:
 
     bool Closed() const;
 
-    int Fd();
-
-    std::atomic<bool> m_dirty_queued{false};
-    ConnCore* m_dirty_next{nullptr};
-    bool m_dirty_linked{false};
+    int Fd() const noexcept;
 
     void StartOwner();
 
@@ -78,6 +74,7 @@ private:
 
     std::shared_ptr<ConnectionState> m_state;
     TcpWait m_desc;
+    std::atomic<int> m_observedFd;
     Reactor* m_owner;
     std::shared_ptr<RawHandler> m_handler;
     bool m_read_waiting{false};

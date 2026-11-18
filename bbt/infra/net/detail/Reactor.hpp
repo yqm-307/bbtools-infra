@@ -144,6 +144,7 @@ private:
     void RemoveConn(const std::shared_ptr<ConnCore>& core);
     void PumpOwner();
     void PumpAllConnsOwner();
+    void _SealMembers();
 
     EngineImpl* m_impl;
     std::size_t m_index;
@@ -163,11 +164,17 @@ private:
      * 不能靠 driver/context 最后一个强引用析构来证明物理关闭。
      */
     std::vector<std::shared_ptr<FdHandle>> m_delivery_fds;
-    std::mutex m_mutex;
-    std::unordered_map<std::uint64_t, std::shared_ptr<ConnCore>> m_conns;
-    std::mutex m_dirty_mutex;
-    ConnCore* m_dirty_head{nullptr};
-    ConnCore* m_dirty_tail{nullptr};
+
+    struct DispatchEntry {
+        std::shared_ptr<ConnCore> core;
+        std::uint64_t next{0};
+        bool queued{false};
+    };
+
+    std::mutex m_membersMutex;
+    std::unordered_map<std::uint64_t, DispatchEntry> m_conns;
+    std::uint64_t m_dirtyHead{0};
+    std::uint64_t m_dirtyTail{0};
 
     /**
      * owner-only

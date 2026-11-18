@@ -85,6 +85,7 @@ ConnCore::ConnCore(
     std::shared_ptr<ConnectionState> state, TcpWait descriptor, Reactor* owner, std::shared_ptr<RawHandler> handler)
     : m_state(std::move(state))
     , m_desc(std::move(descriptor))
+    , m_observedFd(m_desc.native_handle())
     , m_owner(owner)
     , m_handler(std::move(handler))
 {
@@ -102,6 +103,7 @@ ConnCore::~ConnCore()
         boost::system::error_code ignored;
         m_desc.cancel(ignored);
         m_desc.close(ignored);
+        m_observedFd.store(-1, std::memory_order_release);
         m_backend_closed = true;
     }
     m_state->MarkOwnerReleased();
@@ -122,9 +124,9 @@ bool ConnCore::Closed() const
     return m_closed;
 }
 
-int ConnCore::Fd()
+int ConnCore::Fd() const noexcept
 {
-    return m_desc.native_handle();
+    return m_observedFd.load(std::memory_order_acquire);
 }
 
 void ConnCore::StartOwner()
@@ -212,6 +214,7 @@ void ConnCore::ShutdownOwner(std::error_code reason)
         boost::system::error_code ignored;
         m_desc.cancel(ignored);
         m_desc.close(ignored);
+        m_observedFd.store(-1, std::memory_order_release);
         m_backend_closed = true;
     }
     if (!m_ring_closed) {
@@ -254,6 +257,7 @@ void ConnCore::CancelControl()
         boost::system::error_code ignored;
         m_desc.cancel(ignored);
         m_desc.close(ignored);
+        m_observedFd.store(-1, std::memory_order_release);
         m_backend_closed = true;
     }
     if (!m_ring_closed) {
