@@ -25,9 +25,21 @@ public:
      * 从内部状态构造公共句柄（等价于 Engine owner 的构造路径）。
      */
     static Connection Make(std::shared_ptr<ConnectionState> state);
-    static std::shared_ptr<ConnectionState> StateOf(const Connection& connection);
-    static std::unique_lock<std::mutex> HoldForTest(std::shared_ptr<ConnectionState> state);
-    static void Reset(const std::shared_ptr<ConnectionState>& state, std::unique_lock<std::mutex>& lock);
+
+    struct Observation {
+        std::uintptr_t identity;
+        std::size_t readable_bytes;
+        std::size_t pending_bytes;
+        std::uint64_t access_generation;
+        bool close_requested;
+        bool can_accept_one;
+    };
+
+    static Observation Inspect(const Connection& connection);
+    static bool ExerciseReadContention(const Connection& connection, const std::function<void()>& during);
+    static bool
+    ExerciseReadContention(const std::shared_ptr<ConnectionState>& state, const std::function<void()>& during);
+    static bool DeferReceived(const Connection& connection, const std::string& data);
 };
 
 class CoTestAccess {

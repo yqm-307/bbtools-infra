@@ -851,8 +851,8 @@ ConnectionResult Engine::CoAccept(const bbt::coroutine::WaitOptions& options)
          * owner record 就是 Connection::Released() 的事实——reclaim 取同一
          * 记录才满足「receipt 与连接 IsReleased 同一事实源」。
          */
-        if (const auto state = CoAccess::StateOf(conn)) {
-            result.reclaim = CoAccess::MakeReceipt(state->OwnerReleasedRecord());
+        if (const auto record = conn.ReclaimForOwner()) {
+            result.reclaim = CoAccess::MakeReceipt(record);
         }
         result.connection = CoTcpConnection(std::move(conn));
     }
@@ -879,7 +879,7 @@ ConnectionResult Engine::CoDial(const Address& address, const bbt::coroutine::Wa
     auto record = std::make_shared<ReclaimRecord>(false);
     std::uint64_t id = 0;
     if (const auto error = CoSubmitConnect(address, id, record)) {
-        record->released.store(true, std::memory_order_release);
+        record->ConfirmReleased();
         result.error = error;
 
         /**
@@ -888,13 +888,7 @@ ConnectionResult Engine::CoDial(const Address& address, const bbt::coroutine::Wa
         result.reclaim = ReclaimReceipt{};
         return result;
     }
-    if (auto& barrier = DialBarrierForTest()) {
-
-        /**
-         * 测试：强制 owner 完成早于领取 attach
-         */
-        barrier();
-    }
+    InvokeDialBarrierForTest();
     Connection conn;
     result.error = CoWaitConnect(id, conn, options);
     result.reclaim = CoAccess::MakeReceipt(std::move(record));

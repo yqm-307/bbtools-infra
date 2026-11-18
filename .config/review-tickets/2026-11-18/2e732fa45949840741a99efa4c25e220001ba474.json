@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-18",
+  "commit": "2e732fa45949840741a99efa4c25e220001ba474",
+  "base": "5aae4029c448bad7a0a754b6bc00e74ff50ba215",
+  "result": "pass",
+  "reviewer": "Alice (协调者) + 独立审查 gpt-6-astra (deleg_1854cd83) + 独立验收 deepseek-flash (deleg_4504d04c, deleg_7038805c)",
+  "summary": "net S1b：跨类字段访问改为类内方法调用，零行为变更；Read/Write/WaitClosed 协议迁入 ConnectionState；删除 CoAccess::StateOf 与 ConnectionTestAccess::StateOf；ReclaimRecord::released 私有化；公共头仅 Connection.hpp private 区新增声明；friend 16→18 均在设计白名单；ADR 0010 追加 StateOf 已删除说明。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "未参与编写的审查者结论可合入：锁种类/顺序/范围、generation 采样→TryRead→登记→复查顺序、released acquire/release 与发布点、shared_ptr 寿命均未变；测试只改调用未放宽断言。blocker 0 / major 0 / minor 3（口径项）。审查报告约半数 path:line 超出文件行数，结论由独立验收按 diff 复核一致。2e732fa 为审查后追加的 ADR 0010 两行说明，由协调者核对。",
+      "evidence": {
+        "reviewer": "gpt-6-astra (deleg_1854cd83, 677s)",
+        "report": "/home/yqm/.hermes/profiles/alice/reports/net-redesign/runs/review-s1b.md",
+        "report_sha256": "bcd5afb7d6f6e7de7c8a9a118eb9ba45155950220af87bf4748f4379f94c1d8f",
+        "scope": "5aae402..9070637 全部 28 个文件；2e732fa 仅 docs/decisions/0010-gnet-network-foundation.md 追加 2 行"
+      }
+    },
+    {
+      "id": "tests",
+      "kind": "auto",
+      "status": "pass",
+      "summary": "build-rpc（开 RPC/REDIS）编译通过，warning 仅基线 Test_net_foundation.cc:769 a_bound；ctest -j1 -LE live 367/367（net207/http70/rpc68/redis15+其余），独立复跑 rpc/redis 83/83。",
+      "evidence": {
+        "report": "/home/yqm/.hermes/profiles/alice/reports/net-redesign/runs/verify-s1b-c2.md",
+        "report_sha256": "d55f4c3628c8ddf062d16cc464a58ad81750f4e3858a5259231161cdc1d62404"
+      }
+    },
+    {
+      "id": "format",
+      "kind": "auto",
+      "status": "pass",
+      "summary": "28 个改动 C++ 文件 clang-format --dry-run --Werror exit 0；git diff --check exit 0。"
+    }
+  ]
+}

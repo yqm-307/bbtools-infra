@@ -1,3 +1,4 @@
+#include <tests/net/ReadContention.hpp>
 /**
  * 复制读取契约：跨段 FIFO、尾部、失败零消费、容量释放与输出独立寿命。
  */
@@ -186,54 +187,54 @@ BOOST_AUTO_TEST_CASE(multiple_segments_fifo)
 BOOST_AUTO_TEST_CASE(pending_fifo)
 {
     auto state = MakeState(1024);
-    BOOST_REQUIRE(state->ring.TryAppend("ring-body").status == ReadStatus::Ok);
-    BOOST_REQUIRE(state->ring.AppendDeferred("pend"));
-    BOOST_REQUIRE_EQUAL(state->ring.PendingSize(), 4);
+    BOOST_REQUIRE(state->AppendReceived("ring-body").status == ReadStatus::Ok);
+    BOOST_REQUIRE(state->DeferReceived("pend"));
+    BOOST_REQUIRE_EQUAL(state->Inspect().pending_bytes, 4);
     Buffer out;
-    BOOST_REQUIRE(state->ring.TryCopyConsume(out).status == ReadStatus::Ok);
+    BOOST_REQUIRE(state->CopyConsume(out).status == ReadStatus::Ok);
     BOOST_CHECK_EQUAL(JoinBuffer(out), "ring-bodypend");
-    BOOST_CHECK_EQUAL(state->ring.Size(), 0);
-    BOOST_CHECK_EQUAL(state->ring.PendingSize(), 0);
+    BOOST_CHECK_EQUAL(state->Inspect().readable_bytes, 0);
+    BOOST_CHECK_EQUAL(state->Inspect().pending_bytes, 0);
 }
 
 BOOST_AUTO_TEST_CASE(detached_tail_after_pending)
 {
     auto state = MakeState(1024);
-    BOOST_REQUIRE(state->ring.TryAppend("R").status == ReadStatus::Ok);
-    BOOST_REQUIRE(state->ring.AppendDeferred("P"));
-    BOOST_REQUIRE(state->ring.StageDetached("D"));
-    state->ring.MarkClosed();
+    BOOST_REQUIRE(state->AppendReceived("R").status == ReadStatus::Ok);
+    BOOST_REQUIRE(state->DeferReceived("P"));
+    BOOST_REQUIRE(state->PreserveCloseTail("D"));
+    state->FinishReadForTest();
     Buffer out;
-    BOOST_REQUIRE(state->ring.TryCopyConsume(out).status == ReadStatus::Ok);
+    BOOST_REQUIRE(state->CopyConsume(out).status == ReadStatus::Ok);
     BOOST_CHECK_EQUAL(JoinBuffer(out), "RPD");
-    BOOST_CHECK_EQUAL(state->ring.Size(), 0);
-    BOOST_CHECK(state->ring.TryCopyConsume(out).status == ReadStatus::Eof);
+    BOOST_CHECK_EQUAL(state->Inspect().readable_bytes, 0);
+    BOOST_CHECK(state->CopyConsume(out).status == ReadStatus::Eof);
     BOOST_CHECK_EQUAL(JoinBuffer(out), "RPD");
 }
 
 BOOST_AUTO_TEST_CASE(busy_contention_zero_consume)
 {
     auto state = MakeState(1024);
-    BOOST_REQUIRE(state->ring.TryAppend("xyz").status == ReadStatus::Ok);
+    BOOST_REQUIRE(state->AppendReceived("xyz").status == ReadStatus::Ok);
     std::size_t wakes = 0;
-    state->ring.SetOwnerWake([&] { ++wakes; });
-    const auto generation = state->ring.AccessGeneration();
+    state->AttachOwner([&] { ++wakes; });
+    const auto generation = state->Inspect().access_generation;
     Buffer out;
     BOOST_REQUIRE(out.WriteBytes("keep"));
-    auto hold = ConnectionTestAccess::HoldForTest(state);
+    ReadContention hold(state);
     BOOST_REQUIRE(bool(hold));
-    const auto result = state->ring.TryCopyConsume(out);
+    const auto result = state->CopyConsume(out);
     BOOST_CHECK(result.status == ReadStatus::Busy);
     BOOST_CHECK_EQUAL(result.bytes, 0);
     BOOST_CHECK_EQUAL(JoinBuffer(out), "keep");
-    BOOST_CHECK_EQUAL(state->ring.Size(), 3);
-    ConnectionTestAccess::Reset(state, hold);
-    BOOST_CHECK_EQUAL(state->ring.AccessGeneration(), generation + 1);
+    BOOST_CHECK_EQUAL(state->Inspect().readable_bytes, 3);
+    hold.Reset();
+    BOOST_CHECK_EQUAL(state->Inspect().access_generation, generation + 1);
     BOOST_CHECK_EQUAL(wakes, 1);
-    ConnectionTestAccess::Reset(state, hold);
-    BOOST_CHECK_EQUAL(state->ring.AccessGeneration(), generation + 1);
+    hold.Reset();
+    BOOST_CHECK_EQUAL(state->Inspect().access_generation, generation + 1);
     BOOST_CHECK_EQUAL(wakes, 1);
-    BOOST_REQUIRE(state->ring.TryCopyConsume(out).status == ReadStatus::Ok);
+    BOOST_REQUIRE(state->CopyConsume(out).status == ReadStatus::Ok);
     BOOST_CHECK_EQUAL(JoinBuffer(out), "keepxyz");
 }
 
@@ -257,53 +258,53 @@ BOOST_AUTO_TEST_CASE(quota_releases_immediately)
 BOOST_AUTO_TEST_CASE(alloc_failure_keeps_ring_and_quota)
 {
     auto state = MakeState(256);
-    BOOST_REQUIRE(state->ring.TryAppend(std::string(64, 'f')).status == ReadStatus::Ok);
-    BOOST_REQUIRE(state->ring.AppendDeferred("d"));
-    const auto before_size = state->ring.Size();
-    const auto gen_before = state->ring.AccessGeneration();
+    BOOST_REQUIRE(state->AppendReceived(std::string(64, 'f')).status == ReadStatus::Ok);
+    BOOST_REQUIRE(state->DeferReceived("d"));
+    const auto before_size = state->Inspect().readable_bytes;
+    const auto gen_before = state->Inspect().access_generation;
     Buffer out;
     BOOST_REQUIRE(out.WriteBytes("keep"));
     g_fail_alloc = true;
-    const auto result = state->ring.TryCopyConsume(out);
+    const auto result = state->CopyConsume(out);
     g_fail_alloc = false;
     BOOST_CHECK(result.status == ReadStatus::Error);
     BOOST_CHECK(result.error == std::make_error_code(std::errc::not_enough_memory));
     BOOST_CHECK_EQUAL(result.bytes, 0);
     BOOST_CHECK_EQUAL(JoinBuffer(out), "keep");
-    BOOST_CHECK_EQUAL(state->ring.Size(), before_size);
+    BOOST_CHECK_EQUAL(state->Inspect().readable_bytes, before_size);
 
     /**
      * pending 可以合入 ring，但逻辑字节和额度不能被消费。
      */
-    const auto grant = state->ring.TryReserveForAppend(4096);
+    const auto grant = state->ReserveReceive(4096);
     BOOST_CHECK(grant.status == ReadStatus::Ok);
     BOOST_CHECK_EQUAL(grant.granted, 256 - 65);
-    BOOST_CHECK(state->ring.AccessGeneration() > gen_before);
-    BOOST_REQUIRE(state->ring.TryCopyConsume(out).status == ReadStatus::Ok);
+    BOOST_CHECK(state->Inspect().access_generation > gen_before);
+    BOOST_REQUIRE(state->CopyConsume(out).status == ReadStatus::Ok);
     BOOST_CHECK_EQUAL(JoinBuffer(out), "keep" + std::string(64, 'f') + "d");
 }
 
 BOOST_AUTO_TEST_CASE(tail_delivered_before_eof)
 {
     auto state = MakeState(1024);
-    BOOST_REQUIRE(state->ring.TryAppend("tail").status == ReadStatus::Ok);
+    BOOST_REQUIRE(state->AppendReceived("tail").status == ReadStatus::Ok);
     state->RequestClose(std::make_error_code(std::errc::operation_canceled));
-    BOOST_REQUIRE(state->ring.ReadClosed());
+    BOOST_REQUIRE(state->Inspect().read_closed);
     Buffer out;
-    BOOST_REQUIRE(state->ring.TryCopyConsume(out).status == ReadStatus::Ok);
+    BOOST_REQUIRE(state->CopyConsume(out).status == ReadStatus::Ok);
     BOOST_CHECK_EQUAL(JoinBuffer(out), "tail");
-    BOOST_CHECK(state->ring.TryCopyConsume(out).status == ReadStatus::Eof);
+    BOOST_CHECK(state->CopyConsume(out).status == ReadStatus::Eof);
     BOOST_CHECK_EQUAL(JoinBuffer(out), "tail");
 }
 
 BOOST_AUTO_TEST_CASE(output_survives_ring_reuse_and_destruction)
 {
     auto state = MakeState(1024);
-    BOOST_REQUIRE(state->ring.TryAppend("base").status == ReadStatus::Ok);
+    BOOST_REQUIRE(state->AppendReceived("base").status == ReadStatus::Ok);
     Buffer out;
-    BOOST_REQUIRE(state->ring.TryCopyConsume(out).status == ReadStatus::Ok);
-    BOOST_REQUIRE(state->ring.AppendDeferred("NEW"));
-    BOOST_REQUIRE(state->ring.TryAppend("MORE").status == ReadStatus::Ok);
+    BOOST_REQUIRE(state->CopyConsume(out).status == ReadStatus::Ok);
+    BOOST_REQUIRE(state->DeferReceived("NEW"));
+    BOOST_REQUIRE(state->AppendReceived("MORE").status == ReadStatus::Ok);
     BOOST_CHECK_EQUAL(JoinBuffer(out), "base");
     state.reset();
     BOOST_CHECK_EQUAL(JoinBuffer(out), "base");
@@ -314,7 +315,7 @@ BOOST_AUTO_TEST_CASE(read_gate_rejects_non_coroutine)
     auto state = MakeState(1024);
     auto conn = ConnectionTestAccess::Make(state);
     CoTcpConnection ico(conn);
-    BOOST_REQUIRE(state->ring.TryAppend("data").status == ReadStatus::Ok);
+    BOOST_REQUIRE(state->AppendReceived("data").status == ReadStatus::Ok);
     auto [outcome_data, outcome_error] = ico.Read(Until(100ms));
     BOOST_CHECK(bool(outcome_error));
     BOOST_CHECK(outcome_error == std::make_error_code(std::errc::operation_not_permitted));
@@ -322,7 +323,7 @@ BOOST_AUTO_TEST_CASE(read_gate_rejects_non_coroutine)
     /**
      * 未消费
      */
-    BOOST_CHECK_EQUAL(state->ring.Size(), 4);
+    BOOST_CHECK_EQUAL(state->Inspect().readable_bytes, 4);
 }
 
 BOOST_AUTO_TEST_CASE(read_waits_and_delivers_across_wakeup)
@@ -350,7 +351,7 @@ BOOST_AUTO_TEST_CASE(read_waits_and_delivers_across_wakeup)
         }
     });
     BOOST_REQUIRE(WaitUntil([&] { return registered.load(); }, 2000ms));
-    BOOST_REQUIRE(state->ring.TryAppend("wakeup").status == ReadStatus::Ok);
+    BOOST_REQUIRE(state->AppendReceived("wakeup").status == ReadStatus::Ok);
     BOOST_REQUIRE(task.wait_for(5s) == std::future_status::ready);
     task.get();
     BOOST_CHECK_EQUAL(result.load(), 0);
@@ -384,7 +385,7 @@ BOOST_AUTO_TEST_CASE(read_buffer_and_eof_drain)
     auto state = MakeState(1024);
     auto conn = ConnectionTestAccess::Make(state);
     CoTcpConnection ico(conn);
-    BOOST_REQUIRE(state->ring.TryAppend("rest").status == ReadStatus::Ok);
+    BOOST_REQUIRE(state->AppendReceived("rest").status == ReadStatus::Ok);
     state->RequestClose(std::make_error_code(std::errc::operation_canceled));
     StartRuntime(1);
     std::atomic<int> result{-1};
@@ -419,16 +420,16 @@ BOOST_AUTO_TEST_CASE(read_buffer_and_eof_drain)
 BOOST_AUTO_TEST_CASE(readers_consume_only_once)
 {
     auto state = MakeState(1024);
-    BOOST_REQUIRE(state->ring.TryAppend("only-once").status == ReadStatus::Ok);
+    BOOST_REQUIRE(state->AppendReceived("only-once").status == ReadStatus::Ok);
     Buffer first;
-    BOOST_REQUIRE(state->ring.TryCopyConsume(first).status == ReadStatus::Ok);
+    BOOST_REQUIRE(state->CopyConsume(first).status == ReadStatus::Ok);
     BOOST_CHECK_EQUAL(JoinBuffer(first), "only-once");
     Buffer second;
     BOOST_REQUIRE(second.WriteBytes("keep"));
-    BOOST_CHECK(state->ring.TryCopyConsume(second).status == ReadStatus::WouldBlock);
+    BOOST_CHECK(state->CopyConsume(second).status == ReadStatus::WouldBlock);
     BOOST_CHECK_EQUAL(JoinBuffer(second), "keep");
     std::string sink;
-    BOOST_CHECK(state->ring.TryRead(sink).status == ReadStatus::WouldBlock);
+    BOOST_CHECK(state->TryRead(sink).status == ReadStatus::WouldBlock);
     BOOST_CHECK(sink.empty());
 }
 

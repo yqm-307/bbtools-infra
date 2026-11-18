@@ -55,7 +55,7 @@ constexpr std::size_t kMaxConnectOps = 1024;
 void MarkReclaimReleased(const std::shared_ptr<ReclaimRecord>& record)
 {
     if (record) {
-        record->released.store(true, std::memory_order_release);
+        record->ConfirmReleased();
     }
 }
 
@@ -183,7 +183,7 @@ std::error_code StartConnectImpl(
                  * 与 MaybeEraseConnect 同条件：未转移且未释放的记录留在表内兜底。
                  */
                 removable = it->second->done && !it->second->waiter_attached
-                            && (!it->second->reclaim || it->second->reclaim->released.load(std::memory_order_acquire));
+                            && (!it->second->reclaim || it->second->reclaim->Released());
             }
             if (removable) {
                 it = impl->connects.erase(it);

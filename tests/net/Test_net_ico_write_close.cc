@@ -522,7 +522,6 @@ static void WaitClosedDriverFailed()
         std::lock_guard<std::mutex> lock(handler->mutex);
         raw = handler->stored;
     }
-    auto state = ConnectionTestAccess::StateOf(*raw);
     CoTcpConnection conn(*raw);
     ArmedFlag flag;
     flag.ArmCloseAdd();

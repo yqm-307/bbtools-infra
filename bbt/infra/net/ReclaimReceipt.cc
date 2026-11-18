@@ -14,7 +14,7 @@ bool ReclaimReceipt::Valid() const noexcept
 
 bool ReclaimReceipt::Released() const noexcept
 {
-    return !m_record || m_record->released.load(std::memory_order_acquire);
+    return !m_record || m_record->Released();
 }
 
 ReclaimReceipt::ReclaimReceipt(std::shared_ptr<ReclaimRecord> record)

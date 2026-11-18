@@ -20,6 +20,54 @@ Connection::Connection(std::shared_ptr<ConnectionState> state)
 {
 }
 
+std::error_code Connection::ReadCo(Buffer& out, const bbt::coroutine::WaitOptions& options) const
+{
+    if (const auto gate = RequireCoroutineContext())
+        return gate;
+    const auto state = m_state;
+    return state ? state->Read(out, options) : make_error_code(NetErrc::Closed);
+}
+
+std::tuple<std::size_t, std::error_code>
+Connection::WriteCo(std::string data, const bbt::coroutine::WaitOptions& options) const
+{
+    if (const auto gate = RequireCoroutineContext())
+        return {0, gate};
+    const auto state = m_state;
+    if (!state)
+        return {0, make_error_code(NetErrc::Closed)};
+    return state->Write(std::move(data), options);
+}
+
+std::error_code Connection::WaitClosedCo(const bbt::coroutine::WaitOptions& options) const
+{
+    if (const auto gate = RequireCoroutineContext())
+        return gate;
+    const auto state = m_state;
+    return state ? state->WaitClosed(options) : std::error_code{};
+}
+
+std::shared_ptr<ReclaimRecord> Connection::ReclaimForOwner() const
+{
+    return m_state ? m_state->OwnerReleasedRecord() : nullptr;
+}
+
+std::tuple<std::uintptr_t, std::size_t, std::size_t, std::uint64_t, bool, bool> Connection::InspectForTest() const
+{
+    return m_state ? m_state->InspectForTest()
+                   : std::tuple<std::uintptr_t, std::size_t, std::size_t, std::uint64_t, bool, bool>{};
+}
+
+bool Connection::ExerciseReadContentionForTest(void (*during)(const void*), const void* context) const
+{
+    return m_state && m_state->ExerciseReadContentionForTest([&] { during(context); });
+}
+
+bool Connection::DeferReceivedForTest(const std::string& data) const
+{
+    return m_state && m_state->DeferReceived(data);
+}
+
 bool Connection::Valid() const noexcept
 {
     return m_state != nullptr;
@@ -27,7 +75,7 @@ bool Connection::Valid() const noexcept
 
 std::uint64_t Connection::Id() const noexcept
 {
-    return m_state ? m_state->m_id : 0;
+    return m_state ? m_state->Id() : 0;
 }
 
 std::error_code Connection::AsyncWrite(std::string data)
@@ -47,7 +95,7 @@ ReadResult Connection::TryRead(std::string& out)
     if (!m_state) {
         return {ReadStatus::Error, 0, make_error_code(NetErrc::Closed)};
     }
-    return m_state->ring.TryRead(out);
+    return m_state->TryRead(out);
 }
 
 std::error_code Connection::TryRead(Buffer& out)
@@ -55,20 +103,7 @@ std::error_code Connection::TryRead(Buffer& out)
     if (!m_state) {
         return make_error_code(NetErrc::Closed);
     }
-    const auto result = m_state->ring.TryCopyConsume(out);
-    if (result.status != ReadStatus::Ok) {
-        switch (result.status) {
-        case ReadStatus::WouldBlock:
-            return make_error_code(NetErrc::WouldBlock);
-        case ReadStatus::Busy:
-            return make_error_code(NetErrc::Busy);
-        case ReadStatus::Eof:
-            return make_error_code(NetErrc::Eof);
-        default:
-            return result.error;
-        }
-    }
-    return {};
+    return m_state->TryRead(out);
 }
 
 std::tuple<Buffer, std::error_code> Connection::TryRead()
@@ -83,22 +118,22 @@ ReadView Connection::View()
     if (!m_state) {
         return ReadView(ReadStatus::Error, {}, make_error_code(NetErrc::Closed));
     }
-    return m_state->ring.TryView();
+    return m_state->View();
 }
 
 std::size_t Connection::ReadableBytes()
 {
-    return m_state ? m_state->ring.Size() : 0;
+    return m_state ? m_state->Inspect().readable_bytes : 0;
 }
 
 std::error_code Connection::ReadError() const
 {
-    return m_state ? m_state->ring.ReadError() : std::error_code{};
+    return m_state ? m_state->Inspect().read_error : std::error_code{};
 }
 
 bool Connection::ReadEof() const
 {
-    return m_state ? m_state->ring.ReadEof() : true;
+    return m_state ? m_state->Inspect().read_eof : true;
 }
 
 std::error_code Connection::LastWriteError(std::uint64_t* operation)

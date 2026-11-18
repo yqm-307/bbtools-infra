@@ -215,7 +215,7 @@ std::string MakeSeg(char tag)
  * 交错门：接缝回调（owner 线程）与辅助线程（真实数据锁）之间的握手状态。
  */
 struct Gate {
-    std::shared_ptr<ConnectionState> state;
+    Connection connection;
     bool expect_c{true};
 
     /**
@@ -300,26 +300,25 @@ void AuxThread(std::shared_ptr<Gate> gate)
         gate->aux_error.store(true);
         return;
     }
-    std::unique_lock<std::mutex> hold;
+    bool held = false;
     const auto hold_deadline = std::chrono::steady_clock::now() + 6000ms;
     while (std::chrono::steady_clock::now() < hold_deadline) {
-        hold = ConnectionTestAccess::HoldForTest(gate->state);
-        if (hold) {
+        held = ConnectionTestAccess::ExerciseReadContention(gate->connection, [&] {
+            gate->lock_held.store(true);
+            (void)WaitUntil([&] { return gate->release.load(); }, 8000ms);
+        });
+        if (held)
             break;
-        }
         std::this_thread::yield();
     }
-    if (!hold) {
+    if (!held) {
         gate->aux_error.store(true);
         return;
     }
-    gate->lock_held.store(true);
-    (void)WaitUntil([&] { return gate->release.load(); }, 8000ms);
-    ConnectionTestAccess::Reset(gate->state, hold);
     gate->released.store(true);
     const auto pending_deadline = std::chrono::steady_clock::now() + 6000ms;
     while (std::chrono::steady_clock::now() < pending_deadline) {
-        const std::size_t pending = gate->state->ring.PendingSize();
+        const std::size_t pending = ConnectionTestAccess::Inspect(gate->connection).pending_bytes;
         if (pending != 0) {
             gate->pending_observed.store(pending);
             break;
@@ -413,26 +412,27 @@ Outcome RunInterleave(bool send_c, bool tight = false)
     BOOST_REQUIRE(WaitUntil([&] { return handler->accepted.load() == 1; }, 3000ms));
 
     std::shared_ptr<Connection> conn;
-    std::shared_ptr<ConnectionState> state;
+    Connection connection;
     {
         std::lock_guard<std::mutex> lock(handler->mutex);
         BOOST_REQUIRE(handler->stored && handler->stored->Valid());
         conn = handler->stored;
     }
-    state = ConnectionTestAccess::StateOf(*conn);
-    BOOST_REQUIRE(state != nullptr);
+    connection = *conn;
+    BOOST_REQUIRE(connection.Valid());
 
     /**
      * 步骤 1：A 先入 ring（owner 已从内核取走 = ring.Size 含 pending 达到 |A|）。
      */
     BOOST_REQUIRE(SendAll(client, a, 3000ms));
-    BOOST_REQUIRE(WaitUntil([&] { return state->ring.Size() == a.size(); }, 5000ms));
+    BOOST_REQUIRE(
+        WaitUntil([&] { return ConnectionTestAccess::Inspect(connection).readable_bytes == a.size(); }, 5000ms));
 
     /**
      * 步骤 2：武装两个接缝 + 辅助线程。
      */
     auto gate = std::make_shared<Gate>();
-    gate->state = state;
+    gate->connection = connection;
     gate->expect_c = send_c;
     EngineTestAccess::SetReadAppendHook(engine, MakeReadAppendHook(gate));
     EngineTestAccess::SetAppendBusyHook(engine, MakeAppendBusyHook(gate));
@@ -468,7 +468,7 @@ Outcome RunInterleave(bool send_c, bool tight = false)
     const bool window_ok = WaitUntil(
         [&] {
             return gate->read_hook_calls.load() >= 2 && gate->busy_hook_calls.load() == 1
-                   && state->ring.PendingSize() == b.size();
+                   && ConnectionTestAccess::Inspect(connection).pending_bytes == b.size();
         },
         6000ms);
 

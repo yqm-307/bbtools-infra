@@ -119,6 +119,8 @@ public:
      */
     ReadResult TryRead(std::string& out);
     ReadResult TryCopyConsume(Buffer& out);
+    std::error_code TryRead(Buffer& out);
+    std::error_code Read(Buffer& out, const bbt::coroutine::WaitOptions& options);
 
     /**
      * 非等待只读查看。返回的 string_view 只借用当前 ring，不跨下一次操作保活。
@@ -128,7 +130,6 @@ public:
     /**
      * 仅供仓内并发测试制造 owner/消费者竞争，不属于产品读取面。
      */
-    std::unique_lock<std::mutex> TryHoldForTest();
 
     /**
      * 确定性时序测试接缝（正常为空）：分别落在 Busy/WouldBlock 分支创建 waiter
@@ -175,7 +176,8 @@ public:
     bool HasReadError() const noexcept { return (m_error.load(std::memory_order_acquire) >> 32) != 0; }
 
 private:
-    friend class ConnectionTestAccess;
+    friend class ConnectionState;
+    bool ExerciseReadContentionForTest(const std::function<void()>& during);
 
     static std::function<void()>& BusyBeforeWaiterHookForTest();
     static std::function<void()>& WouldBlockBeforeWaiterHookForTest();

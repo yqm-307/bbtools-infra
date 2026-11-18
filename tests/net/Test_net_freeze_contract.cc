@@ -343,13 +343,13 @@ static void CoContextGate()
      * 连接真源：ring 里已有数据 + 一个活动写操作（任何提交都会推进 ActiveOpCount）。
      */
     auto state = std::make_shared<ConnectionState>(7, 4096, 1024, 4, nullptr);
-    CHECK(state->ring.TryAppend("pending-bytes").status == ReadStatus::Ok);
+    CHECK(state->AppendReceived("pending-bytes").status == ReadStatus::Ok);
     Connection connection = ConnectionTestAccess::Make(state);
     std::uint64_t warm_id = 0;
     CHECK(!state->SubmitWrite("queued", warm_id));
-    const std::size_t ring_before = state->ring.Size();
+    const std::size_t ring_before = state->Inspect().readable_bytes;
     const std::size_t ops_before = state->ActiveOpCount();
-    const auto queue_before = state->ring.AccessGeneration();
+    const auto queue_before = state->Inspect().access_generation;
 
     /**
      * 让 handoff 队列里真实有一个已接纳连接（否则"不出队"无法判别）。
@@ -408,9 +408,9 @@ static void CoContextGate()
     /**
      * 零副作用：数据未消费、无新活动写、handoff 队列未被弹走、零新建连。
      */
-    CHECK(state->ring.Size() == ring_before);
+    CHECK(state->Inspect().readable_bytes == ring_before);
     CHECK(state->ActiveOpCount() == ops_before);
-    CHECK(state->ring.AccessGeneration() == queue_before);
+    CHECK(state->Inspect().access_generation == queue_before);
     CHECK(EngineTestAccess::ConnectTableSize(host) == connect_table_before);
     CHECK(host.CountConnections() == 0);
 
@@ -439,7 +439,7 @@ static void CoContextGate()
     std::atomic<int> positive{-1};
     auto positive_task = Task([&] {
         auto pos_state = std::make_shared<ConnectionState>(8, 4096, 1024, 4, nullptr);
-        CHECK(pos_state->ring.TryAppend("in-domain").status == ReadStatus::Ok);
+        CHECK(pos_state->AppendReceived("in-domain").status == ReadStatus::Ok);
         Connection pos = ConnectionTestAccess::Make(pos_state);
         CoTcpConnection co_pos{pos};
         std::string out;
@@ -919,7 +919,7 @@ static void OutputPreservation()
         });
         Get(task);
         CHECK(result.load() == 0);
-        CHECK(state->ring.Size() == 0);
+        CHECK(state->Inspect().readable_bytes == 0);
     }
 
     /**
@@ -927,7 +927,7 @@ static void OutputPreservation()
      */
     {
         auto state = std::make_shared<ConnectionState>(2, 4096, 1024, 4, nullptr);
-        CHECK(state->ring.TryAppend("payload").status == ReadStatus::Ok);
+        CHECK(state->AppendReceived("payload").status == ReadStatus::Ok);
         Connection connection = ConnectionTestAccess::Make(state);
         auto out = std::make_shared<std::string>("existing");
         auto task = Task([&] {
@@ -949,7 +949,7 @@ static void OutputPreservation()
         });
         Get(task);
         CHECK(*out == "existing");
-        CHECK(state->ring.Size() == 7);
+        CHECK(state->Inspect().readable_bytes == 7);
     }
 
     /**
@@ -962,7 +962,7 @@ static void OutputPreservation()
         CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
 
         auto original_state = std::make_shared<ConnectionState>(9, 1024, 1024, 4, nullptr);
-        CHECK(original_state->ring.TryAppend("original").status == ReadStatus::Ok);
+        CHECK(original_state->AppendReceived("original").status == ReadStatus::Ok);
         Connection original = ConnectionTestAccess::Make(original_state);
         std::atomic<int> result{-1};
         auto task = Task([&] {
@@ -994,7 +994,7 @@ static void OutputPreservation()
         CHECK(!dead_listener.Close());
 
         auto original_state = std::make_shared<ConnectionState>(10, 1024, 1024, 4, nullptr);
-        CHECK(original_state->ring.TryAppend("kept").status == ReadStatus::Ok);
+        CHECK(original_state->AppendReceived("kept").status == ReadStatus::Ok);
         Connection original = ConnectionTestAccess::Make(original_state);
         std::atomic<int> result{-1};
         auto task = Task([&] {
@@ -1690,7 +1690,7 @@ static void ConnectFailureCleanup()
             EngineTestAccess::SetConnectWaitStatusOnce(client, static_cast<int>(item.status));
 
             auto original_state = std::make_shared<ConnectionState>(97, 1024, 1024, 4, nullptr);
-            CHECK(original_state->ring.TryAppend("held").status == ReadStatus::Ok);
+            CHECK(original_state->AppendReceived("held").status == ReadStatus::Ok);
             Connection original = ConnectionTestAccess::Make(original_state);
             std::atomic<int> observed{-99};
             std::atomic<int> out_kept{-1};
@@ -1739,7 +1739,7 @@ static void ConnectFailureCleanup()
              * 上一段已消费过 original 的字节，这里换一条新的同款连接做 out 保留证据。
              */
             auto dial_state = std::make_shared<ConnectionState>(197, 1024, 1024, 4, nullptr);
-            CHECK(dial_state->ring.TryAppend("held-dial").status == ReadStatus::Ok);
+            CHECK(dial_state->AppendReceived("held-dial").status == ReadStatus::Ok);
             Connection dial_original = ConnectionTestAccess::Make(dial_state);
             std::atomic<int> dial_errc{-99};
             std::atomic<int> dial_out_kept{-1};
@@ -1869,7 +1869,7 @@ static void AcceptConfiguration()
     auto expect_accept_rejection =
         [](Engine& engine, std::error_code expected, const char* label, std::uint64_t state_id) {
             auto original_state = std::make_shared<ConnectionState>(state_id, 1024, 1024, 4, nullptr);
-            CHECK(original_state->ring.TryAppend("accept-kept").status == ReadStatus::Ok);
+            CHECK(original_state->AppendReceived("accept-kept").status == ReadStatus::Ok);
             Connection original = ConnectionTestAccess::Make(original_state);
             const auto begin = std::chrono::steady_clock::now();
             std::atomic<int> errc{0};

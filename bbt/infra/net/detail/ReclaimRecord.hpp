@@ -18,6 +18,11 @@ struct ReclaimRecord {
     {
     }
 
+    bool Released() const noexcept { return released.load(std::memory_order_acquire); }
+
+    void ConfirmReleased() noexcept { released.store(true, std::memory_order_release); }
+
+private:
     std::atomic<bool> released;
 };
 

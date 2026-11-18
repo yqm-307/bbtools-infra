@@ -24,10 +24,19 @@ std::error_code InvalidContext()
 /**
  * 拨号私有 test 屏障（正常为空）：Engine::CoDial 提交之后、领取 attach 之前调用。
  */
+namespace {
 std::function<void()>& DialBarrierForTest()
 {
     static std::function<void()> barrier;
     return barrier;
+}
+
+} // namespace
+
+void InvokeDialBarrierForTest()
+{
+    if (auto& barrier = DialBarrierForTest())
+        barrier();
 }
 
 std::error_code RequireCoroutineContext()
@@ -67,9 +76,20 @@ void CoTestAccess::SetDialBarrier(std::function<void()> barrier)
     DialBarrierForTest() = std::move(barrier);
 }
 
-std::shared_ptr<ConnectionState> CoAccess::StateOf(const Connection& connection)
+std::error_code CoAccess::Read(const Connection& connection, Buffer& out, const bbt::coroutine::WaitOptions& options)
 {
-    return connection.m_state;
+    return connection.ReadCo(out, options);
+}
+
+std::tuple<std::size_t, std::error_code>
+CoAccess::Write(const Connection& connection, std::string data, const bbt::coroutine::WaitOptions& options)
+{
+    return connection.WriteCo(std::move(data), options);
+}
+
+std::error_code CoAccess::WaitClosed(const Connection& connection, const bbt::coroutine::WaitOptions& options)
+{
+    return connection.WaitClosedCo(options);
 }
 
 std::error_code CoAccess::SubmitConnect(

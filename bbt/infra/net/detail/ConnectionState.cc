@@ -1,6 +1,235 @@
 #include <bbt/infra/net/detail/ConnectionState.hpp>
 
+#include <bbt/infra/net/detail/CoInternal.hpp>
+
 namespace bbt::infra::net {
+
+std::tuple<std::uintptr_t, std::size_t, std::size_t, std::uint64_t, bool, bool> ConnectionState::InspectForTest()
+{
+    const auto observation = Inspect();
+    return {
+        reinterpret_cast<std::uintptr_t>(this),
+        observation.readable_bytes,
+        observation.pending_bytes,
+        observation.access_generation,
+        CloseRequested(),
+        CanAcceptWrite(1)};
+}
+
+bool ConnectionState::ExerciseReadContentionForTest(const std::function<void()>& during)
+{
+    return ring.ExerciseReadContentionForTest(during);
+}
+
+void ConnectionState::AttachOwner(const std::function<void()>& wake)
+{
+    owner_dirty = wake;
+    ring.SetOwnerWake(wake);
+}
+
+ReadResult ConnectionState::TryRead(std::string& out)
+{
+    return ring.TryRead(out);
+}
+
+std::error_code ConnectionState::TryRead(Buffer& out)
+{
+    return ring.TryRead(out);
+}
+
+ReadView ConnectionState::View()
+{
+    return ring.TryView();
+}
+
+std::error_code ConnectionState::Read(Buffer& out, const bbt::coroutine::WaitOptions& options)
+{
+    return ring.Read(out, options);
+}
+
+std::tuple<std::size_t, std::error_code>
+ConnectionState::Write(std::string data, const bbt::coroutine::WaitOptions& options)
+{
+    const auto wanted = data.size();
+    const auto no_buffer = std::make_error_code(std::errc::no_buffer_space);
+    const auto settling = make_error_code(NetErrc::WriteSettling);
+    WriteWait result;
+    std::uint64_t id = 0;
+    for (;;) {
+        const auto error = SubmitWrite(data, id, &result);
+        if (!error)
+            break;
+        if (error != no_buffer && error != settling)
+            return {0, error};
+        if (wanted > MaxOutboundBytes())
+            return {0, no_buffer};
+        if (Closed())
+            return {0, make_error_code(NetErrc::Closed)};
+        auto waiter = CreateWriteWaiter();
+        if (!waiter)
+            return {0, no_buffer};
+        bool add_failed = false;
+        const auto status = waiter->WaitWithCallback(options, [&] {
+            if (!AddWriteWaiter(waiter)) {
+                add_failed = true;
+                waiter->Notify();
+                return true;
+            }
+            if (CanAcceptWrite(wanted) || Closed())
+                waiter->Notify();
+            return true;
+        });
+        if (add_failed)
+            return {0, no_buffer};
+        if (status != bbt::coroutine::WaitStatus::Completed)
+            return {0, WaitStatusError(status)};
+    }
+    /**
+     * 接纳后的每个出口均在写锁内完成或撤销，解除对本调用栈的借用。
+     * 容量与完成等待复用同一绝对 deadline；已发布终态先于撤销。
+     */
+    try {
+        for (;;) {
+            const auto sample = QueryWrite(result);
+            if (sample.terminal)
+                return {sample.sent, sample.error};
+            auto waiter = CreateWriteWaiter();
+            if (!waiter)
+                return CancelWrite(id, result, no_buffer);
+            bool add_failed = false;
+            const auto status = waiter->WaitWithCallback(options, [&] {
+                if (!AddWriteWaiter(waiter)) {
+                    add_failed = true;
+                    waiter->Notify();
+                    return true;
+                }
+                if (QueryWrite(result).terminal)
+                    waiter->Notify();
+                return true;
+            });
+            if (add_failed)
+                return CancelWrite(id, result, no_buffer);
+            if (status != bbt::coroutine::WaitStatus::Completed) {
+                return CancelWrite(id, result, WaitStatusError(status));
+            }
+        }
+    } catch (...) {
+        CancelWrite(id, result, std::make_error_code(std::errc::operation_canceled));
+        throw;
+    }
+}
+
+std::error_code ConnectionState::WaitClosed(const bbt::coroutine::WaitOptions& options)
+{
+    for (;;) {
+        if (Closed()) {
+            return {};
+        }
+
+        /**
+         * close hub 专用等待：Create/Add 两段（Add 在 on_registered 内），
+         * 不直接用 RegisterCloseWaiter——后者在等待前注册，早到
+         * MarkClosed 的 NotifyAll 会落在未登记事件上丢失。
+         */
+        auto waiter = CreateCloseWaiter();
+        if (!waiter) {
+            return std::make_error_code(std::errc::no_buffer_space);
+        }
+        bool add_failed = false;
+        const auto status = waiter->WaitWithCallback(options, [&] {
+            if (!AddCloseWaiter(waiter)) {
+                add_failed = true;
+                waiter->Notify();
+                return true;
+            }
+            if (Closed()) {
+                waiter->Notify();
+            }
+            return true;
+        });
+        if (add_failed) {
+            return std::make_error_code(std::errc::no_buffer_space);
+        }
+        if (status != bbt::coroutine::WaitStatus::Completed) {
+
+            /**
+             * 超时/取消不关闭连接
+             */
+            return WaitStatusError(status);
+        }
+    }
+}
+
+void ConnectionState::PrepareReceiveStorage(std::size_t capacity)
+{
+    ring.ReserveDeferred(capacity);
+    ring.ReserveDetached(capacity);
+}
+
+ReceiveRing::AppendGrant ConnectionState::ReserveReceive(std::size_t want)
+{
+    return ring.TryReserveForAppend(want);
+}
+
+ReadResult ConnectionState::AppendReceived(std::string_view data)
+{
+    return ring.TryAppend(data);
+}
+
+bool ConnectionState::DeferReceived(std::string_view data)
+{
+    return ring.AppendDeferred(data);
+}
+
+bool ConnectionState::PreserveCloseTail(std::string_view data)
+{
+    return ring.StageDetached(data);
+}
+
+void ConnectionState::FinishRead(std::error_code error)
+{
+    if (error)
+        ring.MarkError(error);
+    else
+        ring.MarkEof();
+}
+
+ReadResult ConnectionState::CopyConsume(Buffer& out)
+{
+    return ring.TryCopyConsume(out);
+}
+
+void ConnectionState::FinishReadForTest()
+{
+    ring.MarkClosed();
+}
+
+std::shared_ptr<bbt::coroutine::sync::CoWaiter> ConnectionState::CreateReadWaiterForTest()
+{
+    return ring.CreateDataWaiter();
+}
+
+bool ConnectionState::AddReadWaiterForTest(const std::shared_ptr<bbt::coroutine::sync::CoWaiter>& waiter)
+{
+    return ring.AddDataWaiter(waiter);
+}
+
+bool ConnectionState::TakeReadRetry()
+{
+    return ring.TakeRawRetry();
+}
+
+ConnectionState::Observation ConnectionState::Inspect() const
+{
+    return {
+        ring.Size(),
+        ring.PendingSize(),
+        ring.MaxBytes(),
+        ring.AccessGeneration(),
+        ring.ReadError(),
+        ring.ReadEof(),
+        ring.ReadClosed()};
+}
 
 ConnectionState::ConnectionState(
     std::uint64_t id,

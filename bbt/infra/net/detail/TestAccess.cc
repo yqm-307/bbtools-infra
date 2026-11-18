@@ -18,28 +18,27 @@ Connection ConnectionTestAccess::Make(std::shared_ptr<ConnectionState> state)
     return Connection(std::move(state));
 }
 
-std::shared_ptr<ConnectionState> ConnectionTestAccess::StateOf(const Connection& connection)
+ConnectionTestAccess::Observation ConnectionTestAccess::Inspect(const Connection& connection)
 {
-    return connection.m_state;
+    const auto [identity, bytes, pending, generation, close_requested, can_accept] = connection.InspectForTest();
+    return {identity, bytes, pending, generation, close_requested, can_accept};
 }
 
-std::unique_lock<std::mutex> ConnectionTestAccess::HoldForTest(std::shared_ptr<ConnectionState> state)
+bool ConnectionTestAccess::ExerciseReadContention(const Connection& connection, const std::function<void()>& during)
 {
-    return state ? state->ring.TryHoldForTest() : std::unique_lock<std::mutex>();
+    return connection.ExerciseReadContentionForTest(
+        [](const void* context) { (*static_cast<const std::function<void()>*>(context))(); }, &during);
 }
 
-void ConnectionTestAccess::Reset(const std::shared_ptr<ConnectionState>& state, std::unique_lock<std::mutex>& lock)
+bool ConnectionTestAccess::ExerciseReadContention(
+    const std::shared_ptr<ConnectionState>& state, const std::function<void()>& during)
 {
-    if (lock.owns_lock()) {
-        assert(state && lock.mutex() == &state->ring.m_mutex);
-        lock.unlock();
+    return state && state->ExerciseReadContentionForTest(during);
+}
 
-        /**
-         * 测试保护也必须完成释放协议，否则 Busy 后的等待者和 owner 无法继续。
-         */
-        state->ring.NotifyRelease();
-        state->ring.WakeOwnerOnly();
-    }
+bool ConnectionTestAccess::DeferReceived(const Connection& connection, const std::string& data)
+{
+    return connection.DeferReceivedForTest(data);
 }
 
 Buffer BufferTestAccess::Make(std::shared_ptr<void> backing, std::vector<BufferSegment> segments)

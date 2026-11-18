@@ -184,8 +184,8 @@ BOOST_AUTO_TEST_CASE(read_copy_oom_no_loss)
     const std::string payload(64, 'X');
     for (int index = 1; index <= 6; ++index) {
         auto state = std::make_shared<ConnectionState>(1, 256, 1024, 4, nullptr);
-        BOOST_REQUIRE(state->ring.TryAppend(payload).status == ReadStatus::Ok);
-        state->ring.MarkEof();
+        BOOST_REQUIRE(state->AppendReceived(payload).status == ReadStatus::Ok);
+        state->FinishRead();
         CoTcpConnection conn(ConnectionTestAccess::Make(state));
         std::error_code first_error;
         std::error_code retry_error;
@@ -204,7 +204,7 @@ BOOST_AUTO_TEST_CASE(read_copy_oom_no_loss)
             }
             Disarm();
             first_data = out.CopyTo();
-            used_after = state->ring.Size();
+            used_after = state->Inspect().readable_bytes;
             auto retry = conn.Read(Until(2000ms));
             retry_error = std::get<1>(retry);
             retry_data = std::get<0>(retry).CopyTo();

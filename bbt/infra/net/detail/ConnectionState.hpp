@@ -86,7 +86,7 @@ public:
     /**
      * ---- 物理回收观察 ----
      */
-    bool OwnerReleased() const noexcept { return m_owner_released->released.load(std::memory_order_acquire); }
+    bool OwnerReleased() const noexcept { return m_owner_released->Released(); }
 
     /**
      * 本连接回收责任的共享记录：ReclaimReceipt 凭它观察同一真源
@@ -97,8 +97,42 @@ public:
     /**
      * 仅 owner/控制域在 fd 真实关闭且本连接责任清理后调用；幂等。
      */
-    void MarkOwnerReleased() noexcept { m_owner_released->released.store(true, std::memory_order_release); }
+    void MarkOwnerReleased() noexcept { m_owner_released->ConfirmReleased(); }
 
+    std::uint64_t Id() const noexcept { return m_id; }
+
+    void AttachOwner(const std::function<void()>& wake);
+    ReadResult TryRead(std::string& out);
+    std::error_code TryRead(Buffer& out);
+    ReadView View();
+    std::error_code Read(Buffer& out, const bbt::coroutine::WaitOptions& options);
+    std::tuple<std::size_t, std::error_code> Write(std::string data, const bbt::coroutine::WaitOptions& options);
+    std::error_code WaitClosed(const bbt::coroutine::WaitOptions& options);
+    void PrepareReceiveStorage(std::size_t capacity);
+    ReceiveRing::AppendGrant ReserveReceive(std::size_t want);
+    ReadResult AppendReceived(std::string_view data);
+    bool DeferReceived(std::string_view data);
+    bool PreserveCloseTail(std::string_view data);
+    void FinishRead(std::error_code error = {});
+    bool TakeReadRetry();
+    ReadResult CopyConsume(Buffer& out);
+    void FinishReadForTest();
+    std::shared_ptr<bbt::coroutine::sync::CoWaiter> CreateReadWaiterForTest();
+    bool AddReadWaiterForTest(const std::shared_ptr<bbt::coroutine::sync::CoWaiter>& waiter);
+
+    struct Observation {
+        std::size_t readable_bytes;
+        std::size_t pending_bytes;
+        std::size_t max_bytes;
+        std::uint64_t access_generation;
+        std::error_code read_error;
+        bool read_eof;
+        bool read_closed;
+    };
+
+    Observation Inspect() const;
+
+private:
     const std::uint64_t m_id;
 
     ReceiveRing ring;
@@ -108,6 +142,7 @@ public:
      */
     std::function<void()> owner_dirty;
 
+public:
     /**
      * ---- 接纳（任意线程）----
      */
@@ -195,6 +230,11 @@ public:
     void WakeOwner();
 
 private:
+    friend class Connection;
+    friend class ConnectionTestAccess;
+    std::tuple<std::uintptr_t, std::size_t, std::size_t, std::uint64_t, bool, bool> InspectForTest();
+    bool ExerciseReadContentionForTest(const std::function<void()>& during);
+
     static std::function<void()>& WriteAddHookForTest();
     static std::function<void()>& CloseAddHookForTest();
 

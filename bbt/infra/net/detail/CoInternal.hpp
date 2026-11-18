@@ -47,12 +47,7 @@ std::error_code RequireCoroutineContext();
  */
 std::error_code WaitStatusError(bbt::coroutine::WaitStatus status);
 
-/**
- * 拨号私有 test 屏障的存储引用：Engine::CoDial 在提交后、领取 attach 前调用。
- * 定义在 CoInternal.cc；CoTestAccess::SetDialBarrier 是唯一写入者。
- * 返回的 function 正常为空（无屏障）。
- */
-std::function<void()>& DialBarrierForTest();
+void InvokeDialBarrierForTest();
 
 /**
  * Engine 私有 Co 步骤与连接内部状态的门面；owning 读取将非等待移交和
@@ -61,10 +56,10 @@ std::function<void()>& DialBarrierForTest();
  */
 struct CoAccess {
 
-    /**
-     * 返回连接内部状态的强引用：Co 等待必须在挂起期间保活 ring/hub。
-     */
-    static std::shared_ptr<ConnectionState> StateOf(const Connection& connection);
+    static std::error_code Read(const Connection& connection, Buffer& out, const bbt::coroutine::WaitOptions& options);
+    static std::tuple<std::size_t, std::error_code>
+    Write(const Connection& connection, std::string data, const bbt::coroutine::WaitOptions& options);
+    static std::error_code WaitClosed(const Connection& connection, const bbt::coroutine::WaitOptions& options);
 
     /**
      * 提交：只用于无 handler 的 Engine（否则 operation_not_supported 且零提交）。

@@ -673,14 +673,14 @@ static void RingCombined()
      * 同一 ring 的第二句柄
      */
     Connection peer = ConnectionTestAccess::Make(state);
-    CHECK(state->ring.TryAppend("abcdef").status == ReadStatus::Ok);
+    CHECK(state->AppendReceived("abcdef").status == ReadStatus::Ok);
     const auto view = connection.View();
     CHECK(view && view.Bytes() == "abcdef");
     CHECK(peer.View().Bytes() == "abcdef");
     std::string out;
     CHECK(connection.TryRead(out).status == ReadStatus::Ok);
     CHECK(out == "abcdef");
-    CHECK(!state->ring.HasReadError());
+    CHECK(!state->Inspect().read_error);
     std::cout << "ring_combined readonly_view=ok read_consume=ok\n";
 }
 
@@ -781,7 +781,7 @@ static void BufferTransferLifetime()
     auto raw = ConnectionTestAccess::Make(state);
     Buffer held;
     CHECK(raw.TryRead(held) == make_error_code(NetErrc::WouldBlock));
-    CHECK(state->ring.TryAppend("abcdefgh").status == ReadStatus::Ok);
+    CHECK(state->AppendReceived("abcdefgh").status == ReadStatus::Ok);
     CHECK(!raw.TryRead(held));
     CHECK(held.CopyTo() == "abcdefgh");
     CHECK(raw.ReadableBytes() == 0);
@@ -789,7 +789,7 @@ static void BufferTransferLifetime()
     CHECK(held.CopyTo() == "abcdefgh");
     CHECK(Connection{}.TryRead(held) == make_error_code(NetErrc::Closed));
     CHECK(held.CopyTo() == "abcdefgh");
-    CHECK(state->ring.TryAppend("ijklmnop").status == ReadStatus::Ok);
+    CHECK(state->AppendReceived("ijklmnop").status == ReadStatus::Ok);
     auto second = Task([&] {
         CoTcpConnection co{raw};
         auto [read_data, read_error] = co.Read(Until(1000ms));
@@ -843,9 +843,8 @@ static void BufferTransferLifetime()
     /**
      * 读等待已注册后再发送；首个 Buffer 跨实际挂起和下一批容量复用保留。
      */
-    auto live_state = CoAccess::StateOf(connection);
     std::atomic<bool> waiting{false};
-    live_state->ring.SetAfterAddHookForTest([&] { waiting.store(true); });
+    ReceiveRing::SetAfterAddHookForTest([&] { waiting.store(true); });
     Buffer co_buffer;
     auto reader = Task([&] {
         CoTcpConnection co{connection};
@@ -858,7 +857,7 @@ static void BufferTransferLifetime()
     const std::string next(4096, 'b');
     CHECK(client.Send(next.data(), next.size()).bytes == next.size());
     Get(reader);
-    live_state->ring.SetAfterAddHookForTest({});
+    ReceiveRing::SetAfterAddHookForTest({});
     CHECK(co_buffer.CopyTo() == next);
     CHECK(transferred.CopyTo() == first);
     (void)connection.Close();
@@ -883,7 +882,7 @@ static void ReadOverloadContract()
     CoTcpConnection co{raw};
     ICoConnection& iface = co;
     Buffer out;
-    CHECK(state->ring.TryAppend("retained").status == ReadStatus::Ok);
+    CHECK(state->AppendReceived("retained").status == ReadStatus::Ok);
     CHECK(iface.View().Bytes() == "retained");
     CHECK(!raw.TryRead(out));
     const auto* original = out.Segments().front().data;
@@ -906,10 +905,10 @@ static void ReadOverloadContract()
     /**
      * Read 的执行域门先于可用数据；失败不触及已有 out。
      */
-    CHECK(state->ring.TryAppend("queued").status == ReadStatus::Ok);
+    CHECK(state->AppendReceived("queued").status == ReadStatus::Ok);
     CHECK(co.Read(out) == std::make_error_code(std::errc::operation_not_permitted));
     unchanged();
-    CHECK(state->ring.Size() == 6);
+    CHECK(state->Inspect().readable_bytes == 6);
     CHECK(raw.View().Bytes() == "queued");
     auto [queued, ok] = raw.TryRead();
     CHECK(!ok && queued.CopyTo() == "queued");
@@ -922,13 +921,13 @@ static void ReadOverloadContract()
         CHECK(error == std::make_error_code(std::errc::timed_out) && data.Empty());
     });
     Get(timeout);
-    CHECK(state->ring.Size() == 0);
+    CHECK(state->Inspect().readable_bytes == 0);
 
     /**
      * 证明等待已登记后再取消，校验原错误及已有 Buffer 的 backing 不变。
      */
     std::atomic<bool> registered{false};
-    state->ring.SetAfterAddHookForTest([&] { registered.store(true); });
+    ReceiveRing::SetAfterAddHookForTest([&] { registered.store(true); });
     std::promise<bbt::coroutine::detail::Coroutine*> self;
     auto self_future = self.get_future();
     auto cancelled = Task([&] {
@@ -941,19 +940,19 @@ static void ReadOverloadContract()
     CHECK(WaitUntil([&] { return registered.load(); }, 3000ms));
     self_future.get()->RequestCancel();
     Get(cancelled);
-    state->ring.SetAfterAddHookForTest({});
-    CHECK(state->ring.Size() == 0);
+    ReceiveRing::SetAfterAddHookForTest({});
+    CHECK(state->Inspect().readable_bytes == 0);
 
     /**
      * 相同真源，两种 Read 重载先交尾部再报 EOF，且 EOF 不等同 Closed。
      */
-    CHECK(state->ring.TryAppend("first").status == ReadStatus::Ok);
+    CHECK(state->AppendReceived("first").status == ReadStatus::Ok);
     auto reads = Task([&] {
         out.Clear();
         CHECK(!iface.Read(out));
         CHECK(out.CopyTo() == "first");
-        CHECK(state->ring.TryAppend("tail").status == ReadStatus::Ok);
-        state->ring.MarkEof();
+        CHECK(state->AppendReceived("tail").status == ReadStatus::Ok);
+        state->FinishRead();
         auto [tail, error] = co.Read();
         CHECK(!error && tail.CopyTo() == "tail");
         CHECK(co.Read(out) == eof && out.CopyTo() == "first");
@@ -973,8 +972,8 @@ static void ReadOverloadContract()
      * 接收真源保存 OS 错误的 system_category（与真实 socket 错误一致）。
      */
     const auto fault = std::error_code(ECONNRESET, std::system_category());
-    CHECK(faulty->ring.TryAppend("before-error").status == ReadStatus::Ok);
-    faulty->ring.MarkError(fault);
+    CHECK(faulty->AppendReceived("before-error").status == ReadStatus::Ok);
+    faulty->FinishRead(fault);
     out.Clear();
     CHECK(!error_raw.TryRead(out) && out.CopyTo() == "before-error");
     CHECK(error_raw.TryRead(out) == fault && out.CopyTo() == "before-error");

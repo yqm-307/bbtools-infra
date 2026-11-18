@@ -1,3 +1,4 @@
+#include <tests/net/ReadContention.hpp>
 
 /**
  * 契约聚焦测试：针对父级处置中的真实根因做可判别回归。
@@ -378,8 +379,8 @@ static void RingReleaseNotify()
     StartRuntime(1);
     auto state = std::make_shared<ConnectionState>(1, 4096, 1024, 4, nullptr);
     Connection connection = ConnectionTestAccess::Make(state);
-    CHECK(state->ring.TryAppend("release!").status == ReadStatus::Ok);
-    auto held = ConnectionTestAccess::HoldForTest(state);
+    CHECK(state->AppendReceived("release!").status == ReadStatus::Ok);
+    ReadContention held(state);
     CHECK(bool(held));
     std::atomic<int> result{-1};
     auto task = Task([&] {
@@ -394,7 +395,7 @@ static void RingReleaseNotify()
     /**
      * 锁外 NotifyRelease
      */
-    ConnectionTestAccess::Reset(state, held);
+    held.Reset();
     Get(task);
     CHECK(result.load() == 0);
     std::cout << "ring_release_notify busy_wait_woken=ok\n";
@@ -856,7 +857,7 @@ static void CoReadAppendFaultNonEmptyOut()
     StartRuntime(1);
     auto state = std::make_shared<ConnectionState>(1, 4096, 1024, 4, nullptr);
     Connection connection = ConnectionTestAccess::Make(state);
-    CHECK(state->ring.TryAppend("co-payload").status == ReadStatus::Ok);
+    CHECK(state->AppendReceived("co-payload").status == ReadStatus::Ok);
     auto out = std::make_shared<std::string>("existing");
     std::atomic<int> result{-1};
 
@@ -887,7 +888,7 @@ static void CoReadAppendFaultNonEmptyOut()
     /**
      * 未消费
      */
-    CHECK(state->ring.Size() == 10);
+    CHECK(state->Inspect().readable_bytes == 10);
     CHECK(*out == "existing");
 
     /**
@@ -940,7 +941,7 @@ static void CoReadIdleNoSpin()
     auto state = std::make_shared<ConnectionState>(1, 4096, 1024, 4, nullptr);
     Connection connection = ConnectionTestAccess::Make(state);
     std::atomic<int> result{-1};
-    const auto before = state->ring.AccessGeneration();
+    const auto before = state->Inspect().access_generation;
     auto task = Task([&] {
         CoTcpConnection conn{connection};
         auto [read_data, read_error] = conn.Read(bbt::coroutine::WaitOptions{});
@@ -949,16 +950,16 @@ static void CoReadIdleNoSpin()
         }
     });
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    const auto during = state->ring.AccessGeneration();
+    const auto during = state->Inspect().access_generation;
 
     /**
      * 空数据等待不自激取保护
      */
     CHECK(during - before <= 2);
-    CHECK(state->ring.TryAppend("x").status == ReadStatus::Ok);
+    CHECK(state->AppendReceived("x").status == ReadStatus::Ok);
     Get(task);
     CHECK(result.load() == 0);
-    CHECK(state->ring.AccessGeneration() - before <= 4);
+    CHECK(state->Inspect().access_generation - before <= 4);
     std::cout << "co_read_idle_no_spin generation_delta=" << (during - before) << "\n";
 }
 
@@ -990,7 +991,7 @@ static void StagedCloseTail()
      * owner 已取走、追加遇 Busy 的字节走同 ring pending（统一锁由 owner 持，
      * 不在消费者保护内调用）。Busy 竞争路径由 staged_recv_busy_close 覆盖。
      */
-    CHECK(ConnectionTestAccess::StateOf(*retained)->ring.AppendDeferred("second"));
+    CHECK(ConnectionTestAccess::DeferReceived(*retained, "second"));
 
     /**
      * 请求封口；最终 EOF 由 owner stage 后发布
@@ -1316,12 +1317,12 @@ static void CoReadRapid()
     for (int i = 0; i < kCount; ++i) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
         for (;;) {
-            const auto result = state->ring.TryAppend("x");
+            const auto result = state->AppendReceived("x");
             if (result.status == ReadStatus::Ok) {
                 break;
             }
             if (result.status == ReadStatus::Busy) {
-                if (state->ring.AppendDeferred("x")) {
+                if (state->DeferReceived("x")) {
 
                     /**
                      * 非阻塞：Busy 时由调用者重试，不锁等
@@ -1679,15 +1680,12 @@ static void StagedRecvBusyClose()
         if (!conn1) {
             return;
         }
-        auto hold = ConnectionTestAccess::HoldForTest(ConnectionTestAccess::StateOf(*conn1));
-        if (!hold) {
-            return;
-        }
-        holder_held.store(true);
-        while (!release_hold.load() && std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::yield();
-        }
-        ConnectionTestAccess::Reset(ConnectionTestAccess::StateOf(*conn1), hold);
+        ConnectionTestAccess::ExerciseReadContention(*conn1, [&] {
+            holder_held.store(true);
+            while (!release_hold.load() && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::yield();
+            }
+        });
         holder_done.store(true);
     });
     EngineTestAccess::SetReadAppendHook(engine, [&] {
@@ -1749,21 +1747,17 @@ static void RingDeferredNonblockingTry()
      * 保护由公共守卫经内部 TestAccess 取得：裸 ReceiveRing 不再提供 try-hold。
      */
     auto state = std::make_shared<ConnectionState>(1, 1024, 1024, 4, nullptr);
-    ReceiveRing& ring = state->ring;
-    ring.ReserveDeferred(64);
+    state->PrepareReceiveStorage(64);
     std::atomic<bool> held{false};
     std::atomic<bool> release{false};
     std::thread holder([&] {
-        auto hold = ConnectionTestAccess::HoldForTest(state);
-        if (!hold) {
-            return;
-        }
-        held.store(true);
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-        while (!release.load() && std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::yield();
-        }
-        ConnectionTestAccess::Reset(state, hold);
+        ConnectionTestAccess::ExerciseReadContention(state, [&] {
+            held.store(true);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!release.load() && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::yield();
+            }
+        });
     });
     CHECK(WaitUntil([&] { return held.load(); }, 3000ms));
     const auto begin = std::chrono::steady_clock::now();
@@ -1771,7 +1765,7 @@ static void RingDeferredNonblockingTry()
     /**
      * Busy：必须立即 false，不能等保护释放
      */
-    CHECK(!ring.AppendDeferred("abc"));
+    CHECK(!state->DeferReceived("abc"));
     const auto elapsed =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count();
     CHECK(elapsed < 500);
@@ -1781,9 +1775,9 @@ static void RingDeferredNonblockingTry()
     /**
      * 释放后同一协议可提交
      */
-    CHECK(ring.AppendDeferred("abc"));
+    CHECK(state->DeferReceived("abc"));
     std::string out;
-    CHECK(ring.TryRead(out).status == ReadStatus::Ok);
+    CHECK(state->TryRead(out).status == ReadStatus::Ok);
     CHECK(out == "abc");
     std::cout << "ring_deferred_nonblocking_try elapsed_ms=" << elapsed << " ok\n";
 }
@@ -1856,7 +1850,7 @@ static void CoBusyReleasePhases()
     StartRuntime(1);
     auto make_state = [] {
         auto state = std::make_shared<ConnectionState>(1, 4096, 1024, 4, nullptr);
-        CHECK(state->ring.TryAppend(std::string(256, 'x')).status == ReadStatus::Ok);
+        CHECK(state->AppendReceived(std::string(256, 'x')).status == ReadStatus::Ok);
         return state;
     };
 
@@ -1866,13 +1860,13 @@ static void CoBusyReleasePhases()
     {
         auto state = make_state();
         Connection connection = ConnectionTestAccess::Make(state);
-        auto hold = ConnectionTestAccess::HoldForTest(state);
+        ReadContention hold(state);
         CHECK(bool(hold));
 
         /**
          * 尝试前释放
          */
-        ConnectionTestAccess::Reset(state, hold);
+        hold.Reset();
         auto shared_out = std::make_shared<std::string>();
         std::atomic<int> read_result{-1};
         auto read_task = Task([&] {
@@ -1904,7 +1898,7 @@ static void CoBusyReleasePhases()
                 std::this_thread::yield();
             }
         });
-        auto hold = ConnectionTestAccess::HoldForTest(state);
+        ReadContention hold(state);
         CHECK(bool(hold));
         std::atomic<int> result{-1};
         auto task = Task([&] {
@@ -1919,7 +1913,7 @@ static void CoBusyReleasePhases()
         /**
          * Busy 后、waiter 前释放并推进代次
          */
-        ConnectionTestAccess::Reset(state, hold);
+        hold.Reset();
         release_now.store(true);
         Get(task);
         ReceiveRing::SetBusyBeforeWaiterHookForTest({});
@@ -1934,7 +1928,7 @@ static void CoBusyReleasePhases()
         Connection connection = ConnectionTestAccess::Make(state);
         std::atomic<bool> added{false};
         ReceiveRing::SetAfterAddHookForTest([&] { added.store(true); });
-        auto hold = ConnectionTestAccess::HoldForTest(state);
+        ReadContention hold(state);
         CHECK(bool(hold));
         std::atomic<int> result{-1};
         auto task = Task([&] {
@@ -1949,7 +1943,7 @@ static void CoBusyReleasePhases()
         /**
          * Add 之后释放
          */
-        ConnectionTestAccess::Reset(state, hold);
+        hold.Reset();
         Get(task);
         ReceiveRing::SetAfterAddHookForTest({});
         CHECK(result.load() == 0);
@@ -1985,7 +1979,7 @@ static void CoWouldBlockClosedRace()
     /**
      * 空 ring WouldBlock 与 Add 之间发布终态
      */
-    state->ring.MarkClosed();
+    state->FinishReadForTest();
     closed.store(true);
     Get(task);
     ReceiveRing::SetWouldBlockBeforeWaiterHookForTest({});
@@ -2211,7 +2205,7 @@ static void RawBusyDeferredOnRead()
      * 短保护跨另一 native 线程：测试线程持锁，OnRead 的 TryRead 得到 Busy；
      * 不持锁挂起。
      */
-    auto hold = ConnectionTestAccess::HoldForTest(ConnectionTestAccess::StateOf(*stored));
+    ReadContention hold(*stored);
     CHECK(bool(hold));
     handler->hold_ready.store(true);
     CHECK(WaitUntil([&] { return handler->busy_seen.load(); }, 1000ms));
@@ -2219,7 +2213,7 @@ static void RawBusyDeferredOnRead()
     /**
      * 释放
      */
-    ConnectionTestAccess::Reset(ConnectionTestAccess::StateOf(*stored), hold);
+    hold.Reset();
 
     /**
      * 无新网络字节：owner 必须补投 OnRead 取回原 ring 字节。
@@ -2350,8 +2344,8 @@ static void CoReadHubFullBounded()
     Connection connection = ConnectionTestAccess::Make(state);
     std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>> keep;
     for (std::size_t i = 0; i < WakeHub::kMaxWaiters; ++i) {
-        auto waiter = state->ring.CreateDataWaiter();
-        CHECK(state->ring.AddDataWaiter(waiter));
+        auto waiter = state->CreateReadWaiterForTest();
+        CHECK(state->AddReadWaiterForTest(waiter));
         keep.push_back(std::move(waiter));
     }
     std::atomic<int> result{-2};
@@ -2371,7 +2365,7 @@ static void CoReadHubFullBounded()
      * 清理不污染进程
      */
     keep.clear();
-    CHECK(state->ring.TryAppend("z").status == ReadStatus::Ok);
+    CHECK(state->AppendReceived("z").status == ReadStatus::Ok);
     auto cleanup_out = std::make_shared<std::string>();
     std::atomic<int> cleanup_result{-1};
     auto cleanup_task = Task([&] {
@@ -3321,15 +3315,12 @@ static void RunStagedCloseBeforeRelease(bool engine_close)
         if (!conn1) {
             return;
         }
-        auto hold = ConnectionTestAccess::HoldForTest(ConnectionTestAccess::StateOf(*conn1));
-        if (!hold) {
-            return;
-        }
-        holder_held.store(true);
-        while (!release_hold.load() && std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::yield();
-        }
-        ConnectionTestAccess::Reset(ConnectionTestAccess::StateOf(*conn1), hold);
+        ConnectionTestAccess::ExerciseReadContention(*conn1, [&] {
+            holder_held.store(true);
+            while (!release_hold.load() && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::yield();
+            }
+        });
         holder_done.store(true);
     });
     EngineTestAccess::SetReadAppendHook(engine, [&] {
@@ -3450,8 +3441,7 @@ static void RequestCloseWriteErrorIntent()
 {
     auto sealed = std::make_shared<std::atomic<bool>>(false);
     ConnectionState requested(1001, 64, 64, 4, sealed);
-    requested.owner_dirty = [] {
-    };
+    requested.AttachOwner([] {});
     WriteProbe pending;
     CHECK(!TryAccept(requested, "pending", pending));
 
@@ -3490,8 +3480,7 @@ static void RequestCloseWriteErrorIntent()
     CHECK(pending.Query().error.value() == EPIPE);
 
     ConnectionState default_reason(1003, 64, 64, 4, sealed);
-    default_reason.owner_dirty = [] {
-    };
+    default_reason.AttachOwner([] {});
     default_reason.RequestClose({});
     default_reason.RequestClose(reason);
     default_reason.MarkClosed(reason);
@@ -3507,8 +3496,7 @@ static void RequestCloseWriteErrorIntent()
     CHECK(no_owner.Closed() && no_owner.CloseRequested() && !no_owner.CloseReason());
 
     ConnectionState ordinary(1002, 64, 64, 4, sealed);
-    ordinary.owner_dirty = [] {
-    };
+    ordinary.AttachOwner([] {});
     WriteProbe failed;
     CHECK(!TryAccept(ordinary, "pending", failed));
     ordinary.PumpWrites(1, 64, [](const std::string_view*, std::size_t, std::size_t) -> ssize_t {
@@ -3527,8 +3515,7 @@ static void SealedWriteErrorReadPublication()
     StartRuntime(1);
     auto sealed = std::make_shared<std::atomic<bool>>(false);
     ConnectionState state(1004, 64, 64, 4, sealed);
-    state.owner_dirty = [] {
-    };
+    state.AttachOwner([] {});
     WriteProbe pending;
     CHECK(!TryAccept(state, "pending", pending));
     sealed->store(true);
@@ -3541,7 +3528,7 @@ static void SealedWriteErrorReadPublication()
     /**
      * 写接纳 Closed 尚不等于 owner 已发布读终态
      */
-    CHECK(!state.ring.ReadEof());
+    CHECK(!state.Inspect().read_eof);
     std::promise<void> registered;
     auto ready = registered.get_future();
     auto waiter = state.RegisterCloseWaiter();
@@ -3554,13 +3541,13 @@ static void SealedWriteErrorReadPublication()
         notified.store(status == bbt::coroutine::WaitStatus::Completed);
     });
     CHECK(ready.wait_for(1000ms) == std::future_status::ready);
-    CHECK(state.ring.TryAppend("tail").status == ReadStatus::Ok);
+    CHECK(state.AppendReceived("tail").status == ReadStatus::Ok);
     state.MarkClosed({});
     Get(task);
-    CHECK(notified.load() && state.ring.ReadClosed());
+    CHECK(notified.load() && state.Inspect().read_closed);
     std::string tail;
-    CHECK(state.ring.TryRead(tail).status == ReadStatus::Ok && tail == "tail");
-    CHECK(state.ring.TryRead(tail).status == ReadStatus::Eof);
+    CHECK(state.TryRead(tail).status == ReadStatus::Ok && tail == "tail");
+    CHECK(state.TryRead(tail).status == ReadStatus::Eof);
     state.MarkClosed(std::make_error_code(std::errc::io_error));
     CHECK(!state.CloseReason());
     std::cout << "sealed_write_error_read_publication close_waiter=completed tail_before_eof=1\n";
@@ -3585,11 +3572,10 @@ static void RequestCloseWriteReadiness()
             /**
              * 内部状态断言经 TestAccess：公共句柄不再暴露 State。
              */
-            const auto state = ConnectionTestAccess::StateOf(connection);
+            const auto state = ConnectionTestAccess::Inspect(connection);
             write_checked.store(
-                result.error.value() == EPIPE && result.sent == 0 && state && state->CloseRequested()
-                && !state->CanAcceptWrite(1)
-                && connection.AsyncWrite("must-reject") == make_error_code(NetErrc::Closed));
+                result.error.value() == EPIPE && result.sent == 0 && state.identity != 0 && state.close_requested
+                && !state.can_accept_one && connection.AsyncWrite("must-reject") == make_error_code(NetErrc::Closed));
             writes.fetch_add(1);
         }
 
@@ -3690,15 +3676,12 @@ static void RequestCloseReadTerminalOrder()
         if (!conn1) {
             return;
         }
-        auto hold = ConnectionTestAccess::HoldForTest(ConnectionTestAccess::StateOf(*conn1));
-        if (!hold) {
-            return;
-        }
-        holder_held.store(true);
-        while (!release_hold.load() && std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::yield();
-        }
-        ConnectionTestAccess::Reset(ConnectionTestAccess::StateOf(*conn1), hold);
+        ConnectionTestAccess::ExerciseReadContention(*conn1, [&] {
+            holder_held.store(true);
+            while (!release_hold.load() && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::yield();
+            }
+        });
     });
     EngineTestAccess::SetReadAppendHook(engine, [&] {
         hook_entered.store(true);
