@@ -115,6 +115,22 @@ std::size_t ConnCore::RecvHold() const
     return m_recv_hold.load(std::memory_order_acquire);
 }
 
+void ConnCore::SeedRecvHoldForTest(std::string_view bytes)
+{
+    if (bytes.empty() || bytes.size() > kReadChunk) {
+        throw std::invalid_argument("recv hold seed must fit in one read chunk");
+    }
+    if (m_recv_buf || m_closeStage != CloseStage::Open) {
+        throw std::logic_error("recv hold seed requires a fresh ConnCore");
+    }
+
+    auto buffer = std::make_unique<char[]>(kReadChunk);
+    m_state->PrepareReceiveStorage(kReadChunk);
+    std::memcpy(buffer.get(), bytes.data(), bytes.size());
+    m_recv_buf = std::move(buffer);
+    m_recv_hold.store(bytes.size(), std::memory_order_release);
+}
+
 bool ConnCore::Closed() const
 {
     return m_closeStage >= CloseStage::Finished;

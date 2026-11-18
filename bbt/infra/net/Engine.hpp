@@ -284,7 +284,6 @@ private:
     std::error_code InjectDriverFailureForTest();
     void RestrictConnectCapacityForTest(std::size_t limit);
     struct EngineTestSnapshot InspectForTest();
-    bool RemoveConnForTest(std::uint64_t id);
     struct ConnectTestSnapshot InspectConnectForTest(std::uint64_t id);
     void DelayForTest(std::size_t point, std::chrono::milliseconds delay);
     void ArmHookForTest(std::size_t point, std::function<void()> hook, bool once);

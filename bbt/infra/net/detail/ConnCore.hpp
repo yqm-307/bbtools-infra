@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <memory>
+#include <string_view>
 #include <bbt/infra/net/RawHandler.hpp>
 #include <bbt/infra/net/detail/ConnectionState.hpp>
 #include <bbt/infra/net/detail/EngineSupport.hpp>
@@ -26,6 +27,9 @@ public:
     std::uint64_t Identity() const noexcept;
 
     std::size_t RecvHold() const;
+
+    // 仅供 owner 独占、未启动的直构夹具一次性注入非空尾字节，至多一个读块。
+    void SeedRecvHoldForTest(std::string_view bytes);
 
     bool Closed() const;
 
