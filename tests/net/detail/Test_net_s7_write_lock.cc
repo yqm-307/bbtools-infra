@@ -156,6 +156,7 @@ private:
 struct HookCounters {
     std::atomic<int> try_lock_busy{0};
     std::atomic<int> unlock_before_retry{0};
+    std::atomic<std::size_t> tagged_unlocks{0};
     std::atomic<std::size_t> last_unlock_tag{0};
 };
 
@@ -275,7 +276,23 @@ RunDance(std::shared_ptr<ConnectionState> state, MockSink& sink, const std::func
     if (holder_thread.joinable()) {
         holder_thread.join();
     }
-    exit_outcome = exit_fn(); // 测试线程执行持锁出口（写锁已空闲）
+    try {
+        exit_outcome = exit_fn(); // 测试线程执行持锁出口（写锁已空闲）
+    } catch (...) {
+
+        /**
+         * 出口内断言失败时先放行并 join owner，不能让异常穿过 joinable std::thread。
+         */
+        {
+            std::lock_guard<std::mutex> lk(go_mx);
+            go = true;
+        }
+        go_cv.notify_all();
+        if (owner_thread.joinable()) {
+            owner_thread.join();
+        }
+        throw;
+    }
     // 必须在 join owner 之前放行，否则与 owner_thread.join() 互锁死锁。
     {
         std::lock_guard<std::mutex> lk(go_mx);
@@ -323,10 +340,48 @@ void ArmUnlockBeforeRetry(HookCounters& c, std::shared_ptr<TestHooks> hooks, std
         HookPoint::AfterWriteUnlockBeforeRetry,
         [&c, &current_tag] {
             c.unlock_before_retry.fetch_add(1);
-            c.last_unlock_tag.store(current_tag.load());
+            const auto tag = current_tag.load();
+            if (tag != TagNone) {
+                c.tagged_unlocks.fetch_add(1);
+                c.last_unlock_tag.store(tag);
+            }
         },
         false);
 }
+
+/** 持有者线程若在轮间屏障等待，提前 THROW 时先放行再 join，避免 joinable
+ * std::thread 析构终止进程；正常路径已显式 join，析构时只做幂等放行。 */
+class RoundGateJoiner {
+public:
+    RoundGateJoiner(std::thread& thread, std::mutex& mutex, std::condition_variable& cv, bool& go)
+        : m_thread(thread)
+        , m_mutex(mutex)
+        , m_cv(cv)
+        , m_go(go)
+    {
+    }
+
+    ~RoundGateJoiner()
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_go = true;
+        }
+        m_cv.notify_all();
+        if (m_thread.joinable()) {
+            m_thread.join();
+        }
+    }
+
+    RoundGateJoiner(const RoundGateJoiner&) = delete;
+    RoundGateJoiner& operator=(const RoundGateJoiner&) = delete;
+
+private:
+    std::thread& m_thread;
+    std::mutex& m_mutex;
+    std::condition_variable& m_cv;
+    bool& m_go;
+};
 
 } // namespace
 
@@ -621,9 +676,22 @@ BOOST_AUTO_TEST_CASE(every_locked_exit_passes_retry_point)
         ArmTryLockBusy(counters, f.hooks);
         ArmUnlockBeforeRetry(counters, f.hooks, current_tag);
 
-        auto tagged_fn = [&spec, &current_tag, &f]() -> ExitExpectation {
-            current_tag.store(spec.tag);
-            return spec.fn(f);
+        std::size_t tagged_before = 0;
+        std::size_t tagged_after_exit = 0;
+        auto tagged_fn = [&, spec = &spec]() -> ExitExpectation {
+            tagged_before = counters.tagged_unlocks.load();
+            current_tag.store(spec->tag);
+
+            /**
+             * 出口返回（或抛出）即清 tag，之后 owner 的解锁不得再被计入或覆盖标签。
+             */
+            struct ResetTag {
+                std::atomic<std::size_t>& tag;
+                ~ResetTag() { tag.store(TagNone); }
+            } reset{current_tag};
+            auto outcome = spec->fn(f);
+            tagged_after_exit = counters.tagged_unlocks.load();
+            return outcome;
         };
 
         auto dance = RunDance(f.state, sink, tagged_fn);
@@ -631,8 +699,16 @@ BOOST_AUTO_TEST_CASE(every_locked_exit_passes_retry_point)
         BOOST_REQUIRE_MESSAGE(dance.first_busy, std::string(spec.name) + ": 首次 try_lock 应失败");
         BOOST_REQUIRE_MESSAGE(!dance.second.lock_busy, std::string(spec.name) + ": 出口后 owner 重试应取得空闲锁");
         BOOST_REQUIRE_MESSAGE(
+            tagged_after_exit - tagged_before >= spec.expect_exit_unlocks,
+            std::string(spec.name) + ": 出口自身应带标签解锁");
+        BOOST_REQUIRE_MESSAGE(
             static_cast<int>(counters.last_unlock_tag.load()) == static_cast<int>(spec.tag),
             std::string(spec.name) + ": 出口解锁的标签应与被测出口一致");
+
+        /**
+         * 标签已在出口内清除：owner 随后的解锁不得再计入同一标签。
+         */
+        BOOST_REQUIRE_EQUAL(counters.tagged_unlocks.load(), tagged_after_exit);
         BOOST_REQUIRE_EQUAL(counters.try_lock_busy.load(), 1);
         BOOST_REQUIRE_EQUAL(sink.total_bytes(), spec.expect_total_bytes);
         BOOST_REQUIRE_MESSAGE(
@@ -683,6 +759,7 @@ BOOST_AUTO_TEST_CASE(cancel_between_rounds_terminal_zero)
         false);
 
     std::thread holder([&] { state->PumpWrites(10, kByteBudget, sink); });
+    RoundGateJoiner joiner(holder, r1_mx, r1_cv, r1_go);
     BOOST_REQUIRE_MESSAGE(WaitUntil([&] { return at_round1.load(); }, kWait), "holder 未到达第 1 轮屏障");
 
     // 轮间撤销 op2（尚未发送）：n 必为 0，与对端实收一致。
@@ -748,6 +825,7 @@ BOOST_AUTO_TEST_CASE(cancel_partial_sent_terminal_prefix)
         false);
 
     std::thread holder([&] { state->PumpWrites(10, kByteBudget, sink); });
+    RoundGateJoiner joiner(holder, r1_mx, r1_cv, r1_go);
     BOOST_REQUIRE_MESSAGE(WaitUntil([&] { return at_round1.load(); }, kWait), "holder 未到达第 1 轮屏障");
 
     // op1 已发 1000 字节：撤销 op1 返回 n=1000（已发前缀，终值）。

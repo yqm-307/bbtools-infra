@@ -161,7 +161,7 @@ set_tests_properties(net.freeze_public_surface PROPERTIES TIMEOUT 300
 add_executable(Test_net_contract_regressions Test_net_contract_regressions.cc)
 target_link_libraries(Test_net_contract_regressions PRIVATE bbt::infra_net Boost::headers)
 target_compile_options(Test_net_contract_regressions PRIVATE -Wall -Wextra -Wpedantic)
-target_link_options(Test_net_contract_regressions PRIVATE -rdynamic -Wl,--wrap=sendmsg)
+target_link_options(Test_net_contract_regressions PRIVATE -rdynamic -Wl,--wrap=sendmsg -Wl,--wrap=pthread_mutex_lock)
 foreach(_case        ring_alloc_no_consume hub_early_notify_retained
         write_total_ops_bound write_query_monotonic onwrite_throw_continues
         wait_accepted_existing_out run_preconditions engine_driver_failed
@@ -181,6 +181,7 @@ foreach(_case        ring_alloc_no_consume hub_early_notify_retained
         codial_cancel_post_failure write_terminal_interleaved_no_alloc
         raw_busy_deferred_onread seal_post_failure_retries seal_delay_beyond_deadline callback_auth_barriers
         request_close_write_error_intent request_close_write_readiness sealed_write_error_read_publication
+        write_ready_unlock_reschedule
         waitset_per_channel_full_independent waitset_notify_before_after_add waitset_timedout_wins_late_ready
         waitset_remove_then_notify_next_round waitset_concurrent_readers waitset_multi_writer_capacity_fifo
         waitset_multi_waitclosed_all_woken)

@@ -57,6 +57,7 @@
 #include <vector>
 
 #include <poll.h>
+#include <pthread.h>
 #include <unistd.h>
 
 #include <bbt/coroutine/coroutine.hpp>
@@ -88,6 +89,48 @@ extern "C" ssize_t __wrap_sendmsg(int fd, const msghdr* message, int flags)
         return -1;
     }
     return __real_sendmsg(fd, message, flags);
+}
+
+/**
+ * 目标专属持锁窗口：LastWriteError 的 WriteGuard 走 std::mutex::lock（头内联，
+ * 在本仓 ConnectionState.cc.o 留下外部 pthread_mutex_lock 引用）。包装只在该
+ * 线程局部指针武装时、成功持锁后暂停一次；其它线程/其它锁一律透明转发。
+ */
+struct LockHoldGate {
+    std::atomic<bool> entered{false};
+    std::atomic<bool> open{false};
+    std::atomic<bool> timed_out{false};
+};
+
+thread_local LockHoldGate* g_lock_hold_gate = nullptr;
+
+extern "C" int __real_pthread_mutex_lock(pthread_mutex_t* mutex);
+
+/**
+ * 持锁等待期间只做原子读与 yield：不分配、不取其它锁、不调用 std::function，
+ * 保证"业务线程确实占着写锁"这一事实本身不自造锁序。
+ */
+extern "C" int __wrap_pthread_mutex_lock(pthread_mutex_t* mutex)
+{
+    const int result = __real_pthread_mutex_lock(mutex);
+    if (result != 0) {
+        return result;
+    }
+    auto* gate = g_lock_hold_gate;
+    if (gate == nullptr) {
+        return result;
+    }
+    g_lock_hold_gate = nullptr;
+    gate->entered.store(true);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!gate->open.load(std::memory_order_acquire)) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            gate->timed_out.store(true);
+            break;
+        }
+        std::this_thread::yield();
+    }
+    return result;
 }
 
 void* operator new(std::size_t size)
@@ -3708,6 +3751,301 @@ static void RequestCloseWriteReadiness()
     std::cout << "request_close_write_readiness eagain=1 epipe=1 rejected=1 onwrite=1 onclose=1 tail_before_eof=1\n";
 }
 
+/**
+ * 真实已注册 TCP 连接：写就绪回调与业务线程持写锁的交错。
+ *
+ * 一次 EAGAIN 注入让首轮写零进展并进入真实 Asio wait_write；就绪回调在
+ * BeforeWriteReadyPump 屏障暂停（此时 m_write_waiting 已清、初始 dirty 已消费），
+ * 业务线程用 LastWriteError 的写锁（目标专属 --wrap=pthread_mutex_lock 持锁窗口）
+ * 占住首轮 try_lock。
+ * 放行后 owner 只能观测 EBUSY 并立即返回；同 owner 的第二个连接在该窗口内仍被
+ * 正常读取，证明 owner 未被 A 的写锁阻塞。业务线程解锁时，AfterWriteUnlock 窗口
+ * 内 A 无完成、无字节泄露、dirty 为空；随后同一次解锁的 WakeOwner 触发 MarkDirty
+ * （AfterDirtyWeakLock 在持锁线程上命中）重新入链，owner 才完成首次发送。
+ * 没有第二次 AsyncWrite、手动 Kick/Pump 或 A 的新收发事件——若解锁未认领 retry
+ * 并唤醒 owner，则字节永远不到达对端，末尾断言失败。
+ */
+static void WriteReadyUnlockReschedule()
+{
+    StartRuntime(3);
+
+    struct Handler : RawHandler {
+        std::promise<Connection> first_accepted;
+        std::promise<Connection> second_accepted;
+        std::atomic<int> accepts{0};
+        std::atomic<int> writes{0};
+        std::atomic<int> closes{0};
+        std::atomic<int> b_reads{0};
+        std::atomic<std::uint64_t> b_read_id{0};
+        std::atomic<std::uint64_t> write_id{0};
+        std::atomic<std::size_t> write_sent{0};
+        std::atomic<int> write_error{0};
+
+        void OnAccept(Connection connection) override
+        {
+            if (accepts.fetch_add(1) == 0) {
+                first_accepted.set_value(connection);
+            } else {
+                second_accepted.set_value(connection);
+            }
+        }
+
+        void OnRead(Connection connection) override
+        {
+            /**
+             * 只记录、不消费 ring：消费会经 data 通知给 owner 额外调度，
+             * 污染"仅由解锁唤醒 A"的窗口。
+             */
+            b_read_id.store(connection.Id());
+            b_reads.fetch_add(1);
+        }
+
+        void OnWrite(Connection, WriteResult result) override
+        {
+            write_id.store(result.operation);
+            write_sent.store(result.sent);
+            write_error.store(result.error.value());
+            writes.fetch_add(1);
+        }
+
+        void OnClose(Connection, std::error_code) override { closes.fetch_add(1); }
+    };
+
+    /**
+     * 有界释放闸门：等待超时记录在闸门内，正常路径结束时统一断言未超时，
+     * 避免"超时后静默继续"被当成已成立的时序。
+     */
+    struct Gate {
+        std::shared_ptr<std::promise<void>> promise = std::make_shared<std::promise<void>>();
+        std::shared_future<void> future = promise->get_future().share();
+        std::atomic<bool> opened{false};
+        mutable std::atomic<bool> timed_out{false};
+
+        bool Wait(std::chrono::milliseconds timeout) const
+        {
+            const bool ready = future.wait_for(timeout) == std::future_status::ready;
+            if (!ready) {
+                timed_out.store(true);
+            }
+            return ready;
+        }
+
+        void Open()
+        {
+            if (opened.exchange(true)) {
+                return;
+            }
+            try {
+                promise->set_value();
+            } catch (...) {
+
+                /**
+                 * 已释放或 promise 失效：闸门仍视为打开。
+                 */
+            }
+        }
+    };
+
+    auto handler = std::make_shared<Handler>();
+    auto first_accepted = handler->first_accepted.get_future();
+
+    /**
+     * 钩子回调按引用捕获的状态必须先于 Engine 声明：TestHooks::Invoke 在槽锁外执行
+     * 持久回调，EngineRunner 关闭并 join 完成前这些对象不得销毁。
+     */
+    Gate ready_gate;
+    Gate unlock_gate;
+    Gate dirty_gate;
+    LockHoldGate lock_hold_gate;
+    std::atomic<bool> ready_entered{false};
+    std::atomic<bool> unlock_entered{false};
+    std::atomic<bool> dirty_entered{false};
+    std::atomic<int> try_lock_busy{0};
+    std::atomic<int> last_error_value{0};
+    std::atomic<std::uint64_t> last_error_operation{0};
+    std::thread holder;
+    std::thread::id holder_id;
+
+    Engine engine(handler);
+    EngineTestAccess::ClearConnectInjection(engine);
+    EngineRunner runner(engine, ServerConfig(Loopback(0)));
+    CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
+    std::vector<Address> addresses;
+    CHECK(!engine.LocalAddresses(addresses) && !addresses.empty());
+
+    auto client = ConnectClient(addresses[0]);
+    CHECK(first_accepted.wait_for(3000ms) == std::future_status::ready);
+    auto connection = first_accepted.get();
+    CHECK(connection.Valid());
+
+    /**
+     * 此刻只有 A 已登记，fd 选择无歧义。
+     */
+    const int fd = EngineTestAccess::FirstConnectionFd(engine);
+    CHECK(fd >= 0);
+
+    /**
+     * 同 owner 的 B：证明 A 持写锁时 owner 仍处理其它连接事件。
+     */
+    auto second_accepted = handler->second_accepted.get_future();
+    auto peer_b = ConnectClient(addresses[0]);
+    CHECK(second_accepted.wait_for(3000ms) == std::future_status::ready);
+    auto connection_b = second_accepted.get();
+    CHECK(connection_b.Valid() && connection_b.Id() != connection.Id());
+
+    EngineTestAccess::SetWriteReadyBarrierOnce(engine, [&] {
+        ready_entered.store(true);
+        ready_gate.Wait(5000ms);
+    });
+    EngineTestAccess::ArmHook(engine, HookPoint::AfterWriteTryLockBusy, [&] { try_lock_busy.fetch_add(1); }, false);
+
+    try {
+        g_eagain_sendmsg_fd.store(fd);
+        CHECK(!connection.AsyncWrite("pending"));
+        CHECK(WaitUntil([&] { return ready_entered.load(); }, 3000ms));
+
+        /**
+         * 首轮 EAGAIN 零进展已消费注入；owner 停在 readiness 屏障。
+         */
+        CHECK(g_eagain_sendmsg_fd.load() == -1);
+        holder = std::thread([&] {
+            std::uint64_t operation = 0;
+            g_lock_hold_gate = &lock_hold_gate;
+            const auto error = connection.LastWriteError(&operation);
+            g_lock_hold_gate = nullptr;
+            last_error_value.store(error.value());
+            last_error_operation.store(operation);
+        });
+        holder_id = holder.get_id();
+        CHECK(WaitUntil([&] { return lock_hold_gate.entered.load(); }, 3000ms));
+
+        /**
+         * 此时才武装解锁/入链钩子：此前 A 的 EAGAIN 轮已解锁，B 的 StartOwner 也已
+         * 无争用解锁，只有持锁线程的这次解锁会命中。
+         */
+        EngineTestAccess::ArmHook(
+            engine,
+            HookPoint::AfterWriteUnlockBeforeRetry,
+            [&] {
+                if (std::this_thread::get_id() != holder_id || unlock_entered.exchange(true)) {
+                    return;
+                }
+                unlock_gate.Wait(5000ms);
+            },
+            false);
+        EngineTestAccess::ArmHook(
+            engine,
+            HookPoint::AfterDirtyWeakLock,
+            [&] {
+                if (std::this_thread::get_id() != holder_id || dirty_entered.exchange(true)) {
+                    return;
+                }
+                dirty_gate.Wait(5000ms);
+            },
+            false);
+
+        ready_gate.Open();
+        CHECK(WaitUntil([&] { return try_lock_busy.load() == 1; }, 3000ms));
+
+        /**
+         * 首次准备发送确实忙：零字节、无写/关终态、无意外 dirty（否则 owner 会先在
+         * A 的 CloseRequested 阻塞，而非 fail-fast 处理 B）。
+         */
+        CHECK(handler->writes.load() == 0 && handler->closes.load() == 0);
+        CHECK(EngineTestAccess::DirtyCount(engine) == 0);
+        char probe[16];
+        const auto before_busy = client.Receive(probe, sizeof(probe));
+        CHECK(
+            before_busy.bytes == 0
+            && (before_busy.error.value() == EAGAIN || before_busy.error.value() == EWOULDBLOCK));
+
+        /**
+         * A 的写锁仍被业务线程持有：owner 仍能处理 B 的读事件。
+         */
+        CHECK(SendAll(peer_b, "b!", 1000ms));
+        CHECK(WaitUntil([&] { return handler->b_reads.load() >= 1; }, 3000ms));
+        CHECK(handler->b_read_id.load() == connection_b.Id());
+        CHECK(try_lock_busy.load() == 1);
+
+        lock_hold_gate.open.store(true);
+        CHECK(WaitUntil([&] { return unlock_entered.load(); }, 3000ms));
+
+        /**
+         * 已解锁、尚未 exchange retry：A 无完成、无新字节、dirty 为空，说明没有
+         * 其它唤醒在推进 A。
+         */
+        CHECK(handler->writes.load() == 0 && handler->closes.load() == 0);
+        CHECK(EngineTestAccess::DirtyCount(engine) == 0);
+        const auto after_unlock = client.Receive(probe, sizeof(probe));
+        CHECK(
+            after_unlock.bytes == 0
+            && (after_unlock.error.value() == EAGAIN || after_unlock.error.value() == EWOULDBLOCK));
+
+        unlock_gate.Open();
+        CHECK(WaitUntil([&] { return dirty_entered.load(); }, 3000ms));
+
+        /**
+         * MarkDirty 已被同一次解锁在持锁线程上截获（dirty_entered 只在持锁线程过滤
+         * 后置位），尚未入链，因此依然零进展。
+         */
+        CHECK(handler->writes.load() == 0);
+
+        dirty_gate.Open();
+        if (holder.joinable()) {
+            holder.join();
+        }
+        CHECK(WaitUntil([&] { return handler->writes.load() == 1; }, 3000ms));
+    } catch (...) {
+        g_eagain_sendmsg_fd.store(-1);
+        ready_gate.Open();
+        lock_hold_gate.open.store(true);
+        unlock_gate.Open();
+        dirty_gate.Open();
+        if (holder.joinable()) {
+            holder.join();
+        }
+        throw;
+    }
+
+    /**
+     * 任何屏障超时都说明该时序未被真实观测到，不能当作已成立的交错。
+     */
+    CHECK(
+        !ready_gate.timed_out.load() && !lock_hold_gate.timed_out.load() && !unlock_gate.timed_out.load()
+        && !dirty_gate.timed_out.load());
+
+    std::string received;
+    CHECK(RecvExact(client, 7, received, 2000ms));
+    CHECK(received == "pending");
+    char extra[16];
+    const auto extra_result = client.Receive(extra, sizeof(extra));
+    CHECK(
+        extra_result.bytes == 0 && (extra_result.error.value() == EAGAIN || extra_result.error.value() == EWOULDBLOCK));
+    CHECK(handler->writes.load() == 1);
+    CHECK(handler->write_sent.load() == 7);
+    CHECK(handler->write_error.load() == 0);
+    CHECK(handler->write_id.load() != 0);
+    CHECK(handler->closes.load() == 0);
+    CHECK(handler->b_reads.load() >= 1);
+    CHECK(EngineTestAccess::DirtyCount(engine) == 0);
+    CHECK(last_error_value.load() == 0 && last_error_operation.load() == 0);
+    CHECK(!connection.LastWriteError());
+
+    (void)connection.Close();
+    (void)connection_b.Close();
+    (void)client.Close();
+    (void)peer_b.Close();
+    runner.CloseAndJoin();
+    CHECK(!runner.error);
+
+    /**
+     * owner 已 join，此后不再有回调：此处复查 OnWrite 恰一次且无错误。
+     */
+    CHECK(handler->writes.load() == 1 && handler->write_sent.load() == 7 && handler->write_error.load() == 0);
+    std::cout << "write_ready_unlock_reschedule eagain=1 try_lock_busy=" << try_lock_busy.load()
+              << " b_read_while_locked=1 unlock_wake_markdirty=1 sent=7 onwrite=1 onclose=0\n";
+}
+
 static void RequestCloseReadTerminalOrder()
 {
     StartRuntime(3);
@@ -4334,6 +4672,8 @@ static int RunCases(int argc, char** argv)
             RequestCloseWriteErrorIntent();
         } else if (test == "request_close_write_readiness") {
             RequestCloseWriteReadiness();
+        } else if (test == "write_ready_unlock_reschedule") {
+            WriteReadyUnlockReschedule();
         } else if (test == "sealed_write_error_read_publication") {
             SealedWriteErrorReadPublication();
         } else if (test == "stage_detached_notify_fault_no_duplicate") {
