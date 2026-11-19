@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-20",
+  "commit": "21afe5ccd7d0c09ba43d9cad576f34d381887a7f",
+  "base": "327843bee3051b7d0668ce666dc34dcf32cd7ae4",
+  "result": "pass",
+  "reviewer": "gpt-6.2-astra (deleg_f27cca8b, deleg_9ba67664)",
+  "summary": "S7 写泵按轮持锁、写就绪路径遇锁忙后重调度、选择器复用计数缓冲。完整代码审查的三处测试问题经定向复审关闭。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "逐轮持锁保留撤销前缀和终态语义，选择器采样顺序和公共接口保持一致。复审确认真实 TCP 用例只在测试二进制制造持锁竞争，逐出口计数和线程清理均已修正。",
+      "evidence": {
+        "reviewer": "gpt-6.2-astra (deleg_f27cca8b 全量候选代码审查, deleg_9ba67664 定向复审)",
+        "scope": "327843b..b48f416 与最终测试增量，增量 SHA-256 为 49493120e7cd2be591a356fe813d5791ac4e1593f953a353b6ab67340732fed1，对应 b48f416..21afe5c。覆盖代码和测试审查，性能验收独立记录。"
+      }
+    }
+  ]
+}

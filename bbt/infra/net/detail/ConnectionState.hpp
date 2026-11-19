@@ -164,15 +164,17 @@ public:
         bool need_write_wait{false};
         bool terminal_changed{false};
         bool capacity_freed{false};
+        bool lock_busy{false};
     };
 
     static constexpr std::size_t kMaxViews = 4;
 
     /**
      * sink(views,count) 必须非阻塞，返回实际发送字节数或 -1（errno 表达）。
-     * 单次调用受 rounds 与 byte_budget 双重约束。
+     * 单次调用受 rounds 与 byte_budget 双重约束；每轮独立持锁。
      */
     template <class Sink> SendResult PumpWrites(std::size_t max_rounds, std::size_t byte_budget, Sink&& sink);
+    template <class Sink> SendResult TryPumpWrites(std::size_t max_rounds, std::size_t byte_budget, Sink&& sink);
 
     /**
      * 无分配弹出（vector capacity 在构造时预留）；每次释放 op 额度后锁外通知
@@ -238,7 +240,29 @@ private:
 
     void FailCurrentLocked(std::error_code error);
 
+    class WriteGuard {
+    public:
+        explicit WriteGuard(ConnectionState& state, bool try_lock = false);
+        ~WriteGuard();
+        WriteGuard(const WriteGuard&) = delete;
+        WriteGuard& operator=(const WriteGuard&) = delete;
+
+        bool OwnsLock() const noexcept { return m_ownsLock; }
+
+        void Unlock() noexcept;
+
+    private:
+        ConnectionState& m_state;
+        bool m_ownsLock{false};
+    };
+
+    template <class Sink>
+    SendResult _PumpWrites(std::size_t max_rounds, std::size_t byte_budget, Sink&& sink, bool try_lock);
+    bool _TryWriteLock();
+    void _UnlockWrite() noexcept;
+
     std::mutex m_write_mutex;
+    std::atomic<bool> m_writeRetry{false};
     boost::circular_buffer<WriteEntry> m_writeIntervals;
     OutboundQueue m_queue;
     std::size_t m_outbound_max;

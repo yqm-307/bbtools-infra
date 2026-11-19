@@ -512,7 +512,11 @@ void ConnCore::PumpWritesOwner()
     auto sink = [this](const std::string_view* views, std::size_t count, std::size_t budget) -> ssize_t {
         return SendViewsRaw(m_desc.native_handle(), views, count, budget);
     };
-    const auto result = m_state->PumpWrites(kWriteRounds, kWriteByteBudget, sink);
+    const auto result = m_state->TryPumpWrites(kWriteRounds, kWriteByteBudget, sink);
+    if (result.lock_busy) {
+        // 交给解锁方重调度；现在弹终态或查询待写都会重新阻塞在同一把锁上。
+        return;
+    }
     DeliverTerminalOwner();
     if (Closed()) {
         return;

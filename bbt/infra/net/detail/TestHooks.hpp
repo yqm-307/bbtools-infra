@@ -35,6 +35,9 @@ enum class HookPoint : std::size_t {
     AfterAcceptStopPostFailure,
     DuringReadProtection,
     BeforeOwnerWake,
+    BetweenWriteRounds,
+    AfterWriteTryLockBusy,
+    AfterWriteUnlockBeforeRetry, // 解锁清理中的测试屏障，不得抛异常。
     Count
 };
 enum class FaultPoint : std::size_t {

@@ -559,7 +559,12 @@ std::shared_ptr<Reactor> ReactorSet::Select(
     if (snapshot.empty()) {
         return nullptr;
     }
-    std::vector<std::uint64_t> counts;
+    /**
+     * Select 不挂起也不重入；按调用线程复用容量，仍先采样成员数再取
+     * balancer_mutex，避免把 Reactor 的成员锁嵌入选择器锁。
+     */
+    thread_local std::vector<std::uint64_t> counts;
+    counts.clear();
     counts.reserve(snapshot.size());
     for (auto& reactor : snapshot) {
         counts.push_back(reactor->ConnCount());
