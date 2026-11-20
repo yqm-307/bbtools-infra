@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RPC v2 AppSession 双进程 consumer 驱动（CTest 前台受管父进程）。
+"""RPC AppSession 双进程 consumer 驱动（CTest 前台受管父进程）。
 
 对齐 scripts/bench/driver.py 的既有项目惯例（标准库、前台编排、只清自己
 拉起的子进程）；bench driver 的 JSON 负载协议不适配本 consumer，故为最小
@@ -10,8 +10,7 @@
     loopback 端口（无固定 /tmp 文件、无 shell 后台、无外部端口）；
   - 拉起 client 子进程拨号 + Call/Send，校验退出码与客户端关键断言
     （单 session/link）；
-  - 正常收口：关闭 server stdin（EOF）触发 server 协作退出（自身
-    Close(Graceful) → Close(Timeout)），检查 server 退出码与
+  - 关闭 server stdin（EOF）触发 server 排空已接纳责任并等待连接回收，检查 server 退出码与
     "SERVER CLOSED ok admitted>=2" 收口输出（一次 Call + 一次 Send）；
   - try/finally 兜底 terminate→kill 仅用于异常/超时路径，不能替代正常
     关闭成为通过依据。
@@ -133,7 +132,7 @@ def main(argv):
             return 1
         print("client: %s" % client_out.strip().replace("\n", " | "))
 
-        # 正常协作收口：关闭 stdin → server EOF → 自身 Close(Graceful)→Close(Timeout)。
+        # EOF 触发服务端的 Graceful 关闭，父进程随后核对回收结果。
         if server.stdin is None:
             print("FAIL server stdin pipe unavailable", file=sys.stderr)
             return 1

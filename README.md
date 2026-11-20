@@ -9,7 +9,7 @@ C++17 基础接入层：TCP 网络执行域、HTTP、Redis、RPC、Mongo 与基�
 | TCP 网络底座 | `bbt::infra_net` | Processer driver 推进；Engine + ICoConnection 的建连、收发、关闭与回收 |
 | HTTP Client / Server | `bbt::infra_http_net` | 唯一现役 HTTP 实现；连接池、HTTP/1.1、请求级派发（每连接 reader/parser + 请求任务 + 单顺序 writer）与流式响应；见 [HTTP 指南](docs/guides/http-net.md) |
 | Redis | `bbt::infra_redis_net` | 单连接与有界池，RESP2、KV/Hash、AUTH/SELECT；见 [Redis 指南](docs/guides/redis-net.md) |
-| RPC | `bbt::infra_rpc_net` | 唯一 V2 会话面（`SessionFrame` + u32be + Hello/HelloAck），锁定 protobuf 3.21.12；不依赖 HTTP 开关；见 [RPC 指南](docs/guides/rpc-net.md) |
+| RPC | `bbt::infra_rpc_net` | RPC 会话（`SessionFrame` + u32be + Hello/HelloAck），锁定 protobuf 3.21.12；不依赖 HTTP 开关；见 [RPC 指南](docs/guides/rpc-net.md) |
 | Consul 注册发现 adapter | `bbt::infra_consul` | agent HTTP API 注册、注销与健康发现；专属 HTTP Client；见 [Consul 指南](docs/guides/consul-registry.md) |
 | Mongo | `bbt::infra_mongo` | bounded native worker bridge、BSON、CoMongoDb owner 与 CoMongoColl 句柄；关闭等待由同一 Close 输入控制 |
 | 动态配置 | `bbt::infra_config` | 内存源、文件源与 watch；Close 控制 callback 排空和轮询退出；见 [config 指南](docs/guides/config-watch.md) |

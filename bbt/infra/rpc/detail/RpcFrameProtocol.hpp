@@ -1,17 +1,6 @@
 #pragma once
 
-/**
- * RPC 帧协议接缝（bbt/infra/rpc 实现 TU 专用，非公开头）。
- *
- * 协议层是无状态的纯帧编解码：profile_version/帧类型/长度上限/关联字段与
- * 字段存在性规则都由常量与函数承载（wire 无 magic，只有 u32be 前缀与
- * profile_version）。连接级状态——握手进度、拆包缓冲、pending、发送队列、
- * 入站顺序台账——一律归 RpcSession；本类不持有其中任何一项。
- *
- * 增量拆包所需的接收缓存由调用方以 SessionFrameDecoder 持有（session 的
- * 接收缓存，不是协议层状态）。wire 真源仍是 SessionCodec.hpp（profile 2 +
- * u32be 分帧），本类把「协议外壳」显式命名为一条接缝，字节规则不复制。
- */
+// 仅供既有 wire 用例；生产直接走 SessionCodec.hpp。
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -23,13 +12,6 @@
 namespace bbt::infra::rpc {
 namespace detail {
 
-/**
- * @brief profile 2 无状态帧协议：校验、编码、解码与增量拆包入口。
- *
- * 全部方法为纯函数；解码端字段级违规归 ProtocolError，编码端不可编码值归
- * InvalidArgument（与 SessionCodec 同一口径）。不含 JSON/XML/Protobuf 业务
- * 类型，payload 始终是不透明字节。
- */
 class RpcFrameProtocol {
 public:
     /**

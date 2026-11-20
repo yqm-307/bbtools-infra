@@ -7,7 +7,6 @@
 #include <bbt/infra/rpc/Admission.hpp>
 #include <bbt/infra/rpc/detail/RpcSessionState.hpp>
 #include <bbt/infra/rpc/detail/Session.hpp>
-#include <bbt/infra/rpc/detail/RpcFrameProtocol.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -28,7 +27,7 @@ namespace {
  * 归还，Graceful 不能据此提前 Seal。作用域覆盖 Complete/Fail 的全部退出路径。
  */
 struct OpenReplyGuard {
-    std::weak_ptr<ServerV2State> server;
+    std::weak_ptr<ServerState> server;
 
     ~OpenReplyGuard()
     {
@@ -75,10 +74,21 @@ void AdmissionWorker(std::shared_ptr<detail::AdmissionQueueImpl> impl)
                     return;
                 }
             }
-            const auto status = impl->signal->Wait({RpcClock::now() + 25ms});
-            if (status == bbt::coroutine::WaitStatus::AlreadyWaiting
-                || status == bbt::coroutine::WaitStatus::InvalidContext) {
-                bbtco_sleep(5);
+            const auto status = impl->signal->WaitWithCallback({RpcClock::now() + 25ms}, [impl] {
+                bool ready;
+                {
+                    std::lock_guard<std::mutex> lock(impl->mu);
+                    ready = impl->closed || !impl->queue.empty();
+                }
+                if (ready) {
+                    impl->signal->Notify();
+                }
+                return true;
+            });
+            if (status != WaitStatus::Completed && status != WaitStatus::TimedOut) {
+                // 无法继续等待时拒新，但已进 FIFO 的项仍由本 worker 归还。
+                std::lock_guard<std::mutex> lock(impl->mu);
+                impl->closed = true;
             }
             continue;
         }
@@ -194,7 +204,7 @@ std::shared_ptr<detail::ReplyCompletionImpl> detail::AdmissionAccess::ClaimTermi
 }
 
 void detail::AdmissionAccess::AttachQueue(
-    const std::shared_ptr<AdmissionQueue>& queue, const std::shared_ptr<ServerV2State>& server)
+    const std::shared_ptr<AdmissionQueue>& queue, const std::shared_ptr<ServerState>& server)
 {
     if (!queue || !queue->m_impl) {
         return;
@@ -227,7 +237,7 @@ result<void> AdmissionQueue::Admit(AdmissionItem item)
 
     /**
      * dropped 记账移出 impl->mu 临界区：锁序统一为 server->mu → impl->mu
-     * （ServerV2Close/Stats 持 server->mu 时可经 queue 观察面取 impl->mu；
+     * （ServerClose/Stats 持 server->mu 时可经 queue 观察面取 impl->mu；
      * 反向在 impl->mu 内再取 server->mu 构成闭环死锁）。
      */
     if (over_cap) {
@@ -360,12 +370,11 @@ bbt_co_async(result<void>) ReplyCompletion::Complete(Response response)
             frame.response_schema = impl->response_schema;
             frame.success = false;
             frame.error = Err(ErrorCode::ProtocolError, "response correlation mismatch");
-            auto bytes = detail::RpcFrameProtocol::Encode(frame, session->owner->options.MaxFrameBytes());
+            auto bytes = EncodeFramedSessionFrame(frame, session->owner->options.MaxFrameBytes());
             if (bytes) {
                 SessionCore::OutItem item;
                 item.bytes.assign(reinterpret_cast<const char*>(bytes.value().data()), bytes.value().size());
                 item.lane = impl->lane;
-                item.control_response = true;
                 item.deadline = write_deadline;
                 item.settle = std::make_shared<SessionCore::OutItem::Settle>();
                 auto settle = item.settle;
@@ -380,7 +389,7 @@ bbt_co_async(result<void>) ReplyCompletion::Complete(Response response)
                     const auto wait_deadline = write_deadline == RpcClock::time_point::max()
                                                    ? RpcClock::now() + 30s
                                                    : std::min(write_deadline, RpcClock::now() + 30s);
-                    (void)settle->waiter->Wait({wait_deadline});
+                    (void)settle->Wait(wait_deadline);
                 }
             }
 
@@ -397,14 +406,13 @@ bbt_co_async(result<void>) ReplyCompletion::Complete(Response response)
         frame = std::move(built.value());
         frame.traffic = impl->lane;
     }
-    auto bytes = detail::RpcFrameProtocol::Encode(frame, session->owner->options.MaxFrameBytes());
+    auto bytes = EncodeFramedSessionFrame(frame, session->owner->options.MaxFrameBytes());
     if (!bytes) {
         return result<void>::err(bytes.error());
     }
     SessionCore::OutItem item;
     item.bytes.assign(reinterpret_cast<const char*>(bytes.value().data()), bytes.value().size());
     item.lane = frame.traffic;
-    item.control_response = true;
     item.deadline = write_deadline;
     item.settle = std::make_shared<SessionCore::OutItem::Settle>();
     auto settle = item.settle;
@@ -421,27 +429,7 @@ bbt_co_async(result<void>) ReplyCompletion::Complete(Response response)
     const auto wait_deadline = write_deadline == RpcClock::time_point::max()
                                    ? RpcClock::now() + 30s
                                    : std::min(write_deadline, RpcClock::now() + 30s);
-    const auto status = settle->waiter->Wait({wait_deadline});
-    if (status == bbt::coroutine::WaitStatus::Completed) {
-        return settle->outcome;
-    }
-    if (status == bbt::coroutine::WaitStatus::Cancelled) {
-        return ErrV(ErrorCode::Cancelled, "reply write wait cancelled");
-    }
-    if (status == bbt::coroutine::WaitStatus::TimedOut) {
-
-        /**
-         * 预算内未观察到写终态：写责任可能仍在途，由 infra 继续结算，
-         * 但本调用不得伪报成功。
-         */
-        return ErrV(ErrorCode::TimedOut, "reply write not settled in budget");
-    }
-
-    /**
-     * InvalidContext/AlreadyWaiting/RuntimeUnavailable：无法观察终态的
-     * 等待基础设施失败——不是写成功，写责任仍由 WriterLoop/Kill 结算。
-     */
-    return ErrV(ErrorCode::Unavailable, "reply write wait unavailable");
+    return settle->Wait(wait_deadline);
 }
 
 bbt_co_async(result<void>) ReplyCompletion::Fail(Error error)
@@ -498,14 +486,13 @@ bbt_co_async(result<void>) ReplyCompletion::Fail(Error error)
         frame.request_schema = impl->request_schema;
         frame.response_schema = impl->response_schema;
     }
-    auto bytes = detail::RpcFrameProtocol::Encode(frame, session->owner->options.MaxFrameBytes());
+    auto bytes = EncodeFramedSessionFrame(frame, session->owner->options.MaxFrameBytes());
     if (!bytes) {
         return result<void>::err(bytes.error());
     }
     SessionCore::OutItem item;
     item.bytes.assign(reinterpret_cast<const char*>(bytes.value().data()), bytes.value().size());
     item.lane = frame.traffic;
-    item.control_response = true;
     item.deadline = write_deadline;
     item.settle = std::make_shared<SessionCore::OutItem::Settle>();
     auto settle = item.settle;
@@ -520,17 +507,7 @@ bbt_co_async(result<void>) ReplyCompletion::Fail(Error error)
     const auto wait_deadline = write_deadline == RpcClock::time_point::max()
                                    ? RpcClock::now() + 30s
                                    : std::min(write_deadline, RpcClock::now() + 30s);
-    const auto status = settle->waiter->Wait({wait_deadline});
-    if (status == bbt::coroutine::WaitStatus::Completed) {
-        return settle->outcome;
-    }
-    if (status == bbt::coroutine::WaitStatus::Cancelled) {
-        return ErrV(ErrorCode::Cancelled, "reply write wait cancelled");
-    }
-    if (status == bbt::coroutine::WaitStatus::TimedOut) {
-        return ErrV(ErrorCode::TimedOut, "reply write not settled in budget");
-    }
-    return ErrV(ErrorCode::Unavailable, "reply write wait unavailable");
+    return settle->Wait(wait_deadline);
 }
 
 bool ReplyCompletion::IsTerminal() const noexcept

@@ -4,8 +4,8 @@
  *
  * 只装配，不启动 Engine、不拨号。Call/Send 在受管协程内建立或复用
  * 双向 TCP link；会话负责握手、关联、预算、取消与提交后的未知结果。
- * Close 是唯一关闭入口（Immediate/Timeout/Graceful 三态），Shutdown 是
- * 宿主侧同步强制关闭；连接物理回收仍由 Engine owner 收口，关闭后不可重开。
+ * CloseOptions 指定立即关闭或优雅排空，以及是否等待自身连接回收。
+ * 共享 Engine 由宿主关闭。
  */
 #pragma once
 
@@ -35,6 +35,10 @@ namespace bbt::infra::rpc {
 
 class CoRpcServer;
 
+namespace detail {
+class LinkReleaseProbe;
+}
+
 /**
  * detail：会话 owner，定义见 detail/RpcSessionState.hpp
  */
@@ -63,7 +67,8 @@ public:
      * Hello/HelloAck 握手与 epoch 协商建立 provisional session，同 PeerKey
      * 的并发 Call/Send 共用一条双向 link（含本进程 Server 入站接纳的 link）。
      * Call 要求 request.Reply()==Required、Traffic 为 Service/Actor；
-     * request_id 为空时由 session 生成唯一值。
+     * request_id 为空时为本次尝试生成 ID；显式值原样使用，并须与同一会话代
+     * 内其他 Call 的实际关联值不同。它不是业务幂等键。
      *
      * @return 失败错误面：InvalidArgument/InvalidContext/TimedOut/Closed/
      *         Overloaded/UnsupportedRoute/OutcomeUnknown（committed 后无可信终态）。
@@ -74,7 +79,8 @@ public:
      * @brief 会话出站单向发送（仅受管协程内调用）。
      *
      * Send 要求 request.Reply()==None、Traffic 为 Service/Actor；
-     * message_id 为空时由 session 生成唯一值。RequireRemoteAcceptance
+     * message_id 为空时为本次尝试生成 ID；显式值原样使用，并须与同一会话代
+     * 内其他 Send 的实际关联值不同。RequireRemoteAcceptance
      * 编码为 acceptance_requested presence；true 时等到远端 admission
      * 成功（或拒绝）的 SendAccepted 才返回。false 在本地 lane 接纳后返回。
      */
@@ -136,6 +142,7 @@ private:
      * CoRpcServer::Create 注入 session_owner 取 m_owner
      */
     friend class CoRpcServer;
+    friend class detail::LinkReleaseProbe;
     std::shared_ptr<SessionOwnerState> m_owner;
 };
 

@@ -5,7 +5,28 @@
  */
 #include <bbt/infra/rpc/detail/RpcSessionState.hpp>
 
+#include <algorithm>
+
 namespace bbt::infra::rpc {
+
+Error WaitFailure(bbt::coroutine::WaitStatus status, const char* message)
+{
+    using bbt::coroutine::WaitStatus;
+    switch (status) {
+    case WaitStatus::Cancelled:
+        return Err(ErrorCode::Cancelled, message);
+    case WaitStatus::TimedOut:
+        return Err(ErrorCode::TimedOut, message);
+    case WaitStatus::InvalidContext:
+        return Err(ErrorCode::InvalidContext, message);
+    case WaitStatus::RuntimeUnavailable:
+        return Err(ErrorCode::RuntimeUnavailable, message);
+    case WaitStatus::AlreadyWaiting:
+    case WaitStatus::Completed:
+        return Err(ErrorCode::InternalError, message);
+    }
+    return Err(ErrorCode::InternalError, message);
+}
 
 Error SettleCloseReason(Error reason, const char* default_message)
 {
@@ -28,15 +49,6 @@ std::error_code CheckCall(bbt::coroutine::Deadline deadline)
         return std::make_error_code(std::errc::timed_out);
     }
     return {};
-}
-
-Error CallError(std::error_code cause, const char* message, bool committed)
-{
-    auto error = detail::TcpCallError(cause, message, committed);
-    if (!error.request_phase.has_value() && committed) {
-        error.request_phase = RequestPhase::RequestCommitted;
-    }
-    return error;
 }
 
 result<std::uint32_t> Budget(bbt::coroutine::Deadline deadline)
@@ -64,17 +76,76 @@ void AttachCloseReason(Error& error, const Error& reason)
     }
 }
 
+bool LinkLease::Released() const
+{
+    const auto live = session.lock();
+    return (!live || live->responsibilities.load() == 0) && conn.Released();
+}
+
 bool SessionOwnerState::DrainedLocked() const
 {
-    return active_ops == 0 && establishing.empty();
+    return active_ops == 0;
 }
 
 bool SessionOwnerState::TeardownLocked() const
 {
-    return by_identity.empty() && establishing.empty();
+    return link_leases.empty() && establishing.empty();
 }
 
-bool ServerV2State::DrainedLocked() const
+void SessionOwnerState::ReapReleasedLocked()
+{
+    link_leases.erase(
+        std::remove_if(link_leases.begin(), link_leases.end(), [](const auto& lease) { return lease.Released(); }),
+        link_leases.end());
+    for (auto it = by_identity.begin(); it != by_identity.end();) {
+        auto session = it->second.lock();
+        if (!session || (session->responsibilities.load() == 0 && session->channel->IsReleased())) {
+            it = by_identity.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = by_endpoint.begin(); it != by_endpoint.end();) {
+        auto session = it->second.lock();
+        if (!session || (session->responsibilities.load() == 0 && session->channel->IsReleased())) {
+            it = by_endpoint.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = establishing.begin(); it != establishing.end();) {
+        if (it->second->done && it->second->reclaim.Released()) {
+            it = establishing.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+std::size_t SessionOwnerState::OccupiedLocked() const
+{
+    return link_leases.size() + std::count_if(establishing.begin(), establishing.end(), [](const auto& entry) {
+               return entry.second->reserved;
+           });
+}
+
+void ServerState::ReapReleasedLocked()
+{
+    links.erase(
+        std::remove_if(links.begin(), links.end(), [](const auto& lease) { return lease.Released(); }), links.end());
+    for (auto it = handshakes.begin(); it != handshakes.end();) {
+        if (it->second.finished && it->second.conn.Released()) {
+            it = handshakes.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (rejected_accept.Released()) {
+        rejected_accept = {};
+    }
+}
+
+bool ServerState::DrainedLocked() const
 {
     for (std::size_t i = 0; i != kLaneCount; ++i) {
         if (inflight[i] != 0) {
@@ -93,15 +164,15 @@ bool ServerV2State::DrainedLocked() const
      * 都不算收口。dead 链接同样可能残留未结算写责任（writer 手中的
      * 在写项不属于排队丢弃口径）——不能用 !dead 跳过。
      */
-    for (const auto& weak : links) {
-        if (auto session = weak.lock(); session && session->writes_outstanding.load() != 0) {
+    for (const auto& lease : links) {
+        if (auto session = lease.session.lock(); session && session->writes_outstanding.load() != 0) {
             return false;
         }
     }
     return true;
 }
 
-bool ServerV2State::StoppedLocked() const
+bool ServerState::StoppedLocked() const
 {
     if (starting) {
         return false;
@@ -112,22 +183,13 @@ bool ServerV2State::StoppedLocked() const
     if (started && !accept_loop_exited) {
         return false;
     }
-    if (!handshakes.empty()) {
+    if (!handshakes.empty() || !links.empty() || rejected_accept.Valid()) {
         return false;
-    }
-    for (const auto& weak : links) {
-        auto session = weak.lock();
-        if (!session) {
-            continue;
-        }
-        if (session->responsibilities.load() != 0 || !session->channel->IsReleased()) {
-            return false;
-        }
     }
     return DrainedLocked();
 }
 
-void ServerV2State::NoteInflight(std::size_t lane, long delta)
+void ServerState::NoteInflight(std::size_t lane, long delta)
 {
     auto& value = inflight[lane];
     value = static_cast<std::uint64_t>(static_cast<long>(value) + delta);

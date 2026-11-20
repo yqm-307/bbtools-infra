@@ -1,19 +1,6 @@
 #pragma once
 
-/**
- * RPC v2 会话层状态（bbt/infra/rpc 实现 TU 专用，非公开头）。
- *
- * 这里是「Session 状态收敛」的真源：单 link 的收发缓存、拆包 decoder、
- * pending、握手进度凭据、lane 顺序与关闭状态全部属于 SessionCore；连接
- * 复用台账属于 SessionOwnerState；listener/admission/路由台账属于
- * ServerV2State。Channel（detail/RpcChannel.hpp）与帧协议
- * （detail/RpcFrameProtocol.hpp）无状态，不持有这里任何一项。
- *
- * 本头同时是 RPC 实现 TU 的共享基座：跨 TU 的小常量、错误助手与协程
- * 上下文检查放在文件头部；文件拆分见 detail/RpcSession.cc（link 实现）、
- * detail/AdmissionImpl.cc（admission 公共类型）、
- * detail/SessionHooks.cc（检查点）与 Session.cc（owner/server 生命周期）。
- */
+// 会话私有状态：单 link、共享连接的 owner 和服务端接纳各持一份台账。
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -38,6 +25,7 @@
 #include <bbt/infra/NetworkTypes.hpp>
 #include <bbt/infra/Result.hpp>
 #include <bbt/infra/net/Connection.hpp>
+#include <bbt/infra/net/ReclaimReceipt.hpp>
 #include <bbt/infra/net/Engine.hpp>
 #include <bbt/infra/rpc/Admission.hpp>
 #include <bbt/infra/rpc/CoRpcServer.hpp>
@@ -52,10 +40,10 @@ namespace bbt::infra::rpc {
 
 struct SessionCore;
 struct SessionOwnerState;
-struct ServerV2State;
+struct ServerState;
 
 /**
- * 实现 TU 共享的词法助手（原 Session.cc 匿名段上移，跨 TU 复用）
+ * 内部期限统一使用单调时钟
  */
 using RpcClock = std::chrono::steady_clock;
 
@@ -94,8 +82,21 @@ inline Error ErrPhase(ErrorCode code, std::string message, RequestPhase phase)
     return error;
 }
 
+template <class Table, class Pending>
+bool ErasePending(Table& table, const std::string& key, const std::shared_ptr<Pending>& operation)
+{
+    const auto it = table.find(key);
+    if (it != table.end() && it->second == operation) {
+        table.erase(it);
+        return true;
+    }
+    return false;
+}
+
+Error WaitFailure(bbt::coroutine::WaitStatus status, const char* message);
+
 /**
- * Close/Shutdown 的默认原因补齐：message 为空的 reason 换成默认 Closed。
+ * Close 使用默认 Closed 原因补齐空消息。
  */
 Error SettleCloseReason(Error reason, const char* default_message);
 
@@ -103,8 +104,6 @@ Error SettleCloseReason(Error reason, const char* default_message);
  * 受管协程内检查点：域非法/取消/期限到。
  */
 std::error_code CheckCall(bbt::coroutine::Deadline deadline);
-
-Error CallError(std::error_code cause, const char* message, bool committed);
 
 /**
  * deadline → wire remaining_budget_ms（[1, kRpcV2MaxRemainingBudgetMs]）。
@@ -126,7 +125,7 @@ struct SessionCore final : std::enable_shared_from_this<SessionCore> {
     /**
      * 入站接纳侧
      */
-    std::weak_ptr<ServerV2State> server;
+    std::weak_ptr<ServerState> server;
 
     /**
      * 无状态字节转发：Read/Write/物理关闭
@@ -134,60 +133,53 @@ struct SessionCore final : std::enable_shared_from_this<SessionCore> {
     std::shared_ptr<detail::TcpChannel> channel;
     std::string peer_identity;
 
-    /**
-     * outbound only
-     */
-    std::string endpoint;
     bool outbound{false};
     std::uint64_t epoch{0};
     std::atomic<bool> dead{false};
 
     /**
-     * 关闭责任：reader/writer 协程各持一份「未退出」责任（1=在跑）。启动时
-     * 一并 +1 持物理连接责任；Reader/Writer 任一路退出时连同物理责任一起
-     * 结算（写路径 Kill 与读路径 Kill 同义）。ExitDone()==0 才允许收口
-     * 谓词把本 link 当已退役——session.dead 只是逻辑死亡，不是物理完成。
+     * 发布 link 前登记连接和任务安装责任；reader/writer 各持一份退出责任。
+     * Kill 结算连接责任，任务安装和退出分别结算。责任归零且 conn Released
+     * 后才归还额度；session.dead 只是逻辑死亡。
      */
     std::atomic<int> responsibilities{0};
 
-    /**
-     * 本 link 占用的 owner 会话额度是否已归还（InstallSession 占位 →
-     * Released 唯一归还点；输家 link 从未占位）。
-     */
-    std::atomic<bool> quota_held{false};
+    // 入队和等待共用同一操作对象。认领与撤回均在 pending_mu 下裁定。
+    struct PendingWrite {
+        enum class Phase { Queued, Committed, Withdrawn };
+        Phase phase{Phase::Queued};
+        bool done{false};
+        std::shared_ptr<bbt::coroutine::sync::CoWaiter> waiter = bbt::coroutine::sync::CoWaiter::Create();
+    };
 
-    /**
-     * ---- 出站 lane 队列（per-session FIFO worker 串行写；发送缓存归本类）----
-     */
     struct OutItem {
         std::string bytes;
         TrafficClass lane{TrafficClass::Service};
 
-        /**
-         * request_id 或 message_id（数据帧）
-         */
         std::string key;
+        std::shared_ptr<PendingWrite> pending;
         bbt::coroutine::Deadline deadline{RpcClock::time_point::max()};
-
-        /**
-         * Response/SendAccepted
-         */
-        bool control_response{false};
 
         /**
          * 回复写终态凭据：Complete/Fail 挂 waiter，WriterLoop/Kill 在到达
          * 真实写终态（写出/写失败/关闭丢弃）后写 outcome 并 Notify——共享
-         * 对象不随 item move 失效，settled 保证唯一终态发布。
+         * 对象不随 item move 失效，观察晚于写完成时仍能取回首个结果。
          */
-        struct Settle {
-            std::shared_ptr<bbt::coroutine::sync::CoWaiter> waiter = bbt::coroutine::sync::CoWaiter::Create();
-            result<void> outcome = result<void>::ok();
-            std::atomic<bool> settled{false};
+        class Settle {
+        public:
+            void Publish(result<void> outcome);
+            result<void> Wait(bbt::coroutine::Deadline deadline);
+
+        private:
+            std::mutex m_mutex;
+            std::optional<result<void>> m_outcome;
+            std::shared_ptr<bbt::coroutine::sync::CoWaiter> m_waiter = bbt::coroutine::sync::CoWaiter::Create();
         };
 
         std::shared_ptr<Settle> settle;
     };
 
+private:
     mutable std::mutex out_mu;
     std::deque<OutItem> out_q[kLaneCount];
 
@@ -200,43 +192,25 @@ struct SessionCore final : std::enable_shared_from_this<SessionCore> {
      */
     TrafficStats out_lanes[kLaneCount];
 
-    /**
-     * 写侧 inflight/finished/dropped 计数（与出站真源同锁；RPC inflight
-     * 覆盖「已入队未终态」）。
-     */
     std::uint32_t rr_credit[kLaneCount] = {0, 0, 0};
 
+public:
     /**
      * 排队中 + writer 正在写出的总条数（Drain 持有队列/写责任直到真实
      * 终态）：Enqueue+1、WriterLoop 结算-1、Kill 对丢弃项逐条结算。
      */
     std::atomic<std::uint64_t> writes_outstanding{0};
 
-    /**
-     * ---- 关联表 -------------------------------------------------------------
-     */
-    struct PendingCall {
-        std::shared_ptr<bbt::coroutine::sync::CoWaiter> waiter = bbt::coroutine::sync::CoWaiter::Create();
+    struct PendingCall : PendingWrite {
         result<Response> outcome = result<Response>::err(Err(ErrorCode::InternalError, "unset"));
         std::string service;
         std::string method;
         std::string request_schema;
         std::string response_schema;
-
-        /**
-         * committed：writer 已承担发送责任（conn.Write 提交，结果可能未知），
-         * 不只「写成功」。先通知后等待的丢唤醒由 done 持久谓词关闭——
-         * Dispatch/写终态先写 done 再 Notify，等待方登记后复查 done。
-         */
-        bool committed{false};
-        bool done{false};
     };
 
-    struct PendingSend {
-        std::shared_ptr<bbt::coroutine::sync::CoWaiter> waiter = bbt::coroutine::sync::CoWaiter::Create();
+    struct PendingSend : PendingWrite {
         result<void> outcome = result<void>::err(Err(ErrorCode::InternalError, "unset"));
-        bool committed{false};
-        bool done{false};
     };
 
     mutable std::mutex pending_mu;
@@ -246,7 +220,8 @@ struct SessionCore final : std::enable_shared_from_this<SessionCore> {
     /**
      * ---- reader：接收缓存与拆包 decoder 都是 session 状态，不在协议层 --------
      */
-    mutable std::mutex read_mu;
+
+private:
     SessionFrameDecoder decoder{kRpcV2DefaultMaxFrameBytes};
 
     /**
@@ -258,11 +233,14 @@ struct SessionCore final : std::enable_shared_from_this<SessionCore> {
      */
     std::unordered_map<std::string, std::uint64_t> inbound_sequence;
 
-    /**
-     * ---- stats ---------------------------------------------------------------
-     * 出站 lane 统计真源已并入 out_mu/out_lanes；此处仅保留会话级序号。
-     */
-    std::atomic<std::uint64_t> seq_counter{1};
+public:
+    // 只在启动 reader 前移交握手 decoder。
+    void TakeHandshakeDecoder(SessionFrameDecoder&& handshake_decoder);
+    void NoteOperationStarted(TrafficClass traffic);
+    void NoteEnqueueFailed(TrafficClass traffic);
+    void NoteOperationFinished(TrafficClass traffic, bool published);
+    void AccumulateOutboundStats(ClientStats& stats) const;
+    bbt::coroutine::WaitStatus WaitPending(const PendingWrite& pending, bbt::coroutine::Deadline deadline);
 
     bool Submit(std::size_t stack, std::function<void()> fn);
 
@@ -279,19 +257,6 @@ struct SessionCore final : std::enable_shared_from_this<SessionCore> {
      */
     bool ExitDone();
 
-    /**
-     * Released 唯一归还点：物理 conn 已 Released 且退出责任归零后，归还
-     * 本 link 占用的 owner 会话额度与映射（幂等）。持 owner->mu 调用；
-     * 返回是否有额外交付（notify 已由调用方统一做时不重复）。
-     */
-    bool ReleasedLocked();
-
-    /**
-     * conn 物理 Released 可能晚于退出责任归零，所以收口观察点会重驱一次
-     * 归还（幂等）。持 owner->mu 调用。
-     */
-    bool DriveReleaseLocked() { return ReleasedLocked(); }
-
     result<void> Enqueue(OutItem item);
 
     /**
@@ -306,13 +271,12 @@ struct SessionCore final : std::enable_shared_from_this<SessionCore> {
     void NoteWriteSettled(OutItem& item, result<void> outcome);
 
     /**
-     * 把本条关联的 pending（calls/sends，按 key 唯一）结算成 error 并唤醒
-     * 等待方；key 为空或已结算时无副作用。写失败与写前钩子抛出共用。
+     * 按操作对象结算本条写失败。ID 可在 Call 与 Send 之间重名。
      */
     void FailItemPending(const OutItem& item, const Error& error);
     void WriterLoop();
     void ReaderLoop();
-    void FailPending(Error error, bool committed_only);
+    void FailPendingOnLinkLoss();
     void DispatchInbound(const SessionFrame& frame);
     void AdmitInbound(const SessionFrame& frame, Request request);
     void PostSessionError(const Error& error);
@@ -323,6 +287,14 @@ struct SessionCore final : std::enable_shared_from_this<SessionCore> {
      */
     void RejectProtocol(const std::string& message);
     bool Dequeue(OutItem& out);
+};
+
+// 路由索引与物理租约分离：任务持有 SessionCore，台账不反向强持有它。
+struct LinkLease {
+    std::weak_ptr<SessionCore> session;
+    net::Connection conn;
+
+    bool Released() const;
 };
 
 /**
@@ -341,15 +313,14 @@ struct SessionOwnerState {
     mutable std::mutex mu;
 
     /**
-     * Open → Draining → Closed：draining 由 Graceful Close 置位（拒新、等
-     * active_ops 归零），closed 由 Seal 置位（失败在途、发布首个原因）——
-     * 两位不共用，Immediate/Timeout Close 在 Draining 下同样执行「失败在途」。
+     * Graceful 设置 draining，发布首因后拒新并等 active_ops 归零。
+     * Immediate 仍可在排空期间强制 Seal，让在途调用取得终态。
      */
     bool closed{false};
     bool draining{false};
 
     /**
-     * Close/Shutdown 发布；首个原因固定
+     * 首次关闭时发布，升级为 Immediate 时保留。
      */
     std::optional<Error> close_reason;
 
@@ -372,37 +343,30 @@ struct SessionOwnerState {
      */
     std::unordered_map<bbt::coroutine::detail::CoroutineId, std::uint32_t> operation_tasks;
     std::unordered_map<std::string, std::weak_ptr<SessionCore>> by_endpoint;
-    std::unordered_map<std::string, std::shared_ptr<SessionCore>> by_identity;
+    std::unordered_map<std::string, std::weak_ptr<SessionCore>> by_identity;
+    std::vector<LinkLease> link_leases;
 
     struct Establishing {
-        std::shared_ptr<SessionCore> session;
-        Error error = Err(ErrorCode::InternalError, "unset");
+        struct Completion {
+            std::optional<result<std::shared_ptr<SessionCore>>> outcome;
+        };
+
+        /* 只有拨号方和已加入的等待方持有结果；回收台账不能经赢家反向持有 owner。 */
+        std::weak_ptr<Completion> completion;
         bool done{false};
 
-        /**
-         * 建立中额度占位：GetSession 创建记录即置位（同事务），安装成功
-         * 转化为 by_identity 成员额度；记录擦除时随记录消亡。InstallSession
-         * 计数 = by_identity.size() + 其他 reserved 记录。
-         */
-        bool reserved{false};
-
-        /**
-         * 建立中握手 conn（拨号成功→安装/失败前）：SessionOwnerSeal 据
-         * 此 RequestClose——owner Close 不等握手自然到期（关闭责任）。
-         */
+        // 安装接管额度；未安装则保留到建立任务结束且 receipt 已 Released。
+        bool reserved{true};
         net::Connection conn;
+        net::ReclaimReceipt reclaim;
     };
 
     std::unordered_map<std::string, std::shared_ptr<Establishing>> establishing;
-    std::weak_ptr<ServerV2State> inbound_server;
+    std::weak_ptr<ServerState> inbound_server;
     std::uint64_t epoch_counter{0};
+    std::atomic<std::uint64_t> next_attempt_id{1};
     std::mt19937_64 random{std::random_device{}()};
 
-    /**
-     * stats（sessions/links gauge，lane 汇总由 Session 上报）
-     */
-    std::atomic<std::uint64_t> sessions{0};
-    std::atomic<std::uint64_t> links{0};
     std::atomic<std::uint64_t> acceptance_pending{0};
 
     /**
@@ -412,10 +376,12 @@ struct SessionOwnerState {
     bool DrainedLocked() const;
 
     /**
-     * 物理收口谓词（Timeout）：全部 link 映射与建立中记录都已归还。
+     * wait_release 的完成条件是全部 link 映射与建立中记录都已归还。
      * 持 owner->mu 调用；实现见 detail/RpcSessionState.cc。
      */
     bool TeardownLocked() const;
+    void ReapReleasedLocked();
+    std::size_t OccupiedLocked() const;
 
     ~SessionOwnerState();
 };
@@ -427,7 +393,7 @@ namespace detail {
 
 struct ReplyCompletionImpl {
     std::weak_ptr<SessionCore> session;
-    std::weak_ptr<ServerV2State> server;
+    std::weak_ptr<ServerState> server;
 
     /**
      * Response | SendAccepted
@@ -455,7 +421,7 @@ struct ReplyCompletionImpl {
 };
 
 struct AdmissionLeaseImpl {
-    std::weak_ptr<ServerV2State> server;
+    std::weak_ptr<ServerState> server;
     TrafficClass lane{TrafficClass::Service};
     std::atomic<bool> released{false};
 };
@@ -476,7 +442,7 @@ struct AdmissionQueueImpl final : std::enable_shared_from_this<AdmissionQueueImp
      */
     std::uint64_t queued_items[kLaneCount] = {0, 0, 0};
     std::uint64_t queued_bytes[kLaneCount] = {0, 0, 0};
-    std::weak_ptr<ServerV2State> server;
+    std::weak_ptr<ServerState> server;
 
     /**
      * owning request 的实际计费字节——payload 之外含全部字符串字段、
@@ -491,9 +457,9 @@ struct AdmissionQueueImpl final : std::enable_shared_from_this<AdmissionQueueImp
 // clang-format on
 
 /**
- * ServerV2State：listener/admission/路由/令牌桶与收口台账。
+ * ServerState：listener/admission/路由/令牌桶与收口台账。
  */
-struct ServerV2State final : std::enable_shared_from_this<ServerV2State> {
+struct ServerState final : std::enable_shared_from_this<ServerState> {
     struct Route {
         CoRpcServer::RpcHandler handler;
         CoRpcServer::RouteOptions options;
@@ -531,7 +497,7 @@ struct ServerV2State final : std::enable_shared_from_this<ServerV2State> {
     bool draining{false};
 
     /**
-     * Close/Shutdown 发布；首个原因固定
+     * 首次关闭时发布，升级为 Immediate 时保留。
      */
     std::optional<Error> close_reason;
     bool queue_started{false};
@@ -554,14 +520,18 @@ struct ServerV2State final : std::enable_shared_from_this<ServerV2State> {
     std::uint64_t inflight[kLaneCount] = {0, 0, 0};
     std::uint64_t finished[kLaneCount] = {0, 0, 0};
     std::uint64_t dropped[kLaneCount] = {0, 0, 0};
-    std::vector<std::weak_ptr<SessionCore>> links;
+    std::vector<LinkLease> links;
 
-    /**
-     * 建立中入站握手 conn 台账（conn.Id() → 连接句柄）：accept 即登记、
-     * ServeInbound 结束（安装成功/失败/封口拒绝）移除。Seal/Close 对台账
-     * RequestClose 并保留责任——握手未入 links 期间同样受 Close 约束。
-     */
-    std::unordered_map<std::uint64_t, net::Connection> handshakes;
+    struct Handshake {
+        net::Connection conn;
+        bool finished{false};
+    };
+
+    // conn 为空表示已由 links 接管；未安装时握手退出后仍保留到 Released。
+    std::unordered_map<std::uint64_t, Handshake> handshakes;
+    // 超额或封口竞态下，至多多持有一条已交付但未接纳的连接。
+    net::Connection rejected_accept;
+    void ReapReleasedLocked();
 
     /**
      * AcceptLoop 协程退出标记：accept 循环本身也是一份退出责任——它可能
@@ -604,7 +574,7 @@ struct HookInjectedFailure final {};
  */
 struct HookGate {
     const SessionOwnerState* owner{nullptr};
-    const ServerV2State* server{nullptr};
+    const ServerState* server{nullptr};
     const SessionCore* session{nullptr};
     const detail::ICoChannel* channel{nullptr};
     bbt::coroutine::Deadline deadline{bbt::coroutine::Deadline::max()};
@@ -620,6 +590,8 @@ namespace detail {
  * 只做三件事：未注册直接通过；Pause 在库自己的 CoWaiter 上分片等待；
  * ThrowOnce 在锁内唯一认领并抛出内部标签。不执行用户代码。
  */
+result<void> RunHookCheckpoint(SessionHooks& hooks, HookPoint point, const HookGate& gate);
+
 class SessionHookAccess {
 public:
     static result<void> Checkpoint(SessionHooks& hooks, HookPoint point, const HookGate& gate);
@@ -648,16 +620,16 @@ private:
 };
 
 /**
- * @brief 路由分发（Session.cc 定义）：注册路由 + 令牌桶，未注册回落
+ * @brief 路由分发：注册路由 + 令牌桶，未注册回落
  * framework admission handler。CoRpcServer::Create 的 handler lambda 转调。
  */
-result<void> DispatchAdmission(const std::shared_ptr<ServerV2State>& server, AdmissionItem item);
+result<void> DispatchAdmission(const std::shared_ptr<ServerState>& server, AdmissionItem item);
 
 /**
- * @brief 入站 link 的握手 → session 发布服务循环（detail/RpcSession.cc 定义）。
+ * @brief 入站 link 的握手与安装。
  * AcceptLoop 每接纳一条连接起一个本任务；channel 寿命随任务持有。
  */
-void ServeInbound(std::shared_ptr<ServerV2State> server, detail::TcpChannel channel);
+void ServeInbound(std::shared_ptr<ServerState> server, detail::TcpChannel channel);
 
 // clang-format off
 }

@@ -3,9 +3,8 @@
  * @brief 双向 RPC 会话入站服务端，与 CoRpcClient 共享会话 owner。
  *
  * 接纳、路由、回复与写责任由会话台账管理；上层提供同步 admission
- * handler 或可挂起的注册路由。Close 是唯一关闭入口（Immediate/Timeout/
- * Graceful 三态），Shutdown 是宿主侧同步强制关闭。Engine 的运行与收口
- * 归应用，本类不另建 session registry。
+ * handler 或可挂起的注册路由。CloseOptions 指定关闭模式、期限与回收等待。
+ * Engine 的运行与收口归应用。
  */
 #pragma once
 
@@ -40,19 +39,19 @@ class CoRpcServer;
 /**
  * detail：会话入站状态，定义见 detail/RpcSessionState.hpp
  */
-struct ServerV2State;
+struct ServerState;
 
 namespace detail {
 
 /**
- * 完整定义见 detail/RpcSessionState.hpp。
+ * 完整定义见 detail/SessionTestAccess.hpp。
  */
-struct ServerV2Ledger;
+struct ServerLedger;
 
 /**
  * 测试接缝：读取会话入站台账快照（仅测试使用）。
  */
-ServerV2Ledger ServerV2LedgerForTest(const CoRpcServer& server) noexcept;
+ServerLedger ServerLedgerForTest(const CoRpcServer& server) noexcept;
 // clang-format off
 }
 // clang-format on
@@ -176,13 +175,13 @@ public:
 
 private:
     /**
-     * 内部接缝读 m_v2：台账快照与 owner 访问都在 detail 下，公共 API 面
+     * 内部接缝读 m_state：台账快照与 owner 访问都在 detail 下，公共 API 面
      * 不含它们。
      */
-    friend detail::ServerV2Ledger detail::ServerV2LedgerForTest(const CoRpcServer&) noexcept;
+    friend detail::ServerLedger detail::ServerLedgerForTest(const CoRpcServer&) noexcept;
 
-    explicit CoRpcServer(std::shared_ptr<ServerV2State> v2) noexcept;
-    std::shared_ptr<ServerV2State> m_v2;
+    explicit CoRpcServer(std::shared_ptr<ServerState> state) noexcept;
+    std::shared_ptr<ServerState> m_state;
 };
 
 // clang-format off
