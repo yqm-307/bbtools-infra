@@ -1,6 +1,6 @@
 /**
  * RPC Co 门禁、关闭回调及会话 wire 失效边界；不启动网络线程。
- * V2 单一会话面：Client 由 Engine + ClientOptions 装配，Server 由
+ * Client 由 Engine + ClientOptions 装配，Server 由
  * Engine + 同一 Client owner + admission handler 装配。
  */
 #define BOOST_TEST_MODULE rpc.co_lifecycle
@@ -155,7 +155,7 @@ BOOST_AUTO_TEST_CASE(close_callback_once_and_observation_does_not_retain_server)
 }
 
 /**
- * Create 失败不得提交 Co 对象观测：V2 以 engine/handler 缺失与空 identity
+ * Create 失败不得提交 Co 对象观测：以 engine/handler 缺失与空 identity
  * 为拒绝面（旧 IRpcTransport 空 seam 已随接口删除）。
  */
 BOOST_AUTO_TEST_CASE(failed_create_has_no_committed_observation)

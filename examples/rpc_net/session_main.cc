@@ -1,5 +1,5 @@
 /**
- * RPC v2 AppSession 双进程 consumer 示例（真实两 OS 进程 + 动态 loopback
+ * RPC AppSession 双进程 consumer 示例（真实两 OS 进程 + 动态 loopback
  * 端口）：server 进程打印实际监听端口到 stdout；client 进程读端口并发起
  * Call/Send；两侧各一 Engine + Client(owner) + Server(同 owner)。
  * 用法：
@@ -210,19 +210,16 @@ int RunServer()
     stdin_watcher.join();
     const bool normal_stop = stop.load();
 
-    /**
-     * 正常资源收口：排空已准入项（完成在途回复）后走唯一关闭入口——
-     * Close(Graceful) 等已接纳责任归还后封口；WaitStopped 有界确认物理收口；
-     * 析构内 RequestClose 幂等。
-     */
+    /* 先交付示例应用已接纳的回复，再由 RPC 排空写责任并等待连接回收。 */
     const auto drain_deadline = Clock::now() + 3s;
     while (app.HasPendingAdmissions() && Clock::now() < drain_deadline) {
         app.PumpOnce();
         std::this_thread::sleep_for(1ms);
     }
     auto close_future = SubmitCo([&] {
-        return bbt_co_await app.server->Close(
-            bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::milliseconds(3000)));
+        auto options = bbt::infra::CloseOptions::Graceful(Clock::now() + 3s);
+        options.wait_release = true;
+        return bbt_co_await app.server->Close(options);
     });
     if (close_future.wait_for(5s) != std::future_status::ready) {
         return Fail("server graceful close hung");
@@ -230,21 +227,7 @@ int RunServer()
     if (!close_future.get()) {
         return Fail("server graceful close failed");
     }
-    auto settle_future = SubmitCo([&] {
-        auto closed = bbt_co_await app.server->Close(bbt::infra::CloseOptions::Immediate());
-        if (!closed) {
-            return closed;
-        }
-        return bbt_co_await app.server->Close(
-            bbt::infra::CloseOptions{
-                bbt::infra::CloseMode::Immediate,
-                true,
-                {},
-                std::chrono::steady_clock::now() + std::chrono::milliseconds(3000)});
-    });
-    if (settle_future.wait_for(5s) != std::future_status::ready || !settle_future.get()) {
-        return Fail("server close did not settle");
-    }
+
     if (!app.server->IsClosed()) {
         return Fail("server not closed after close");
     }

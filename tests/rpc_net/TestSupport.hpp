@@ -1,7 +1,7 @@
 #pragma once
 
 /**
- * rpc_net 契约测试支持（V2 单一会话面）：自有进程、动态端口的真实 loopback
+ * rpc_net 契约测试支持：自有进程、动态端口的真实 loopback
  * 对端（raw POSIX 拨号/监听，脚本化 SessionFrame wire 字节），受控 CoWaiter
  * 屏障与有界 watchdog。fixture 只补充时序控制与观察，不 mock RPC 协议本身。
  */

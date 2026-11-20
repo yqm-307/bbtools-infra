@@ -41,7 +41,7 @@
 - Server 是否只承担它拥有的监听和注册职责，Client 是否只承担调用职责；停止、排空、等待执行和业务回收是否被错误地塞进底层公共 API。
 - 上层是否只依赖 Channel 或等价的稳定通信抽象，而不需要知道 TCP、HTTP、连接池或长连接的具体实现；异步回调的对象寿命、关闭和取消责任是否明确写在契约中。
 
-RPC 的现行面见 [ADR 0022](../decisions/0022-rpc-single-protocol.md)（V2 会话唯一消费面，已落地）与 [RPC net 文档](rpc-net.md)：V1 wire、旧 adapter 与 `Channel` 目标抽象已按该记录删除/取代。文档不得再用目标接口描述现状。
+RPC 的现行面见 [ADR 0022](../decisions/0022-rpc-single-protocol.md)与 [RPC net 文档](rpc-net.md)：V1 wire、旧 adapter 与 `Channel` 目标抽象已按该记录删除/取代。文档不得再用目标接口描述现状。
 
 关闭语义按各模块契约判断，不统一改写为同步或异步。新 Redis 的逻辑封口、owner 回收和宿主最终排空见 [Redis net 文档](redis-net.md#关闭与宿主收尾)；旧同步资源不能直接接入新的非阻塞 Close。失败建连的返回也不自动证明资源已释放。
 

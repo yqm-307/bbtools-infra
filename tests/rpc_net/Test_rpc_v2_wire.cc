@@ -1,5 +1,5 @@
 /**
- * rpc v2 wire 契约：SessionFrame profile 2 编解码、kind 字段存在性矩阵、
+ * RPC wire 契约：SessionFrame profile 2 编解码、kind 字段存在性矩阵、
  * acceptance_requested presence、错误阶段、metadata/budget 上限、u32be 分帧
  * 上限与畸形报文拒绝（纯字节层验证，不连网络）。
  */
@@ -1450,7 +1450,7 @@ void FrameProtocolSeam()
         CHECK(a && b && a.value().has_value() && b.value().has_value());
         CHECK(a.value()->message_id == b.value()->message_id);
     }
-    std::cout << "v2 frame protocol seam: single-reader order, coalesced/split, opaque payload ok\n";
+    std::cout << "frame protocol seam: single-reader order, coalesced/split, opaque payload ok\n";
 }
 
 // clang-format off
@@ -1476,7 +1476,7 @@ int RunCase(const std::string& mode)
     } else {
         CHECK(false);
     }
-    std::cout << "rpc v2 wire " << mode << " PASS\n";
+    std::cout << "RPC wire " << mode << " PASS\n";
     return 0;
 }
 

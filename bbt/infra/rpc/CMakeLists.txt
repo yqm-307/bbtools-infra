@@ -8,7 +8,11 @@ add_library(bbt_infra_rpc_net STATIC
     Hooks.cc
     Options.cc
     detail/RpcSession.cc
+    detail/RpcSessionOwner.cc
+    detail/RpcHandshake.cc
+    detail/RpcInbound.cc
     detail/AdmissionImpl.cc
+    detail/SessionTestAccess.cc
     detail/SessionHooks.cc
     detail/RpcSessionState.cc
     detail/RpcChannel.cc
@@ -52,6 +56,7 @@ add_custom_target(bbt_infra_rpc_public_header_leak_check ALL
     COMMENT "rpc public headers: no HTTP/net/protobuf type leakage")
 
 if(BUILD_TESTING)
+    target_compile_definitions(bbt_infra_rpc_net PRIVATE BBT_INFRA_RPC_TEST_ATTEMPT_BARRIER)
     add_subdirectory("${PROJECT_SOURCE_DIR}/tests/rpc_net" rpc_net_tests)
     add_subdirectory("${PROJECT_SOURCE_DIR}/examples/rpc_net" rpc_net_examples)
 endif()

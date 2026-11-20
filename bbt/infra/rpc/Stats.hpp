@@ -17,7 +17,7 @@
  *   lane 字段会在 session 退役后下降；当前字段是各自取样点的 gauge。
  *
  * 使用边界：只把这些数当趋势与容量观察。不要用单次取样的跨字段等式/不等式
- * 判定泄漏、收口或「队列为空」；需要确定性的收口判断时用 Close 各模式的返回值，或用 detail::ServerV2Ledger 的台账快照。
+ * 判定泄漏、收口或「队列为空」；需要确定性的收口判断时用对应 Close 模式的返回值。
  *
  * queued/dequeued/inflight/finished 职责（ADR 0014 §2.3）：
  *   queued    — 有限队列尚未交付 dispatch/mailbox；

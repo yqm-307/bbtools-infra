@@ -1,21 +1,10 @@
-/**
- * RPC v2 会话层生命周期实现：SessionOwnerState 台账、ServerV2State 装配、
- * accept/路由/admission 分发与统一 Close（Immediate/Timeout/Graceful）。
- * 单 link 的收发缓存、拆包、pending、握手进度、顺序与关闭状态收敛在
- * detail/RpcSession.cc 的 SessionCore；Channel/帧协议接缝无状态，见
- * detail/RpcChannel.hpp 与 detail/RpcFrameProtocol.hpp。
- *
- * 公共 API（CoRpcClient/CoRpcServer）本体在 CoRpcClient.cc/CoRpcServer.cc；
- * admission 公共类型的 impl 在 detail/AdmissionImpl.cc；
- * 检查点在 detail/SessionHooks.cc。
- */
-#include <bbt/infra/rpc/CoRpcClient.hpp>
+// 客户端 owner 和服务端的启动、accept 与关闭流程。
 #include <bbt/infra/rpc/CoRpcServer.hpp>
 #include <bbt/infra/rpc/detail/Session.hpp>
+#include <bbt/infra/rpc/detail/SessionTestAccess.hpp>
 #include <bbt/infra/rpc/detail/RpcSessionState.hpp>
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -32,160 +21,26 @@
 namespace bbt::infra::rpc {
 
 using namespace std::chrono_literals;
-using bbt::coroutine::WaitStatus;
 
 namespace {
 
-/**
- * 测试注入（detail::ServerV2TestAccess）：只影响下一次 ServerV2Start，产品
- * 路径默认不触发。注册失败注入在 accept 任务登记处消费；barrier 在
- * 「已认领启动权、尚未创建队列/登记任务」的无锁窗口执行一次。
- */
-std::atomic<bool> g_fail_next_start_registration{false};
-std::mutex g_start_barrier_mu;
-std::function<void()> g_start_barrier;
-
-bool ConsumeStartRegistrationFailureForTest()
+void FinishInbound(ServerState& server, std::uint64_t id)
 {
-    return g_fail_next_start_registration.exchange(false, std::memory_order_acq_rel);
-}
-
-std::function<void()> TakeStartRegistrationBarrierForTest()
-{
-    std::lock_guard<std::mutex> lock(g_start_barrier_mu);
-    return std::move(g_start_barrier);
-}
-
-std::string RouteKey(const Request& request)
-{
-    std::string key = request.Service();
-    key.push_back('/');
-    key.append(request.Method());
-    return key;
-}
-
-bool ConsumeRouteToken(ServerV2State::Route& route)
-{
-    if (route.options.burst_tokens == 0) {
-        return true;
-    }
-    const auto now = RpcClock::now();
-    const auto elapsed = std::chrono::duration<double>(now - route.last_refill).count();
-    route.tokens = std::min(
-        static_cast<double>(route.options.burst_tokens), route.tokens + elapsed * route.options.refill_per_second);
-    route.last_refill = now;
-    if (route.tokens < 1.0) {
-        return false;
-    }
-    route.tokens -= 1.0;
-    return true;
-}
-
-/**
- * 已授权路由 handler 的责任标记：以协程 id 登记，Close/WaitStopped 据此
- * 在副作用前拒绝自等待；作用域结束（含异常）移除。
- */
-class RouteResponsibility {
-public:
-    explicit RouteResponsibility(std::shared_ptr<ServerV2State> server)
-        : m_server(std::move(server))
+    net::Connection abandoned;
     {
-        m_id = bbt::coroutine::GetLocalCoroutineId();
-        if (m_id != 0) {
-            std::lock_guard<std::mutex> lock(m_server->mu);
-            m_server->responsibility_tasks.insert(m_id);
-        }
+        std::lock_guard<std::mutex> lock(server.mu);
+        abandoned = server.handshakes.at(id).conn;
     }
-
-    ~RouteResponsibility()
-    {
-        if (m_id != 0) {
-            std::lock_guard<std::mutex> lock(m_server->mu);
-            m_server->responsibility_tasks.erase(m_id);
-        }
+    if (abandoned.Valid()) {
+        (void)abandoned.Close();
     }
-
-    RouteResponsibility(const RouteResponsibility&) = delete;
-    RouteResponsibility& operator=(const RouteResponsibility&) = delete;
-
-private:
-    std::shared_ptr<ServerV2State> m_server;
-    bbt::coroutine::detail::CoroutineId m_id{0};
-};
-
-void RunRoute(std::shared_ptr<ServerV2State> server, CoRpcServer::RpcHandler handler, AdmissionItem item)
-{
-    RouteResponsibility responsibility(std::move(server));
-    try {
-        auto response = bbt_co_await handler(std::move(item.request));
-        if (item.reply) {
-            if (response) {
-                const auto completion = bbt_co_await item.reply->Complete(std::move(response).value());
-                (void)completion;
-            } else {
-                const auto completion = bbt_co_await item.reply->Fail(response.error());
-                (void)completion;
-            }
-        }
-    } catch (...) {
-        if (item.reply) {
-            const auto completion =
-                bbt_co_await item.reply->Fail(Err(ErrorCode::InternalError, "rpc route handler threw"));
-            (void)completion;
-        }
-    }
-    if (item.lease) {
-        item.lease->Release();
-    }
+    std::lock_guard<std::mutex> lock(server.mu);
+    server.handshakes.at(id).finished = true;
+    server.ReapReleasedLocked();
+    server.close_signal->Notify();
 }
 
-// clang-format off
-}
-// clang-format on
-
-result<void> detail::DispatchAdmission(const std::shared_ptr<ServerV2State>& server, AdmissionItem item)
-{
-    CoRpcServer::RpcHandler route_handler;
-    AdmissionHandler fallback;
-    {
-        std::lock_guard<std::mutex> lock(server->mu);
-        const auto it = server->routes.find(RouteKey(item.request));
-        if (it == server->routes.end()) {
-            fallback = server->framework_handler;
-        } else {
-            if (item.request.Reply() != ReplyMode::Required) {
-                return ErrV(ErrorCode::InvalidArgument, "registered rpc route requires a Call request");
-            }
-            if (!ConsumeRouteToken(it->second)) {
-                return ErrV(ErrorCode::Overloaded, "rpc route rate limit exceeded");
-            }
-            route_handler = it->second.handler;
-        }
-    }
-    if (!route_handler) {
-        if (!fallback) {
-            return ErrV(ErrorCode::Unavailable, "rpc server has no admission handler");
-        }
-        RouteResponsibility responsibility(server);
-        return fallback(std::move(item));
-    }
-
-    bool registered = false;
-    g_scheduler->RegistCoroutineTask(
-        128 * 1024,
-        [server, handler = std::move(route_handler), item = std::move(item)]() mutable {
-            RunRoute(server, std::move(handler), std::move(item));
-        },
-        registered);
-    if (!registered) {
-        return ErrV(ErrorCode::RuntimeUnavailable, "rpc route task registration failed");
-    }
-    return result<void>::ok();
-}
-
-namespace {
-
-void AcceptLoop(std::shared_ptr<ServerV2State> server)
+void AcceptLoop(std::shared_ptr<ServerState> server)
 {
     const auto exit_loop = [&] {
         std::lock_guard<std::mutex> lock(server->mu);
@@ -193,18 +48,20 @@ void AcceptLoop(std::shared_ptr<ServerV2State> server)
         server->close_signal->Notify();
     };
     for (;;) {
+        bool reject_pending;
         {
             std::lock_guard<std::mutex> lock(server->mu);
             if (server->stopping) {
-
-                /**
-                 * exit_loop 自身取 server->mu——持锁内联调用会自死锁；
-                 * 标记与唤醒直接在本临界区内联完成。
-                 */
                 server->accept_loop_exited = true;
                 server->close_signal->Notify();
                 return;
             }
+            server->ReapReleasedLocked();
+            reject_pending = server->rejected_accept.Valid();
+        }
+        if (reject_pending) {
+            bbtco_sleep(10);
+            continue;
         }
         auto accepted = server->engine->CoAccept({RpcClock::now() + 50ms});
         if (accepted.error == std::errc::timed_out) {
@@ -214,7 +71,7 @@ void AcceptLoop(std::shared_ptr<ServerV2State> server)
 
             /**
              * RequestStopAccepting/Seal 会取消在途 CoAccept：这是正常封口路径，
-             * 不是 accept 故障，不得发布失败原因覆盖调用方的 Close/Shutdown。
+             * 保留调用方已发布的关闭原因。
              */
             bool sealed = false;
             {
@@ -225,58 +82,55 @@ void AcceptLoop(std::shared_ptr<ServerV2State> server)
                 exit_loop();
                 return;
             }
-            detail::ServerV2Seal(server, Err(ErrorCode::RuntimeUnavailable, "rpc server: accept loop failed"));
+            detail::ServerSeal(server, Err(ErrorCode::RuntimeUnavailable, "rpc server: accept loop failed"));
             exit_loop();
             return;
         }
+        const auto conn_id = accepted.connection.Raw().Id();
+        bool reject;
         {
             std::lock_guard<std::mutex> lock(server->mu);
-
-            /**
-             * 握手 conn 与已发布 link 同占 MaxConnections——
-             * 建立中不算免费额度。
-             */
-            if (server->stopping
-                || server->links.size() + server->handshakes.size() >= server->options.MaxConnections()) {
-                (void)accepted.connection.Close();
-                continue;
+            server->ReapReleasedLocked();
+            reject = server->stopping
+                     || server->links.size() + server->handshakes.size() >= server->options.MaxConnections();
+            if (!reject) {
+                try {
+                    server->handshakes.emplace(conn_id, ServerState::Handshake{accepted.connection.Raw()});
+                } catch (...) {
+                    reject = true;
+                }
             }
-
-            /**
-             * 握手责任早登记：conn.Id() 台账先于任务接管——Close/Seal
-             * 能立即看到并 RequestClose 这条建立中连接（物理关闭责任）。
-             */
-            server->handshakes.emplace(accepted.connection.Raw().Id(), accepted.connection.Raw());
+            if (reject) {
+                server->rejected_accept = accepted.connection.Raw();
+            }
+        }
+        if (reject) {
+            (void)accepted.connection.Close();
+            continue;
         }
         bool registered = false;
-        std::weak_ptr<ServerV2State> weak = server;
-        const auto conn_id = accepted.connection.Raw().Id();
-        g_scheduler->RegistCoroutineTask(
-            128 * 1024,
-            [weak, conn = accepted.connection]() mutable {
-                if (auto server = weak.lock()) {
-
-                    /**
-                     * 裸协程任务：异常逃逸即 terminate——隔离到本 conn
-                     * 退役，不穿透 scheduler。
-                     */
-                    try {
-                        detail::ServeInbound(server, detail::TcpChannel{conn});
-                    } catch (...) {
+        std::weak_ptr<ServerState> weak = server;
+        try {
+            g_scheduler->RegistCoroutineTask(
+                128 * 1024,
+                [weak, conn = accepted.connection, conn_id]() mutable {
+                    if (auto server = weak.lock()) {
+                        try {
+                            detail::ServeInbound(server, detail::TcpChannel{conn});
+                        } catch (...) {
+                            // 与握手拒绝共用同一退役路径，不越过 scheduler 边界。
+                        }
+                        FinishInbound(*server, conn_id);
+                    } else {
                         (void)conn.Close();
-                        std::lock_guard<std::mutex> lock(server->mu);
-                        server->handshakes.erase(conn.Raw().Id());
-                        server->close_signal->Notify();
                     }
-                } else {
-                    (void)conn.Close();
-                }
-            },
-            registered);
+                },
+                registered);
+        } catch (...) {
+            // 构造任务失败，仍由 accept 循环归还握手责任。
+        }
         if (!registered) {
-            (void)accepted.connection.Close();
-            std::lock_guard<std::mutex> lock(server->mu);
-            server->handshakes.erase(conn_id);
+            FinishInbound(*server, conn_id);
         }
         bbtco_yield;
     }
@@ -286,31 +140,6 @@ void AcceptLoop(std::shared_ptr<ServerV2State> server)
 }
 // clang-format on
 
-/**
- * v2 台账快照：links/handshakes/writes 三项在同一把 server 锁内取样。
- */
-detail::ServerV2Ledger detail::ServerV2LedgerOf(const std::shared_ptr<ServerV2State>& v2) noexcept
-{
-    detail::ServerV2Ledger out;
-    if (!v2) {
-        return out;
-    }
-    std::lock_guard<std::mutex> lock(v2->mu);
-    for (const auto& weak : v2->links) {
-        auto session = weak.lock();
-        if (!session) {
-            continue;
-        }
-        ++out.links;
-        out.writes_outstanding += session->writes_outstanding.load();
-    }
-    out.handshakes = v2->handshakes.size();
-    return out;
-}
-
-/**
- * detail 挂钩实现
- */
 void detail::SessionOwnerSeal(const std::shared_ptr<SessionOwnerState>& owner, Error reason) noexcept
 {
     std::vector<std::shared_ptr<SessionCore>> sessions;
@@ -326,9 +155,10 @@ void detail::SessionOwnerSeal(const std::shared_ptr<SessionOwnerState>& owner, E
              * 「失败在途」恰好一次：closed 位唯一表达，Draining 下同样执行。
              */
             owner->closed = true;
-            for (auto& [id, session] : owner->by_identity) {
-                (void)id;
-                sessions.push_back(session);
+            for (const auto& lease : owner->link_leases) {
+                if (auto session = lease.session.lock()) {
+                    sessions.push_back(std::move(session));
+                }
             }
 
             /**
@@ -430,7 +260,8 @@ void detail::SessionOwnerEndOperation(const std::shared_ptr<SessionOwnerState>& 
 }
 
 /**
- * 统一 Close：Immediate 立即 Seal；Timeout 先 Seal 再有界等待物理收口； Graceful 先拒新、等已接纳责任归还后 Seal。等待经各自 close_signal 分片 （单等待位 + 周期复查），谓词评估在状态锁内，等待在锁外。
+ * 每个 close_signal 只有一个等待位。关闭方在状态锁内检查责任归还情况，
+ * 在锁外分片等待，直到责任归还或达到绝对期限。
  */
 namespace {
 
@@ -442,7 +273,7 @@ using bbt::infra::detail::WaitCloseSlice;
 
 /**
  * owner 逻辑排空等待（Graceful）：DrainedLocked 胜返回 ok；等待期间被
- * Immediate/RequestClose 强制封口（closed）时返回首个关闭原因；到 deadline
+ * Immediate 强制封口（closed）时返回首个关闭原因；到 deadline
  * 返回 TimedOut。以时间片复查而不是完全依赖唤醒——close_signal 是单等待位。
  */
 result<void> OwnerWaitDrained(const std::shared_ptr<SessionOwnerState>& owner, bbt::coroutine::Deadline deadline)
@@ -468,28 +299,15 @@ result<void> OwnerWaitDrained(const std::shared_ptr<SessionOwnerState>& owner, b
     }
 }
 
-/**
- * owner 物理收口等待（Timeout）：Seal 之后等 by_identity/establishing 全部
- * 归还。conn 物理 Released 可能晚于退出责任归零，每次唤醒都在 owner->mu
- * 下重驱各 link 的 ReleasedLocked（幂等）——物理关闭凭据按次轮询推进。
- */
 result<void> OwnerWaitSettled(const std::shared_ptr<SessionOwnerState>& owner, bbt::coroutine::Deadline deadline)
 {
     for (;;) {
-        std::vector<std::shared_ptr<SessionCore>> live;
         {
             std::lock_guard<std::mutex> lock(owner->mu);
+            owner->ReapReleasedLocked();
             if (owner->TeardownLocked()) {
                 return result<void>::ok();
             }
-            for (auto& [id, session] : owner->by_identity) {
-                (void)id;
-                live.push_back(session);
-            }
-        }
-        for (auto& session : live) {
-            std::lock_guard<std::mutex> lock(owner->mu);
-            session->DriveReleaseLocked();
         }
         if (deadline != bbt::coroutine::Deadline::max() && RpcClock::now() >= deadline) {
             return ErrV(ErrorCode::TimedOut, "timeout close: resource release incomplete");
@@ -505,16 +323,16 @@ result<void> OwnerWaitSettled(const std::shared_ptr<SessionOwnerState>& owner, b
  * server 逻辑排空等待（Graceful）：DrainedLocked 胜返回 ok；被打断返回已
  * 发布原因；到 deadline 返回 TimedOut。
  */
-result<void> ServerWaitDrained(const std::shared_ptr<ServerV2State>& v2, bbt::coroutine::Deadline deadline)
+result<void> ServerWaitDrained(const std::shared_ptr<ServerState>& state, bbt::coroutine::Deadline deadline)
 {
     for (;;) {
         {
-            std::lock_guard<std::mutex> lock(v2->mu);
-            if (v2->closed) {
+            std::lock_guard<std::mutex> lock(state->mu);
+            if (state->closed) {
                 return result<void>::err(
-                    v2->close_reason ? *v2->close_reason : Err(ErrorCode::Closed, "rpc server: closed"));
+                    state->close_reason ? *state->close_reason : Err(ErrorCode::Closed, "rpc server: closed"));
             }
-            if (v2->DrainedLocked()) {
+            if (state->DrainedLocked()) {
                 return result<void>::ok();
             }
         }
@@ -522,43 +340,27 @@ result<void> ServerWaitDrained(const std::shared_ptr<ServerV2State>& v2, bbt::co
             return ErrV(ErrorCode::TimedOut, "graceful close deadline exceeded");
         }
         const auto slice = bbt::infra::detail::NextCloseSlice(deadline);
-        if (const auto waited = WaitCloseSlice(v2->close_signal, slice); !waited) {
+        if (const auto waited = WaitCloseSlice(state->close_signal, slice); !waited) {
             return result<void>::err(waited.error());
         }
     }
 }
 
-/**
- * server 物理收口等待（Timeout）：Seal 之后等 StoppedLocked——listener/
- * accept task、握手台账、session 退出责任与 conn Released 全部完成。
- * 同样每片重驱各 link 的 ReleasedLocked（幂等）。
- */
-result<void> ServerWaitStopped(const std::shared_ptr<ServerV2State>& v2, bbt::coroutine::Deadline deadline)
+result<void> WaitServerReleased(const std::shared_ptr<ServerState>& state, bbt::coroutine::Deadline deadline)
 {
     for (;;) {
-        std::vector<std::shared_ptr<SessionCore>> live;
         {
-            std::lock_guard<std::mutex> lock(v2->mu);
-            if (v2->StoppedLocked()) {
+            std::lock_guard<std::mutex> lock(state->mu);
+            state->ReapReleasedLocked();
+            if (state->StoppedLocked()) {
                 return result<void>::ok();
-            }
-            for (auto& weak : v2->links) {
-                if (auto session = weak.lock()) {
-                    live.push_back(std::move(session));
-                }
-            }
-        }
-        if (!live.empty()) {
-            std::lock_guard<std::mutex> lock(v2->owner->mu);
-            for (auto& session : live) {
-                session->DriveReleaseLocked();
             }
         }
         if (deadline != bbt::coroutine::Deadline::max() && RpcClock::now() >= deadline) {
             return ErrV(ErrorCode::TimedOut, "timeout close: resource release incomplete");
         }
         const auto slice = bbt::infra::detail::NextCloseSlice(deadline);
-        if (const auto waited = WaitCloseSlice(v2->close_signal, slice); !waited) {
+        if (const auto waited = WaitCloseSlice(state->close_signal, slice); !waited) {
             return result<void>::err(waited.error());
         }
     }
@@ -568,13 +370,13 @@ result<void> ServerWaitStopped(const std::shared_ptr<ServerV2State>& v2, bbt::co
 }
 // clang-format on
 
-result<std::shared_ptr<ServerV2State>> detail::ServerV2Create(
+result<std::shared_ptr<ServerState>> detail::ServerCreate(
     std::shared_ptr<net::Engine> engine,
     const std::shared_ptr<SessionOwnerState>& owner,
     AdmissionHandler admission_handler,
     ServerOptions options)
 {
-    using R = result<std::shared_ptr<ServerV2State>>;
+    using R = result<std::shared_ptr<ServerState>>;
     if (!engine || !owner || !admission_handler) {
         return R::err(Err(ErrorCode::InvalidArgument, "engine/session_owner/handler required"));
     }
@@ -596,14 +398,14 @@ result<std::shared_ptr<ServerV2State>> detail::ServerV2Create(
         handoff) {
         return R::err(Err(ErrorCode::RuntimeUnavailable, "accept handoff setup failed"));
     }
-    auto v2 = std::make_shared<ServerV2State>();
-    v2->engine = std::move(engine);
-    v2->owner = owner;
-    v2->framework_handler = std::move(admission_handler);
-    v2->options = options;
-    const std::weak_ptr<ServerV2State> weak_v2 = v2;
-    v2->handler = [weak_v2](AdmissionItem item) -> result<void> {
-        const auto server = weak_v2.lock();
+    auto state = std::make_shared<ServerState>();
+    state->engine = std::move(engine);
+    state->owner = owner;
+    state->framework_handler = std::move(admission_handler);
+    state->options = options;
+    const std::weak_ptr<ServerState> weak_server = state;
+    state->handler = [weak_server](AdmissionItem item) -> result<void> {
+        const auto server = weak_server.lock();
         if (!server) {
             return ErrV(ErrorCode::Closed, "rpc server is gone");
         }
@@ -611,44 +413,44 @@ result<std::shared_ptr<ServerV2State>> detail::ServerV2Create(
     };
     {
         std::lock_guard<std::mutex> lock(owner->mu);
-        owner->inbound_server = v2;
+        owner->inbound_server = state;
     }
-    return R::ok(std::move(v2));
+    return R::ok(std::move(state));
 }
 
-result<void> detail::ServerV2Start(const std::shared_ptr<ServerV2State>& v2)
+result<void> detail::ServerStart(const std::shared_ptr<ServerState>& state)
 {
 
     /**
      * 测试注入在入口取得：任何早退都会丢弃它，不会留下引用已销毁测试
      * 对象的待执行 barrier。
      */
-    auto test_barrier = TakeStartRegistrationBarrierForTest();
+    auto test_barrier = detail::TakeStartRegistrationBarrierForTest();
     {
-        std::lock_guard<std::mutex> lock(v2->mu);
-        if (v2->closed || v2->draining) {
+        std::lock_guard<std::mutex> lock(state->mu);
+        if (state->closed || state->draining) {
             return ErrV(ErrorCode::Closed, "server closed");
         }
-        if (v2->started) {
+        if (state->started) {
             return result<void>::ok();
         }
-        if (v2->starting) {
+        if (state->starting) {
 
             /**
              * 同一 Server 只允许一个 Start 在途；并发重复启动不静默成功。
              */
             return ErrV(ErrorCode::InvalidContext, "server start already in progress");
         }
-        if (v2->engine->Phase() != net::EnginePhase::Running) {
+        if (state->engine->Phase() != net::EnginePhase::Running) {
             return ErrV(ErrorCode::InvalidContext, "engine must be Running with listener");
         }
 
         /**
          * 只在本临界区认领启动权：AdmissionQueue::Create 与两次协程任务
-         * 注册都可能因栈池未命中在 Co 域挂起，不能持 v2->mu 完成（Close/
+         * 注册都可能因栈池未命中在 Co 域挂起，不能持 state->mu 完成（Close/
          * Seal、Stats 与收口观察都用这把锁）。
          */
-        v2->starting = true;
+        state->starting = true;
     }
 
     if (test_barrier) {
@@ -658,21 +460,22 @@ result<void> detail::ServerV2Start(const std::shared_ptr<ServerV2State>& v2)
     /**
      * 单 FIFO admission worker。
      */
-    auto created = AdmissionQueue::Create(v2->options.MaxInflight(), v2->options.MaxHandlerBytes(), v2->handler);
+    auto created =
+        AdmissionQueue::Create(state->options.MaxInflight(), state->options.MaxHandlerBytes(), state->handler);
     if (!created) {
-        std::lock_guard<std::mutex> lock(v2->mu);
-        v2->starting = false;
-        v2->close_signal->Notify();
+        std::lock_guard<std::mutex> lock(state->mu);
+        state->starting = false;
+        state->close_signal->Notify();
         return result<void>::err(created.error());
     }
     std::shared_ptr<AdmissionQueue> queue = std::move(created).value();
-    detail::AdmissionAccess::AttachQueue(queue, v2);
+    detail::AdmissionAccess::AttachQueue(queue, state);
 
     bool registered = false;
-    if (!ConsumeStartRegistrationFailureForTest()) {
+    if (!detail::ConsumeStartRegistrationFailureForTest()) {
         g_scheduler->RegistCoroutineTask(
             128 * 1024,
-            [v2] {
+            [state] {
                 // clang-format off
 
                 /**
@@ -680,12 +483,12 @@ result<void> detail::ServerV2Start(const std::shared_ptr<ServerV2State>& v2)
                  */
                 // clang-format on
                 try {
-                    AcceptLoop(v2);
+                    AcceptLoop(state);
                 } catch (...) {
-                    detail::ServerV2Seal(v2, Err(ErrorCode::InternalError, "rpc server: accept loop threw"));
-                    std::lock_guard<std::mutex> lock(v2->mu);
-                    v2->accept_loop_exited = true;
-                    v2->close_signal->Notify();
+                    detail::ServerSeal(state, Err(ErrorCode::InternalError, "rpc server: accept loop threw"));
+                    std::lock_guard<std::mutex> lock(state->mu);
+                    state->accept_loop_exited = true;
+                    state->close_signal->Notify();
                 }
             },
             registered);
@@ -694,22 +497,22 @@ result<void> detail::ServerV2Start(const std::shared_ptr<ServerV2State>& v2)
     if (registered) {
         bool sealed = false;
         {
-            std::lock_guard<std::mutex> lock(v2->mu);
-            v2->starting = false;
-            v2->queue = queue;
+            std::lock_guard<std::mutex> lock(state->mu);
+            state->starting = false;
+            state->queue = queue;
 
             /**
              * accept 任务已登记：即使同时被 Close/Seal 封口，物理收口也要
              * 等该任务退出，不能按「从未 Start」放行。
              */
-            v2->started = true;
+            state->started = true;
 
             /**
              * Graceful Close 先置 draining 再 Seal；两者都与「已封口」同义，
              * 不能让 Start 在排空窗口里仍报成功。
              */
-            sealed = v2->closed || v2->draining;
-            v2->close_signal->Notify();
+            sealed = state->closed || state->draining;
+            state->close_signal->Notify();
         }
         if (sealed) {
 
@@ -728,73 +531,63 @@ result<void> detail::ServerV2Start(const std::shared_ptr<ServerV2State>& v2)
      * 调用方（或下一次 Start）看到的是可重试的空闲 Server。
      */
     {
-        std::lock_guard<std::mutex> lock(v2->mu);
-        v2->starting = false;
-        v2->close_signal->Notify();
+        std::lock_guard<std::mutex> lock(state->mu);
+        state->starting = false;
+        state->close_signal->Notify();
     }
     (void)queue->Close();
     return ErrV(ErrorCode::RuntimeUnavailable, "accept task registration failed");
 }
 
-void detail::ServerV2TestAccess::FailNextStartRegistration() noexcept
-{
-    g_fail_next_start_registration.store(true, std::memory_order_release);
-}
-
-void detail::ServerV2TestAccess::SetStartRegistrationBarrierOnce(std::function<void()> barrier)
-{
-    std::lock_guard<std::mutex> lock(g_start_barrier_mu);
-    g_start_barrier = std::move(barrier);
-}
-
-void detail::ServerV2StopAccepting(const std::shared_ptr<ServerV2State>& v2) noexcept
+void detail::ServerStopAccepting(const std::shared_ptr<ServerState>& state) noexcept
 {
     std::shared_ptr<AdmissionQueue> queue;
     {
-        std::lock_guard<std::mutex> lock(v2->mu);
-        v2->stopping = true;
-        queue = v2->queue;
-        v2->close_signal->Notify();
+        std::lock_guard<std::mutex> lock(state->mu);
+        state->stopping = true;
+        queue = state->queue;
+        state->close_signal->Notify();
     }
-    v2->engine->RequestStopAccepting();
+    state->engine->RequestStopAccepting();
     if (queue) {
         (void)queue->Close();
     }
 }
 
-void detail::ServerV2Seal(const std::shared_ptr<ServerV2State>& v2, Error reason) noexcept
+void detail::ServerSeal(const std::shared_ptr<ServerState>& state, Error reason) noexcept
 {
     std::vector<std::shared_ptr<SessionCore>> links;
     std::vector<net::Connection> handshakes;
     std::shared_ptr<AdmissionQueue> queue;
     {
-        std::lock_guard<std::mutex> lock(v2->mu);
-        if (!v2->close_reason) {
-            v2->close_reason = std::move(reason);
+        std::lock_guard<std::mutex> lock(state->mu);
+        if (!state->close_reason) {
+            state->close_reason = std::move(reason);
         }
-        if (v2->closed) {
+        if (state->closed) {
             return;
         }
-        v2->closed = true;
-        v2->stopping = true;
-        queue = v2->queue;
-        for (auto& weak : v2->links) {
-            if (auto session = weak.lock()) {
+        state->closed = true;
+        state->stopping = true;
+        queue = state->queue;
+        for (const auto& lease : state->links) {
+            if (auto session = lease.session.lock()) {
                 links.push_back(session);
             }
         }
 
-        /**
-         * 建立中握手 conn 同样是关闭责任：RequestClose 让握手 Read 尽快
-         * 失败退出；台账条目由 ServeInbound 结束时移除（物理关闭责任）。
-         */
-        for (auto& [id, conn] : v2->handshakes) {
+        for (const auto& [id, handshake] : state->handshakes) {
             (void)id;
-            handshakes.push_back(conn);
+            if (handshake.conn.Valid()) {
+                handshakes.push_back(handshake.conn);
+            }
         }
-        v2->close_signal->Notify();
+        if (state->rejected_accept.Valid()) {
+            handshakes.push_back(state->rejected_accept);
+        }
+        state->close_signal->Notify();
     }
-    v2->engine->RequestStopAccepting();
+    state->engine->RequestStopAccepting();
     if (queue) {
         (void)queue->Close();
     }
@@ -849,7 +642,7 @@ result<void> detail::SessionOwnerClose(const std::shared_ptr<SessionOwnerState>&
         if (!already_closed) {
 
             /**
-             * 首因在封口同门发布；后续 Immediate/RequestClose 只升级强制收口。
+             * 发布首因与拒新共用这把锁，后续 Immediate 沿用首因。
              */
             if (!owner->close_reason) {
                 owner->close_reason = reason;
@@ -895,7 +688,7 @@ detail::SessionOwnerWaitStopped(const std::shared_ptr<SessionOwnerState>& owner,
     return OwnerWaitSettled(owner, deadline);
 }
 
-result<void> detail::ServerV2Close(const std::shared_ptr<ServerV2State>& v2, const CloseOptions& options)
+result<void> detail::ServerClose(const std::shared_ptr<ServerState>& state, const CloseOptions& options)
 {
     if (const auto valid = bbt::infra::detail::ValidateCloseOptions(options); !valid) {
         return result<void>::err(valid.error());
@@ -905,96 +698,96 @@ result<void> detail::ServerV2Close(const std::shared_ptr<ServerV2State>& v2, con
     }
     const auto self = bbt::coroutine::GetLocalCoroutineId();
     {
-        std::lock_guard<std::mutex> lock(v2->mu);
+        std::lock_guard<std::mutex> lock(state->mu);
         if ((options.mode == CloseMode::Graceful || options.wait_release) && self != 0
-            && v2->responsibility_tasks.find(self) != v2->responsibility_tasks.end()) {
+            && state->responsibility_tasks.find(self) != state->responsibility_tasks.end()) {
             return ErrV(ErrorCode::InvalidContext, "rpc server: Close rejected from an admitted handler task");
         }
     }
     const auto reason = SettleCloseReason(options.reason.value_or(Error{}), "rpc server: closed by owner");
     if (options.mode == CloseMode::Immediate) {
-        ServerV2Seal(v2, reason);
+        ServerSeal(state, reason);
         return bbt::infra::detail::FinishCloseWithRelease(
-            options, [v2](bbt::coroutine::Deadline deadline) { return ServerV2WaitStopped(v2, deadline); });
+            options, [state](bbt::coroutine::Deadline deadline) { return WaitServerReleased(state, deadline); });
     }
     bool already_closed = false;
     {
-        std::lock_guard<std::mutex> lock(v2->mu);
-        if (v2->closed) {
-            if (!v2->DrainedLocked()) {
+        std::lock_guard<std::mutex> lock(state->mu);
+        if (state->closed) {
+            if (!state->DrainedLocked()) {
                 return result<void>::err(
-                    v2->close_reason ? *v2->close_reason : Err(ErrorCode::Closed, "rpc server: closed"));
+                    state->close_reason ? *state->close_reason : Err(ErrorCode::Closed, "rpc server: closed"));
             }
             already_closed = true;
         }
         if (!already_closed) {
-            if (!v2->close_reason) {
-                v2->close_reason = reason;
+            if (!state->close_reason) {
+                state->close_reason = reason;
             }
-            if (!v2->draining) {
-                v2->draining = true;
+            if (!state->draining) {
+                state->draining = true;
 
                 /**
                  * 与停止接纳同一封口点：新握手在 Seal 前到达也必须退役。
                  */
-                v2->stopping = true;
-                v2->close_signal->Notify();
+                state->stopping = true;
+                state->close_signal->Notify();
             }
         }
     }
     if (already_closed) {
         return bbt::infra::detail::FinishCloseWithRelease(
-            options, [v2](bbt::coroutine::Deadline deadline) { return ServerV2WaitStopped(v2, deadline); });
+            options, [state](bbt::coroutine::Deadline deadline) { return WaitServerReleased(state, deadline); });
     }
 
     /**
      * 拒新：stopping + admission 封口；原因已在同门发布。
      */
-    ServerV2StopAccepting(v2);
-    if (const auto drained = ServerWaitDrained(v2, options.deadline); !drained) {
+    ServerStopAccepting(state);
+    if (const auto drained = ServerWaitDrained(state, options.deadline); !drained) {
         return drained;
     }
-    ServerV2Seal(v2, reason);
+    ServerSeal(state, reason);
     return bbt::infra::detail::FinishCloseWithRelease(
-        options, [v2](bbt::coroutine::Deadline deadline) { return ServerV2WaitStopped(v2, deadline); });
+        options, [state](bbt::coroutine::Deadline deadline) { return WaitServerReleased(state, deadline); });
 }
 
-result<void> detail::ServerV2WaitStopped(const std::shared_ptr<ServerV2State>& v2, bbt::coroutine::Deadline deadline)
+result<void> detail::ServerWaitStopped(const std::shared_ptr<ServerState>& state, bbt::coroutine::Deadline deadline)
 {
     if (!bbt::coroutine::IsInCoroutineContext()) {
         return ErrV(ErrorCode::InvalidContext, "rpc server: WaitStopped requires coroutine context");
     }
     const auto self = bbt::coroutine::GetLocalCoroutineId();
     {
-        std::lock_guard<std::mutex> lock(v2->mu);
+        std::lock_guard<std::mutex> lock(state->mu);
 
         /**
          * 自等待拒绝先于封口状态判断：已授权 handler 任务不能等自己回收。
          */
-        if (self != 0 && v2->responsibility_tasks.find(self) != v2->responsibility_tasks.end()) {
+        if (self != 0 && state->responsibility_tasks.find(self) != state->responsibility_tasks.end()) {
             return ErrV(ErrorCode::InvalidContext, "rpc server: WaitStopped rejected from an admitted handler task");
         }
-        if (!v2->closed) {
+        if (!state->closed) {
             return ErrV(ErrorCode::InvalidArgument, "rpc server: close before WaitStopped");
         }
     }
-    return ServerWaitStopped(v2, deadline);
+    return WaitServerReleased(state, deadline);
 }
 
-bool detail::ServerV2Closed(const ServerV2State& v2) noexcept
+bool detail::ServerClosed(const ServerState& state) noexcept
 {
-    std::lock_guard<std::mutex> lock(v2.mu);
+    std::lock_guard<std::mutex> lock(state.mu);
 
     /**
      * 逻辑封口：优雅排空期间已拒新
      */
-    return v2.closed || v2.draining;
+    return state.closed || state.draining;
 }
 
-std::optional<Error> detail::ServerV2CloseReason(const ServerV2State& v2)
+std::optional<Error> detail::ServerCloseReason(const ServerState& state)
 {
-    std::lock_guard<std::mutex> lock(v2.mu);
-    return v2.close_reason;
+    std::lock_guard<std::mutex> lock(state.mu);
+    return state.close_reason;
 }
 
 // clang-format off

@@ -1,5 +1,5 @@
 /**
- * rpc v2 AppSession 契约测试：真实 loopback TCP、Hello/HelloAck 握手与
+ * RPC AppSession 契约测试：真实 loopback TCP、Hello/HelloAck 握手与
  * epoch、Client-owned 双向会话、单 FIFO admission、lane 有界隔离、
  * Call/Send/SendAccepted、Close(Immediate/Timeout/Graceful)/Shutdown、Stats。真实双端：
  * 每进程一 Engine + Client(owner) + Server(同 owner)（ADR §3.1）。
@@ -11,8 +11,11 @@
 #include <bbt/infra/rpc/Options.hpp>
 #include <bbt/infra/rpc/Stats.hpp>
 #include <bbt/infra/rpc/detail/Session.hpp>
+#include <bbt/infra/rpc/detail/RpcSessionState.hpp>
 #include <bbt/infra/rpc/detail/RpcChannel.hpp>
+#include <bbt/infra/rpc/detail/SessionTestAccess.hpp>
 #include <bbt/infra/net/detail/TestAccess.hpp>
+#include <bbt/infra/net/detail/EngineTestAccess.hpp>
 #include <bbt/infra/net/Error.hpp>
 
 #include <deque>
@@ -29,7 +32,7 @@ namespace net = bbt::infra::net;
 using Clock = std::chrono::steady_clock;
 
 /**
- * 全局协程提交（同 Host::Submit/Call，免 Host 自带 Engine——v2 AppHost
+ * 全局协程提交（同 Host::Submit/Call，免 Host 自带 Engine——AppHost
  * 需要 listener+handoff，不能复用 client-only Host::engine）。
  */
 template <class F> auto SubmitCo(F fn) -> std::future<decltype(fn())>
@@ -100,7 +103,7 @@ result<void> CloseTimeoutFor(const Handle& handle, std::int64_t timeout_ms, bbt:
 }
 
 /**
- * v2 进程装配（ADR §3.1）：自有 Engine(listener+handoff) + Client(owner)
+ * 进程装配（ADR §3.1）：自有 Engine(listener+handoff) + Client(owner)
  * + Server(同 owner)。admission handler 默认记录并转移 owning item。
  * Start 域由用例选择：Native 覆盖既有宿主入口，Co 覆盖受管协程直接起服，
  * Deferred 留给启动/关闭竞争用例自行触发。
@@ -133,7 +136,8 @@ struct AppHost {
         const std::string& identity,
         const rpc::ClientOptions& client_options = {},
         const rpc::ServerOptions& server_options = {},
-        StartMode start_mode = StartMode::Native)
+        StartMode start_mode = StartMode::Native,
+        std::function<void(net::Engine&)> before_run = {})
     {
         rpc::ClientOptions co = client_options;
         co.SetLocalIdentity(identity).SetTrustedNetworkPlaintext(true);
@@ -170,6 +174,9 @@ struct AppHost {
         config.runtime_progress = net::RuntimeProgress::Independent;
         config.options.num_event_loop = 1;
         config.listen_addresses = {so.ListenAddress()};
+        if (before_run) {
+            before_run(*engine); // Idle 相位：首次装测试钩子须在 Run 前完成
+        }
         runner = std::thread([this, config] { run_error = engine->Run(config); });
         try {
             CHECK(WaitUntil(
@@ -355,7 +362,7 @@ void RegisteredRoute()
 
     CHECK(server.server->UnregisterRpc("svc/M"));
     CHECK(server.server->UnregisterRpc("svc/M").error().code == ErrorCode::NotFound);
-    std::cout << "v2 registered route: handler=ok rate_limit=overloaded unregister=ok\n";
+    std::cout << "registered route: handler=ok rate_limit=overloaded unregister=ok\n";
 }
 
 /**
@@ -385,7 +392,7 @@ void Roundtrip()
     const auto server_stats = b.server->Stats();
     CHECK(server_stats.accepted_connections >= 1);
     CHECK(server_stats.callbacks >= 1);
-    std::cout << "v2 roundtrip call ok sessions=1 links=1\n";
+    std::cout << "roundtrip call ok sessions=1 links=1\n";
 }
 
 /**
@@ -411,7 +418,7 @@ void Bidirectional()
     CHECK(WaitUntil([&] { return a.client->Stats().links == 1 && b.client->Stats().links == 1; }, 3s));
     CHECK(a.client->Stats().links == 1);
     CHECK(b.client->Stats().links == 1);
-    std::cout << "v2 bidirectional one shared link a=1 b=1\n";
+    std::cout << "bidirectional one shared link a=1 b=1\n";
 }
 
 /**
@@ -437,7 +444,7 @@ void SendAcceptance()
         CallCo([&] { return bbt_co_await a.client->Send(b.Target(), MakeSend("m2", 3, "k"), SendUntil(3s, false)); });
     CHECK(send_local);
     CHECK(WaitUntil([&] { return b.sends.load() == 2; }));
-    std::cout << "v2 send remote-acceptance + local-acceptance ok\n";
+    std::cout << "send remote-acceptance + local-acceptance ok\n";
 }
 
 /**
@@ -502,7 +509,7 @@ void Ordering()
         CHECK(seq[0] == "call1" && seq[1] == "send2" && seq[2] == "call3");
     }
     (void)Get(pump);
-    std::cout << "v2 ordering call1/send2/call3 preserved\n";
+    std::cout << "ordering call1/send2/call3 preserved\n";
 }
 
 /**
@@ -588,7 +595,7 @@ void OrderingLedger()
         CHECK(b.by_key["dup"].size() == 1);
         CHECK(b.by_key["rev"].size() == 1);
     }
-    std::cout << "v2 ordering ledger: gap/duplicate/reversed reject protocol ok\n";
+    std::cout << "ordering ledger: gap/duplicate/reversed reject protocol ok\n";
 }
 
 /**
@@ -635,7 +642,7 @@ void CloseNegativeTimeout()
     CHECK(a.client->IsClosed());
     CHECK(CloseServer(a.server, immediate_release));
     CHECK(a.server->IsClosed());
-    std::cout << "v2 close options validation + wait_release merge ok\n";
+    std::cout << "close options validation + wait_release merge ok\n";
 }
 
 /**
@@ -672,7 +679,7 @@ void ServerCrossEngine()
     (void)client->Close(bbt::infra::CloseOptions::Immediate());
     (void)engine_a->Close();
     (void)engine_b->Close();
-    std::cout << "v2 server cross-engine create rejected ok\n";
+    std::cout << "server cross-engine create rejected ok\n";
 }
 
 /**
@@ -730,7 +737,7 @@ void Overload()
     CHECK(Get(svc));
     const auto stats = a.client->Stats();
     CHECK(stats.actor.dropped >= 4);
-    std::cout << "v2 overload actor=4-overloaded service-isolated ok\n";
+    std::cout << "overload actor=4-overloaded service-isolated ok\n";
 }
 
 /**
@@ -796,7 +803,7 @@ void LaneFairness()
     CHECK(stats.service.dequeued >= 6);
     CHECK(stats.actor.dequeued >= 2);
     CHECK(WaitUntil([&] { return b.sends.load() >= 8; }, 3s));
-    std::cout << "v2 lane fairness actor-not-starved ok svc=" << stats.service.dequeued
+    std::cout << "lane fairness actor-not-starved ok svc=" << stats.service.dequeued
               << " actor=" << stats.actor.dequeued << "\n";
 }
 
@@ -836,7 +843,7 @@ void Disconnect()
      * 等待迟到的 Fail 到达（不阻塞用例）。
      */
     std::this_thread::sleep_for(400ms);
-    std::cout << "v2 disconnect committed outcome="
+    std::cout << "disconnect committed outcome="
               << (late.error().code == ErrorCode::OutcomeUnknown ? "OutcomeUnknown" : "TimedOut") << "\n";
 }
 
@@ -878,7 +885,7 @@ void Deadline()
             settled.error().code == ErrorCode::TimedOut || settled.error().code == ErrorCode::OutcomeUnknown
             || settled.error().code == ErrorCode::Closed);
     }
-    std::cout << "v2 deadline expired + invalid-args rejected + inbound budget local-min\n";
+    std::cout << "deadline expired + invalid-args rejected + inbound budget local-min\n";
 }
 
 /**
@@ -948,7 +955,7 @@ void HandshakeRaw()
     peer.Send({reinterpret_cast<const char*>(call_bytes.value().data()), call_bytes.value().size()});
     std::this_thread::sleep_for(300ms);
     CHECK(b.calls.load() == 0);
-    std::cout << "v2 handshake raw + wrong-epoch dropped\n";
+    std::cout << "handshake raw + wrong-epoch dropped\n";
 }
 
 /**
@@ -1030,7 +1037,7 @@ void HandshakeCoalesced()
     auto rsp = rpc::DecodeSessionFrame(reinterpret_cast<const std::uint8_t*>(rsp_body.data()), rsp_body.size());
     CHECK(rsp && rsp.value().kind == rpc::FrameKind::Response);
     CHECK(rsp.value().request_id == "pipelined");
-    std::cout << "v2 handshake coalesced ack+call admitted\\n";
+    std::cout << "handshake coalesced ack+call admitted\\n";
 }
 
 /**
@@ -1117,7 +1124,7 @@ void HandshakeCoalescedBig()
     auto rsp = rpc::DecodeSessionFrame(reinterpret_cast<const std::uint8_t*>(rsp_body.data()), rsp_body.size());
     CHECK(rsp && rsp.value().kind == rpc::FrameKind::Response);
     CHECK(rsp.value().request_id == "big-pipelined");
-    std::cout << "v2 handshake coalesced ack+192KiB-call admitted\\n";
+    std::cout << "handshake coalesced ack+192KiB-call admitted\\n";
 }
 
 /**
@@ -1383,7 +1390,7 @@ void HandshakeCoalescedBigPinned()
      */
     CHECK(conn.reads.load() == 2);
     conn.CloseScript();
-    std::cout << "v2 handshake pinned single-batch ack+192KiB admitted\\n";
+    std::cout << "handshake pinned single-batch ack+192KiB admitted\\n";
 }
 
 /**
@@ -1467,7 +1474,7 @@ void HandshakeStashTailPreserved()
      */
     CHECK(conn.reads.load() == 1);
     conn.CloseScript();
-    std::cout << "v2 handshake stash tail preserved\\n";
+    std::cout << "handshake stash tail preserved\\n";
 }
 
 void HandshakePrefixReject()
@@ -1517,7 +1524,7 @@ void HandshakePrefixReject()
      * 该 link 拒绝不计 handshake 成功；server 本体仍存活可观。
      */
     CHECK(b.server->Stats().accepted_connections == 0);
-    std::cout << "v2 handshake oversized prefix link retired\n";
+    std::cout << "handshake oversized prefix link retired\n";
 }
 
 void CloseDrain()
@@ -1568,7 +1575,7 @@ void CloseDrain()
     auto after =
         CallCo([&] { return bbt_co_await a->client->Call(b->Target(), MakeCall("after", 4, "k"), UntilMs(800ms)); });
     CHECK(!after);
-    std::cout << "v2 close graceful drain + timeout physical release ok\n";
+    std::cout << "close graceful drain + timeout physical release ok\n";
 }
 
 /**
@@ -1621,11 +1628,11 @@ void CloseReason()
      */
     b->ProcessAdmitted(Echo);
     CHECK(CloseTimeoutFor(b->server, 3000));
-    std::cout << "v2 close immediate publishes first reason + idempotent ok\n";
+    std::cout << "close immediate publishes first reason + idempotent ok\n";
 }
 
 /**
- * Close(custom)：v2 已提交在途 Call 保留 OutcomeUnknown/request_phase，并在
+ * Close(custom)：已提交在途 Call 保留 OutcomeUnknown/request_phase，并在
  * 唯一终态上附带首个关闭原因的 code/message，不追改成已胜出的成功。
  */
 void CloseReasonPending()
@@ -1676,7 +1683,7 @@ void CloseReasonPending()
     CHECK(CloseServer(
         b->server,
         bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::milliseconds(3000))));
-    std::cout << "v2 close reason attached to committed pending call\n";
+    std::cout << "close reason attached to committed pending call\n";
 }
 
 /**
@@ -1713,7 +1720,7 @@ void AdmissionInflight()
     CHECK(WaitUntil([&] { return b.calls.load() == 2; }));
     b.ProcessAdmitted(Echo);
     CHECK(Get(third));
-    std::cout << "v2 admission inflight cap immediate-overload + recover ok\n";
+    std::cout << "admission inflight cap immediate-overload + recover ok\n";
 }
 
 /**
@@ -1757,7 +1764,7 @@ void AdmissionReject()
     CHECK(CloseServer(
         b.server,
         bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::milliseconds(1500))));
-    std::cout << "v2 admission handler-reject unique-terminal graceful close ok\n";
+    std::cout << "admission handler-reject unique-terminal graceful close ok\n";
 }
 
 /**
@@ -1793,7 +1800,7 @@ void AdmissionBytes()
     CHECK(WaitUntil([&] { return b.calls.load() == 1; }));
     b.ProcessAdmitted(Echo);
     CHECK(Get(ok));
-    std::cout << "v2 admission owning-bytes charged + small admitted\n";
+    std::cout << "admission owning-bytes charged + small admitted\n";
 }
 
 /**
@@ -1821,7 +1828,7 @@ void AdmissionSealed()
      * 本地 deadline TimedOut。
      */
     CHECK(sealed.error().code != ErrorCode::TimedOut);
-    std::cout << "v2 admission sealed immediate terminal ok\n";
+    std::cout << "admission sealed immediate terminal ok\n";
 }
 
 /**
@@ -1939,7 +1946,7 @@ void ReplyWriteDeferred()
      * 已排队/写入中的直接证据：writer 取走条目停在闸门，计数 >0。
      */
     CHECK(WaitUntil([&] { return gate1->Entered(HookPoint::BeforeWrite); }, 3s));
-    CHECK(rpc::detail::ServerV2LedgerForTest(*b.server).writes_outstanding >= 1);
+    CHECK(rpc::detail::ServerLedgerForTest(*b.server).writes_outstanding >= 1);
 
     /**
      * Complete 不得入队即返成功。
@@ -1956,7 +1963,7 @@ void ReplyWriteDeferred()
      * 调用方收到 Response
      */
     CHECK(Get(held1));
-    CHECK(WaitUntil([&] { return rpc::detail::ServerV2LedgerForTest(*b.server).writes_outstanding == 0; }, 2s));
+    CHECK(WaitUntil([&] { return rpc::detail::ServerLedgerForTest(*b.server).writes_outstanding == 0; }, 2s));
 
     /**
      * 阶段二：Graceful Close 不早成功——已接纳写责任未结算时关闭必须挂起，
@@ -1976,7 +1983,7 @@ void ReplyWriteDeferred()
     }
     auto done2 = SubmitCo([&] { return bbt_co_await reply->Complete(Echo(request)); });
     CHECK(WaitUntil([&] { return gate2->Entered(HookPoint::BeforeWrite); }, 3s));
-    CHECK(rpc::detail::ServerV2LedgerForTest(*b.server).writes_outstanding >= 1);
+    CHECK(rpc::detail::ServerLedgerForTest(*b.server).writes_outstanding >= 1);
     CHECK(done2.wait_for(0ms) != std::future_status::ready);
 
     /**
@@ -1995,10 +2002,10 @@ void ReplyWriteDeferred()
     gate2->Release();
     CHECK(Get(done2));
     CHECK(Get(held2));
-    CHECK(WaitUntil([&] { return rpc::detail::ServerV2LedgerForTest(*b.server).writes_outstanding == 0; }, 2s));
+    CHECK(WaitUntil([&] { return rpc::detail::ServerLedgerForTest(*b.server).writes_outstanding == 0; }, 2s));
     CHECK(Get(graceful));
     CHECK(b.server->IsClosed());
-    std::cout << "v2 reply write deferred: no early complete/graceful close ok\n";
+    std::cout << "reply write deferred: no early complete/graceful close ok\n";
 }
 
 /**
@@ -2031,10 +2038,10 @@ void ReplyWriteFailClose()
     }
     auto done = SubmitCo([&] { return bbt_co_await reply->Complete(Echo(request)); });
     CHECK(WaitUntil([&] { return gate->Entered(HookPoint::BeforeWrite); }, 3s));
-    CHECK(rpc::detail::ServerV2LedgerForTest(*b->server).writes_outstanding >= 1);
+    CHECK(rpc::detail::ServerLedgerForTest(*b->server).writes_outstanding >= 1);
 
     /**
-     * 在写未终态时 v2 立即封口：Kill 对在写项保留责任（不属排队丢弃），
+     * 在写未终态时立即封口：Kill 对在写项保留责任（不属排队丢弃），
      * 真实终态由 WriterLoop 的失败路径唯一结算。
      */
     (void)b->server->Close(bbt::infra::CloseOptions::Immediate());
@@ -2050,7 +2057,7 @@ void ReplyWriteFailClose()
     /**
      * 写终态唯一结算：凭据发布后计数恰好归零（发布先于计数递减，须等待）。
      */
-    CHECK(WaitUntil([&] { return rpc::detail::ServerV2LedgerForTest(*b->server).writes_outstanding == 0; }, 2s));
+    CHECK(WaitUntil([&] { return rpc::detail::ServerLedgerForTest(*b->server).writes_outstanding == 0; }, 2s));
     const auto held_result = Get(held);
 
     /**
@@ -2058,7 +2065,7 @@ void ReplyWriteFailClose()
      */
     CHECK(!held_result);
     CHECK(CloseTimeoutFor(b->server, 3000));
-    std::cout << "v2 reply write fail-close: real failure returned\n";
+    std::cout << "reply write fail-close: real failure returned\n";
 }
 
 /**
@@ -2092,7 +2099,7 @@ void WriteTerminalOnce()
     CHECK(WaitUntil([&] { return b.calls.load() == 1; }));
     b.ProcessAdmitted(Echo);
     CHECK(Get(boot));
-    CHECK(WaitUntil([&] { return rpc::detail::ServerV2LedgerForTest(*b.server).writes_outstanding == 0; }));
+    CHECK(WaitUntil([&] { return rpc::detail::ServerLedgerForTest(*b.server).writes_outstanding == 0; }));
 
     std::vector<std::future<bbt::infra::result<rpc::Response>>> calls;
     for (unsigned i = 0; i != 3; ++i) {
@@ -2142,7 +2149,7 @@ void WriteTerminalOnce()
     CHECK(WaitUntil([&] {
         const auto stats = b.client->Stats().service;
         return stats.queued == 2 && stats.bytes_queued > 0
-               && rpc::detail::ServerV2LedgerForTest(*b.server).writes_outstanding == 3;
+               && rpc::detail::ServerLedgerForTest(*b.server).writes_outstanding == 3;
     }));
     CHECK(completed.load() == 0);
     for (auto& write : writes) {
@@ -2172,7 +2179,7 @@ void WriteTerminalOnce()
         CHECK(!duplicate && duplicate.error().code == ErrorCode::InvalidArgument);
     }
     CHECK(CloseTimeoutFor(b.server, 3000));
-    const auto ledger = rpc::detail::ServerV2LedgerForTest(*b.server);
+    const auto ledger = rpc::detail::ServerLedgerForTest(*b.server);
     CHECK(ledger.writes_outstanding == 0);
     CHECK(ledger.links == 0 && ledger.handshakes == 0);
     CHECK(b.client->Stats().service.queued == 0);
@@ -2231,11 +2238,11 @@ void ReplyWriteBudget()
     /**
      * 写责任在 writer 终态路径唯一结算（在写项 deadline 已过 → 写失败）。
      */
-    CHECK(WaitUntil([&] { return rpc::detail::ServerV2LedgerForTest(*b->server).writes_outstanding == 0; }, 3s));
+    CHECK(WaitUntil([&] { return rpc::detail::ServerLedgerForTest(*b->server).writes_outstanding == 0; }, 3s));
     const auto held_result = Get(held);
     CHECK(!held_result);
     CHECK(held_result.error().code == ErrorCode::OutcomeUnknown);
-    std::cout << "v2 reply write budget: request budget not reset\n";
+    std::cout << "reply write budget: request budget not reset\n";
 }
 
 /**
@@ -2273,7 +2280,7 @@ void ReplyCorrelationMismatch()
     bad.SetService("other-service");
     auto done = SubmitCo([&] { return bbt_co_await reply->Complete(std::move(bad)); });
     CHECK(WaitUntil([&] { return gate->Entered(HookPoint::BeforeWrite); }, 3s));
-    CHECK(rpc::detail::ServerV2LedgerForTest(*b.server).writes_outstanding >= 1);
+    CHECK(rpc::detail::ServerLedgerForTest(*b.server).writes_outstanding >= 1);
 
     /**
      * 等写终态
@@ -2290,11 +2297,11 @@ void ReplyCorrelationMismatch()
     const auto held_result = Get(held);
     CHECK(!held_result);
     CHECK(held_result.error().code == ErrorCode::ProtocolError);
-    CHECK(WaitUntil([&] { return rpc::detail::ServerV2LedgerForTest(*b.server).writes_outstanding == 0; }, 2s));
+    CHECK(WaitUntil([&] { return rpc::detail::ServerLedgerForTest(*b.server).writes_outstanding == 0; }, 2s));
     CHECK(CloseServer(
         b.server,
         bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::milliseconds(2000))));
-    std::cout << "v2 reply correlation mismatch: ProtocolError + write accounted\n";
+    std::cout << "reply correlation mismatch: ProtocolError + write accounted\n";
 }
 
 /**
@@ -2361,8 +2368,8 @@ void CloseReleased()
     CHECK(CloseTimeoutFor(b->server, 3000));
     CHECK(b->server->IsClosed());
     CHECK(WaitUntil([&] { return b->engine->CountConnections() == 0; }, 3s));
-    CHECK(WaitUntil([&] { return rpc::detail::ServerV2LedgerForTest(*b->server).writes_outstanding == 0; }, 2s));
-    std::cout << "v2 close reply + responsibility smoke ok\n";
+    CHECK(WaitUntil([&] { return rpc::detail::ServerLedgerForTest(*b->server).writes_outstanding == 0; }, 2s));
+    std::cout << "close reply + responsibility smoke ok\n";
 }
 
 /**
@@ -2374,7 +2381,7 @@ void CloseHandshake()
     auto gate = MakeDialGate(*b);
     RawTcpPeer peer(b->address);
     CHECK(WaitUntil([&] { return gate->Entered(HookPoint::InboundBeforeHandshake) == 1; }, 3s));
-    CHECK(rpc::detail::ServerV2LedgerForTest(*b->server).handshakes >= 1);
+    CHECK(rpc::detail::ServerLedgerForTest(*b->server).handshakes >= 1);
     CHECK(gate->InFlight() == 1);
 
     /**
@@ -2387,13 +2394,13 @@ void CloseHandshake()
     CHECK(!HookState(b->client->Hooks(), HookPoint::InboundBeforeHandshake).closed);
     CHECK(WaitUntil(
         [&] {
-            const auto ledger = rpc::detail::ServerV2LedgerForTest(*b->server);
+            const auto ledger = rpc::detail::ServerLedgerForTest(*b->server);
             return ledger.links == 0 && ledger.handshakes == 0;
         },
         3s));
     CHECK(WaitUntil([&] { return b->engine->CountConnections() == 0; }, 3s));
     CHECK(WaitUntil([&] { return peer.Eof(); }));
-    std::cout << "v2 close handshake-conn responsibility + sealed kill ok\n";
+    std::cout << "close handshake-conn responsibility + sealed kill ok\n";
 }
 
 /**
@@ -2451,7 +2458,7 @@ void CloseSealedNoPublish()
     CHECK(WaitUntil([&] { return gate->InFlight() == 0; }));
     CHECK(WaitUntil(
         [&] {
-            const auto ledger = rpc::detail::ServerV2LedgerForTest(*b->server);
+            const auto ledger = rpc::detail::ServerLedgerForTest(*b->server);
             return ledger.links == 0 && ledger.handshakes == 0;
         },
         3s));
@@ -2459,7 +2466,7 @@ void CloseSealedNoPublish()
     CHECK(b->server->Stats().accepted_connections == 0);
     CHECK(WaitUntil([&] { return b->engine->CountConnections() == 0; }));
     CHECK(WaitUntil([&] { return peer.Eof(); }));
-    std::cout << "v2 sealed post-close handshake not published ok\n";
+    std::cout << "sealed post-close handshake not published ok\n";
 }
 
 /**
@@ -2636,7 +2643,7 @@ void QuotaPeers()
     CHECK(!outbound_result);
     ::close(lfd);
     gate->Release();
-    std::cout << "v2 quota max-sessions cross-peer + establishing ok\n";
+    std::cout << "quota max-sessions cross-peer + establishing ok\n";
 }
 
 /**
@@ -2742,7 +2749,7 @@ void SimultaneousDial()
      */
     pump_stop->store(true);
     (void)Get(pump);
-    std::cout << "v2 simultaneous dial fenced to one link ok\n";
+    std::cout << "simultaneous dial fenced to one link ok\n";
 }
 
 /**
@@ -2782,7 +2789,7 @@ void EpochReconnect()
      * owner 寿命内单调递增
      */
     CHECK(first != 0 && second > first);
-    std::cout << "v2 epoch reconnect monotonic " << first << "->" << second << " ok\n";
+    std::cout << "epoch reconnect monotonic " << first << "->" << second << " ok\n";
 }
 
 /**
@@ -2905,7 +2912,7 @@ void QuotaEstablishDial()
      */
     gate->Release();
     (void)Get(pending);
-    std::cout << "v2 quota pre-dial reject: overloaded before second conn\n";
+    std::cout << "quota pre-dial reject: overloaded before second conn\n";
 }
 
 /**
@@ -2960,7 +2967,7 @@ void QuotaReleaseRetry()
     b->ProcessAdmitted(Echo);
     CHECK(Get(boot));
     CHECK(a->client->Stats().sessions == 1);
-    std::cout << "v2 quota release then admit: shared record + retry ok\n";
+    std::cout << "quota release then admit: shared record + retry ok\n";
 }
 
 /**
@@ -2972,7 +2979,7 @@ void NeverStartedDrainClose()
 {
 
     /**
-     * 未 Start 的 v2 Server：Create 后 queue 为空、accept 任务未登记——
+     * 未 Start 的 Server：Create 后 queue 为空、accept 任务未登记——
      * Close 不得解引用空 queue，也不得在 accept_loop_exited 上虚假等待
      * （无启动任务即视为已退出）。
      */
@@ -3017,8 +3024,8 @@ void NeverStartedDrainClose()
     (void)server->Close(bbt::infra::CloseOptions::Immediate(MakeError(ErrorCode::TimedOut, "later")));
 
     /**
-     * 并发 IsClosed/LocalAddress 与 Shutdown（Start 未发生）同锁读取——
-     * 读侧与写侧同一把 v2->mu，不构成数据竞争。在 Shutdown 前
+     * 并发 IsClosed/LocalAddress 与 Close（Start 未发生）同锁读取——
+     * 读写双方使用同一把服务端状态锁。在 Close 前
      * 启动 reader 覆盖并发窗口；reads 计数在 stop 前推进即证明循环
      * 真实执行（Close 已幂等完成，reader 立即退出）。
      */
@@ -3044,7 +3051,7 @@ void NeverStartedDrainClose()
     CHECK(WaitUntil([&] { return reads.load() > 0; }, 1s));
     stop.store(true, std::memory_order_release);
     reader.join();
-    std::cout << "v2 never-started close/shutdown idempotent + concurrent reads ok\n";
+    std::cout << "never-started close/shutdown idempotent + concurrent reads ok\n";
 }
 
 void QueueFullDrainStatsConcurrent()
@@ -3171,7 +3178,7 @@ void QueueFullDrainStatsConcurrent()
             return false;
         }
         const auto s = b.server->Stats();
-        const auto writes = rpc::detail::ServerV2LedgerForTest(*b.server).writes_outstanding;
+        const auto writes = rpc::detail::ServerLedgerForTest(*b.server).writes_outstanding;
         return s.service.inflight == 0 && s.service.queued == 0 && s.service.bytes_queued == 0 && writes == 0;
     };
     CHECK(WaitUntil(responsibility_clear, 10s));
@@ -3212,15 +3219,15 @@ void QueueFullDrainStatsConcurrent()
     CHECK(WaitUntil(
         [&] {
             const auto s = b.server->Stats();
-            const auto ledger = rpc::detail::ServerV2LedgerForTest(*b.server);
+            const auto ledger = rpc::detail::ServerLedgerForTest(*b.server);
             return s.service.inflight == 0 && s.service.queued == 0 && s.service.bytes_queued == 0
                    && s.active_connections == 0 && ledger.links == 0 && ledger.handshakes == 0
-                   && rpc::detail::ServerV2LedgerForTest(*b.server).writes_outstanding == 0;
+                   && rpc::detail::ServerLedgerForTest(*b.server).writes_outstanding == 0;
         },
         5s));
     const auto final_stats = b.server->Stats();
     CHECK(final_stats.service.finished >= final_stats.service.dropped);
-    std::cout << "v2 queue-full close/stats concurrent no deadlock"
+    std::cout << "queue-full close/stats concurrent no deadlock"
               << " ok=" << ok << " overloaded=" << overloaded << " finished=" << final_stats.service.finished << "\n";
 }
 
@@ -3278,7 +3285,7 @@ void HookStateContract()
     CHECK(WaitUntil([&] { return HookState(closed, HookPoint::BeforeWrite).closed; }));
     const auto after_close = closed->Arm(HookPoint::BeforeWrite, HookAction::Pause, Clock::now() + 1s);
     CHECK(!after_close && after_close.error().code == ErrorCode::Closed);
-    std::cout << "v2 hook state: owner isolation + generation + close contract ok\n";
+    std::cout << "hook state: owner isolation + generation + close contract ok\n";
 }
 
 /**
@@ -3301,7 +3308,7 @@ void HookPauseDeadline()
     CHECK(!result && result.error().code == ErrorCode::TimedOut);
     CHECK(WaitUntil([&] { return HookState(hooks, HookPoint::OutboundBeforeHandshake).in_flight == 0; }));
     CHECK(hooks->Clear(HookPoint::OutboundBeforeHandshake, armed.value()));
-    std::cout << "v2 hook pause deadline: real outbound checkpoint timed out and settled\n";
+    std::cout << "hook pause deadline: real outbound checkpoint timed out and settled\n";
 }
 
 /**
@@ -3357,7 +3364,7 @@ void HookPauseCancelClose()
                    && HookState(hooks, HookPoint::OutboundBeforeHandshake).closed;
         }));
     }
-    std::cout << "v2 hook pause cancel/close: real outbound checkpoint settled\n";
+    std::cout << "hook pause cancel/close: real outbound checkpoint settled\n";
 }
 
 /**
@@ -3387,7 +3394,7 @@ void HookOutboundThrow()
     b.ProcessAdmitted(Echo);
     CHECK(Get(retried));
     CHECK(a.client->Stats().sessions == 1);
-    std::cout << "v2 outbound ThrowOnce: visible failure + quota retry ok\n";
+    std::cout << "outbound ThrowOnce: visible failure + quota retry ok\n";
 }
 
 /**
@@ -3424,7 +3431,7 @@ void HookWriteThrow()
     CHECK(HookState(hooks, HookPoint::BeforeWrite).entered == 1);
     CHECK(HookState(hooks, HookPoint::BeforeWrite).in_flight == 0);
     CHECK(!HookState(hooks, HookPoint::BeforeWrite).armed);
-    CHECK(WaitUntil([&] { return rpc::detail::ServerV2LedgerForTest(*b.server).writes_outstanding == 0; }, 2s));
+    CHECK(WaitUntil([&] { return rpc::detail::ServerLedgerForTest(*b.server).writes_outstanding == 0; }, 2s));
     const auto held_result = Get(held);
 
     /**
@@ -3436,7 +3443,7 @@ void HookWriteThrow()
     CHECK(CloseServer(
         b.server,
         bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::milliseconds(3000))));
-    std::cout << "v2 BeforeWrite ThrowOnce: dequeued write settled once\n";
+    std::cout << "BeforeWrite ThrowOnce: dequeued write settled once\n";
 }
 
 /**
@@ -3485,7 +3492,7 @@ void ShutdownTimeoutStaysDraining()
     CHECK(CloseClient(a->client, bbt::infra::CloseOptions::Immediate()));
     auto again = a->client->CloseReason();
     CHECK(again.has_value() && again->code == ErrorCode::Closed);
-    std::cout << "v2 shutdown sync seal + rejects new\n";
+    std::cout << "shutdown sync seal + rejects new\n";
 }
 
 /**
@@ -3539,7 +3546,7 @@ void ShutdownInterruptedByClose()
     CHECK(held_result.error().code == ErrorCode::OutcomeUnknown);
     CHECK(held_result.error().request_phase == bbt::infra::RequestPhase::RequestCommitted);
     b->ProcessAdmitted(Echo);
-    std::cout << "v2 graceful close interrupted by shutdown returns first reason\n";
+    std::cout << "graceful close interrupted by shutdown returns first reason\n";
 }
 
 /**
@@ -3596,12 +3603,12 @@ void CloseInflightReason()
      * 归还 b 侧已接纳项，避免测试自身留下未终结 handler。
      */
     b->ProcessAdmitted(Echo);
-    std::cout << "v2 close inflight: committed keeps OutcomeUnknown, "
+    std::cout << "close inflight: committed keeps OutcomeUnknown, "
                  "uncommitted gets Closed, both carry reason\n";
 }
 
 /**
- * ---- 24. 客户端输入边界（V1 client_input 的通用断言迁移到 V2 入口） ---------
+ * ---- 24. 客户端输入边界 ---------
  * target 只接受 tcp://numeric-ip:port；Call 固定 Required、Send 固定 None；
  * 未设置/已过期 deadline 不发请求。全部拒绝发生在拨号前。
  */
@@ -3675,7 +3682,7 @@ void ClientInput()
     const auto stats = a.client->Stats();
     CHECK(stats.sessions == 0 && stats.links == 0);
     CHECK(a.engine->CountConnections() == 0);
-    std::cout << "v2 client input: target/request/send boundaries rejected before dial\n";
+    std::cout << "client input: target/request/send boundaries rejected before dial\n";
 }
 
 /**
@@ -3711,7 +3718,7 @@ void CancelPostCommit()
     b.ProcessAdmitted(Echo);
     CHECK(outcome.error().code == ErrorCode::Cancelled);
     CHECK(a.client->Stats().links == 1);
-    std::cout << "v2 cancel post-commit: Cancelled + RequestCommitted, late reply dropped\n";
+    std::cout << "cancel post-commit: Cancelled + RequestCommitted, late reply dropped\n";
 }
 
 /**
@@ -3784,7 +3791,7 @@ void MalformedReply()
          */
         CHECK(WaitUntil([&] { return a.engine->CountConnections() == 0; }, 3s));
     }
-    std::cout << "v2 malformed reply: correlation mismatch=ProtocolError/ReplyTerminal, "
+    std::cout << "malformed reply: correlation mismatch=ProtocolError/ReplyTerminal, "
                  "undecodable frame=OutcomeUnknown/RequestCommitted\n";
 }
 
@@ -3825,7 +3832,7 @@ void CloseGracefulTimeout()
         b->server, bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::seconds(2))));
     CHECK(CloseTimeoutFor(b->server, 3000));
     CHECK(WaitUntil([&] { return b->engine->CountConnections() == 0; }, 3s));
-    std::cout << "v2 close graceful timeout retains responsibility then drains\n";
+    std::cout << "close graceful timeout retains responsibility then drains\n";
 }
 
 /**
@@ -3861,7 +3868,7 @@ void CloseSelfWait()
     CHECK(close_rejected.load());
     CHECK(wait_rejected.load());
     CHECK(!server.server->IsClosed());
-    std::cout << "v2 close self-wait rejected from admitted handler\n";
+    std::cout << "close self-wait rejected from admitted handler\n";
 }
 
 /**
@@ -3894,7 +3901,7 @@ void CoStartRoundtrip()
 
     const auto late = CallCo([&] { return server.server->Start(); });
     CHECK(!late && late.error().code == ErrorCode::Closed);
-    std::cout << "v2 co-domain start: loopback ok; repeat start idempotent; start after close closed\n";
+    std::cout << "co-domain start: loopback ok; repeat start idempotent; start after close closed\n";
 }
 
 /**
@@ -3909,7 +3916,7 @@ void CoStartCloseRace()
     std::promise<void> release;
     auto entered_future = entered.get_future();
     auto release_future = release.get_future();
-    rpc::detail::ServerV2TestAccess::SetStartRegistrationBarrierOnce([&] {
+    rpc::detail::ServerTestAccess::SetStartRegistrationBarrierOnce([&] {
         entered.set_value();
         release_future.wait();
     });
@@ -3918,7 +3925,7 @@ void CoStartCloseRace()
     CHECK(entered_future.wait_for(3s) == std::future_status::ready);
 
     /**
-     * 若 Start 持有 v2->mu，下面的 RequestClose 只能等 Start 走完。
+     * 若 Start 持有服务端状态锁，下面的 Close 只能等 Start 走完。
      */
     auto closer =
         std::async(std::launch::async, [&] { (void)server.server->Close(bbt::infra::CloseOptions::Immediate()); });
@@ -3943,7 +3950,7 @@ void CoStartCloseRace()
     CHECK(CloseServer(server.server, bbt::infra::CloseOptions::Immediate()));
     CHECK(CloseTimeoutFor(server.server, 3000));
     CHECK(WaitUntil([&] { return server.engine->CountConnections() == 0; }, 1s));
-    std::cout << "v2 co start/close race: close not blocked; start closed; physical stop gated\n";
+    std::cout << "co start/close race: close not blocked; start closed; physical stop gated\n";
 }
 
 /**
@@ -3953,7 +3960,7 @@ void CoStartCloseRace()
 void CoStartRegistrationFailureRollback()
 {
     AppHost server("co-rollback-server", {}, {}, StartMode::Deferred);
-    rpc::detail::ServerV2TestAccess::FailNextStartRegistration();
+    rpc::detail::ServerTestAccess::FailNextStartRegistration();
     const auto failed = CallCo([&] { return server.server->Start(); });
     CHECK(!failed && failed.error().code == ErrorCode::RuntimeUnavailable);
     CHECK(!server.server->IsClosed());
@@ -3977,16 +3984,1666 @@ void CoStartRegistrationFailureRollback()
     CHECK(CloseServer(server.server, bbt::infra::CloseOptions::Immediate()));
     CHECK(CloseTimeoutFor(server.server, 3000));
     CHECK(WaitUntil([&] { return server.engine->CountConnections() == 0; }, 3s));
-    std::cout << "v2 co start registration failure: rolled back; retry serves loopback\n";
+    std::cout << "co start registration failure: rolled back; retry serves loopback\n";
+}
+
+/** 已建 TCP 连接的 raw peer 以给定身份完成 inbound Hello/HelloAck（测试侧为拨方，对端即被替换方的 server）。 */
+void PeerHelloHandshake(RawTcpPeer& peer, const std::string& peer_identity)
+{
+    rpc::SessionFrame hello;
+    hello.kind = rpc::FrameKind::Hello;
+    hello.traffic = rpc::TrafficClass::System;
+    hello.peer_identity = peer_identity;
+    hello.session_epoch = 1;
+    hello.connection_nonce = 0xC0FFEEu;
+    auto hello_bytes = rpc::EncodeFramedSessionFrame(hello, 8 * 1024 * 1024);
+    CHECK(hello_bytes);
+    peer.Send(std::string(reinterpret_cast<const char*>(hello_bytes.value().data()), hello_bytes.value().size()));
+
+    const auto hdr = peer.ReadExact(4);
+    const auto len = rpc::DecodeFramePrefix(reinterpret_cast<const std::uint8_t*>(hdr.data()));
+    CHECK(len > 0 && len <= 8 * 1024 * 1024);
+    const auto body = peer.ReadExact(len);
+    auto srv_hello = rpc::DecodeSessionFrame(reinterpret_cast<const std::uint8_t*>(body.data()), body.size());
+    CHECK(srv_hello && srv_hello.value().kind == rpc::FrameKind::Hello);
+
+    rpc::SessionFrame ack;
+    ack.kind = rpc::FrameKind::HelloAck;
+    ack.traffic = rpc::TrafficClass::System;
+    ack.peer_identity = peer_identity;
+    ack.session_epoch = srv_hello.value().session_epoch;
+    ack.connection_nonce = srv_hello.value().connection_nonce;
+    auto ack_bytes = rpc::EncodeFramedSessionFrame(ack, 8 * 1024 * 1024);
+    CHECK(ack_bytes);
+    peer.Send(std::string(reinterpret_cast<const char*>(ack_bytes.value().data()), ack_bytes.value().size()));
+}
+
+/** 以已协商 epoch 回给入站 Call 一个成功 Response（按 Request 关联字段原样回映，身份由 RequestId 承载）。 */
+static void SendReplyFrame(RawTcpListener& peer, const rpc::SessionFrame& call_frame, std::uint64_t session_epoch)
+{
+    auto request = rpc::RequestFromSessionFrame(call_frame);
+    CHECK(request);
+    auto response = rpc::Response::FromRequest(request.value());
+    response.SetPayload(request.value().Payload());
+    auto frame = rpc::ResponseToSessionFrame(response, session_epoch);
+    CHECK(frame);
+    auto bytes = rpc::EncodeFramedSessionFrame(frame.value(), 8 * 1024 * 1024);
+    CHECK(bytes);
+    peer.SendRaw(std::string(reinterpret_cast<const char*>(bytes.value().data()), bytes.value().size()));
+}
+
+/** 回发 SendAccepted 确认（message_id 与原始 Send 关联）。 */
+static void SendSendAccepted(RawTcpListener& peer, const std::string& message_id, std::uint64_t session_epoch)
+{
+    rpc::SessionFrame frame;
+    frame.kind = rpc::FrameKind::SendAccepted;
+    frame.traffic = rpc::TrafficClass::System;
+    frame.message_id = message_id;
+    frame.session_epoch = session_epoch;
+    frame.has_outcome = true;
+    frame.success = true;
+    auto bytes = rpc::EncodeFramedSessionFrame(frame, 8 * 1024 * 1024);
+    CHECK(bytes);
+    peer.SendRaw(std::string(reinterpret_cast<const char*>(bytes.value().data()), bytes.value().size()));
+}
+
+/** 回发 SendAccepted 失败确认（不同合法错误终态；message_id 与原始 Send 关联）。 */
+static void SendSendRejected(
+    RawTcpListener& peer,
+    const std::string& message_id,
+    std::uint64_t session_epoch,
+    ErrorCode code,
+    const std::string& message)
+{
+    rpc::SessionFrame frame;
+    frame.kind = rpc::FrameKind::SendAccepted;
+    frame.traffic = rpc::TrafficClass::System;
+    frame.message_id = message_id;
+    frame.session_epoch = session_epoch;
+    frame.has_outcome = true;
+    frame.success = false;
+    frame.error = MakeError(code, message);
+    auto bytes = rpc::EncodeFramedSessionFrame(frame, 8 * 1024 * 1024);
+    CHECK(bytes);
+    peer.SendRaw(std::string(reinterpret_cast<const char*>(bytes.value().data()), bytes.value().size()));
+}
+
+/** 同一连接、两个显式 ID：旧 Call 等待以 Cancelled + RequestCommitted 结束，新尝试已在同一连接被对端接收，
+ * 旧正常终态被处理时新等待仍在，新等待最后由自身终态完成。不睡眠、不依赖不具区分力的顺序发送。 */
+void AttemptSameConnOldEndCall()
+{
+    AppHost a("attempt-call-a"); // 真实客户端
+    RawTcpListener b(
+        "attempt-call-b"); // 脚本化 server 侧对端（“attempt-call-b” > “attempt-call-a”，listener 为握手 epoch owner）
+
+    /** 1. boot：建立正向链路，后续尝试复用同一连接。先登记协程让拨号在调度器上推进，再 Accept。 */
+    auto boot = SubmitCo([&] { return bbt_co_await a.client->Call(b.Target(), MakeCall("boot", 1, "k"), UntilMs()); });
+    b.Accept();                                // 阻塞等拨方连接（boot Call 的协程发起拨号）
+    const std::uint64_t epoch = b.Handshake(); // 完成 Hello/HelloAck（server 侧脚本化）
+    auto boot_frame = b.ReadFrame();
+    CHECK(boot_frame.kind == rpc::FrameKind::Call);
+    CHECK(boot_frame.request_id == "boot");
+    SendReplyFrame(b, boot_frame, epoch);
+    CHECK(Get(boot));
+    CHECK(a.client->Stats().links == 1); // 单连接
+
+    /** 2. 旧调用：显式 ~bbt-rpc:100，key "k"；逻辑提交后取消，旧等待以 Cancelled + RequestCommitted 结束。 */
+    std::promise<bbt::coroutine::detail::Coroutine*> handle1;
+    auto handle1_future = handle1.get_future();
+    auto old_call = SubmitCo([&] {
+        handle1.set_value(g_bbt_tls_coroutine_co);
+        return bbt_co_await a.client->Call(b.Target(), MakeCall("~bbt-rpc:100", 2, "k"), UntilMs(10s));
+    });
+    auto* co1 = Get(handle1_future);
+    CHECK(co1 != nullptr);
+    auto old_frame = b.ReadFrame();
+    CHECK(old_frame.kind == rpc::FrameKind::Call);
+    CHECK(old_frame.request_id == "~bbt-rpc:100"); // 收到旧操作
+    co1->RequestCancel();
+    const auto old_outcome = Get(old_call);
+    CHECK(!old_outcome);
+    CHECK(old_outcome.error().code == ErrorCode::Cancelled);
+    CHECK(old_outcome.error().request_phase == bbt::infra::RequestPhase::RequestCommitted);
+
+    /** 3. 新调用：同业务键 "k"，新 ID ~bbt-rpc:200；同一连接被对端读出新的显式 ID。 */
+    std::promise<bbt::coroutine::detail::Coroutine*> handle2;
+    auto handle2_future = handle2.get_future();
+    auto new_call = SubmitCo([&] {
+        handle2.set_value(g_bbt_tls_coroutine_co);
+        return bbt_co_await a.client->Call(b.Target(), MakeCall("~bbt-rpc:200", 3, "k"), UntilMs(10s));
+    });
+    auto* co2 = Get(handle2_future);
+    CHECK(co2 != nullptr);
+    auto new_frame = b.ReadFrame();
+    CHECK(new_frame.kind == rpc::FrameKind::Call);
+    CHECK(new_frame.request_id == "~bbt-rpc:200"); // 同一连接读出新的显式 ID
+    CHECK(a.client->Stats().links == 1);           // 同一连接，未新建 link
+
+    /** 4. 回发旧正常终态（迟到的 ~bbt-rpc:100 回复；旧等待已取消，此回复应被丢弃）。 */
+    SendReplyFrame(b, old_frame, epoch);
+
+    /** 5. 旧终态处理中，新等待仍 pending（迟到旧终态不得翻转新等待）。 */
+    CHECK(new_call.wait_for(0s) != std::future_status::ready);
+
+    /** 6. 完成一项独立 Call 作为有序接收证据（同字节流后续帧仍可达且按序送达）。 */
+    auto extra =
+        SubmitCo([&] { return bbt_co_await a.client->Call(b.Target(), MakeCall("extra", 4, "k"), UntilMs()); });
+    auto extra_frame = b.ReadFrame();
+    CHECK(extra_frame.kind == rpc::FrameKind::Call);
+    CHECK(extra_frame.request_id == "extra");
+    SendReplyFrame(b, extra_frame, epoch);
+    const auto extra_outcome = Get(extra);
+    CHECK(extra_outcome);
+    CHECK(extra_outcome.value().RequestId() == "extra"); // 检查身份
+
+    /** 独立 Call 未翻转新等待。 */
+    CHECK(new_call.wait_for(0s) != std::future_status::ready);
+
+    /** 7. 给新操作的正确终态。 */
+    SendReplyFrame(b, new_frame, epoch);
+    const auto new_outcome = Get(new_call);
+    CHECK(new_outcome);
+    CHECK(new_outcome.value().RequestId() == "~bbt-rpc:200"); // 检查身份：新等待由自身终态完成
+    std::cout << "attempt same conn old end call: late ~bbt-rpc:100 reply does not settle ~bbt-rpc:200 wait\n";
+}
+
+/** 同一连接、两个显式 ID：旧 Send(true) 的旧帧先到达对端，显式取消后旧确认等待以
+ * Cancelled + RequestCommitted 结束；新尝试已在同一连接被对端接收；迟到的旧成功确认
+ * 被丢弃、不翻转新等待；独立 Call 证明 reader 按序进展；新等待仅由自身的不同合法
+ * 错误终态结束。不睡眠、不依赖不具区分力的顺序发送。 */
+void AttemptSameConnOldEndSend()
+{
+    AppHost a("attempt-send-a");
+    RawTcpListener b("attempt-send-b");
+
+    /** boot：建立正向链路，后续尝试复用同一连接。 */
+    auto boot = SubmitCo([&] { return bbt_co_await a.client->Call(b.Target(), MakeCall("boot", 1, "k"), UntilMs()); });
+    b.Accept();
+    const std::uint64_t epoch = b.Handshake();
+    auto boot_frame = b.ReadFrame();
+    CHECK(boot_frame.kind == rpc::FrameKind::Call);
+    CHECK(boot_frame.request_id == "boot");
+    SendReplyFrame(b, boot_frame, epoch);
+    CHECK(Get(boot));
+    CHECK(a.client->Stats().links == 1);
+
+    /** 旧发送：显式 ~bbt-rpc:100，key "k"，要求远端确认；旧帧先到达对端。 */
+    std::promise<bbt::coroutine::detail::Coroutine*> handle1;
+    auto handle1_future = handle1.get_future();
+    auto old_send = SubmitCo([&] {
+        handle1.set_value(g_bbt_tls_coroutine_co);
+        return bbt_co_await a.client->Send(b.Target(), MakeSend("~bbt-rpc:100", 2, "k"), SendUntil(10s, true));
+    });
+    auto old_frame = b.ReadFrame();
+    CHECK(old_frame.kind == rpc::FrameKind::Send);
+    CHECK(old_frame.message_id == "~bbt-rpc:100"); // 收到旧操作
+
+    /** 显式取消旧确认等待：旧帧已提交，等待以 Cancelled + RequestCommitted 结束。 */
+    auto* co1 = Get(handle1_future);
+    CHECK(co1 != nullptr);
+    co1->RequestCancel();
+    const auto old_outcome = Get(old_send);
+    CHECK(!old_outcome);
+    CHECK(old_outcome.error().code == ErrorCode::Cancelled);
+    CHECK(old_outcome.error().request_phase == bbt::infra::RequestPhase::RequestCommitted);
+
+    /** 新发送：同业务键 "k"，新 message_id ~bbt-rpc:200；同一连接被对端读出新的显式 ID。 */
+    auto new_send = SubmitCo([&] {
+        return bbt_co_await a.client->Send(b.Target(), MakeSend("~bbt-rpc:200", 3, "k"), SendUntil(10s, true));
+    });
+    auto new_frame = b.ReadFrame();
+    CHECK(new_frame.kind == rpc::FrameKind::Send);
+    CHECK(new_frame.message_id == "~bbt-rpc:200"); // 同一连接读出新的显式 ID
+    CHECK(a.client->Stats().links == 1);           // 同一连接，未新建 link
+
+    /** 回发旧成功确认（迟到的 ~bbt-rpc:100 SendAccepted；旧等待已取消，不得翻转新等待）。 */
+    SendSendAccepted(b, old_frame.message_id, epoch);
+
+    /** 完成一项独立 Call 作为有序接收证据（迟到旧终态处理后，同字节流后续帧仍可达且按序送达）。 */
+    auto extra =
+        SubmitCo([&] { return bbt_co_await a.client->Call(b.Target(), MakeCall("extra", 4, "k"), UntilMs()); });
+    auto extra_frame = b.ReadFrame();
+    CHECK(extra_frame.kind == rpc::FrameKind::Call);
+    CHECK(extra_frame.request_id == "extra");
+    SendReplyFrame(b, extra_frame, epoch);
+    const auto extra_outcome = Get(extra);
+    CHECK(extra_outcome);
+    CHECK(extra_outcome.value().RequestId() == "extra"); // 检查身份
+
+    /** 迟到旧成功确认与独立 Call 均未翻转新等待。 */
+    CHECK(new_send.wait_for(0s) != std::future_status::ready);
+
+    /** 新操作唯一终态：不同合法错误（Unavailable 失败确认），仅它结束新等待。 */
+    SendSendRejected(b, new_frame.message_id, epoch, ErrorCode::Unavailable, "peer rejected");
+    const auto new_outcome = Get(new_send);
+    CHECK(!new_outcome);
+    CHECK(new_outcome.error().code == ErrorCode::Unavailable); // 新等待由自身不同合法错误结束
+    CHECK(!new_outcome.error().request_phase.has_value());     // 确认帧错误原样交付，无本地阶段标注
+    std::cout << "attempt same conn old end send: cancelled ~bbt-rpc:100 wait + late success confirm dropped, "
+                 "~bbt-rpc:200 wait settled only by its own Unavailable confirm\n";
+}
+
+/** 出站旧 link 被替换后的物理回收：旧连接未 Released 时同对象（client owner）wait_release 以短绝对期限
+ * 到期；放行后同对象 wait_release 成功，共享 Engine 仍 Running。 */
+void HeldReleaseOutboundOldLink()
+{
+    std::atomic<bool> barrier_entered{false};
+    std::atomic<bool> release_barrier{false};
+    AppHost a("host-a"); // 远端：正常双端
+    AppHost b("host-b", {}, {}, StartMode::Native, [&](net::Engine& eng) {
+        // Idle 相位首次装测试钩子（创建 test_hooks）；真实屏障在 fixture 运行后装。
+        net::EngineTestAccess::SetShutdownBarrierOnce(eng, [] {});
+    }); // 被置换方：client 与 server 共享 engine_b；AppHost 析构自行收口 runner，无 joinable-thread terminate
+
+    /** 1. 出站旧 link 已安装：b→a 正常调用。 */
+    auto boot = SubmitCo([&] { return bbt_co_await b.client->Call(a.Target(), MakeCall("old", 1, "k"), UntilMs()); });
+    CHECK(WaitUntil([&] { return a.calls.load() == 1; }));
+    a.ProcessAdmitted(Echo);
+    CHECK(Get(boot));
+
+    /** 旧探针：正常成功往返后，同一本地 client/peer 可取到非零 id 的旧连接探针。 */
+    auto old_probe = rpc::detail::LinkReleaseProbe::ForPeer(*b.client, "host-a");
+    CHECK(old_probe.has_value());
+    CHECK(old_probe->Id() != 0);
+
+    /** engine 一次性屏障：fixture 已运行后安装，拦截旧连接 ShutdownOwner 关 backend 前。 */
+    net::EngineTestAccess::SetShutdownBarrierOnce(*b.engine, [&] {
+        barrier_entered.store(true, std::memory_order_release);
+        while (!release_barrier.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    });
+
+    /** RAII：任何异常出口先放行屏障，再析构宿主（AppHost 析构 Close + join runner，绝不留 joinable 线程）。 */
+    struct ReleaseGuard {
+        std::atomic<bool>& flag;
+
+        ~ReleaseGuard() { flag.store(true, std::memory_order_release); }
+    } release_guard{release_barrier};
+
+    /** 2. 同身份入站连接建立并安装：InstallSession 覆盖旧出站路由，旧会话被 Kill，
+     *    其连接进入 ShutdownOwner 并被屏障扣留。换路后同一 peer 的路由赢家应切为新连接。 */
+    RawTcpPeer peer(b.address);
+    PeerHelloHandshake(peer, "host-a");
+    /** 关前必须已进屏障：路由已换不代表暂停点在第一次 Close 之前抵达。 */
+    CHECK(WaitUntil([&] { return barrier_entered.load(std::memory_order_acquire); }, 5s));
+    /** 新赢家直接由 probe 断言：非零且与旧探针不同；不保留副本、不重复检查。 */
+    CHECK(WaitUntil(
+        [&] {
+            const auto p = rpc::detail::LinkReleaseProbe::ForPeer(*b.client, "host-a");
+            return p.has_value() && p->Id() != 0 && p->Id() != old_probe->Id();
+        },
+        5s));
+    CHECK(!old_probe->Released()); // 屏障扣住期：探针锚定的旧连接未释放
+
+    /** 3. 旧目标未 Released：同对象（client owner）wait_release 以短绝对期限到期，首因不变；
+     *    同一旧连接在两个返回点分别采样：屏障扣住期为 false，放行后第二次 Close 返回点为 true。
+     *    全 Engine 屏障由 reactor 一次性装设，本样本不宣称只扣住旧连接，也不据此证明独因。 */
+    const auto short_deadline = std::chrono::steady_clock::now() + 800ms;
+    auto staged = CallCo([&] {
+        auto first = bbt_co_await b.client->Close(
+            bbt::infra::CloseOptions{bbt::infra::CloseMode::Immediate, true, {}, short_deadline});
+        CHECK(!first);
+        CHECK(first.error().code == ErrorCode::TimedOut);
+        CHECK(b.client->CloseReason().has_value());
+        CHECK(!old_probe->Released()); // 屏障扣住期：同一旧连接尚未释放
+
+        /** 4. 释放屏障。 */
+        release_barrier.store(true, std::memory_order_release);
+
+        /** 5. 放行后同一协程同一 owner 第二次 Close 返回点采样旧探针：
+         *    无 WaitUntil/休眠/轮询；同一旧连接已释放，共享 Engine 仍 Running。 */
+        auto second = bbt_co_await b.client->Close(
+            bbt::infra::CloseOptions{
+                bbt::infra::CloseMode::Immediate, true, {}, std::chrono::steady_clock::now() + 5s});
+        CHECK(second);
+        CHECK(old_probe->Released());
+        CHECK(b.engine->Phase() == net::EnginePhase::Running);
+        return bbt::infra::result<void>::ok();
+    });
+    CHECK(staged);
+    std::cout
+        << "held release outbound old link: wait_release TimedOut before Released, ok after release, engine running\n";
+}
+
+/** 入站旧 link 被替换后的物理回收：旧连接未 Released 时服务端同对象 wait_release 以短绝对期限
+ * 到期；放行后同对象 wait_release 成功，共享 Engine 仍 Running。 */
+void HeldReleaseInboundOldLink()
+{
+    std::atomic<bool> barrier_entered{false};
+    std::atomic<bool> release_barrier{false};
+    AppHost a("host-a"); // 远端发起旧调用
+    AppHost b("host-b", {}, {}, StartMode::Native, [&](net::Engine& eng) {
+        // Idle 相位首次装测试钩子（创建 test_hooks）；真实屏障在 fixture 运行后装。
+        net::EngineTestAccess::SetShutdownBarrierOnce(eng, [] {});
+    }); // 置换方：server 侧持有入站旧 link，client+server 共享 engine_b
+
+    /** 1. 入站旧 link 已安装：a→b 正常调用被 b 接纳。 */
+    auto boot = SubmitCo([&] { return bbt_co_await a.client->Call(b.Target(), MakeCall("old", 1, "k"), UntilMs()); });
+    CHECK(WaitUntil([&] { return b.calls.load() == 1; }));
+    b.ProcessAdmitted(Echo);
+    CHECK(Get(boot));
+
+    /** engine 一次性屏障：fixture 已运行后安装。 */
+    net::EngineTestAccess::SetShutdownBarrierOnce(*b.engine, [&] {
+        barrier_entered.store(true, std::memory_order_release);
+        while (!release_barrier.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    });
+
+    struct ReleaseGuard {
+        std::atomic<bool>& flag;
+
+        ~ReleaseGuard() { flag.store(true, std::memory_order_release); }
+    } release_guard{release_barrier};
+
+    /** 2. 同身份入站连接再次建立并安装：InstallSession 覆盖旧入站路由，旧会话被 Kill，
+     *    其连接进入 ShutdownOwner 并被屏障扣留。 */
+    RawTcpPeer peer(b.address);
+    PeerHelloHandshake(peer, "host-a");
+    CHECK(WaitUntil([&] { return barrier_entered.load(); }, 5s));
+
+    /** 3. 旧目标未 Released：服务端同对象 wait_release 以短绝对期限到期（独立于客户端侧）。 */
+    const auto short_deadline = std::chrono::steady_clock::now() + 800ms;
+    auto first = CallCo([&] {
+        return bbt_co_await b.server->Close(
+            bbt::infra::CloseOptions{bbt::infra::CloseMode::Immediate, true, {}, short_deadline});
+    });
+    CHECK(!first);
+    CHECK(first.error().code == ErrorCode::TimedOut);
+    CHECK(b.server->CloseReason().has_value());
+
+    /** 4. 释放旧连接屏障。 */
+    release_barrier.store(true, std::memory_order_release);
+
+    /** 5. 放行后服务端同对象 wait_release 成功（新绝对期限）；旧连接连接表项已回收，
+     *    共享 Engine 仍 Running。 */
+    auto second = CallCo([&] {
+        return bbt_co_await b.server->Close(
+            bbt::infra::CloseOptions{
+                bbt::infra::CloseMode::Immediate, true, {}, std::chrono::steady_clock::now() + 5s});
+    });
+    CHECK(second);
+    CHECK(b.engine->Phase() == net::EnginePhase::Running);
+    std::cout
+        << "held release inbound old link: server wait_release TimedOut before Released, ok after release, engine running\n";
+}
+
+/** 自动 ID 与退役重拨（两次独立 Send 的普通重拨，非同一次调用内换链）：自动取号的
+ * Send 在线上携带 ~bbt-rpc: 前缀与显式 AR 标志；旧链按协议违规退役、凭据物理释放
+ * 后，下一次 Send 自动重拨到新连接并取不同 attempt ID，路由赢家切到新链。对端字节
+ * 由 raw 监听对端逐帧判读。 */
+void AutoIdRedialAfterRetirement()
+{
+    AppHost a("rechain-a");
+    RawTcpListener b("rechain-b"); // identity 更大 → 对端为 epoch owner
+
+    /** 1. boot：显式 ID 建立正向链路（自动 attempt ID 计数不受显式 ID 影响）。 */
+    auto boot = SubmitCo([&] { return bbt_co_await a.client->Call(b.Target(), MakeCall("boot", 1, "k"), UntilMs()); });
+    b.Accept();
+    const std::uint64_t epoch = b.Handshake();
+    auto boot_frame = b.ReadFrame();
+    CHECK(boot_frame.kind == rpc::FrameKind::Call);
+    CHECK(boot_frame.request_id == "boot");
+    SendReplyFrame(b, boot_frame, epoch);
+    CHECK(Get(boot));
+    CHECK(a.client->Stats().links == 1);
+    auto old_probe = rpc::detail::LinkReleaseProbe::ForPeer(*a.client, "rechain-b");
+    CHECK(old_probe.has_value());
+    CHECK(old_probe->Id() != 0);
+
+    /** 2. 旧链自动 Send（空 message_id = 自动取号）：对端读到 attempt ID 前缀与显式 AR 标志。 */
+    auto first =
+        SubmitCo([&] { return bbt_co_await a.client->Send(b.Target(), MakeSend("", 2, "k"), SendUntil(10s, true)); });
+    auto first_frame = b.ReadFrame();
+    CHECK(first_frame.kind == rpc::FrameKind::Send);
+    CHECK(first_frame.message_id.rfind("~bbt-rpc:", 0) == 0); // 自动 ID 前缀
+    CHECK(first_frame.acceptance_requested.has_value() && *first_frame.acceptance_requested == true);
+    const auto old_auto_id = first_frame.message_id;
+    SendSendAccepted(b, old_auto_id, epoch);
+    CHECK(Get(first));
+
+    /** 3. 旧链退役：不可解码帧使会话按协议违规死亡，物理连接释放；旧链凭据随之 Released。 */
+    const std::string garbage("\x0f\x0f\x0f\x0f", 4);
+    std::uint8_t prefix[4];
+    rpc::EncodeFramePrefix(static_cast<std::uint32_t>(garbage.size()), prefix);
+    b.SendRaw(std::string(reinterpret_cast<const char*>(prefix), sizeof(prefix)) + garbage);
+    CHECK(WaitUntil([&] { return a.engine->CountConnections() == 0; }, 3s));
+    CHECK(old_probe->Released());
+
+    /** 4. 换链重拨：第二个自动 Send 必须落到新连接，且取到与旧链不同的新 attempt ID。 */
+    auto second =
+        SubmitCo([&] { return bbt_co_await a.client->Send(b.Target(), MakeSend("", 3, "k"), SendUntil(10s, true)); });
+    b.Accept(); // 第二条物理连接（新链）
+    const std::uint64_t epoch2 = b.Handshake();
+    auto second_frame = b.ReadFrame();
+    CHECK(second_frame.kind == rpc::FrameKind::Send);
+    CHECK(second_frame.message_id.rfind("~bbt-rpc:", 0) == 0);
+    CHECK(second_frame.message_id != old_auto_id); // 新链新号：换链后不重用旧 ID
+    CHECK(WaitUntil(
+        [&] {
+            const auto p = rpc::detail::LinkReleaseProbe::ForPeer(*a.client, "rechain-b");
+            return p.has_value() && p->Id() != 0 && p->Id() != old_probe->Id(); // 路由赢家已切到新链
+        },
+        3s));
+    SendSendAccepted(b, second_frame.message_id, epoch2);
+    CHECK(Get(second));
+    CHECK(a.client->Stats().links == 1);
+    std::cout << "attempt auto id rechain: old " << old_auto_id << " -> new " << second_frame.message_id
+              << " on new link\n";
+}
+
+/** 未安装出站连接的回收：拨号成功、握手起点被 Pause 钉住时，establishing 台账仍持有
+ * 有效单次拨号凭据且会话从未安装；Close(Immediate) 取消 Pause 后，物理释放被 engine
+ * 一次性屏障扣住——同一 owner 第一次 Close(wait_release) 以短绝对期限到期且凭据未
+ * 释放；放行后同一协程第二次 Close(wait_release) 成功，凭据在返回点已 Released。 */
+void UninstalledOutboundReclaim()
+{
+    std::atomic<bool> barrier_entered{false};
+    std::atomic<bool> release_barrier{false};
+    AppHost a("estab-a", {}, {}, StartMode::Native, [&](net::Engine& eng) {
+        // Idle 相位首次装测试钩子（创建 test_hooks）；真实屏障在 fixture 运行后装。
+        net::EngineTestAccess::SetShutdownBarrierOnce(eng, [] {});
+    });
+    BareListen dead; // 只作拨号目标，永不回应
+
+    auto gate = MakeDialGate(a);
+    auto pending =
+        SubmitCo([&] { return bbt_co_await a.client->Call(dead.Target(), MakeCall("p1", 1, "k"), UntilMs(10s)); });
+    CHECK(WaitUntil([&] { return gate->Entered(HookPoint::OutboundBeforeHandshake) == 1; }, 3s));
+    CHECK(a.client->Stats().sessions == 0); // 从未安装
+
+    /** 未安装凭据：establishing 台账中的有效单次拨号凭据（连接交付前即可观察）。 */
+    auto receipt = rpc::detail::LinkReleaseProbe::EstablishingReceipt(*a.client, dead.Target());
+    CHECK(receipt.has_value());
+    CHECK(!receipt->Released());
+
+    /** engine 一次性屏障：fixture 已运行后安装，拦截该连接 ShutdownOwner 关 backend 前。 */
+    net::EngineTestAccess::SetShutdownBarrierOnce(*a.engine, [&] {
+        barrier_entered.store(true, std::memory_order_release);
+        while (!release_barrier.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    });
+
+    /** RAII：任何异常出口先放行屏障，再析构宿主。 */
+    struct ReleaseGuard {
+        std::atomic<bool>& flag;
+
+        ~ReleaseGuard() { flag.store(true, std::memory_order_release); }
+    } release_guard{release_barrier};
+
+    /** 按目标连接两次 Close 的凭据核验：两次返回点分别采样同一凭据。 */
+    const auto short_deadline = Clock::now() + 800ms;
+    auto staged = CallCo([&] {
+        auto first = bbt_co_await a.client->Close(
+            bbt::infra::CloseOptions{bbt::infra::CloseMode::Immediate, true, {}, short_deadline});
+        CHECK(!first);
+        CHECK(first.error().code == ErrorCode::TimedOut);
+        CHECK(barrier_entered.load(std::memory_order_acquire)); // 到期首因：屏障扣住物理释放
+        CHECK(!receipt->Released());                            // 扣住期：未安装凭据未释放
+
+        /** 放行屏障。 */
+        release_barrier.store(true, std::memory_order_release);
+
+        /** 放行后同一协程同一 owner 第二次 Close 返回点采样：凭据已释放，Engine 仍 Running。 */
+        auto second = bbt_co_await a.client->Close(
+            bbt::infra::CloseOptions{bbt::infra::CloseMode::Immediate, true, {}, Clock::now() + 5s});
+        CHECK(second);
+        CHECK(receipt->Released());
+        CHECK(a.engine->Phase() == net::EnginePhase::Running);
+        return bbt::infra::result<void>::ok();
+    });
+    CHECK(staged);
+    const auto pending_result = Get(pending);
+    CHECK(!pending_result && pending_result.error().code == ErrorCode::Closed);
+    std::cout
+        << "attempt outbound establish reclaim: wait_release TimedOut while held, ok after release, receipt released\n";
+}
+
+/** 未安装入站连接的回收：握手起点被 Pause 钉住的入站连接尚未移交 link，server 台账
+ * 按连接持有凭据；Close(Immediate) 取消 Pause 后物理释放被 engine 一次性屏障扣住——
+ * 服务端第一次 Close(wait_release) 以短绝对期限到期且凭据未释放；放行后同一对象第二
+ * 次 Close(wait_release) 成功，凭据在返回点已 Released，raw 对端读到 EOF。 */
+void UninstalledInboundReclaim()
+{
+    std::atomic<bool> barrier_entered{false};
+    std::atomic<bool> release_barrier{false};
+    AppHost b("handshake-b", {}, {}, StartMode::Native, [&](net::Engine& eng) {
+        // Idle 相位首次装测试钩子（创建 test_hooks）；真实屏障在 fixture 运行后装。
+        net::EngineTestAccess::SetShutdownBarrierOnce(eng, [] {});
+    });
+    auto gate = MakeDialGate(b);
+    RawTcpPeer peer(b.address);
+    CHECK(WaitUntil([&] { return gate->Entered(HookPoint::InboundBeforeHandshake) == 1; }, 3s));
+
+    /** 未安装凭据：尚未移交 link 的握手连接逐条探针（本用例恰好一条）。 */
+    auto handshakes = rpc::detail::LinkReleaseProbe::ForHandshakes(*b.client);
+    CHECK(handshakes.size() == 1);
+    CHECK(handshakes[0].Id() != 0);
+    CHECK(!handshakes[0].Released());
+    CHECK(rpc::detail::ServerLedgerForTest(*b.server).handshakes == 1);
+
+    /** engine 一次性屏障：fixture 已运行后安装。 */
+    net::EngineTestAccess::SetShutdownBarrierOnce(*b.engine, [&] {
+        barrier_entered.store(true, std::memory_order_release);
+        while (!release_barrier.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    });
+
+    struct ReleaseGuard {
+        std::atomic<bool>& flag;
+
+        ~ReleaseGuard() { flag.store(true, std::memory_order_release); }
+    } release_guard{release_barrier};
+
+    /** 第一次 Close(wait_release)：屏障扣住期以短绝对期限到期，凭据未释放。 */
+    const auto short_deadline = Clock::now() + 800ms;
+    auto first = CallCo([&] {
+        return bbt_co_await b.server->Close(
+            bbt::infra::CloseOptions{bbt::infra::CloseMode::Immediate, true, {}, short_deadline});
+    });
+    CHECK(!first);
+    CHECK(first.error().code == ErrorCode::TimedOut);
+    CHECK(barrier_entered.load(std::memory_order_acquire));
+    CHECK(!handshakes[0].Released());
+
+    /** 放行屏障后第二次 Close(wait_release) 成功；凭据在返回点已释放。 */
+    release_barrier.store(true, std::memory_order_release);
+    auto second = CallCo([&] {
+        return bbt_co_await b.server->Close(
+            bbt::infra::CloseOptions{bbt::infra::CloseMode::Immediate, true, {}, Clock::now() + 5s});
+    });
+    CHECK(second);
+    CHECK(handshakes[0].Released());
+    CHECK(b.engine->Phase() == net::EnginePhase::Running);
+    CHECK(WaitUntil([&] { return b.engine->CountConnections() == 0; }, 3s));
+    CHECK(WaitUntil(
+        [&] {
+            const auto ledger = rpc::detail::ServerLedgerForTest(*b.server);
+            return ledger.links == 0 && ledger.handshakes == 0;
+        },
+        3s));
+    CHECK(peer.Eof());
+    std::cout
+        << "attempt inbound handshake reclaim: wait_release TimedOut while held, ok after release, probe released\n";
+}
+
+/** 握手成功但从未安装的入站连接回收：raw 对端完成完整握手后，服务端停在安装前
+ * 挂点——link 台账从未新增，server 按连接持有未移交的握手凭据；Close 取消 Pause
+ * 后物理释放被 engine 一次性屏障扣住，第一次 Close(wait_release) 以短绝对期限到期
+ * 且凭据未释放；放行后第二次 Close(wait_release) 成功，凭据在返回点已 Released，
+ * 共享 Engine 仍 Running，raw 对端读到 EOF。 */
+void UninstalledInboundPublishReclaim()
+{
+    std::atomic<bool> barrier_entered{false};
+    std::atomic<bool> release_barrier{false};
+    AppHost b("handshake-b", {}, {}, StartMode::Native, [&](net::Engine& eng) {
+        // Idle 相位首次装测试钩子（创建 test_hooks）；真实屏障在 fixture 运行后装。
+        net::EngineTestAccess::SetShutdownBarrierOnce(eng, [] {});
+    });
+    auto gate = std::make_shared<HookGate>();
+    gate->Arm(b, HookPoint::InboundBeforePublish);
+    RawTcpPeer peer(b.address);
+
+    /**
+     * 完整握手（B 是 epoch owner："handshake-b" < "zz-peer"）。
+     */
+    rpc::SessionFrame hello;
+    hello.kind = rpc::FrameKind::Hello;
+    hello.traffic = rpc::TrafficClass::System;
+    hello.peer_identity = "zz-peer";
+    hello.session_epoch = 1;
+    hello.connection_nonce = 0xABCDEF;
+    auto hello_bytes = rpc::EncodeFramedSessionFrame(hello, 8 * 1024 * 1024);
+    CHECK(hello_bytes);
+    peer.Send({reinterpret_cast<const char*>(hello_bytes.value().data()), hello_bytes.value().size()});
+    const auto hdr = peer.ReadExact(4);
+    const auto len = rpc::DecodeFramePrefix(reinterpret_cast<const std::uint8_t*>(hdr.data()));
+    const auto body = peer.ReadExact(len);
+    auto srv_hello = rpc::DecodeSessionFrame(reinterpret_cast<const std::uint8_t*>(body.data()), body.size());
+    CHECK(srv_hello && srv_hello.value().kind == rpc::FrameKind::Hello);
+    const auto ack_hdr = peer.ReadExact(4);
+    const auto ack_len = rpc::DecodeFramePrefix(reinterpret_cast<const std::uint8_t*>(ack_hdr.data()));
+    const auto ack_body = peer.ReadExact(ack_len);
+    auto ack = rpc::DecodeSessionFrame(reinterpret_cast<const std::uint8_t*>(ack_body.data()), ack_body.size());
+    CHECK(ack && ack.value().kind == rpc::FrameKind::HelloAck);
+    rpc::SessionFrame echo;
+    echo.kind = rpc::FrameKind::HelloAck;
+    echo.traffic = rpc::TrafficClass::System;
+    echo.peer_identity = "zz-peer";
+    echo.session_epoch = ack.value().session_epoch;
+    echo.connection_nonce = srv_hello.value().connection_nonce;
+    auto echo_bytes = rpc::EncodeFramedSessionFrame(echo, 8 * 1024 * 1024);
+    CHECK(echo_bytes);
+    peer.Send({reinterpret_cast<const char*>(echo_bytes.value().data()), echo_bytes.value().size()});
+
+    /**
+     * 握手成功、停在安装前：对端进入发布前挂点且未再推进，link 台账为空，
+     * 握手台账按连接持有未移交凭据。
+     */
+    CHECK(WaitUntil([&] { return gate->Entered(HookPoint::InboundBeforePublish) == 1; }, 3s));
+    CHECK(gate->InFlight() == 1);
+    CHECK(rpc::detail::ServerLedgerForTest(*b.server).links == 0);
+    CHECK(rpc::detail::ServerLedgerForTest(*b.server).handshakes == 1);
+    auto handshakes = rpc::detail::LinkReleaseProbe::ForHandshakes(*b.client);
+    CHECK(handshakes.size() == 1);
+    CHECK(handshakes[0].Id() != 0);
+    CHECK(!handshakes[0].Released());
+
+    /** engine 一次性屏障：fixture 已运行后安装。 */
+    net::EngineTestAccess::SetShutdownBarrierOnce(*b.engine, [&] {
+        barrier_entered.store(true, std::memory_order_release);
+        while (!release_barrier.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    });
+
+    struct ReleaseGuard {
+        std::atomic<bool>& flag;
+
+        ~ReleaseGuard() { flag.store(true, std::memory_order_release); }
+    } release_guard{release_barrier};
+
+    /** 第一次 Close(wait_release)：屏障扣住期以短绝对期限到期，凭据未释放。 */
+    const auto short_deadline = Clock::now() + 800ms;
+    auto first = CallCo([&] {
+        return bbt_co_await b.server->Close(
+            bbt::infra::CloseOptions{bbt::infra::CloseMode::Immediate, true, {}, short_deadline});
+    });
+    CHECK(!first);
+    CHECK(first.error().code == ErrorCode::TimedOut);
+    CHECK(barrier_entered.load(std::memory_order_acquire));
+    CHECK(!handshakes[0].Released());
+
+    /** 放行屏障后第二次 Close(wait_release) 成功；凭据在返回点已释放。 */
+    release_barrier.store(true, std::memory_order_release);
+    auto second = CallCo([&] {
+        return bbt_co_await b.server->Close(
+            bbt::infra::CloseOptions{bbt::infra::CloseMode::Immediate, true, {}, Clock::now() + 5s});
+    });
+    CHECK(second);
+    CHECK(handshakes[0].Released());
+    CHECK(b.engine->Phase() == net::EnginePhase::Running);
+    CHECK(WaitUntil([&] { return b.engine->CountConnections() == 0; }, 3s));
+    CHECK(WaitUntil(
+        [&] {
+            const auto ledger = rpc::detail::ServerLedgerForTest(*b.server);
+            return ledger.links == 0 && ledger.handshakes == 0;
+        },
+        3s));
+    CHECK(peer.Eof());
+    std::cout
+        << "prepr inbound publish reclaim: handshake done never installed, wait_release TimedOut while held, ok after release, probe released\n";
+}
+
+/** 握手成功但选举落败、从未安装的出站连接回收：同 peer identity 已有已安装入站
+ * 赢家（本地身份大于对端，安装选举保留入站方向），另开 endpoint 的新出站握手在
+ * 对端安装前挂点之后于选举中落败——该连接从未成为 link，其单次拨号凭据留在
+ * establishing 台账；提前取得该凭据副本后，物理释放被 engine 一次性屏障扣住，
+ * 第一次 Close(wait_release) 以短绝对期限到期且凭据未释放；放行后第二次
+ * Close(wait_release) 成功，凭据在返回点已 Released，共享 Engine 仍 Running，
+ * 路由赢家保持原入站会话，触发拨号的调用以 owner 关闭收场而非拨号失败早退。 */
+void OutboundElectionLoserReclaim()
+{
+    std::atomic<bool> barrier_entered{false};
+    std::atomic<bool> release_barrier{false};
+    AppHost b("app-b");
+    AppHost a("zz-loser-host", {}, {}, StartMode::Native, [&](net::Engine& eng) {
+        // Idle 相位首次装测试钩子（创建 test_hooks）；真实屏障在 fixture 运行后装。
+        net::EngineTestAccess::SetShutdownBarrierOnce(eng, [] {});
+    });
+
+    /** 1. boot：对端拨入建立入站赢家（a 侧 by_identity 持有该入站 link）。 */
+    auto boot = SubmitCo([&] { return bbt_co_await b.client->Call(a.Target(), MakeCall("boot", 1, "k"), UntilMs()); });
+    CHECK(WaitUntil([&] { return a.calls.load() == 1; }));
+    a.ProcessAdmitted(Echo);
+    CHECK(Get(boot));
+    CHECK(a.client->Stats().links == 1);
+    auto winner = rpc::detail::LinkReleaseProbe::ForPeer(*a.client, "app-b");
+    CHECK(winner.has_value());
+    CHECK(winner->Id() != 0);
+    CHECK(!winner->Released());
+
+    /** 2. 对端安装前挂点：新出站握手完成后、对端落败处置前停住，固定握手成功窗口。 */
+    auto gate = std::make_shared<HookGate>();
+    gate->Arm(b, HookPoint::InboundBeforePublish);
+
+    /** 3. engine 一次性屏障：先装，落败连接是其后第一条进入 ShutdownStage 的连接。 */
+    net::EngineTestAccess::SetShutdownBarrierOnce(*a.engine, [&] {
+        barrier_entered.store(true, std::memory_order_release);
+        while (!release_barrier.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    });
+
+    struct ReleaseGuard {
+        std::atomic<bool>& flag;
+
+        ~ReleaseGuard() { flag.store(true, std::memory_order_release); }
+    } release_guard{release_barrier};
+
+    /** 4. 触发新 endpoint 出站拨号：完整握手在两侧完成，随后 a 侧选举落败。 */
+    auto pending =
+        SubmitCo([&] { return bbt_co_await a.client->Call(b.Target(), MakeCall("loser", 2, "k"), UntilMs(10s)); });
+    CHECK(WaitUntil([&] { return gate->Entered(HookPoint::InboundBeforePublish) == 1; }, 3s));
+    CHECK(gate->InFlight() == 1);
+    CHECK(WaitUntil([&] { return barrier_entered.load(std::memory_order_acquire); }, 3s));
+
+    /**
+     * 5. 提前取落败拨号凭据：establishing 台账按本次拨号 endpoint 持有有效单次
+     * 拨号凭据（唯一一次指向该 endpoint 的拨号，非赢家入站连接）；赢家未变。
+     */
+    auto receipt = rpc::detail::LinkReleaseProbe::EstablishingReceipt(*a.client, b.Target());
+    CHECK(receipt.has_value());
+    CHECK(!receipt->Released());
+    CHECK(a.client->Stats().links == 1);
+    auto winner_still = rpc::detail::LinkReleaseProbe::ForPeer(*a.client, "app-b");
+    CHECK(winner_still.has_value());
+    CHECK(winner_still->Id() == winner->Id());
+    CHECK(!winner_still->Released());
+
+    /** 6. 按目标凭据两次 Close：两次返回点分别采样同一凭据。 */
+    const auto short_deadline = Clock::now() + 800ms;
+    auto staged = CallCo([&] {
+        auto first = bbt_co_await a.client->Close(
+            bbt::infra::CloseOptions{bbt::infra::CloseMode::Immediate, true, {}, short_deadline});
+        CHECK(!first);
+        CHECK(first.error().code == ErrorCode::TimedOut);
+        CHECK(barrier_entered.load(std::memory_order_acquire)); // 到期首因：屏障扣住物理释放
+        CHECK(!receipt->Released());                            // 扣住期：落败凭据未释放
+
+        /** 放行屏障。 */
+        release_barrier.store(true, std::memory_order_release);
+
+        /** 放行后同一协程同一 owner 第二次 Close 返回点采样：凭据已释放，Engine 仍 Running。 */
+        auto second = bbt_co_await a.client->Close(
+            bbt::infra::CloseOptions{bbt::infra::CloseMode::Immediate, true, {}, Clock::now() + 5s});
+        CHECK(second);
+        CHECK(receipt->Released());
+        CHECK(a.engine->Phase() == net::EnginePhase::Running);
+        return bbt::infra::result<void>::ok();
+    });
+    CHECK(staged);
+
+    /**
+     * 触发拨号的调用拿到赢家会话后被 owner 关闭结算：未提交 Closed、已提交
+     * OutcomeUnknown——两者都排除拨号/握手失败早退。
+     */
+    const auto pending_result = Get(pending);
+    CHECK(!pending_result);
+    CHECK(pending_result.error().code == ErrorCode::Closed || pending_result.error().code == ErrorCode::OutcomeUnknown);
+    std::cout << "prepr outbound loser reclaim: handshake done lost election never installed, wait_release TimedOut "
+                 "while held, ok after release, receipt released, winner unchanged\n";
+}
+
+/** 默认关闭后的对象寿命回归（owner-lifetime 修复专项）：复用出站选举落败的正向
+ * 场景——入站赢家已安装、新出站握手成功后选举落败从未安装，其 establishing
+ * 记录保留、落败连接凭据被 engine 一次性屏障扣住仍待回收。随后只用默认
+ * CloseOptions（Immediate、wait_release=false）关闭并释放全部业务句柄
+ * （client/server facade）与临时强引用（凭据/探针副本），不加 Stats、不发起
+ * 第二次 Close、不等物理回收：落败连接的回收由 engine 自然完成，共享 Engine
+ * 全程保持 Running。寿命见证是非 owning 的 weak_ptr<SessionHooks>：该受控检查
+ * 点控制器仅由 owner 台账持有（两个 facade 就绪后句柄副本即取即弃，use_count
+ * 必须为 1；产品只在台账成员存一份，封口与析构只改控制器内部状态、从不重置
+ * 成员），其过期即 owner 台账销毁。台账仅存的强引用是 SessionCore.owner 与
+ * ServerState.owner，故台账销毁同时证明赢家会话核心（共享建立结果的最终
+ * 载体）与全部会话强引用先行消亡——未清账的 establishing 记录与待回收连接
+ * 不阻碍对象销毁，默认关闭后不依赖 Stats、二次 Close 或等待回收再次清账。 */
+void OwnerLifetimeAfterDefaultClose()
+{
+    AppHost b("app-b");
+    auto gate = std::make_shared<HookGate>();
+    gate->Arm(b, HookPoint::InboundBeforePublish);
+
+    /**
+     * 观察侧 owner 手工装配：AppHost 析构会代替测试关闭业务句柄并停 Engine，
+     * 本用例必须在断言窗口内显式控制句柄释放且共享 Engine 保持 Running，
+     * 不能依赖任何辅助析构在见证过期前清账。
+     */
+    auto a_engine = net::Engine::Create(std::shared_ptr<net::RawHandler>{});
+    // Idle 相位首次装测试钩子（创建 test_hooks）；真实屏障在拨号前装。
+    net::EngineTestAccess::SetShutdownBarrierOnce(*a_engine, [] {});
+    rpc::ClientOptions a_client_options;
+    a_client_options.SetLocalIdentity("zz-owner-life").SetTrustedNetworkPlaintext(true);
+    auto made_client = rpc::CoRpcClient::Create(a_engine, a_client_options);
+    CHECK(made_client);
+    auto a_client = std::move(made_client).value();
+    rpc::AdmissionHandler a_handler = [](rpc::AdmissionItem&& item) -> bbt::infra::result<void> {
+        if (item.reply) {
+            auto response = Echo(item.request);
+            SubmitCo([reply = item.reply, response = std::move(response)]() mutable {
+                return bbt_co_await reply->Complete(std::move(response));
+            });
+        }
+        if (item.lease) {
+            (void)item.lease->Release();
+        }
+        return bbt::infra::result<void>::ok();
+    };
+    rpc::ServerOptions a_server_options;
+    std::error_code address_error;
+    a_server_options.SetListenAddress(net::Address::Ip("127.0.0.1", 0, address_error));
+    CHECK(!address_error);
+    auto made_server = rpc::CoRpcServer::Create(a_engine, a_client, a_handler, a_server_options);
+    CHECK(made_server);
+    auto a_server = std::move(made_server).value();
+
+    std::atomic<bool> barrier_entered{false};
+    std::atomic<bool> release_barrier{false};
+
+    /**
+     * 寿命见证取得：受控检查点控制器的句柄副本即取即弃；两个 facade 就绪后
+     * 引用计数为 1，证明 facade/ServerState/会话均未复制 hooks，唯一持有者
+     * 是 owner 台账成员。
+     */
+    std::weak_ptr<rpc::SessionHooks> owner_hooks_witness;
+    {
+        auto handle = a_client->Hooks();
+        CHECK(handle);
+        owner_hooks_witness = handle;
+    }
+    CHECK(owner_hooks_witness.use_count() == 1);
+
+    /**
+     * 失败路径兜底：断言中途抛出时放行屏障并收口 runner，防止屏障扣住 engine
+     * 线程或 joinable thread terminate 掩盖真实失败；engine 停止只发生在失败
+     * 路径，成功路径在全部断言后显式执行同一收口。
+     */
+    struct EngineRunnerGuard {
+        std::shared_ptr<net::Engine> engine;
+        std::atomic<bool>* release_barrier{nullptr};
+        std::thread runner;
+        bool done{false};
+
+        void Close()
+        {
+            if (done) {
+                return;
+            }
+            done = true;
+            if (release_barrier != nullptr) {
+                release_barrier->store(true, std::memory_order_release);
+            }
+            (void)engine->Close();
+            if (runner.joinable()) {
+                runner.join();
+            }
+        }
+
+        ~EngineRunnerGuard() { Close(); }
+    } a_guard;
+
+    a_guard.engine = a_engine;
+    a_guard.release_barrier = &release_barrier;
+    net::EngineConfig a_config;
+    a_config.runtime_progress = net::RuntimeProgress::Independent;
+    a_config.options.num_event_loop = 1;
+    a_config.listen_addresses = {a_server_options.ListenAddress()};
+    a_guard.runner = std::thread([a_engine, a_config] { (void)a_engine->Run(a_config); });
+    CHECK(WaitUntil([&] { return a_engine->Phase() == net::EnginePhase::Running; }));
+    auto started = a_server->Start();
+    CHECK(started);
+    const auto a_local = a_server->LocalAddress();
+    CHECK(a_local);
+    const auto a_target = "tcp://127.0.0.1:" + std::to_string(a_local.value().Port());
+
+    /** boot：对端拨入建立入站赢家（a 侧 by_identity 持有该入站 link）。 */
+    auto boot = SubmitCo([&] { return bbt_co_await b.client->Call(a_target, MakeCall("boot", 1, "k"), UntilMs()); });
+    std::optional<rpc::detail::LinkReleaseProbe> winner;
+    CHECK(WaitUntil([&] {
+        winner = rpc::detail::LinkReleaseProbe::ForPeer(*a_client, "app-b");
+        return winner.has_value();
+    }));
+    CHECK(winner->Id() != 0);
+    CHECK(!winner->Released());
+    CHECK(Get(boot));
+
+    /** 真实屏障先装：落败连接是其後第一条进入 ShutdownStage 的连接。 */
+    net::EngineTestAccess::SetShutdownBarrierOnce(*a_engine, [&] {
+        barrier_entered.store(true, std::memory_order_release);
+        while (!release_barrier.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    });
+
+    /** 触发新 endpoint 出站拨号：完整握手在两侧完成，随后 a 侧选举落败。 */
+    auto pending =
+        SubmitCo([&] { return bbt_co_await a_client->Call(b.Target(), MakeCall("loser", 2, "k"), UntilMs(10s)); });
+    CHECK(WaitUntil([&] { return gate->Entered(HookPoint::InboundBeforePublish) == 1; }, 3s));
+    CHECK(gate->InFlight() == 1);
+    CHECK(WaitUntil([&] { return barrier_entered.load(std::memory_order_acquire); }, 3s));
+
+    /** 共享建立结果与尚待回收的连接：establishing 记录保留、凭据未释放、
+     *  路由赢家保持原入站会话。 */
+    auto receipt = rpc::detail::LinkReleaseProbe::EstablishingReceipt(*a_client, b.Target());
+    CHECK(receipt.has_value());
+    CHECK(!receipt->Released());
+    auto winner_still = rpc::detail::LinkReleaseProbe::ForPeer(*a_client, "app-b");
+    CHECK(winner_still.has_value());
+    CHECK(winner_still->Id() == winner->Id());
+
+    /** 默认 CloseOptions（Immediate、wait_release=false）关闭全部业务句柄。 */
+    CHECK(CloseClient(a_client, {}));
+    CHECK(CloseServer(a_server, {}));
+
+    /** 触发拨号的调用拿到共享建立结果（赢家会话）后被 owner 关闭结算：未提交
+     *  Closed、已提交 OutcomeUnknown——两者都排除拨号/握手失败早退。 */
+    const auto pending_result = Get(pending);
+    CHECK(!pending_result);
+    CHECK(pending_result.error().code == ErrorCode::Closed || pending_result.error().code == ErrorCode::OutcomeUnknown);
+
+    /** 释放全部业务句柄与临时强引用；释放点上落败连接仍待回收、establishing
+     *  记录未清账。 */
+    a_client.reset();
+    a_server.reset();
+    winner.reset();
+    winner_still.reset();
+    CHECK(!receipt->Released());
+    receipt.reset();
+
+    /** 放行屏障后不加任何清账入口（无 Stats、无第二次 Close、无等待回收）：
+     *  对象销毁只由非 owning 见证判定——检查点控制器过期即 owner 台账销毁。 */
+    release_barrier.store(true, std::memory_order_release);
+    CHECK(WaitUntil([&] { return owner_hooks_witness.expired(); }, 5s));
+    CHECK(a_engine->Phase() == net::EnginePhase::Running);
+    CHECK(WaitUntil([&] { return a_engine->CountConnections() == 0; }, 3s));
+
+    a_guard.Close();
+    std::cout << "prepr owner lifetime: default close with pending establishing record, handles released, hooks "
+                 "witness expired, engine stayed running\n";
+}
+
+/**
+ * ---- 取号后暂停点（私有一次性接缝）：单次 Call/Send 内真实换链 ----
+ * 共同契约：一次性屏障在 Budget/编码/登记/Enqueue 前捕获本次调用的首个 attempt
+ * ID；随后测试自有 raw 对端以同身份真实拨入（本端身份字典序更大，入站覆盖出站
+ * 路由），确认选举胜者变更且旧连接物理释放后才放行；同一次调用在死链 fencing
+ * 点重取号，恰好一帧业务帧落在换链拨入的新物理连接上，旧链 boot 往返后全程零
+ * 业务帧。单帧判别直接在接收侧连接字节/解码层逐帧完成（ReadFrame + 真实
+ * SessionFrameDecoder），不依赖 AppHost admission 计数——接纳回调是 AppHost 的
+ * admission 边界而非逐连接收帧，RpcInbound 处理旧 epoch 时可直接丢弃帧，接纳
+ * 计数不等于线上帧数。协议控制帧（Hello/HelloAck 握手、SendAccepted 接纳确认）
+ * 不计入业务帧计数，逐帧显式分类区分；异常帧/重复/残帧/读取超时按失败揭示，
+ * 不作为 EOF 或过滤掉。旧连接以单次消费式 Eof() 判别「boot 后零字节 + 实际收口」
+ * （TCP 先递数据后递 EOF，单次 recv 命中 EOF 即流上无遗留字节；命中数据或超时
+ * 都是异常，不得放行，也不循环 Eof 吃掉多余字节）；新物理连接从握手完成读到
+ * 目标帧，再读到操作完成后独立有序 marker（同车道同键 FIFO 保序），最后干净
+ * 收口无补发。全程有界等待真实状态变化，不睡眠、不猜定时、不用两次调用拼凑
+ * 单帧证据。
+ */
+
+/** 取号屏障共享状态：回调按值持有，任何出口下等待协程存活期都有效。 */
+struct AttemptBarrierState {
+    std::mutex mu;
+    std::string first_id;
+    std::atomic<bool> arrived{false};
+    std::atomic<bool> released{false};
+    std::atomic<bool> timed_out{false};
+    std::shared_ptr<bbt::coroutine::sync::CoWaiter> release_waiter;
+
+    std::string TakeFirstId()
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        return first_id;
+    }
+};
+
+/** 注册一次性取号屏障：复制首个 attempt ID（view 仅回调期有效）、标记到达，
+ *  然后在释放门上以协程原生 Wait 分片等待——不占死 worker，同进程换链驱动
+ *  拨入才能在屏障期推进。回调自身超时只放行，由用例断言揭示。 */
+std::shared_ptr<AttemptBarrierState> ArmAttemptIdBarrierOnce()
+{
+    auto state = std::make_shared<AttemptBarrierState>();
+    state->release_waiter = bbt::coroutine::sync::CoWaiter::Create();
+    CHECK(state->release_waiter);
+    rpc::detail::SetAttemptIdBarrierOnceForTest([state](std::string_view id) {
+        {
+            std::lock_guard<std::mutex> lock(state->mu);
+            state->first_id.assign(id);
+        }
+        state->arrived.store(true, std::memory_order_release);
+        const auto deadline = Clock::now() + 5s;
+        for (;;) {
+            if (state->released.load(std::memory_order_acquire)) {
+                return;
+            }
+            if (Clock::now() >= deadline) {
+                state->timed_out.store(true, std::memory_order_release);
+                return;
+            }
+            (void)state->release_waiter->Wait({std::min(deadline, Clock::now() + 50ms)});
+        }
+    });
+    return state;
+}
+
+/** RAII：任何出口先清掉未消费的屏障槽位、打开释放门（含唤醒等待中的回调），
+ *  再有界等待已提交调用退出。回调按值持有共享状态，等待协程即使晚于本对象
+ *  析构才被调度也不引用测试栈。 */
+struct AttemptBarrierGuard {
+    std::shared_ptr<AttemptBarrierState> state;
+    std::function<bool()> wait_submitted;
+
+    ~AttemptBarrierGuard()
+    {
+        rpc::detail::SetAttemptIdBarrierOnceForTest({});
+        if (state) {
+            state->released.store(true, std::memory_order_release);
+            if (state->release_waiter) {
+                state->release_waiter->Notify();
+            }
+        }
+        if (wait_submitted) {
+            (void)wait_submitted();
+        }
+    }
+};
+
+/** RawTcpPeer 上的 wire 帧读写（与 RawTcpListener::ReadFrame/SendFrame 同构，
+ *  复用既有编解码 helper；对端 fd 在 support 类内私有，经 Send/ReadExact 使用）。 */
+rpc::SessionFrame ReadFrameOnPeer(RawTcpPeer& peer)
+{
+    const auto prefix = peer.ReadExact(4);
+    const auto length = rpc::DecodeFramePrefix(reinterpret_cast<const std::uint8_t*>(prefix.data()));
+    CHECK(length > 0 && length <= 8 * 1024 * 1024);
+    const auto body = peer.ReadExact(length);
+    auto decoded = rpc::DecodeSessionFrame(reinterpret_cast<const std::uint8_t*>(body.data()), body.size());
+    CHECK(decoded);
+    return std::move(decoded).value();
+}
+
+void SendFrameOnPeer(RawTcpPeer& peer, const rpc::SessionFrame& frame)
+{
+    auto bytes = rpc::EncodeFramedSessionFrame(frame, 8 * 1024 * 1024);
+    CHECK(bytes);
+    peer.Send(std::string(reinterpret_cast<const char*>(bytes.value().data()), bytes.value().size()));
+}
+
+/** 换链拨入连接上给入站 Call 回成功 Response（按帧关联字段原样回映）。 */
+void SendReplyOnPeer(RawTcpPeer& peer, const rpc::SessionFrame& call_frame, std::uint64_t session_epoch)
+{
+    auto request = rpc::RequestFromSessionFrame(call_frame);
+    CHECK(request);
+    auto response = rpc::Response::FromRequest(request.value());
+    response.SetPayload(request.value().Payload());
+    auto frame = rpc::ResponseToSessionFrame(response, session_epoch);
+    CHECK(frame);
+    SendFrameOnPeer(peer, frame.value());
+}
+
+/** 换链拨入连接上按票据回 SendAccepted 控制帧；票据关联由 a 侧 pending 匹配
+ *  （op 完成）证明，控制帧不计入业务帧计数。 */
+void SendSendAcceptedOnPeer(RawTcpPeer& peer, const std::string& message_id, std::uint64_t session_epoch)
+{
+    rpc::SessionFrame frame;
+    frame.kind = rpc::FrameKind::SendAccepted;
+    frame.traffic = rpc::TrafficClass::System;
+    frame.message_id = message_id;
+    frame.session_epoch = session_epoch;
+    frame.has_outcome = true;
+    frame.success = true;
+    SendFrameOnPeer(peer, frame);
+}
+
+/** 旧链 boot：a 真实拨入测试自有 listener 并完成一次往返。listener 身份字典序
+ *  更小（epoch owner），RawTcpListener::Handshake 的身份顺序假设不适用，按真实
+ *  顺序脚本化握手：读拨方 Hello → 写本端 Hello proposal → 写选定 HelloAck →
+ *  读拨方 HelloAck echo；随后恰读一帧 boot 业务帧并回 Response。boot 后旧链
+ *  不再有读事件（目标操作尚在取号屏障前，首号编码/入队均未发生）。 */
+void BootOldChainWithOwnerHandshake(
+    AppHost& a, RawTcpListener& listener, const std::string& listener_identity, const std::string& dialer_identity)
+{
+    auto boot =
+        SubmitCo([&] { return bbt_co_await a.client->Call(listener.Target(), MakeCall("boot", 1, "k"), UntilMs()); });
+    listener.Accept();
+    const auto dialer_hello = listener.ReadFrame();
+    CHECK(dialer_hello.kind == rpc::FrameKind::Hello);
+    CHECK(dialer_hello.peer_identity == dialer_identity);
+    CHECK(dialer_hello.session_epoch != 0);
+    rpc::SessionFrame own;
+    own.kind = rpc::FrameKind::Hello;
+    own.traffic = rpc::TrafficClass::System;
+    own.peer_identity = listener_identity;
+    own.session_epoch = 1;
+    own.connection_nonce = 0x5EED;
+    listener.SendFrame(own);
+    rpc::SessionFrame own_ack;
+    own_ack.kind = rpc::FrameKind::HelloAck;
+    own_ack.traffic = rpc::TrafficClass::System;
+    own_ack.peer_identity = listener_identity;
+    own_ack.session_epoch = own.session_epoch;
+    own_ack.connection_nonce = dialer_hello.connection_nonce;
+    listener.SendFrame(own_ack);
+    const auto dialer_ack = listener.ReadFrame();
+    CHECK(dialer_ack.kind == rpc::FrameKind::HelloAck);
+    CHECK(dialer_ack.session_epoch == own.session_epoch);
+    CHECK(dialer_ack.connection_nonce == own.connection_nonce);
+    CHECK(dialer_ack.peer_identity == dialer_identity);
+    const auto boot_frame = listener.ReadFrame();
+    CHECK(boot_frame.kind == rpc::FrameKind::Call);
+    CHECK(boot_frame.request_id == "boot");
+    CHECK(boot_frame.session_epoch == own.session_epoch);
+    SendReplyFrame(listener, boot_frame, own.session_epoch);
+    CHECK(Get(boot));
+    CHECK(a.client->Stats().links == 1);
+}
+
+/** 真实换链（帧层观测形态）：测试自有 raw 对端以同身份真实拨入 a（拨入身份
+ *  字典序更小 → 拨入方为 epoch owner）：写 Hello proposal → 读对端 Hello →
+ *  写选定 HelloAck → 读对端 HelloAck echo；a 的入站会话覆盖出站路由并 Kill 旧
+ *  会话。胜者探针变更且旧探针 Released（旧会话已死，死链 fencing 必然成立）后
+ *  返回；拨入连接即新物理连接，目标帧在其上读出。 */
+std::shared_ptr<RawTcpPeer> SwapWinnerByRealDialIn(
+    AppHost& a,
+    const std::string& peer_identity,
+    const std::string& local_identity,
+    const rpc::detail::LinkReleaseProbe& old_probe)
+{
+    auto dialer = std::make_shared<RawTcpPeer>(a.address);
+    rpc::SessionFrame hello;
+    hello.kind = rpc::FrameKind::Hello;
+    hello.traffic = rpc::TrafficClass::System;
+    hello.peer_identity = peer_identity;
+    hello.session_epoch = 2;
+    hello.connection_nonce = 0xD1A11E;
+    SendFrameOnPeer(*dialer, hello);
+    const auto local_hello = ReadFrameOnPeer(*dialer);
+    CHECK(local_hello.kind == rpc::FrameKind::Hello);
+    CHECK(local_hello.peer_identity == local_identity);
+    rpc::SessionFrame ack;
+    ack.kind = rpc::FrameKind::HelloAck;
+    ack.traffic = rpc::TrafficClass::System;
+    ack.peer_identity = peer_identity;
+    ack.session_epoch = hello.session_epoch;
+    ack.connection_nonce = local_hello.connection_nonce;
+    SendFrameOnPeer(*dialer, ack);
+    const auto local_ack = ReadFrameOnPeer(*dialer);
+    CHECK(local_ack.kind == rpc::FrameKind::HelloAck);
+    CHECK(local_ack.session_epoch == hello.session_epoch);
+    CHECK(local_ack.connection_nonce == hello.connection_nonce);
+    CHECK(local_ack.peer_identity == local_identity);
+
+    CHECK(WaitUntil(
+        [&] {
+            const auto winner = rpc::detail::LinkReleaseProbe::ForPeer(*a.client, peer_identity);
+            return winner.has_value() && winner->Id() != 0 && winner->Id() != old_probe.Id();
+        },
+        5s));
+    CHECK(WaitUntil([&] { return old_probe.Released(); }, 5s));
+    return dialer;
+}
+
+/** 单次 Call：屏障捕获自动首号 → 真实换链确认后放行 → 同一次调用重取新号。
+ *  帧层证据：旧链 boot 后到实际收口零字节（首号从未上线）；新物理连接从握手
+ *  完成恰读一帧目标业务帧（Call，线上 ID ≠ 首号），随后一帧独立有序 marker，
+ *  干净收口无补发——新旧两物理连接合计恰好一帧目标业务帧。 */
+void PrivateAttemptCallAutoSwap()
+{
+    AppHost a("zz-op-a");          // 本端身份大于对端：入站安装可覆盖出站路由
+    RawTcpListener peer("peer-b"); // listener 身份更小 → listener 为握手 epoch owner
+
+    /** 1. boot：旧链建立并完成一次真实往返（旧连接上恰一帧 boot 业务帧）。 */
+    BootOldChainWithOwnerHandshake(a, peer, "peer-b", "zz-op-a");
+    const auto old_probe = rpc::detail::LinkReleaseProbe::ForPeer(*a.client, "peer-b");
+    CHECK(old_probe.has_value());
+    CHECK(old_probe->Id() != 0);
+
+    /** 2. 注册屏障后启动唯一目标 Call；armed 窗口内无其他取号方。 */
+    const auto barrier = ArmAttemptIdBarrierOnce();
+    std::future<result<rpc::Response>> op;
+    AttemptBarrierGuard guard{barrier, [&] { return op.valid() && op.wait_for(2s) == std::future_status::ready; }};
+    op = SubmitCo([&] { return bbt_co_await a.client->Call(peer.Target(), MakeCall("", 2, "k"), UntilMs(10s)); });
+    CHECK(WaitUntil([&] { return barrier->arrived.load(std::memory_order_acquire); }, 5s));
+    const auto first_id = barrier->TakeFirstId();
+    CHECK(first_id.rfind("~bbt-rpc:", 0) == 0); // 自动 ID 前缀
+
+    /** 3. 首次入队前真实换链：换链驱动拨入（帧层新物理连接）+ 胜者变更 + 旧连接物理释放。 */
+    const auto dialer = SwapWinnerByRealDialIn(a, "peer-b", "zz-op-a", old_probe.value());
+
+    /** 4. 旧链实际收口判别：boot 往返后零字节零业务帧——首号帧从未写上旧链。 */
+    const bool old_link_closed_without_traffic = peer.Eof();
+    CHECK(old_link_closed_without_traffic);
+
+    /** 5. 放行：同一次调用在死链 fencing 点重取号并落到换链拨入连接。 */
+    barrier->released.store(true, std::memory_order_release);
+    barrier->release_waiter->Notify();
+    const auto target_frame = ReadFrameOnPeer(*dialer); // 握手完成后第一帧即目标帧
+    CHECK(target_frame.kind == rpc::FrameKind::Call);
+    CHECK(target_frame.request_id.rfind("~bbt-rpc:", 0) == 0);
+    CHECK(target_frame.request_id != first_id); // 同一次调用换链取得不同 ID
+    CHECK(target_frame.session_epoch == 2);
+    SendReplyOnPeer(*dialer, target_frame, 2);
+    const auto outcome = Get(op);
+    CHECK(outcome);
+    CHECK(!barrier->timed_out.load(std::memory_order_acquire));
+    CHECK(outcome.value().RequestId() == target_frame.request_id);
+    const auto wire_id = outcome.value().RequestId();
+
+    /** 6. 独立有序 marker：同链同车道后续帧恰一帧且按序可达（无重复、无首号补发）。 */
+    auto marker =
+        SubmitCo([&] { return bbt_co_await a.client->Call(peer.Target(), MakeCall("marker", 3, "k"), UntilMs(10s)); });
+    const auto marker_frame = ReadFrameOnPeer(*dialer);
+    CHECK(marker_frame.kind == rpc::FrameKind::Call);
+    CHECK(marker_frame.request_id == "marker");
+    CHECK(marker_frame.session_epoch == 2);
+    SendReplyOnPeer(*dialer, marker_frame, 2);
+    CHECK(Get(marker));
+
+    /** 7. 新连接干净收口：marker 之后无任何补发/重复帧。 */
+    (void)a.client->Close(bbt::infra::CloseOptions::Immediate());
+    CHECK(WaitUntil([&] { return a.engine->CountConnections() == 0; }, 5s));
+    const bool new_link_closed_without_traffic = dialer->Eof();
+    CHECK(new_link_closed_without_traffic);
+    std::cout << "private attempt call auto swap: barrier " << first_id << " -> wire " << wire_id
+              << "; old link closed after boot with 0 frames, new link exactly 1 target + 1 marker business frame\n";
+}
+
+/** 单次 Send（无远端确认）：屏障捕获自动首号 → 真实换链确认后放行 → 同一次
+ *  Send 经退役 fencing 重取新号。帧层证据：旧链 boot 后到实际收口零字节；新
+ *  物理连接从握手完成恰读一帧目标业务帧（Send，无接纳请求标志），随后一帧
+ *  独立有序 marker（与目标 Send 同 Actor 车道同键保序），干净收口无补发。 */
+void PrivateAttemptSendAutoSwap()
+{
+    AppHost a("zz-op-a");
+    RawTcpListener peer("peer-b");
+
+    BootOldChainWithOwnerHandshake(a, peer, "peer-b", "zz-op-a");
+    const auto old_probe = rpc::detail::LinkReleaseProbe::ForPeer(*a.client, "peer-b");
+    CHECK(old_probe.has_value());
+    CHECK(old_probe->Id() != 0);
+
+    const auto barrier = ArmAttemptIdBarrierOnce();
+    std::future<result<void>> op;
+    AttemptBarrierGuard guard{barrier, [&] { return op.valid() && op.wait_for(2s) == std::future_status::ready; }};
+    op = SubmitCo(
+        [&] { return bbt_co_await a.client->Send(peer.Target(), MakeSend("", 2, "k"), SendUntil(10s, false)); });
+    CHECK(WaitUntil([&] { return barrier->arrived.load(std::memory_order_acquire); }, 5s));
+    const auto first_id = barrier->TakeFirstId();
+    CHECK(first_id.rfind("~bbt-rpc:", 0) == 0);
+
+    const auto dialer = SwapWinnerByRealDialIn(a, "peer-b", "zz-op-a", old_probe.value());
+
+    const bool old_link_closed_without_traffic = peer.Eof();
+    CHECK(old_link_closed_without_traffic);
+
+    barrier->released.store(true, std::memory_order_release);
+    barrier->release_waiter->Notify();
+    const auto target_frame = ReadFrameOnPeer(*dialer);
+    CHECK(target_frame.kind == rpc::FrameKind::Send);
+    CHECK(target_frame.message_id.rfind("~bbt-rpc:", 0) == 0);
+    CHECK(target_frame.message_id != first_id);
+    CHECK(target_frame.session_epoch == 2);
+    CHECK(!target_frame.acceptance_requested.has_value() || *target_frame.acceptance_requested == false);
+    CHECK(Get(op)); // 无确认 Send：入队即成功
+    CHECK(!barrier->timed_out.load(std::memory_order_acquire));
+
+    auto marker = SubmitCo([&] {
+        return bbt_co_await a.client->Call(
+            peer.Target(), MakeCall("marker", 3, "k", rpc::TrafficClass::Actor), UntilMs(10s));
+    });
+    const auto marker_frame = ReadFrameOnPeer(*dialer);
+    CHECK(marker_frame.kind == rpc::FrameKind::Call);
+    CHECK(marker_frame.request_id == "marker");
+    CHECK(marker_frame.session_epoch == 2);
+    SendReplyOnPeer(*dialer, marker_frame, 2);
+    CHECK(Get(marker));
+
+    (void)a.client->Close(bbt::infra::CloseOptions::Immediate());
+    CHECK(WaitUntil([&] { return a.engine->CountConnections() == 0; }, 5s));
+    const bool new_link_closed_without_traffic = dialer->Eof();
+    CHECK(new_link_closed_without_traffic);
+    std::cout << "private attempt send auto swap: barrier " << first_id << " -> wire " << target_frame.message_id
+              << "; old link closed after boot with 0 frames, new link exactly 1 target + 1 marker business frame\n";
+}
+
+/** 单次 Send（显式票据 + 远端确认）：屏障捕获显式 ~bbt-rpc:100 → 真实换链确认
+ *  后放行 → 同一次 Send 在新链上仍携带同一显式票据（不被重写为自动号）。
+ *  帧层证据：旧链 boot 后到实际收口零字节；新物理连接从握手完成恰读一帧目标
+ *  业务帧（Send，票据原样、接纳请求标志置位），SendAccepted 控制帧按同一票据
+ *  关联返回（op 完成证明，控制帧不计入业务帧计数），随后一帧独立有序 marker
+ *  （同 Actor 车道同键保序），干净收口无补发。 */
+void PrivateAttemptExplicitTicketSwap()
+{
+    AppHost a("zz-op-a");
+    RawTcpListener peer("peer-b");
+
+    BootOldChainWithOwnerHandshake(a, peer, "peer-b", "zz-op-a");
+    const auto old_probe = rpc::detail::LinkReleaseProbe::ForPeer(*a.client, "peer-b");
+    CHECK(old_probe.has_value());
+    CHECK(old_probe->Id() != 0);
+
+    const std::string ticket("~bbt-rpc:100");
+    const auto barrier = ArmAttemptIdBarrierOnce();
+    std::future<result<void>> op;
+    AttemptBarrierGuard guard{barrier, [&] { return op.valid() && op.wait_for(2s) == std::future_status::ready; }};
+    op = SubmitCo(
+        [&] { return bbt_co_await a.client->Send(peer.Target(), MakeSend(ticket, 2, "k"), SendUntil(10s, true)); });
+    CHECK(WaitUntil([&] { return barrier->arrived.load(std::memory_order_acquire); }, 5s));
+    CHECK(barrier->TakeFirstId() == ticket); // 显式票据原样经过暂停点
+
+    const auto dialer = SwapWinnerByRealDialIn(a, "peer-b", "zz-op-a", old_probe.value());
+
+    const bool old_link_closed_without_traffic = peer.Eof();
+    CHECK(old_link_closed_without_traffic);
+
+    barrier->released.store(true, std::memory_order_release);
+    barrier->release_waiter->Notify();
+    const auto target_frame = ReadFrameOnPeer(*dialer);
+    CHECK(target_frame.kind == rpc::FrameKind::Send);
+    CHECK(target_frame.message_id == ticket); // 票据未被重写（重写会产生自动号）
+    CHECK(target_frame.acceptance_requested.has_value() && *target_frame.acceptance_requested == true);
+    CHECK(target_frame.session_epoch == 2);
+    SendSendAcceptedOnPeer(*dialer, ticket, 2);
+    CHECK(Get(op)); // 同一票据的 SendAccepted 控制帧关联返回
+    CHECK(!barrier->timed_out.load(std::memory_order_acquire));
+
+    auto marker = SubmitCo([&] {
+        return bbt_co_await a.client->Call(
+            peer.Target(), MakeCall("marker", 3, "k", rpc::TrafficClass::Actor), UntilMs(10s));
+    });
+    const auto marker_frame = ReadFrameOnPeer(*dialer);
+    CHECK(marker_frame.kind == rpc::FrameKind::Call);
+    CHECK(marker_frame.request_id == "marker");
+    CHECK(marker_frame.session_epoch == 2);
+    SendReplyOnPeer(*dialer, marker_frame, 2);
+    CHECK(Get(marker));
+
+    (void)a.client->Close(bbt::infra::CloseOptions::Immediate());
+    CHECK(WaitUntil([&] { return a.engine->CountConnections() == 0; }, 5s));
+    const bool new_link_closed_without_traffic = dialer->Eof();
+    CHECK(new_link_closed_without_traffic);
+    std::cout << "private attempt explicit ticket swap: " << ticket << " unchanged across in-call link swap"
+              << "; old link closed after boot with 0 frames, new link exactly 1 target + 1 marker business frame\n";
 }
 
 // clang-format off
 }
 // clang-format on
 
+/**
+ * ---- write 终态：SessionCore::OutItem::Settle::Publish/Wait 契约 ----
+ * Publish(result<void>) 首次生效且幂等；Wait(Deadline) 在已发布时立即返
+ * 回首个终态，未发布时挂起直至 Publish/超时/取消。观察与发布的先后由
+ * 此处显式控制，给足 5s 期限，只断言终态值与一次性结算，不靠短时间阈值。
+ */
+void SettlePublishBeforeWaitOk()
+{
+    auto settle = std::make_shared<rpc::SessionCore::OutItem::Settle>();
+    settle->Publish(result<void>::ok());
+    auto fut = SubmitCo([&] { return settle->Wait(Clock::now() + 5s); });
+    const auto r = Get(fut);
+    CHECK(r);
+    std::cout << "settle publish-before-wait ok -> Wait returns ok immediately\n";
+}
+
+void SettlePublishBeforeWaitErr()
+{
+    auto settle = std::make_shared<rpc::SessionCore::OutItem::Settle>();
+    settle->Publish(result<void>::err(MakeError(ErrorCode::Closed, "write closed")));
+    auto fut = SubmitCo([&] { return settle->Wait(Clock::now() + 5s); });
+    const auto r = Get(fut);
+    CHECK(!r);
+    CHECK(r.error().code == ErrorCode::Closed);
+    std::cout << "settle publish-before-wait err -> Wait returns err immediately\n";
+}
+
+void SettleWaitThenPublishOk()
+{
+    auto settle = std::make_shared<rpc::SessionCore::OutItem::Settle>();
+    std::atomic<bool> submitted{false};
+    std::atomic<bool> waiting{false};
+    std::atomic<bool> published{false};
+    auto fut = SubmitCo([&] {
+        /** 登记后发布：Wait 前自己提交发布协程，提交返回后直接进入 Wait，
+         *  中间无其他 yield；唯一 worker 于等待协程挂起并跑完 on-yield
+         *  注册回调后才执行发布协程。 */
+        SubmitCo([&] {
+            settle->Publish(result<void>::ok());
+            published.store(true, std::memory_order_release);
+        });
+        submitted.store(true, std::memory_order_release);
+        waiting.store(true, std::memory_order_release);
+        return settle->Wait(Clock::now() + 5s);
+    });
+    CHECK(WaitUntil([&] { return waiting.load(std::memory_order_acquire); }, 5s));
+    CHECK(submitted.load(std::memory_order_acquire));
+    CHECK(g_scheduler->GetWorkerProcesserIds().size() == 1);
+    const auto r = Get(fut);
+    CHECK(r);
+    CHECK(published.load(std::memory_order_acquire));
+    std::cout
+        << "settle wait-then-publish ok (single worker, register-then-publish) -> Wait returns ok after publish\n";
+}
+
+void SettleWaitThenPublishErr()
+{
+    auto settle = std::make_shared<rpc::SessionCore::OutItem::Settle>();
+    std::atomic<bool> submitted{false};
+    std::atomic<bool> waiting{false};
+    std::atomic<bool> published{false};
+    auto fut = SubmitCo([&] {
+        SubmitCo([&] {
+            settle->Publish(result<void>::err(MakeError(ErrorCode::Closed, "write closed")));
+            published.store(true, std::memory_order_release);
+        });
+        submitted.store(true, std::memory_order_release);
+        waiting.store(true, std::memory_order_release);
+        return settle->Wait(Clock::now() + 5s);
+    });
+    CHECK(WaitUntil([&] { return waiting.load(std::memory_order_acquire); }, 5s));
+    CHECK(submitted.load(std::memory_order_acquire));
+    CHECK(g_scheduler->GetWorkerProcesserIds().size() == 1);
+    const auto r = Get(fut);
+    CHECK(!r);
+    CHECK(r.error().code == ErrorCode::Closed);
+    CHECK(published.load(std::memory_order_acquire));
+    std::cout
+        << "settle wait-then-publish err (single worker, register-then-publish) -> Wait returns err after publish\n";
+}
+
+void SettleFirstPublishWins()
+{
+    auto settle = std::make_shared<rpc::SessionCore::OutItem::Settle>();
+    settle->Publish(result<void>::ok());
+    settle->Publish(result<void>::err(MakeError(ErrorCode::Closed, "write closed")));
+    auto fut = SubmitCo([&] { return settle->Wait(Clock::now() + 5s); });
+    const auto r = Get(fut);
+    CHECK(r);
+    std::cout << "settle first-publish-wins -> Wait returns first outcome\n";
+}
+
+/** call2 在排队时取消等待。对端仍须依次接纳 call1、call2、call3，首尾两个调用均收到回复。 */
+void OrderedCallCancelMiddle()
+{
+    AppHost a("order-a"), b("order-b");
+    auto boot = SubmitCo([&] { return bbt_co_await a.client->Call(b.Target(), MakeCall("boot", 1, "k"), UntilMs()); });
+    CHECK(WaitUntil([&] { return b.calls.load() == 1; }));
+    b.ProcessAdmitted(Echo);
+    CHECK(Get(boot));
+
+    std::promise<bbt::coroutine::detail::Coroutine*> handle2;
+    auto handle2_future = handle2.get_future();
+    auto gate = std::make_shared<HookGate>();
+    gate->Arm(a, HookPoint::BeforeWrite);
+    /** call1 提交并卡于出站（gate 未释放）。 */
+    auto c1 = SubmitCo([&] { return bbt_co_await a.client->Call(b.Target(), MakeCall("call1", 1, "ord"), UntilMs()); });
+    CHECK(WaitUntil([&] { return gate->Entered(HookPoint::BeforeWrite) == 1; }));
+
+    /** call2 提交并排队于出站。 */
+    auto c2 = SubmitCo([&] {
+        handle2.set_value(g_bbt_tls_coroutine_co);
+        return bbt_co_await a.client->Call(b.Target(), MakeCall("call2", 2, "ord"), UntilMs(10s));
+    });
+    CHECK(WaitUntil([&] { return a.client->Stats().service.queued == 1; }));
+
+    /** call3 提交并排队于出站。 */
+    auto c3 =
+        SubmitCo([&] { return bbt_co_await a.client->Call(b.Target(), MakeCall("call3", 3, "ord"), UntilMs(10s)); });
+    CHECK(WaitUntil([&] { return a.client->Stats().service.queued == 2; }));
+
+    /** gate 未释放：取消排队中的 call2。调用方等待以 Cancelled 结束，且尚未 committed（无 phase）。 */
+    auto* co2 = Get(handle2_future);
+    CHECK(co2 != nullptr);
+    co2->RequestCancel();
+    const auto r2 = Get(c2);
+    CHECK(!r2);
+    CHECK(r2.error().code == ErrorCode::Cancelled);
+    CHECK(!r2.error().request_phase.has_value());
+
+    /** 对端目前只见 boot；call2 被取消但帧仍在发送队列中。 */
+    CHECK(b.calls.load() == 1);
+
+    /** 放行：call1、call2、call3 依序写出完成，对端按序接纳。 */
+    gate->Release();
+    CHECK(WaitUntil([&] { return b.calls.load() == 4; }, 5s));
+    b.ProcessAdmitted(Echo);
+    const auto r1 = Get(c1);
+    CHECK(r1);
+    CHECK(r1.value().RequestId() == "call1");
+    const auto r3 = Get(c3);
+    CHECK(r3);
+    CHECK(r3.value().RequestId() == "call3");
+
+    {
+        std::lock_guard<std::mutex> lock(b.mu);
+        const auto& seq = b.by_key["ord"];
+        CHECK(seq.size() == 3);
+        CHECK(seq[0] == "call1" && seq[1] == "call2" && seq[2] == "call3");
+    }
+    std::cout << "ordered call 1/2/3: middle (2) cancelled while queued -> Cancelled + no phase, peer sees boot only, "
+                 "release delivers call1, call2, call3 in order\n";
+}
+
+/**
+ * ADR 0014 §4.1/§5.4：Send(true) 已入 lane 并请求远端确认后，取消调用方只
+ * 结束调用方的确认等待，不撤销已接纳的发送责任。Writer 被前一帧（blocker）挡住，
+ * 目标 Send(true) 随后入 lane；经 g_bbt_tls_coroutine_co + RequestCancel 取消调用方：
+ * 终态 Cancelled、request_phase 未提供（与 NotStarted 不同，尚未 committed）。
+ * 释放闸门后同一连接对端仍实际收到目标帧。
+ */
+void SendTrueCancelOnlyEndsWait()
+{
+    AppHost a("sendtrue-a"), b("sendtrue-b");
+    auto boot = SubmitCo([&] { return bbt_co_await a.client->Call(b.Target(), MakeCall("boot", 1, "k"), UntilMs()); });
+    CHECK(WaitUntil([&] { return b.calls.load() == 1; }));
+    b.ProcessAdmitted(Echo);
+    CHECK(Get(boot));
+
+    auto gate = std::make_shared<HookGate>();
+    gate->Arm(a, HookPoint::BeforeWrite);
+
+    /** 先发 blocker（独立 ordering key），确认其已进入 gate。 */
+    auto blocker = SubmitCo([&] {
+        return bbt_co_await a.client->Send(b.Target(), MakeSend("blocker", 1, "blocker-key"), SendUntil(5s, false));
+    });
+    CHECK(WaitUntil([&] { return gate->Entered(HookPoint::BeforeWrite) >= 1; }, 3s));
+
+    /** 再发目标 Send(true)，验证 actor lane 排队。 */
+    std::promise<bbt::coroutine::detail::Coroutine*> handle;
+    auto handle_future = handle.get_future();
+    auto sent = SubmitCo([&] {
+        handle.set_value(g_bbt_tls_coroutine_co);
+        return bbt_co_await a.client->Send(b.Target(), MakeSend("s-true", 2, "k"), SendUntil(5s, true));
+    });
+    CHECK(WaitUntil([&] { return a.client->Stats().actor.queued >= 1; }, 3s));
+
+    /** 在 writer 放行前取得取消结果，确认调用方可以先结束等待。 */
+    auto* co = Get(handle_future);
+    CHECK(co != nullptr);
+    co->RequestCancel();
+    const auto sr = Get(sent);
+    CHECK(!sr);
+    CHECK(sr.error().code == ErrorCode::Cancelled);
+    CHECK(!sr.error().request_phase.has_value());
+
+    /** 释放闸门：blocker 与目标帧顺序送达，对端实际收到目标帧。 */
+    gate->Release();
+    CHECK(WaitUntil([&] { return b.sends.load() == 2; }, 5s));
+    CHECK(a.client->Stats().links == 1);
+    {
+        std::lock_guard<std::mutex> lock(b.mu);
+        const auto& k = b.by_key["k"];
+        CHECK(k.size() == 2);
+        CHECK(k[0] == "boot" && k[1] == "s-true");
+        const auto& blocker_key = b.by_key["blocker-key"];
+        CHECK(blocker_key.size() == 1);
+        CHECK(blocker_key[0] == "blocker");
+    }
+    const auto br = Get(blocker);
+    CHECK(br);
+    std::cout
+        << "send(true) caller-cancel ends wait: Cancelled + no phase, blocker ahead, peer receives target frame on same link\n";
+}
+
+/**
+ * Settle::Wait 超时路径：未 Publish 时进入 Wait 并给短 deadline， waiter 必须
+ * 裁定期限后以 TimedOut 返回，不阻塞至 forever，不误报 ok。
+ */
+void SettleWaitTimeout()
+{
+    auto settle = std::make_shared<rpc::SessionCore::OutItem::Settle>();
+    auto fut = SubmitCo([&] { return settle->Wait(Clock::now() + 100ms); });
+    const auto r = Get(fut);
+    CHECK(!r);
+    CHECK(r.error().code == ErrorCode::TimedOut);
+    std::cout << "settle wait timeout -> Wait returns TimedOut without publish\n";
+}
+
+/** 预取消：Wait 前同步 Publish(ok)，再在同一协程自取消，再调用 Wait（中间无 yield）。
+ * 取消优先于已发布结果 → Wait 返回 Cancelled。 */
+void SettleWaitThenCancel()
+{
+    auto settle = std::make_shared<rpc::SessionCore::OutItem::Settle>();
+    auto fut = SubmitCo([&] {
+        settle->Publish(result<void>::ok());
+        g_bbt_tls_coroutine_co->RequestCancel();
+        return settle->Wait(Clock::now() + 5s);
+    });
+    const auto r = Get(fut);
+    CHECK(!r);
+    CHECK(r.error().code == ErrorCode::Cancelled);
+    std::cout << "settle wait then cancel -> Wait returns Cancelled (cancel wins over published ok)\n";
+}
+
+/** 预到期：Wait 前同步 Publish(ok)，给已过期 deadline（Clock::now()-1s）→ TimedOut。 */
+void SettleWaitThenTimeout()
+{
+    auto settle = std::make_shared<rpc::SessionCore::OutItem::Settle>();
+    auto fut = SubmitCo([&] {
+        settle->Publish(result<void>::ok());
+        return settle->Wait(Clock::now() - 1s);
+    });
+    const auto r = Get(fut);
+    CHECK(!r);
+    CHECK(r.error().code == ErrorCode::TimedOut);
+    std::cout << "settle wait then timeout -> Wait returns TimedOut (expired deadline)\n";
+}
+
+/** 预取消 + 预到期：Wait 前同步 Publish(ok)，再自取消，再 Wait → Cancelled（取消优先于超时）。 */
+void SettleWaitThenCancelAndTimeout()
+{
+    auto settle = std::make_shared<rpc::SessionCore::OutItem::Settle>();
+    auto fut = SubmitCo([&] {
+        settle->Publish(result<void>::ok());
+        g_bbt_tls_coroutine_co->RequestCancel();
+        return settle->Wait(Clock::now() - 1s);
+    });
+    const auto r = Get(fut);
+    CHECK(!r);
+    CHECK(r.error().code == ErrorCode::Cancelled);
+    std::cout << "settle wait then cancel+timeout -> Wait returns Cancelled (cancel wins)\n";
+}
+
 int RunCase(const std::string& mode)
 {
-    g_bbt_coroutine_config->m_cfg_static_thread_num = 4;
+    const bool single_worker =
+        (mode == "v2s_settle_wait_then_publish_ok" || mode == "v2s_settle_wait_then_publish_err"
+         || mode == "v2s_settle_wait_then_cancel" || mode == "v2s_settle_wait_then_timeout"
+         || mode == "v2s_settle_wait_then_cancel_and_timeout");
+    g_bbt_coroutine_config->m_cfg_static_thread_num = single_worker ? 1 : 4;
     g_bbt_coroutine_config->m_cfg_stack_size = 256 * 1024;
     g_bbt_coroutine_config->m_cfg_processer_auto_scale = false;
     g_scheduler->Start();
@@ -4104,10 +5761,58 @@ int RunCase(const std::string& mode)
         CancelPostCommit();
     } else if (mode == "v2s_malformed_reply") {
         MalformedReply();
+    } else if (mode == "v2s_attempt_same_conn_old_end_call") {
+        AttemptSameConnOldEndCall();
+    } else if (mode == "v2s_attempt_same_conn_old_end_send") {
+        AttemptSameConnOldEndSend();
+    } else if (mode == "v2s_held_release_outbound_old_link") {
+        HeldReleaseOutboundOldLink();
+    } else if (mode == "v2s_held_release_inbound_old_link") {
+        HeldReleaseInboundOldLink();
+    } else if (mode == "v2s_settle_publish_before_wait_ok") {
+        SettlePublishBeforeWaitOk();
+    } else if (mode == "v2s_settle_publish_before_wait_err") {
+        SettlePublishBeforeWaitErr();
+    } else if (mode == "v2s_settle_wait_then_publish_ok") {
+        SettleWaitThenPublishOk();
+    } else if (mode == "v2s_settle_wait_then_publish_err") {
+        SettleWaitThenPublishErr();
+    } else if (mode == "v2s_settle_first_publish_wins") {
+        SettleFirstPublishWins();
+    } else if (mode == "v2s_ordered_call_cancel_middle") {
+        OrderedCallCancelMiddle();
+    } else if (mode == "v2s_send_true_cancel_only_ends_wait") {
+        SendTrueCancelOnlyEndsWait();
+    } else if (mode == "v2s_settle_wait_then_cancel") {
+        SettleWaitThenCancel();
+    } else if (mode == "v2s_settle_wait_then_timeout") {
+        SettleWaitThenTimeout();
+    } else if (mode == "v2s_settle_wait_then_cancel_and_timeout") {
+        SettleWaitThenCancelAndTimeout();
+    } else if (mode == "v2s_settle_wait_timeout") {
+        SettleWaitTimeout();
+    } else if (mode == "v2s_prepr_auto_id_redial") {
+        AutoIdRedialAfterRetirement();
+    } else if (mode == "v2s_prepr_outbound_establish_reclaim") {
+        UninstalledOutboundReclaim();
+    } else if (mode == "v2s_prepr_inbound_handshake_reclaim") {
+        UninstalledInboundReclaim();
+    } else if (mode == "v2s_prepr_inbound_publish_reclaim") {
+        UninstalledInboundPublishReclaim();
+    } else if (mode == "v2s_prepr_outbound_loser_reclaim") {
+        OutboundElectionLoserReclaim();
+    } else if (mode == "v2s_prepr_owner_lifetime") {
+        OwnerLifetimeAfterDefaultClose();
+    } else if (mode == "v2s_private_attempt_call_auto_swap") {
+        PrivateAttemptCallAutoSwap();
+    } else if (mode == "v2s_private_attempt_send_auto_swap") {
+        PrivateAttemptSendAutoSwap();
+    } else if (mode == "v2s_private_attempt_explicit_ticket_swap") {
+        PrivateAttemptExplicitTicketSwap();
     } else {
         CHECK(false);
     }
-    std::cout << "rpc v2 session " << mode << " PASS\n";
+    std::cout << "RPC session " << mode << " PASS\n";
     return 0;
 }
 

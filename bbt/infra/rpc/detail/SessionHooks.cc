@@ -10,6 +10,39 @@
 namespace bbt::infra::rpc {
 namespace detail {
 
+namespace {
+
+const char* HookPointLabel(HookPoint point) noexcept
+{
+    switch (point) {
+    case HookPoint::BeforeWrite:
+        return "before_write";
+    case HookPoint::OutboundBeforeHandshake:
+        return "outbound_handshake";
+    case HookPoint::InboundBeforeHandshake:
+        return "inbound_handshake";
+    case HookPoint::InboundBeforePublish:
+        return "inbound_publish";
+    }
+    return "unknown";
+}
+
+} // namespace
+
+/**
+ * 把库内部固定标签转成可见错误：四个调用点都只处理 result，各自完成
+ * pending/记录/额度/连接的收尾，异常不越过各自的责任边界。
+ */
+result<void> RunHookCheckpoint(SessionHooks& hooks, HookPoint point, const HookGate& gate)
+{
+    try {
+        return SessionHookAccess::Checkpoint(hooks, point, gate);
+    } catch (const HookInjectedFailure&) {
+        return ErrV(
+            ErrorCode::InternalError, std::string("hook checkpoint injected failure: ") + HookPointLabel(point));
+    }
+}
+
 result<void> SessionHookAccess::Checkpoint(SessionHooks& hooks, HookPoint point, const HookGate& gate)
 {
     const auto index = SessionHooks::IndexOf(point);
@@ -105,7 +138,7 @@ result<void> SessionHookAccess::PauseUntil(
         if (gate.owner && SessionOwnerClosed(*gate.owner)) {
             return "hook pause: owner closed";
         }
-        if (gate.server && ServerV2Closed(*gate.server)) {
+        if (gate.server && ServerClosed(*gate.server)) {
             return "hook pause: server closed";
         }
         if (gate.session && gate.session->dead.load()) {

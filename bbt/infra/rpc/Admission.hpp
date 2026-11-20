@@ -218,7 +218,7 @@ public:
     bool IsClosed() const noexcept;
 
     /**
-     * 观察面：计数读都在队列自己的锁内完成。ServerV2Stats/Close 只经这里拿
+     * 观察面：计数读都在队列自己的锁内完成。ServerStats/Close 只经这里拿
      * 快照，不直读 impl 字段——server 台账锁与队列锁因此保持单向顺序。
      * per-lane 重载供分 lane 快照使用，lane 越界按 0 计。
      * @brief 当前队列条目总数（gauge，单次取锁）。

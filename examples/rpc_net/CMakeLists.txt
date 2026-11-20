@@ -1,4 +1,4 @@
-# v2 AppSession 双进程 consumer：server 子进程绑定动态端口经 stdout 管道传
+# AppSession 双进程 consumer：server 子进程绑定动态端口经 stdout 管道传
 # PORT 行，client 子进程拨号 + Call/Send 验证一条双向 TCP link。
 # session_consumer.py 是 CTest 前台受管父进程（对齐 tests/net +
 # scripts/bench/driver.py 既有惯例）：管道交换端口、stdin EOF 触发 server

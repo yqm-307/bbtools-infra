@@ -36,7 +36,9 @@ bbt_co_async(result<void>) Close(const CloseOptions& options = {});
 
 - `target` 只接受 `tcp://<numeric-ip>:<port>`（IPv6 用方括号）。无 DNS，不接受 scheme 之外的路径、查询或主机名。
 - `Call` 要求 `Request::Reply() == Required`，且 `Traffic` 为 Service/Actor；`Send` 要求 `Reply() == None`。
-- `request_id` 或 `message_id` 为空时由 session 生成。
+- 每次传输尝试使用新的关联 ID：`Call` 用 `request_id`，`Send` 用 `message_id`（包括不等远端确认的 Send）。留空由 RPC 自动生成；合法的显式值原样发出，`Response` / `SendAccepted` 原样回显。
+- 显式 ID 由调用方负责：同一发送方的同一对端会话代内，相同类型的另一笔尝试不得复用同一 ID，即使上一笔已取消或超时。当前只拒绝仍登记的同名等待；重复使用已摘除的 ID 时，迟到终态可能与新尝试无法区分。Call 与 Send 是两个关联空间。唯一性按实际关联值判断：显式值与自动生成值相同也属于复用。自动生成不保留显式 ID 的历史，也不保证与任意显式值不碰撞。
+- 业务重试用独立的业务幂等键，并由业务层判重；新的关联 ID 不保证业务只执行一次。沿用 framework 有序票据时不要擅自改写其显式 ID，也不要在同一会话代重发该票据并期待 RPC 区分终态；独立的票据标识与传输尝试关联需要 framework 协同迁移。
 - 同 session 同 `ordering_key` 且 `sequence != 0` 的入站帧必须连续递增（首帧即台账基值）；重复、逆序或缺口按 `ProtocolError` 退役该 link。出站方保证同 key 按序入队。
 - 入站 `AdmissionHandler` 不得挂起，也不得运行业务。业务在协程中完成后回写回复，`Complete` 等到真实写终态：
 
@@ -54,7 +56,8 @@ auto completed = bbt_co_await item.reply->Complete(std::move(response));
   - deadline 已过期 → `TimedOut`，不发请求；
   - 传输、排队、取消错误原样透传（`TransportError` / `Overloaded` / `Closed` / `Cancelled`）；
   - 请求已提交后失联或超时 → `OutcomeUnknown`，`Error.request_phase` 保留阶段事实。
-- RPC 不重发、不升级、不降级。
+- RPC 只在 fencing 导致本地接纳失败时最多重选一次 link，不重发已入队帧，也不做业务重试、协议升级或降级。无序 Call 提交前取消可撤回；已入队的有序 Call 和等待远端确认的 Send 在取消后仍由 writer 结算，取消不会撤销对端业务。
+- 等待基础设施失败返回 `RuntimeUnavailable`；错误等待域返回 `InvalidContext`；私有单等待位冲突为 `InternalError`。已提交时保留 `RequestCommitted` 阶段，不能据此断言远端未执行。
 
 ## 启动
 
@@ -72,7 +75,7 @@ auto completed = bbt_co_await item.reply->Complete(std::move(response));
 - 任意域使用非阻塞 `Close(CloseOptions::Immediate(reason))` 立即封口；`Graceful → Immediate` 升级由任一次 Immediate（同一 `Close(CloseOptions)` 入口）触发，反向不允许。
 - 物理收口用 Co `Close(CloseOptions{..., wait_release=true})`（有限 deadline）；它不替模块排空，不关闭共享 Engine。
 - 本对象已授权 handler 或已接纳调用协程内调用带等待的 `Close`（Graceful 或 wait_release=true）是自等待，在副作用前返回 `InvalidContext`。
-- 等待只覆盖 RPC 自身责任，不承诺业务 handler 的优雅结束。物理回收以 Engine 收口为证。
+- 物理等待以本对象连接的 `Released` 凭据及本地责任退出为准，包括 fencing 替换下来的旧 link、尚未安装就关闭的连接，不等待共享 Engine 退出。
 
 ## 构建与配置
 

@@ -1,7 +1,7 @@
 # rpc_net 契约测试：单可执行 + 用例名分发（case-dispatch 约定见
-# tests/README.md）。只保留 V2 单一会话面（SessionFrame profile 2）。
+# tests/README.md）。RPC 会话使用 SessionFrame profile 2。
 
-# v2 SessionFrame profile 2 值层/wire/分帧与无状态帧协议接缝（纯字节层，
+# SessionFrame profile 2 值层/wire/分帧与无状态帧协议接缝（纯字节层，
 # 不连网络）。
 add_executable(Test_rpc_v2_wire Test_rpc_v2_wire.cc)
 target_link_libraries(Test_rpc_v2_wire PRIVATE bbt::infra_rpc_net Boost::headers)
@@ -12,7 +12,7 @@ foreach(_case v2_roundtrip v2_reject v2_malformed v2_framing v2_values v2_protoc
     set_tests_properties(rpc.net.${_case} PROPERTIES TIMEOUT 30 LABELS "unit")
 endforeach()
 
-# v2 AppSession：真实 loopback TCP 双端（每进程 Engine+Client owner+Server
+# AppSession：真实 loopback TCP 双端（每进程 Engine+Client owner+Server
 # 同 owner），握手/epoch、Call/Send、单 FIFO admission、lane 隔离、关闭、
 # 客户端输入边界/取消/畸形回复。
 add_executable(Test_rpc_v2_session Test_rpc_v2_session.cc)
@@ -43,7 +43,15 @@ foreach(_case v2s_roundtrip v2s_registered_route v2s_bidirectional v2s_send_acce
         v2s_shutdown_interrupted_by_close
         v2s_close_inflight_reason
         v2s_client_input v2s_cancel_post_commit v2s_malformed_reply
-        v2s_send_no_acceptance_drain write_terminal_once)
+        v2s_settle_publish_before_wait_ok v2s_settle_publish_before_wait_err
+        v2s_settle_wait_then_publish_ok v2s_settle_wait_then_publish_err
+        v2s_settle_first_publish_wins v2s_ordered_call_cancel_middle v2s_settle_wait_timeout v2s_send_true_cancel_only_ends_wait
+        v2s_settle_wait_then_cancel v2s_settle_wait_then_timeout v2s_settle_wait_then_cancel_and_timeout
+        v2s_send_no_acceptance_drain v2s_attempt_same_conn_old_end_call v2s_attempt_same_conn_old_end_send v2s_held_release_inbound_old_link v2s_held_release_outbound_old_link write_terminal_once
+        v2s_prepr_auto_id_redial v2s_prepr_outbound_establish_reclaim v2s_prepr_inbound_handshake_reclaim
+        v2s_prepr_inbound_publish_reclaim v2s_prepr_outbound_loser_reclaim v2s_prepr_owner_lifetime
+        v2s_private_attempt_call_auto_swap v2s_private_attempt_send_auto_swap
+        v2s_private_attempt_explicit_ticket_swap)
     add_test(NAME rpc.net.${_case} COMMAND Test_rpc_v2_session ${_case})
     set_tests_properties(rpc.net.${_case} PROPERTIES TIMEOUT 60 LABELS "rpc_net")
 endforeach()

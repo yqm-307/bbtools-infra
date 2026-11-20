@@ -1,5 +1,5 @@
 /**
- * bbtools-infra v2：SessionFrame wire codec 与 u32be 分帧实现。
+ * RPC SessionFrame wire codec 与 u32be 分帧实现。
  * 公开面见 bbt/infra/rpc/SessionCodec.hpp；protobuf 生成物只在本文件与 protoc
  * 生成目录内出现，不向公共头泄漏。
  *
@@ -12,8 +12,11 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <utility>
+
+#include <bbt/infra/rpc/detail/SessionCodecInternal.hpp>
 
 #include "bbt/infra/rpc/v2/session_frame.pb.h"
 
@@ -893,22 +896,59 @@ std::size_t FrameByteLimit(FrameKind kind, std::size_t max_frame_bytes)
     return max_frame_bytes;
 }
 
-result<std::vector<std::uint8_t>> EncodeFramedSessionFrame(const SessionFrame& frame, std::size_t max_frame_bytes)
+namespace {
+
+result<void> CheckMaxFrameBytes(std::size_t max_frame_bytes)
 {
     if (max_frame_bytes == 0 || max_frame_bytes > kRpcV2MaxFrameBytes)
-        return result<std::vector<std::uint8_t>>::err(
-            MakeError(ErrorCode::InvalidArgument, "max_frame_bytes out of range"));
+        return result<void>::err(MakeError(ErrorCode::InvalidArgument, "max_frame_bytes out of range"));
+    return result<void>::ok();
+}
+
+result<void> CheckFrameByteLimit(FrameKind kind, std::size_t body_size, std::size_t max_frame_bytes)
+{
+    if (body_size > FrameByteLimit(kind, max_frame_bytes))
+        return result<void>::err(MakeError(ErrorCode::InvalidArgument, "frame body exceeds kind byte limit"));
+    return result<void>::ok();
+}
+
+} // namespace
+
+result<std::vector<std::uint8_t>> EncodeFramedSessionFrame(const SessionFrame& frame, std::size_t max_frame_bytes)
+{
+    if (auto r = CheckMaxFrameBytes(max_frame_bytes); !r)
+        return result<std::vector<std::uint8_t>>::err(r.error());
     auto body = EncodeSessionFrame(frame);
     if (!body)
         return result<std::vector<std::uint8_t>>::err(body.error());
-    const std::size_t limit = FrameByteLimit(frame.kind, max_frame_bytes);
-    if (body.value().size() > limit)
-        return result<std::vector<std::uint8_t>>::err(
-            MakeError(ErrorCode::InvalidArgument, "frame body exceeds kind byte limit"));
+    if (auto r = CheckFrameByteLimit(frame.kind, body.value().size(), max_frame_bytes); !r)
+        return result<std::vector<std::uint8_t>>::err(r.error());
     std::vector<std::uint8_t> out(4 + body.value().size());
     EncodeFramePrefix(static_cast<std::uint32_t>(body.value().size()), out.data());
     std::memcpy(out.data() + 4, body.value().data(), body.value().size());
     return result<std::vector<std::uint8_t>>::ok(std::move(out));
+}
+
+result<std::string> detail::EncodeFramedSessionBytes(const SessionFrame& frame, std::size_t max_frame_bytes)
+{
+    using R = result<std::string>;
+    if (auto r = CheckMaxFrameBytes(max_frame_bytes); !r)
+        return R::err(r.error());
+    pbv2::SessionFrame proto;
+    if (auto r = FillProto(frame, &proto); !r)
+        return R::err(r.error());
+    const auto body_size = proto.ByteSizeLong();
+    // 保留旧路径先报 protobuf 的 int 尺寸错误，再报 kind 尺寸错误的顺序。
+    if (body_size > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        return R::err(MakeError(ErrorCode::ProtocolError, "protobuf serialize failed"));
+    if (auto r = CheckFrameByteLimit(frame.kind, body_size, max_frame_bytes); !r)
+        return R::err(r.error());
+
+    std::string out(4 + body_size, '\0');
+    EncodeFramePrefix(static_cast<std::uint32_t>(body_size), reinterpret_cast<std::uint8_t*>(out.data()));
+    if (!proto.SerializeToArray(out.data() + 4, static_cast<int>(body_size)))
+        return R::err(MakeError(ErrorCode::ProtocolError, "protobuf serialize failed"));
+    return R::ok(std::move(out));
 }
 
 /**
