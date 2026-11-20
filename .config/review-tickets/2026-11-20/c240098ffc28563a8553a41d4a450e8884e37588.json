@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-20",
+  "commit": "c240098ffc28563a8553a41d4a450e8884e37588",
+  "base": "dee853d6dc3c3839133167c092c5379be24130ad",
+  "result": "pass",
+  "reviewer": "gpt-6.2-astra (deleg_97d7ec37)",
+  "summary": "独立代码审查通过。核对了换链取号、写结果发布、逐连接回收、owner 寿命、Call 编码和测试接口改名。framework 有序往返仍受既有 HTTP 接口不兼容阻塞，writer 空闲成本尚缺实测。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "出站拨号落选后，回收台账通过弱引用访问结果槽。默认关闭并释放业务句柄后，寿命回归观察到 owner 释放、共享 Engine 继续运行。自动 ID 换链后重取，显式票据原样保留。审查者核对了测试接缝的声明、实现与调用，并回读 91 项 RPC 测试及 2 项冒烟测试的结果。",
+      "evidence": {
+        "reviewer": "gpt-6.2-astra (deleg_97d7ec37)",
+        "scope": "dee853d6dc3c3839133167c092c5379be24130ad..c240098ffc28563a8553a41d4a450e8884e37588，34 个文件，内容清单 SHA-256 e2025b31c1fbd1460de8b28cb8e1368be5e55281c2a6ac790839f5abb4ee57dd。"
+      }
+    }
+  ]
+}
