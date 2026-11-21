@@ -27,6 +27,7 @@ struct DriverSlot {
     bbt::coroutine::detail::ProcesserId processer_id{BBT_COROUTINE_INVALID_PROCESSER_ID};
     bbt::coroutine::detail::ProcesserDriverToken token{};
     std::shared_ptr<ReactorDriver> driver;
+    bool main_owner{false};
 };
 
 class DriverBinder {
@@ -43,7 +44,7 @@ public:
      * 同代同步解绑：成功项原地移出（不分配额外容器）；解绑被拒项保留在
      * slots 中由调用者继续持有。返回首个失败映射。
      */
-    static std::error_code UnbindSlots(std::vector<DriverSlot>& slots);
+    static std::error_code UnbindSlots(std::vector<DriverSlot>& slots, bool fail_last_for_test = false);
 
     static std::error_code MapStatus(bbt::coroutine::detail::ProcesserDriverStatus status);
 };

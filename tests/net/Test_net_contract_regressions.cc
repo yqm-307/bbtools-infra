@@ -13,6 +13,10 @@
  * wait_accepted_existing_out 既有 out 有效不算本轮成功
  * run_preconditions 未初始化/未声明独立推进零副作用拒绝
  * engine_driver_failed Engine 级 Failed 同步解绑/冻结/不伪回调
+ * engine_close_finalize_retry Close 后 Unbind 故障保留 Closing/LastError/同代绑定，
+ *   FinalizeNative 活跃 Run 拒绝、原生线程同代重试到 Stopped、查询出口关闭且幂等
+ * engine_seal_prepare_conn_retained SealPrepare 首次封锁失败保留已接纳连接登记与
+ *   OnClose 责任；同代重试在连接真实 owner 恰一次兑现，Stopped 且首因保留
  * invalid_options_rejected 保留字段非法值在绑定前拒绝（历史 ET/ticker 字段已删除）
  * handoff_full_resume 容量 1 下先 reserve 再 accept、满后恢复
  * lb_subs LB 分配真实落到两个 sub owner
@@ -354,6 +358,39 @@ struct EchoHandler : RawHandler {
 };
 
 struct NullHandler : RawHandler {};
+
+/** 记录 OnAccept/OnClose 各自 worker id 的最小探针；不回读，连接保持空闲。 */
+struct LifecycleProbe : RawHandler {
+    std::atomic<int> accepted{0};
+    std::atomic<int> closed{0};
+    std::mutex mutex;
+    std::set<std::uint64_t> accept_ids;
+    std::set<std::uint64_t> close_ids;
+
+    static void RecordWorkerId(std::set<std::uint64_t>& ids, std::mutex& mutex)
+    {
+        if (auto processer = bbt::coroutine::detail::Processer::TryGetLocalProcesser()) {
+            std::lock_guard<std::mutex> lock(mutex);
+            ids.insert(processer->GetId());
+        }
+    }
+
+    void OnAccept(Connection) override
+    {
+        accepted.fetch_add(1);
+        RecordWorkerId(accept_ids, mutex);
+    }
+
+    void OnRead(Connection) override {}
+
+    void OnWrite(Connection, WriteResult) override {}
+
+    void OnClose(Connection, std::error_code) override
+    {
+        RecordWorkerId(close_ids, mutex);
+        closed.fetch_add(1);
+    }
+};
 
 /**
  * 只观察不消费：用于 staged/尾部可读验证。
@@ -706,6 +743,143 @@ static void EngineDriverFailed()
     CHECK(!client.Close());
     runner.CloseAndJoin();
     std::cout << "engine_driver_failed stopped=1 error=" << error.value() << " no_pseudo_onclose=ok\n";
+}
+
+/**
+ * 引擎关闭重试回归：hooks/Unbind 注入必须在 Idle 装配，故障随 Run 末代首次解绑
+ * 消费。活跃 Run 期间 FinalizeNative 以 device_or_resource_busy 同步拒绝；Close
+ * 后解绑按真实拒绝路径失败：双槽布局下 main 真实解绑移出、末槽 sub 注入
+ * io_error 保留同代绑定，错误经 Run 出口浮出且保留 Closing、LastError，不伪
+ * Stopped。原生线程 FinalizeNative 同代重试成功发布 Stopped 且 Run 首因不变，
+ * 此后监听/owner 查询按终态拒绝且 LocalAddresses 不改写 out，重复调用幂等
+ * 成功不复活。
+ */
+static void EngineCloseFinalizeRetry()
+{
+    StartRuntime(2);
+    auto handler = std::make_shared<NullHandler>();
+    Engine engine(handler);
+    EngineTestAccess::ClearConnectInjection(engine);
+    EngineTestAccess::ArmFault(engine, FaultPoint::Unbind);
+    EngineRunner runner(engine, ServerConfig(Loopback(0)));
+    CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
+    std::vector<Address> addresses;
+    CHECK(!engine.LocalAddresses(addresses));
+    CHECK(addresses.size() == 1);
+    std::vector<std::uint64_t> original_main;
+    std::vector<std::uint64_t> original_sub;
+    CHECK(!engine.ReactorOwnerIds(original_main, original_sub));
+    CHECK(original_main.size() == 1);
+    CHECK(original_sub.size() == 1);
+
+    /**
+     * 活跃 Run：原生域同步拒绝，不触碰本代资源。
+     */
+    CHECK(engine.FinalizeNative() == std::make_error_code(std::errc::device_or_resource_busy));
+    CHECK(engine.Phase() == EnginePhase::Running);
+
+    runner.CloseAndJoin();
+    const auto unbind_cause = std::make_error_code(std::errc::io_error);
+    CHECK(runner.error == unbind_cause);
+    CHECK(engine.LastError() == unbind_cause);
+    CHECK(engine.Phase() == EnginePhase::Closing);
+    std::vector<Address> retained;
+    CHECK(!engine.LocalAddresses(retained));
+    CHECK(retained.size() == 1);
+
+    /**
+     * 双槽布局：成功项真实解绑移出（main），注入失败的末槽（sub）保留同代绑定。
+     */
+    std::vector<std::uint64_t> main_owners;
+    std::vector<std::uint64_t> sub_owners;
+    CHECK(!engine.ReactorOwnerIds(main_owners, sub_owners));
+    CHECK(main_owners.empty());
+    CHECK(sub_owners.size() == original_sub.size());
+    CHECK(sub_owners[0] == original_sub[0]);
+
+    /**
+     * 条件已解除：同代重试成功发布 Stopped，Run 首因不变；查询出口关闭，
+     * 终态 LocalAddresses 拒绝且不改写 out；重复调用幂等成功不复活。
+     */
+    CHECK(!engine.FinalizeNative());
+    CHECK(engine.Phase() == EnginePhase::Stopped);
+    CHECK(engine.LastError() == unbind_cause);
+    std::vector<Address> refused_addresses{addresses[0]};
+    CHECK(engine.LocalAddresses(refused_addresses) == std::make_error_code(std::errc::operation_not_permitted));
+    CHECK(refused_addresses.size() == 1);
+    CHECK(refused_addresses[0].ToString() == addresses[0].ToString());
+    std::vector<std::uint64_t> refused_main;
+    std::vector<std::uint64_t> refused_sub;
+    CHECK(
+        engine.ReactorOwnerIds(refused_main, refused_sub) == std::make_error_code(std::errc::operation_not_permitted));
+    CHECK(refused_main.empty());
+    CHECK(refused_sub.empty());
+    CHECK(!engine.FinalizeNative());
+    CHECK(engine.Phase() == EnginePhase::Stopped);
+    CHECK(engine.LocalAddresses(refused_addresses) == std::make_error_code(std::errc::operation_not_permitted));
+    CHECK(refused_addresses[0].ToString() == addresses[0].ToString());
+    std::cout << "engine_close_finalize_retry run_busy_refused main_unbound_sub_retained closing_retained "
+                 "finalize_stopped cause_kept idempotent=ok\n";
+}
+
+/**
+ * SealPrepare 注入让 Close 后的首次 owner 封锁在装配阶段失败：Run 以真实
+ * not_enough_memory 出口返回并发布 Closing，已接纳连接仍登记、OnClose 责任
+ * 未兑现。同代 FinalizeNative 重试封锁成功，在连接登记的真实 sub owner 上
+ * 恰一次兑现 OnClose 并发布 Stopped；Run 首因保留到终态。OnAccept/OnClose
+ * 的 worker id 分别记录，责任兑现以连接实际登记 owner 为准。
+ */
+static void EngineSealPrepareConnRetained()
+{
+    StartRuntime(2);
+    auto handler = std::make_shared<LifecycleProbe>();
+    Engine engine(handler);
+    EngineTestAccess::ClearConnectInjection(engine);
+    EngineTestAccess::ArmFault(engine, FaultPoint::SealPrepare);
+    EngineRunner runner(engine, ServerConfig(Loopback(0)));
+    CHECK(WaitUntil([&] { return engine.Phase() == EnginePhase::Running; }, 3000ms));
+    std::vector<Address> addresses;
+    CHECK(!engine.LocalAddresses(addresses));
+    auto client = ConnectClient(addresses[0]);
+    CHECK(WaitUntil([&] { return handler->accepted.load() == 1; }, 3000ms));
+    std::vector<std::uint64_t> main_owners;
+    std::vector<std::uint64_t> sub_owners;
+    CHECK(!engine.ReactorOwnerIds(main_owners, sub_owners));
+    CHECK(main_owners.size() == 1);
+    CHECK(sub_owners.size() == 1);
+    CHECK(EngineTestAccess::ConnectionCount(engine) == 1);
+
+    runner.CloseAndJoin();
+    const auto first_cause = std::make_error_code(std::errc::not_enough_memory);
+    CHECK(runner.error == first_cause);
+    CHECK(engine.LastError() == first_cause);
+    CHECK(engine.Phase() == EnginePhase::Closing);
+
+    /**
+     * 封锁未达 owner：连接登记未回收，OnClose 责任未兑现。
+     */
+    CHECK(EngineTestAccess::ConnectionCount(engine) == 1);
+    CHECK(handler->closed.load() == 0);
+    CHECK(handler->close_ids.empty());
+
+    /**
+     * 同代重试：封锁下发 owner，OnClose 在连接实际登记 owner 上恰一次兑现。
+     */
+    CHECK(!engine.FinalizeNative());
+    CHECK(engine.Phase() == EnginePhase::Stopped);
+    CHECK(handler->closed.load() == 1);
+    CHECK(handler->close_ids.size() == 1);
+    CHECK(*handler->close_ids.begin() == sub_owners[0]);
+    CHECK(engine.LastError() == first_cause);
+    {
+        std::lock_guard<std::mutex> lock(handler->mutex);
+        std::cout << "engine_seal_prepare_conn_retained run_nomem closing conn_retained onclose_once_on_owner "
+                     "finalize_stopped cause_kept accept_ids=";
+        for (auto id : handler->accept_ids) {
+            std::cout << id << ",";
+        }
+        std::cout << " close_ids=" << *handler->close_ids.begin() << " ok\n";
+    }
 }
 
 /**
@@ -4584,6 +4758,10 @@ static int RunCases(int argc, char** argv)
             RunPreconditions();
         } else if (test == "engine_driver_failed") {
             EngineDriverFailed();
+        } else if (test == "engine_close_finalize_retry") {
+            EngineCloseFinalizeRetry();
+        } else if (test == "engine_seal_prepare_conn_retained") {
+            EngineSealPrepareConnRetained();
         } else if (test == "invalid_options_rejected") {
             InvalidOptionsRejected();
         } else if (test == "handoff_full_resume") {

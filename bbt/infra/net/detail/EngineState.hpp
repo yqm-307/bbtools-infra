@@ -5,6 +5,7 @@
 #include <deque>
 #include <exception>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -97,6 +98,7 @@ public:
     bool SealRequestedLocked(const Guard&) const;
     void FinishRunLocked(const Guard&);
     bool RunFinishedLocked(const Guard&) const;
+    bool RunActiveLocked(const Guard&) const;
     bool TryClaimRun();
     void NotifyNative();
     void NotifyNativeLocked(const Guard&);
@@ -147,10 +149,7 @@ public:
     DriverSlot SlotLocked(const EngineControl::Guard&, std::size_t index) const;
     std::error_code InjectFailureLocked(const EngineControl::Guard&);
     void OwnerIdsLocked(
-        const EngineControl::Guard&,
-        bool has_main,
-        std::vector<std::uint64_t>& main,
-        std::vector<std::uint64_t>& subs) const;
+        const EngineControl::Guard&, std::vector<std::uint64_t>& main, std::vector<std::uint64_t>& subs) const;
 
 private:
     std::vector<DriverSlot> slots;
@@ -164,6 +163,7 @@ public:
     void PublishLayoutLocked(const EngineControl::Guard&, bool server);
     std::vector<std::shared_ptr<Reactor>> SnapshotLocked(const EngineControl::Guard&) const;
     std::shared_ptr<Reactor> MainLocked(const EngineControl::Guard&) const;
+    std::shared_ptr<Reactor> AtLocked(const EngineControl::Guard&, std::size_t index) const;
     bool HasSubsLocked(const EngineControl::Guard&) const;
     std::vector<std::shared_ptr<Reactor>> SubsLocked(const EngineControl::Guard&) const;
     void ClearLocked(const EngineControl::Guard&);
@@ -322,7 +322,7 @@ public:
     EnginePhase Phase() const noexcept;
     std::error_code EnableAcceptHandoff(std::size_t capacity);
     std::error_code Run(const EngineConfig& config);
-    std::error_code FinalizeNative();
+    std::error_code FinalizeNative() noexcept;
     std::error_code RunImpl(const EngineConfig& config);
     std::error_code LocalAddresses(std::vector<Address>& out) const;
     std::size_t CountConnections() const;
@@ -421,8 +421,14 @@ public:
     void PrepareHooksForTest();
 
 private:
+    std::error_code SealOwnersNative();
+    std::error_code ReclaimNative();
     std::shared_ptr<RawHandler> handler;
     EngineControl control;
+    bool finalize_active{false}; // 由 control 保护。
+    // Run 和 FinalizeNative 串行消费同一批回执。解绑后不再投递 owner 工作。
+    std::vector<std::shared_future<std::error_code>> owner_seals;
+    bool owner_seals_settled{false};
     DriverBindings bindings;
     ReactorSet owners;
     AcceptQueue accepts;

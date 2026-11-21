@@ -1,5 +1,6 @@
 #include <bbt/infra/redis/CoRedisCli.hpp>
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <mutex>
 #include <utility>
@@ -356,6 +357,10 @@ struct CoRedisCli::State {
         const std::string command(formatted, static_cast<std::size_t>(size));
         const bbt::coroutine::WaitOptions wait{options.deadline};
         net::CoTcpConnection co{local};
+        // 编码耗尽预算时必须在 Write 接纳命令前返回。
+        if (std::chrono::steady_clock::now() >= options.deadline) {
+            return result<RawReply>::err(MakeError(ErrorCode::TimedOut, "redis: deadline expired before write"));
+        }
         const auto [sent, write_error] = co.Write(command, wait);
         if (write_error) {
             bool sealed;

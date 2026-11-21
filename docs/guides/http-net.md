@@ -2,7 +2,7 @@
 
 > 状态：已合入 main（PR #102，提交 `4b07517`）；远端 CI 结论以 PR 与 main 的 workflow run 为准。本文描述当前实现，不是冻结契约；接口以 `bbt/infra/http/Client.hpp`、`Server.hpp` 为准。
 >
-> **迁移中**：`net::EngineLifecycle` 与其 pthread runner/timer 已从实现删除；本文片段与示例尚未迁移，不代表当前可照抄的接缝。目标形态是应用根持有共享 Engine、入口 native host hook 在主线程调用一次 `Engine::Run`，主任务用 `Engine::CoWaitRunning` 等 Running、`Run` 返回即本代收口；Engine 的共享、关闭与两向退出见 [Engine 主线程宿主与共享所有权契约](../architecture/native-lifecycle-seam-contract.md) 与 coroutine `core-runtime-contract.md` §12.2。
+> 应用根持有共享 Engine，入口 native host hook 在主线程调用一次 `Engine::Run`，主任务用 `Engine::CoWaitRunning` 等 Running。Engine 的共享、关闭与两向退出见 [Engine 主线程宿主与共享所有权契约](../architecture/native-lifecycle-seam-contract.md) 与 coroutine `core-runtime-contract.md` §12.2。
 >
 > 关闭控制面（`http::Server/Client`、`rpc::CoRpcServer/CoRpcClient`、`redis::CoRedisPool` 的 `Close(CloseOptions)` + `Close(Immediate)` + `Close(wait_release=true)`）与 **HTTP 请求级派发**已在 infra 落地；请求级责任、响应顺序与 inflight 结算的冻结语义见 [关闭控制面契约](../architecture/close-options-contract.md) §4，本文只写实现口径与验证入口。
 
@@ -89,12 +89,12 @@ auto drained = client->Close(bbt::infra::CloseOptions::Graceful(
 //    Immediate：只封口、发布首因、令在飞/排队请求失败；不等待业务完成。
 client->Close();
 //    Engine 的收口：主任务结束后由 host hook 的 OnMainTaskDone 调用一次
-//    engine->Close()；Run 返回即本代收口，业务不 join 线程、不等待 future。
+//    engine->Close()；Run 返回后由宿主检查 Phase() 是否为 Stopped。
 ```
 
 上面 2)–4) 的片段都位于 `bbtco_main()` 内；Engine 的发布、host hook 与两向退出
 见 [Engine 主线程宿主与共享所有权契约](../architecture/native-lifecycle-seam-contract.md)。
-`examples/http_net/main.cc` 仍使用已删除的 `EngineLifecycle`，迁移前不能编译或照抄。
+完整宿主入口见[HTTP 消费示例](../../examples/http_net/main.cc)。
 
 示例场景：新 Client 向新 Server 发两次 GET（200/404）与一次 POST 回显；真实 accepted=1/requests=3 证明复用，不含自带 POSIX HTTP 服务端。
 
@@ -118,7 +118,7 @@ auto drained = server->Close(CloseOptions::Graceful(deadline));
 // 立即：server->Close(CloseOptions::Immediate(reason)) 只封口、取消流源、令 session 失败，不等 handler。
 auto stopped = server->Close(options)（wait_release=true，有限 deadline）; // 物理收口：callback/连接/listener
 // 最后由 host hook 在 OnMainTaskDone 中调用 engine->Close()；
-// Run 返回即 Engine 收口，不存在 runner/join。
+// Run 返回后由宿主检查 Phase() 是否为 Stopped。
 ```
 
 - Engine 的接纳端专用于本 Server；不得并置第二个 `Engine::CoAccept` 消费者或 raw reader。Create 在 Idle 调用；不隐式 Run、监听或创建线程。应用 handler 是 `std::function<result<Response>(IncomingCallContext, IncomingRequest)>`，request 全部 owning；未认证 `peer_principal` 恒空，不用 IP 冒充身份。

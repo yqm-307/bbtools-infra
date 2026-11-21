@@ -21,7 +21,7 @@ result<void> Close(const CloseOptions& options = {});
 |---|---|---|
 | 封口 | 不再接纳，首因已发布 | 后续操作返回 Closed；CloseReason 只读 |
 | 用户责任结算 | 既有责任写终态、结果已发布或明确放弃 | Graceful 成功及模块责任谓词 |
-| 物理回收 | 本对象连接、监听、worker 或 lease 已真实释放 | Close(wait_release=true) 成功、Released()/ReclaimReceipt、Engine Run 返回 |
+| 物理回收 | 本对象连接、监听、worker 或 lease 已真实释放 | Close(wait_release=true) 成功、Released()/ReclaimReceipt、Engine Run 返回后确认 Stopped |
 
 三者不可互相替代。非等待 Immediate 成功只说明关闭动作已提交；Graceful 成功也不独立证明 fd/worker 已释放。超时不得清台账冒充回收。
 
@@ -40,7 +40,7 @@ result<void> Close(const CloseOptions& options = {});
 | MCP stdio transport | 已接纳请求写终态、输出队列及 writer 当前帧均结算 | reader/writer 退出、sink 卸载、O_NONBLOCK 还原；Co/native |
 | mongo::CoMongoDb | 已提交 op 发布逻辑终态 | infra 原有 native finalizer 完成 worker 退出、join、lease 归还；Co/native 等信号，不在 Co worker join |
 | net::Connection / ICoConnection | 无业务排空责任，不支持 Graceful | Immediate 可选 wait_release，等待限 Co；非等待任意线程 |
-| net::Engine | 无业务 drain，不支持 Graceful | 只支持 Immediate、不等待；唯一回收凭据仍为原主线程 host hook 内 Run 返回且 Stopped |
+| net::Engine | 无业务 drain，不支持 Graceful | Close 只支持 Immediate、不等待。Run 返回后以 Stopped 确认回收，仍为 Closing 则按[宿主契约](native-lifecycle-seam-contract.md#4-关闭与回收)重试 |
 
 net 返回 `std::error_code`，协议 adapter 返回 `result<void>`；不强行合并错误层。连接 `Close(options, native_reason)` 保留原生首因，`options.reason` 的非空协议错误不是 native error，副作用前返回 invalid_argument；Engine 同样拒绝非空协议 reason。Engine 无业务排空或独立 runner；`wait_release` 与现有「主任务完成才关闭宿主」存在自依赖，因此在副作用前明确拒绝该参数，不创建 reaper/runner 或隐式等待 HostGate。此能力限制须由集成方独立确认，不能把 Engine 非等待成功当作物理回收。
 

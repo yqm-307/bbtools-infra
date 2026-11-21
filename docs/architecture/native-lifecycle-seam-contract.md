@@ -6,7 +6,7 @@
 
 - 一个应用运行实例恰好一个 `net::Engine`。Engine 由应用根（framework `v2::CoApp`）在主协程内创建并在整个运行期持有；创建只占 Idle 状态，不监听、不建线程。
 - 应用在主协程完成全部 **Idle 阶段装配**（所有要求 `Engine Idle` 的 `Create`，包括 HTTP/RPC Server 的 accept handoff 登记、HTTP/RPC Client、Redis 池、发现用 HTTP Client）后，把 `{shared_ptr<Engine>, EngineConfig}` 发布给入口宿主闸门（framework 拥有，进程内单槽位，不是通用管理器）；发布即表示「装配完成，可以 Run」。
-- 发布之后，runtime 提交后 native host hook 在**原生 main 线程**上调用一次 `Engine::Run(config)`。`Run` 返回即本代 Engine 的 listener、连接台账、driver 绑定、原始回调与 context 已收口；不存在第二个执行 Run 的线程，也没有 runner/join/`pthread_tryjoin_np`/reaper timer/control 线程。
+- 发布之后，runtime 提交后 native host hook 在**原生 main 线程**上调用一次 `Engine::Run(config)`。本代回收按 §4 判定。只有该线程执行 Run。
 - 网络宿主、Redis、发现等组件**借用**同一 Engine（`shared_ptr` 只在装配与调用期有效）：只关闭自己拥有的客户端、连接、会话、watcher；不调用 `Run`，不调用共享 Engine 的 `Close(Immediate)`，不在自身 `Close`/`OnStop`/析构中关闭 Engine。
 - `Engine::Run` 只允许应用入口的 native host hook 调用；业务协程、Service、Component、模块 `Close` 都不调用它。runtime 不认识 Engine：只提供「提交后 native hook 的执行位置」与「主任务完成通知」，不 include infra，不持有 Engine/runner/future/join。
 - 同一应用运行实例不再出现第二个 Engine，也不以 Engine 注册表、按地址自动合并或多 Engine 管理器替代本形态；本条只约束 framework 宿主形态，不禁止不经 framework 的 infra 独立消费者各自持有自己的 Engine。
@@ -16,7 +16,7 @@
 入口顺序固定为：`setup_runtime`（runtime Start 前）→ `RuntimeMain` Start → 可选提交前同步 hook（短、不挂起，保留）→ 提交主任务 → **提交后 native host hook**（本项目新增）→ 只等「主任务完成 + host hook 返回」。
 
 - **方向 A（主任务结束 → Run 退出）**：主任务正常返回或未捕获异常时，runtime 恰好一次调用 hook 登记的 `OnMainTaskDone` 回调；hook 在回调里对共享 Engine 调用一次 `Close()`（任意线程、非阻塞、幂等），`Run` 的控制循环因此封口并返回。hook 必须在返回前接住 `Run` 的返回值。
-- **方向 B（Run 提前失败 → 主任务被唤醒）**：`Run` 在发布 Running 前失败时，Engine 记录 `LastError` 并进入 `Stopped`；主任务在 `CoWaitRunning` 上有界等待，观察 Stopped 即返回该错误（无错误时为 `Closed`），按启动失败收口并返回。hook 不得在未让主任务可观察失败的情况下先行退出。
+- **方向 B（Run 提前失败 → 主任务被唤醒）**：`Run` 在发布 Running 前失败时，Engine 记录 `LastError`。主任务在 `CoWaitRunning` 上有界等待，观察到 Stopped，或 Run 已退出且仍为 Closing 时，按 `LastError` 返回并收口。hook 不得在未让主任务可观察失败的情况下先行退出。
 - hook 等待发布时同时等待「主任务完成」：主任务在发布前失败或提前返回时，hook 不再 Run，直接返回 `0`，让 `MainReturned/MainThrew` 的原退出码生效；此时不存在需要关闭的 Engine。
 - **完成恰好一次**：一次 RuntimeMain 运行只发布一个结果。优先级：host hook 返回非零 → `HostHookFailed`（取该返回值）；主任务未捕获异常 → `MainThrew`（1）；否则 `MainReturned`（取主任务 int）。提交前 hook 非零仍为 `HookRejected`，且不再提交主任务。
 - 「只等主任务」改为「等主任务与 host hook 两者」：hook 先返回时 runtime 继续等主任务结束（主任务通过方向 B 的失败观察自行收口）；主任务先结束时 runtime 继续等 hook 返回。两部分都结束后才返回 native `main`。禁止用 `result.get()` 前后换位掩盖死等，也不新增线程/condition 轮询替代该等待。`OnMainTaskDone` 登记只活到 hook 返回或抛异常（见 coroutine 契约 §12.2）：hook 提前返回后它不会再被调用，所以「主任务之后完成」只能靠 hook 已设置的共享状态或已发出的 `Close(Immediate)`，不能靠已随 hook 栈失效的回调。
@@ -46,8 +46,8 @@ public:
 ## 4. 关闭与回收
 
 - 组件关闭只处理自己拥有的对象：`Close(CloseOptions)` 的 `mode`/`wait_release`/`deadline` 含义见 [关闭控制面契约](close-options-contract.md)。共享 Engine 不由任何组件关闭。
-- 应用 `CoStop` 只收口组件与业务对象；它在 Engine 仍 Running 时完成，不等待 Engine 物理回收。主任务返回后由 host hook 调用 `Close(Immediate)`，`Run` 返回才表示 Engine 本代网络资源收口。
-- 共享 Engine 的物理凭据只有一项：`Run` 已在 host hook 内返回且 `Phase()==Stopped`。`Run` 返回后 Engine 析构只做兜底，不再承担未完成的物理责任；`Run` 返回时仍 `Closing`（解绑失败）按失败保留错误，由宿主报告，不伪报 Stopped。
+- 应用 `CoStop` 在 Engine 仍 Running 时收口组件与业务对象。主任务返回后由 host hook 请求 `Close(Immediate)`。
+- `Run` 返回后，宿主检查 `Phase()`。`Stopped` 确认本代物理收口。若仍为 `Closing`，保留本代引擎、报告首因，并由原生宿主按[网络执行域的重试契约](gnet-network-execution.md)调用 `FinalizeNative()`。
 - 组件的物理回收各自独立：HTTP/RPC/Redis/consul 用各自 `Close(wait_release=true)`（`wait_release=true` 时在同一 `Close` 内消费同一绝对期限），Mongo 用 infra 自有 native finalizer；不得把 Engine 的 `Run` 返回当作它们已排空或已回收。Mongo 的 `wait_release=true` 在 Co 域同样成立：Co 调用挂起等该 native finalizer 的完成信号，join 只在 finalizer 线程执行，不在 Co worker 或组件析构中。
 - `Run` 提前失败、主任务异常、hook 失败都保留首因与 owner；同一次停止不换模式、不续预算、不自动重试；下一次显式关闭才可给新的绝对期限。
 

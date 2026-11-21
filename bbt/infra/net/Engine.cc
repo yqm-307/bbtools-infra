@@ -105,14 +105,9 @@ std::error_code Engine::Run(const EngineConfig& config)
     return m_impl->Run(config);
 }
 
-std::error_code Engine::FinalizeNative()
+std::error_code Engine::FinalizeNative() noexcept
 {
     return m_impl->FinalizeNative();
-}
-
-std::error_code Engine::RunImpl(const EngineConfig& config)
-{
-    return m_impl->RunImpl(config);
 }
 
 std::error_code Engine::LocalAddresses(std::vector<Address>& out) const

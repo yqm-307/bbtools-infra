@@ -7,7 +7,7 @@
  * `Engine::Run` 占调用它的宿主 native 控制线程，自动绑定已登记 Processer 槽，
  * 每个 Reactor 由对应 P 的 driver 推进自有 Asio context；不新建库内控制线程或
  * 网络 I/O 线程。应用运行时只在入口 native host hook 内调用一次 `Run`，主协程
- * 用 `CoWaitRunning` 观察 Running；`Run` 返回是本代网络资源收口的唯一凭据。
+ * 用 `CoWaitRunning` 观察 Running，用 `Phase()` 的 Stopped 确认本代物理收口。
  * 生命周期与取舍见 docs/architecture/gnet-network-execution.md 与
  * docs/architecture/native-lifecycle-seam-contract.md。
  *
@@ -21,7 +21,7 @@
  *   - 成功后自动绑槽（server 1 main + N sub；client-only 无 main），安装
  *     listener，发布 Running（此时 `LocalAddresses` 才可能有完整语义），进入
  *     控制循环。
- *   - `Close(Immediate)` 并发安全、幂等，只封口并唤醒控制域；`Run` 返回才表示本
+ *   - `Close(Immediate)` 并发安全、幂等，只封口并唤醒控制域；以 Stopped 确认本
  *     Engine 的网络资源、回调与 driver 已收口。
  *   - 控制域按持有 token 有限复查 `QueryProcesserDriver`；Failed 时封口、同代
  *     解绑，以冻结状态、`LastError`/`LastFailure` 与内部完成订阅作为替代出口，
@@ -106,7 +106,7 @@ struct CoAccess;
  * @brief 网络执行域：listener、连接台账与 Co 消费面。
  *
  * 一个 Engine 对应一代网络资源。「代」是唯一的重启单位：`Run` 成功进入
- * Running，`Run` 返回即本代全部资源收口；同一实例不能重新开启。
+ * Running，同一实例不能重新开启；Run 返回后仍为 Closing 时，宿主可重试收口。
  *
  * 线程与域约束见各成员的注释：`Close(Immediate)`、`RequestStopAccepting` 等可从任意线程
  * 调用，`Run` 只能由应用入口的 native host hook 在每个运行实例中调用一次。
@@ -134,25 +134,36 @@ public:
     Engine& operator=(const Engine&) = delete;
 
     /**
-     * @brief 应用入口 native host hook 的执行入口；阻塞到本代成功收口后返回。
+     * @brief 应用入口 native host hook 的执行入口；控制循环结束并尝试收口后返回。
      *
      * 只允许在应用入口的 native host hook 中调用一次；同一实例的第二次 `Run`
      * （含并发）在绑定与 socket 副作用之前返回 `device_or_resource_busy`，
      * `Run` 成功后不可重开。前置校验失败时在绑定与 socket 副作用之前返回。
      *
      * @param config 监听地址、网络选项与推进方式声明。
-     * @return 空表示正常收口；否则为前置校验或启动失败的原因。返回本身就是本代
-     *         网络资源收口的凭据，`Phase()` 同时为 Stopped；仍为 Closing 时表示
-     *         解绑失败，错误保留给宿主报告。
+     * @return 空表示正常收口，否则返回校验、启动、运行或收口错误。返回后若仍为
+     *         Closing，宿主持有本代引擎并通过 `FinalizeNative()` 重试。
      */
     std::error_code Run(const EngineConfig& config);
 
     /**
      * @brief 请求关闭。任意线程可调用，非阻塞、幂等。
      *
-     * 只封口并唤醒控制域；收口凭据是 `Run` 返回。
+     * 只封口并唤醒控制域。等待 `Run` 返回后，通过 Stopped 确认本代已收口。
      */
     std::error_code Close(const CloseOptions& options = {}) noexcept;
+
+    /**
+     * @brief 由原生宿主线程在 Run 退出后重试同代物理收口。
+     *
+     * 协程或已登记 worker 调用返回 operation_not_permitted。Run 仍在执行时
+     * 返回 device_or_resource_busy；另一次收口正在进行时返回
+     * resource_unavailable_try_again。Idle 或 Stopped 时幂等返回成功。
+     * Closing 时先由健康 owner 完成未结回调，再同步解绑与物理收口。失败保留
+     * Closing 和剩余责任，成功发布 Stopped。`LastError()` 保留 Run 首因。
+     * 本调用无解绑时限。
+     */
+    std::error_code FinalizeNative() noexcept;
 
     /**
      * @brief 当前阶段快照。
@@ -300,15 +311,6 @@ private:
     /**
      * Run 的唯一实现体（控制门已由 Run 占用）。
      */
-    std::error_code RunImpl(const EngineConfig& config);
-
-    /**
-     * 析构兜底：Run 因解绑失败保留 Closing 时再尝试一次同代同步收口。
-     *
-     * 只在 phase==Closing 时有实际动作；成功返回空错误并发布 Stopped，
-     * 解绑失败返回原错误并保留同代绑定。可在 native 非 Processer 域调用。
-     */
-    std::error_code FinalizeNative();
 
     /**
      * ---- Co 内部步骤（仅由 detail/CoInternal.hpp 调用）-----------------------

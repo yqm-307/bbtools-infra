@@ -165,6 +165,7 @@ target_link_options(Test_net_contract_regressions PRIVATE -rdynamic -Wl,--wrap=s
 foreach(_case        ring_alloc_no_consume hub_early_notify_retained
         write_total_ops_bound write_query_monotonic onwrite_throw_continues
         wait_accepted_existing_out run_preconditions engine_driver_failed
+        engine_close_finalize_retry engine_seal_prepare_conn_retained
         invalid_options_rejected handoff_full_resume lb_subs fairness
         ring_append_fault_shared_out co_read_append_fault_nonempty_out buffer_copy_consume_fault co_read_idle_no_spin
         staged_close_tail connect_complete_before_wait connect_timeout_recycles_adopt
