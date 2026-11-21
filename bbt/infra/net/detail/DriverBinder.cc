@@ -82,6 +82,9 @@ DriverBinder::BindSlots(std::size_t count, std::vector<DriverSlot>& out, std::ve
     if (count > ids.size()) {
         return std::make_error_code(std::errc::no_buffer_space);
     }
+    if (count > out.max_size() - out.size() || (residual && count > residual->max_size() - residual->size())) {
+        return std::make_error_code(std::errc::no_buffer_space);
+    }
 
     /**
      * 本地构建新绑定：失败时调用者 out 中既存绑定保持原样，不丢责任。
@@ -89,20 +92,20 @@ DriverBinder::BindSlots(std::size_t count, std::vector<DriverSlot>& out, std::ve
     std::vector<DriverSlot> bound;
     try {
         bound.reserve(count);
+        if (residual) {
+            residual->reserve(residual->size() + count);
+        }
     } catch (const std::bad_alloc&) {
         return std::make_error_code(std::errc::not_enough_memory);
     }
 
     auto rollback = [&](std::error_code reason) {
         const auto unbind_error = UnbindSlots(bound);
-        if (unbind_error && residual != nullptr) {
-
-            /**
-             * 未解绑的残项责任移交给调用者；不让局部 vector 析构吞掉。
-             */
-            residual->insert(
-                residual->end(), std::make_move_iterator(bound.begin()), std::make_move_iterator(bound.end()));
-            bound.clear();
+        if (residual) {
+            // 容量在登记前已预留，回滚不能丢掉尚未解绑的 token。
+            for (auto& slot : bound) {
+                residual->push_back(std::move(slot));
+            }
         }
         return reason ? reason : unbind_error;
     };
@@ -116,12 +119,18 @@ DriverBinder::BindSlots(std::size_t count, std::vector<DriverSlot>& out, std::ve
             driver = std::make_shared<ReactorDriver>();
         } catch (const std::bad_alloc&) {
             return rollback(std::make_error_code(std::errc::not_enough_memory));
+        } catch (...) {
+            return rollback(std::make_error_code(std::errc::io_error));
         }
         ProcesserDriverToken token{};
         ProcesserDriverStatus status = ProcesserDriverStatus::InvalidDriver;
         try {
             status = scheduler->RegisterProcesserDriver(id, driver, token);
         } catch (...) {
+            // 注册先提交 token 再唤醒 worker，提交后抛异常仍由本轮回滚。
+            if (token != ProcesserDriverToken{}) {
+                bound.push_back(DriverSlot{id, token, std::move(driver)});
+            }
             return rollback(std::make_error_code(std::errc::io_error));
         }
         if (status == ProcesserDriverStatus::Ok) {
@@ -164,10 +173,11 @@ DriverBinder::BindSlots(std::size_t count, std::vector<DriverSlot>& out, std::ve
     return {};
 }
 
-std::error_code DriverBinder::UnbindSlots(std::vector<DriverSlot>& slots)
+std::error_code DriverBinder::UnbindSlots(std::vector<DriverSlot>& slots, bool fail_last_for_test)
 {
     std::error_code first;
     Scheduler* scheduler = SchedulerInstance();
+    const auto fail_id = fail_last_for_test ? slots.back().processer_id : BBT_COROUTINE_INVALID_PROCESSER_ID;
 
     /**
      * 原地移除成功项（swap-pop），不分配额外容器。
@@ -175,6 +185,13 @@ std::error_code DriverBinder::UnbindSlots(std::vector<DriverSlot>& slots)
     std::size_t index = 0;
     while (index < slots.size()) {
         DriverSlot& slot = slots[index];
+        if (fail_last_for_test && slot.processer_id == fail_id) {
+            if (!first) {
+                first = std::make_error_code(std::errc::io_error);
+            }
+            ++index;
+            continue;
+        }
         if (!slot.driver) {
             slot = std::move(slots.back());
             slots.pop_back();

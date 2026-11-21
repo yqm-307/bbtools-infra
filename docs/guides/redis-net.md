@@ -66,7 +66,7 @@ key/value 二进制安全；拒绝空 key 和空 DEL 列表。PING 只接受 PON
 - `Set(key, value, SetOptions, CallOptions) -> result<bool>`：`SetOptions.expire` 为可选过期，`std::chrono::milliseconds`，须 >0 且不超 `kMaxSetExpire`（365 天），线上以 PX 发送（EX 语义由毫秒表达）；`SetOptions::Condition` 取 `None`/`NX`/`XX`。写入成功 `ok(true)`；NX/XX 条件不满足（服务端 nil 回复）为 `ok(false)`，不是错误。expire 越界或空 key 在接纳前返回 InvalidArgument（零接纳，什么都不发）。既有 `Set(key, value, CallOptions) -> result<void>` 签名与行为不变。
 - `Expire(key, ttl, CallOptions) -> result<bool>`：PEXPIRE。`ok(true)` 已设置过期；key 不存在 `ok(false)`；ttl≤0 InvalidArgument 零接纳。
 - `Ttl(key, CallOptions) -> result<TtlResult>`：PTTL 映射为 `TtlResult::State` 三态——`KeyMissing`（key 不存在）/`NoExpiry`（存在但无过期）/`Expires`（`remaining` 为剩余毫秒，其余态不读）；服务端 -1/-2 魔数不进入公共 API。
-- `Incr`/`Decr`/`IncrBy`/`DecrBy -> result<std::int64_t>`：返回服务端整数结果。非整数值、溢出由服务端报错，映射为 RemoteError 且连接保持（RemoteError 是唯一保留连接的错误），同流可继续 Ping/Get。
+- `Incr`/`Decr`/`IncrBy`/`DecrBy -> result<std::int64_t>`：返回服务端整数结果。非整数值或溢出时，完整 Redis 错误回复映射为 `RemoteError`，同一连接仍可继续 `Ping`/`Get`。
 - Hash（key/field/value 二进制安全；空 key、空 field、`HDel` 空 fields 一律 InvalidArgument 零接纳）：`HSet` 返回 `ok(true)` 新建字段、`ok(false)` 覆盖已有字段；`HGet` 字段缺失或 key 不存在为 `ok(nullopt)`；`HDel` 返回实际删除数量；`HExists` 字段存在为 true；`HGetAll` 返回按服务端顺序排列、二进制安全的 field/value 对序列（`HashEntries`）。
 
 对应回复接纳规则扩充：PEXPIRE 只接受 0/1；PTTL、INCR 族与 HSET 只接受整数；AUTH/SELECT 只接受 +OK。数组回复由共享解码层 `bbt/infra/redis/detail/` 解成一维扁平快照：元素只接受 Bulk/Status/Nil/Integer（Integer 转十进制文本），元素数与元素字节合计上限为 `detail::kMaxArrayElements`（65536）与 `detail::kMaxArrayBytes`（16 MiB）；字节预算在复制每个元素负载前按剩余额度校验（checked-add，无回绕），空元素指针与 str/len 不一致同样拒绝。超限、嵌套数组或其他元素类型按现有协议错误规则退役连接，已接纳命令为 OutcomeUnknown、cause 为 ProtocolError。HGETALL 在 Array 之外还要求元素数为偶数且不含 nil 元素（field/value 对契约），奇数或含 nil 的完整数组同样退役为 ProtocolError。当前只有 HGETALL 放行数组回复，其余命令收到数组仍按协议错误退役；LRANGE 等数组命令未开放入口。
@@ -80,6 +80,7 @@ key/value 二进制安全；拒绝空 key 和空 DEL 列表。PING 只接受 PON
 | 非协程 / 未连接 / 已封口 | InvalidContext / RuntimeUnavailable / Closed，零提交 |
 | `Engine::CoDial` 拒连 / deadline / 取消 | TransportError / TimedOut / Cancelled，不发布连接；失败不代表 fd 已回收 |
 | Engine 不可用或有 RawHandler | RuntimeUnavailable，保留 net 原始错误码 |
+| 编码后、调用 Write 前已过 deadline | TimedOut，零提交，已有连接仍可复用 |
 | 写返回 n=0 且有错误（含已接纳后零发送即撤销） | 按原因 Closed、TimedOut、Cancelled、Overloaded 或 TransportError，不一概映射 Overloaded |
 | 写返回 n>0，没有可信完整回复 | OutcomeUnknown，`details["cause"]` 保存物理错误类别，`backend_category/backend_code` 保留后端原因；不填 request_phase，不推断 Redis 未执行 |
 | 完整 Redis ERROR | RemoteError，`domain_code` 为 WRONGTYPE 等首词，`backend_category="redis"`；连接继续同步 |

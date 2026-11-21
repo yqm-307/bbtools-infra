@@ -317,6 +317,11 @@ bool EngineControl::RunFinishedLocked(const Guard&) const
     return run_finished;
 }
 
+bool EngineControl::RunActiveLocked(const Guard&) const
+{
+    return control_claimed.load() && !run_finished;
+}
+
 bool EngineControl::TryClaimRun()
 {
     bool expected = false;
@@ -455,11 +460,9 @@ bool DriverBindings::HasResidual() const
 
 std::vector<DriverSlot> DriverBindings::TakeOwnedLocked(const EngineControl::Guard&)
 {
-    auto result = std::move(slots);
-    slots.clear();
-    for (auto& slot : residual_slots)
-        result.push_back(std::move(slot));
-    residual_slots.clear();
+    // 绑定成功、绑定回滚残留互斥。清理交接不分配内存。
+    std::vector<DriverSlot> result;
+    result.swap(slots.empty() ? residual_slots : slots);
     return result;
 }
 
@@ -482,18 +485,11 @@ std::error_code DriverBindings::InjectFailureLocked(const EngineControl::Guard&)
 }
 
 void DriverBindings::OwnerIdsLocked(
-    const EngineControl::Guard&,
-    bool has_main,
-    std::vector<std::uint64_t>& main,
-    std::vector<std::uint64_t>& subs) const
+    const EngineControl::Guard&, std::vector<std::uint64_t>& main, std::vector<std::uint64_t>& subs) const
 {
-    std::size_t index = 0;
-    if (has_main && !slots.empty()) {
-        main.push_back(slots[0].processer_id);
-        index = 1;
+    for (const auto& slot : slots) {
+        (slot.main_owner ? main : subs).push_back(slot.processer_id);
     }
-    for (; index < slots.size(); ++index)
-        subs.push_back(slots[index].processer_id);
 }
 
 void ReactorSet::PublishBalancerLocked(const EngineControl::Guard&, std::unique_ptr<LoadBalancer> value)
@@ -531,6 +527,11 @@ std::vector<std::shared_ptr<Reactor>> ReactorSet::SnapshotLocked(const EngineCon
 std::shared_ptr<Reactor> ReactorSet::MainLocked(const EngineControl::Guard&) const
 {
     return main_index < reactors.size() ? reactors[main_index] : nullptr;
+}
+
+std::shared_ptr<Reactor> ReactorSet::AtLocked(const EngineControl::Guard&, std::size_t index) const
+{
+    return index < reactors.size() ? reactors[index] : nullptr;
 }
 
 bool ReactorSet::HasSubsLocked(const EngineControl::Guard&) const
@@ -1476,7 +1477,22 @@ std::error_code EngineImpl::Run(const EngineConfig& config)
     if (!control.TryClaimRun()) {
         return std::make_error_code(std::errc::device_or_resource_busy);
     }
-    const auto error = RunImpl(config);
+    std::error_code error;
+    try {
+        error = RunImpl(config);
+    } catch (const std::bad_alloc&) {
+        error = std::make_error_code(std::errc::not_enough_memory);
+    } catch (...) {
+        error = std::make_error_code(std::errc::io_error);
+    }
+    if (error && Phase() != EnginePhase::Stopped) {
+        {
+            auto guard = control.Acquire();
+            control.RecordErrorLocked(guard, error);
+            control.PublishPhaseLocked(guard, EnginePhase::Closing);
+        }
+        (void)Close({});
+    }
     {
         auto guard = control.Acquire();
         control.FinishRunLocked(guard);
@@ -1485,35 +1501,168 @@ std::error_code EngineImpl::Run(const EngineConfig& config)
     return error;
 }
 
-std::error_code EngineImpl::FinalizeNative()
+std::error_code EngineImpl::FinalizeNative() noexcept
 {
-    auto impl = shared_from_this();
-    if (!impl) {
-        return {};
+    if (bbt::coroutine::GetLocalCoroutineId() != 0
+        || bbt::coroutine::detail::Processer::TryGetLocalProcesser() != nullptr) {
+        return std::make_error_code(std::errc::operation_not_permitted);
     }
     {
         auto guard = control.Acquire();
+        if (control.RunActiveLocked(guard)) {
+            return std::make_error_code(std::errc::device_or_resource_busy);
+        }
         if (control.PhaseLocked(guard) != EnginePhase::Closing) {
             return {};
         }
+        if (finalize_active) {
+            return std::make_error_code(std::errc::resource_unavailable_try_again);
+        }
+        finalize_active = true;
+    }
+    std::error_code error;
+    try {
+        error = ReclaimNative();
+    } catch (const std::bad_alloc&) {
+        error = std::make_error_code(std::errc::not_enough_memory);
+    } catch (...) {
+        error = std::make_error_code(std::errc::io_error);
+    }
+    {
+        auto guard = control.Acquire();
+        finalize_active = false;
+    }
+    return error;
+}
+
+std::error_code EngineImpl::SealOwnersNative()
+{
+    if (owner_seals_settled) {
+        return {};
+    }
+    SealService();
+    const auto reactors = [&] {
+        auto guard = control.Acquire();
+        return owners.SnapshotLocked(guard);
+    }();
+    owner_seals.resize(reactors.size());
+    auto impl = shared_from_this();
+    auto* scheduler = bbt::coroutine::detail::Scheduler::GetInstance().get();
+    const auto owner_lost = [&](std::size_t index) {
+        using bbt::coroutine::detail::ProcesserDriverSnapshot;
+        using bbt::coroutine::detail::ProcesserDriverState;
+        using bbt::coroutine::detail::ProcesserDriverStatus;
+        const auto slot = [&] {
+            auto guard = control.Acquire();
+            return bindings.SlotLocked(guard, index);
+        }();
+        ProcesserDriverSnapshot snapshot;
+        const auto status = scheduler->QueryProcesserDriver(slot.processer_id, snapshot);
+        if (status != ProcesserDriverStatus::Ok || snapshot.m_token != slot.token) {
+            RecordError(std::make_error_code(std::errc::operation_canceled));
+            return true;
+        }
+        if (snapshot.m_state == ProcesserDriverState::Failed) {
+            RecordControlFailure(snapshot.m_exception);
+            RecordError(std::make_error_code(std::errc::io_error));
+            return true;
+        }
+        return false;
+    };
+
+    for (std::size_t index = 0; index < reactors.size(); ++index) {
+        auto& receipt = owner_seals[index];
+        if (receipt.valid() || owner_lost(index)) {
+            continue;
+        }
+        if (TakeFault(FaultPoint::SealPrepare)) {
+            throw std::bad_alloc{};
+        }
+        auto promise = std::make_shared<std::promise<std::error_code>>();
+        auto future = promise->get_future().share();
+        const auto& reactor = reactors[index];
+        const auto seal = [reactor, promise, impl] {
+            for (int attempt = 0; attempt < 2; ++attempt) {
+                try {
+                    if (impl->TakeFault(FaultPoint::SealThrow)) {
+                        throw std::bad_alloc{};
+                    }
+                    if (reactor->SealServiceOnOwner([promise] { promise->set_value({}); })) {
+                        return;
+                    }
+                } catch (...) {
+                    impl->control.NoteOwnerFailure();
+                }
+            }
+            promise->set_value(std::make_error_code(std::errc::resource_unavailable_try_again));
+        };
+        const auto post = [&] {
+            return !TakeFault(FaultPoint::SealPost) && reactor->TryPostInternal(seal);
+        };
+        if (!post() && !post()) {
+            return std::make_error_code(std::errc::resource_unavailable_try_again);
+        }
+        receipt = std::move(future);
+    }
+    for (std::size_t index = 0; index < owner_seals.size(); ++index) {
+        auto& receipt = owner_seals[index];
+        if (!receipt.valid()) {
+            continue;
+        }
+        while (receipt.wait_for(std::chrono::milliseconds(5)) != std::future_status::ready) {
+            if (TakeFault(FaultPoint::WaitDriverFailed)) {
+                return std::make_error_code(std::errc::io_error);
+            }
+            if (owner_lost(index)) {
+                break;
+            }
+        }
+        if (receipt.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+            if (const auto error = receipt.get()) {
+                receipt = {};
+                return error;
+            }
+        }
+    }
+    if (control.OwnerFailed()) {
+        RecordError(std::make_error_code(std::errc::not_enough_memory));
+    }
+    owner_seals.clear();
+    owner_seals_settled = true;
+    return {};
+}
+
+std::error_code EngineImpl::ReclaimNative()
+{
+    if (const auto error = SealOwnersNative()) {
+        return error;
     }
     std::vector<DriverSlot> to_unbind;
-    std::vector<std::shared_ptr<Reactor>> reactors;
     {
         auto guard = control.Acquire();
         to_unbind = bindings.TakeOwnedLocked(guard);
-        reactors = owners.SnapshotLocked(guard);
     }
     if (!to_unbind.empty()) {
-        const auto error = DriverBinder::UnbindSlots(to_unbind);
+        const auto error = DriverBinder::UnbindSlots(to_unbind, TakeFault(FaultPoint::Unbind));
         if (error || !to_unbind.empty()) {
             auto guard = control.Acquire();
             bindings.PublishLocked(guard, std::move(to_unbind));
             return error ? error : std::make_error_code(std::errc::io_error);
         }
     }
-    for (auto& reactor : reactors) {
-        reactor->FinalizeControl();
+    // 逐个取 owner，避免在低内存的清理路径新建快照。
+    for (std::size_t index = 0;; ++index) {
+        std::shared_ptr<Reactor> reactor;
+        {
+            auto guard = control.Acquire();
+            reactor = owners.AtLocked(guard, index);
+        }
+        if (!reactor) {
+            break;
+        }
+        if (const auto error = reactor->FinalizeControl()) {
+            return error;
+        }
         reactor->ReleaseDriver();
     }
     SettleAbandonedConnectReclaim();
@@ -1593,32 +1742,11 @@ std::error_code EngineImpl::RunImpl(const EngineConfig& config)
     }
 
     auto abort_install = [&](std::error_code error) -> std::error_code {
-        std::vector<DriverSlot> to_unbind;
-        {
-            auto guard = control.Acquire();
-            to_unbind = bindings.TakeOwnedLocked(guard);
+        RecordError(error);
+        if (const auto reclaim_error = ReclaimNative()) {
+            return reclaim_error;
         }
-        const auto unbind_error = DriverBinder::UnbindSlots(to_unbind);
-        if (unbind_error || !to_unbind.empty()) {
-            auto guard = control.Acquire();
-            bindings.PublishLocked(guard, std::move(to_unbind));
-            control.RecordErrorLocked(guard, unbind_error ? unbind_error : error);
-            control.PublishPhaseLocked(guard, EnginePhase::Closing);
-            return unbind_error ? unbind_error : error;
-        }
-        for (auto& reactor : reactors) {
-            reactor->FinalizeControl();
-            reactor->ReleaseDriver();
-        }
-        SettleAbandonedConnectReclaim();
-        if (accepts.StopRequested()) {
-            MarkAcceptStopDone();
-        }
-        {
-            auto guard = control.Acquire();
-            owners.ClearLocked(guard);
-        }
-        return fail(error);
+        return error;
     };
 
     auto* scheduler = bbt::coroutine::detail::Scheduler::GetInstance().get();
@@ -1678,6 +1806,7 @@ std::error_code EngineImpl::RunImpl(const EngineConfig& config)
     std::shared_ptr<Reactor> main_reactor;
     {
         auto guard = control.Acquire();
+        slots.front().main_owner = server;
         bindings.PublishLocked(guard, std::move(slots));
         owners.PublishBalancerLocked(guard, std::move(balancer));
         for (std::size_t i = 0; i < bindings.CountLocked(guard); ++i) {
@@ -1808,7 +1937,6 @@ std::error_code EngineImpl::RunImpl(const EngineConfig& config)
      */
     NotifyPhaseWaiters();
 
-    bool failed = false;
     for (;;) {
         bool close = false;
         {
@@ -1857,18 +1985,17 @@ std::error_code EngineImpl::RunImpl(const EngineConfig& config)
                 break;
             }
             if (snapshot.m_state == bbt::coroutine::detail::ProcesserDriverState::Failed) {
-                failed = true;
+                control_error = true;
                 RecordControlFailure(snapshot.m_exception);
                 RecordError(std::make_error_code(std::errc::io_error));
                 break;
             }
         }
-        if (failed || control_error) {
+        if (control_error) {
 
             /**
              * 诚实收口，不无限只记录后继续等
              */
-            failed = true;
             break;
         }
     }
@@ -1877,119 +2004,12 @@ std::error_code EngineImpl::RunImpl(const EngineConfig& config)
         auto guard = control.Acquire();
         control.PublishPhaseLocked(guard, EnginePhase::Closing);
     }
-    SealService();
 
-    /**
-     * 正常路径：owner 撤 listener/取消 connect/关闭连接并兑现用户终态。
-     */
-    bool owner_seal_complete = !failed;
-    std::error_code final_error;
-    if (!failed) {
-        std::vector<std::shared_future<std::error_code>> seals;
-        for (auto& reactor : reactors) {
-            auto promise = std::make_shared<std::promise<std::error_code>>();
-            seals.push_back(promise->get_future().share());
-
-            /**
-             * 单次可恢复 post 失败：补交同一条 seal 责任，不设隐藏关闭 deadline，
-             * 直到原 owner 兑现全部已接纳回调（正常完成条件是 owner 结算，而非 2s）。
-             */
-            for (;;) {
-                if (TakeFault(FaultPoint::SealPost)) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    continue;
-                }
-                if (reactor->TryPostInternal([reactor, promise, impl] {
-                        try {
-                            if (impl->TakeFault(FaultPoint::SealThrow)) {
-                                throw std::runtime_error("seal-throw-test");
-                            }
-                            reactor->SealServiceOnOwner([promise] { promise->set_value(std::error_code{}); });
-                        } catch (...) {
-
-                            /**
-                             * 本地可恢复异常：保留首错，但先重试完成正常 owner
-                             * 收口（OnClose/OnWrite/OnConnect），不得用冻结替代。
-                             */
-                            impl->control.NoteOwnerFailure();
-                            try {
-                                reactor->SealServiceOnOwner([promise] { promise->set_value(std::error_code{}); });
-                            } catch (...) {
-                                promise->set_value(std::make_error_code(std::errc::not_enough_memory));
-                            }
-                        }
-                    })) {
-                    break;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-        }
-        for (auto& future : seals) {
-            while (future.wait_for(std::chrono::milliseconds(5)) != std::future_status::ready) {
-                if (driver_failed()) {
-
-                    /**
-                     * driver 真实 Failed：不再等一个不会执行的 handler
-                     */
-                    break;
-                }
-            }
-            if (future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
-                owner_seal_complete = false;
-                final_error = std::make_error_code(std::errc::operation_canceled);
-            } else if (const auto seal_result = future.get()) {
-                owner_seal_complete = false;
-                final_error = seal_result;
-            }
-        }
-        if (control.OwnerFailed()) {
-            RecordError(std::make_error_code(std::errc::not_enough_memory));
-            if (!final_error) {
-                final_error = std::make_error_code(std::errc::not_enough_memory);
-            }
-        }
-        if (!owner_seal_complete) {
-            auto guard = control.Acquire();
-            control.RecordErrorLocked(guard, final_error);
-        }
+    if (const auto error = ReclaimNative()) {
+        RecordError(error);
+        return LastError();
     }
-
-    /**
-     * 同代同步解绑；失败/残留则保留责任对象、保持 Closing、可观测错误，不发布 Stopped。
-     */
-    std::vector<DriverSlot> to_unbind;
-    {
-        auto guard = control.Acquire();
-        to_unbind = bindings.TakeOwnedLocked(guard);
-    }
-    const auto unbind_error = DriverBinder::UnbindSlots(to_unbind);
-    if (unbind_error || !to_unbind.empty()) {
-        auto guard = control.Acquire();
-        bindings.PublishLocked(guard, std::move(to_unbind));
-        control.RecordErrorLocked(guard, unbind_error ? unbind_error : std::make_error_code(std::errc::io_error));
-        control.PublishPhaseLocked(guard, EnginePhase::Closing);
-        return control.LastErrorLocked(guard);
-    }
-
-    /**
-     * 解绑成功：控制域独占清理旧 context（不再触发用户回调），再释放 driver 环。
-     */
-    for (auto& reactor : reactors) {
-        reactor->FinalizeControl();
-        reactor->ReleaseDriver();
-    }
-    SettleAbandonedConnectReclaim();
-    if (accepts.StopRequested()) {
-        MarkAcceptStopDone();
-    }
-    {
-        auto guard = control.Acquire();
-        owners.ClearLocked(guard);
-        control.PublishPhaseLocked(guard, EnginePhase::Stopped);
-        control.NotifyNative();
-    }
-    NotifyPhaseWaiters();
-    return final_error ? final_error : LastError();
+    return LastError();
 }
 
 std::error_code EngineImpl::LocalAddresses(std::vector<Address>& out) const
@@ -2016,7 +2036,7 @@ EngineImpl::ReactorOwnerIds(std::vector<std::uint64_t>& main_owners, std::vector
     if (control.PhaseLocked(guard) == EnginePhase::Idle || control.PhaseLocked(guard) == EnginePhase::Stopped) {
         return std::make_error_code(std::errc::operation_not_permitted);
     }
-    bindings.OwnerIdsLocked(guard, owners.MainLocked(guard) != nullptr, main_owners, sub_owners);
+    bindings.OwnerIdsLocked(guard, main_owners, sub_owners);
     return {};
 }
 

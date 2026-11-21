@@ -120,9 +120,9 @@ Engine::Run 占合法宿主 native 线程：校验前提→自动绑定→安装
 
 正常收口顺序：原 owner 撤 listener、取消 connect、结算 handoff、关闭连接并完成既有责任→原 owner 推进取消完成项→控制线程同代同步解绑、等待全部 Tick/Wait/Wake lease→必要时控制域独占清理剩余 context 项→context 存活时拆 socket/backend→销毁 context→发布 Stopped、Run 返回。
 
-Close(Immediate) 是服务封口，Run 返回才确认该 Engine 的网络资源、callback 与 driver 已收口；不等待上层业务协程返回、外部 Conn/数据引用归零或业务回包。外部句柄继续查冻结状态、读已有缓冲，后续新网络操作明确拒绝，不访问已销毁 context。
+Close(Immediate) 是服务封口。Run 返回后，Stopped 确认该 Engine 的网络资源、callback 与 driver 已收口；不等待上层业务协程返回、外部 Conn/数据引用归零或业务回包。外部句柄继续查冻结状态、读已有缓冲，后续新网络操作明确拒绝，不访问已销毁 context。
 
-不提供 Engine Close(deadline) 硬返回时限：同步解绑无 deadline，不捏造可取消解绑。调用者先 Close(Immediate)、等 Run 返回再销毁 Engine，不并发销毁仍被 Run 使用的对象。不建后台 reaper、不 terminate，不以 context.stop 丢 callback 或 runtime 停机伪造资源完成。
+同步解绑没有硬时限。宿主 Close(Immediate) 并等待 Run 返回后，若仍是 Closing，则保留本代引擎，由原生宿主线程调用 `FinalizeNative()` 重试物理收口。健康 owner 尚欠的回调先在原 owner 完成，再同代解绑。重试失败保留 Closing 和剩余责任，`LastError()` 保留 Run 首因。重试与 Run、其他重试互斥，禁止从协程或已登记 worker 调用。析构在合法原生域复用同一收口路径。
 
 上层适配（http/rpc/redis/config/consul/mcp/mongo）的统一关闭控制面是
 `Close(CloseOptions{mode, reason, deadline})`；三终态、模式、自等待拒绝和
@@ -203,7 +203,7 @@ C++17、`bbt::infra::net`、Boost 优先及现有构建目标保持，不新增�
 
 ## 8.1 停止接纳与物理回收观察
 
-`Engine::RequestStopAccepting()` 把「停止接纳新业务」与「关闭整个 Engine」分开：任意线程、非阻塞、幂等，本代不重新开放接纳；已有业务连接仍可读写，`CoDial` 不因此被封口。`AcceptingStopped()` 初始为 false，只在本代 listener 真实关闭、handoff 封口、接纳等待者被通知后为真；停止请求本身不是物理停止凭据，真实停止由 owner 关闭 listener（或 driver Failed 后同代同步解绑、控制域关闭 listener）确认。它不证明已 accepted fd、外部连接引用或业务任务已释放；连接回收看 `Connection::Released()`，Engine 最终收口看 `Run` 返回。
+`Engine::RequestStopAccepting()` 把「停止接纳新业务」与「关闭整个 Engine」分开：任意线程、非阻塞、幂等，本代不重新开放接纳；已有业务连接仍可读写，`CoDial` 不因此被封口。`AcceptingStopped()` 初始为 false，只在本代 listener 真实关闭、handoff 封口、接纳等待者被通知后为真；停止请求本身不是物理停止凭据，真实停止由 owner 关闭 listener（或 driver Failed 后同代同步解绑、控制域关闭 listener）确认。它不证明已 accepted fd、外部连接引用或业务任务已释放；连接回收看 `Connection::Released()`，Engine 最终收口要在 `Run` 返回后确认 `Stopped`。
 
 - Idle 停止后不允许本代再创建监听，server `Run` 返回 `operation_canceled`；client-only 布局不需监听，不因此禁止启动或拨号。Starting 期间在不能确认 owner 与安装责任收口前，观察面保持未完成；已确认停止后不得再建本代监听。
 - Running 停止不封整个 Engine：不关闭已交付连接、不解绑 driver，Engine 仍推进在途读写。停止封口与 `CoAccept`/handoff 授权共门：已授权的 raw `OnAccept` 允许完成，门后不授予新交付；停止后的 `CoAccept` 返回 `operation_canceled` 且 `connection` 无效；未交付队列与晚到交接请求回收。
@@ -295,7 +295,7 @@ owner 域 StopServiceOwner（封服务 + 物理关闭全部连接，不等待 ha
 - **析构不在锁下**：registry 与 backend 先交换到局部、再于短锁外销毁；不新增 reaper、不 detach 线程、不要求 owner 活过所有 shell。
 - **脱离发布后不再分配**：锁外直接遍历已转移的 registry 释放 backend，避免发布后在受限线程里分配临时列表。
 
-上述原理已由 R2 的 owner 收口实现继承（`Engine::Run` 返回即同代解绑完成）；旧 bridge 的 `Drained()`/`WaitDrained`/`operation_in_progress` 等具体入口不存在。
+当前 owner 收口沿用上述原理。`Engine::Run` 返回后以 `Stopped` 确认同代解绑完成。
 
 ### 旧公共 Engine 切片（F1–F8 系列，已删除）
 
@@ -346,7 +346,7 @@ native owner 调用。
 **生成式入口的 Engine 消费接缝：主线程直接 Run。** 应用主协程在全部 Idle 阶段装配完成后，把
 `shared_ptr<Engine>` 与完整 `EngineConfig` 发布给 framework 的入口宿主闸门；runtime 提交主任务后，
 native host hook 在原生 main 线程调用一次 `Engine::Run`，主任务在 `Engine::CoWaitRunning` 上等
-Running，关闭时由 host hook 调 `Close(Immediate)`，`Run` 返回即本代收口。不存在 runner/timer/试收割，
+Running，关闭时由 host hook 调 `Close(Immediate)`，`Run` 返回后核对本代是否已到 Stopped。不存在 runner/timer/试收割，
 runtime 不感知 Engine；一个应用运行实例只创建一个 Engine，Redis/Mongo/发现/网络组件借用同一实例。
 
 最小 API 形状、两向退出、启动失败与共享所有权规则唯一见

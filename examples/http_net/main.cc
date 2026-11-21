@@ -1,8 +1,8 @@
 /**
  * Co-only 消费示例：bbtco_main 在 Engine Idle 阶段装配 Server 与 Client，
  * 发布共享 Engine 后由入口 native host hook 在主线程调用一次 Engine::Run；
- * 主任务用 Engine::CoWaitRunning 等 Running，Run 返回即本代网络资源收口的
- * 唯一凭据。业务侧不建线程、不 join、不等待 future。
+ * 主任务用 Engine::CoWaitRunning 等 Running。Run 返回后由宿主检查 Stopped。
+ * 业务侧不建线程、不 join、不等待 future。
  */
 #include <bbt/infra/http/Client.hpp>
 #include <bbt/infra/http/Server.hpp>
@@ -36,7 +36,7 @@ void Check(bool condition, const char* message)
 /**
  * 入口宿主闸门：主任务在 Idle 装配完成后发布共享 Engine 与 Run 配置；host hook
  * 在 native 主线程等待发布后调用一次 Run。runtime 的 OnMainTaskDone 回调在主任务
- * 结束时 RequestClose，Run 的控制循环因此封口返回。
+ * 结束时调用 Close，唤醒 Run 的控制循环。
  */
 struct HostGate {
     std::mutex mutex;
@@ -159,8 +159,7 @@ int bbtco_main()
     std::cout << "HTTP stopped tasks=0 sessions=0 inflight=0 listener_stopped=1\n";
 
     /**
-     * 业务责任已收口；主任务返回后由 host hook 的 RequestClose 让 Run 返回，
-     * Engine 本代网络资源的物理收口由该返回证明。
+     * 业务责任已收口。主任务返回后，宿主负责本代引擎的物理收口。
      */
     return 0;
 }
@@ -169,8 +168,7 @@ int bbtco_main_host_hook(bbt::coroutine::HostHookContext& ctx)
 {
 
     /**
-     * 主任务结束（正常/异常）恰好一次：RequestClose 只封口并唤醒控制域，
-     * Run 返回才是收口凭据。
+     * 主任务结束时请求关闭。收口检查留在执行 Run 的原生线程。
      */
     ctx.OnMainTaskDone([] {
         std::shared_ptr<net::Engine> engine;
@@ -207,6 +205,11 @@ int bbtco_main_host_hook(bbt::coroutine::HostHookContext& ctx)
     const auto run_error = engine->Run(config);
     if (run_error) {
         std::cerr << "Engine::Run failed: " << run_error.message() << '\n';
+        if (engine->Phase() == net::EnginePhase::Closing) {
+            if (const auto close_error = engine->FinalizeNative()) {
+                std::cerr << "Engine::FinalizeNative failed: " << close_error.message() << '\n';
+            }
+        }
         return 1;
     }
     if (engine->Phase() != net::EnginePhase::Stopped || engine->CountConnections() != 0) {

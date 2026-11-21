@@ -43,7 +43,7 @@ public:
     /**
      * owner 封服务 / 控制域冻结 / 解绑后释放 driver。
      */
-    void SealServiceOnOwner(std::function<void()> on_done = {});
+    bool SealServiceOnOwner(std::function<void()> on_done);
 
     /**
      * 接收域独立封口：撤该 owner 的全部 listener 并物理关闭 fd；不触已交付
@@ -51,7 +51,7 @@ public:
      */
     void StopAcceptingOnOwner();
     void FinishConnectCallback();
-    void FinalizeControl();
+    std::error_code FinalizeControl();
     void ReleaseDriver();
 
     /**

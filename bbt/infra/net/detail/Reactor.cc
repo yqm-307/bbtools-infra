@@ -1053,7 +1053,7 @@ void Reactor::_SealMembers()
     m_dirtyTail = 0;
 }
 
-void Reactor::SealServiceOnOwner(std::function<void()> on_done)
+bool Reactor::SealServiceOnOwner(std::function<void()> on_done)
 {
     const auto seal_delay = m_impl->DelayCount(DelayPoint::Seal);
     if (seal_delay > 0) {
@@ -1102,11 +1102,8 @@ void Reactor::SealServiceOnOwner(std::function<void()> on_done)
         }
         core->ShutdownOwner(std::make_error_code(std::errc::operation_canceled));
         if (!core->Closed()) {
-
-            /**
-             * 责任未完成：保留 registry，下次 seal 重试
-             */
-            break;
+            // 留在登记册中，重试完成后才能确认本 owner 的回执。
+            return false;
         }
         {
             std::lock_guard<std::mutex> lock(m_membersMutex);
@@ -1121,9 +1118,7 @@ void Reactor::SealServiceOnOwner(std::function<void()> on_done)
         m_impl->PublishConnectionCount(m_conns.size());
     }
     if (m_pending_connect_callbacks == 0) {
-        if (on_done) {
-            on_done();
-        }
+        on_done();
     } else {
 
         /**
@@ -1131,6 +1126,7 @@ void Reactor::SealServiceOnOwner(std::function<void()> on_done)
          */
         m_on_pending_zero = std::move(on_done);
     }
+    return true;
 }
 
 void Reactor::StopAcceptingOnOwner()
@@ -1156,7 +1152,7 @@ void Reactor::StopAcceptingOnOwner()
     m_impl->MarkAcceptStopDone();
 }
 
-void Reactor::FinalizeControl()
+std::error_code Reactor::FinalizeControl()
 {
     _SealMembers();
     boost::system::error_code ignored;
@@ -1184,18 +1180,28 @@ void Reactor::FinalizeControl()
         (void)holder->Close();
     }
     m_delivery_fds.clear();
-    std::vector<std::shared_ptr<ConnCore>> snapshot;
-    {
-        std::lock_guard<std::mutex> lock(m_membersMutex);
-        for (auto& entry : m_conns) {
-            snapshot.push_back(entry.second.core);
+    // 同步解绑后由控制域独占收口。每条连接实际关闭后才移除登记。
+    for (;;) {
+        std::shared_ptr<ConnCore> core;
+        std::uint64_t id;
+        {
+            std::lock_guard<std::mutex> lock(m_membersMutex);
+            if (m_conns.empty()) {
+                break;
+            }
+            const auto it = m_conns.begin();
+            id = it->first;
+            core = it->second.core;
         }
-        m_conns.clear();
-    }
-    for (auto& core : snapshot) {
         core->CancelControl();
+        if (!core->Closed()) {
+            return std::make_error_code(std::errc::resource_unavailable_try_again);
+        }
+        std::lock_guard<std::mutex> lock(m_membersMutex);
+        m_conns.erase(id);
     }
     m_impl->PublishConnectionCount(0);
+    return {};
 }
 
 void Reactor::ReleaseDriver()
