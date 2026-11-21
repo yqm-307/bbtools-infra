@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-21",
+  "commit": "4d0111fdb6f07fbb275e112095cdcf72469ccdf5",
+  "base": "1cca27c0516bdb9236d72aec9df0137a586bc515",
+  "result": "pass",
+  "reviewer": "gpt-6.2-astra (deleg_beefa9f0)",
+  "summary": "独立复审未发现阻塞项。已核对原 owner 回调责任、部分解绑保留主从身份、宿主物理回收凭据、Redis 写前期限和错误映射。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "候选差异与独立复审快照一致。两条引擎回归实测通过。Redis 编码跨期限及部分收口并发时序仅做了静态复核。",
+      "evidence": {
+        "reviewer": "gpt-6.2-astra (deleg_beefa9f0)",
+        "scope": "1cca27c0516bdb9236d72aec9df0137a586bc515..4d0111fdb6f07fbb275e112095cdcf72469ccdf5，19 个文件。审查差异 SHA-256 34287b308dd479b92b3713408a43d427d7634e30b683b3b02ac739f38b787f88。"
+      }
+    }
+  ]
+}
