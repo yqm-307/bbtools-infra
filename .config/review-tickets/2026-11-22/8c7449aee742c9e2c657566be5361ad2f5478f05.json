@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-22",
+  "commit": "8c7449aee742c9e2c657566be5361ad2f5478f05",
+  "base": "85e3a667bbb1bba766f99e2da72514340cda6c09",
+  "result": "pass",
+  "reviewer": "独立只读审查子代理（deleg_4ceadbf9/task-0）",
+  "summary": "独立复审确认 coroutine pin 与 provenance 文档同步更新，目标提交已合入 bbtools-coroutine main，变更范围与回滚边界清晰。",
+  "checks": [
+      {
+          "id": "llm-review",
+          "kind": "attested",
+          "status": "pass",
+          "summary": "已完成 origin/main..8c7449aee742c9e2c657566be5361ad2f5478f05 的完整只读审查，pin、provenance、上游 main 合入状态与提交范围均符合仓库门禁。",
+          "evidence": {
+              "reviewer": "独立只读审查子代理（deleg_4ceadbf9/task-0）",
+              "scope": "bbtools-infra origin/main..8c7449aee742c9e2c657566be5361ad2f5478f05，cmake/coroutine.sha、docs/dependencies/bbtools-coroutine-pin.provenance.md、bbtools-coroutine main 与 PR #441"
+          }
+      }
+  ]
+}
