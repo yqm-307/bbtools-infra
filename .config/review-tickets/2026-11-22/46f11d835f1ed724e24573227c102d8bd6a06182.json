@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-22",
+  "commit": "46f11d835f1ed724e24573227c102d8bd6a06182",
+  "base": "a52bcf69c32428e7317867463b92b0b266d8836e",
+  "result": "pass",
+  "reviewer": "独立只读审查子代理（deleg_5f8ee52f/task-1）",
+  "summary": "独立审查确认该提交只升级 third-party/bbtools-pub gitlink，目标提交已合入 pub main，嵌套 toolkit 绑定已合入 toolkit main，工作树无未提交内容。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "已完成 origin/main..46f11d835f1ed724e24573227c102d8bd6a06182 的完整只读审查，范围、提交关系、pub/toolkit main 合入状态均符合仓库门禁。",
+      "evidence": {
+        "reviewer": "独立只读审查子代理（deleg_5f8ee52f/task-1）",
+        "scope": "bbtools-infra origin/main..46f11d835f1ed724e24573227c102d8bd6a06182，third-party/bbtools-pub gitlink、pub main、嵌套 bbt-agent-toolkit gitlink 与 toolkit main"
+      }
+    }
+  ]
+}
