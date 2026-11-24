@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-25",
+  "commit": "d4000bef39f44459be3a4fe564a57b0ed1ac8ec9",
+  "base": "f6e011ac9f50487d1f66b095bda0a33b43f8aee6",
+  "result": "pass",
+  "reviewer": "独立只读审查子代理（deleg_3667deba/task-0）",
+  "summary": "八文件补丁独立审查结论为 ship，无发现；入库补丁与受审补丁逐字一致。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "核对五个模板成员签名和实例化可见性不变、RPC 帧解码实现原样迁移、公开头及链接边界不变。",
+      "evidence": {
+        "reviewer": "独立只读审查子代理（deleg_3667deba/task-0）",
+        "scope": "完整代码范围 f6e011ac9f50487d1f66b095bda0a33b43f8aee6..d4000bef39f44459be3a4fe564a57b0ed1ac8ec9；受审补丁 SHA-256 6a7ec7026699855361c05126fc8a29a8458e58549aa72a3b8c5740d4ed4b6f4a。"
+      }
+    }
+  ]
+}
