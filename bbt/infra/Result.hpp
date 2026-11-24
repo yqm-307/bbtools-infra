@@ -233,7 +233,7 @@ public:
     /**
      * @brief 成功时为 true。
      */
-    explicit operator bool() const noexcept { return m_data.index() == 0; }
+    explicit operator bool() const noexcept;
 
     /**
      * @brief 取成功值的左值引用；在错误分支调用会抛出 std::logic_error。

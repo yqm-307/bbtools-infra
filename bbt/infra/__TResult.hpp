@@ -12,6 +12,11 @@ template <class T> inline result<T> result<T>::err(Error error)
     return result(ErrTag{}, std::move(error));
 }
 
+template <class T> inline result<T>::operator bool() const noexcept
+{
+    return m_data.index() == 0;
+}
+
 template <class T> inline T& result<T>::value() &
 {
     RequireOk();

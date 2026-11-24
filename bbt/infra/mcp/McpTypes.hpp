@@ -697,22 +697,22 @@ public:
     /**
      * @brief 是否携带完成值。
      */
-    bool IsCompleted() const noexcept { return m_value.index() == 0; }
+    bool IsCompleted() const noexcept;
 
     /**
      * @brief 是否携带 input_required。
      */
-    bool IsInputRequired() const noexcept { return m_value.index() == 1; }
+    bool IsInputRequired() const noexcept;
 
     /**
      * @brief 完成值（IsCompleted() 为真时有效）。
      */
-    const Complete& Value() const { return std::get<0>(m_value); }
+    const Complete& Value() const;
 
     /**
      * @brief input_required（IsInputRequired() 为真时有效）。
      */
-    const InputRequired& Required() const { return std::get<1>(m_value); }
+    const InputRequired& Required() const;
 
 private:
     std::variant<Complete, InputRequired> m_value;

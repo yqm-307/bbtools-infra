@@ -5,6 +5,12 @@
 
 #include <bbt/infra/rpc/SessionCodec.hpp>
 
+namespace bbt::infra::rpc {
+
+std::size_t FrameByteLimit(FrameKind kind, std::size_t max_frame_bytes);
+
+} // namespace bbt::infra::rpc
+
 namespace bbt::infra::rpc::detail {
 
 // 直接编码到写队列使用的拥有型缓冲（含 u32be 前缀）。

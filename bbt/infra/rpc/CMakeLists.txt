@@ -2,6 +2,7 @@
 add_library(bbt_infra_rpc_net STATIC
     Response.cc
     SessionCodec.cc
+    detail/SessionFrameDecoder.cc
     Session.cc
     CoRpcClient.cc
     CoRpcServer.cc
