@@ -277,7 +277,7 @@ private:
     /**
      * @brief 池内借出一条连接（快路径或 FIFO 等待 handoff），命令包装共用。
      */
-    bbt_co_async(result<Borrow>) Acquire(const CallOptions& options);
+    static bbt_co_async(result<Borrow>) Acquire(const std::shared_ptr<State>& state, const CallOptions& options);
 
     /**
      * 物理收口等待的共享实现：只依赖池状态，供 wait_release=true 的 Close 与
@@ -289,7 +289,9 @@ private:
      * 命令包装共用样板（定义在 .cc，仅本翻译单元实例化）：借还语义与 Acquire/
      * Borrow RAII 一致，把借到的 client 交给 invoke 并原样返回其终态。
      */
-    template <typename R, typename Invoke> bbt_co_async(R) RunBorrowed(const CallOptions& options, Invoke&& invoke);
+    template <typename R, typename Invoke>
+    static bbt_co_async(R)
+        RunBorrowed(const std::shared_ptr<State>& state, const CallOptions& options, Invoke&& invoke);
 
     explicit CoRedisPool(std::shared_ptr<State> state) noexcept;
     std::shared_ptr<State> state_;

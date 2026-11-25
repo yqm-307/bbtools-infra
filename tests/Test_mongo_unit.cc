@@ -200,12 +200,11 @@ template <class F> bool RunInCoroutine(F&& f, int budget_ms = kBudgetMs)
 {
     bbt::core::thread::CountDownLatch done{1};
     bool succ = false;
-    g_scheduler->RegistCoroutineTask(
-        [fn = std::forward<F>(f), &done]() mutable {
-            fn();
-            done.Down();
-        },
-        succ);
+    bbtco_noexcept(&succ)[fn = std::forward<F>(f), &done]() mutable
+    {
+        fn();
+        done.Down();
+    };
     if (!succ)
         return false;
     return done.WaitTimeout(budget_ms) == 0;
@@ -533,12 +532,11 @@ BOOST_AUTO_TEST_CASE(t_owner_close_single_worker_wait_release)
     std::optional<result<std::vector<MongoDocument>>> out;
     std::atomic_bool out_ready{false};
     bool find_task = false;
-    g_scheduler->RegistCoroutineTask(
-        [&, coll] {
-            out.emplace(bbt_co_await coll->Find(EmptyDoc(), fo, Opt(40000)));
-            out_ready.store(true, std::memory_order_release);
-        },
-        find_task);
+    bbtco_noexcept(&find_task)[&, coll]
+    {
+        out.emplace(bbt_co_await coll->Find(EmptyDoc(), fo, Opt(40000)));
+        out_ready.store(true, std::memory_order_release);
+    };
     BOOST_REQUIRE(find_task);
 
     /**
@@ -555,39 +553,36 @@ BOOST_AUTO_TEST_CASE(t_owner_close_single_worker_wait_release)
     std::atomic_int ticks{0};
     std::atomic_bool pulse_done{false};
     bool pulse_task = false;
-    g_scheduler->RegistCoroutineTask(
-        [&] {
-            while (!in_wait.load(std::memory_order_acquire))
-                bbtco_sleep(1);
-            while (!close_returned.load(std::memory_order_acquire)) {
-                ticks.fetch_add(1);
-                bbtco_sleep(5);
-            }
-            pulse_done.store(true, std::memory_order_release);
-        },
-        pulse_task);
+    bbtco_noexcept(&pulse_task)[&]
+    {
+        while (!in_wait.load(std::memory_order_acquire))
+            bbtco_sleep(1);
+        while (!close_returned.load(std::memory_order_acquire)) {
+            ticks.fetch_add(1);
+            bbtco_sleep(5);
+        }
+        pulse_done.store(true, std::memory_order_release);
+    };
     BOOST_REQUIRE(pulse_task);
 
     std::optional<result<void>> closed;
     std::atomic_bool closed_ready{false};
     std::atomic<long long> close_ms{0};
     bool close_task = false;
-    g_scheduler->RegistCoroutineTask(
-        [&] {
-            CloseOptions options;
-            options.mode = CloseMode::Immediate;
-            options.wait_release = true;
-            options.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{8000};
-            const auto begin = std::chrono::steady_clock::now();
-            in_wait.store(true, std::memory_order_release);
-            closed.emplace(db->Close(options));
-            close_ms.store(
-                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin)
-                    .count());
-            close_returned.store(true, std::memory_order_release);
-            closed_ready.store(true, std::memory_order_release);
-        },
-        close_task);
+    bbtco_noexcept(&close_task)[&]
+    {
+        CloseOptions options;
+        options.mode = CloseMode::Immediate;
+        options.wait_release = true;
+        options.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{8000};
+        const auto begin = std::chrono::steady_clock::now();
+        in_wait.store(true, std::memory_order_release);
+        closed.emplace(db->Close(options));
+        close_ms.store(
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count());
+        close_returned.store(true, std::memory_order_release);
+        closed_ready.store(true, std::memory_order_release);
+    };
     BOOST_REQUIRE(close_task);
 
     /**
@@ -792,14 +787,13 @@ BOOST_AUTO_TEST_CASE(t_capacity_overloaded)
     std::atomic_int done{0};
     auto submit = [&](int budget_ms) {
         bool succ = false;
-        g_scheduler->RegistCoroutineTask(
-            [&, budget_ms] {
-                auto r = cli->FindOne(EmptyDoc(), Opt(budget_ms));
-                if (!r && r.error().code == ErrorCode::Overloaded)
-                    overloaded.fetch_add(1);
-                done.fetch_add(1);
-            },
-            succ);
+        bbtco_noexcept(&succ)[&, budget_ms]
+        {
+            auto r = cli->FindOne(EmptyDoc(), Opt(budget_ms));
+            if (!r && r.error().code == ErrorCode::Overloaded)
+                overloaded.fetch_add(1);
+            done.fetch_add(1);
+        };
         BOOST_REQUIRE(succ);
     };
 
@@ -858,12 +852,11 @@ BOOST_AUTO_TEST_CASE(t_deadline_only)
     std::optional<result<std::optional<MongoDocument>>> out;
     std::atomic_bool out_ready{false};
     bool succ0 = false;
-    g_scheduler->RegistCoroutineTask(
-        [&] {
-            out.emplace(cli->FindOne(EmptyDoc(), Opt(500)));
-            out_ready.store(true, std::memory_order_release);
-        },
-        succ0);
+    bbtco_noexcept(&succ0)[&]
+    {
+        out.emplace(cli->FindOne(EmptyDoc(), Opt(500)));
+        out_ready.store(true, std::memory_order_release);
+    };
     BOOST_REQUIRE(succ0);
 #ifdef BBT_INFRA_STRINGENT_DEBUG
 
@@ -912,12 +905,11 @@ BOOST_AUTO_TEST_CASE(t_close_during_inflight)
     std::optional<result<std::optional<MongoDocument>>> out;
     std::atomic_bool out_ready{false};
     bool succ = false;
-    g_scheduler->RegistCoroutineTask(
-        [&] {
-            out.emplace(cli->FindOne(EmptyDoc(), Opt(40000)));
-            out_ready.store(true, std::memory_order_release);
-        },
-        succ);
+    bbtco_noexcept(&succ)[&]
+    {
+        out.emplace(cli->FindOne(EmptyDoc(), Opt(40000)));
+        out_ready.store(true, std::memory_order_release);
+    };
     BOOST_REQUIRE(succ);
 
     /**
@@ -966,20 +958,19 @@ BOOST_AUTO_TEST_CASE(t_worker_threads_bound)
     bbt::core::thread::CountDownLatch all{4};
     for (int i = 0; i < 4; ++i) {
         bool succ = false;
-        g_scheduler->RegistCoroutineTask(
-            [&] {
-                // clang-format off
+        bbtco_noexcept(&succ)[&]
+        {
+            // clang-format off
 
-                /**
-                 * 不可达地址：每个 op 在 server selection 中停留约 8s，
-                 * 足以让 2 个 worker 同时各持一个在途调用。
-                 */
-                // clang-format on
-                auto r = cli->FindOne(EmptyDoc(), Opt(20000));
-                (void)r;
-                all.Down();
-            },
-            succ);
+            /**
+             * 不可达地址：每个 op 在 server selection 中停留约 8s，
+             * 足以让 2 个 worker 同时各持一个在途调用。
+             */
+            // clang-format on
+            auto r = cli->FindOne(EmptyDoc(), Opt(20000));
+            (void)r;
+            all.Down();
+        };
         BOOST_REQUIRE(succ);
     }
 
@@ -1185,16 +1176,15 @@ BOOST_AUTO_TEST_CASE(t_finalizer_spawn_failure_bounded)
     std::optional<result<void>> closed;
     std::atomic_bool closed_ready{false};
     bool close_task = false;
-    g_scheduler->RegistCoroutineTask(
-        [&] {
-            CloseOptions options;
-            options.mode = CloseMode::Immediate;
-            options.wait_release = true;
-            options.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{300};
-            closed.emplace(rt->Close(options));
-            closed_ready.store(true, std::memory_order_release);
-        },
-        close_task);
+    bbtco_noexcept(&close_task)[&]
+    {
+        CloseOptions options;
+        options.mode = CloseMode::Immediate;
+        options.wait_release = true;
+        options.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{300};
+        closed.emplace(rt->Close(options));
+        closed_ready.store(true, std::memory_order_release);
+    };
     BOOST_REQUIRE(close_task);
     BOOST_REQUIRE(WaitUntil([&] { return closed_ready.load(std::memory_order_acquire); }, 5000));
     BOOST_REQUIRE(*closed);
@@ -1590,14 +1580,13 @@ BOOST_AUTO_TEST_CASE(t_dp_queue_overloaded)
     std::atomic_int done{0};
     auto submit_find = [&](int budget_ms) {
         bool succ = false;
-        g_scheduler->RegistCoroutineTask(
-            [&, budget_ms] {
-                auto r = bbt_co_await coll->Find(EmptyDoc(), fo, Opt(budget_ms));
-                if (!r && r.error().code == ErrorCode::Overloaded)
-                    overloaded.fetch_add(1);
-                done.fetch_add(1);
-            },
-            succ);
+        bbtco_noexcept(&succ)[&, budget_ms]
+        {
+            auto r = bbt_co_await coll->Find(EmptyDoc(), fo, Opt(budget_ms));
+            if (!r && r.error().code == ErrorCode::Overloaded)
+                overloaded.fetch_add(1);
+            done.fetch_add(1);
+        };
         BOOST_REQUIRE(succ);
     };
 
@@ -1661,13 +1650,12 @@ BOOST_AUTO_TEST_CASE(t_dp_handle_close_scoped)
     fo.limit = 1;
     std::atomic_bool h1_done{false};
     bool succ = false;
-    g_scheduler->RegistCoroutineTask(
-        [&] {
-            auto r = bbt_co_await c1->Find(EmptyDoc(), fo, Opt(30000));
-            (void)r;
-            h1_done.store(true);
-        },
-        succ);
+    bbtco_noexcept(&succ)[&]
+    {
+        auto r = bbt_co_await c1->Find(EmptyDoc(), fo, Opt(30000));
+        (void)r;
+        h1_done.store(true);
+    };
     BOOST_REQUIRE(succ);
     BOOST_REQUIRE(WaitUntil([&] { return rt->DriverCallsInFlightForTest() == 1; }, 10000));
 
@@ -1734,17 +1722,16 @@ BOOST_AUTO_TEST_CASE(t_dp_owner_close_drains_inflight)
     std::atomic_bool out_ready{false};
     std::atomic_bool inflight_at_return{false};
     bool succ = false;
-    g_scheduler->RegistCoroutineTask(
-        [&] {
-            out.emplace(bbt_co_await coll->Find(EmptyDoc(), fo, Opt(40000)));
+    bbtco_noexcept(&succ)[&]
+    {
+        out.emplace(bbt_co_await coll->Find(EmptyDoc(), fo, Opt(40000)));
 
-            /**
-             * 逻辑终态交付当刻：该 op 仍在执行槽内（driver 未返回）。
-             */
-            inflight_at_return.store(rt->DriverCallsInFlightForTest() == 1);
-            out_ready.store(true, std::memory_order_release);
-        },
-        succ);
+        /**
+         * 逻辑终态交付当刻：该 op 仍在执行槽内（driver 未返回）。
+         */
+        inflight_at_return.store(rt->DriverCallsInFlightForTest() == 1);
+        out_ready.store(true, std::memory_order_release);
+    };
     BOOST_REQUIRE(succ);
 
     /**
@@ -1826,12 +1813,11 @@ BOOST_AUTO_TEST_CASE(t_owner_close_options_graceful_then_physical)
     std::optional<result<std::vector<MongoDocument>>> out;
     std::atomic_bool out_ready{false};
     bool succ = false;
-    g_scheduler->RegistCoroutineTask(
-        [&] {
-            out.emplace(bbt_co_await coll->Find(EmptyDoc(), fo, Opt(40000)));
-            out_ready.store(true, std::memory_order_release);
-        },
-        succ);
+    bbtco_noexcept(&succ)[&]
+    {
+        out.emplace(bbt_co_await coll->Find(EmptyDoc(), fo, Opt(40000)));
+        out_ready.store(true, std::memory_order_release);
+    };
     BOOST_REQUIRE(succ);
     BOOST_REQUIRE(WaitUntil([&] { return rt->DriverCallsInFlightForTest() == 1; }, 10000));
 
@@ -1844,17 +1830,15 @@ BOOST_AUTO_TEST_CASE(t_owner_close_options_graceful_then_physical)
     std::atomic_bool graceful_ready{false};
     std::atomic<long long> graceful_ms{0};
     bool close_task = false;
-    g_scheduler->RegistCoroutineTask(
-        [&] {
-            const auto begin = std::chrono::steady_clock::now();
-            graceful.emplace(
-                db->Close(CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::milliseconds{1000})));
-            graceful_ms.store(
-                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin)
-                    .count());
-            graceful_ready.store(true, std::memory_order_release);
-        },
-        close_task);
+    bbtco_noexcept(&close_task)[&]
+    {
+        const auto begin = std::chrono::steady_clock::now();
+        graceful.emplace(
+            db->Close(CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::milliseconds{1000})));
+        graceful_ms.store(
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count());
+        graceful_ready.store(true, std::memory_order_release);
+    };
     BOOST_REQUIRE(close_task);
     BOOST_REQUIRE(WaitUntil([&] { return graceful_ready.load(std::memory_order_acquire); }, 10000));
     BOOST_REQUIRE(*graceful);
@@ -1915,12 +1899,11 @@ BOOST_AUTO_TEST_CASE(t_owner_close_immediate_keeps_driver_thread)
     std::optional<result<std::vector<MongoDocument>>> out;
     std::atomic_bool out_ready{false};
     bool succ = false;
-    g_scheduler->RegistCoroutineTask(
-        [&] {
-            out.emplace(bbt_co_await coll->Find(EmptyDoc(), fo, Opt(40000)));
-            out_ready.store(true, std::memory_order_release);
-        },
-        succ);
+    bbtco_noexcept(&succ)[&]
+    {
+        out.emplace(bbt_co_await coll->Find(EmptyDoc(), fo, Opt(40000)));
+        out_ready.store(true, std::memory_order_release);
+    };
     BOOST_REQUIRE(succ);
     BOOST_REQUIRE(WaitUntil([&] { return rt->DriverCallsInFlightForTest() == 1; }, 10000));
 
@@ -1988,17 +1971,16 @@ BOOST_AUTO_TEST_CASE(t_owner_wait_stopped_preconditions)
     std::optional<result<void>> from_co;
     std::atomic_bool from_co_ready{false};
     bool succ = false;
-    g_scheduler->RegistCoroutineTask(
-        [&] {
-            from_co.emplace(db->Close(
-                bbt::infra::CloseOptions{
-                    bbt::infra::CloseMode::Immediate,
-                    true,
-                    {},
-                    std::chrono::steady_clock::now() + std::chrono::milliseconds{1000}}));
-            from_co_ready.store(true, std::memory_order_release);
-        },
-        succ);
+    bbtco_noexcept(&succ)[&]
+    {
+        from_co.emplace(db->Close(
+            bbt::infra::CloseOptions{
+                bbt::infra::CloseMode::Immediate,
+                true,
+                {},
+                std::chrono::steady_clock::now() + std::chrono::milliseconds{1000}}));
+        from_co_ready.store(true, std::memory_order_release);
+    };
     BOOST_REQUIRE(succ);
     BOOST_REQUIRE(WaitUntil([&] { return from_co_ready.load(std::memory_order_acquire); }, 10000));
     BOOST_REQUIRE(*from_co);
@@ -2039,12 +2021,11 @@ BOOST_AUTO_TEST_CASE(t_owner_wait_release_co_suspends_until_physical)
     std::optional<result<std::vector<MongoDocument>>> out;
     std::atomic_bool out_ready{false};
     bool succ = false;
-    g_scheduler->RegistCoroutineTask(
-        [&] {
-            out.emplace(bbt_co_await coll->Find(EmptyDoc(), fo, Opt(40000)));
-            out_ready.store(true, std::memory_order_release);
-        },
-        succ);
+    bbtco_noexcept(&succ)[&]
+    {
+        out.emplace(bbt_co_await coll->Find(EmptyDoc(), fo, Opt(40000)));
+        out_ready.store(true, std::memory_order_release);
+    };
     BOOST_REQUIRE(succ);
 
     /**
@@ -2056,39 +2037,36 @@ BOOST_AUTO_TEST_CASE(t_owner_wait_release_co_suspends_until_physical)
     std::atomic_int ticks{0};
     std::atomic_bool pulse_done{false};
     bool pulse_task = false;
-    g_scheduler->RegistCoroutineTask(
-        [&] {
-            while (window.load(std::memory_order_acquire) == CloseWaitWindow::kNotStarted)
-                bbtco_sleep(1);
-            while (window.load(std::memory_order_acquire) == CloseWaitWindow::kInFlight) {
-                ticks.fetch_add(1);
-                bbtco_sleep(5);
-            }
-            pulse_done.store(true, std::memory_order_release);
-        },
-        pulse_task);
+    bbtco_noexcept(&pulse_task)[&]
+    {
+        while (window.load(std::memory_order_acquire) == CloseWaitWindow::kNotStarted)
+            bbtco_sleep(1);
+        while (window.load(std::memory_order_acquire) == CloseWaitWindow::kInFlight) {
+            ticks.fetch_add(1);
+            bbtco_sleep(5);
+        }
+        pulse_done.store(true, std::memory_order_release);
+    };
     BOOST_REQUIRE(pulse_task);
 
     std::optional<result<void>> closed;
     std::atomic_bool closed_ready{false};
     std::atomic<long long> close_ms{0};
     bool close_task = false;
-    g_scheduler->RegistCoroutineTask(
-        [&] {
-            CloseOptions options;
-            options.mode = CloseMode::Immediate;
-            options.wait_release = true;
-            options.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{8000};
-            const auto begin = std::chrono::steady_clock::now();
-            window.store(CloseWaitWindow::kInFlight, std::memory_order_release);
-            closed.emplace(db->Close(options));
-            close_ms.store(
-                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin)
-                    .count());
-            window.store(CloseWaitWindow::kReturned, std::memory_order_release);
-            closed_ready.store(true, std::memory_order_release);
-        },
-        close_task);
+    bbtco_noexcept(&close_task)[&]
+    {
+        CloseOptions options;
+        options.mode = CloseMode::Immediate;
+        options.wait_release = true;
+        options.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{8000};
+        const auto begin = std::chrono::steady_clock::now();
+        window.store(CloseWaitWindow::kInFlight, std::memory_order_release);
+        closed.emplace(db->Close(options));
+        close_ms.store(
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count());
+        window.store(CloseWaitWindow::kReturned, std::memory_order_release);
+        closed_ready.store(true, std::memory_order_release);
+    };
     BOOST_REQUIRE(close_task);
 
     /**
@@ -2139,12 +2117,11 @@ BOOST_AUTO_TEST_CASE(t_owner_wait_release_timeout_keeps_worker)
     std::optional<result<std::vector<MongoDocument>>> out;
     std::atomic_bool out_ready{false};
     bool succ = false;
-    g_scheduler->RegistCoroutineTask(
-        [&] {
-            out.emplace(bbt_co_await coll->Find(EmptyDoc(), fo, Opt(40000)));
-            out_ready.store(true, std::memory_order_release);
-        },
-        succ);
+    bbtco_noexcept(&succ)[&]
+    {
+        out.emplace(bbt_co_await coll->Find(EmptyDoc(), fo, Opt(40000)));
+        out_ready.store(true, std::memory_order_release);
+    };
     BOOST_REQUIRE(succ);
     BOOST_REQUIRE(WaitUntil([&] { return rt->DriverCallsInFlightForTest() == 1; }, 10000));
 
@@ -2154,16 +2131,15 @@ BOOST_AUTO_TEST_CASE(t_owner_wait_release_timeout_keeps_worker)
     std::optional<result<void>> closed;
     std::atomic_bool closed_ready{false};
     bool close_task = false;
-    g_scheduler->RegistCoroutineTask(
-        [&] {
-            CloseOptions options;
-            options.mode = CloseMode::Immediate;
-            options.wait_release = true;
-            options.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{300};
-            closed.emplace(db->Close(options));
-            closed_ready.store(true, std::memory_order_release);
-        },
-        close_task);
+    bbtco_noexcept(&close_task)[&]
+    {
+        CloseOptions options;
+        options.mode = CloseMode::Immediate;
+        options.wait_release = true;
+        options.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{300};
+        closed.emplace(db->Close(options));
+        closed_ready.store(true, std::memory_order_release);
+    };
     BOOST_REQUIRE(close_task);
     BOOST_REQUIRE(WaitUntil([&] { return closed_ready.load(std::memory_order_acquire); }, 10000));
     BOOST_REQUIRE(!*closed);
@@ -2263,12 +2239,11 @@ BOOST_AUTO_TEST_CASE(t_owner_release_last_ref_in_coroutine_no_join)
     std::optional<result<std::vector<MongoDocument>>> out;
     std::atomic_bool out_ready{false};
     bool succ = false;
-    g_scheduler->RegistCoroutineTask(
-        [&] {
-            out.emplace(bbt_co_await coll->Find(EmptyDoc(), fo, Opt(40000)));
-            out_ready.store(true, std::memory_order_release);
-        },
-        succ);
+    bbtco_noexcept(&succ)[&]
+    {
+        out.emplace(bbt_co_await coll->Find(EmptyDoc(), fo, Opt(40000)));
+        out_ready.store(true, std::memory_order_release);
+    };
     BOOST_REQUIRE(succ);
     BOOST_REQUIRE(WaitUntil([&] { return rt->DriverCallsInFlightForTest() == 1; }, 10000));
 
@@ -2280,17 +2255,16 @@ BOOST_AUTO_TEST_CASE(t_owner_release_last_ref_in_coroutine_no_join)
     std::atomic_int post_drop_ticks{0};
     std::atomic_bool pulse_done{false};
     bool pulse_task = false;
-    g_scheduler->RegistCoroutineTask(
-        [&] {
-            while (!dropped.load(std::memory_order_acquire))
-                bbtco_sleep(1);
-            while (!rt->IsClosed()) {
-                post_drop_ticks.fetch_add(1);
-                bbtco_sleep(5);
-            }
-            pulse_done.store(true, std::memory_order_release);
-        },
-        pulse_task);
+    bbtco_noexcept(&pulse_task)[&]
+    {
+        while (!dropped.load(std::memory_order_acquire))
+            bbtco_sleep(1);
+        while (!rt->IsClosed()) {
+            post_drop_ticks.fetch_add(1);
+            bbtco_sleep(5);
+        }
+        pulse_done.store(true, std::memory_order_release);
+    };
     BOOST_REQUIRE(pulse_task);
 
     /**
@@ -2301,21 +2275,19 @@ BOOST_AUTO_TEST_CASE(t_owner_release_last_ref_in_coroutine_no_join)
     std::atomic<long long> drop_ms{0};
     std::atomic_bool workers_alive_at_drop{false};
     bool drop_task = false;
-    g_scheduler->RegistCoroutineTask(
-        [&] {
-            const auto begin = std::chrono::steady_clock::now();
-            db.reset();
-            drop_ms.store(
-                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin)
-                    .count());
+    bbtco_noexcept(&drop_task)[&]
+    {
+        const auto begin = std::chrono::steady_clock::now();
+        db.reset();
+        drop_ms.store(
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count());
 
-            /**
-             * 返回当刻 worker 仍在：join 没有落在本协程 worker 上。
-             */
-            workers_alive_at_drop.store(rt->LiveWorkersForTest() == 1);
-            dropped.store(true, std::memory_order_release);
-        },
-        drop_task);
+        /**
+         * 返回当刻 worker 仍在：join 没有落在本协程 worker 上。
+         */
+        workers_alive_at_drop.store(rt->LiveWorkersForTest() == 1);
+        dropped.store(true, std::memory_order_release);
+    };
     BOOST_REQUIRE(drop_task);
     BOOST_REQUIRE(WaitUntil([&] { return dropped.load(std::memory_order_acquire); }, 15000));
 
@@ -2386,12 +2358,11 @@ BOOST_AUTO_TEST_CASE(t_owner_runtime_last_ref_reclaimed)
     std::atomic_bool out_ready{false};
     bool find_task = false;
     auto* hp = coll.get();
-    g_scheduler->RegistCoroutineTask(
-        [&, hp] {
-            out.emplace(bbt_co_await hp->Find(EmptyDoc(), fo, Opt(40000)));
-            out_ready.store(true, std::memory_order_release);
-        },
-        find_task);
+    bbtco_noexcept(&find_task)[&, hp]
+    {
+        out.emplace(bbt_co_await hp->Find(EmptyDoc(), fo, Opt(40000)));
+        out_ready.store(true, std::memory_order_release);
+    };
     BOOST_REQUIRE(find_task);
     BOOST_REQUIRE(WaitUntil([&] { return rt->DriverCallsInFlightForTest() == 1; }, 10000));
 
@@ -2403,19 +2374,17 @@ BOOST_AUTO_TEST_CASE(t_owner_runtime_last_ref_reclaimed)
     std::atomic_bool workers_alive_at_drop{false};
     std::atomic<long long> drop_ms{0};
     bool drop_task = false;
-    g_scheduler->RegistCoroutineTask(
-        [&] {
-            const auto begin = std::chrono::steady_clock::now();
-            workers_alive_at_drop.store(rt->LiveWorkersForTest() == 1);
-            db.reset();
-            coll.reset();
-            rt.reset();
-            drop_ms.store(
-                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin)
-                    .count());
-            dropped.store(true, std::memory_order_release);
-        },
-        drop_task);
+    bbtco_noexcept(&drop_task)[&]
+    {
+        const auto begin = std::chrono::steady_clock::now();
+        workers_alive_at_drop.store(rt->LiveWorkersForTest() == 1);
+        db.reset();
+        coll.reset();
+        rt.reset();
+        drop_ms.store(
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count());
+        dropped.store(true, std::memory_order_release);
+    };
     BOOST_REQUIRE(drop_task);
     BOOST_REQUIRE(WaitUntil([&] { return dropped.load(std::memory_order_acquire); }, 15000));
     BOOST_CHECK_LE(drop_ms.load(), 800);
@@ -2488,19 +2457,17 @@ BOOST_AUTO_TEST_CASE(t_owner_finalizer_handoff_overlaps_last_ref)
     std::atomic<long long> drop_ms{0};
     std::atomic<std::thread::id> drop_thread{};
     bool drop_task = false;
-    g_scheduler->RegistCoroutineTask(
-        [&] {
-            const auto begin = std::chrono::steady_clock::now();
-            db.reset();
-            coll.reset();
-            rt.reset();
-            drop_ms.store(
-                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin)
-                    .count());
-            drop_thread.store(std::this_thread::get_id());
-            dropped.store(true, std::memory_order_release);
-        },
-        drop_task);
+    bbtco_noexcept(&drop_task)[&]
+    {
+        const auto begin = std::chrono::steady_clock::now();
+        db.reset();
+        coll.reset();
+        rt.reset();
+        drop_ms.store(
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count());
+        drop_thread.store(std::this_thread::get_id());
+        dropped.store(true, std::memory_order_release);
+    };
     BOOST_REQUIRE(drop_task);
     BOOST_REQUIRE(WaitUntil([&] { return dropped.load(std::memory_order_acquire); }, 15000));
 
@@ -2598,13 +2565,12 @@ BOOST_AUTO_TEST_CASE(t_owner_multi_handles_share_workers)
     for (auto& h : handles) {
         bool succ = false;
         auto* hp = h.get();
-        g_scheduler->RegistCoroutineTask(
-            [hp, &submitted] {
-                auto r = bbt_co_await hp->FindOne(EmptyDoc(), Opt(30000));
-                (void)r;
-                submitted.fetch_add(1);
-            },
-            succ);
+        bbtco_noexcept(&succ)[hp, &submitted]
+        {
+            auto r = bbt_co_await hp->FindOne(EmptyDoc(), Opt(30000));
+            (void)r;
+            submitted.fetch_add(1);
+        };
         BOOST_REQUIRE(succ);
     }
 
@@ -2745,14 +2711,13 @@ BOOST_AUTO_TEST_CASE(t_shared_backpressure_queue_one)
     std::atomic_int c_done{0};
     auto submit = [&](mongo::CoMongoColl* h, std::atomic_int& overloaded, std::atomic_int& done, int budget_ms) {
         bool succ = false;
-        g_scheduler->RegistCoroutineTask(
-            [h, budget_ms, &overloaded, &done] {
-                auto r = bbt_co_await h->FindOne(EmptyDoc(), Opt(budget_ms));
-                if (!r && r.error().code == ErrorCode::Overloaded)
-                    overloaded.fetch_add(1);
-                done.fetch_add(1);
-            },
-            succ);
+        bbtco_noexcept(&succ)[h, budget_ms, &overloaded, &done]
+        {
+            auto r = bbt_co_await h->FindOne(EmptyDoc(), Opt(budget_ms));
+            if (!r && r.error().code == ErrorCode::Overloaded)
+                overloaded.fetch_add(1);
+            done.fetch_add(1);
+        };
         BOOST_REQUIRE(succ);
     };
 
@@ -2839,13 +2804,12 @@ BOOST_AUTO_TEST_CASE(t_handle_close_scoped)
      */
     std::atomic_bool h1_done{false};
     bool succ = false;
-    g_scheduler->RegistCoroutineTask(
-        [&] {
-            auto r = bbt_co_await c1->FindOne(EmptyDoc(), Opt(30000));
-            (void)r;
-            h1_done.store(true);
-        },
-        succ);
+    bbtco_noexcept(&succ)[&]
+    {
+        auto r = bbt_co_await c1->FindOne(EmptyDoc(), Opt(30000));
+        (void)r;
+        h1_done.store(true);
+    };
     BOOST_REQUIRE(succ);
 #ifdef BBT_INFRA_STRINGENT_DEBUG
     BOOST_REQUIRE(WaitUntil([&] { return rt->RunningDriverCallsForTest() == 1; }, 10000));
@@ -2872,13 +2836,12 @@ BOOST_AUTO_TEST_CASE(t_handle_close_scoped)
      * 在途收口后正常执行）。
      */
     std::atomic_bool h2_done{false};
-    g_scheduler->RegistCoroutineTask(
-        [&] {
-            auto r = bbt_co_await c2->FindOne(EmptyDoc(), Opt(30000));
-            (void)r;
-            h2_done.store(true);
-        },
-        succ);
+    bbtco_noexcept(&succ)[&]
+    {
+        auto r = bbt_co_await c2->FindOne(EmptyDoc(), Opt(30000));
+        (void)r;
+        h2_done.store(true);
+    };
     BOOST_REQUIRE(succ);
 
     (void)c2->Close();
@@ -2947,12 +2910,11 @@ BOOST_AUTO_TEST_CASE(t_owner_close_not_premature_during_inflight)
      */
     for (int i = 0; i < 2; ++i) {
         bool succ = false;
-        g_scheduler->RegistCoroutineTask(
-            [hp] {
-                auto r = bbt_co_await hp->FindOne(EmptyDoc(), Opt(30000));
-                (void)r;
-            },
-            succ);
+        bbtco_noexcept(&succ)[hp]
+        {
+            auto r = bbt_co_await hp->FindOne(EmptyDoc(), Opt(30000));
+            (void)r;
+        };
         BOOST_REQUIRE(succ);
     }
 #ifdef BBT_INFRA_STRINGENT_DEBUG
@@ -3015,12 +2977,11 @@ BOOST_AUTO_TEST_CASE(t_owner_concurrent_close_two_threads)
      */
     for (int i = 0; i < 3; ++i) {
         bool succ = false;
-        g_scheduler->RegistCoroutineTask(
-            [hp] {
-                auto r = bbt_co_await hp->FindOne(EmptyDoc(), Opt(30000));
-                (void)r;
-            },
-            succ);
+        bbtco_noexcept(&succ)[hp]
+        {
+            auto r = bbt_co_await hp->FindOne(EmptyDoc(), Opt(30000));
+            (void)r;
+        };
         BOOST_REQUIRE(succ);
     }
 #ifdef BBT_INFRA_STRINGENT_DEBUG

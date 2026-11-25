@@ -293,10 +293,10 @@ private:
     };
 
     /**
-     * Acquire 主体：已在本入口完成接纳（inflight++）。返回 ok 的在途责任随
-     * 租借移交归还方；返回 err 由 Acquire 唯一出口结算名额。
+     * 获取执行体（快路径 / 预算内新建 / 有界排队）：负责完成接纳登记与
+     * 归还责任结算。
      */
-    static result<Lease> AcquireBody(
+    static result<Lease> AcquireLease(
         const std::shared_ptr<State>& state,
         const Origin& origin,
         const net::Address& address,

@@ -145,6 +145,14 @@ public:
     bbt_co_async(result<void>) Close(const CloseOptions& options = {});
 
     /**
+     * @brief native 控制线程使用的立即关闭入口，不等待异步收口。
+     *
+     * 只使用 options.reason。需要等待 handler、reply 或 session
+     * 物理回收时必须使用 Close 并通过 bbt_co_await 消费。
+     */
+    result<void> CloseImmediate(const CloseOptions& options = CloseOptions::Immediate());
+
+    /**
      * @brief 查询本 Server 是否已逻辑封口。
      */
     bool IsClosed() const noexcept;

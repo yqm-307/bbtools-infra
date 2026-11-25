@@ -9,6 +9,36 @@
 
 namespace bbt::infra::rpc {
 
+std::size_t LaneIndex(TrafficClass traffic) noexcept
+{
+    switch (traffic) {
+    case TrafficClass::System:
+        return 0;
+    case TrafficClass::Service:
+        return 1;
+    case TrafficClass::Actor:
+        return 2;
+    }
+    return 1;
+}
+
+Error Err(ErrorCode code, std::string message)
+{
+    return MakeError(code, "rpc session: " + std::move(message));
+}
+
+result<void> ErrV(ErrorCode code, std::string message)
+{
+    return result<void>::err(Err(code, std::move(message)));
+}
+
+Error ErrPhase(ErrorCode code, std::string message, RequestPhase phase)
+{
+    auto error = Err(code, std::move(message));
+    error.request_phase = phase;
+    return error;
+}
+
 Error WaitFailure(bbt::coroutine::WaitStatus status, const char* message)
 {
     using bbt::coroutine::WaitStatus;

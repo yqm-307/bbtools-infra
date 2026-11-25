@@ -228,6 +228,7 @@ public:
         auto counts = ledger;
         counts->submitted.fetch_add(1);
         bool registered = false;
+        // bbt-lint: ignore-next-line coroutine-sugar -- explicit 128 KiB stack; bbtco has no stack-size form
         g_scheduler->RegistCoroutineTask(
             128 * 1024,
             [promise, callback = std::move(callback), counts]() mutable {

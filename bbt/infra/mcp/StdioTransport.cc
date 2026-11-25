@@ -961,10 +961,14 @@ McpStdioTransport::Start(std::shared_ptr<McpServer> server, StdioOptions options
      */
     bool reader_started = false;
     bool writer_started = false;
-    bbt::coroutine::detail::Scheduler::GetInstance()->RegistCoroutineTask(
-        [impl] { impl->ReaderLoop(); }, reader_started);
-    bbt::coroutine::detail::Scheduler::GetInstance()->RegistCoroutineTask(
-        [impl] { impl->WriterLoop(); }, writer_started);
+    bbtco_noexcept(&reader_started)[impl]
+    {
+        impl->ReaderLoop();
+    };
+    bbtco_noexcept(&writer_started)[impl]
+    {
+        impl->WriterLoop();
+    };
     if (!reader_started || !writer_started) {
 
         /**

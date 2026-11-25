@@ -553,6 +553,7 @@ struct Server::State : std::enable_shared_from_this<Server::State> {
         }
         bool registered = false;
         try {
+            // bbt-lint: ignore-next-line coroutine-sugar -- 请求任务需显式 128 KiB 栈；公开宏无指定栈大小的形态
             g_scheduler->RegistCoroutineTask(
                 128 * 1024,
                 [lease, body = std::move(body)]() mutable {

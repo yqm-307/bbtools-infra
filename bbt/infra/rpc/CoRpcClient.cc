@@ -38,12 +38,16 @@ result<std::shared_ptr<CoRpcClient>> CoRpcClient::Create(std::shared_ptr<net::En
 
 bbt_co_async(result<Response>) CoRpcClient::Call(std::string_view target, Request request, const CallOptions& options)
 {
-    return detail::SessionOwnerCall(m_owner, target, std::move(request), options);
+    return bbt_co_bind(
+        [owner = m_owner, target = std::string(target), request = std::move(request), options]() mutable
+            -> result<Response> { return detail::SessionOwnerCall(owner, target, std::move(request), options); });
 }
 
 bbt_co_async(result<void>) CoRpcClient::Send(std::string_view target, Request message, const SendOptions& options)
 {
-    return detail::SessionOwnerSend(m_owner, target, std::move(message), options);
+    return bbt_co_bind(
+        [owner = m_owner, target = std::string(target), message = std::move(message), options]() mutable
+            -> result<void> { return detail::SessionOwnerSend(owner, target, std::move(message), options); });
 }
 
 std::shared_ptr<SessionHooks> CoRpcClient::Hooks() const noexcept
@@ -63,7 +67,13 @@ CoRpcClient::~CoRpcClient() noexcept
 
 bbt_co_async(result<void>) CoRpcClient::Close(const CloseOptions& options)
 {
-    return detail::SessionOwnerClose(m_owner, options);
+    return bbt_co_bind(
+        [owner = m_owner, options]() -> result<void> { return detail::SessionOwnerClose(owner, options); });
+}
+
+result<void> CoRpcClient::CloseImmediate(const CloseOptions& options)
+{
+    return detail::SessionOwnerClose(m_owner, CloseOptions::Immediate(options.reason.value_or(Error{})));
 }
 
 bool CoRpcClient::IsClosed() const noexcept

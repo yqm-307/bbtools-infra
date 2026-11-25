@@ -40,19 +40,21 @@ Error ContextError()
  * 健康状态归还或退役，不改变既有命令的可观察行为。
  */
 template <typename R, typename Invoke>
-bbt_co_async(R) CoRedisPool::RunBorrowed(const CallOptions& options, Invoke&& invoke)
+bbt_co_async(R)
+    CoRedisPool::RunBorrowed(const std::shared_ptr<State>& state, const CallOptions& options, Invoke&& invoke)
 {
-    const auto state = state_;
-    auto acquired = bbt_co_await Acquire(options);
-    if (!acquired) {
-        return R::err(std::move(acquired.error()));
-    }
-    auto borrow = std::move(acquired).value();
+    return bbt_co_bind([state, options, invoke = std::forward<Invoke>(invoke)]() mutable -> R {
+        auto acquired = bbt_co_await Acquire(state, options);
+        if (!acquired) {
+            return R::err(std::move(acquired.error()));
+        }
+        auto borrow = std::move(acquired).value();
 
-    /**
+        /**
      * borrow 析构归还。
      */
-    return bbt_co_await invoke(*borrow.client);
+        return bbt_co_await invoke(*borrow.client);
+    });
 }
 
 /**
@@ -237,9 +239,13 @@ struct CoRedisPool::State {
     }
 };
 
+/**
+ * 测试探针薄入口：直接复用 Acquire 的 async 操作，不包第二层操作包装
+ * ——pool 不可复制，也无须为转发再造操作体。
+ */
 bbt_co_async(result<CoRedisPool::Borrow>) PoolTestAccess::Take(CoRedisPool& pool, const CallOptions& options)
 {
-    return bbt_co_await pool.Acquire(options);
+    return CoRedisPool::Acquire(pool.state_, options);
 }
 
 std::size_t PoolTestAccess::Queued(const CoRedisPool& pool)
@@ -358,130 +364,132 @@ CoRedisPool::Create(std::shared_ptr<net::Engine> engine, net::Address address, P
     return result<std::shared_ptr<CoRedisPool>>::ok(std::shared_ptr<CoRedisPool>(new CoRedisPool(std::move(state))));
 }
 
-bbt_co_async(result<void>) CoRedisPool::Connect(const CallOptions& options)
-
 /**
- * 此后包括挂起恢复都不再访问公开对象。
+ * Connect 执行体：幂等/修复判定、逐 slot 建连与发布收口全部在此；
+ * 挂起恢复后只访问 state 快照，不访问公开句柄。
  */
+
+bbt_co_async(result<void>) CoRedisPool::Connect(const CallOptions& options)
 {
-    const auto state = state_;
-    if (bbt::coroutine::GetLocalCoroutineId() == 0) {
-        return result<void>::err(ContextError());
-    }
-    bool need_build = false;
-    {
-        std::lock_guard<std::mutex> lock(state->mutex);
-        if (state->closed) {
-            return result<void>::err(ClosedError());
+    return bbt_co_bind([state = state_, options]() mutable -> result<void> {
+        if (bbt::coroutine::GetLocalCoroutineId() == 0) {
+            return result<void>::err(ContextError());
         }
-        if (state->connecting) {
-            return result<void>::err(OverloadedError());
-        }
-        if (state->ready) {
-
-            /**
-             * 幂等：全健康时零动作；有坏 slot 时进入修复，只重建坏 slot。
-             */
-            for (const auto& slot : state->slots) {
-                if (!slot.alive) {
-                    need_build = true;
-                    break;
-                }
-            }
-            if (!need_build) {
-                return result<void>::ok();
-            }
-        } else {
-            if (state->slots.empty()) {
-                state->slots.resize(state->options.connections);
-            }
-            need_build = true;
-        }
-        state->connecting = true;
-    }
-
-    /**
-     * 逐 slot 建连：新池建全部，修复只建坏 slot。部分失败回滚本次建立的
-     * 连接并清 connecting，不发布半就绪状态。
-     */
-    std::vector<std::shared_ptr<CoRedisCli>> established;
-
-    struct BuildCleanup {
-        std::shared_ptr<State> state;
-        std::vector<std::shared_ptr<CoRedisCli>>& established;
-
-        ~BuildCleanup()
+        bool need_build = false;
         {
-            for (auto& client : established) {
-                if (client) {
-                    (void)client->Close();
-                }
-            }
             std::lock_guard<std::mutex> lock(state->mutex);
-            state->connecting = false;
-        }
-    } cleanup{state, established};
-
-    std::vector<std::size_t> targets;
-    {
-        std::lock_guard<std::mutex> lock(state->mutex);
-        for (std::size_t slot_index = 0; slot_index < state->slots.size(); ++slot_index) {
-            if (!state->slots[slot_index].alive) {
-                targets.push_back(slot_index);
+            if (state->closed) {
+                return result<void>::err(ClosedError());
             }
+            if (state->connecting) {
+                return result<void>::err(OverloadedError());
+            }
+            if (state->ready) {
+
+                /**
+                 * 幂等：全健康时零动作；有坏 slot 时进入修复，只重建坏 slot。
+                 */
+                for (const auto& slot : state->slots) {
+                    if (!slot.alive) {
+                        need_build = true;
+                        break;
+                    }
+                }
+                if (!need_build) {
+                    return result<void>::ok();
+                }
+            } else {
+                if (state->slots.empty()) {
+                    state->slots.resize(state->options.connections);
+                }
+                need_build = true;
+            }
+            state->connecting = true;
         }
-    }
-    for (std::size_t remaining = targets.size(); remaining > 0; --remaining) {
 
         /**
-         * 每条连接（含修复/重建）都用池配置的握手走三参 Create；
-         * 握手配置非法或握手失败时下方 rollback 统一归还预算。
+         * 逐 slot 建连：新池建全部，修复只建坏 slot。部分失败回滚本次建立的
+         * 连接并清 connecting，不发布半就绪状态。
          */
-        auto created = CoRedisCli::Create(state->engine, state->address, state->options.handshake);
-        if (!created) {
-            for (auto& item : established) {
-                (void)item->Close();
+        std::vector<std::shared_ptr<CoRedisCli>> established;
+
+        struct BuildCleanup {
+            std::shared_ptr<State> state;
+            std::vector<std::shared_ptr<CoRedisCli>>& established;
+
+            ~BuildCleanup()
+            {
+                for (auto& client : established) {
+                    if (client) {
+                        (void)client->Close();
+                    }
+                }
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->connecting = false;
             }
-            std::lock_guard<std::mutex> lock(state->mutex);
-            return result<void>::err(std::move(created.error()));
-        }
-        auto client = std::move(created).value();
+        } cleanup{state, established};
+
+        std::vector<std::size_t> targets;
         {
             std::lock_guard<std::mutex> lock(state->mutex);
-            auto& owned = state->owned_clients;
-            owned.erase(
-                std::remove_if(owned.begin(), owned.end(), [](const auto& old) { return old->Released(); }),
-                owned.end());
-            owned.push_back(client);
-        }
-        auto connected = bbt_co_await client->Connect(options);
-        if (!connected) {
-            (void)client->Close();
-            for (auto& item : established) {
-                (void)item->Close();
+            for (std::size_t slot_index = 0; slot_index < state->slots.size(); ++slot_index) {
+                if (!state->slots[slot_index].alive) {
+                    targets.push_back(slot_index);
+                }
             }
+        }
+        for (std::size_t remaining = targets.size(); remaining > 0; --remaining) {
+
+            /**
+             * 每条连接（含修复/重建）都用池配置的握手走三参 Create；
+             * 握手配置非法或握手失败时下方 rollback 统一归还预算。
+             */
+            auto created = CoRedisCli::Create(state->engine, state->address, state->options.handshake);
+            if (!created) {
+                for (auto& item : established) {
+                    (void)item->Close();
+                }
+                std::lock_guard<std::mutex> lock(state->mutex);
+                return result<void>::err(std::move(created.error()));
+            }
+            auto client = std::move(created).value();
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                auto& owned = state->owned_clients;
+                owned.erase(
+                    std::remove_if(owned.begin(), owned.end(), [](const auto& old) { return old->Released(); }),
+                    owned.end());
+                owned.push_back(client);
+            }
+            auto connected = bbt_co_await client->Connect(options);
+            if (!connected) {
+                (void)client->Close();
+                for (auto& item : established) {
+                    (void)item->Close();
+                }
+                std::lock_guard<std::mutex> lock(state->mutex);
+                return result<void>::err(std::move(connected.error()));
+            }
+            established.push_back(std::move(client));
+        }
+        {
             std::lock_guard<std::mutex> lock(state->mutex);
-            return result<void>::err(std::move(connected.error()));
-        }
-        established.push_back(std::move(client));
-    }
-    {
-        std::lock_guard<std::mutex> lock(state->mutex);
-        if (state->closed) {
-            for (auto& item : established) {
-                (void)item->Close();
+            if (state->closed) {
+                for (auto& item : established) {
+                    (void)item->Close();
+                }
+                return result<void>::err(ClosedError());
             }
-            return result<void>::err(ClosedError());
+            std::size_t cursor = 0;
+            for (const auto target : targets) {
+                state->slots[target].client = std::move(established[cursor++]);
+                state->slots[target].alive = true;
+                state->RequeueLocked(state->slots[target].client, target);
+            }
+            state->ready = true;
         }
-        std::size_t cursor = 0;
-        for (const auto target : targets) {
-            state->slots[target].client = std::move(established[cursor++]);
-            state->slots[target].alive = true;
-            state->RequeueLocked(state->slots[target].client, target);
-        }
-        state->ready = true;
-    }
-    return result<void>::ok();
+        return result<void>::ok();
+    });
 }
 
 void CoRedisPool::_BeginClose(Error reason) noexcept
@@ -660,7 +668,7 @@ result<void> CoRedisPool::Close(const CloseOptions& options)
 
 bbt_co_async(result<void>) CoRedisPool::_WaitReleased(bbt::coroutine::Deadline deadline)
 {
-    return WaitStoppedOn(state_, deadline);
+    return bbt_co_bind([state = state_, deadline] { return WaitStoppedOn(state, deadline); });
 }
 
 result<void> CoRedisPool::WaitStoppedOn(const std::shared_ptr<State>& state, bbt::coroutine::Deadline deadline)
@@ -704,294 +712,321 @@ bool CoRedisPool::IsClosed() const noexcept
 }
 
 /**
- * 池内借出一条连接。快路径直接取；池空时有界 FIFO 排队，归还方 handoff。
- * 超时/取消/封口可区分且等待者不遗失；离场时已收到的 handoff 连接转交回池。
+ * Acquire 执行体：快路径、有界 FIFO 排队与 handoff/离场结算全部在此；
+ * 等待者与借用责任账本只经 state 快照维护，挂起恢复后不触碰公开句柄。
  */
-bbt_co_async(result<CoRedisPool::Borrow>) CoRedisPool::Acquire(const CallOptions& options)
+
+bbt_co_async(result<CoRedisPool::Borrow>)
+    CoRedisPool::Acquire(const std::shared_ptr<State>& state, const CallOptions& options)
 {
-    const auto state = state_;
-    if (bbt::coroutine::GetLocalCoroutineId() == 0) {
-        return result<Borrow>::err(ContextError());
-    }
-    std::shared_ptr<CoRedisCli> taken;
-    std::size_t index = 0;
-    {
-        std::lock_guard<std::mutex> lock(state->mutex);
-        if (state->closed) {
-            return result<Borrow>::err(ClosedError());
+    return bbt_co_bind([state, options]() -> result<CoRedisPool::Borrow> {
+        if (bbt::coroutine::GetLocalCoroutineId() == 0) {
+            return result<Borrow>::err(ContextError());
         }
-        if (!state->ready) {
-            return result<Borrow>::err(MakeError(ErrorCode::RuntimeUnavailable, "redis pool: not connected"));
-        }
-        if (state->TryTakeLocked(taken, index)) {
-            const auto id = bbt::coroutine::GetLocalCoroutineId();
-            ++state->borrowers[id];
-            return result<Borrow>::ok(Borrow(state, std::move(taken), index, id));
-        }
-        if (!state->AdmitLocked()) {
-            return result<Borrow>::err(OverloadedError());
-        }
-    }
-    auto waiter = std::make_shared<State::Waiter>();
-    waiter->gate = bbt::coroutine::sync::CoWaiter::Create();
-    if (!waiter->gate) {
-        return result<Borrow>::err(MakeError(ErrorCode::InternalError, "redis pool: waiter allocation failed"));
-    }
-
-    /**
-     * 所有退出路径（包括登记失败、回调异常）统一出账并归还已交接的槽。
-     */
-    struct Cleanup {
-        std::shared_ptr<State> state;
-        std::shared_ptr<State::Waiter> waiter;
-
-        ~Cleanup()
+        std::shared_ptr<CoRedisCli> taken;
+        std::size_t index = 0;
         {
-            std::shared_ptr<CoRedisCli> discard;
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (state->closed) {
+                return result<Borrow>::err(ClosedError());
+            }
+            if (!state->ready) {
+                return result<Borrow>::err(MakeError(ErrorCode::RuntimeUnavailable, "redis pool: not connected"));
+            }
+            if (state->TryTakeLocked(taken, index)) {
+                const auto id = bbt::coroutine::GetLocalCoroutineId();
+                ++state->borrowers[id];
+                return result<Borrow>::ok(Borrow(state, std::move(taken), index, id));
+            }
+            if (!state->AdmitLocked()) {
+                return result<Borrow>::err(OverloadedError());
+            }
+        }
+        auto waiter = std::make_shared<State::Waiter>();
+        waiter->gate = bbt::coroutine::sync::CoWaiter::Create();
+        if (!waiter->gate) {
+            return result<Borrow>::err(MakeError(ErrorCode::InternalError, "redis pool: waiter allocation failed"));
+        }
+
+        /**
+         * 所有退出路径（包括登记失败、回调异常）统一出账并归还已交接的槽。
+         */
+        struct Cleanup {
+            std::shared_ptr<State> state;
+            std::shared_ptr<State::Waiter> waiter;
+
+            ~Cleanup()
             {
-                std::lock_guard<std::mutex> lock(state->mutex);
-                state->DequeueLocked(waiter);
-                if (waiter->handed) {
-                    auto orphan = std::move(waiter->handed);
+                std::shared_ptr<CoRedisCli> discard;
+                {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    state->DequeueLocked(waiter);
+                    if (waiter->handed) {
+                        auto orphan = std::move(waiter->handed);
 
-                    /**
-                     * 只有 Discarded 才在锁外物理关闭
-                     */
-                    discard = orphan;
-                    const auto result = state->RequeueLocked(std::move(orphan), waiter->handed_index);
-                    if (result == State::RequeueResult::Handed) {
-                        discard.reset();
-                    } else {
-                        if (state->borrowed != 0) {
-                            --state->borrowed;
-                        }
-                        if (result == State::RequeueResult::Idle) {
-
-                            /**
-                             * 已回空闲队列，连接仍由池持有
-                             */
+                        /**
+                         * 只有 Discarded 才在锁外物理关闭
+                         */
+                        discard = orphan;
+                        const auto result = state->RequeueLocked(std::move(orphan), waiter->handed_index);
+                        if (result == State::RequeueResult::Handed) {
                             discard.reset();
+                        } else {
+                            if (state->borrowed != 0) {
+                                --state->borrowed;
+                            }
+                            if (result == State::RequeueResult::Idle) {
+
+                                /**
+                                 * 已回空闲队列，连接仍由池持有
+                                 */
+                                discard.reset();
+                            }
                         }
                     }
+                    state->close_signal->Notify();
                 }
-                state->close_signal->Notify();
+                if (discard) {
+                    (void)discard->Close();
+                }
             }
-            if (discard) {
-                (void)discard->Close();
-            }
+        } cleanup{state, waiter};
+
+        bool overloaded = false;
+        std::exception_ptr registration_error;
+        if (state->wait_hook) {
+            state->wait_hook(0);
         }
-    } cleanup{state, waiter};
 
-    bool overloaded = false;
-    std::exception_ptr registration_error;
-    if (state->wait_hook) {
-        state->wait_hook(0);
-    }
-
-    /**
-     * CoWaiter 已登记后才复查/入队；锁内发布状态后 Notify 不会丢失。
-     */
-    const auto status = waiter->gate->WaitWithCallback({options.deadline}, [&] {
-        try {
-            {
-                std::lock_guard<std::mutex> lock(state->mutex);
-                if (state->closed) {
-                    waiter->gate->Notify();
-                } else if (state->TryTakeLocked(waiter->handed, waiter->handed_index)) {
-                    waiter->gate->Notify();
-                } else if (!state->AdmitLocked()) {
-                    overloaded = true;
-                    waiter->gate->Notify();
-                } else {
-                    state->waiters.push_back(waiter);
-                    waiter->in_queue = true;
+        /**
+         * CoWaiter 已登记后才复查/入队；锁内发布状态后 Notify 不会丢失。
+         */
+        const auto status = waiter->gate->WaitWithCallback({options.deadline}, [&] {
+            try {
+                {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    if (state->closed) {
+                        waiter->gate->Notify();
+                    } else if (state->TryTakeLocked(waiter->handed, waiter->handed_index)) {
+                        waiter->gate->Notify();
+                    } else if (!state->AdmitLocked()) {
+                        overloaded = true;
+                        waiter->gate->Notify();
+                    } else {
+                        state->waiters.push_back(waiter);
+                        waiter->in_queue = true;
+                    }
                 }
-            }
-            if (state->wait_hook) {
-                state->wait_hook(1);
-            }
-        } catch (...) {
+                if (state->wait_hook) {
+                    state->wait_hook(1);
+                }
+            } catch (...) {
 
-            /**
-             * on_registered 在调度器栈执行，异常不能穿过 runtime 回调边界。
-             */
-            registration_error = std::current_exception();
-            waiter->gate->Notify();
+                /**
+                 * on_registered 在调度器栈执行，异常不能穿过 runtime 回调边界。
+                 */
+                registration_error = std::current_exception();
+                waiter->gate->Notify();
+            }
+            return true;
+        });
+        if (registration_error) {
+            std::rethrow_exception(registration_error);
         }
-        return true;
-    });
-    if (registration_error) {
-        std::rethrow_exception(registration_error);
-    }
-    if (state->wait_hook) {
-        state->wait_hook(2);
-    }
-    bool closed_now = false;
-    std::shared_ptr<CoRedisCli> discard;
-    {
-        std::lock_guard<std::mutex> lock(state->mutex);
-        state->DequeueLocked(waiter);
-        if (state->closed) {
-            closed_now = true;
-        } else if (overloaded) {
+        if (state->wait_hook) {
+            state->wait_hook(2);
+        }
+        bool closed_now = false;
+        std::shared_ptr<CoRedisCli> discard;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->DequeueLocked(waiter);
+            if (state->closed) {
+                closed_now = true;
+            } else if (overloaded) {
 
-            /**
-             * 下面统一返回 Overloaded。
-             */
-        } else if (status == bbt::coroutine::WaitStatus::Completed && waiter->handed) {
-            const auto id = bbt::coroutine::GetLocalCoroutineId();
-            ++state->borrowers[id];
-            return result<Borrow>::ok(Borrow(state, std::move(waiter->handed), waiter->handed_index, id));
-        } else if (waiter->handed) {
+                /**
+                 * 下面统一返回 Overloaded。
+                 */
+            } else if (status == bbt::coroutine::WaitStatus::Completed && waiter->handed) {
+                const auto id = bbt::coroutine::GetLocalCoroutineId();
+                ++state->borrowers[id];
+                return result<Borrow>::ok(Borrow(state, std::move(waiter->handed), waiter->handed_index, id));
+            } else if (waiter->handed) {
 
-            /**
-             * 首胜不是本等待者（取消/超时赢），handoff 连接转交回池给下一
-             * 等待者或空闲队列；未被接手时锁外物理关闭。
-             */
-            auto orphan = std::move(waiter->handed);
-            discard = orphan;
-            const auto result = state->RequeueLocked(std::move(orphan), waiter->handed_index);
-            if (result == State::RequeueResult::Handed) {
-                discard.reset();
-            } else {
-                if (state->borrowed != 0) {
-                    --state->borrowed;
-                }
-                if (result == State::RequeueResult::Idle) {
-
-                    /**
-                     * 已回空闲队列，连接仍由池持有
-                     */
+                /**
+                 * 首胜不是本等待者（取消/超时赢），handoff 连接转交回池给下一
+                 * 等待者或空闲队列；未被接手时锁外物理关闭。
+                 */
+                auto orphan = std::move(waiter->handed);
+                discard = orphan;
+                const auto result = state->RequeueLocked(std::move(orphan), waiter->handed_index);
+                if (result == State::RequeueResult::Handed) {
                     discard.reset();
+                } else {
+                    if (state->borrowed != 0) {
+                        --state->borrowed;
+                    }
+                    if (result == State::RequeueResult::Idle) {
+
+                        /**
+                         * 已回空闲队列，连接仍由池持有
+                         */
+                        discard.reset();
+                    }
                 }
             }
         }
-    }
-    if (discard) {
-        (void)discard->Close();
-    }
-    if (closed_now) {
-        return result<Borrow>::err(ClosedError());
-    }
-    if (overloaded) {
-        return result<Borrow>::err(OverloadedError());
-    }
-    if (status == bbt::coroutine::WaitStatus::Cancelled) {
-        return result<Borrow>::err(MakeError(ErrorCode::Cancelled, "redis pool: acquire cancelled"));
-    }
-    if (status == bbt::coroutine::WaitStatus::TimedOut) {
-        return result<Borrow>::err(MakeError(ErrorCode::TimedOut, "redis pool: acquire timeout"));
-    }
-    return result<Borrow>::err(MakeError(ErrorCode::RuntimeUnavailable, "redis pool: wait registration failed"));
+        if (discard) {
+            (void)discard->Close();
+        }
+        if (closed_now) {
+            return result<Borrow>::err(ClosedError());
+        }
+        if (overloaded) {
+            return result<Borrow>::err(OverloadedError());
+        }
+        if (status == bbt::coroutine::WaitStatus::Cancelled) {
+            return result<Borrow>::err(MakeError(ErrorCode::Cancelled, "redis pool: acquire cancelled"));
+        }
+        if (status == bbt::coroutine::WaitStatus::TimedOut) {
+            return result<Borrow>::err(MakeError(ErrorCode::TimedOut, "redis pool: acquire timeout"));
+        }
+        return result<Borrow>::err(MakeError(ErrorCode::RuntimeUnavailable, "redis pool: wait registration failed"));
+    });
 }
 
 bbt_co_async(result<void>) CoRedisPool::Ping(const CallOptions& options)
 {
-    return bbt_co_await RunBorrowed<result<void>>(options, [&](CoRedisCli& client) { return client.Ping(options); });
+    return RunBorrowed<result<void>>(state_, options, [options](CoRedisCli& client) { return client.Ping(options); });
 }
 
 bbt_co_async(result<std::optional<std::string>>) CoRedisPool::Get(std::string_view key, const CallOptions& options)
 {
-    return bbt_co_await RunBorrowed<result<std::optional<std::string>>>(
-        options, [&](CoRedisCli& client) { return client.Get(key, options); });
+    return RunBorrowed<result<std::optional<std::string>>>(
+        state_, options, [key = std::string(key), options](CoRedisCli& client) { return client.Get(key, options); });
 }
 
 bbt_co_async(result<void>) CoRedisPool::Set(std::string_view key, std::string_view value, const CallOptions& options)
 {
-    return bbt_co_await RunBorrowed<result<void>>(
-        options, [&](CoRedisCli& client) { return client.Set(key, value, options); });
+    return RunBorrowed<result<void>>(
+        state_, options, [key = std::string(key), value = std::string(value), options](CoRedisCli& client) {
+            return client.Set(key, value, options);
+        });
 }
 
 bbt_co_async(result<bool>) CoRedisPool::Set(
     std::string_view key, std::string_view value, const SetOptions& set_options, const CallOptions& options)
 {
-    return bbt_co_await RunBorrowed<result<bool>>(
-        options, [&](CoRedisCli& client) { return client.Set(key, value, set_options, options); });
+    return RunBorrowed<result<bool>>(
+        state_,
+        options,
+        [key = std::string(key), value = std::string(value), set_options, options](CoRedisCli& client) {
+            return client.Set(key, value, set_options, options);
+        });
 }
 
 bbt_co_async(result<bool>) CoRedisPool::Exists(std::string_view key, const CallOptions& options)
 {
-    return bbt_co_await RunBorrowed<result<bool>>(
-        options, [&](CoRedisCli& client) { return client.Exists(key, options); });
+    return RunBorrowed<result<bool>>(
+        state_, options, [key = std::string(key), options](CoRedisCli& client) { return client.Exists(key, options); });
 }
 
 bbt_co_async(result<std::uint64_t>) CoRedisPool::Delete(std::vector<std::string> keys, const CallOptions& options)
 {
-    return bbt_co_await RunBorrowed<result<std::uint64_t>>(
-        options, [&](CoRedisCli& client) { return client.Delete(std::move(keys), options); });
+    return RunBorrowed<result<std::uint64_t>>(
+        state_, options, [keys = std::move(keys), options](CoRedisCli& client) mutable {
+            return client.Delete(std::move(keys), options);
+        });
 }
 
 bbt_co_async(result<bool>)
     CoRedisPool::Expire(std::string_view key, std::chrono::milliseconds ttl, const CallOptions& options)
 {
-    return bbt_co_await RunBorrowed<result<bool>>(
-        options, [&](CoRedisCli& client) { return client.Expire(key, ttl, options); });
+    return RunBorrowed<result<bool>>(state_, options, [key = std::string(key), ttl, options](CoRedisCli& client) {
+        return client.Expire(key, ttl, options);
+    });
 }
 
 bbt_co_async(result<TtlResult>) CoRedisPool::Ttl(std::string_view key, const CallOptions& options)
 {
-    return bbt_co_await RunBorrowed<result<TtlResult>>(
-        options, [&](CoRedisCli& client) { return client.Ttl(key, options); });
+    return RunBorrowed<result<TtlResult>>(
+        state_, options, [key = std::string(key), options](CoRedisCli& client) { return client.Ttl(key, options); });
 }
 
 bbt_co_async(result<std::int64_t>) CoRedisPool::Incr(std::string_view key, const CallOptions& options)
 {
-    return bbt_co_await RunBorrowed<result<std::int64_t>>(
-        options, [&](CoRedisCli& client) { return client.Incr(key, options); });
+    return RunBorrowed<result<std::int64_t>>(
+        state_, options, [key = std::string(key), options](CoRedisCli& client) { return client.Incr(key, options); });
 }
 
 bbt_co_async(result<std::int64_t>) CoRedisPool::Decr(std::string_view key, const CallOptions& options)
 {
-    return bbt_co_await RunBorrowed<result<std::int64_t>>(
-        options, [&](CoRedisCli& client) { return client.Decr(key, options); });
+    return RunBorrowed<result<std::int64_t>>(
+        state_, options, [key = std::string(key), options](CoRedisCli& client) { return client.Decr(key, options); });
 }
 
 bbt_co_async(result<std::int64_t>)
     CoRedisPool::IncrBy(std::string_view key, std::int64_t delta, const CallOptions& options)
 {
-    return bbt_co_await RunBorrowed<result<std::int64_t>>(
-        options, [&](CoRedisCli& client) { return client.IncrBy(key, delta, options); });
+    return RunBorrowed<result<std::int64_t>>(
+        state_, options, [key = std::string(key), delta, options](CoRedisCli& client) {
+            return client.IncrBy(key, delta, options);
+        });
 }
 
 bbt_co_async(result<std::int64_t>)
     CoRedisPool::DecrBy(std::string_view key, std::int64_t delta, const CallOptions& options)
 {
-    return bbt_co_await RunBorrowed<result<std::int64_t>>(
-        options, [&](CoRedisCli& client) { return client.DecrBy(key, delta, options); });
+    return RunBorrowed<result<std::int64_t>>(
+        state_, options, [key = std::string(key), delta, options](CoRedisCli& client) {
+            return client.DecrBy(key, delta, options);
+        });
 }
 
 bbt_co_async(result<bool>)
     CoRedisPool::HSet(std::string_view key, std::string_view field, std::string_view value, const CallOptions& options)
 {
-    return bbt_co_await RunBorrowed<result<bool>>(
-        options, [&](CoRedisCli& client) { return client.HSet(key, field, value, options); });
+    return RunBorrowed<result<bool>>(
+        state_,
+        options,
+        [key = std::string(key), field = std::string(field), value = std::string(value), options](CoRedisCli& client) {
+            return client.HSet(key, field, value, options);
+        });
 }
 
 bbt_co_async(result<std::optional<std::string>>)
     CoRedisPool::HGet(std::string_view key, std::string_view field, const CallOptions& options)
 {
-    return bbt_co_await RunBorrowed<result<std::optional<std::string>>>(
-        options, [&](CoRedisCli& client) { return client.HGet(key, field, options); });
+    return RunBorrowed<result<std::optional<std::string>>>(
+        state_, options, [key = std::string(key), field = std::string(field), options](CoRedisCli& client) {
+            return client.HGet(key, field, options);
+        });
 }
 
 bbt_co_async(result<std::uint64_t>)
     CoRedisPool::HDel(std::string_view key, std::vector<std::string> fields, const CallOptions& options)
 {
-    return bbt_co_await RunBorrowed<result<std::uint64_t>>(
-        options, [&](CoRedisCli& client) { return client.HDel(key, std::move(fields), options); });
+    return RunBorrowed<result<std::uint64_t>>(
+        state_, options, [key = std::string(key), fields = std::move(fields), options](CoRedisCli& client) mutable {
+            return client.HDel(key, std::move(fields), options);
+        });
 }
 
 bbt_co_async(result<bool>)
     CoRedisPool::HExists(std::string_view key, std::string_view field, const CallOptions& options)
 {
-    return bbt_co_await RunBorrowed<result<bool>>(
-        options, [&](CoRedisCli& client) { return client.HExists(key, field, options); });
+    return RunBorrowed<result<bool>>(
+        state_, options, [key = std::string(key), field = std::string(field), options](CoRedisCli& client) {
+            return client.HExists(key, field, options);
+        });
 }
 
 bbt_co_async(result<HashEntries>) CoRedisPool::HGetAll(std::string_view key, const CallOptions& options)
 {
-    return bbt_co_await RunBorrowed<result<HashEntries>>(
-        options, [&](CoRedisCli& client) { return client.HGetAll(key, options); });
+    return RunBorrowed<result<HashEntries>>(state_, options, [key = std::string(key), options](CoRedisCli& client) {
+        return client.HGetAll(key, options);
+    });
 }
 
 // clang-format off

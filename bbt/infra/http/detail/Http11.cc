@@ -237,10 +237,13 @@ Http11Connection::ReadResponse(const PreparedRequest& request, const PhaseDeadli
 bbt_co_async(result<Http11Connection::ExchangeResult>) Http11Connection::Exchange(
     const PreparedRequest& request, const std::string& serialized, const PhaseDeadlines& deadlines)
 {
-    if (auto written = WriteRequest(serialized, StageDeadline(deadlines.write_timeout, deadlines.total)); !written) {
-        return R::err(std::move(written.error()));
-    }
-    return ReadResponse(request, deadlines);
+    return bbt_co_bind([this, request = request, serialized = serialized, deadlines]() -> result<ExchangeResult> {
+        if (auto written = WriteRequest(serialized, StageDeadline(deadlines.write_timeout, deadlines.total));
+            !written) {
+            return R::err(std::move(written.error()));
+        }
+        return ReadResponse(request, deadlines);
+    });
 }
 
 // clang-format off

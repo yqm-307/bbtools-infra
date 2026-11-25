@@ -23,6 +23,7 @@
 
 #include <bbt/coroutine/detail/Scheduler.hpp>
 #include <bbt/coroutine/sync/CoWaiter.hpp>
+#include <bbt/coroutine/syntax/SyntaxMacro.hpp>
 #include <bbt/infra/CloseOptions.hpp>
 #include <bbt/infra/config/FileSource.hpp>
 #include <bbt/infra/config/MemorySource.hpp>
@@ -949,26 +950,24 @@ BOOST_AUTO_TEST_CASE(watch_close_options_co_graceful_does_not_block_workers)
     auto watcher = std::move(wres).value();
     BOOST_REQUIRE(WaitUntil([&] { return cb->entered.load(std::memory_order_acquire); }, 3000));
 
-    auto& scheduler = *bbt::coroutine::detail::Scheduler::GetInstance();
     std::atomic_bool stop_pulse{false};
     std::atomic_bool pulse_done{false};
     std::atomic_int pulses{0};
     std::atomic_bool pulse_started{false};
     bool pulse_registered = false;
-    scheduler.RegistCoroutineTask(
-        [&] {
-            pulse_started.store(true, std::memory_order_release);
-            while (!stop_pulse.load(std::memory_order_acquire)) {
-                CoSleepMs(5);
-                pulses.fetch_add(1, std::memory_order_relaxed);
-            }
+    bbtco_noexcept(&pulse_registered)[&]
+    {
+        pulse_started.store(true, std::memory_order_release);
+        while (!stop_pulse.load(std::memory_order_acquire)) {
+            CoSleepMs(5);
+            pulses.fetch_add(1, std::memory_order_relaxed);
+        }
 
-            /**
-             * 退出位：本协程按引用捕获测试栈局部，测试帧销毁前必须等它真正退出。
-             */
-            pulse_done.store(true, std::memory_order_release);
-        },
-        pulse_registered);
+        /**
+         * 退出位：本协程按引用捕获测试栈局部，测试帧销毁前必须等它真正退出。
+         */
+        pulse_done.store(true, std::memory_order_release);
+    };
     BOOST_REQUIRE(pulse_registered);
     BOOST_REQUIRE(WaitUntil([&] { return pulse_started.load(std::memory_order_acquire); }, 3000));
 
@@ -976,14 +975,13 @@ BOOST_AUTO_TEST_CASE(watch_close_options_co_graceful_does_not_block_workers)
     std::atomic_bool close_done{false};
     std::atomic<long long> close_returned_at{0};
     bool close_registered = false;
-    scheduler.RegistCoroutineTask(
-        [&] {
-            close_result.emplace(watcher->Close(
-                bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::seconds{5})));
-            close_returned_at.store(CloseNowMs(), std::memory_order_release);
-            close_done.store(true, std::memory_order_release);
-        },
-        close_registered);
+    bbtco_noexcept(&close_registered)[&]
+    {
+        close_result.emplace(watcher->Close(
+            bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::seconds{5})));
+        close_returned_at.store(CloseNowMs(), std::memory_order_release);
+        close_done.store(true, std::memory_order_release);
+    };
     BOOST_REQUIRE(close_registered);
 
     /**
@@ -1110,15 +1108,14 @@ BOOST_AUTO_TEST_CASE(watch_close_options_rejects_unbounded_graceful)
     std::optional<bbt::infra::result<void>> co_release;
     std::atomic_bool co_done{false};
     bool co_registered = false;
-    bbt::coroutine::detail::Scheduler::GetInstance()->RegistCoroutineTask(
-        [&] {
-            bbt::infra::CloseOptions options = bbt::infra::CloseOptions::Immediate();
-            options.wait_release = true;
-            options.deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
-            co_release.emplace(watcher->Close(options));
-            co_done.store(true, std::memory_order_release);
-        },
-        co_registered);
+    bbtco_noexcept(&co_registered)[&]
+    {
+        bbt::infra::CloseOptions options = bbt::infra::CloseOptions::Immediate();
+        options.wait_release = true;
+        options.deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+        co_release.emplace(watcher->Close(options));
+        co_done.store(true, std::memory_order_release);
+    };
     BOOST_REQUIRE(co_registered);
     BOOST_REQUIRE(WaitUntil([&] { return co_done.load(std::memory_order_acquire); }, 3000));
     BOOST_REQUIRE(co_release.has_value());

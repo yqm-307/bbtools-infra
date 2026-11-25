@@ -408,6 +408,11 @@ struct Client::State {
     {
     }
 
+    static result<PreparedRequest>
+    BuildRequest(const State& state, std::string_view method, std::string_view url, const RequestOptions& options);
+    static bbt_co_async(result<Response>)
+        Send(std::shared_ptr<State> state, const PreparedRequest& request, const CallOptions& call);
+
     const std::shared_ptr<net::Engine> engine;
     const ClientOptions options;
     detail::ConnectionPool pool;
@@ -474,19 +479,24 @@ Client::~Client() noexcept
 result<PreparedRequest>
 Client::BuildRequest(std::string_view method, std::string_view url, const RequestOptions& options) const
 {
-    const auto state = m_state;
+    return State::BuildRequest(*m_state, method, url, options);
+}
+
+result<PreparedRequest> Client::State::BuildRequest(
+    const State& state, std::string_view method, std::string_view url, const RequestOptions& options)
+{
     if (!Token(method)) {
         return result<PreparedRequest>::err(InvalidArgument("method must not be empty"));
     }
     std::string absolute(url);
     if (absolute.find("://") == std::string::npos) {
-        if (state->options.base_url.empty()) {
+        if (state.options.base_url.empty()) {
             return result<PreparedRequest>::err(InvalidArgument("relative url requires client base_url"));
         }
         if (!absolute.empty() && absolute.front() != '/') {
             absolute.insert(absolute.begin(), '/');
         }
-        auto base = state->options.base_url;
+        auto base = state.options.base_url;
         if (!base.empty() && base.back() == '/' && !absolute.empty() && absolute.front() == '/') {
             base.pop_back();
         }
@@ -500,7 +510,7 @@ Client::BuildRequest(std::string_view method, std::string_view url, const Reques
     /**
      * headers merge：client 打底，同名（不区分大小写）请求级覆盖。
      */
-    Headers headers = state->options.headers;
+    Headers headers = state.options.headers;
     for (const auto& header : options.headers) {
         bool replaced = false;
         for (auto& existing : headers) {
@@ -529,7 +539,7 @@ Client::BuildRequest(std::string_view method, std::string_view url, const Reques
     /**
      * params merge：client 在前，请求级追加在后；URL 自带 query 透传保留。
      */
-    QueryParams params = state->options.params;
+    QueryParams params = state.options.params;
     for (const auto& param : options.params) {
         params.push_back(param);
     }
@@ -552,10 +562,10 @@ Client::BuildRequest(std::string_view method, std::string_view url, const Reques
     request.address = parsed.value().address;
     request.host_header = std::move(host_header);
     request.headers = std::move(headers);
-    request.connect_timeout = options.connect_timeout.value_or(state->options.connect_timeout);
-    request.read_timeout = options.read_timeout.value_or(state->options.read_timeout);
-    request.write_timeout = options.write_timeout.value_or(state->options.write_timeout);
-    request.pool_timeout = options.pool_timeout.value_or(state->options.pool_timeout);
+    request.connect_timeout = options.connect_timeout.value_or(state.options.connect_timeout);
+    request.read_timeout = options.read_timeout.value_or(state.options.read_timeout);
+    request.write_timeout = options.write_timeout.value_or(state.options.write_timeout);
+    request.pool_timeout = options.pool_timeout.value_or(state.options.pool_timeout);
     auto valid = ValidatePrepared(request);
     if (!valid) {
         return result<PreparedRequest>::err(std::move(valid.error()));
@@ -565,109 +575,126 @@ Client::BuildRequest(std::string_view method, std::string_view url, const Reques
 
 bbt_co_async(result<Response>) Client::Get(std::string_view url, const RequestOptions& options, const CallOptions& call)
 {
-    auto request = BuildRequest("GET", url, options);
-    if (!request) {
-        return result<Response>::err(std::move(request.error()));
-    }
-    return Send(request.value(), call);
+    return bbt_co_bind([state = m_state, url = std::string(url), options, call]() -> result<Response> {
+        auto request = State::BuildRequest(*state, "GET", url, options);
+        if (!request) {
+            return result<Response>::err(std::move(request.error()));
+        }
+        return bbt_co_await State::Send(state, request.value(), call);
+    });
 }
 
 bbt_co_async(result<Response>) Client::Post(
     std::string_view url, RequestBody body, const RequestOptions& options, const CallOptions& call)
 {
-    auto request = BuildRequest("POST", url, options);
-    if (!request) {
-        return result<Response>::err(std::move(request.error()));
-    }
-
-    /**
-     * body 与 Content-Type：请求级 headers 已含同名头时不覆盖。
-     */
-    if (!body.content_type.empty()) {
-        bool has_type = false;
-        for (const auto& header : request.value().headers) {
-            if (EqualsNoCase(header.first, "Content-Type")) {
-                has_type = true;
-                break;
+    return bbt_co_bind(
+        [state = m_state, url = std::string(url), body = std::move(body), options, call]() mutable -> result<Response> {
+            auto request = State::BuildRequest(*state, "POST", url, options);
+            if (!request) {
+                return result<Response>::err(std::move(request.error()));
             }
-        }
-        if (!has_type) {
-            request.value().headers.emplace_back("Content-Type", body.content_type);
-        }
-    }
-    request.value().body = std::move(body.content);
-    return Send(request.value(), call);
+
+            /**
+             * body 与 Content-Type：请求级 headers 已含同名头时不覆盖。
+             */
+            if (!body.content_type.empty()) {
+                bool has_type = false;
+                for (const auto& header : request.value().headers) {
+                    if (EqualsNoCase(header.first, "Content-Type")) {
+                        has_type = true;
+                        break;
+                    }
+                }
+                if (!has_type) {
+                    request.value().headers.emplace_back("Content-Type", body.content_type);
+                }
+            }
+            request.value().body = std::move(body.content);
+            return bbt_co_await State::Send(state, request.value(), call);
+        });
 }
 
 bbt_co_async(result<Response>) Client::Request(
     std::string_view method, std::string_view url, const RequestOptions& options, const CallOptions& call)
 {
-    auto request = BuildRequest(method, url, options);
-    if (!request) {
-        return result<Response>::err(std::move(request.error()));
-    }
-    return Send(request.value(), call);
+    return bbt_co_bind(
+        [state = m_state, method = std::string(method), url = std::string(url), options, call]() -> result<Response> {
+            auto request = State::BuildRequest(*state, method, url, options);
+            if (!request) {
+                return result<Response>::err(std::move(request.error()));
+            }
+            return bbt_co_await State::Send(state, request.value(), call);
+        });
 }
 
 bbt_co_async(result<Response>) Client::Send(const PreparedRequest& request, const CallOptions& call)
 {
-    const auto state = m_state;
-    if (bbt::coroutine::GetLocalCoroutineId() == 0) {
-        return result<Response>::err(MakeError(ErrorCode::InvalidContext, "http client: coroutine context required"));
-    }
-    if (state->pool.IsClosed()) {
-        if (const auto reason = state->pool.CloseReason()) {
-            return result<Response>::err(*reason);
-        }
-        return result<Response>::err(MakeError(ErrorCode::Closed, "http client: closed"));
-    }
+    return State::Send(m_state, request, call);
+}
 
-    /**
-     * 封口引起的失败以关闭原因对外；已提交（请求可能已生效）的 OutcomeUnknown
-     * 事实不追改，只附加关闭原因供排障。
-     */
-    const auto fail = [&state](Error error) {
-        const auto reason = state->pool.CloseReason();
-        if (!reason) {
-            return result<Response>::err(std::move(error));
+bbt_co_async(result<Response>) Client::State::Send(
+    std::shared_ptr<State> state, const PreparedRequest& request, const CallOptions& call)
+{
+    return bbt_co_bind([state = std::move(state), request, call]() -> result<Response> {
+        if (bbt::coroutine::GetLocalCoroutineId() == 0) {
+            return result<Response>::err(
+                MakeError(ErrorCode::InvalidContext, "http client: coroutine context required"));
         }
-        if (error.request_phase && *error.request_phase == RequestPhase::RequestCommitted) {
-            error.details.emplace_back("close_reason", reason->message);
-            return result<Response>::err(std::move(error));
+        if (state->pool.IsClosed()) {
+            if (const auto reason = state->pool.CloseReason()) {
+                return result<Response>::err(*reason);
+            }
+            return result<Response>::err(MakeError(ErrorCode::Closed, "http client: closed"));
         }
-        return result<Response>::err(*reason);
-    };
-    try {
-        auto valid = ValidatePrepared(request);
-        if (!valid) {
-            return result<Response>::err(std::move(valid.error()));
+
+        /**
+         * 封口引起的失败以关闭原因对外；已提交（请求可能已生效）的 OutcomeUnknown
+         * 事实不追改，只附加关闭原因供排障。
+         */
+        const auto fail = [&state](Error error) {
+            const auto reason = state->pool.CloseReason();
+            if (!reason) {
+                return result<Response>::err(std::move(error));
+            }
+            if (error.request_phase && *error.request_phase == RequestPhase::RequestCommitted) {
+                error.details.emplace_back("close_reason", reason->message);
+                return result<Response>::err(std::move(error));
+            }
+            return result<Response>::err(*reason);
+        };
+        try {
+            auto valid = ValidatePrepared(request);
+            if (!valid) {
+                return result<Response>::err(std::move(valid.error()));
+            }
+            if (const auto gate = detail::CheckCall(call.deadline)) {
+                return result<Response>::err(MakeError(
+                    gate == std::errc::operation_canceled ? ErrorCode::Cancelled : ErrorCode::TimedOut,
+                    "http client: call ended before submission"));
+            }
+            auto serialized = detail::SerializeRequest(request);
+            if (!serialized) {
+                return result<Response>::err(std::move(serialized.error()));
+            }
+            if (state->options.max_request_body_bytes && request.body.size() > *state->options.max_request_body_bytes) {
+                return result<Response>::err(InvalidArgument("request body exceeds max_request_body_bytes"));
+            }
+            const auto deadlines = detail::ResolveDeadlines(request, call.deadline, std::chrono::steady_clock::now());
+            auto leased = bbt_co_await state->pool.Acquire(valid.value().origin, request.address, deadlines);
+            if (!leased) {
+                return fail(std::move(leased.error()));
+            }
+            auto exchanged = bbt_co_await leased.value().connection->Exchange(request, serialized.value(), deadlines);
+            if (!exchanged) {
+                return fail(std::move(exchanged.error()));
+            }
+            leased.value().Release(exchanged.value().keep_alive);
+            return result<Response>::ok(std::move(exchanged.value().response));
+        } catch (const std::exception& error) {
+            return result<Response>::err(
+                MakeError(ErrorCode::InternalError, "http client: " + std::string(error.what())));
         }
-        if (const auto gate = detail::CheckCall(call.deadline)) {
-            return result<Response>::err(MakeError(
-                gate == std::errc::operation_canceled ? ErrorCode::Cancelled : ErrorCode::TimedOut,
-                "http client: call ended before submission"));
-        }
-        auto serialized = detail::SerializeRequest(request);
-        if (!serialized) {
-            return result<Response>::err(std::move(serialized.error()));
-        }
-        if (state->options.max_request_body_bytes && request.body.size() > *state->options.max_request_body_bytes) {
-            return result<Response>::err(InvalidArgument("request body exceeds max_request_body_bytes"));
-        }
-        const auto deadlines = detail::ResolveDeadlines(request, call.deadline, std::chrono::steady_clock::now());
-        auto leased = bbt_co_await state->pool.Acquire(valid.value().origin, request.address, deadlines);
-        if (!leased) {
-            return fail(std::move(leased.error()));
-        }
-        auto exchanged = bbt_co_await leased.value().connection->Exchange(request, serialized.value(), deadlines);
-        if (!exchanged) {
-            return fail(std::move(exchanged.error()));
-        }
-        leased.value().Release(exchanged.value().keep_alive);
-        return result<Response>::ok(std::move(exchanged.value().response));
-    } catch (const std::exception& error) {
-        return result<Response>::err(MakeError(ErrorCode::InternalError, "http client: " + std::string(error.what())));
-    }
+    });
 }
 
 void Client::_BeginClose(Error reason) noexcept

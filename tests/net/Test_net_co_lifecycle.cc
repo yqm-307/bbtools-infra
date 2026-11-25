@@ -38,16 +38,15 @@ void OnCo(std::function<void()> action)
     auto done = std::make_shared<std::promise<void>>();
     auto future = done->get_future();
     bool submitted = false;
-    g_scheduler->RegistCoroutineTask(
-        [done, action = std::move(action)] {
-            try {
-                action();
-                done->set_value();
-            } catch (...) {
-                done->set_exception(std::current_exception());
-            }
-        },
-        submitted);
+    bbtco_noexcept(&submitted)[done, action = std::move(action)]()
+    {
+        try {
+            action();
+            done->set_value();
+        } catch (...) {
+            done->set_exception(std::current_exception());
+        }
+    };
     BOOST_REQUIRE(submitted);
     if (future.wait_for(std::chrono::seconds(5)) != std::future_status::ready)
 

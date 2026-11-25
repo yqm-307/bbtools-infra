@@ -122,7 +122,7 @@ public:
     bool IsSealed() const;
 
 private:
-    std::unique_lock<std::mutex> Lock() const { return std::unique_lock<std::mutex>(m_mutex); }
+    std::unique_lock<std::mutex> Lock() const;
 
     mutable std::mutex m_mutex;
     std::condition_variable control_cv;
@@ -350,11 +350,7 @@ public:
 
     void AddConnection() { conn_count.fetch_add(1, std::memory_order_relaxed); }
 
-    void RemoveConnection()
-    {
-        if (conn_count.load() > 0)
-            conn_count.fetch_sub(1);
-    }
+    void RemoveConnection();
 
     void PublishConnectionCount(std::size_t count) { conn_count.store(count); }
 
@@ -407,11 +403,7 @@ public:
 
     int TakeConnectWaitStatus() { return test_hooks ? test_hooks->TakeConnectWaitStatus() : -1; }
 
-    void InvokeHook(HookPoint point) const
-    {
-        if (test_hooks)
-            test_hooks->Invoke(point);
-    }
+    void InvokeHook(HookPoint point) const;
 
     bool TakeFault(FaultPoint point) const { return test_hooks && test_hooks->TakeFault(point); }
 

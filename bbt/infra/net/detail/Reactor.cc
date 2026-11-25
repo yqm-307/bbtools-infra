@@ -47,6 +47,24 @@
 
 namespace bbt::infra::net {
 
+void Reactor::ArmHookForTest(HookPoint point, std::function<void()> hook, bool once)
+{
+    if (m_impl->Hooks())
+        m_impl->Hooks()->ArmOwner(point, m_index, std::move(hook), once);
+}
+
+void Reactor::InvokeHook(HookPoint point)
+{
+    if (m_impl->Hooks())
+        m_impl->Hooks()->InvokeOwner(point, m_index);
+}
+
+void Reactor::KickPumpOwner()
+{
+    auto self = shared_from_this();
+    (void)TryPostInternal([self] { self->PumpAllConnsOwner(); });
+}
+
 std::error_code FromBoost(const boost::system::error_code& error)
 {
     if (!error) {

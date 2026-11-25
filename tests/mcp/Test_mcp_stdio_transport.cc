@@ -39,6 +39,7 @@
 
 #include <bbt/coroutine/detail/GlobalConfig.hpp>
 #include <bbt/coroutine/detail/Scheduler.hpp>
+#include <bbt/coroutine/syntax/SyntaxMacro.hpp>
 
 namespace {
 
@@ -1083,17 +1084,16 @@ void TestGracefulSealSharesCloseDeadline()
     std::atomic<long long> close_elapsed_ms{0};
     bool registered = false;
     auto transport = rig.transport;
-    bbt::coroutine::detail::Scheduler::GetInstance()->RegistCoroutineTask(
-        [transport, &close_result, &close_done, &close_elapsed_ms] {
-            const auto begin = std::chrono::steady_clock::now();
-            close_result.emplace(transport->Close(
-                bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::milliseconds{250})));
-            close_elapsed_ms.store(
-                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count(),
-                std::memory_order_release);
-            close_done.store(true, std::memory_order_release);
-        },
-        registered);
+    bbtco_noexcept(&registered)[transport, &close_result, &close_done, &close_elapsed_ms]
+    {
+        const auto begin = std::chrono::steady_clock::now();
+        close_result.emplace(transport->Close(
+            bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::milliseconds{250})));
+        close_elapsed_ms.store(
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count(),
+            std::memory_order_release);
+        close_done.store(true, std::memory_order_release);
+    };
     CHECK(registered);
 
     const auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::seconds{8};
@@ -1170,13 +1170,12 @@ void TestImmediateUpgradeWhileGracefulWaits()
     std::atomic_bool graceful_done{false};
     bool registered = false;
     auto transport = rig.transport;
-    bbt::coroutine::detail::Scheduler::GetInstance()->RegistCoroutineTask(
-        [transport, &graceful_result, &graceful_done] {
-            graceful_result.emplace(transport->Close(
-                bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::seconds{5})));
-            graceful_done.store(true, std::memory_order_release);
-        },
-        registered);
+    bbtco_noexcept(&registered)[transport, &graceful_result, &graceful_done]
+    {
+        graceful_result.emplace(transport->Close(
+            bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::seconds{5})));
+        graceful_done.store(true, std::memory_order_release);
+    };
     CHECK(registered);
 
     /**
@@ -1318,15 +1317,13 @@ void TestCoRecheckWaitsRelease()
     std::atomic<bool> done{false};
     std::optional<bbt::infra::result<void>> closed;
     bool submitted = false;
-    bbt::coroutine::detail::Scheduler::GetInstance()->RegistCoroutineTask(
-        [&] {
-            auto options =
-                bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::seconds{5});
-            options.wait_release = true;
-            closed.emplace(rig.transport->Close(options));
-            done.store(true, std::memory_order_release);
-        },
-        submitted);
+    bbtco_noexcept(&submitted)[&]
+    {
+        auto options = bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::seconds{5});
+        options.wait_release = true;
+        closed.emplace(rig.transport->Close(options));
+        done.store(true, std::memory_order_release);
+    };
     CHECK(submitted);
     auto wait_flag = [](const std::atomic<bool>& flag) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{8};

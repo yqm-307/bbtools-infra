@@ -535,6 +535,7 @@ result<void> detail::DispatchAdmission(const std::shared_ptr<ServerState>& serve
     }
 
     bool registered = false;
+    // bbt-lint: ignore-next-line coroutine-sugar -- route task needs the explicit 128 KiB stack
     g_scheduler->RegistCoroutineTask(
         128 * 1024,
         [server, handler = std::move(route_handler), item = std::move(item)]() mutable {

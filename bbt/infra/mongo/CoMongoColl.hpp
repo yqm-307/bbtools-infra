@@ -14,10 +14,10 @@ namespace bbt::infra::mongo {
  * 句柄，也不等待 owner 在途归零。
  *
  * 等待入口：CRUD 用上游 bbt_co_async 标记返回类型，调用方必须经 bbt_co_await 消费
- * （`auto r = bbt_co_await coll->FindOne(...)`）。标记只附加返回类型、不改变实现与语义；
- * 只有写了 await 的表达式才会在非协程域先撞 AwaitHelper 的 std::logic_error（早于本组件的
- * InvalidContext 校验）。漏写 await 直接持有返回值的调用不被静态拦住、函数体照常执行，
- * 故这不是协程外调用的完整静态强制。Create/Start/Collection/Close 不挂起，保持裸
+ * （`auto r = bbt_co_await coll->FindOne(...)`）。接口返回惰性 async 操作，必须通过
+ * `bbt_co_await` 或 `bbt_co_fire` 消费；
+ * `await` 表达式在非协程域会先撞 AwaitHelper 的 std::logic_error（早于本组件的
+ * InvalidContext 校验）。`fire` 由调度器创建 detached 协程。Create/Start/Collection/Close 不挂起，保持裸
  * result<void>/void。
  *
  * 空 filter 的语义：

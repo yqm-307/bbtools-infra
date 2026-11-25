@@ -89,7 +89,12 @@ result<void> CoRpcServer::Start()
 
 bbt_co_async(result<void>) CoRpcServer::Close(const CloseOptions& options)
 {
-    return detail::ServerClose(m_state, options);
+    return bbt_co_bind([state = m_state, options]() -> result<void> { return detail::ServerClose(state, options); });
+}
+
+result<void> CoRpcServer::CloseImmediate(const CloseOptions& options)
+{
+    return detail::ServerClose(m_state, CloseOptions::Immediate(options.reason.value_or(Error{})));
 }
 
 CoRpcServer::~CoRpcServer() noexcept

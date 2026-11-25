@@ -1210,3 +1210,96 @@ void CloseDuringHandshake()
                  "code="
               << static_cast<int>(code) << " ping=Closed\n";
 }
+
+/**
+ * 惰性命令参数所有权（COMMON）：暂存后原地改写调用方字符缓冲的字符（缓冲仍
+ * 存活，不用悬空/UB 作判据），消费时必须仍按暂存时的旧参数提交，且暂存与
+ * 改写期间不得向对端提交任何命令（Redis 参数所有权，覆盖 Cli 与 Pool）。
+ */
+void LazyCommandArgumentOwnership()
+{
+
+    /**
+     * Client SET：key/value 是调用方 string 上的视图。
+     */
+    {
+        std::atomic<bool> probe{false}, probed{false}, early{false};
+        std::vector<std::string> received;
+        Peer peer([&](int fd) {
+            CHECK(WaitUntil([&] { return probe.load(); }));
+
+            /**
+             * 暂存 + 改写已完成：此刻可读说明消费前就已提交。
+             */
+            pollfd readable{fd, POLLIN, 0};
+            early.store(::poll(&readable, 1, 0) == 1 && (readable.revents & POLLIN) != 0);
+            probed.store(true);
+            received = Peer::ReadCommand(fd);
+            CHECK(Peer::Send(fd, "+OK\r\n"));
+        });
+        Host host;
+        auto cli = host.Make(peer.address);
+        host.Connect(cli);
+
+        std::string key = "qa:lazy-set-key";
+        std::string value = "qa:lazy-set-value";
+        auto staged = cli->Set(key, value, Until());
+        std::fill(key.begin(), key.end(), 'k');
+        std::fill(value.begin(), value.end(), 'v');
+        CHECK(key != "qa:lazy-set-key");
+        CHECK(value != "qa:lazy-set-value");
+
+        probe.store(true);
+        CHECK(WaitUntil([&] { return probed.load(); }));
+        CHECK(!early.load());
+        CHECK(host.Call([&] { return bbt_co_await std::move(staged); }));
+        peer.Join();
+        CHECK((received == std::vector<std::string>({"SET", "qa:lazy-set-key", "qa:lazy-set-value"})));
+        cli.reset();
+        host.Finish();
+        std::cout << "lazy_command_args cli=SET staged_old=1 not_submitted=1\n";
+    }
+
+    /**
+     * Pool HSET：连接池转发层同样必须在暂存时保存 key/field/value。
+     */
+    {
+        std::atomic<bool> probe{false}, probed{false}, early{false};
+        std::vector<std::string> received;
+        Peer peer([&](int fd) {
+            CHECK(WaitUntil([&] { return probe.load(); }));
+            pollfd readable{fd, POLLIN, 0};
+            early.store(::poll(&readable, 1, 0) == 1 && (readable.revents & POLLIN) != 0);
+            probed.store(true);
+            received = Peer::ReadCommand(fd);
+            CHECK(Peer::Send(fd, ":1\r\n"));
+        });
+        Host host;
+        auto pool = PeerPool(host, peer.address);
+
+        std::string key = "qa:lazy-hset-key";
+        std::string field = "qa:lazy-hset-field";
+        std::string value = "qa:lazy-hset-value";
+        auto staged = pool->HSet(key, field, value, Until());
+        std::fill(key.begin(), key.end(), 'k');
+        std::fill(field.begin(), field.end(), 'f');
+        std::fill(value.begin(), value.end(), 'v');
+        CHECK(key != "qa:lazy-hset-key");
+        CHECK(field != "qa:lazy-hset-field");
+        CHECK(value != "qa:lazy-hset-value");
+
+        probe.store(true);
+        CHECK(WaitUntil([&] { return probed.load(); }));
+        CHECK(!early.load());
+        auto inserted = host.Call([&] { return bbt_co_await std::move(staged); });
+        CHECK(inserted && inserted.value());
+        peer.Join();
+        CHECK(
+            (received
+             == std::vector<std::string>({"HSET", "qa:lazy-hset-key", "qa:lazy-hset-field", "qa:lazy-hset-value"})));
+        (void)pool->Close();
+        pool.reset();
+        host.Finish();
+        std::cout << "lazy_command_args pool=HSET staged_old=1 not_submitted=1\n";
+    }
+}

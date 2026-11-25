@@ -41,16 +41,15 @@ void OnCo(std::function<void()> action)
     auto done = std::make_shared<std::promise<void>>();
     auto future = done->get_future();
     bool submitted = false;
-    g_scheduler->RegistCoroutineTask(
-        [done, action = std::move(action)] {
-            try {
-                action();
-                done->set_value();
-            } catch (...) {
-                done->set_exception(std::current_exception());
-            }
-        },
-        submitted);
+    bbtco_noexcept(&submitted)[done, action = std::move(action)]
+    {
+        try {
+            action();
+            done->set_value();
+        } catch (...) {
+            done->set_exception(std::current_exception());
+        }
+    };
     BOOST_REQUIRE(submitted);
     if (future.wait_for(std::chrono::seconds(5)) != std::future_status::ready)
         std::terminate();
@@ -100,7 +99,7 @@ BOOST_AUTO_TEST_CASE(non_co_session_call_send_do_not_create_pending_work)
         BOOST_CHECK_EQUAL(stats.actor.inflight, 0U);
         BOOST_CHECK_EQUAL(engine->CountConnections(), 0U);
         BOOST_CHECK(engine->Phase() == bbt::infra::net::EnginePhase::Idle);
-        (void)client->Close(bbt::infra::CloseOptions::Immediate());
+        (void)client->CloseImmediate(bbt::infra::CloseOptions::Immediate());
     }
     OnCo([&] {
         rpc::Request request("echo", "call");
@@ -141,8 +140,8 @@ BOOST_AUTO_TEST_CASE(close_callback_once_and_observation_does_not_retain_server)
     const auto identity = server->GetObjectInfo();
     BOOST_CHECK(identity.id != 0);
     BOOST_REQUIRE(co::GetCoObjectManager()->GetObjectInfo(identity.id));
-    (void)server->Close(bbt::infra::CloseOptions::Immediate());
-    (void)server->Close(bbt::infra::CloseOptions::Immediate());
+    (void)server->CloseImmediate(bbt::infra::CloseOptions::Immediate());
+    (void)server->CloseImmediate(bbt::infra::CloseOptions::Immediate());
     BOOST_CHECK(server->IsClosed());
     BOOST_CHECK_EQUAL(co::GetCoObjectStats("infra.rpc.CoRpcServer").alive, before.alive + 1);
     server.reset();
@@ -226,6 +225,78 @@ BOOST_AUTO_TEST_CASE(wire_budget_and_acceptance_presence_boundaries)
      */
     frame.acceptance_requested = false;
     ExpectCode(rpc::ValidateSessionFrame(frame), ErrorCode::InvalidArgument);
+}
+
+/**
+ * native CloseImmediate 只取 reason：调用方给出有限期限、wait_release 甚至
+ * Graceful 输入时仍立即逻辑封口并保留首因，不返回 InvalidContext、不等待
+ * 物理归还（RPC CloseImmediate 关闭契约）。通用 Close 的 wait_release
+ * 语义由 rpc.net.v2s_close_negative_timeout 保护，本用例不替代它。
+ */
+BOOST_AUTO_TEST_CASE(close_immediate_from_native_uses_only_reason)
+{
+    auto engine = bbt::infra::net::Engine::Create(nullptr);
+    rpc::ClientOptions client_options;
+    client_options.SetLocalIdentity("close-immediate").SetTrustedNetworkPlaintext(true);
+    auto made_client = rpc::CoRpcClient::Create(engine, client_options);
+    BOOST_REQUIRE(made_client);
+    auto client = std::move(made_client).value();
+
+    rpc::AdmissionHandler handler = [](rpc::AdmissionItem&& item) {
+        (void)item;
+        return result<void>::err(bbt::infra::MakeError(ErrorCode::Unavailable, "not started"));
+    };
+    rpc::ServerOptions server_options;
+    std::error_code address_error;
+    server_options.SetListenAddress(bbt::infra::net::Address::Ip("127.0.0.1", 0, address_error));
+    BOOST_REQUIRE(!address_error);
+    auto made_server = rpc::CoRpcServer::Create(engine, client, std::move(handler), server_options);
+    BOOST_REQUIRE(made_server);
+    auto server = std::move(made_server).value();
+
+    /**
+     * Client：Immediate + wait_release + 有限期限 + reason。原生线程无协程上下文。
+     */
+    bbt::infra::CloseOptions client_close =
+        bbt::infra::CloseOptions::Immediate(bbt::infra::MakeError(ErrorCode::Unavailable, "qa: client immediate"));
+    client_close.wait_release = true;
+    client_close.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    const auto client_closed = client->CloseImmediate(client_close);
+    BOOST_CHECK(client_closed);
+    BOOST_CHECK(client->IsClosed());
+    const auto client_reason = client->CloseReason();
+    BOOST_CHECK(client_reason.has_value());
+    if (client_reason) {
+        BOOST_CHECK(client_reason->code == ErrorCode::Unavailable);
+        BOOST_CHECK_EQUAL(client_reason->message, "qa: client immediate");
+    }
+
+    /**
+     * Server：Graceful + wait_release 输入同样只在 reason 上生效。
+     */
+    bbt::infra::CloseOptions server_close = bbt::infra::CloseOptions::Graceful(
+        std::chrono::steady_clock::now() + std::chrono::seconds(1),
+        bbt::infra::MakeError(ErrorCode::Unavailable, "qa: server immediate"));
+    server_close.wait_release = true;
+    const auto server_closed = server->CloseImmediate(server_close);
+    BOOST_CHECK(server_closed);
+    BOOST_CHECK(server->IsClosed());
+    const auto server_reason = server->CloseReason();
+    BOOST_CHECK(server_reason.has_value());
+    if (server_reason) {
+        BOOST_CHECK(server_reason->code == ErrorCode::Unavailable);
+        BOOST_CHECK_EQUAL(server_reason->message, "qa: server immediate");
+    }
+
+    /**
+     * 幂等：重复 native 入口不因等待选项改变首因。
+     */
+    BOOST_CHECK(client->CloseImmediate(client_close));
+    const auto repeated = client->CloseReason();
+    BOOST_CHECK(repeated.has_value());
+    if (repeated) {
+        BOOST_CHECK_EQUAL(repeated->message, "qa: client immediate");
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

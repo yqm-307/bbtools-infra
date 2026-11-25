@@ -753,6 +753,7 @@ int RunServer(int argc, char** argv)
     bool teardown_incomplete = false;
     if (mode == "co") {
         TrackTaskBegin();
+        // bbt-lint: ignore-next-line coroutine-sugar -- explicit 64 KiB stack; bbtco has no stack-size form
         g_scheduler->RegistCoroutineTask(
             65536,
             [&engine] {
@@ -767,6 +768,7 @@ int RunServer(int argc, char** argv)
                     const Connection c = res.connection.Raw();
                     g_metrics.accepted.fetch_add(1);
                     TrackTaskBegin();
+                    // bbt-lint: ignore-next-line coroutine-sugar -- explicit 64 KiB stack; bbtco has no stack-size form
                     g_scheduler->RegistCoroutineTask(
                         65536,
                         [c] {

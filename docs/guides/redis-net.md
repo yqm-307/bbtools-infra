@@ -1,6 +1,6 @@
 # Redis 的 net 窄入口（已合入，默认关闭）
 
-公共消费接口为 `<bbt/infra/redis/interface/IRedisCli.hpp>` 中的 `bbt::infra::redis::IRedisCli`；具体实现仍由 `<bbt/infra/redis/CoRedisCli.hpp>` 与 `<bbt/infra/redis/CoRedisPool.hpp>` 提供，CMake 目标均为 `bbt::infra_redis_net`。具体类的公共头与实现同目录置于 `bbt/infra/redis/`（对齐 `bbt/infra/net` 布局；原 include 路径与 namespace 不变），hiredis 编解码共享层在 `bbt/infra/redis/detail/`（模块私有，不公开）。等待入口用上游 PR #414 的 `bbt_co_async(result<...>)` 标记，调用方经 `bbt_co_await` 消费；await helper 的协程域前置检查先于函数体，非协程直调抛 `std::logic_error`。固定大小连接池 `CoRedisPool` 的语义见[池](#池-coredispool)一节。该独立入口经审查后由 [PR #95](https://github.com/yqm-307/bbtools-infra/pull/95) 合入，合并提交 `7401099b16741d67f88a64807dd086a3ea0996ae`；旧 `bbt::infra::CoRedisCli` / `bbt::infra_redis` 保留原契约。默认构建不启用新入口，framework 消费者尚未切换。
+公共消费接口为 `<bbt/infra/redis/interface/IRedisCli.hpp>` 中的 `bbt::infra::redis::IRedisCli`；具体实现仍由 `<bbt/infra/redis/CoRedisCli.hpp>` 与 `<bbt/infra/redis/CoRedisPool.hpp>` 提供，CMake 目标均为 `bbt::infra_redis_net`。具体类的公共头与实现同目录置于 `bbt/infra/redis/`（对齐 `bbt/infra/net` 布局；原 include 路径与 namespace 不变），hiredis 编解码共享层在 `bbt/infra/redis/detail/`（模块私有，不公开）。固定大小连接池 `CoRedisPool` 的语义见[池](#池-coredispool)一节。该独立入口经审查后由 [PR #95](https://github.com/yqm-307/bbtools-infra/pull/95) 合入，合并提交 `7401099b16741d67f88a64807dd086a3ea0996ae`；旧 `bbt::infra::CoRedisCli` / `bbt::infra_redis` 保留原契约。默认构建不启用新入口，framework 消费者尚未切换。
 
 ## 公共客户端接口
 
@@ -11,7 +11,7 @@
 bbt_co_async(result<std::optional<std::string>>)
 LoadValue(redis::IRedisCli& client, std::string_view key, const CallOptions& options)
 {
-    return bbt_co_await client.Get(key, options);
+    return client.Get(key, options);
 }
 ```
 
@@ -48,7 +48,7 @@ hiredis 仅用于实现的 RESP2 编码/reader 和共享的 `bbt/infra/redis/det
 
 装配可携带连接级握手配置：`Create(engine, address, RedisHandshake)`。`RedisHandshake{username, password, database}` 中 username 为空时 AUTH 走单参数 legacy 形式，password 为空不发送 AUTH，database<0（默认 -1）不 SELECT，合法值 0..`kMaxDatabase`（1000000），越界在装配时返回 InvalidArgument；原两参重载保留，等价于不握手。握手发生在每次 `Connect` 成功建连后的同一活动位置、同一绝对 deadline 内，按 AUTH 再 SELECT 顺序各等待一次 +OK，不流水线、不缓存终态。握手 I/O 使用发布锁内快照的本地连接句柄，挂起期间不读写共享成员，不与并发 `Close` 产生数据竞争；握手成功后以同一状态锁复查封口，`Close` 胜出时 `Connect` 不返回成功。任一步失败：`Connect` 返回映射后的错误（服务端拒绝为 RemoteError），连接退役，后续命令按「显式 Connect required」处理，client 仍可 `Close`；错误消息与 details 由服务端原文组成，不含密码。未配置握手（password 空且 database<0）时握手零动作，行为与原先完全一致。
 
-`Connect` 与全部命令入口（`Ping`、`Get`、`Set`、`Exists`、`Delete` 及下文新增命令）都返回本仓 `result<T>`，要求真实协程域。调用方式：
+`Connect` 与全部命令入口返回惰性操作：创建时持有共享状态和参数快照（包括 `string_view` 的内容），不接纳命令、不执行 I/O。调用方在受管协程内用 `bbt_co_await` 取得 `result<T>`；在协程域外使用 `bbt_co_await` 会抛 `std::logic_error`。调用方式：
 
 ```cpp
 auto reply = bbt_co_await client->Get(key, options);
@@ -71,7 +71,7 @@ key/value 二进制安全；拒绝空 key 和空 DEL 列表。PING 只接受 PON
 
 对应回复接纳规则扩充：PEXPIRE 只接受 0/1；PTTL、INCR 族与 HSET 只接受整数；AUTH/SELECT 只接受 +OK。数组回复由共享解码层 `bbt/infra/redis/detail/` 解成一维扁平快照：元素只接受 Bulk/Status/Nil/Integer（Integer 转十进制文本），元素数与元素字节合计上限为 `detail::kMaxArrayElements`（65536）与 `detail::kMaxArrayBytes`（16 MiB）；字节预算在复制每个元素负载前按剩余额度校验（checked-add，无回绕），空元素指针与 str/len 不一致同样拒绝。超限、嵌套数组或其他元素类型按现有协议错误规则退役连接，已接纳命令为 OutcomeUnknown、cause 为 ProtocolError。HGETALL 在 Array 之外还要求元素数为偶数且不含 nil 元素（field/value 对契约），奇数或含 nil 的完整数组同样退役为 ProtocolError。当前只有 HGETALL 放行数组回复，其余命令收到数组仍按协议错误退役；LRANGE 等数组命令未开放入口。
 
-一个 client 只允许一个活动 Connect 或命令，竞争立即 Overloaded；已经健康连接时重复 Connect 幂等。每个等待入口先复制共享 State 和调用所需值，挂起恢复后不再访问公开句柄；短锁保护接纳/封口/连接发布，不跨挂起。reader 由活动操作独占，Close 不抢先释放活动 reader。
+一个 client 只允许一个活动 Connect 或命令，竞争立即 Overloaded；已经健康连接时重复 Connect 幂等。短锁保护接纳/封口/连接发布，不跨挂起。reader 由活动操作独占，Close 不抢先释放活动 reader。
 
 ## 错误与流同步
 

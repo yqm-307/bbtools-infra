@@ -41,6 +41,7 @@ static int RunConsumerCases()
         auto object = std::make_shared<CoObject>("consumer", "coroutine-first");
         auto promise = std::make_shared<std::promise<int>>();
         auto future = promise->get_future();
+        // bbt-lint: ignore-next-line coroutine-sugar -- explicit 64 KiB stack; bbtco has no stack-size form
         g_scheduler->RegistCoroutineTask(
             65536,
             [object, promise] {

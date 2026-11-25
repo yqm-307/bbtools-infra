@@ -69,11 +69,11 @@ template <class T> void RequireOk(const result<T>& value, const char* stage)
  * 不算问题（重复清理或已被删都正常），但删除本身报错要带给调用方。只在协程内
  * 调用：不进析构、不在 owner 关闭之后 await，也不宽范围删集合。
  */
-bbt_co_async(std::string) CleanupInserted(mongo::CoMongoColl& coll, const mongo::MongoDocument& filter)
+static std::string CleanupInsertedBody(std::shared_ptr<mongo::CoMongoColl> coll, mongo::MongoDocument filter)
 {
     std::string problems;
-    const auto removed = bbt_co_await coll.DeleteOne(filter, Budget(5000));
-    const auto miss = bbt_co_await coll.FindOne(filter, Budget(5000));
+    const auto removed = bbt_co_await coll->DeleteOne(filter, Budget(5000));
+    const auto miss = bbt_co_await coll->FindOne(filter, Budget(5000));
 
     if (!miss)
         problems = "FindOne(after cleanup) failed: " + miss.error().message;
@@ -87,11 +87,16 @@ bbt_co_async(std::string) CleanupInserted(mongo::CoMongoColl& coll, const mongo:
     return problems;
 }
 
+bbt_co_async(std::string) CleanupInserted(std::shared_ptr<mongo::CoMongoColl> coll, mongo::MongoDocument filter)
+{
+    return bbt_co_bind(CleanupInsertedBody, std::move(coll), std::move(filter));
+}
+
 /**
  * 一次完整 CRUD 闭环：构造 → 插入 → 读回（类型化 getter + canonical JSON）
  * → 删除 → 读回未命中。
  */
-void Crud(mongo::CoMongoColl& coll, const std::string& id)
+void Crud(const std::shared_ptr<mongo::CoMongoColl>& coll, const std::string& id)
 {
     const std::string where = "{\"_id\":\"" + id + "\"}";
 
@@ -111,12 +116,12 @@ void Crud(mongo::CoMongoColl& coll, const std::string& id)
      * 失败路径同样不得遗留本轮测试数据。
      */
     try {
-        RequireOk(bbt_co_await coll.InsertOne(doc.value(), Budget(5000)), "InsertOne");
+        RequireOk(bbt_co_await coll->InsertOne(doc.value(), Budget(5000)), "InsertOne");
 
         /**
          * 读：命中返回文档；未命中是 ok(nullopt)，与错误分支区分。
          */
-        auto found = bbt_co_await coll.FindOne(filter.value(), Budget(5000));
+        auto found = bbt_co_await coll->FindOne(filter.value(), Budget(5000));
         RequireOk(found, "FindOne");
         Require(found.value().has_value(), "FindOne: 插入的文档未命中");
         const mongo::MongoDocument& got = *found.value();
@@ -139,9 +144,9 @@ void Crud(mongo::CoMongoColl& coll, const std::string& id)
         /**
          * 删除并读回：清理属于本示例自己写入的唯一 _id。
          */
-        auto removed = bbt_co_await coll.DeleteOne(filter.value(), Budget(5000));
+        auto removed = bbt_co_await coll->DeleteOne(filter.value(), Budget(5000));
         RequireOk(removed, "DeleteOne");
-        auto miss = bbt_co_await coll.FindOne(filter.value(), Budget(5000));
+        auto miss = bbt_co_await coll->FindOne(filter.value(), Budget(5000));
         RequireOk(miss, "FindOne(after delete)");
 
         /**
@@ -213,16 +218,15 @@ int Run()
     auto completion = std::make_shared<std::promise<void>>();
     auto done = completion->get_future();
     bool registered = false;
-    g_scheduler->RegistCoroutineTask(
-        [coll, completion, id] {
-            try {
-                Crud(*coll, id);
-                completion->set_value();
-            } catch (...) {
-                completion->set_exception(std::current_exception());
-            }
-        },
-        registered);
+    bbtco_noexcept(&registered)[coll, completion, id]
+    {
+        try {
+            Crud(coll, id);
+            completion->set_value();
+        } catch (...) {
+            completion->set_exception(std::current_exception());
+        }
+    };
     int code = 0;
     if (!registered) {
         std::cerr << "coroutine task registration failed\n";
