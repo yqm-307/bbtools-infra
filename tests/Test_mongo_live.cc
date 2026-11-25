@@ -129,12 +129,11 @@ template <class F> bool RunInCoroutine(F&& f, int budget_ms = kBudgetMs)
 {
     bbt::core::thread::CountDownLatch done{1};
     bool succ = false;
-    g_scheduler->RegistCoroutineTask(
-        [fn = std::forward<F>(f), &done]() mutable {
-            fn();
-            done.Down();
-        },
-        succ);
+    bbtco_noexcept(&succ)[fn = std::forward<F>(f), &done]() mutable
+    {
+        fn();
+        done.Down();
+    };
     if (!succ)
         return false;
     return done.WaitTimeout(budget_ms) == 0;
@@ -520,12 +519,11 @@ void CloseAndCheck(const std::shared_ptr<CoMongoCli>& cli)
 template <class State, class Fn> bool RunHeapOp(const std::shared_ptr<State>& st, Fn fn, int budget_ms = kBudgetMs)
 {
     bool started = false;
-    g_scheduler->RegistCoroutineTask(
-        [st, fn]() mutable {
-            fn(*st);
-            st->done.store(true);
-        },
-        started);
+    bbtco_noexcept(&started)[st, fn]() mutable
+    {
+        fn(*st);
+        st->done.store(true);
+    };
     if (!started)
         return false;
     return WaitUntil([&] { return st->done.load(); }, budget_ms);
@@ -771,38 +769,37 @@ BOOST_AUTO_TEST_CASE(t_concurrent_smoke_16)
     const auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < kWorkers; ++i) {
         bool succ = false;
-        g_scheduler->RegistCoroutineTask(
-            [&, i] {
-                const std::string id = "bbt:t:smoke:" + std::to_string(i);
-                const auto doc = JsonDoc("{\"_id\":\"" + id + "\",\"v\":\"payload" + std::to_string(i) + "\"}");
-                const auto filter = JsonDoc("{\"_id\":\"" + id + "\"}");
+        bbtco_noexcept(&succ)[&, i]
+        {
+            const std::string id = "bbt:t:smoke:" + std::to_string(i);
+            const auto doc = JsonDoc("{\"_id\":\"" + id + "\",\"v\":\"payload" + std::to_string(i) + "\"}");
+            const auto filter = JsonDoc("{\"_id\":\"" + id + "\"}");
 
-                /**
-                 * 单请求 deadline ≤3s（docs/decisions/0004-mongo-client-mongocxx-dependency.md 有界上限）。
-                 */
-                auto s = cli->InsertOne(doc, Opt(3000));
-                if (!s) {
+            /**
+             * 单请求 deadline ≤3s（docs/decisions/0004-mongo-client-mongocxx-dependency.md 有界上限）。
+             */
+            auto s = cli->InsertOne(doc, Opt(3000));
+            if (!s) {
+                errors.fetch_add(1);
+            } else {
+                auto g = cli->FindOne(filter, Opt(3000));
+                if (!g) {
                     errors.fetch_add(1);
+                } else if (!g.value().has_value()) {
+                    mismatches.fetch_add(1);
                 } else {
-                    auto g = cli->FindOne(filter, Opt(3000));
-                    if (!g) {
-                        errors.fetch_add(1);
-                    } else if (!g.value().has_value()) {
+                    auto fv = FieldString(*g.value(), "v");
+                    if (!fv || *fv != "payload" + std::to_string(i)) {
                         mismatches.fetch_add(1);
                     } else {
-                        auto fv = FieldString(*g.value(), "v");
-                        if (!fv || *fv != "payload" + std::to_string(i)) {
-                            mismatches.fetch_add(1);
-                        } else {
-                            auto d = cli->DeleteOne(filter, Opt(3000));
-                            if (!d || d.value() != 1u)
-                                errors.fetch_add(1);
-                        }
+                        auto d = cli->DeleteOne(filter, Opt(3000));
+                        if (!d || d.value() != 1u)
+                            errors.fetch_add(1);
                     }
                 }
-                done.fetch_add(1);
-            },
-            succ);
+            }
+            done.fetch_add(1);
+        };
         BOOST_REQUIRE(succ);
     }
     BOOST_REQUIRE(WaitUntil([&] { return done.load() == kWorkers; }, 30000));
@@ -833,15 +830,14 @@ BOOST_AUTO_TEST_CASE(t_close_drains_inflight)
     std::atomic_int settled{0};
     for (int i = 0; i < kOps; ++i) {
         bool succ = false;
-        g_scheduler->RegistCoroutineTask(
-            [&, i] {
-                const std::string id = "bbt:t:drain:" + std::to_string(i);
-                auto r = cli->InsertOne(JsonDoc("{\"_id\":\"" + id + "\"}"), Opt(30000));
-                if (r || r.error().code == ErrorCode::Closed)
-                    settled.fetch_add(1);
-                done.fetch_add(1);
-            },
-            succ);
+        bbtco_noexcept(&succ)[&, i]
+        {
+            const std::string id = "bbt:t:drain:" + std::to_string(i);
+            auto r = cli->InsertOne(JsonDoc("{\"_id\":\"" + id + "\"}"), Opt(30000));
+            if (r || r.error().code == ErrorCode::Closed)
+                settled.fetch_add(1);
+            done.fetch_add(1);
+        };
         BOOST_REQUIRE(succ);
     }
     SleepMs(30);
@@ -926,44 +922,42 @@ BOOST_AUTO_TEST_CASE(t_owner_multi_collection_live)
     std::atomic_int ok{0};
     std::atomic_int errs{0};
     bool s1 = false, s2 = false;
-    g_scheduler->RegistCoroutineTask(
-        [&] {
-            if (bbt_co_await ca->InsertOne(da, Opt(3000))) {
-                auto g = bbt_co_await ca->FindOne(fa, Opt(3000));
-                if (g && g.value().has_value()) {
-                    auto fv = FieldString(*g.value(), "v");
-                    if (fv && *fv == "a")
-                        ok.fetch_add(1);
-                    else
-                        errs.fetch_add(1);
-                } else
-                    errs.fetch_add(1);
-                auto d = bbt_co_await ca->DeleteOne(fa, Opt(3000));
-                if (!d || d.value() != 1u)
+    bbtco_noexcept(&s1)[&]
+    {
+        if (bbt_co_await ca->InsertOne(da, Opt(3000))) {
+            auto g = bbt_co_await ca->FindOne(fa, Opt(3000));
+            if (g && g.value().has_value()) {
+                auto fv = FieldString(*g.value(), "v");
+                if (fv && *fv == "a")
+                    ok.fetch_add(1);
+                else
                     errs.fetch_add(1);
             } else
                 errs.fetch_add(1);
-        },
-        s1);
-    g_scheduler->RegistCoroutineTask(
-        [&] {
-            if (bbt_co_await cb->InsertOne(db_, Opt(3000))) {
-                auto g = bbt_co_await cb->FindOne(fb, Opt(3000));
-                if (g && g.value().has_value()) {
-                    auto fv = FieldString(*g.value(), "v");
-                    if (fv && *fv == "b")
-                        ok.fetch_add(1);
-                    else
-                        errs.fetch_add(1);
-                } else
-                    errs.fetch_add(1);
-                auto d = bbt_co_await cb->DeleteOne(fb, Opt(3000));
-                if (!d || d.value() != 1u)
+            auto d = bbt_co_await ca->DeleteOne(fa, Opt(3000));
+            if (!d || d.value() != 1u)
+                errs.fetch_add(1);
+        } else
+            errs.fetch_add(1);
+    };
+    bbtco_noexcept(&s2)[&]
+    {
+        if (bbt_co_await cb->InsertOne(db_, Opt(3000))) {
+            auto g = bbt_co_await cb->FindOne(fb, Opt(3000));
+            if (g && g.value().has_value()) {
+                auto fv = FieldString(*g.value(), "v");
+                if (fv && *fv == "b")
+                    ok.fetch_add(1);
+                else
                     errs.fetch_add(1);
             } else
                 errs.fetch_add(1);
-        },
-        s2);
+            auto d = bbt_co_await cb->DeleteOne(fb, Opt(3000));
+            if (!d || d.value() != 1u)
+                errs.fetch_add(1);
+        } else
+            errs.fetch_add(1);
+    };
     BOOST_REQUIRE(s1 && s2);
     BOOST_REQUIRE(WaitUntil([&] { return ok.load() == 2; }, 20000));
     BOOST_CHECK_EQUAL(errs.load(), 0);
@@ -1346,18 +1340,17 @@ BOOST_AUTO_TEST_CASE(t_backend_blocked_owner_close_closed)
      * 启动在途 find（长 deadline：只能由 owner Close 结束）。
      */
     bool launched = false;
-    g_scheduler->RegistCoroutineTask(
-        [op, h, rt, flt] {
-            op->out.emplace(bbt_co_await h->FindOne(flt, Opt(30000)));
+    bbtco_noexcept(&launched)[op, h, rt, flt]
+    {
+        op->out.emplace(bbt_co_await h->FindOne(flt, Opt(30000)));
 
-            /**
-             * Closed 逻辑终态交付当刻：driver 仍在执行槽内。
-             */
-            op->inflight_at_return.store(rt->DriverCallsInFlightForTest() == 1);
-            op->t_op_done_ns.store(NowNs());
-            op->done.store(true);
-        },
-        launched);
+        /**
+         * Closed 逻辑终态交付当刻：driver 仍在执行槽内。
+         */
+        op->inflight_at_return.store(rt->DriverCallsInFlightForTest() == 1);
+        op->t_op_done_ns.store(NowNs());
+        op->done.store(true);
+    };
     BOOST_REQUIRE(launched);
 
     /**
@@ -2160,18 +2153,17 @@ BOOST_AUTO_TEST_CASE(t_dp_find_blocked_owner_close)
     mongo::FindOptions fo;
     fo.limit = 1;
     bool launched = false;
-    g_scheduler->RegistCoroutineTask(
-        [op, coll, rt, fo] {
-            op->out.emplace(bbt_co_await coll->Find(MongoDocument{}, fo, Opt(30000)));
+    bbtco_noexcept(&launched)[op, coll, rt, fo]
+    {
+        op->out.emplace(bbt_co_await coll->Find(MongoDocument{}, fo, Opt(30000)));
 
-            /**
-             * Closed 逻辑终态交付当刻：driver 仍在执行槽内。
-             */
-            op->inflight_at_return.store(rt->DriverCallsInFlightForTest() == 1);
-            op->t_op_done_ns.store(NowNs());
-            op->done.store(true);
-        },
-        launched);
+        /**
+         * Closed 逻辑终态交付当刻：driver 仍在执行槽内。
+         */
+        op->inflight_at_return.store(rt->DriverCallsInFlightForTest() == 1);
+        op->t_op_done_ns.store(NowNs());
+        op->done.store(true);
+    };
     BOOST_REQUIRE(launched);
 
     /**

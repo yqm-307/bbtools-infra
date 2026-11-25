@@ -45,6 +45,7 @@ template <class F> auto SubmitCo(F fn) -> std::future<decltype(fn())>
     auto promise = std::make_shared<std::promise<T>>();
     auto future = promise->get_future();
     bool registered = false;
+    // bbt-lint: ignore-next-line coroutine-sugar -- explicit stack size plus registered result has no combined public bbtco form
     g_scheduler->RegistCoroutineTask(
         256 * 1024,
         [promise, callback = std::move(fn)]() mutable {
@@ -132,10 +133,10 @@ struct Assembly {
     ~Assembly()
     {
         if (server) {
-            (void)server->Close(bbt::infra::CloseOptions::Immediate());
+            (void)server->CloseImmediate(bbt::infra::CloseOptions::Immediate());
         }
         if (client) {
-            (void)client->Close(bbt::infra::CloseOptions::Immediate());
+            (void)client->CloseImmediate(bbt::infra::CloseOptions::Immediate());
         }
         (void)engine->Close();
         if (runner.joinable()) {

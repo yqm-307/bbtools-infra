@@ -144,7 +144,8 @@ cmake/                 CMake 模块
 ## 9. 格式、构建与警告
 
 - C++ 格式参数由 `.clang-format` 定义；`.editorconfig` 统一 UTF-8、LF、4 空格缩进和文件末尾换行，Makefile/YAML 例外按需设置。
-- 全仓按 `.clang-format` 格式化（与 `third-party/bbtools-pub/.clang-format` 保持一致，pub 更新时同步拷贝）。全仓格式检查 `bash scripts/ci/check_format.sh` 为本地门禁，版本固定 clang-format 23.1.3；当前 CI 仍只对 PR 改动行运行 `clang-format-diff`，全仓检查尚未接入 CI。全仓格式化变更单独提交，不夹带在功能变更中。
+- 全仓按 `.clang-format` 格式化（与 `third-party/bbtools-pub/.clang-format` 保持一致，pub 更新时同步拷贝）。本地通过 `bash scripts/ci/check_format.sh` 委托 pub 的 `tools/format/format-cpp.py` 只读检查已跟踪的 C/C++ 文件，`--staged` 只读暂存区内容。版本固定 clang-format 23.1.3。当前 CI 仍只对 PR 改动行运行 `clang-format-diff`；全仓格式化变更单独提交，不夹带在功能变更中。
+- 从仓根运行 `python3 -I third-party/bbtools-pub/tools/lint/lint.py --root bbt --config .config/bbt-git-hooks.toml`，只读扫描实现中的协程语法糖候选；将 `--root bbt` 换成 `--root examples` 或 `--root tests` 可单独检查示例或测试。候选需人工核对；退出 `2` 表示扫描不完整或工具错误，不表示检查通过。此规则不接入 Git hook 或 CI。
 - 使用 CMake；不得引入新编译器警告。新模块/测试需接入相应 `CMakeLists.txt`。本地构建并发和验证边界见 `AGENTS.md`，禁止无参数并行构建。
 
 ## 10. CI 骨架

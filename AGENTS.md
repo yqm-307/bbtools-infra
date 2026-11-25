@@ -31,6 +31,9 @@
 
 <!-- omh:agent-instructions:begin -->
 - 执行域、Co-only 入口与存量迁移遵循 [docs/conventions.md](docs/conventions.md) 第十一节；旧示例不得作为新增代码的入口或原生等待先例。
+- **协程 API 与编码规范**：写调用代码时，从 [bbtools-coroutine](https://github.com/yqm-307/bbtools-coroutine) 的 README 文档地图进入，按本次构建实际消费的版本读 `.github/skills/bbtools-coroutine/SKILL.md` 和所需指南。公共入口用 `<bbt/coroutine/coroutine.hpp>`；宏查 `bbt/coroutine/syntax/SyntaxMacro.hpp`，签名和挂起条件查 API 参考与公共头，运行时边界查核心运行时契约。上游 `main` 可供调研，不代表本仓当前构建已支持其 API。
+- **async 写法**：按消费版本的 `docs/guides/async-usage.md`（若无则查 API 参考）选择写法。支持 `bbt_co_return` 时，当前协程内的顺序流程可直接写 `bbt_co_await`，优先用 `bbt_co_return expr;` 返回（旧版按对应指南）；函数体从调用时执行。需要先保存操作、稍后执行或 detached 提交时保留惰性的 `bbt_co_bind`，`bbt_co_fire` 只用于惰性操作。迁移前查调用点是否依赖延迟执行，并核对跨挂起点的数据所有权。
+- **选示例**：应用入口、同步原语与顺序组合优先看上游 `docs/guides/user-guide.md` 的对应场景，再按需读 `examples/`。其中的 `socketpair_adapter` 示例只参考 fd 就绪或外部回调唤醒协程的适配方式，不照搬其中的原生等待、`join` 或内部接口；infra 的入口、执行域与资源收口仍按本仓契约。
 <!-- omh:agent-instructions:end -->
 
 - **adapter 边界**：第三方类型、异常、线程模型不进入公共 API；adapter 负责 I/O、取消/关闭、错误映射与资源寿命，coroutine 只负责运行时等待/唤醒。等待结束、逻辑关闭与物理回收按各模块契约区分。

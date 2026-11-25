@@ -111,6 +111,7 @@ void AcceptLoop(std::shared_ptr<ServerState> server)
         bool registered = false;
         std::weak_ptr<ServerState> weak = server;
         try {
+            // bbt-lint: ignore-next-line coroutine-sugar -- inbound task needs the explicit 128 KiB stack
             g_scheduler->RegistCoroutineTask(
                 128 * 1024,
                 [weak, conn = accepted.connection, conn_id]() mutable {
@@ -473,6 +474,7 @@ result<void> detail::ServerStart(const std::shared_ptr<ServerState>& state)
 
     bool registered = false;
     if (!detail::ConsumeStartRegistrationFailureForTest()) {
+        // bbt-lint: ignore-next-line coroutine-sugar -- accept task needs the explicit 128 KiB stack
         g_scheduler->RegistCoroutineTask(
             128 * 1024,
             [state] {

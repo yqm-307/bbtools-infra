@@ -18,58 +18,25 @@ class FdHandle {
 public:
     FdHandle() = default;
 
-    explicit FdHandle(int fd)
-        : m_fd(fd)
-    {
-    }
+    explicit FdHandle(int fd);
 
-    ~FdHandle()
-    {
-        if (m_fd >= 0) {
-            ::close(m_fd);
-        }
-    }
+    ~FdHandle();
 
     FdHandle(const FdHandle&) = delete;
     FdHandle& operator=(const FdHandle&) = delete;
 
-    FdHandle(FdHandle&& other) noexcept
-        : m_fd(other.m_fd)
-    {
-        other.m_fd = -1;
-    }
+    FdHandle(FdHandle&& other) noexcept;
 
-    FdHandle& operator=(FdHandle&& other) noexcept
-    {
-        if (this != &other) {
-            if (m_fd >= 0) {
-                ::close(m_fd);
-            }
-            m_fd = other.m_fd;
-            other.m_fd = -1;
-        }
-        return *this;
-    }
+    FdHandle& operator=(FdHandle&& other) noexcept;
 
     int Get() const noexcept { return m_fd; }
 
-    int Release() noexcept
-    {
-        const int fd = m_fd;
-        m_fd = -1;
-        return fd;
-    }
+    int Release() noexcept;
 
     /**
      * 显式物理 close 点：责任转移/失败收口前调用，使「记录释放」晚于真实关闭。
      */
-    void Close() noexcept
-    {
-        if (m_fd >= 0) {
-            ::close(m_fd);
-            m_fd = -1;
-        }
-    }
+    void Close() noexcept;
 
 private:
     int m_fd{-1};

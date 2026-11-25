@@ -114,10 +114,10 @@ if(TARGET bbt_infra_mongo)
     # Mongo 新入口 async/await 正负编译门禁（与 tests/redis_net 同规约）：
     # 正例（4 个 CRUD 经 bbt_co_await 消费）必须可编译；负例（漏写 await、
     # 直接按 result 访问）必须被拒绝。只做 -fsyntax-only，不需要后端/链接。
-    # 包含面用显式列表：公开头 + pin 的 coroutine 源码根（源码消费是唯一能通过
-    # pin 核验的路径，故该变量必非空）。
+    # 探针不链接目标，须显式传入 coroutine 公开头依赖的 Boost 路径；
+    # Boost 可以装在编译器默认搜索路径之外。
     file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/mongo-async-includes.txt"
-        CONTENT "${PROJECT_SOURCE_DIR}\n${BBT_COROUTINE_SOURCE_DIR}\n")
+        CONTENT "${PROJECT_SOURCE_DIR}\n${BBT_COROUTINE_SOURCE_DIR}\n$<JOIN:$<TARGET_PROPERTY:Boost::headers,INTERFACE_INCLUDE_DIRECTORIES>,\n>\n")
     add_test(NAME mongo.async_compile COMMAND ${CMAKE_COMMAND}
         "-DCXX=${CMAKE_CXX_COMPILER}"
         "-DINCLUDES=${CMAKE_CURRENT_BINARY_DIR}/mongo-async-includes.txt"

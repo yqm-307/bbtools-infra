@@ -38,20 +38,6 @@ namespace {
 using bbt::infra::Error;
 using bbt::infra::ErrorCode;
 
-std::mutex health_delivery_mutex;
-const Client* health_delivery_client = nullptr;
-std::weak_ptr<HealthDeliveryPause> health_delivery_pause;
-
-std::shared_ptr<HealthDeliveryPause> TakeHealthDeliveryPause(const Client& client)
-{
-    std::lock_guard<std::mutex> lock(health_delivery_mutex);
-    if (health_delivery_client != &client) {
-        return {};
-    }
-    health_delivery_client = nullptr;
-    return std::exchange(health_delivery_pause, {}).lock();
-}
-
 Error InvalidArgument(std::string message)
 {
     return MakeError(ErrorCode::InvalidArgument, "consul: " + std::move(message));
@@ -251,15 +237,6 @@ std::optional<std::uint16_t> PortMember(const boost::json::object& object, std::
 }
 // clang-format on
 
-std::shared_ptr<HealthDeliveryPause> ClientTestAccess::PauseHealthDelivery(const Client& client)
-{
-    auto pause = std::make_shared<HealthDeliveryPause>();
-    std::lock_guard<std::mutex> lock(health_delivery_mutex);
-    health_delivery_client = &client;
-    health_delivery_pause = pause;
-    return pause;
-}
-
 struct Client::State {
     State(std::shared_ptr<bbt::infra::http::Client> client, Options opts)
         : http(std::move(client))
@@ -270,32 +247,13 @@ struct Client::State {
     /**
      * 单次 HTTP 交换：token 头、分阶段超时、总期限在此统一收口，业务路径只给
      * 方法与 target（target 以 '/' 开头的 origin-form）。
+     * 调用方持有 OpScope 并立即等待，保证 HTTP Client 活到交换结束。
      */
     bbt_co_async(result<http::Response>) Send(
         std::string_view method,
         const std::string& target,
         std::string body,
-        std::chrono::milliseconds read_budget) const
-    {
-        http::RequestOptions request;
-        request.headers.emplace_back("Accept", "application/json");
-        if (!options.token.empty()) {
-            request.headers.emplace_back("X-Consul-Token", options.token);
-        }
-        request.SetTimeout(options.request_timeout).SetReadTimeout(read_budget);
-
-        auto prepared = http->BuildRequest(method, base + target, request);
-        if (!prepared) {
-            return result<http::Response>::err(std::move(prepared.error()));
-        }
-        if (!body.empty()) {
-            prepared.value().body = std::move(body);
-            prepared.value().headers.emplace_back("Content-Type", "application/json");
-        }
-        CallOptions call;
-        call.deadline = std::chrono::steady_clock::now() + options.request_timeout;
-        return bbt_co_await http->Send(prepared.value(), call);
-    }
+        std::chrono::milliseconds read_budget) const;
 
     /**
      * 阻塞查询的读档必须容纳 Consul 允许的 wait/16 附加抖动，否则「阻塞返回」
@@ -316,9 +274,16 @@ struct Client::State {
     std::string base;
 
     /**
-     * 保护 inflight/terminal 与协程等待者登记
+     * 保护 inflight/terminal、协程等待者登记及测试交付屏障。
      */
     mutable std::mutex mutex;
+
+    /**
+     * 操作可以比公开句柄活得更久，屏障跟随操作持有的状态。
+     */
+    std::weak_ptr<HealthDeliveryPause> health_delivery_pause;
+
+    std::shared_ptr<HealthDeliveryPause> TakeHealthDeliveryPause();
 
     /**
      * 宿主线程等待真实终态
@@ -436,6 +401,21 @@ struct Client::State {
     }
 };
 
+std::shared_ptr<HealthDeliveryPause> ClientTestAccess::PauseHealthDelivery(const Client& client)
+{
+    auto pause = std::make_shared<HealthDeliveryPause>();
+    const auto& state = client.m_state;
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->health_delivery_pause = pause;
+    return pause;
+}
+
+std::shared_ptr<HealthDeliveryPause> Client::State::TakeHealthDeliveryPause()
+{
+    std::lock_guard<std::mutex> lock(mutex);
+    return std::exchange(health_delivery_pause, {}).lock();
+}
+
 /**
  * 在飞登记：封口后拒绝新操作；析构归还名额，最后一个离开的操作关闭专属 HTTP
  * Client 并发布终态、唤醒 Close 的等待者。状态由 shared_ptr 持有，Close 等待期间
@@ -512,6 +492,30 @@ private:
     bool m_entered{false};
 };
 
+bbt_co_async(result<http::Response>) Client::State::Send(
+    std::string_view method, const std::string& target, std::string body, std::chrono::milliseconds read_budget) const
+{
+    http::RequestOptions request;
+    request.headers.emplace_back("Accept", "application/json");
+    if (!options.token.empty()) {
+        request.headers.emplace_back("X-Consul-Token", options.token);
+    }
+    request.SetTimeout(options.request_timeout).SetReadTimeout(read_budget);
+
+    auto prepared = http->BuildRequest(method, base + target, request);
+    if (!prepared) {
+        bbt_co_return result<http::Response>::err(std::move(prepared.error()));
+    }
+    if (!body.empty()) {
+        prepared.value().body = std::move(body);
+        prepared.value().headers.emplace_back("Content-Type", "application/json");
+    }
+    CallOptions call;
+    call.deadline = std::chrono::steady_clock::now() + options.request_timeout;
+    auto response = bbt_co_await http->Send(prepared.value(), call);
+    bbt_co_return std::move(response);
+}
+
 result<std::shared_ptr<Client>> Client::Create(std::shared_ptr<bbt::infra::http::Client> http, Options options)
 {
     if (!http) {
@@ -554,221 +558,228 @@ Client::~Client() noexcept
 
 bbt_co_async(result<void>) Client::Register(ServiceRegistration registration)
 {
-    OpScope scope(m_state);
-    if (!scope.entered()) {
-        return result<void>::err(scope.error());
-    }
-    const auto& state = scope.state();
-    if (auto valid = ValidateRegistration(registration); !valid) {
-        return scope.Deliver(result<void>::err(std::move(valid.error())));
-    }
-    boost::json::object payload;
-    payload["ID"] = registration.id;
-    payload["Name"] = registration.name;
-    payload["Address"] = registration.address;
-    payload["Port"] = registration.port;
-    boost::json::array tags;
-    for (const auto& tag : registration.tags) {
-        tags.emplace_back(tag);
-    }
-    payload["Tags"] = std::move(tags);
+    return bbt_co_bind([owned_state = m_state, registration = std::move(registration)]() -> result<void> {
+        OpScope scope(owned_state);
+        if (!scope.entered()) {
+            return result<void>::err(scope.error());
+        }
+        const auto& state = scope.state();
+        if (auto valid = ValidateRegistration(registration); !valid) {
+            return scope.Deliver(result<void>::err(std::move(valid.error())));
+        }
+        boost::json::object payload;
+        payload["ID"] = registration.id;
+        payload["Name"] = registration.name;
+        payload["Address"] = registration.address;
+        payload["Port"] = registration.port;
+        boost::json::array tags;
+        for (const auto& tag : registration.tags) {
+            tags.emplace_back(tag);
+        }
+        payload["Tags"] = std::move(tags);
 
-    /**
-     * TCP check 只证明端口可达，不宣称业务 readiness；DeregisterCriticalServiceAfter
-     * 让崩溃进程的登记不会永久残留。
-     */
-    boost::json::object check;
-    check["TCP"] = registration.address + ":" + std::to_string(registration.port);
-    check["Interval"] = "1s";
-    check["Timeout"] = "500ms";
-    check["DeregisterCriticalServiceAfter"] = "1m";
-    payload["Check"] = std::move(check);
+        /**
+         * TCP check 只证明端口可达，不宣称业务 readiness；DeregisterCriticalServiceAfter
+         * 让崩溃进程的登记不会永久残留。
+         */
+        boost::json::object check;
+        check["TCP"] = registration.address + ":" + std::to_string(registration.port);
+        check["Interval"] = "1s";
+        check["Timeout"] = "500ms";
+        check["DeregisterCriticalServiceAfter"] = "1m";
+        payload["Check"] = std::move(check);
 
-    auto response = bbt_co_await state->Send(
-        "PUT", "/v1/agent/service/register", boost::json::serialize(payload), state->options.request_timeout);
-    if (!response) {
-        return scope.Deliver(result<void>::err(std::move(response.error())));
-    }
-    return scope.Deliver(CheckStatus(response.value(), "register"));
+        auto response = bbt_co_await state->Send(
+            "PUT", "/v1/agent/service/register", boost::json::serialize(payload), state->options.request_timeout);
+        if (!response) {
+            return scope.Deliver(result<void>::err(std::move(response.error())));
+        }
+        return scope.Deliver(CheckStatus(response.value(), "register"));
+    });
 }
 
 bbt_co_async(result<void>) Client::Deregister(std::string_view id)
 {
-    OpScope scope(m_state);
-    if (!scope.entered()) {
-        return result<void>::err(scope.error());
-    }
-    if (id.empty()) {
-        return scope.Deliver(result<void>::err(InvalidArgument("deregister id must not be empty")));
-    }
-    const auto& state = scope.state();
-    auto response = bbt_co_await state->Send(
-        "PUT", "/v1/agent/service/deregister/" + PercentEncode(id), std::string{}, state->options.request_timeout);
-    if (!response) {
-        return scope.Deliver(result<void>::err(std::move(response.error())));
-    }
+    return bbt_co_bind([owned_state = m_state, id = std::string(id)]() -> result<void> {
+        OpScope scope(owned_state);
+        if (!scope.entered()) {
+            return result<void>::err(scope.error());
+        }
+        if (id.empty()) {
+            return scope.Deliver(result<void>::err(InvalidArgument("deregister id must not be empty")));
+        }
+        const auto& state = scope.state();
+        auto response = bbt_co_await state->Send(
+            "PUT", "/v1/agent/service/deregister/" + PercentEncode(id), std::string{}, state->options.request_timeout);
+        if (!response) {
+            return scope.Deliver(result<void>::err(std::move(response.error())));
+        }
 
-    /**
-     * agent 对已不存在的 ID 返回 404（实测 1.20.2："Unknown service ID"）。注销的
-     * 语义是「结束登记」，只有 agent 明确返回该 body 才视为目标已不存在；其它 404
-     * 仍是明确拒绝，避免把错误代理/路径误判为幂等成功。
-     */
-    if (response.value().status_code == 404 && response.value().body.find("Unknown service ID") != std::string::npos) {
-        return scope.Deliver(result<void>::ok());
-    }
-    return scope.Deliver(CheckStatus(response.value(), "deregister"));
+        /**
+         * agent 对已不存在的 ID 返回 404（实测 1.20.2："Unknown service ID"）。注销的
+         * 语义是「结束登记」，只有 agent 明确返回该 body 才视为目标已不存在；其它 404
+         * 仍是明确拒绝，避免把错误代理/路径误判为幂等成功。
+         */
+        if (response.value().status_code == 404
+            && response.value().body.find("Unknown service ID") != std::string::npos) {
+            return scope.Deliver(result<void>::ok());
+        }
+        return scope.Deliver(CheckStatus(response.value(), "deregister"));
+    });
 }
 
 bbt_co_async(result<ServiceSnapshot>) Client::HealthyInstances(std::string_view service, std::uint64_t index)
 {
-    OpScope scope(m_state);
-    if (!scope.entered()) {
-        return result<ServiceSnapshot>::err(scope.error());
-    }
-    if (service.empty()) {
-        return scope.Deliver(result<ServiceSnapshot>::err(InvalidArgument("service name must not be empty")));
-    }
-    const auto& state = scope.state();
-    http::QueryParams params;
-    params.emplace_back("passing", "true");
-    if (!state->options.datacenter.empty()) {
-        params.emplace_back("dc", state->options.datacenter);
-    }
-    if (index != 0 && state->options.query_wait > std::chrono::milliseconds{0}) {
-        params.emplace_back("index", std::to_string(index));
-
-        /**
-         * 用 ms 表达 wait：避免秒级取整引入额外 jitter，仍是 Consul 接受的时长。
-         */
-        params.emplace_back("wait", std::to_string(state->options.query_wait.count()) + "ms");
-    }
-    auto target = "/v1/health/service/" + PercentEncode(service);
-    if (!params.empty()) {
-        target.push_back('?');
-        for (std::size_t i = 0; i < params.size(); ++i) {
-            if (i != 0) {
-                target.push_back('&');
-            }
-            target += PercentEncode(params[i].first) + "=" + PercentEncode(params[i].second);
+    return bbt_co_bind([owned_state = m_state, service = std::string(service), index]() -> result<ServiceSnapshot> {
+        OpScope scope(owned_state);
+        if (!scope.entered()) {
+            return result<ServiceSnapshot>::err(scope.error());
         }
-    }
-
-    const bool blocking = index != 0 && state->options.query_wait > std::chrono::milliseconds{0};
-    auto response = bbt_co_await state->Send("GET", target, std::string{}, state->ReadBudgetForQuery(blocking));
-    if (!response) {
-        return scope.Deliver(result<ServiceSnapshot>::err(std::move(response.error())));
-    }
-    /**
-     * 解析只产生候选终态；所有成功/错误统一在 Deliver 与 Immediate 线性化。
-     */
-    auto outcome = [&response, service]() -> result<ServiceSnapshot> {
-        const auto& message = response.value();
-        if (auto ok = CheckStatus(message, "health query"); !ok) {
-            return result<ServiceSnapshot>::err(std::move(ok.error()));
+        if (service.empty()) {
+            return scope.Deliver(result<ServiceSnapshot>::err(InvalidArgument("service name must not be empty")));
         }
-
-        const auto index_header = HeaderValue(message.headers, "X-Consul-Index");
-        if (!index_header || index_header->empty()) {
-            return result<ServiceSnapshot>::err(Protocol("health response missing X-Consul-Index"));
+        const auto& state = scope.state();
+        http::QueryParams params;
+        params.emplace_back("passing", "true");
+        if (!state->options.datacenter.empty()) {
+            params.emplace_back("dc", state->options.datacenter);
         }
-        std::uint64_t revision = 0;
-        const auto parsed_index =
-            std::from_chars(index_header->data(), index_header->data() + index_header->size(), revision);
-        if (parsed_index.ec != std::errc() || parsed_index.ptr != index_header->data() + index_header->size()) {
-            return result<ServiceSnapshot>::err(Protocol("health response has invalid X-Consul-Index"));
-        }
-
-        boost::system::error_code parse_error;
-        const auto document = boost::json::parse(message.body, parse_error);
-        if (parse_error) {
-            return result<ServiceSnapshot>::err(Protocol("health response is not valid json"));
-        }
-        if (!document.is_array()) {
-            return result<ServiceSnapshot>::err(Protocol("health response must be an array"));
-        }
-
-        ServiceSnapshot snapshot;
-        snapshot.index = revision;
-        for (const auto& entry : document.get_array()) {
-            if (!entry.is_object()) {
-                return result<ServiceSnapshot>::err(Protocol("health entry must be an object"));
-            }
-            const auto& object = entry.get_object();
-            const auto* service_value = Member(object, "Service");
-            if (service_value == nullptr || !service_value->is_object()) {
-                return result<ServiceSnapshot>::err(Protocol("health entry missing Service object"));
-            }
-            const auto& service_object = service_value->get_object();
+        if (index != 0 && state->options.query_wait > std::chrono::milliseconds{0}) {
+            params.emplace_back("index", std::to_string(index));
 
             /**
-             * passing=true 由 agent 过滤；这里再核一遍 checks 状态，避免 agent 忽略参数
-             * 时把 critical 实例当成可用目标（判定只是状态串，不重算健康）。
+             * 用 ms 表达 wait：避免秒级取整引入额外 jitter，仍是 Consul 接受的时长。
              */
-            const auto* checks = Member(object, "Checks");
-            if (checks != nullptr) {
-                if (!checks->is_array()) {
-                    return result<ServiceSnapshot>::err(Protocol("health entry Checks must be an array"));
+            params.emplace_back("wait", std::to_string(state->options.query_wait.count()) + "ms");
+        }
+        auto target = "/v1/health/service/" + PercentEncode(service);
+        if (!params.empty()) {
+            target.push_back('?');
+            for (std::size_t i = 0; i < params.size(); ++i) {
+                if (i != 0) {
+                    target.push_back('&');
                 }
-                bool passing = true;
-                for (const auto& check : checks->get_array()) {
-                    if (!check.is_object()) {
-                        return result<ServiceSnapshot>::err(Protocol("health check must be an object"));
-                    }
-                    const auto status = StringMember(check.get_object(), "Status");
-                    if (!status) {
-                        return result<ServiceSnapshot>::err(Protocol("health check missing Status"));
-                    }
-                    if (*status != "passing") {
-                        passing = false;
-                        break;
-                    }
-                }
-                if (!passing) {
-                    continue;
-                }
+                target += PercentEncode(params[i].first) + "=" + PercentEncode(params[i].second);
+            }
+        }
+
+        const bool blocking = index != 0 && state->options.query_wait > std::chrono::milliseconds{0};
+        auto response = bbt_co_await state->Send("GET", target, std::string{}, state->ReadBudgetForQuery(blocking));
+        if (!response) {
+            return scope.Deliver(result<ServiceSnapshot>::err(std::move(response.error())));
+        }
+        /**
+         * 解析只产生候选终态；所有成功/错误统一在 Deliver 与 Immediate 线性化。
+         */
+        auto outcome = [&response, service]() -> result<ServiceSnapshot> {
+            const auto& message = response.value();
+            if (auto ok = CheckStatus(message, "health query"); !ok) {
+                return result<ServiceSnapshot>::err(std::move(ok.error()));
             }
 
-            const auto id = StringMember(service_object, "ID");
-            if (!id || id->empty()) {
-                return result<ServiceSnapshot>::err(Protocol("health entry has empty service ID"));
+            const auto index_header = HeaderValue(message.headers, "X-Consul-Index");
+            if (!index_header || index_header->empty()) {
+                return result<ServiceSnapshot>::err(Protocol("health response missing X-Consul-Index"));
             }
-            const auto port = PortMember(service_object, "Port");
-            if (!port) {
-                return result<ServiceSnapshot>::err(Protocol("health entry has invalid service port"));
+            std::uint64_t revision = 0;
+            const auto parsed_index =
+                std::from_chars(index_header->data(), index_header->data() + index_header->size(), revision);
+            if (parsed_index.ec != std::errc() || parsed_index.ptr != index_header->data() + index_header->size()) {
+                return result<ServiceSnapshot>::err(Protocol("health response has invalid X-Consul-Index"));
             }
-            std::string address;
-            if (const auto declared = StringMember(service_object, "Address"); declared && !declared->empty()) {
-                address = *declared;
-            } else {
-                const auto* node = Member(object, "Node");
-                if (node == nullptr || !node->is_object()) {
-                    return result<ServiceSnapshot>::err(Protocol("health entry missing Node address"));
+
+            boost::system::error_code parse_error;
+            const auto document = boost::json::parse(message.body, parse_error);
+            if (parse_error) {
+                return result<ServiceSnapshot>::err(Protocol("health response is not valid json"));
+            }
+            if (!document.is_array()) {
+                return result<ServiceSnapshot>::err(Protocol("health response must be an array"));
+            }
+
+            ServiceSnapshot snapshot;
+            snapshot.index = revision;
+            for (const auto& entry : document.get_array()) {
+                if (!entry.is_object()) {
+                    return result<ServiceSnapshot>::err(Protocol("health entry must be an object"));
                 }
-                const auto node_address = StringMember(node->get_object(), "Address");
-                if (!node_address || node_address->empty()) {
-                    return result<ServiceSnapshot>::err(Protocol("health entry has no usable address"));
+                const auto& object = entry.get_object();
+                const auto* service_value = Member(object, "Service");
+                if (service_value == nullptr || !service_value->is_object()) {
+                    return result<ServiceSnapshot>::err(Protocol("health entry missing Service object"));
                 }
-                address = *node_address;
+                const auto& service_object = service_value->get_object();
+
+                /**
+                 * passing=true 由 agent 过滤；这里再核一遍 checks 状态，避免 agent 忽略参数
+                 * 时把 critical 实例当成可用目标（判定只是状态串，不重算健康）。
+                 */
+                const auto* checks = Member(object, "Checks");
+                if (checks != nullptr) {
+                    if (!checks->is_array()) {
+                        return result<ServiceSnapshot>::err(Protocol("health entry Checks must be an array"));
+                    }
+                    bool passing = true;
+                    for (const auto& check : checks->get_array()) {
+                        if (!check.is_object()) {
+                            return result<ServiceSnapshot>::err(Protocol("health check must be an object"));
+                        }
+                        const auto status = StringMember(check.get_object(), "Status");
+                        if (!status) {
+                            return result<ServiceSnapshot>::err(Protocol("health check missing Status"));
+                        }
+                        if (*status != "passing") {
+                            passing = false;
+                            break;
+                        }
+                    }
+                    if (!passing) {
+                        continue;
+                    }
+                }
+
+                const auto id = StringMember(service_object, "ID");
+                if (!id || id->empty()) {
+                    return result<ServiceSnapshot>::err(Protocol("health entry has empty service ID"));
+                }
+                const auto port = PortMember(service_object, "Port");
+                if (!port) {
+                    return result<ServiceSnapshot>::err(Protocol("health entry has invalid service port"));
+                }
+                std::string address;
+                if (const auto declared = StringMember(service_object, "Address"); declared && !declared->empty()) {
+                    address = *declared;
+                } else {
+                    const auto* node = Member(object, "Node");
+                    if (node == nullptr || !node->is_object()) {
+                        return result<ServiceSnapshot>::err(Protocol("health entry missing Node address"));
+                    }
+                    const auto node_address = StringMember(node->get_object(), "Address");
+                    if (!node_address || node_address->empty()) {
+                        return result<ServiceSnapshot>::err(Protocol("health entry has no usable address"));
+                    }
+                    address = *node_address;
+                }
+                if (!IsNumericIpv4(address)) {
+                    return result<ServiceSnapshot>::err(Protocol("health entry address is not numeric ipv4"));
+                }
+                Instance instance;
+                instance.id = *id;
+                instance.name = StringMember(service_object, "Service").value_or(std::string(service));
+                instance.address = std::move(address);
+                instance.port = *port;
+                snapshot.instances.push_back(std::move(instance));
             }
-            if (!IsNumericIpv4(address)) {
-                return result<ServiceSnapshot>::err(Protocol("health entry address is not numeric ipv4"));
-            }
-            Instance instance;
-            instance.id = *id;
-            instance.name = StringMember(service_object, "Service").value_or(std::string(service));
-            instance.address = std::move(address);
-            instance.port = *port;
-            snapshot.instances.push_back(std::move(instance));
+            return result<ServiceSnapshot>::ok(std::move(snapshot));
+        }();
+        if (auto pause = state->TakeHealthDeliveryPause()) {
+            pause->reached.store(true, std::memory_order_release);
+            bbt::coroutine::sync::CombinedWaitOptions wait;
+            wait.deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+            (void)pause->resume->Wait(wait);
         }
-        return result<ServiceSnapshot>::ok(std::move(snapshot));
-    }();
-    if (auto pause = TakeHealthDeliveryPause(*this)) {
-        pause->reached.store(true, std::memory_order_release);
-        bbt::coroutine::sync::CombinedWaitOptions wait;
-        wait.deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
-        (void)pause->resume->Wait(wait);
-    }
-    return scope.Deliver(std::move(outcome));
+        return scope.Deliver(std::move(outcome));
+    });
 }
 
 result<void>

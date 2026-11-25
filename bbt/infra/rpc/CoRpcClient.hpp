@@ -126,6 +126,13 @@ public:
     bbt_co_async(result<void>) Close(const CloseOptions& options = {});
 
     /**
+     * @brief 原生控制线程的立即逻辑封口入口。
+     *
+     * 只使用 options.reason，立即封口，不等待物理回收。
+     */
+    result<void> CloseImmediate(const CloseOptions& options = CloseOptions::Immediate());
+
+    /**
      * @brief 查询当前是否已逻辑封口。
      */
     bool IsClosed() const noexcept;

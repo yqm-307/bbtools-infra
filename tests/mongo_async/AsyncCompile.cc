@@ -16,7 +16,7 @@ void Consume(mongo::CoMongoColl& coll, const mongo::MongoDocument& doc, const Ca
 #ifdef BBT_NEGATIVE_ASYNC
 
     /**
-     * 漏写 bbt_co_await：AsyncReturn 没有 result 的 value()，必须编译失败。
+     * 漏写 bbt_co_await：AsyncOperation 没有 result 的 value()，必须编译失败。
      */
     auto pending = coll.FindOne(doc, options);
     pending.value();

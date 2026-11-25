@@ -7,10 +7,10 @@
 ## 固定上游 commit（本 pin）
 
 - 仓库：<https://github.com/yqm-307/bbtools-coroutine>
-- 固定 commit（消费标识）：`dc338e9b0c463a3a2a156b003485c801c2fad60f`
-  （修复挂起回调中的冷栈申请，并包含 StackPool 回归测试）
+- 固定 commit（消费标识）：`d11679b3f034060e7428f3c1b5c86cb902d358e6`
+  （支持无括号的 `bbt_co_return expr;`，保留 `bbt_co_bind` 的惰性执行语义）
 - 语义：显式选择此 pin 时消费不可变 commit，不随 `main` 更新；本地最新模式不声明命中此 pin。
-- 该 commit 来自上游已合入的 [PR #441](https://github.com/yqm-307/bbtools-coroutine/pull/441)。
+- 该 commit 是上游 [PR #450](https://github.com/yqm-307/bbtools-coroutine/pull/450) 合入 `main` 的 merge commit。
   消费落点必须是该 commit 的干净 Git 检出才可称为精确版本消费；上游合入不代表本仓集成验证已完成。
 
 ## 单一 pin 真源
@@ -68,8 +68,10 @@ hex 字符，不做规范化/截断）。本地默认不会读取它：
 
 ## 与历史 provenance 的关系
 
-当前 pin 已从本地候选 `4837cec9e803ebd4250345feb40a748f0afe8c87` 更新为上文的合入版本；下述旧版本仅作历史出处。
+下述旧版本仅作历史出处。
 
+- `82ae91a849da5f2a184291685e960b9f2cc5eb39`（PR #447 merge）引入顺序 async 函数体的 `bbt_co_return(...)`。
+- `e1ab697c70d3a8ac705fb32563c10ea76d2cd376`（PR #443 merge）引入惰性 async 操作；不包含 `bbt_co_return`。
 - `bbtools-coroutine-candidate.provenance.md` 固定的是 `8ae6a889…`（PR #392
   mergeCommit，候选期证明「可脱离未提交差异重建」）；该记录已随 PR #84 合入
   main，是**历史出处**。

@@ -28,32 +28,33 @@ ConnectionPool::ConnectionPool(
 bbt_co_async(result<ConnectionPool::Lease>)
     ConnectionPool::Acquire(const Origin& origin, const net::Address& address, const PhaseDeadlines& deadlines)
 {
-    const auto state = m_state;
-    if (bbt::coroutine::GetLocalCoroutineId() == 0) {
-        return result<Lease>::err(MakeError(ErrorCode::InvalidContext, "http pool: coroutine context required"));
-    }
-    {
-        std::lock_guard<std::mutex> lock(state->mutex);
-        if (state->phase != Phase::Open) {
-            return result<Lease>::err(state->ClosedErrorLocked());
+    return bbt_co_bind([state = m_state, origin = origin, address, deadlines]() -> result<ConnectionPool::Lease> {
+        if (bbt::coroutine::GetLocalCoroutineId() == 0) {
+            return result<Lease>::err(MakeError(ErrorCode::InvalidContext, "http pool: coroutine context required"));
         }
-        ++state->inflight;
-        ++state->operation_tasks[bbt::coroutine::GetLocalCoroutineId()];
-    }
-    auto lease_result = AcquireBody(state, origin, address, deadlines);
-    if (!lease_result) {
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (state->phase != Phase::Open) {
+                return result<Lease>::err(state->ClosedErrorLocked());
+            }
+            ++state->inflight;
+            ++state->operation_tasks[bbt::coroutine::GetLocalCoroutineId()];
+        }
+        auto lease_result = AcquireLease(state, origin, address, deadlines);
+        if (!lease_result) {
 
-        /**
-         * 唯一出口归还本操作的在途名额；成功路径的责任已随租借移交。
-         */
-        std::lock_guard<std::mutex> lock(state->mutex);
-        --state->inflight;
-        auto task = state->operation_tasks.find(bbt::coroutine::GetLocalCoroutineId());
-        if (--task->second == 0)
-            state->operation_tasks.erase(task);
-        state->cv.notify_all();
-    }
-    return lease_result;
+            /**
+             * 唯一出口归还本操作的在途名额；成功路径的责任已随租借移交。
+             */
+            std::lock_guard<std::mutex> lock(state->mutex);
+            --state->inflight;
+            auto task = state->operation_tasks.find(bbt::coroutine::GetLocalCoroutineId());
+            if (--task->second == 0)
+                state->operation_tasks.erase(task);
+            state->cv.notify_all();
+        }
+        return lease_result;
+    });
 }
 
 void ConnectionPool::RequestClose(Error reason) noexcept
@@ -451,7 +452,7 @@ void ConnectionPool::State::SweepLocked()
     }
 }
 
-result<ConnectionPool::Lease> ConnectionPool::AcquireBody(
+result<ConnectionPool::Lease> ConnectionPool::AcquireLease(
     const std::shared_ptr<State>& state,
     const Origin& origin,
     const net::Address& address,

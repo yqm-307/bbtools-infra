@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-25",
+  "commit": "369e312cfbaf926a221883d3ca77717a95f3168c",
+  "base": "a3a203cf625fa18750b7c7235f4e703c72435406",
+  "result": "pass",
+  "reviewer": "独立只读审查子代理（deleg_65b8e6eb/task-0）",
+  "summary": "独立审查通过，无发现；变更限于 Mongo 编译探针的 Boost 头路径，保留正负例及测试元数据。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "核对 Boost::headers 目标、路径分隔，以及正例、负例和测试注册不变。",
+      "evidence": {
+        "reviewer": "独立只读审查子代理（deleg_65b8e6eb/task-0）",
+        "scope": "a3a203cf625fa18750b7c7235f4e703c72435406..369e312cfbaf926a221883d3ca77717a95f3168c，仅 tests/CMakeLists.txt；受审补丁 SHA-256 c4842ca3000e8892a63de3e7abc41a367f6fa6e9eb2e260cfeca856ee18c8ef8。"
+      }
+    }
+  ]
+}

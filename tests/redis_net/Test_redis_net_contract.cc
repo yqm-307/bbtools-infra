@@ -1148,6 +1148,8 @@ int Run(int argc, char** argv)
             HgetallProtocolFaults();
         } else if (name == "close_during_handshake") {
             CloseDuringHandshake();
+        } else if (name == "lazy_command_argument_ownership") {
+            LazyCommandArgumentOwnership();
         } else {
             throw std::runtime_error("unknown case: " + name);
         }

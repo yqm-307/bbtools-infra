@@ -1,5 +1,11 @@
-schema_version = 1
+schema_version = 2
 timeout_seconds = 60
+
+[scan]
+rules = ["coroutine-sugar"]
+
+[commit]
+rules = ["whitespace", "format", "comment-form", "template-layout"]
 
 [push]
 rules = ["review-ticket", "llm-review", "format"]

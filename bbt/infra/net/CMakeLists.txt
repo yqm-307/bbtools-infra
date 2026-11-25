@@ -1,6 +1,6 @@
 add_library(bbt_infra_net STATIC
     CoObject.cc Address.cc NativeSocket.cc LoadBalancing.cc
-    Connection.cc ReclaimReceipt.cc CoTcpConnection.cc detail/CoInternal.cc
+    Connection.cc ReclaimReceipt.cc CoTcpConnection.cc detail/CoInternal.cc detail/EngineSupport.cc
     Engine.cc detail/EngineState.cc detail/Reactor.cc detail/ConnCore.cc
     detail/EngineTestAccess.cc detail/ReactorDriver.cc detail/DriverBinder.cc detail/OptionsNormalize.cc
     detail/TestAccess.cc detail/TestHooks.cc

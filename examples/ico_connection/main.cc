@@ -129,6 +129,7 @@ int main()
     std::atomic<int> server_waitclosed_ok{0};
     auto server_promise = std::make_shared<std::promise<void>>();
     auto server_future = server_promise->get_future();
+    // bbt-lint: ignore-next-line coroutine-sugar -- explicit stack size has no public bbtco equivalent
     g_scheduler->RegistCoroutineTask(
         65536,
         [&] {
@@ -210,6 +211,7 @@ int main()
     std::atomic<int> client_status_ok{0};
     auto client_promise = std::make_shared<std::promise<void>>();
     auto client_future = client_promise->get_future();
+    // bbt-lint: ignore-next-line coroutine-sugar -- explicit stack size has no public bbtco equivalent
     g_scheduler->RegistCoroutineTask(
         65536,
         [&] {

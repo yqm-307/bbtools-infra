@@ -27,7 +27,7 @@ ENABLE_PREPROCESSING   = YES
 # bbt_co_async 必须展开成真实返回类型包装，不能简化成 x，否则成员签名/参数解析失真。
 MACRO_EXPANSION        = YES
 EXPAND_ONLY_PREDEF     = YES
-PREDEFINED             = "bbt_co_async(...)=::bbt::coroutine::detail::AsyncReturn<__VA_ARGS__>" \
+PREDEFINED             = "bbt_co_async(...)=::bbt::coroutine::detail::AsyncOperation<__VA_ARGS__>" \
                          "bbt_co_await="
 
 GENERATE_XML           = YES

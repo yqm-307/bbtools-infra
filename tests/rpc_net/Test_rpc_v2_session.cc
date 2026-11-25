@@ -42,6 +42,7 @@ template <class F> auto SubmitCo(F fn) -> std::future<decltype(fn())>
     auto future = promise->get_future();
     std::function<T()> callback = std::move(fn);
     bool registered = false;
+    // bbt-lint: ignore-next-line coroutine-sugar -- explicit 256 KiB stack; bbtco has no stack-size form
     g_scheduler->RegistCoroutineTask(
         256 * 1024,
         [promise, callback = std::move(callback)]() mutable {
@@ -220,10 +221,10 @@ struct AppHost {
              * Shutdown 是宿主侧同步强制关闭（不挂起、幂等），析构不再等
              * 物理回收——Engine 收口是物理释放的唯一责任方。
              */
-            (void)server->Close(bbt::infra::CloseOptions::Immediate());
+            (void)server->CloseImmediate(bbt::infra::CloseOptions::Immediate());
         }
         if (client) {
-            (void)client->Close(bbt::infra::CloseOptions::Immediate());
+            (void)client->CloseImmediate(bbt::infra::CloseOptions::Immediate());
         }
         (void)engine->Close();
         if (runner.joinable()) {
@@ -342,8 +343,10 @@ void RegisteredRoute()
     AppHost server("route-server");
     std::atomic<bool> entered{false};
     rpc::CoRpcServer::RpcHandler handler = [&entered](rpc::Request request) -> bbt_co_async(result<rpc::Response>) {
-        entered.store(true);
-        return result<rpc::Response>::ok(Echo(request));
+        return bbt_co_bind([&entered, request = std::move(request)]() mutable -> result<rpc::Response> {
+            entered.store(true);
+            return result<rpc::Response>::ok(Echo(request));
+        });
     };
     rpc::CoRpcServer::RouteOptions limit;
     limit.burst_tokens = 1;
@@ -675,8 +678,8 @@ void ServerCrossEngine()
     /**
      * Engine 未 Run：显式收口对象，engine 由本用例归应用侧 RequestClose。
      */
-    (void)same.value()->Close(bbt::infra::CloseOptions::Immediate());
-    (void)client->Close(bbt::infra::CloseOptions::Immediate());
+    (void)same.value()->CloseImmediate(bbt::infra::CloseOptions::Immediate());
+    (void)client->CloseImmediate(bbt::infra::CloseOptions::Immediate());
     (void)engine_a->Close();
     (void)engine_b->Close();
     std::cout << "server cross-engine create rejected ok\n";
@@ -1604,7 +1607,8 @@ void CloseReason()
      * 重复 Close/Shutdown 不覆盖首个原因。
      */
     CHECK(CloseServer(b->server, bbt::infra::CloseOptions::Immediate(MakeError(ErrorCode::TimedOut, "later"))));
-    (void)b->server->Close(bbt::infra::CloseOptions::Immediate(MakeError(ErrorCode::Unavailable, "shutdown later")));
+    (void)b->server->CloseImmediate(
+        bbt::infra::CloseOptions::Immediate(MakeError(ErrorCode::Unavailable, "shutdown later")));
     auto again = b->server->CloseReason();
     CHECK(again.has_value() && again->message == "owner close");
 
@@ -1817,7 +1821,7 @@ void AdmissionSealed()
     /**
      * Shutdown 是宿主侧同步强制关闭：立即停止接纳并封口 admission。
      */
-    (void)b.server->Close(bbt::infra::CloseOptions::Immediate());
+    (void)b.server->CloseImmediate(bbt::infra::CloseOptions::Immediate());
     CHECK(WaitUntil([&] { return b.server->Stats().accepted_connections >= 1; }));
     auto sealed =
         CallCo([&] { return bbt_co_await a.client->Call(b.Target(), MakeCall("sealed", 2, "k"), UntilMs(3s)); });
@@ -2044,7 +2048,7 @@ void ReplyWriteFailClose()
      * 在写未终态时立即封口：Kill 对在写项保留责任（不属排队丢弃），
      * 真实终态由 WriterLoop 的失败路径唯一结算。
      */
-    (void)b->server->Close(bbt::infra::CloseOptions::Immediate());
+    (void)b->server->CloseImmediate(bbt::infra::CloseOptions::Immediate());
     CHECK(WaitUntil([&] { return gate->InFlight() == 0; }));
     const auto result = Get(done);
 
@@ -2155,12 +2159,12 @@ void WriteTerminalOnce()
     for (auto& write : writes) {
         CHECK(write.wait_for(0ms) != std::future_status::ready);
     }
-    (void)b.server->Close(bbt::infra::CloseOptions::Immediate());
+    (void)b.server->CloseImmediate(bbt::infra::CloseOptions::Immediate());
 
     /**
      * 重复封口不再拥有任何队列/写结算责任。
      */
-    (void)b.server->Close(bbt::infra::CloseOptions::Immediate());
+    (void)b.server->CloseImmediate(bbt::infra::CloseOptions::Immediate());
     for (auto& write : writes) {
         const auto result = Get(write);
         CHECK(!result);
@@ -2185,7 +2189,7 @@ void WriteTerminalOnce()
     CHECK(b.client->Stats().service.queued == 0);
     CHECK(b.client->Stats().service.bytes_queued == 0);
     CHECK(b.server->Stats().service.inflight == 0);
-    (void)a.server->Close(bbt::infra::CloseOptions::Immediate());
+    (void)a.server->CloseImmediate(bbt::infra::CloseOptions::Immediate());
     CHECK(CloseTimeoutFor(a.server, 3000));
     CHECK(WaitUntil([&] { return a.engine->CountConnections() == 0 && b.engine->CountConnections() == 0; }));
     CHECK(completed.load() == 3);
@@ -2387,7 +2391,7 @@ void CloseHandshake()
     /**
      * 立即封口：取消握手 Pause，不等待物理收口
      */
-    (void)b->server->Close(bbt::infra::CloseOptions::Immediate());
+    (void)b->server->CloseImmediate(bbt::infra::CloseOptions::Immediate());
     CHECK(b->server->IsClosed());
     CHECK(CloseTimeoutFor(b->server, 3000));
     CHECK(WaitUntil([&] { return gate->InFlight() == 0; }));
@@ -2454,7 +2458,7 @@ void CloseSealedNoPublish()
     /**
      * 立即封口（不等待）
      */
-    (void)b->server->Close(bbt::infra::CloseOptions::Immediate());
+    (void)b->server->CloseImmediate(bbt::infra::CloseOptions::Immediate());
     CHECK(WaitUntil([&] { return gate->InFlight() == 0; }));
     CHECK(WaitUntil(
         [&] {
@@ -3021,7 +3025,7 @@ void NeverStartedDrainClose()
         server, bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::milliseconds(500))));
     const auto first_reason = server->CloseReason();
     CHECK(first_reason.has_value() && first_reason->code == ErrorCode::Closed);
-    (void)server->Close(bbt::infra::CloseOptions::Immediate(MakeError(ErrorCode::TimedOut, "later")));
+    (void)server->CloseImmediate(bbt::infra::CloseOptions::Immediate(MakeError(ErrorCode::TimedOut, "later")));
 
     /**
      * 并发 IsClosed/LocalAddress 与 Close（Start 未发生）同锁读取——
@@ -3038,7 +3042,7 @@ void NeverStartedDrainClose()
             ++reads;
         }
     });
-    (void)server->Close(bbt::infra::CloseOptions::Immediate());
+    (void)server->CloseImmediate(bbt::infra::CloseOptions::Immediate());
     CHECK(server->IsClosed());
     CHECK(server->CloseReason().has_value());
     if (const auto observed = server->CloseReason(); observed) {
@@ -3356,7 +3360,7 @@ void HookPauseCancelClose()
         /**
          * 宿主侧同步强制关闭：不等、不挂起，封口即取消出站握手 Pause。
          */
-        (void)a->client->Close(bbt::infra::CloseOptions::Immediate());
+        (void)a->client->CloseImmediate(bbt::infra::CloseOptions::Immediate());
         const auto result = Get(pending);
         CHECK(!result && result.error().code == ErrorCode::Closed);
         CHECK(WaitUntil([&] {
@@ -3459,7 +3463,7 @@ void ShutdownTimeoutStaysDraining()
         SubmitCo([&] { return bbt_co_await a->client->Call(b->Target(), MakeCall("held", 1, "k"), UntilMs(5s)); });
     CHECK(WaitUntil([&] { return b->calls.load() == 1; }));
 
-    (void)a->client->Close(bbt::infra::CloseOptions::Immediate());
+    (void)a->client->CloseImmediate(bbt::infra::CloseOptions::Immediate());
     CHECK(a->client->IsClosed());
 
     /**
@@ -3488,7 +3492,7 @@ void ShutdownTimeoutStaysDraining()
     /**
      * 幂等且不覆盖首个原因。
      */
-    (void)a->client->Close(bbt::infra::CloseOptions::Immediate(MakeError(ErrorCode::Unavailable, "later")));
+    (void)a->client->CloseImmediate(bbt::infra::CloseOptions::Immediate(MakeError(ErrorCode::Unavailable, "later")));
     CHECK(CloseClient(a->client, bbt::infra::CloseOptions::Immediate()));
     auto again = a->client->CloseReason();
     CHECK(again.has_value() && again->code == ErrorCode::Closed);
@@ -3520,7 +3524,8 @@ void ShutdownInterruptedByClose()
     auto first = b->server->CloseReason();
     CHECK(first.has_value() && first->code == ErrorCode::Closed);
 
-    (void)b->server->Close(bbt::infra::CloseOptions::Immediate(MakeError(ErrorCode::Unavailable, "owner abort")));
+    (void)b->server->CloseImmediate(
+        bbt::infra::CloseOptions::Immediate(MakeError(ErrorCode::Unavailable, "owner abort")));
     const auto closed = Get(graceful);
     CHECK(!closed);
 
@@ -3533,7 +3538,8 @@ void ShutdownInterruptedByClose()
      * 首个原因固定：二次 Close/Shutdown 不覆盖。
      */
     CHECK(CloseServer(b->server, bbt::infra::CloseOptions::Immediate(MakeError(ErrorCode::TimedOut, "later"))));
-    (void)b->server->Close(bbt::infra::CloseOptions::Immediate(MakeError(ErrorCode::Unavailable, "shutdown later")));
+    (void)b->server->CloseImmediate(
+        bbt::infra::CloseOptions::Immediate(MakeError(ErrorCode::Unavailable, "shutdown later")));
     auto observed = b->server->CloseReason();
     CHECK(observed.has_value() && observed->code == ErrorCode::Closed);
 
@@ -3846,18 +3852,23 @@ void CloseSelfWait()
     std::atomic<bool> close_rejected{false};
     std::atomic<bool> wait_rejected{false};
     rpc::CoRpcServer::RpcHandler handler = [&](rpc::Request request) -> bbt_co_async(result<rpc::Response>) {
-        entered.store(true);
-        auto closed = bbt_co_await server_ptr->Close(
-            bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::milliseconds(200)));
-        close_rejected.store(!closed && closed.error().code == ErrorCode::InvalidContext);
-        auto waited = bbt_co_await server_ptr->Close(
-            bbt::infra::CloseOptions{
-                bbt::infra::CloseMode::Immediate,
-                true,
-                {},
-                std::chrono::steady_clock::now() + std::chrono::milliseconds(200)});
-        wait_rejected.store(!waited && waited.error().code == ErrorCode::InvalidContext);
-        return result<rpc::Response>::ok(Echo(request));
+        return bbt_co_bind(
+            [&entered, &close_rejected, &wait_rejected, server_ptr, request = std::move(request)]() mutable
+                -> result<rpc::Response> {
+                entered.store(true);
+                auto closed = bbt_co_await server_ptr->Close(
+                    bbt::infra::CloseOptions::Graceful(
+                        std::chrono::steady_clock::now() + std::chrono::milliseconds(200)));
+                close_rejected.store(!closed && closed.error().code == ErrorCode::InvalidContext);
+                auto waited = bbt_co_await server_ptr->Close(
+                    bbt::infra::CloseOptions{
+                        bbt::infra::CloseMode::Immediate,
+                        true,
+                        {},
+                        std::chrono::steady_clock::now() + std::chrono::milliseconds(200)});
+                wait_rejected.store(!waited && waited.error().code == ErrorCode::InvalidContext);
+                return result<rpc::Response>::ok(Echo(request));
+            });
     };
     CHECK(server.server->RegisterRpc("svc/M", std::move(handler)));
 
@@ -3881,7 +3892,7 @@ void CoStartRoundtrip()
     AppHost server("co-start-server", {}, {}, StartMode::Co);
     AppHost client("co-start-client");
     rpc::CoRpcServer::RpcHandler handler = [](rpc::Request request) -> bbt_co_async(result<rpc::Response>) {
-        return result<rpc::Response>::ok(Echo(request));
+        return bbt_co_bind([=]() -> result<rpc::Response> { return result<rpc::Response>::ok(Echo(request)); });
     };
     CHECK(server.server->RegisterRpc("svc/M", std::move(handler)));
 
@@ -3927,8 +3938,8 @@ void CoStartCloseRace()
     /**
      * 若 Start 持有服务端状态锁，下面的 Close 只能等 Start 走完。
      */
-    auto closer =
-        std::async(std::launch::async, [&] { (void)server.server->Close(bbt::infra::CloseOptions::Immediate()); });
+    auto closer = std::async(
+        std::launch::async, [&] { (void)server.server->CloseImmediate(bbt::infra::CloseOptions::Immediate()); });
     const bool closed_while_registering = closer.wait_for(2s) == std::future_status::ready;
 
     /**
@@ -3967,7 +3978,7 @@ void CoStartRegistrationFailureRollback()
 
     AppHost client("co-rollback-client");
     rpc::CoRpcServer::RpcHandler handler = [](rpc::Request request) -> bbt_co_async(result<rpc::Response>) {
-        return result<rpc::Response>::ok(Echo(request));
+        return bbt_co_bind([=]() -> result<rpc::Response> { return result<rpc::Response>::ok(Echo(request)); });
     };
     CHECK(server.server->RegisterRpc("svc/M", std::move(handler)));
     const auto retried = CallCo([&] { return server.server->Start(); });
@@ -5233,7 +5244,7 @@ void PrivateAttemptCallAutoSwap()
     CHECK(Get(marker));
 
     /** 7. 新连接干净收口：marker 之后无任何补发/重复帧。 */
-    (void)a.client->Close(bbt::infra::CloseOptions::Immediate());
+    (void)a.client->CloseImmediate(bbt::infra::CloseOptions::Immediate());
     CHECK(WaitUntil([&] { return a.engine->CountConnections() == 0; }, 5s));
     const bool new_link_closed_without_traffic = dialer->Eof();
     CHECK(new_link_closed_without_traffic);
@@ -5291,7 +5302,7 @@ void PrivateAttemptSendAutoSwap()
     SendReplyOnPeer(*dialer, marker_frame, 2);
     CHECK(Get(marker));
 
-    (void)a.client->Close(bbt::infra::CloseOptions::Immediate());
+    (void)a.client->CloseImmediate(bbt::infra::CloseOptions::Immediate());
     CHECK(WaitUntil([&] { return a.engine->CountConnections() == 0; }, 5s));
     const bool new_link_closed_without_traffic = dialer->Eof();
     CHECK(new_link_closed_without_traffic);
@@ -5351,7 +5362,7 @@ void PrivateAttemptExplicitTicketSwap()
     SendReplyOnPeer(*dialer, marker_frame, 2);
     CHECK(Get(marker));
 
-    (void)a.client->Close(bbt::infra::CloseOptions::Immediate());
+    (void)a.client->CloseImmediate(bbt::infra::CloseOptions::Immediate());
     CHECK(WaitUntil([&] { return a.engine->CountConnections() == 0; }, 5s));
     const bool new_link_closed_without_traffic = dialer->Eof();
     CHECK(new_link_closed_without_traffic);

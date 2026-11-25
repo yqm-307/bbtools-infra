@@ -102,6 +102,7 @@ static std::future<void> Task(std::function<void()> callback)
 {
     auto promise = std::make_shared<std::promise<void>>();
     auto future = promise->get_future();
+    // bbt-lint: ignore-next-line coroutine-sugar -- explicit 64 KiB stack; bbtco has no stack-size form
     g_scheduler->RegistCoroutineTask(
         65536,
         [promise, callback] {

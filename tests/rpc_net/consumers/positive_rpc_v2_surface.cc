@@ -36,7 +36,9 @@ bbt::infra::result<void> Admit(bbt::infra::rpc::AdmissionItem&& item)
 bbt::infra::rpc::CoRpcServer::RpcHandler Route()
 {
     return [](bbt::infra::rpc::Request request) -> bbt_co_async(bbt::infra::result<bbt::infra::rpc::Response>) {
-        return bbt::infra::result<bbt::infra::rpc::Response>::ok(bbt::infra::rpc::Response::FromRequest(request));
+        return bbt_co_bind([=]() -> bbt::infra::result<bbt::infra::rpc::Response> {
+            return bbt::infra::result<bbt::infra::rpc::Response>::ok(bbt::infra::rpc::Response::FromRequest(request));
+        });
     };
 }
 

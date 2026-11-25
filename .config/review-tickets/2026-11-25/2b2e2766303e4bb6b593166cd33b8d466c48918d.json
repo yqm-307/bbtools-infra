@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-25",
+  "commit": "2b2e2766303e4bb6b593166cd33b8d466c48918d",
+  "base": "dd3dd4a2a14d41e254cfe3fca0ec01c2545855e8",
+  "result": "pass",
+  "reviewer": "独立只读审查子代理（deleg_d0b701ba/task-0、deleg_57d1658f/task-0）",
+  "summary": "首轮核对操作所有权、等待与关闭契约，唯一 P1 经固定版本的子模块对象及干净检出定点复核确认不成立；两轮使用同一候选。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "核对 HTTP、RPC、Redis、Consul 的惰性操作与状态持有链、Redis 参数所有权、RPC 两端立即封口，以及固定 pub 版本的可重建格式门禁；未将句柄销毁后的专项动态回归或不完整的词法扫描记为通过。",
+      "evidence": {
+        "reviewer": "首轮独立审查 deleg_d0b701ba/task-0；唯一格式 finding 的独立定点复核 deleg_57d1658f/task-0",
+        "scope": "代码范围 dd3dd4a2a14d41e254cfe3fca0ec01c2545855e8..2b2e2766303e4bb6b593166cd33b8d466c48918d；受审树 635f123e2b86fb224d53effb05aae329cb48cd2b；补丁 SHA-256 d932aa0282aaa2403d2b662c120ab0ce9af3bc472012139c60799e74590ba520。"
+      }
+    }
+  ]
+}

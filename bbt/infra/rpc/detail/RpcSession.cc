@@ -39,6 +39,7 @@ bool SessionCore::Submit(std::size_t stack, std::function<void()> fn)
     responsibilities.fetch_add(1);
     bool registered = false;
     try {
+        // bbt-lint: ignore-next-line coroutine-sugar -- session tasks use the caller-selected stack size
         g_scheduler->RegistCoroutineTask(
             stack,
             [session, fn = std::move(fn)]() mutable {

@@ -129,6 +129,7 @@ int main()
     };
     auto promise = std::make_shared<std::promise<void>>();
     auto future = promise->get_future();
+    // bbt-lint: ignore-next-line coroutine-sugar -- explicit stack size has no public bbtco equivalent
     g_scheduler->RegistCoroutineTask(
         65536,
         [promise, server_task] {

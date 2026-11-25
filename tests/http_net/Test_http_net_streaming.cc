@@ -136,34 +136,39 @@ public:
 
     bbt_co_async(result<http::StreamStart>) Start(const bbt::coroutine::WaitOptions&) override
     {
-        ++starts;
-        return result<http::StreamStart>::ok(start);
+        return bbt_co_bind([=]() -> result<http::StreamStart> {
+            ++starts;
+            return result<http::StreamStart>::ok(start);
+        });
     }
 
     bbt_co_async(result<std::optional<std::string>>) Next(const bbt::coroutine::WaitOptions& options) override
     {
-        const auto index = nexts.fetch_add(1);
-        if (index >= steps.size()) {
-            return result<std::optional<std::string>>::ok(std::optional<std::string>{});
-        }
-        const auto& step = steps[index];
-        switch (step.kind) {
-        case Step::Kind::Chunk:
-            return result<std::optional<std::string>>::ok(std::optional<std::string>{step.data});
-        case Step::Kind::Eof:
-            return result<std::optional<std::string>>::ok(std::optional<std::string>{});
-        case Step::Kind::Error:
-            return result<std::optional<std::string>>::err(MakeError(step.code, "source error"));
-        case Step::Kind::Pause: {
-            ++pauses;
-            const auto status = release->WaitWithCallback(options, [] { return true; });
-            if (status == bbt::coroutine::WaitStatus::TimedOut || status == bbt::coroutine::WaitStatus::Cancelled) {
-                return result<std::optional<std::string>>::err(MakeError(ErrorCode::TimedOut, "source wait expired"));
+        return bbt_co_bind([=]() -> result<std::optional<std::string>> {
+            const auto index = nexts.fetch_add(1);
+            if (index >= steps.size()) {
+                return result<std::optional<std::string>>::ok(std::optional<std::string>{});
             }
-            return result<std::optional<std::string>>::ok(std::optional<std::string>{step.data});
-        }
-        }
-        return result<std::optional<std::string>>::err(MakeError(ErrorCode::InternalError, "unreachable"));
+            const auto& step = steps[index];
+            switch (step.kind) {
+            case Step::Kind::Chunk:
+                return result<std::optional<std::string>>::ok(std::optional<std::string>{step.data});
+            case Step::Kind::Eof:
+                return result<std::optional<std::string>>::ok(std::optional<std::string>{});
+            case Step::Kind::Error:
+                return result<std::optional<std::string>>::err(MakeError(step.code, "source error"));
+            case Step::Kind::Pause: {
+                ++pauses;
+                const auto status = release->WaitWithCallback(options, [] { return true; });
+                if (status == bbt::coroutine::WaitStatus::TimedOut || status == bbt::coroutine::WaitStatus::Cancelled) {
+                    return result<std::optional<std::string>>::err(
+                        MakeError(ErrorCode::TimedOut, "source wait expired"));
+                }
+                return result<std::optional<std::string>>::ok(std::optional<std::string>{step.data});
+            }
+            }
+            return result<std::optional<std::string>>::err(MakeError(ErrorCode::InternalError, "unreachable"));
+        });
     }
 
     void Cancel() noexcept override
@@ -475,14 +480,18 @@ public:
 
     bbt_co_async(result<http::StreamStart>) Start(const bbt::coroutine::WaitOptions&) override
     {
-        ++m_inner->starts;
-        return result<http::StreamStart>::err(MakeError(ErrorCode::InternalError, "start failed"));
+        return bbt_co_bind([=]() -> result<http::StreamStart> {
+            ++m_inner->starts;
+            return result<http::StreamStart>::err(MakeError(ErrorCode::InternalError, "start failed"));
+        });
     }
 
     bbt_co_async(result<std::optional<std::string>>) Next(const bbt::coroutine::WaitOptions&) override
     {
-        ++m_inner->nexts;
-        return result<std::optional<std::string>>::err(MakeError(ErrorCode::InternalError, "must not reach"));
+        return bbt_co_bind([=]() -> result<std::optional<std::string>> {
+            ++m_inner->nexts;
+            return result<std::optional<std::string>>::err(MakeError(ErrorCode::InternalError, "must not reach"));
+        });
     }
 
     void Cancel() noexcept override { ++m_inner->cancels; }
@@ -701,17 +710,21 @@ void StartDeadline()
 
         bbt_co_async(result<http::StreamStart>) Start(const bbt::coroutine::WaitOptions& options) override
         {
-            const auto status = release->WaitWithCallback(options, [] { return true; });
-            if (status == bbt::coroutine::WaitStatus::TimedOut) {
-                return result<http::StreamStart>::err(MakeError(ErrorCode::TimedOut, "start expired"));
-            }
-            return result<http::StreamStart>::ok(
-                http::StreamStart{http::StreamStart::Mode::Chunked, 200, {}, {}, "late"});
+            return bbt_co_bind([=]() -> result<http::StreamStart> {
+                const auto status = release->WaitWithCallback(options, [] { return true; });
+                if (status == bbt::coroutine::WaitStatus::TimedOut) {
+                    return result<http::StreamStart>::err(MakeError(ErrorCode::TimedOut, "start expired"));
+                }
+                return result<http::StreamStart>::ok(
+                    http::StreamStart{http::StreamStart::Mode::Chunked, 200, {}, {}, "late"});
+            });
         }
 
         bbt_co_async(result<std::optional<std::string>>) Next(const bbt::coroutine::WaitOptions&) override
         {
-            return result<std::optional<std::string>>::ok(std::optional<std::string>{});
+            return bbt_co_bind([=]() -> result<std::optional<std::string>> {
+                return result<std::optional<std::string>>::ok(std::optional<std::string>{});
+            });
         }
 
         void Cancel() noexcept override

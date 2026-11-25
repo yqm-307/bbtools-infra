@@ -52,46 +52,16 @@ using RpcClock = std::chrono::steady_clock;
  */
 inline constexpr std::size_t kLaneCount = 3;
 
-inline std::size_t LaneIndex(TrafficClass traffic) noexcept
-{
-    switch (traffic) {
-    case TrafficClass::System:
-        return 0;
-    case TrafficClass::Service:
-        return 1;
-    case TrafficClass::Actor:
-        return 2;
-    }
-    return 1;
-}
+std::size_t LaneIndex(TrafficClass traffic) noexcept;
 
-inline Error Err(ErrorCode code, std::string message)
-{
-    return MakeError(code, "rpc session: " + std::move(message));
-}
+Error Err(ErrorCode code, std::string message);
 
-inline result<void> ErrV(ErrorCode code, std::string message)
-{
-    return result<void>::err(Err(code, std::move(message)));
-}
+result<void> ErrV(ErrorCode code, std::string message);
 
-inline Error ErrPhase(ErrorCode code, std::string message, RequestPhase phase)
-{
-    auto error = Err(code, std::move(message));
-    error.request_phase = phase;
-    return error;
-}
+Error ErrPhase(ErrorCode code, std::string message, RequestPhase phase);
 
 template <class Table, class Pending>
-bool ErasePending(Table& table, const std::string& key, const std::shared_ptr<Pending>& operation)
-{
-    const auto it = table.find(key);
-    if (it != table.end() && it->second == operation) {
-        table.erase(it);
-        return true;
-    }
-    return false;
-}
+bool ErasePending(Table& table, const std::string& key, const std::shared_ptr<Pending>& operation);
 
 Error WaitFailure(bbt::coroutine::WaitStatus status, const char* message);
 
@@ -638,3 +608,5 @@ void ServeInbound(std::shared_ptr<ServerState> server, detail::TcpChannel channe
 // clang-format off
 }
 // clang-format on
+
+#include <bbt/infra/rpc/detail/__TRpcSessionState.hpp>

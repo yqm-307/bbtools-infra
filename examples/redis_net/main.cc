@@ -89,6 +89,7 @@ void RunSingleConnection(std::shared_ptr<net::Engine> engine, const net::Address
     /**
      * 宿主登记唯一 API 任务；完成信号前释放捕获，不再访问 adapter。
      */
+    // bbt-lint: ignore-next-line coroutine-sugar -- explicit stack size plus registered result has no combined public bbtco form
     g_scheduler->RegistCoroutineTask(
         128 * 1024,
         [client, key, completion]() mutable {
@@ -167,6 +168,8 @@ void RunPool(std::shared_ptr<net::Engine> engine, const net::Address& address)
     bool registered = false;
     auto completion = std::make_shared<std::promise<void>>();
     auto done = completion->get_future().share();
+
+    // bbt-lint: ignore-next-line coroutine-sugar -- explicit stack size plus registered result has no combined public bbtco form
     g_scheduler->RegistCoroutineTask(
         128 * 1024,
         [pool, key, completion]() mutable {

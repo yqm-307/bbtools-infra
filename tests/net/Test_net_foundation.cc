@@ -526,6 +526,7 @@ static void Context()
     CHECK(object->RequireCoroutine() == std::errc::operation_not_permitted);
     auto promise = std::make_shared<std::promise<std::uint64_t>>();
     auto future = promise->get_future();
+    // bbt-lint: ignore-next-line coroutine-sugar -- explicit 64 KiB stack; bbtco has no stack-size form
     g_scheduler->RegistCoroutineTask(
         65536,
         [object, promise] {
@@ -619,6 +620,7 @@ static void NativeAcceptConnect()
     auto client_go = std::make_shared<std::promise<void>>();
     auto accepted_promise = std::make_shared<std::promise<int>>();
     auto probe_promise = std::make_shared<std::promise<bool>>();
+    // bbt-lint: ignore-next-line coroutine-sugar -- explicit 64 KiB stack; bbtco has no stack-size form
     g_scheduler->RegistCoroutineTask(
         65536,
         [&, client_go, accepted_promise] {
@@ -684,6 +686,7 @@ static void NativeAcceptConnect()
             }
         },
         "net.native_accept_connect");
+    // bbt-lint: ignore-next-line coroutine-sugar -- explicit 64 KiB stack; bbtco has no stack-size form
     g_scheduler->RegistCoroutineTask(
         65536,
         [probe_promise] {

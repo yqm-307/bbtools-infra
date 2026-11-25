@@ -47,6 +47,23 @@
 
 namespace bbt::infra::net {
 
+std::unique_lock<std::mutex> EngineControl::Lock() const
+{
+    return std::unique_lock<std::mutex>(m_mutex);
+}
+
+void EngineImpl::RemoveConnection()
+{
+    if (conn_count.load() > 0)
+        conn_count.fetch_sub(1);
+}
+
+void EngineImpl::InvokeHook(HookPoint point) const
+{
+    if (test_hooks)
+        test_hooks->Invoke(point);
+}
+
 std::error_code Engine::InjectDriverFailureForTest()
 {
     return m_impl->InjectDriverFailureForTest();

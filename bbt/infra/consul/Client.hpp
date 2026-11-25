@@ -240,6 +240,8 @@ public:
     bool IsClosed() const noexcept;
 
 private:
+    friend struct ClientTestAccess;
+
     void _BeginClose(
         Error reason = MakeError(ErrorCode::Closed, "consul: client closed by owner"), bool immediate = true) noexcept;
     result<void> _WaitReleased(bbt::coroutine::Deadline deadline);

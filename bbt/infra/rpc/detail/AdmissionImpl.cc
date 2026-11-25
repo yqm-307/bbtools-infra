@@ -4,6 +4,7 @@
  * 接缝。impl 类型见 detail/RpcSessionState.hpp；会话内使用点（reader 的
  * AdmitInbound/拒绝路径）在 detail/RpcSession.cc。
  */
+#include <bbt/coroutine/syntax/SyntaxMacro.hpp>
 #include <bbt/infra/rpc/Admission.hpp>
 #include <bbt/infra/rpc/detail/RpcSessionState.hpp>
 #include <bbt/infra/rpc/detail/Session.hpp>
@@ -42,6 +43,14 @@ struct OpenReplyGuard {
         }
     }
 };
+
+/**
+ * Complete 延迟体：终态唯一结算 + Response 关联校验 + 回复入队与写终态等待。
+ */
+
+/**
+ * Fail 延迟体：终态唯一结算 + 错误帧入队与写终态等待，语义同 Complete。
+ */
 
 // clang-format off
 }
@@ -114,7 +123,7 @@ void AdmissionWorker(std::shared_ptr<detail::AdmissionQueueImpl> impl)
                  * Send + RequireRemoteAcceptance：mailbox 接纳成功由 infra
                  * 写一次 SendAccepted 终态；Complete({}) 产成功确认。
                  */
-                (void)reply->Complete(Response{});
+                (void)(bbt_co_await reply->Complete(Response{}));
             }
             if (!is_call && lease) {
 
@@ -137,7 +146,7 @@ void AdmissionWorker(std::shared_ptr<detail::AdmissionQueueImpl> impl)
         if (reply && !reply->IsTerminal()) {
             auto error = handled.error();
             if (reply->ForSendAcceptance() || is_call) {
-                (void)reply->Fail(std::move(error));
+                (void)(bbt_co_await reply->Fail(std::move(error)));
             }
         }
 
@@ -173,6 +182,7 @@ AdmissionQueue::Create(std::size_t max_items, std::size_t max_bytes, AdmissionHa
     impl->max_bytes = max_bytes;
     impl->handler = std::move(handler);
     bool registered = false;
+    // bbt-lint: ignore-next-line coroutine-sugar -- admission worker needs the explicit 128 KiB stack
     g_scheduler->RegistCoroutineTask(128 * 1024, [impl] { AdmissionWorker(impl); }, registered);
     if (!registered) {
         return R::err(Err(ErrorCode::RuntimeUnavailable, "admission worker registration failed"));
@@ -313,201 +323,203 @@ std::uint64_t AdmissionQueue::BytesQueued(std::size_t lane) const noexcept
  */
 bbt_co_async(result<void>) ReplyCompletion::Complete(Response response)
 {
-    auto impl = m_impl;
-    if (!impl) {
-        return ErrV(ErrorCode::InvalidArgument, "reply completion invalid");
-    }
-
-    /**
-     * 契约要求受管协程挂起等写终态；非协程调用在 terminal/入队等任何
-     * 副作用前拒绝——「无法等待」不得伪报成写成功（写责任唯一结算由
-     * infra 完成，本条不产生任何写责任）。
-     */
-    if (!g_bbt_tls_coroutine_co) {
-        return ErrV(ErrorCode::InvalidContext, "reply completion requires coroutine context");
-    }
-    if (impl->terminal.exchange(true)) {
-        return ErrV(ErrorCode::InvalidArgument, "reply completion already terminal");
-    }
-    OpenReplyGuard reply_guard{impl->server};
-    auto session = impl->session.lock();
-    if (!session || session->dead.load()) {
-        return ErrV(ErrorCode::Closed, "session closed before reply");
-    }
-    const auto write_deadline = impl->reply_deadline;
-
-    /**
-     * 回复写窗口已过：迟到回复对调用方已无交付意义，且把过期期限交给共享
-     * stream 会在接纳后超时并把整条 link 退役。只发布本条终态，不产生写责任。
-     */
-    if (write_deadline != RpcClock::time_point::max() && write_deadline <= RpcClock::now()) {
-        return ErrV(ErrorCode::TimedOut, "reply deadline expired before write");
-    }
-    SessionFrame frame;
-    frame.session_epoch = session->epoch;
-    frame.has_outcome = true;
-    frame.success = true;
-    if (impl->kind == FrameKind::SendAccepted) {
-        frame.kind = FrameKind::SendAccepted;
-        frame.traffic = TrafficClass::System;
-        frame.message_id = impl->message_id;
-    } else {
+    return bbt_co_bind([impl = m_impl, response = std::move(response)]() mutable -> result<void> {
+        if (!impl) {
+            return ErrV(ErrorCode::InvalidArgument, "reply completion invalid");
+        }
 
         /**
-         * Response 关联字段必须与 Request 一致（ADR §2.4）；不一致
-         * ProtocolError 并改写为错误终态，不让 handler 改写他人回复。
+         * 契约要求受管协程挂起等写终态；非协程调用在 terminal/入队等任何
+         * 副作用前拒绝——「无法等待」不得伪报成写成功（写责任唯一结算由
+         * infra 完成，本条不产生任何写责任）。
          */
-        if (response.RequestId() != impl->request_id || response.Service() != impl->service
-            || response.Method() != impl->method || response.RequestSchema() != impl->request_schema
-            || response.ResponseSchema() != impl->response_schema) {
+        if (!g_bbt_tls_coroutine_co) {
+            return ErrV(ErrorCode::InvalidContext, "reply completion requires coroutine context");
+        }
+        if (impl->terminal.exchange(true)) {
+            return ErrV(ErrorCode::InvalidArgument, "reply completion already terminal");
+        }
+        OpenReplyGuard reply_guard{impl->server};
+        auto session = impl->session.lock();
+        if (!session || session->dead.load()) {
+            return ErrV(ErrorCode::Closed, "session closed before reply");
+        }
+        const auto write_deadline = impl->reply_deadline;
+
+        /**
+         * 回复写窗口已过：迟到回复对调用方已无交付意义，且把过期期限交给共享
+         * stream 会在接纳后超时并把整条 link 退役。只发布本条终态，不产生写责任。
+         */
+        if (write_deadline != RpcClock::time_point::max() && write_deadline <= RpcClock::now()) {
+            return ErrV(ErrorCode::TimedOut, "reply deadline expired before write");
+        }
+        SessionFrame frame;
+        frame.session_epoch = session->epoch;
+        frame.has_outcome = true;
+        frame.success = true;
+        if (impl->kind == FrameKind::SendAccepted) {
+            frame.kind = FrameKind::SendAccepted;
+            frame.traffic = TrafficClass::System;
+            frame.message_id = impl->message_id;
+        } else {
+
+            /**
+             * Response 关联字段必须与 Request 一致（ADR §2.4）；不一致
+             * ProtocolError 并改写为错误终态，不让 handler 改写他人回复。
+             */
+            if (response.RequestId() != impl->request_id || response.Service() != impl->service
+                || response.Method() != impl->method || response.RequestSchema() != impl->request_schema
+                || response.ResponseSchema() != impl->response_schema) {
+                frame.kind = FrameKind::Response;
+                frame.traffic = impl->lane;
+                frame.reply = ReplyMode::Required;
+                frame.request_id = impl->request_id;
+                frame.service = impl->service;
+                frame.method = impl->method;
+                frame.request_schema = impl->request_schema;
+                frame.response_schema = impl->response_schema;
+                frame.success = false;
+                frame.error = Err(ErrorCode::ProtocolError, "response correlation mismatch");
+                auto bytes = EncodeFramedSessionFrame(frame, session->owner->options.MaxFrameBytes());
+                if (bytes) {
+                    SessionCore::OutItem item;
+                    item.bytes.assign(reinterpret_cast<const char*>(bytes.value().data()), bytes.value().size());
+                    item.lane = impl->lane;
+                    item.deadline = write_deadline;
+                    item.settle = std::make_shared<SessionCore::OutItem::Settle>();
+                    auto settle = item.settle;
+
+                    /**
+                     * 关联错误终态同样是一条真实写责任：入队失败写责任从未
+                     * 产生（Enqueue 只在成功时 +1）；入队成功则等真实写终态
+                     * 再返回，写责任如实计入排空。
+                     */
+                    auto enqueued = session->Enqueue(std::move(item));
+                    if (enqueued) {
+                        const auto wait_deadline = write_deadline == RpcClock::time_point::max()
+                                                       ? RpcClock::now() + 30s
+                                                       : std::min(write_deadline, RpcClock::now() + 30s);
+                        (void)settle->Wait(wait_deadline);
+                    }
+                }
+
+                /**
+                 * 调用方面前始终保留 ProtocolError 语义（关联违规的判定，
+                 * 不描述写终态本身）。
+                 */
+                return ErrV(ErrorCode::ProtocolError, "response correlation mismatch");
+            }
+            auto built = ResponseToSessionFrame(response, session->epoch);
+            if (!built) {
+                return result<void>::err(built.error());
+            }
+            frame = std::move(built.value());
+            frame.traffic = impl->lane;
+        }
+        auto bytes = EncodeFramedSessionFrame(frame, session->owner->options.MaxFrameBytes());
+        if (!bytes) {
+            return result<void>::err(bytes.error());
+        }
+        SessionCore::OutItem item;
+        item.bytes.assign(reinterpret_cast<const char*>(bytes.value().data()), bytes.value().size());
+        item.lane = frame.traffic;
+        item.deadline = write_deadline;
+        item.settle = std::make_shared<SessionCore::OutItem::Settle>();
+        auto settle = item.settle;
+        auto enqueued = session->Enqueue(std::move(item));
+        if (!enqueued) {
+            return enqueued;
+        }
+
+        /**
+         * Complete 的成功终态对应 socket 真实写终态：等到 WriterLoop 结算
+         * 而非入队即返回。等待与入队共用请求的有限预算（无界时封顶 30s），
+         * 不另起计时。
+         */
+        const auto wait_deadline = write_deadline == RpcClock::time_point::max()
+                                       ? RpcClock::now() + 30s
+                                       : std::min(write_deadline, RpcClock::now() + 30s);
+        return settle->Wait(wait_deadline);
+    });
+}
+
+bbt_co_async(result<void>) ReplyCompletion::Fail(Error error)
+{
+    return bbt_co_bind([impl = m_impl, error = std::move(error)]() mutable -> result<void> {
+        if (!impl) {
+            return ErrV(ErrorCode::InvalidArgument, "reply completion invalid");
+        }
+        if (!g_bbt_tls_coroutine_co) {
+            return ErrV(ErrorCode::InvalidContext, "reply completion requires coroutine context");
+        }
+        if (impl->terminal.exchange(true)) {
+            return ErrV(ErrorCode::InvalidArgument, "reply completion already terminal");
+        }
+        OpenReplyGuard reply_guard{impl->server};
+        auto session = impl->session.lock();
+        if (!session || session->dead.load()) {
+            return ErrV(ErrorCode::Closed, "session closed before reply");
+        }
+        const auto write_deadline = impl->reply_deadline;
+
+        /**
+         * 回复写窗口已过：迟到回复对调用方已无交付意义，且把过期期限交给共享
+         * stream 会在接纳后超时并把整条 link 退役。只发布本条终态，不产生写责任。
+         */
+        if (write_deadline != RpcClock::time_point::max() && write_deadline <= RpcClock::now()) {
+            return ErrV(ErrorCode::TimedOut, "reply deadline expired before write");
+        }
+        SessionFrame frame;
+        frame.session_epoch = session->epoch;
+        frame.has_outcome = true;
+        frame.success = false;
+        frame.error = std::move(error);
+
+        /**
+         * wire 约束：Call/Response 必 Required
+         */
+        frame.reply = ReplyMode::Required;
+        if (impl->kind == FrameKind::SendAccepted) {
+            frame.kind = FrameKind::SendAccepted;
+            frame.traffic = TrafficClass::System;
+            frame.message_id = impl->message_id;
+
+            /**
+             * 非 Call/Response kind 必 None
+             */
+            frame.reply = ReplyMode::None;
+        } else {
             frame.kind = FrameKind::Response;
             frame.traffic = impl->lane;
-            frame.reply = ReplyMode::Required;
             frame.request_id = impl->request_id;
             frame.service = impl->service;
             frame.method = impl->method;
             frame.request_schema = impl->request_schema;
             frame.response_schema = impl->response_schema;
-            frame.success = false;
-            frame.error = Err(ErrorCode::ProtocolError, "response correlation mismatch");
-            auto bytes = EncodeFramedSessionFrame(frame, session->owner->options.MaxFrameBytes());
-            if (bytes) {
-                SessionCore::OutItem item;
-                item.bytes.assign(reinterpret_cast<const char*>(bytes.value().data()), bytes.value().size());
-                item.lane = impl->lane;
-                item.deadline = write_deadline;
-                item.settle = std::make_shared<SessionCore::OutItem::Settle>();
-                auto settle = item.settle;
-
-                /**
-                 * 关联错误终态同样是一条真实写责任：入队失败写责任从未
-                 * 产生（Enqueue 只在成功时 +1）；入队成功则等真实写终态
-                 * 再返回，写责任如实计入排空。
-                 */
-                auto enqueued = session->Enqueue(std::move(item));
-                if (enqueued) {
-                    const auto wait_deadline = write_deadline == RpcClock::time_point::max()
-                                                   ? RpcClock::now() + 30s
-                                                   : std::min(write_deadline, RpcClock::now() + 30s);
-                    (void)settle->Wait(wait_deadline);
-                }
-            }
-
-            /**
-             * 调用方面前始终保留 ProtocolError 语义（关联违规的判定，
-             * 不描述写终态本身）。
-             */
-            return ErrV(ErrorCode::ProtocolError, "response correlation mismatch");
         }
-        auto built = ResponseToSessionFrame(response, session->epoch);
-        if (!built) {
-            return result<void>::err(built.error());
+        auto bytes = EncodeFramedSessionFrame(frame, session->owner->options.MaxFrameBytes());
+        if (!bytes) {
+            return result<void>::err(bytes.error());
         }
-        frame = std::move(built.value());
-        frame.traffic = impl->lane;
-    }
-    auto bytes = EncodeFramedSessionFrame(frame, session->owner->options.MaxFrameBytes());
-    if (!bytes) {
-        return result<void>::err(bytes.error());
-    }
-    SessionCore::OutItem item;
-    item.bytes.assign(reinterpret_cast<const char*>(bytes.value().data()), bytes.value().size());
-    item.lane = frame.traffic;
-    item.deadline = write_deadline;
-    item.settle = std::make_shared<SessionCore::OutItem::Settle>();
-    auto settle = item.settle;
-    auto enqueued = session->Enqueue(std::move(item));
-    if (!enqueued) {
-        return enqueued;
-    }
-
-    /**
-     * Complete 的成功终态对应 socket 真实写终态：等到 WriterLoop 结算
-     * 而非入队即返回。等待与入队共用请求的有限预算（无界时封顶 30s），
-     * 不另起计时。
-     */
-    const auto wait_deadline = write_deadline == RpcClock::time_point::max()
-                                   ? RpcClock::now() + 30s
-                                   : std::min(write_deadline, RpcClock::now() + 30s);
-    return settle->Wait(wait_deadline);
-}
-
-bbt_co_async(result<void>) ReplyCompletion::Fail(Error error)
-{
-    auto impl = m_impl;
-    if (!impl) {
-        return ErrV(ErrorCode::InvalidArgument, "reply completion invalid");
-    }
-    if (!g_bbt_tls_coroutine_co) {
-        return ErrV(ErrorCode::InvalidContext, "reply completion requires coroutine context");
-    }
-    if (impl->terminal.exchange(true)) {
-        return ErrV(ErrorCode::InvalidArgument, "reply completion already terminal");
-    }
-    OpenReplyGuard reply_guard{impl->server};
-    auto session = impl->session.lock();
-    if (!session || session->dead.load()) {
-        return ErrV(ErrorCode::Closed, "session closed before reply");
-    }
-    const auto write_deadline = impl->reply_deadline;
-
-    /**
-     * 回复写窗口已过：迟到回复对调用方已无交付意义，且把过期期限交给共享
-     * stream 会在接纳后超时并把整条 link 退役。只发布本条终态，不产生写责任。
-     */
-    if (write_deadline != RpcClock::time_point::max() && write_deadline <= RpcClock::now()) {
-        return ErrV(ErrorCode::TimedOut, "reply deadline expired before write");
-    }
-    SessionFrame frame;
-    frame.session_epoch = session->epoch;
-    frame.has_outcome = true;
-    frame.success = false;
-    frame.error = std::move(error);
-
-    /**
-     * wire 约束：Call/Response 必 Required
-     */
-    frame.reply = ReplyMode::Required;
-    if (impl->kind == FrameKind::SendAccepted) {
-        frame.kind = FrameKind::SendAccepted;
-        frame.traffic = TrafficClass::System;
-        frame.message_id = impl->message_id;
+        SessionCore::OutItem item;
+        item.bytes.assign(reinterpret_cast<const char*>(bytes.value().data()), bytes.value().size());
+        item.lane = frame.traffic;
+        item.deadline = write_deadline;
+        item.settle = std::make_shared<SessionCore::OutItem::Settle>();
+        auto settle = item.settle;
+        auto enqueued = session->Enqueue(std::move(item));
+        if (!enqueued) {
+            return enqueued;
+        }
 
         /**
-         * 非 Call/Response kind 必 None
+         * Fail 同 Complete——成功终态对应 socket 真实写终态。
          */
-        frame.reply = ReplyMode::None;
-    } else {
-        frame.kind = FrameKind::Response;
-        frame.traffic = impl->lane;
-        frame.request_id = impl->request_id;
-        frame.service = impl->service;
-        frame.method = impl->method;
-        frame.request_schema = impl->request_schema;
-        frame.response_schema = impl->response_schema;
-    }
-    auto bytes = EncodeFramedSessionFrame(frame, session->owner->options.MaxFrameBytes());
-    if (!bytes) {
-        return result<void>::err(bytes.error());
-    }
-    SessionCore::OutItem item;
-    item.bytes.assign(reinterpret_cast<const char*>(bytes.value().data()), bytes.value().size());
-    item.lane = frame.traffic;
-    item.deadline = write_deadline;
-    item.settle = std::make_shared<SessionCore::OutItem::Settle>();
-    auto settle = item.settle;
-    auto enqueued = session->Enqueue(std::move(item));
-    if (!enqueued) {
-        return enqueued;
-    }
-
-    /**
-     * Fail 同 Complete——成功终态对应 socket 真实写终态。
-     */
-    const auto wait_deadline = write_deadline == RpcClock::time_point::max()
-                                   ? RpcClock::now() + 30s
-                                   : std::min(write_deadline, RpcClock::now() + 30s);
-    return settle->Wait(wait_deadline);
+        const auto wait_deadline = write_deadline == RpcClock::time_point::max()
+                                       ? RpcClock::now() + 30s
+                                       : std::min(write_deadline, RpcClock::now() + 30s);
+        return settle->Wait(wait_deadline);
+    });
 }
 
 bool ReplyCompletion::IsTerminal() const noexcept

@@ -306,54 +306,58 @@ public:
 
     bbt_co_async(result<StreamStart>) Start(const bbt::coroutine::WaitOptions& options) override
     {
-        const auto status = WaitEvent(options);
-        {
-            std::lock_guard<std::mutex> lock(m_mtx);
-            if (m_cancelled)
-                return result<StreamStart>::err(MakeMcpHttpError(ErrorCode::Closed, "mcp.http.stream_closed"));
-            if (!m_queue.empty())
-                return result<StreamStart>::ok(MakeSseStart(PopLocked()));
-        }
-        if (status == CombinedWaitStatus::InvalidContext)
-            return result<StreamStart>::err(MakeMcpHttpError(ErrorCode::InvalidContext, "mcp.http.stream_context"));
-        if (status == CombinedWaitStatus::TimedOut)
-            return result<StreamStart>::err(MakeMcpHttpError(ErrorCode::TimedOut, "mcp.http.stream_start"));
+        return bbt_co_bind([this, options]() -> result<StreamStart> {
+            const auto status = WaitEvent(options);
+            {
+                std::lock_guard<std::mutex> lock(m_mtx);
+                if (m_cancelled)
+                    return result<StreamStart>::err(MakeMcpHttpError(ErrorCode::Closed, "mcp.http.stream_closed"));
+                if (!m_queue.empty())
+                    return result<StreamStart>::ok(MakeSseStart(PopLocked()));
+            }
+            if (status == CombinedWaitStatus::InvalidContext)
+                return result<StreamStart>::err(MakeMcpHttpError(ErrorCode::InvalidContext, "mcp.http.stream_context"));
+            if (status == CombinedWaitStatus::TimedOut)
+                return result<StreamStart>::err(MakeMcpHttpError(ErrorCode::TimedOut, "mcp.http.stream_start"));
 
-        /**
+            /**
          * Completed（被 keepalive tick 到点唤醒且无帧）→ 注释块开头。
          */
-        return result<StreamStart>::ok(MakeSseStart(std::string(kKeepaliveChunk)));
+            return result<StreamStart>::ok(MakeSseStart(std::string(kKeepaliveChunk)));
+        });
     }
 
     bbt_co_async(result<std::optional<std::string>>) Next(const bbt::coroutine::WaitOptions& options) override
     {
-        for (;;) {
-            {
-                std::lock_guard<std::mutex> lock(m_mtx);
-                if (!m_queue.empty())
-                    return result<std::optional<std::string>>::ok(std::optional<std::string>{PopLocked()});
-                if (m_eof)
-                    return result<std::optional<std::string>>::ok(std::optional<std::string>{});
-                if (m_cancelled)
+        return bbt_co_bind([this, options]() -> result<std::optional<std::string>> {
+            for (;;) {
+                {
+                    std::lock_guard<std::mutex> lock(m_mtx);
+                    if (!m_queue.empty())
+                        return result<std::optional<std::string>>::ok(std::optional<std::string>{PopLocked()});
+                    if (m_eof)
+                        return result<std::optional<std::string>>::ok(std::optional<std::string>{});
+                    if (m_cancelled)
+                        return result<std::optional<std::string>>::err(
+                            MakeMcpHttpError(ErrorCode::Closed, "mcp.http.stream_closed"));
+                }
+                const auto status = WaitEvent(options);
+                if (status == CombinedWaitStatus::InvalidContext)
                     return result<std::optional<std::string>>::err(
-                        MakeMcpHttpError(ErrorCode::Closed, "mcp.http.stream_closed"));
-            }
-            const auto status = WaitEvent(options);
-            if (status == CombinedWaitStatus::InvalidContext)
-                return result<std::optional<std::string>>::err(
-                    MakeMcpHttpError(ErrorCode::InvalidContext, "mcp.http.stream_context"));
+                        MakeMcpHttpError(ErrorCode::InvalidContext, "mcp.http.stream_context"));
 
-            /**
+                /**
              * Completed / TimedOut(tick 到点) / Cancelled（防御）→ loop 复查；
              * 空队时按 tick 语义产出 keepalive 注释块。
              */
-            {
-                std::lock_guard<std::mutex> lock(m_mtx);
-                if (m_queue.empty() && !m_eof && !m_cancelled)
-                    return result<std::optional<std::string>>::ok(
-                        std::optional<std::string>{std::string(kKeepaliveChunk)});
+                {
+                    std::lock_guard<std::mutex> lock(m_mtx);
+                    if (m_queue.empty() && !m_eof && !m_cancelled)
+                        return result<std::optional<std::string>>::ok(
+                            std::optional<std::string>{std::string(kKeepaliveChunk)});
+                }
             }
-        }
+        });
     }
 
     /**
@@ -494,6 +498,14 @@ private:
         for (auto& waiter : woken)
             waiter->Notify();
     }
+
+    /**
+     * Start 延迟体：等首帧（ack 先于一切事件）或 keepalive tick，交付 SSE 起始。
+     */
+
+    /**
+     * Next 延迟体：帧/EOF/取消/期限/keepalive tick 的循环复查与交付。
+     */
 
     std::shared_ptr<McpSession> m_session;
     std::size_t m_max_events;
