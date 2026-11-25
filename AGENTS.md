@@ -67,7 +67,7 @@
 - 标题 `<type>(<scope>): <简洁中文说明>`；单次提交不混无关变更；格式化变更单独提交。
 - 目标测试通过且无新增编译警告后才允许 commit；交付前检查无意外改动并报告未覆盖项。
 - Author 固定为用户本人 `yqm-307`：用本机 git 配置（`user.name=yqm-307`）直接提交，不加 `--author`，不使用 agent 身份。
-- 本地 push 门禁：`git config --local core.hooksPath .config/bbt-git-hooks` 启用（先查已有值，不覆盖其他 hook 系统）；本仓规则配置在 `.config/bbt-git-hooks.toml`，规则与 review ticket 格式见 `third-party/bbtools-pub/tools/git-hooks/README.md`。代码 commit 审查通过后，ticket 放在紧随其后的单独 commit（只改 `.config/review-tickets/`）。
+- 本地 push 门禁：`git config --local core.hooksPath .config/bbt-git-hooks` 启用（先查已有值，不覆盖其他 hook 系统）；本仓规则配置在 `.config/lint.toml`，规则与 review ticket 格式见 `third-party/bbtools-pub/tools/git-hooks/README.md`。代码 commit 审查通过后，ticket 放在紧随其后的单独 commit（只改 `.config/review-tickets/`）。
 - 不直推 `main`、不自行合并或发布；PR 关联 Issue，写明范围、验证命令、结果与未覆盖边界。远端写入后回读确认目标对象。
 - PR 唯一 required check 为 `result`（语义见 `docs/guides/ci.md`）。CI 失败先读日志定位根因，不靠重跑掩盖；业务代码修复可自主做，CI/CD 配置修改须先获确认。
 

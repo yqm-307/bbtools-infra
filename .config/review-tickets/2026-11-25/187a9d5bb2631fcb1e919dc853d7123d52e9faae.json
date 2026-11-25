@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-25",
+  "commit": "187a9d5bb2631fcb1e919dc853d7123d52e9faae",
+  "base": "01dd5f3289ac87e3628b1b6b8ea63c5219e8f708",
+  "result": "pass",
+  "reviewer": "alice-session-subagents",
+  "summary": "lint 接入经两轮独立审查：第一轮 changes-needed（6 项：提交信息虚报 exit 0、文档引用失效、T302/T304 全豁免过宽、T101 状态机误归类、措辞不准、夹带备份文件），全部修复；第二轮复审 pass。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "round1: 6 findings fixed; round2: pass, 1 info wording fixed in final amend",
+      "evidence": {
+        "reviewer": "independent subagent review (deleg_41a3df11, deleg_efe96eb7)",
+        "scope": "origin/main..187a9d5"
+      }
+    }
+  ]
+}

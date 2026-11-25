@@ -1,0 +1,134 @@
+# 本仓 lint 统一配置；规则语义与级别表见 third-party/bbtools-pub/tools/lint/README.md。
+schema_version = 2
+timeout_seconds = 60
+enforce_blocks = true
+
+# 全量候选扫描：只报告、不阻断；T 系列是人工复核候选。
+# 不开：T102（外部锁多为所有权明确写法）、T201/T202（短注释是规范要求）、
+# T303（测试文件无头文件属正常结构；生产 .cc 无配对头多为模块内部实现，同样放弃监督）、
+# T601（*TestAccess 测试接缝是本仓契约设计）。
+# 不开 T302/T304：本仓布局以聚合头（类型/常量集合）与 detail 支撑头为约定，
+# 与两条规则「stem 对应单一类型」的前提不合，启用即整仓误报，登记豁免等于永久关闭。
+[scan]
+rules = ["coroutine-sugar", "T101", "T301", "T401", "T501"]
+
+# 确定性规则进 hook，默认级别阻断（两级版即原 block；四档版即 fatal 首错即停）。
+[commit]
+rules = ["whitespace", "format", "comment-form", "template-layout", "new-root", "third-party-layout", "header-implementation"]
+
+[push]
+rules = ["review-ticket", "llm-review", "format", "secrets"]
+
+# 顶层目录契约（AGENTS.md）：allowed_roots 之外的新增顶层目录会被拦截。
+[layout]
+allowed_roots = ["bbt", "tests", "examples", "proto", "cmake", "docs", "scripts", ".github", ".config", "third-party"]
+allowed_gitlinks = ["third-party/bbtools-pub"]
+
+[scope]
+exclude = ["build/*", "build-*", "proto/*", "*.pb.h", "*.pb.cc"]
+
+[format]
+binary = "clang-format"
+
+# retired-symbol 待首个退役符号登记 [[retired]] 后再加入 commit.rules。
+# header-implementation 误报率高，只告警不阻断。
+# fatal/error/warn/notice 四档分级依赖 bbtools-pub#14；当前 submodule 钉在两级版（block/warn），
+# warn 可用，error/notice 待 submodule 指针升级后启用。
+[rules.header-implementation]
+level = "warn"
+
+# 全量扫描的告警级别配置只影响 hook（scan 恒为候选报告），以下 options 调整阈值。
+[rules.T301]
+options = { file_lines = 1000 }
+
+# RPC v2 公开常量是线协议兼容契约，不是内部迁移残留名。
+[[exclude]]
+rule = "T501"
+path = "*"
+symbol = "kRpcV2*"
+reason = "RPC v2 线协议公开常量属于兼容契约"
+
+# 系统 socket 常量名来自平台 API。
+[[exclude]]
+rule = "T501"
+path = "*"
+symbol = "IPPROTO_IPV6"
+reason = "POSIX socket 选项常量名，不可改名"
+
+[[exclude]]
+rule = "T501"
+path = "*"
+symbol = "IPV6_V6ONLY"
+reason = "POSIX socket 选项常量名，不可改名"
+
+# SplitV6Scope 描述 IPv6 scope 拆分语义，V6 是协议版本不是内部版本号。
+[[exclude]]
+rule = "T501"
+path = "*"
+symbol = "SplitV6Scope"
+reason = "IPv6 协议语义名，非历史版本命名"
+
+# RpcFrameProtocol 静态转发壳承载线协议契约，集中分发是有意的。
+[[exclude]]
+rule = "T401"
+path = "*"
+symbol = "RpcFrameProtocol"
+reason = "线协议帧操作的集中入口，契约价值高于转发壳形态"
+
+# T101 值记录豁免：仅限确为「字段公开可变即职责」的类型，按模块路径限定范围，
+# 避免跨模块同名误豁免；生命周期/状态机类型（ServerState、SessionOwnerState、
+# Session、AdmissionQueueImpl、MongoOp、ReplyCompletionImpl）不豁免，留作重构候选。
+[[exclude]]
+rule = "T101"
+path = "bbt/infra/http/*"
+symbol = "ClientOptions"
+reason = "纯值记录类型：字段公开可变是其职责，不属于封装破坏"
+
+[[exclude]]
+rule = "T101"
+path = "bbt/infra/http/*"
+symbol = "PreparedRequest"
+reason = "纯值记录类型：字段公开可变是其职责，不属于封装破坏"
+
+[[exclude]]
+rule = "T101"
+path = "bbt/infra/http/*"
+symbol = "RequestRecord"
+reason = "纯值记录类型：字段公开可变是其职责，不属于封装破坏"
+
+[[exclude]]
+rule = "T101"
+path = "bbt/infra/mcp/*"
+symbol = "StdioCloseEvidence"
+reason = "关闭证据快照值记录，字段公开可变是其职责"
+
+[[exclude]]
+rule = "T101"
+path = "bbt/infra/net/*"
+symbol = "Options"
+reason = "纯值记录类型：字段公开可变是其职责，不属于封装破坏"
+
+[[exclude]]
+rule = "T101"
+path = "bbt/infra/net/detail/*"
+symbol = "NormalizedOptions"
+reason = "归一化选项值记录，字段公开可变是其职责"
+
+[[exclude]]
+rule = "T101"
+path = "bbt/infra/rpc/*"
+symbol = "SessionFrame"
+reason = "线协议帧值记录，字段公开可变是其职责"
+
+[[exclude]]
+rule = "T101"
+path = "tests/*"
+symbol = "*"
+reason = "测试夹具/host 类型按用例需要公开字段，不适用生产封装审美"
+
+# T301：测试文件随用例增长，长度不代表职责问题；生产文件保留为重构候选。
+[[exclude]]
+rule = "T301"
+path = "tests/*"
+symbol = "*"
+reason = "测试文件长度随用例规模增长，不作为职责拆分依据"
