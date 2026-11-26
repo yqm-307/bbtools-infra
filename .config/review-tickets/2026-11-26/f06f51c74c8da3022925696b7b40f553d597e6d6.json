@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-26",
+  "commit": "f06f51c74c8da3022925696b7b40f553d597e6d6",
+  "base": "6ba2951d596a83998d239eb94272600d73a05351",
+  "result": "pass",
+  "reviewer": "alice-session-subagent",
+  "summary": "submodule 升级与 notice 启用经独立审查 pass：指针确为 pub main 已合入提交、带入 3 个纯增量 commit、扫描基线 133 无回归、notice 行为正确、提交信息无虚报。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "all blocking-pass; 2 non-blocking notes are pre-existing baseline behaviors",
+      "evidence": {
+        "reviewer": "independent subagent review (deleg_a2bc8d73)",
+        "scope": "origin/main..f06f51c"
+      }
+    }
+  ]
+}

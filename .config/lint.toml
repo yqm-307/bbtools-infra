@@ -12,7 +12,7 @@ enforce_blocks = true
 [scan]
 rules = ["coroutine-sugar", "T101", "T301", "T401", "T501"]
 
-# 确定性规则进 hook，默认级别阻断（两级版即原 block；四档版即 fatal 首错即停）。
+# 确定性规则进 hook，默认级别 fatal（首错即停）；error 级会阻断但跑完其余规则统一报告。
 [commit]
 rules = ["whitespace", "format", "comment-form", "template-layout", "new-root", "third-party-layout", "header-implementation"]
 
@@ -30,12 +30,10 @@ exclude = ["build/*", "build-*", "proto/*", "*.pb.h", "*.pb.cc"]
 [format]
 binary = "clang-format"
 
-# retired-symbol 待首个退役符号登记 [[retired]] 后再加入 commit.rules。
-# header-implementation 误报率高，只告警不阻断。
-# fatal/error/warn/notice 四档分级依赖 bbtools-pub#14；当前 submodule 钉在两级版（block/warn），
-# warn 可用，error/notice 待 submodule 指针升级后启用。
+# retired-symbol 待首个退役符号登记 [[retired]] 后再加入 commit.rules（建议 error 级）。
+# header-implementation 误报率高，只留一行简注。
 [rules.header-implementation]
-level = "warn"
+level = "notice"
 
 # 全量扫描的告警级别配置只影响 hook（scan 恒为候选报告），以下 options 调整阈值。
 [rules.T301]
