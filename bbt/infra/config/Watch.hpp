@@ -32,19 +32,13 @@ enum class WatchEventKind { Initial, Updated, Failed, Recovered };
  */
 struct WatchEvent {
 
-    /**
-     * 事件种类。
-     */
+    /* 事件种类。 */
     WatchEventKind kind{WatchEventKind::Initial};
 
-    /**
-     * Initial、Updated、Recovered 时有效。
-     */
+    /* Initial、Updated、Recovered 时有效。 */
     Snapshot snapshot;
 
-    /**
-     * Failed 时有效。
-     */
+    /* Failed 时有效。 */
     Error error;
 };
 
@@ -53,14 +47,10 @@ struct WatchEvent {
  */
 struct WatchOptions {
 
-    /**
-     * 轮询间隔，须大于零。
-     */
+    /* 轮询间隔，须大于零。 */
     std::chrono::milliseconds poll_interval{100};
 
-    /**
-     * 是否投递首次快照。
-     */
+    /* 是否投递首次快照。 */
     bool deliver_initial{true};
 };
 
@@ -137,7 +127,7 @@ public:
     /**
      * @brief 实现细节类型，在 .cc 中定义；此处仅前向声明，消费者不可使用其成员。
      */
-    struct Impl;
+    class Impl;
 
 private:
     void _BeginClose(Error reason = MakeError(ErrorCode::Closed, "config watcher: closed by owner")) noexcept;

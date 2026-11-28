@@ -57,6 +57,29 @@ owner 主动调用的同步 `Close()`**。本文原「§事件、错误与关闭
   一律返回错误结果，**不发布伪成功空快照**；空文件是合法空配置（`version = 0`、空 `Value`）。
 - `version` 取自文件内容（显式字段），`revision` 为解析后 `Value` 的内容指纹；二者都不依赖墙钟/mtime。
 
+## 解析器取舍：与 Boost.PropertyTree 行式 INI 的语义对照
+
+Boost 1.90 的 `boost/property_tree/ini_parser.hpp`（`read_ini`）是成熟能力，按复用顺序先评估。
+核验结论：**本格式不是 INI 的子集**，直接换用 `read_ini` 会静默改变语义，故保留模块自带的
+行式解析器——它只有逐行切分的复杂度，无隐藏行为，差异由 `file_source_line_format_semantics`
+用例逐条钉死。对照依据为 Boost 1.90 `ini_parser.hpp` 的实现：
+
+| 维度 | PropertyTree `read_ini` | 本格式 |
+|---|---|---|
+| `[s]` section 行 | 建立层级（`s.k` 路径） | 无 section：裸 `[s]` 缺 `=` 判格式错误；`[s] = 1` 是普通扁平键 |
+| `;` 行首 | 注释 | 非特殊字符（该行通常因缺 `=` 判格式错误） |
+| `#` 行首 / 行内 | 行首注释 / 行内按普通字符 | 相同 |
+| 无 `=` 行、空键、重复键 | 抛 `ini_parser_error` | 判 `ProtocolError`（语义一致） |
+| 键值两端空白 | 按 locale 裁剪 | 裁剪空格/制表符/回车（ASCII 集内一致） |
+| 值含 `=` | 按首个 `=` 切分、原样保留 | 相同 |
+| `version` 键 | 普通键，进入树 | 保留元数据键：抽出为 uint64 快照版本，不进入 `Value`；多次出现后者覆盖前者 |
+| 错误模型 | 抛异常 | 返回 `result` 错误，不跨接口抛异常 |
+| 空文件 | 空树 | 合法空配置（语义一致） |
+
+换用 `read_ini` 还要把层级树再压平成 `Value` 的有序映射、把异常错误模型适配回 `result`，
+适配层本身比逐行解析更复杂；扁平键空间与保留 `version` 元数据是本格式的固有语义，
+不是 INI 的方言选项。
+
 ## 版本与去重
 
 - `MemorySource::Set` 版本单调 +1；显式版本必须严格大于当前版本，否则 `InvalidArgument`。
@@ -146,7 +169,7 @@ TMPDIR=<run-dir> <build>/config-consumer/config_consumer
 
 `config.watch` 的回归覆盖（**已按新契约（owner 主动同步 `Close()`、进程寿命 runtime）迁移**；
 部分交错由握手建立状态；既有去重、关闭后静默与资源边界用例仍使用 `SleepRawMs` 观察窗口，
-这些窗口不能单独证明轮询协程已到达挂起点。`Test_config_watch.cc` 共 6 用例 58 断言全过）：
+这些窗口不能单独证明轮询协程已到达挂起点）：
 
 - `watch_create_without_running_scheduler`：运行时未初始化 → 创建被拒为 `RuntimeUnavailable`。
 - `watch_initial_dedup_update_memory`：首拍 `Initial`、同版本去重、更新版本投递，消费者只看到
@@ -158,6 +181,19 @@ TMPDIR=<run-dir> <build>/config-consumer/config_consumer
 - `watch_failure_recovery_file`：源读取失败不发布伪成功；恢复后继续投递新版本。
 - `watch_close_stops_loop_and_releases_source`：`Close()` 唤醒并等待轮询协程退出 → `IsClosed()`
   → 释放外部句柄后**源随之析构**（测试侧 `TrackedSource` 析构标志为真）。
+- `watch_close_release_requires_finite_deadline`：`wait_release` 无期限 → `InvalidArgument`，不产生副作用。
+- `watch_close_from_callback_then_wait_release`：回调内 `Close(Graceful)` 自等待副作用前 `InvalidContext`；
+  回调内 `Close(Immediate)` 只逻辑封口，外部 `wait_release` 等到协程真实退出。
+- `watch_wait_release_timeout_not_fake_completion`：协程确实未退出时 `wait_release` 到期 `TimedOut`，
+  放行后同一 watcher 成功。
+- `probe_initial_callback_before_watcher_published`：非回归探针，记录首回调与 `Create` 返回的交错形态。
+- `watch_close_options_native_graceful_timeout_keeps_responsibility`：native 域 Graceful 到期只报
+  `TimedOut` 并保留封口与在途责任，责任归零后幂等成功、首因固定。
+- `watch_close_options_co_graceful_does_not_block_workers`：Co 域 Graceful 分片等待不占住 worker，
+  同进程 pulse 协程持续推进。
+- `watch_close_options_self_wait_rejected`：回调内 Graceful 自等待拒绝；Immediate 合法。
+- `watch_close_options_rejects_unbounded_graceful`：Graceful/`wait_release` 必须给有限期限；
+  Co 域 `wait_release` 拒绝；native 域 `wait_release` 成功即物理终态。
 
 已删除的旧语义用例（不保留旧断言伪装兼容）：`watch_waitclosed_single_waiter_and_drain`、
 `watch_waitclosed_cancelled_mapping`（`WaitClosed`/单等待位/`AlreadyWaiting`/取消令牌已随上游删除）、

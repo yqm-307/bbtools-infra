@@ -317,6 +317,109 @@ BOOST_AUTO_TEST_CASE(file_source_directory_and_empty)
     ::unlink(empty.c_str());
 }
 
+/**
+ * 行式格式的语义钉装：本格式不追求 Boost.PropertyTree INI 兼容，
+ * 具体取舍（无 section、注释只在行首、键的扁平读法等）见
+ * docs/guides/config-watch.md 的语义对照。以下用例把与 INI 直觉不同、
+ * 以及契约明确钉死的行为固定下来，防止解析器迁移时语义静默漂移。
+ */
+BOOST_AUTO_TEST_CASE(file_source_line_format_semantics)
+{
+
+    /**
+     * 值中的 '=' 原样保留（按首个 '=' 切分）
+     */
+    {
+        const std::string p = MakeTempFile("cfg_eqval", "conn = host=1;port=2\n");
+        auto src = FileSource::Create(p, "app", "k");
+        BOOST_REQUIRE(src);
+        auto r = src.value()->Read();
+        BOOST_REQUIRE(r);
+        auto conn = r.value().value.GetString("conn");
+        BOOST_REQUIRE(conn);
+        BOOST_CHECK_EQUAL(conn.value(), "host=1;port=2");
+        ::unlink(p.c_str());
+    }
+
+    /**
+     * 行尾不产生注释：'#' 在值中按普通字符保留（INI 方言常作行内注释）
+     */
+    {
+        const std::string p = MakeTempFile("cfg_hash", "k = v # not a comment\n");
+        auto src = FileSource::Create(p, "app", "k");
+        BOOST_REQUIRE(src);
+        auto r = src.value()->Read();
+        BOOST_REQUIRE(r);
+        BOOST_CHECK_EQUAL(r.value().value.GetString("k").value(), "v # not a comment");
+        ::unlink(p.c_str());
+    }
+
+    /**
+     * ';' 不是注释字符：该行缺 '=' → 格式错误（PropertyTree INI 中 ';' 行是注释）
+     */
+    {
+        const std::string p = MakeTempFile("cfg_semi", "; not a comment in this format\nk = 1\n");
+        auto src = FileSource::Create(p, "app", "k");
+        BOOST_REQUIRE(src);
+        auto r = src.value()->Read();
+        BOOST_CHECK(!r);
+        BOOST_CHECK(static_cast<int>(r.error().code) == static_cast<int>(ErrorCode::ProtocolError));
+        ::unlink(p.c_str());
+    }
+
+    /**
+     * 无 section 概念：裸 "[s]" 行缺 '=' → 格式错误；
+     * 带 '=' 时 "[s]" 只是普通扁平键，不建立层级
+     */
+    {
+        const std::string p = MakeTempFile("cfg_sect", "[s]\nk = 1\n");
+        auto src = FileSource::Create(p, "app", "k");
+        BOOST_REQUIRE(src);
+        BOOST_CHECK(!src.value()->Read());
+        ::unlink(p.c_str());
+    }
+    {
+        const std::string p = MakeTempFile("cfg_sectkey", "[s] = 1\n");
+        auto src = FileSource::Create(p, "app", "k");
+        BOOST_REQUIRE(src);
+        auto r = src.value()->Read();
+        BOOST_REQUIRE(r);
+        BOOST_CHECK_EQUAL(r.value().value.GetString("[s]").value(), "1");
+        ::unlink(p.c_str());
+    }
+
+    /**
+     * 重复 version：后者覆盖前者（非 version 键重复仍是格式错误）
+     */
+    {
+        const std::string p = MakeTempFile("cfg_dupver", "version = 1\nversion = 7\nk = 1\n");
+        auto src = FileSource::Create(p, "app", "k");
+        BOOST_REQUIRE(src);
+        auto r = src.value()->Read();
+        BOOST_REQUIRE(r);
+        BOOST_CHECK_EQUAL(r.value().version, 7u);
+        BOOST_CHECK(!r.value().value.Has("version"));
+        ::unlink(p.c_str());
+    }
+
+    /**
+     * 空值合法：「存在且为空」与缺失区分；键值两端空白（含 \r）裁剪，
+     * 空白裁剪只作用两端、不进入键内容
+     */
+    {
+        const std::string p = MakeTempFile("cfg_ws", "  key.a  =  \t \r\n\r\n  key.b\t=\tv\t\r\n");
+        auto src = FileSource::Create(p, "app", "k");
+        BOOST_REQUIRE(src);
+        auto r = src.value()->Read();
+        BOOST_REQUIRE(r);
+        auto a = r.value().value.GetString("key.a");
+        BOOST_REQUIRE(a);
+        BOOST_CHECK_EQUAL(a.value(), "");
+        BOOST_CHECK_EQUAL(r.value().value.GetString("key.b").value(), "v");
+        ::unlink(p.c_str());
+    }
+}
+
 // clang-format off
 }
 // clang-format on
