@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-28",
+  "commit": "ab3786a8fd509dea9a038b14e811fd25207f6061",
+  "base": "22ee925fac8dfeef96801a90ad8c1d17696d24d1",
+  "result": "pass",
+  "reviewer": "alice-session-subagent",
+  "summary": "独立复核完整提交范围，无 P0/P1。普通模式 Consul/MCP 共用唯一私有 Boost.JSON 实现；同进程协议回归覆盖两方解析，Consul 的 HTTP 必需门禁及关闭 API 保持不变。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "核对完整 diff、已审补丁及双开构建与测试证据；git diff --check 通过。既有锁版日志显示定向测试 4/4、末轮 Consul 协议测试 1/1，本轮未重跑。",
+      "evidence": {
+        "reviewer": "alice-session-subagent",
+        "scope": "22ee925fac8dfeef96801a90ad8c1d17696d24d1..ab3786a8fd509dea9a038b14e811fd25207f6061"
+      }
+    }
+  ]
+}
