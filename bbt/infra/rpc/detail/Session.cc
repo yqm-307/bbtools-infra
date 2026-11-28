@@ -1,4 +1,6 @@
-// 客户端 owner 和服务端的启动、accept 与关闭流程。
+/**
+ * 客户端 owner 和服务端的启动、accept 与关闭流程。
+ */
 #include <bbt/infra/rpc/CoRpcServer.hpp>
 #include <bbt/infra/rpc/detail/Session.hpp>
 #include <bbt/infra/rpc/detail/SessionTestAccess.hpp>
@@ -69,7 +71,7 @@ void AcceptLoop(std::shared_ptr<ServerState> server)
         }
         if (accepted.error) {
 
-            /**
+            /*
              * RequestStopAccepting/Seal 会取消在途 CoAccept：这是正常封口路径，
              * 保留调用方已发布的关闭原因。
              */
@@ -111,7 +113,7 @@ void AcceptLoop(std::shared_ptr<ServerState> server)
         bool registered = false;
         std::weak_ptr<ServerState> weak = server;
         try {
-            // bbt-lint: ignore-next-line coroutine-sugar -- inbound task needs the explicit 128 KiB stack
+            // NOLINTNEXTLINE(coroutine-sugar) -- inbound task needs the explicit 128 KiB stack
             g_scheduler->RegistCoroutineTask(
                 128 * 1024,
                 [weak, conn = accepted.connection, conn_id]() mutable {
@@ -119,7 +121,10 @@ void AcceptLoop(std::shared_ptr<ServerState> server)
                         try {
                             detail::ServeInbound(server, detail::TcpChannel{conn});
                         } catch (...) {
-                            // 与握手拒绝共用同一退役路径，不越过 scheduler 边界。
+
+                            /**
+                             * 与握手拒绝共用同一退役路径，不越过 scheduler 边界。
+                             */
                         }
                         FinishInbound(*server, conn_id);
                     } else {
@@ -128,7 +133,10 @@ void AcceptLoop(std::shared_ptr<ServerState> server)
                 },
                 registered);
         } catch (...) {
-            // 构造任务失败，仍由 accept 循环归还握手责任。
+
+            /**
+             * 构造任务失败，仍由 accept 循环归还握手责任。
+             */
         }
         if (!registered) {
             FinishInbound(*server, conn_id);
@@ -422,7 +430,7 @@ result<std::shared_ptr<ServerState>> detail::ServerCreate(
 result<void> detail::ServerStart(const std::shared_ptr<ServerState>& state)
 {
 
-    /**
+    /*
      * 测试注入在入口取得：任何早退都会丢弃它，不会留下引用已销毁测试
      * 对象的待执行 barrier。
      */
@@ -474,7 +482,7 @@ result<void> detail::ServerStart(const std::shared_ptr<ServerState>& state)
 
     bool registered = false;
     if (!detail::ConsumeStartRegistrationFailureForTest()) {
-        // bbt-lint: ignore-next-line coroutine-sugar -- accept task needs the explicit 128 KiB stack
+        // NOLINTNEXTLINE(coroutine-sugar) -- accept task needs the explicit 128 KiB stack
         g_scheduler->RegistCoroutineTask(
             128 * 1024,
             [state] {

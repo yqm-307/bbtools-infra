@@ -12,6 +12,13 @@ namespace bbt::infra::rpc {
 
 namespace {
 
+/*
+ * ReadHandshakeFrame 的增量补喂块大小：两次 Next() 之间 decoder 缓冲只
+ * 容纳不完整单帧（声明≤64KiB+4），32KiB 块使 buffer+take 恒小于握手
+ * pending 界（4+2*64KiB），合法帧头不触硬界、非法大声明仍在解码点被拒。
+ */
+constexpr std::size_t kHandshakeFeedChunk = 32 * 1024;
+
 /**
  * Handshake helpers（trusted-network plaintext，ADR §3.2/§3.4）
  * 受限握手阶段 I/O：直接在 conn 上 Write/Read（未建 lane worker）。
@@ -28,20 +35,13 @@ namespace {
  */
 struct HandshakeStash {
 
-    /**
+    /*
      * owning 余量（可为空）
      */
     std::vector<std::uint8_t> bytes;
 
     bool Empty() const noexcept { return bytes.empty(); }
 };
-
-/**
- * ReadHandshakeFrame 的增量补喂块大小：两次 Next() 之间 decoder 缓冲只
- * 容纳不完整单帧（声明≤64KiB+4），32KiB 块使 buffer+take 恒小于握手
- * pending 界（4+2*64KiB），合法帧头不触硬界、非法大声明仍在解码点被拒。
- */
-constexpr std::size_t kHandshakeFeedChunk = 32 * 1024;
 
 /**
  * 读一帧握手帧。同批 Read 只消费到「下一个完整握手帧」为止——解码成功

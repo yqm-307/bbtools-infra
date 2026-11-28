@@ -39,7 +39,7 @@ class CoRpcServer;
 /**
  * detail：会话入站状态，定义见 detail/RpcSessionState.hpp
  */
-struct ServerState;
+class ServerState;
 
 namespace detail {
 

@@ -46,56 +46,6 @@
 namespace bbt::infra::rpc {
 
 /**
- * wire profile 版本：所有 frame 的 profile_version 固定为 2。
- */
-inline constexpr std::uint32_t kRpcV2ProfileVersion = 2;
-
-/**
- * 分帧上限（ADR 0014 §5.2）。
- *
- * 数据帧默认上限
- */
-inline constexpr std::size_t kRpcV2DefaultMaxFrameBytes = 8 * 1024 * 1024;
-
-/**
- * 帧长硬上限（1 GiB）
- */
-inline constexpr std::size_t kRpcV2MaxFrameBytes = kNetworkLimitsMaxBodyBytes;
-
-/**
- * Hello/HelloAck 上限
- */
-inline constexpr std::size_t kRpcV2HelloMaxFrameBytes = 64 * 1024;
-
-/**
- * 字段级上限（ADR 0014 §5.1 字段约束表）。
- *
- * peer_identity 字节上限
- */
-inline constexpr std::size_t kRpcV2MaxPeerIdentityBytes = 256;
-
-/**
- * message_id 字节上限
- */
-inline constexpr std::size_t kRpcV2MaxMessageIdBytes = 128;
-
-/**
- * ordering_key 字节上限
- */
-inline constexpr std::size_t kRpcV2MaxOrderingKeyBytes = 256;
-
-/**
- * service/method/request_id/schema 只做值与长度检查（不解析业务地址）。
- */
-inline constexpr std::size_t kRpcV2MaxFieldBytes = 256;
-
-/**
- * remaining_budget_ms 合法范围 1..kRpcV2MaxRemainingBudgetMs（沿用 ≤24h）。
- */
-inline constexpr std::uint32_t kRpcV2MaxRemainingBudgetMs =
-    static_cast<std::uint32_t>(std::chrono::milliseconds{kNetworkLimitsMaxIncomingTimeout}.count());
-
-/**
  * @brief wire FrameKind 对应枚举。
  *
  * 序号固定；Unspecified 在解码端视为 ProtocolError。
@@ -111,6 +61,26 @@ enum class FrameKind : std::uint8_t {
     SessionError = 7,
     Close = 8,
 };
+
+/* 所有 frame 的 profile_version 固定为 2。 */
+inline constexpr std::uint32_t kRpcV2ProfileVersion = 2;
+
+/* 分帧上限：数据帧有默认值与硬上限，握手帧另有限制。 */
+inline constexpr std::size_t kRpcV2DefaultMaxFrameBytes = 8 * 1024 * 1024;
+inline constexpr std::size_t kRpcV2MaxFrameBytes = kNetworkLimitsMaxBodyBytes;
+inline constexpr std::size_t kRpcV2HelloMaxFrameBytes = 64 * 1024;
+
+/* wire 标识字段的字节上限；service/method/request_id/schema 不解析业务地址。 */
+inline constexpr std::size_t kRpcV2MaxPeerIdentityBytes = 256;
+inline constexpr std::size_t kRpcV2MaxMessageIdBytes = 128;
+inline constexpr std::size_t kRpcV2MaxOrderingKeyBytes = 256;
+inline constexpr std::size_t kRpcV2MaxFieldBytes = 256;
+
+/**
+ * remaining_budget_ms 合法范围 1..kRpcV2MaxRemainingBudgetMs（沿用 ≤24h）。
+ */
+inline constexpr std::uint32_t kRpcV2MaxRemainingBudgetMs =
+    static_cast<std::uint32_t>(std::chrono::milliseconds{kNetworkLimitsMaxIncomingTimeout}.count());
 
 /**
  * @brief SessionFrame：wire profile 2 的值类型视图。
@@ -436,7 +406,7 @@ public:
     std::vector<std::uint8_t> TakePending();
 
 private:
-    struct Impl;
+    class Impl;
 
     /**
      * 不透明内部状态（缓冲/前缀/错误/阶段）

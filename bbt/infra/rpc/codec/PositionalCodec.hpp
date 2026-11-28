@@ -33,12 +33,6 @@
 namespace bbt::infra::rpc {
 
 /**
- * 位置参数 schema 标识。上层应引用本常量而不是复制字面量，避免出现
- * 第二套 schema 标识。
- */
-inline constexpr std::string_view kRpcPositionalSchema = "bbt.rpc.positional/v1";
-
-/**
  * @brief 逻辑 field 的 wire tag。
  *
  * 数值即线上字节，不得重排；新增类型只能追加。
@@ -51,6 +45,22 @@ enum class WireType : std::uint8_t {
     String = 5,
     Bytes = 6,
 };
+
+/*
+ * 去引用/去 cv 后的存储类型。
+ */
+template <class T> using Decay = std::decay_t<T>;
+
+/*
+ * 位置参数 schema 标识。上层应引用本常量而不是复制字面量，避免出现
+ * 第二套 schema 标识。
+ */
+inline constexpr std::string_view kRpcPositionalSchema = "bbt.rpc.positional/v1";
+
+/*
+ * 32 位长度字段上界：encode 端写长度前显式检查，超界报错而不是静默截断。
+ */
+inline constexpr std::uint32_t kMaxFieldBytes = 0xFFFFFFFFu;
 
 /**
  * @brief 无 protobuf 依赖的 codec 默认 trait seam，默认 kDefined=false。
@@ -72,11 +82,6 @@ template <class T> struct ProtoCodec {
  * T 是否有 ProtoCodec 特化。
  */
 template <class T> inline constexpr bool is_proto_codec_v = ProtoCodec<T>::kDefined;
-
-/**
- * 去引用/去 cv 后的存储类型。
- */
-template <class T> using Decay = std::decay_t<T>;
 
 /**
  * T 是否为 bytes（std::vector<std::uint8_t>）。
@@ -114,11 +119,6 @@ inline constexpr bool scalar_supported_v =
     std::is_same_v<Decay<T>, bool>
     || (std::is_integral_v<Decay<T>> && !std::is_same_v<Decay<T>, bool>) || std::is_floating_point_v<Decay<T>>
     || std::is_same_v<Decay<T>, std::string> || is_bytes_v<T>;
-
-/**
- * 32 位长度字段上界：encode 端写长度前显式检查，超界报错而不是静默截断。
- */
-inline constexpr std::uint32_t kMaxFieldBytes = 0xFFFFFFFFu;
 
 /**
  * @brief 长度是否放得进 wire 的 32 位长度字段。用 64 位比较，32 位平台上恒真。

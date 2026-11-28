@@ -6,7 +6,7 @@
 
 ```text
 CoRpcClient / CoRpcServer                   客户端负责 Call/Send 与共享会话，服务端负责接纳，两者均用 Close(options) 收口
-  └─ Session.cc                   启动、accept 与关闭
+  └─ detail/Session.cc            启动、accept 与关闭
        ├─ detail/RpcSessionOwner.cc   拨号、复用、链路安装和 Call/Send
        ├─ detail/RpcHandshake.cc      Hello / HelloAck 与 decoder 交接
        ├─ detail/RpcSession.cc        单 link 收发、lane、写终态与退役

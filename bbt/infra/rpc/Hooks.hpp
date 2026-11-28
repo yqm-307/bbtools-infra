@@ -51,7 +51,7 @@
 
 namespace bbt::infra::rpc {
 
-struct SessionOwnerState;
+class SessionOwnerState;
 
 namespace detail {
 class SessionHookAccess;
@@ -181,7 +181,7 @@ public:
 
 private:
     friend class detail::SessionHookAccess;
-    friend struct SessionOwnerState;
+    friend class SessionOwnerState;
 
     static constexpr std::size_t kHookPointCount = 4;
 

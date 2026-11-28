@@ -42,7 +42,7 @@ class LinkReleaseProbe;
 /**
  * detail：会话 owner，定义见 detail/RpcSessionState.hpp
  */
-struct SessionOwnerState;
+class SessionOwnerState;
 
 /**
  * @brief 双向 RPC 会话客户端。

@@ -134,7 +134,7 @@ detail::ServerLedger detail::ServerLedgerForTest(const CoRpcServer& server) noex
             continue;
         }
         ++out.links;
-        out.writes_outstanding += session->writes_outstanding.load();
+        out.writes_outstanding += session->OutstandingWrites();
     }
     out.handshakes = state->handshakes.size();
     return out;

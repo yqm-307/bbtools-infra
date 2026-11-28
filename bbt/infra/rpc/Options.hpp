@@ -27,54 +27,23 @@
 
 namespace bbt::infra::rpc {
 
-/**
- * @name 会话表/帧/lane 上限
- * @brief Client 会话表/帧/lane 上限的默认值与硬上限（ADR 0014 §3.2、§5.2）。
- * @{
- */
-
-/**
- * 会话表默认上限
- */
+/* 会话表容量：默认值与硬上限。 */
 inline constexpr std::size_t kDefaultMaxSessions = 64;
-
-/**
- * 会话表硬上限
- */
 inline constexpr std::size_t kMaxMaxSessions = 4096;
 
-/**
- * 帧长默认上限（8 MiB）
- */
+/* 帧长限制：硬上限沿用网络层的 1 GiB 边界。 */
 inline constexpr std::size_t kDefaultMaxFrameBytes = 8 * 1024 * 1024;
-
-/**
- * 帧长下限
- */
 inline constexpr std::size_t kMinFrameBytes = 1024;
-
-/**
- * 帧硬上限沿用 kNetworkLimitsMaxBodyBytes 的 1 GiB 边界。
- */
 inline constexpr std::size_t kMaxFrameBytes = kNetworkLimitsMaxBodyBytes;
 
-/**
- * lane 待发默认上限
- */
-inline constexpr std::size_t kDefaultQueueBytes = 16 * 1024 * 1024;
+/* Hello/HelloAck payload 在握手阶段再收窄到 min(max_frame, 64 KiB)。 */
+inline constexpr std::size_t kMaxHelloFrameBytes = 64 * 1024;
 
-/**
- * lane 待发硬上限
- */
+/* lane 待发容量：默认值与硬上限。 */
+inline constexpr std::size_t kDefaultQueueBytes = 16 * 1024 * 1024;
 inline constexpr std::size_t kMaxQueueBytes = 256 * 1024 * 1024;
 
 /**
- * Hello/HelloAck payload 上限（ADR 0014 §5.2）：握手阶段 min(max_frame,64KiB)。
- */
-inline constexpr std::size_t kMaxHelloFrameBytes = 64 * 1024;
-
-/**
- * @}
  * @brief Client 出站配置。
  *
  * setter 只存值，不校验；调用 Validate() 或通过 CoRpcClient::Create 边界时统一校验。
