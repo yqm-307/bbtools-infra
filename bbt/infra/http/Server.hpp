@@ -1,18 +1,6 @@
 /**
  * @file Server.hpp
- * @brief 原生协程 HTTP 服务端（bbt::infra::http）：装配、请求处理与流式响应。
- *
- * Server 只接管 Engine 的 accept 消费：Create 时 Engine 必须 Idle，Start 时
- * 必须 Running 且已有监听；对象本身不 Run、不建线程、不建 Engine，最终由
- * 应用关闭。同一 Engine 不得另设 raw reader 或第二个 CoAccept 消费者。
- *
- * 请求处理只有一个入口（ServerHandler 或 StreamingServerHandler），回复可以
- * 是完整 Response，也可以是需要拉取的 ResponseBody（chunked）。
- *
- * 每连接固定 reader/parser + 请求执行任务 + 单 writer/sequencer：handler 可以
- * 重叠执行，线上响应保持请求顺序；writer 是唯一写 socket、唯一拉取流源的角色。
- * 请求记录、inflight 与队列按同一接纳预算有界，字节上界为
- * `limits.max_inflight * limits.max_body_bytes`（每个响应体另有单响应上限）。
+ * @brief 原生协程 HTTP 服务端及其请求、回复和流式响应接口。
  */
 #pragma once
 
@@ -26,6 +14,9 @@
 
 #include <bbt/coroutine/sync/WaitTypes.hpp>
 #include <bbt/coroutine/syntax/Async.hpp>
+#include <bbt/infra/CloseOptions.hpp>
+#include <bbt/infra/NetworkTypes.hpp>
+#include <bbt/infra/Result.hpp>
 #include <bbt/infra/http/Client.hpp>
 
 namespace bbt::infra::http {
@@ -70,8 +61,7 @@ struct StreamStart {
  * chunked；chunked 开始后 Next 逐个交还自拥 chunk（nullopt=EOF）。HTTP session
  * 经 ICoConnection::Write 写 wire chunk，调用方不持 socket/fd/序列化器。
  *
- * Start/Next 必须在受管协程内挂起消费；Cancel 幂等、可在任意域调用，只表达
- * 「session 不再拉取」，由实现保证不再交付后续结果。
+ * Start/Next 由 writer 在受管协程内消费；调用方不直接驱动流源。
  */
 class ResponseBody {
 public:
@@ -90,7 +80,7 @@ public:
     virtual bbt_co_async(result<std::optional<std::string>>) Next(const bbt::coroutine::WaitOptions&) = 0;
 
     /**
-     * @brief 停止拉取；幂等，可在任意域调用。
+     * @brief 停止拉取；幂等，可在任意域调用，实现不得再交付后续结果。
      */
     virtual void Cancel() noexcept = 0;
 };
@@ -153,19 +143,27 @@ class ServerTestAccess;
 /**
  * @brief 原生协程 HTTP 服务端，独占 Engine 的 accept 消费。
  *
- * 生命周期：Create（Engine Idle）→ Start（Engine Running 且有监听）→
- * Close(CloseOptions)/Close(Immediate) 逻辑封口 → Close(wait_release=true) 物理回收。封口单向，
- * 不可重开。关闭动作不等待 handler 之外的对象、不关 Engine，物理回收由 Engine
- * owner 完成。
+ * 应用拥有并推进 Engine；Server 不创建、启动或关闭 Engine，不创建线程。
+ * 同一 Engine 不得另设 raw reader 或第二个 CoAccept 消费者。
+ * 封口是单向的，逻辑关闭与物理回收见 Close。
+ *
+ * 每连接只有一个 reader/parser 和一个 writer/sequencer。请求 handler 可重叠
+ * 执行，但 writer 按请求顺序写回复，也是唯一拉取流源的角色。请求记录、inflight
+ * 与响应队列共用接纳预算，缓冲响应体的总上限为
+ * `limits.max_inflight * limits.max_body_bytes`。
  */
 class Server {
 public:
+    ~Server() noexcept;
+
+    Server(const Server&) = delete;
+
+    Server& operator=(const Server&) = delete;
+
     /**
-     * @brief 装配服务端：Engine 必须 Idle；只配置 handoff，不 Run/监听/建线程。
+     * @brief 装配一次性回复服务端；Engine 必须 Idle，只配置 handoff，不开始监听。
      *
-     * Engine 由应用独占接纳消费（不得另设 raw reader 或第二个 CoAccept 消费者），
-     * 最终由应用关闭。
-     * @param engine 应用独占并推进的 net::Engine，Server 只接管其 accept 消费
+     * @param engine 应用拥有并推进的 net::Engine
      * @param handler 一次性回复的处理函数
      * @param options 会话/头/体上限与交接队列配置
      * @return 装配失败时为错误
@@ -176,11 +174,12 @@ public:
         ServerOptions options = {});
 
     /**
-     * @brief 流式工厂：handler 可返回完整 Response 或 ResponseBody 拉取源。
+     * @brief 装配方式同 Create；handler 可返回完整 Response 或 ResponseBody 拉取源。
      *
-     * 独立工厂签名（不与 Create 重载）。StreamingOptions 校验：max_chunk_bytes>0、
-     * max_stream_lifetime/stream_write_timeout 有限正值且 <=24h。
-     * @param engine 应用独占并推进的 net::Engine
+     * StreamingOptions 校验：max_chunk_bytes 为正且不超过 kNetworkLimitsMaxBodyBytes；
+     * max_stream_lifetime/stream_write_timeout 为正且不超过 24h。
+     *
+     * @param engine 应用拥有并推进的 net::Engine
      * @param handler 可返回流式回复的处理函数
      * @param options 会话/头/体上限与交接队列配置
      * @param streaming 流式回复的限额
@@ -191,9 +190,6 @@ public:
         StreamingServerHandler handler,
         ServerOptions options = {},
         StreamingOptions streaming = {});
-    ~Server() noexcept;
-    Server(const Server&) = delete;
-    Server& operator=(const Server&) = delete;
 
     /**
      * @brief 开始接纳：Engine Running 且有监听后调用。
@@ -239,12 +235,12 @@ public:
     ServerStats Stats() const noexcept;
 
 private:
-    void _BeginClose(Error reason = MakeError(ErrorCode::Closed, "http server: closed by owner")) noexcept;
-    result<void> _WaitReleased(bbt::coroutine::Deadline deadline);
-
     friend class ServerTestAccess;
-    struct State;
+    class State;
+
     explicit Server(std::shared_ptr<State> state) noexcept;
+
+private:
     std::shared_ptr<State> m_state;
 };
 
