@@ -10,6 +10,13 @@ add_executable(Test_infra_consul Test_infra_consul.cc)
 target_link_libraries(Test_infra_consul
     PRIVATE bbt::infra_consul bbt::infra_http_net Boost::headers Threads::Threads)
 target_compile_options(Test_infra_consul PRIVATE -Wall -Wextra -Wpedantic)
+
+# Consul 先于 MCP 接线，此时不能用 if(TARGET) 探测 MCP 目标。
+if(BBT_INFRA_MCP)
+    target_link_libraries(Test_infra_consul PRIVATE bbt::infra_mcp_core)
+    target_compile_definitions(Test_infra_consul PRIVATE BBT_CONSUL_TEST_WITH_MCP)
+endif()
+
 # 协议/关闭契约不依赖 Consul 二进制，必须在普通 smoke 中单独执行。
 add_test(NAME infra.consul.protocol COMMAND Test_infra_consul --protocol)
 set_tests_properties(infra.consul.protocol PROPERTIES TIMEOUT 60 LABELS "smoke;unit")

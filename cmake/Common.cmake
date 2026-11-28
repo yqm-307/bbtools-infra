@@ -160,3 +160,11 @@ target_link_libraries(bbt_infra_common PUBLIC bbt_coroutine)
 include("${CMAKE_CURRENT_LIST_DIR}/AsyncMisuseErrors.cmake")
 
 find_package(Threads REQUIRED)
+
+# Consul 与 MCP 可以链接到同一进程，Boost.JSON 实现只能编进一个编译单元。
+if(BBT_INFRA_CONSUL OR BBT_INFRA_MCP)
+    find_package(Boost 1.90 REQUIRED)
+    add_library(bbt_infra_boost_json STATIC
+        "${PROJECT_SOURCE_DIR}/bbt/infra/detail/BoostJson.cc")
+    target_link_libraries(bbt_infra_boost_json PRIVATE Boost::headers)
+endif()

@@ -14,12 +14,7 @@
 #include <utility>
 #include <vector>
 
-/**
- * Boost.JSON 以源码方式内联进本模块（仓内唯一一处之外的第二个 TU 会与 MCP 的
- * JsonValue.cc 重复定义；顶层 CMake 对 BBT_INFRA_CONSUL + BBT_INFRA_MCP 同开做
- * fail-closed 门禁）。不链接 libboost_json，不新增第三方依赖。
- */
-#include <boost/json/src.hpp>
+#include <boost/json.hpp>
 
 #include <arpa/inet.h>
 

@@ -13,11 +13,7 @@
 #                          close_drain 收口证据），依赖 mcp_core + coroutine；
 #   bbt_infra_mcp_schema—— 可选 JSON Schema 校验私有 adapter（fail-closed），
 #                          仅 BBT_INFRA_MCP_SCHEMA=ON 时构建（见 schema/CMakeLists）。
-#
-# Boost.JSON 以源码方式内联进 core（JsonValue.cc 是全仓唯一包含
-# boost/json/src.hpp 的 TU），不链接 libboost_json；Boost::headers 仅承担
-# 头文件可见性（boost::json 声明）。core 不依赖 HTTP/RPC/Redis/Mongo。
-find_package(Boost 1.90 REQUIRED)
+# core 不依赖 HTTP/RPC/Redis/Mongo。
 
 add_library(bbt_infra_mcp_core STATIC
     JsonValue.cc
@@ -33,7 +29,7 @@ target_include_directories(bbt_infra_mcp_core
 target_compile_features(bbt_infra_mcp_core PUBLIC cxx_std_17)
 target_link_libraries(bbt_infra_mcp_core
     PUBLIC  bbt::infra_common
-    PRIVATE Boost::headers Threads::Threads)
+    PRIVATE bbt_infra_boost_json Boost::headers Threads::Threads)
 target_compile_options(bbt_infra_mcp_core PRIVATE -Wall -Wextra -Wpedantic)
 
 add_library(bbt_infra_mcp_stdio STATIC
@@ -76,7 +72,7 @@ foreach(_mcp_target IN ITEMS bbt_infra_mcp_core bbt_infra_mcp_stdio)
             "MCP 依赖方向破坏：${_mcp_target} 的接口闭包含禁项（${_mcp_links}）")
     endif()
 endforeach()
-message(STATUS "MCP 闭包证据: core=[bbt_infra_common] stdio=[bbt_infra_mcp_core]")
+message(STATUS "MCP 闭包证据: core=[bbt_infra_common, bbt_infra_boost_json] stdio=[bbt_infra_mcp_core]")
 
 # 可选 JSON Schema adapter（fail-closed）：依赖与校验逻辑在 schema/CMakeLists.txt。
 if(BBT_INFRA_MCP_SCHEMA)
