@@ -41,8 +41,7 @@ void OnCo(std::function<void()> action)
     auto done = std::make_shared<std::promise<void>>();
     auto future = done->get_future();
     bool submitted = false;
-    bbtco_noexcept(&submitted)[done, action = std::move(action)]
-    {
+    bbtco_noexcept(&submitted) [done, action = std::move(action)]() {
         try {
             action();
             done->set_value();

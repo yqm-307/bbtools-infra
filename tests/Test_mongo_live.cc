@@ -129,8 +129,7 @@ template <class F> bool RunInCoroutine(F&& f, int budget_ms = kBudgetMs)
 {
     bbt::core::thread::CountDownLatch done{1};
     bool succ = false;
-    bbtco_noexcept(&succ)[fn = std::forward<F>(f), &done]() mutable
-    {
+    bbtco_noexcept(&succ) [fn = std::forward<F>(f), &done]() mutable {
         fn();
         done.Down();
     };
@@ -519,8 +518,7 @@ void CloseAndCheck(const std::shared_ptr<CoMongoCli>& cli)
 template <class State, class Fn> bool RunHeapOp(const std::shared_ptr<State>& st, Fn fn, int budget_ms = kBudgetMs)
 {
     bool started = false;
-    bbtco_noexcept(&started)[st, fn]() mutable
-    {
+    bbtco_noexcept(&started) [st, fn]() mutable {
         fn(*st);
         st->done.store(true);
     };
@@ -769,8 +767,7 @@ BOOST_AUTO_TEST_CASE(t_concurrent_smoke_16)
     const auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < kWorkers; ++i) {
         bool succ = false;
-        bbtco_noexcept(&succ)[&, i]
-        {
+        bbtco_noexcept(&succ) [&, i]() {
             const std::string id = "bbt:t:smoke:" + std::to_string(i);
             const auto doc = JsonDoc("{\"_id\":\"" + id + "\",\"v\":\"payload" + std::to_string(i) + "\"}");
             const auto filter = JsonDoc("{\"_id\":\"" + id + "\"}");
@@ -830,8 +827,7 @@ BOOST_AUTO_TEST_CASE(t_close_drains_inflight)
     std::atomic_int settled{0};
     for (int i = 0; i < kOps; ++i) {
         bool succ = false;
-        bbtco_noexcept(&succ)[&, i]
-        {
+        bbtco_noexcept(&succ) [&, i]() {
             const std::string id = "bbt:t:drain:" + std::to_string(i);
             auto r = cli->InsertOne(JsonDoc("{\"_id\":\"" + id + "\"}"), Opt(30000));
             if (r || r.error().code == ErrorCode::Closed)
@@ -922,8 +918,7 @@ BOOST_AUTO_TEST_CASE(t_owner_multi_collection_live)
     std::atomic_int ok{0};
     std::atomic_int errs{0};
     bool s1 = false, s2 = false;
-    bbtco_noexcept(&s1)[&]
-    {
+    bbtco_noexcept(&s1) [&]() {
         if (bbt_co_await ca->InsertOne(da, Opt(3000))) {
             auto g = bbt_co_await ca->FindOne(fa, Opt(3000));
             if (g && g.value().has_value()) {
@@ -940,8 +935,7 @@ BOOST_AUTO_TEST_CASE(t_owner_multi_collection_live)
         } else
             errs.fetch_add(1);
     };
-    bbtco_noexcept(&s2)[&]
-    {
+    bbtco_noexcept(&s2) [&]() {
         if (bbt_co_await cb->InsertOne(db_, Opt(3000))) {
             auto g = bbt_co_await cb->FindOne(fb, Opt(3000));
             if (g && g.value().has_value()) {
@@ -1340,8 +1334,7 @@ BOOST_AUTO_TEST_CASE(t_backend_blocked_owner_close_closed)
      * 启动在途 find（长 deadline：只能由 owner Close 结束）。
      */
     bool launched = false;
-    bbtco_noexcept(&launched)[op, h, rt, flt]
-    {
+    bbtco_noexcept(&launched) [op, h, rt, flt]() {
         op->out.emplace(bbt_co_await h->FindOne(flt, Opt(30000)));
 
         /**
@@ -2153,8 +2146,7 @@ BOOST_AUTO_TEST_CASE(t_dp_find_blocked_owner_close)
     mongo::FindOptions fo;
     fo.limit = 1;
     bool launched = false;
-    bbtco_noexcept(&launched)[op, coll, rt, fo]
-    {
+    bbtco_noexcept(&launched) [op, coll, rt, fo]() {
         op->out.emplace(bbt_co_await coll->Find(MongoDocument{}, fo, Opt(30000)));
 
         /**

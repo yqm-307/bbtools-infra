@@ -23,7 +23,9 @@ namespace {
  * 置位（调用方先取 IsTerminal），这里不再二次判定。
  */
 void PostReplyErrorNoWait(
-    const std::shared_ptr<SessionCore>& session, const detail::ReplyCompletionImpl& impl, Error error)
+    const std::shared_ptr<SessionCore>& session,
+    const detail::ReplyCompletionImpl& impl,
+    Error error)
 {
     if (!session || session->dead.load()) {
         return;

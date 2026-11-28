@@ -55,8 +55,10 @@ std::error_code WaitStatusError(bbt::coroutine::WaitStatus status);
 struct CoAccess {
 
     static std::error_code Read(const Connection& connection, Buffer& out, const bbt::coroutine::WaitOptions& options);
-    static std::tuple<std::size_t, std::error_code>
-    Write(const Connection& connection, std::string data, const bbt::coroutine::WaitOptions& options);
+    static std::tuple<std::size_t, std::error_code> Write(
+        const Connection& connection,
+        std::string data,
+        const bbt::coroutine::WaitOptions& options);
     static std::error_code WaitClosed(const Connection& connection, const bbt::coroutine::WaitOptions& options);
 
     /**
@@ -74,8 +76,11 @@ struct CoAccess {
     /**
      * 领取：成功才写 out；任何未交付失败都由内部归还 claim 并让 owner 回收 fd。
      */
-    static std::error_code
-    WaitConnect(Engine& engine, std::uint64_t connect_id, Connection& out, const bbt::coroutine::WaitOptions& options);
+    static std::error_code WaitConnect(
+        Engine& engine,
+        std::uint64_t connect_id,
+        Connection& out,
+        const bbt::coroutine::WaitOptions& options);
 
     /**
      * 从 handoff 队列取连接；配置/生命周期错误立即返回，不等永远不会来的事件。

@@ -214,8 +214,9 @@ public:
      * server 的 main 是 `main_owners` 的第一项；client-only 的 `main_owners` 为空。
      * 未运行时返回空。
      */
-    std::error_code
-    ReactorOwnerIds(std::vector<std::uint64_t>& main_owners, std::vector<std::uint64_t>& sub_owners) const;
+    std::error_code ReactorOwnerIds(
+        std::vector<std::uint64_t>& main_owners,
+        std::vector<std::uint64_t>& sub_owners) const;
 
     /**
      * @brief 非阻塞建连，只用于配置了 RawHandler 的 Engine。建连结果只通过 raw 回调交付。
@@ -299,8 +300,9 @@ private:
     void DelayForTest(std::size_t point, std::chrono::milliseconds delay);
     void ArmHookForTest(std::size_t point, std::function<void()> hook, bool once);
     void ArmFaultForTest(std::size_t point);
-    std::size_t
-    OccupyConnectWaitersForTest(std::uint64_t id, std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>>& keep);
+    std::size_t OccupyConnectWaitersForTest(
+        std::uint64_t id,
+        std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>>& keep);
     void RequestOwnerPumpForTest();
     void OverrideWaitOnceForTest(int status);
     void ClearConnectInjectionForTest();
@@ -324,14 +326,18 @@ private:
      * close/转交点；未交付的失败由 owner 的回收路径收口该记录。
      */
     std::error_code CoSubmitConnect(
-        const Address& address, std::uint64_t& out_connect_id, const std::shared_ptr<ReclaimRecord>& reclaim);
+        const Address& address,
+        std::uint64_t& out_connect_id,
+        const std::shared_ptr<ReclaimRecord>& reclaim);
 
     /**
      * 领取结果。仅成功时把本次结果交付到 `out`；失败不修改 `out`。调用方必须在本函数内
      * 归还 claim 与登记责任，并让 owner 回收未交付的 fd。
      */
-    std::error_code
-    CoWaitConnect(std::uint64_t connect_id, Connection& out, const bbt::coroutine::WaitOptions& options);
+    std::error_code CoWaitConnect(
+        std::uint64_t connect_id,
+        Connection& out,
+        const bbt::coroutine::WaitOptions& options);
 
     /**
      * 从有界 handoff 队列取已接纳的连接。配置或生命周期错误立即返回，不等待。

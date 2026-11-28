@@ -242,7 +242,8 @@ private:
     friend struct ClientTestAccess;
 
     void _BeginClose(
-        Error reason = MakeError(ErrorCode::Closed, "consul: client closed by owner"), bool immediate = true) noexcept;
+        Error reason = MakeError(ErrorCode::Closed, "consul: client closed by owner"),
+        bool immediate = true) noexcept;
     result<void> _WaitReleased(bbt::coroutine::Deadline deadline);
 
     struct State;
@@ -253,8 +254,10 @@ private:
      * 关闭的等待半段：宿主线程阻塞等待、协程域协作挂起等待，都等同一谓词；
      * deadline 到期返回 TimedOut，不冒充完成。
      */
-    static result<void>
-    WaitUntil(const std::shared_ptr<State>& state, bbt::coroutine::Deadline deadline, bool terminal) noexcept;
+    static result<void> WaitUntil(
+        const std::shared_ptr<State>& state,
+        bbt::coroutine::Deadline deadline,
+        bool terminal) noexcept;
 
     std::shared_ptr<State> m_state;
 };

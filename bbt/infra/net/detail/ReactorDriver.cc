@@ -35,8 +35,9 @@ void ReactorDriver::RecordUnhandledFailure(std::exception_ptr error)
     }
 }
 
-bbt::coroutine::detail::ProcesserDriverResult
-ReactorDriver::RunBounded(bool can_block, std::chrono::steady_clock::duration budget)
+bbt::coroutine::detail::ProcesserDriverResult ReactorDriver::RunBounded(
+    bool can_block,
+    std::chrono::steady_clock::duration budget)
 {
     if (m_context.stopped()) {
         m_context.restart();

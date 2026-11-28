@@ -137,7 +137,11 @@ struct MongoOp : std::enable_shared_from_this<MongoOp> {
     std::atomic<Phase> phase{Phase::kQueued};
 
     MongoOp(
-        std::shared_ptr<MongoRuntime> rt, std::shared_ptr<MongoCollImpl> h, Kind k, MongoDocument d, MongoDocument u);
+        std::shared_ptr<MongoRuntime> rt,
+        std::shared_ptr<MongoCollImpl> h,
+        Kind k,
+        MongoDocument d,
+        MongoDocument u);
 
     /**
      * 可在任意线程调用：首次落定者独占 outcome 写入并唤醒等待者；

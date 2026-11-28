@@ -340,8 +340,9 @@ std::uint32_t DecodeFramePrefix(const std::uint8_t in[4]) noexcept;
  * @param max_frame_bytes 数据帧上限
  * @return 完整帧字节或错误
  */
-result<std::vector<std::uint8_t>>
-EncodeFramedSessionFrame(const SessionFrame& frame, std::size_t max_frame_bytes = kRpcV2DefaultMaxFrameBytes);
+result<std::vector<std::uint8_t>> EncodeFramedSessionFrame(
+    const SessionFrame& frame,
+    std::size_t max_frame_bytes = kRpcV2DefaultMaxFrameBytes);
 
 /**
  * @brief 增量分帧解码器。

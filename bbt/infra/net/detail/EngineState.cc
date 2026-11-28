@@ -100,7 +100,8 @@ void Engine::ArmFaultForTest(std::size_t point)
 }
 
 std::size_t Engine::OccupyConnectWaitersForTest(
-    std::uint64_t id, std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>>& keep)
+    std::uint64_t id,
+    std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>>& keep)
 {
     return m_impl->OccupyConnectWaitersForTest(id, keep);
 }
@@ -228,7 +229,8 @@ void EngineImpl::ArmFaultForTest(std::size_t point)
 }
 
 std::size_t EngineImpl::OccupyConnectWaitersForTest(
-    std::uint64_t id, std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>>& keep)
+    std::uint64_t id,
+    std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>>& keep)
 {
     return connects.OccupyWaitersForTest(id, keep);
 }
@@ -502,7 +504,9 @@ std::error_code DriverBindings::InjectFailureLocked(const EngineControl::Guard&)
 }
 
 void DriverBindings::OwnerIdsLocked(
-    const EngineControl::Guard&, std::vector<std::uint64_t>& main, std::vector<std::uint64_t>& subs) const
+    const EngineControl::Guard&,
+    std::vector<std::uint64_t>& main,
+    std::vector<std::uint64_t>& subs) const
 {
     for (const auto& slot : slots) {
         (slot.main_owner ? main : subs).push_back(slot.processer_id);
@@ -1075,8 +1079,11 @@ bool ConnectRegistry::CancelRequested(std::uint64_t id)
     return op && op->CancelRequested();
 }
 
-std::error_code
-ConnectRegistry::Wait(EngineImpl& engine, std::uint64_t id, Connection& out, const bbt::coroutine::WaitOptions& options)
+std::error_code ConnectRegistry::Wait(
+    EngineImpl& engine,
+    std::uint64_t id,
+    Connection& out,
+    const bbt::coroutine::WaitOptions& options)
 {
     auto op = Find(id);
     if (!op)
@@ -1102,7 +1109,8 @@ ConnectTestSnapshot ConnectRegistry::InspectConnectForTest(std::uint64_t id)
 }
 
 std::size_t ConnectRegistry::OccupyWaitersForTest(
-    std::uint64_t id, std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>>& keep)
+    std::uint64_t id,
+    std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>>& keep)
 {
     auto op = Find(id);
     return op ? op->OccupyWaitersForTest(keep) : 0;
@@ -2044,8 +2052,9 @@ std::size_t EngineImpl::CountConnections() const
     return conn_count.load();
 }
 
-std::error_code
-EngineImpl::ReactorOwnerIds(std::vector<std::uint64_t>& main_owners, std::vector<std::uint64_t>& sub_owners) const
+std::error_code EngineImpl::ReactorOwnerIds(
+    std::vector<std::uint64_t>& main_owners,
+    std::vector<std::uint64_t>& sub_owners) const
 {
     auto guard = control.Acquire();
     main_owners.clear();
@@ -2155,8 +2164,10 @@ std::error_code EngineImpl::CoWaitAccepted(Connection& out, const bbt::coroutine
     return accepts.WaitAccepted(out, options);
 }
 
-std::error_code
-EngineImpl::CoWaitConnect(std::uint64_t connect_id, Connection& out, const bbt::coroutine::WaitOptions& options)
+std::error_code EngineImpl::CoWaitConnect(
+    std::uint64_t connect_id,
+    Connection& out,
+    const bbt::coroutine::WaitOptions& options)
 {
     if (handler)
         return std::make_error_code(std::errc::operation_not_supported);

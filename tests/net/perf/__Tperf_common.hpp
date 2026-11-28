@@ -77,8 +77,12 @@ inline bool VerifyPayload(const char* src, std::uint64_t conn, std::uint64_t seq
     return true;
 }
 
-inline std::string
-MakeFrame(std::uint64_t conn, std::uint64_t seq, std::int64_t stamp_ns, std::uint32_t payload_len, std::uint8_t kind)
+inline std::string MakeFrame(
+    std::uint64_t conn,
+    std::uint64_t seq,
+    std::int64_t stamp_ns,
+    std::uint32_t payload_len,
+    std::uint8_t kind)
 {
     std::string frame;
     frame.reserve(kHeaderBytes + payload_len);
@@ -146,8 +150,11 @@ inline bool FrameParser::VerifyCurrent(const std::string& frame) const
     return VerifyPayload(frame.data() + kHeaderBytes, m_conn, m_seq, m_len);
 }
 
-inline Args
-ParseArgs(int argc, char** argv, const std::vector<std::string>& required, const std::vector<std::string>& optional)
+inline Args ParseArgs(
+    int argc,
+    char** argv,
+    const std::vector<std::string>& required,
+    const std::vector<std::string>& optional)
 {
     Args args;
     for (int i = 1; i < argc; ++i) {

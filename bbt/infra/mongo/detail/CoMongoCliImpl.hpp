@@ -20,8 +20,10 @@ public:
 
     result<void> InsertOne(const MongoDocument& doc, const CallOptions& options);
     result<std::optional<MongoDocument>> FindOne(const MongoDocument& filter, const CallOptions& options);
-    result<MongoUpdateResult>
-    UpdateOne(const MongoDocument& filter, const MongoDocument& update, const CallOptions& options);
+    result<MongoUpdateResult> UpdateOne(
+        const MongoDocument& filter,
+        const MongoDocument& update,
+        const CallOptions& options);
     result<std::uint64_t> DeleteOne(const MongoDocument& filter, const CallOptions& options);
 
     /**

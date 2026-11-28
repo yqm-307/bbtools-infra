@@ -28,8 +28,9 @@ std::error_code Connection::ReadCo(Buffer& out, const bbt::coroutine::WaitOption
     return state ? state->Read(out, options) : make_error_code(NetErrc::Closed);
 }
 
-std::tuple<std::size_t, std::error_code>
-Connection::WriteCo(std::string data, const bbt::coroutine::WaitOptions& options) const
+std::tuple<std::size_t, std::error_code> Connection::WriteCo(
+    std::string data,
+    const bbt::coroutine::WaitOptions& options) const
 {
     if (const auto gate = RequireCoroutineContext())
         return {0, gate};

@@ -59,8 +59,9 @@ void OnStopSignal(int)
 #ifdef BBT_MCP_SCHEMA_ADAPTER
 std::atomic<int> g_tool_calls{0};
 
-bbt::infra::result<bbt::infra::mcp::HandlerResult<bbt::infra::mcp::ToolResult>>
-EchoTool(const bbt::infra::mcp::RequestContext&, bbt::infra::mcp::JsonValue arguments)
+bbt::infra::result<bbt::infra::mcp::HandlerResult<bbt::infra::mcp::ToolResult>> EchoTool(
+    const bbt::infra::mcp::RequestContext&,
+    bbt::infra::mcp::JsonValue arguments)
 {
     using namespace bbt::infra::mcp;
     using Result = bbt::infra::result<HandlerResult<ToolResult>>;
@@ -87,8 +88,9 @@ EchoTool(const bbt::infra::mcp::RequestContext&, bbt::infra::mcp::JsonValue argu
 /**
  * resources/read：回显注册 uri（与注册 uri 相同，库已校验）。
  */
-bbt::infra::result<bbt::infra::mcp::ResourceResult>
-EchoResource(const bbt::infra::mcp::RequestContext&, const std::string& uri)
+bbt::infra::result<bbt::infra::mcp::ResourceResult> EchoResource(
+    const bbt::infra::mcp::RequestContext&,
+    const std::string& uri)
 {
     auto content = bbt::infra::mcp::ResourceContents::Text(uri, "text/plain", "echo:" + uri);
     if (!content)
@@ -101,8 +103,9 @@ EchoResource(const bbt::infra::mcp::RequestContext&, const std::string& uri)
 /**
  * prompts/get：取 params.arguments.text（缺省「你好」），回显到单条 user 消息。
  */
-bbt::infra::result<bbt::infra::mcp::PromptResult>
-EchoPrompt(const bbt::infra::mcp::RequestContext&, const bbt::infra::mcp::JsonValue& arguments)
+bbt::infra::result<bbt::infra::mcp::PromptResult> EchoPrompt(
+    const bbt::infra::mcp::RequestContext&,
+    const bbt::infra::mcp::JsonValue& arguments)
 {
     std::string text = "你好";
     if (arguments.IsObject()) {

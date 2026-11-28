@@ -1084,8 +1084,7 @@ void TestGracefulSealSharesCloseDeadline()
     std::atomic<long long> close_elapsed_ms{0};
     bool registered = false;
     auto transport = rig.transport;
-    bbtco_noexcept(&registered)[transport, &close_result, &close_done, &close_elapsed_ms]
-    {
+    bbtco_noexcept(&registered) [transport, &close_result, &close_done, &close_elapsed_ms]() {
         const auto begin = std::chrono::steady_clock::now();
         close_result.emplace(transport->Close(
             bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::milliseconds{250})));
@@ -1170,8 +1169,7 @@ void TestImmediateUpgradeWhileGracefulWaits()
     std::atomic_bool graceful_done{false};
     bool registered = false;
     auto transport = rig.transport;
-    bbtco_noexcept(&registered)[transport, &graceful_result, &graceful_done]
-    {
+    bbtco_noexcept(&registered) [transport, &graceful_result, &graceful_done]() {
         graceful_result.emplace(transport->Close(
             bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::seconds{5})));
         graceful_done.store(true, std::memory_order_release);
@@ -1317,8 +1315,7 @@ void TestCoRecheckWaitsRelease()
     std::atomic<bool> done{false};
     std::optional<bbt::infra::result<void>> closed;
     bool submitted = false;
-    bbtco_noexcept(&submitted)[&]
-    {
+    bbtco_noexcept(&submitted) [&]() {
         auto options = bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::seconds{5});
         options.wait_release = true;
         closed.emplace(rig.transport->Close(options));

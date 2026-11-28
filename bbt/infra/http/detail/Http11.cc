@@ -49,8 +49,10 @@ Error ProtocolError(const std::string& message)
     return error;
 }
 
-bbt::coroutine::Deadline
-DeadlineAt(std::chrono::milliseconds phase, bbt::coroutine::Deadline total, std::chrono::steady_clock::time_point now)
+bbt::coroutine::Deadline DeadlineAt(
+    std::chrono::milliseconds phase,
+    bbt::coroutine::Deadline total,
+    std::chrono::steady_clock::time_point now)
 {
 
     /**
@@ -85,7 +87,9 @@ std::error_code CheckCall(bbt::coroutine::Deadline deadline)
 }
 
 PhaseDeadlines ResolveDeadlines(
-    const PreparedRequest& request, bbt::coroutine::Deadline total, std::chrono::steady_clock::time_point now)
+    const PreparedRequest& request,
+    bbt::coroutine::Deadline total,
+    std::chrono::steady_clock::time_point now)
 {
     return {
         request.connect_timeout,
@@ -144,8 +148,9 @@ result<void> Http11Connection::WriteRequest(const std::string& bytes, bbt::corou
     return result<void>::err(std::move(failure));
 }
 
-result<Http11Connection::ExchangeResult>
-Http11Connection::ReadResponse(const PreparedRequest& request, const PhaseDeadlines& deadlines)
+result<Http11Connection::ExchangeResult> Http11Connection::ReadResponse(
+    const PreparedRequest& request,
+    const PhaseDeadlines& deadlines)
 {
     std::string pending;
 
@@ -235,7 +240,9 @@ Http11Connection::ReadResponse(const PreparedRequest& request, const PhaseDeadli
 }
 
 bbt_co_async(result<Http11Connection::ExchangeResult>) Http11Connection::Exchange(
-    const PreparedRequest& request, const std::string& serialized, const PhaseDeadlines& deadlines)
+    const PreparedRequest& request,
+    const std::string& serialized,
+    const PhaseDeadlines& deadlines)
 {
     return bbt_co_bind([this, request = request, serialized = serialized, deadlines]() -> result<ExchangeResult> {
         if (auto written = WriteRequest(serialized, StageDeadline(deadlines.write_timeout, deadlines.total));

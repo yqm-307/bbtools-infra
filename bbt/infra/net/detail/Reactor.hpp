@@ -64,9 +64,13 @@ public:
         bool delayed_delivery = false,
         const std::shared_ptr<ReclaimRecord>& reclaim = {});
     void BeginConnectOnOwner(
-        const Address& address, std::uint64_t connect_id, const std::shared_ptr<ReclaimRecord>& reclaim = {});
+        const Address& address,
+        std::uint64_t connect_id,
+        const std::shared_ptr<ReclaimRecord>& reclaim = {});
     void StartConnectSocketOnOwner(
-        const Address& address, std::uint64_t connect_id, const std::shared_ptr<ReclaimRecord>& reclaim = {});
+        const Address& address,
+        std::uint64_t connect_id,
+        const std::shared_ptr<ReclaimRecord>& reclaim = {});
     void CancelAllRequestedOnOwner();
 
     void MarkDirty(const std::shared_ptr<ConnCore>& core);

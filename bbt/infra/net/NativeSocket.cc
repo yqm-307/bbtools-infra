@@ -419,8 +419,11 @@ std::error_code NativeSocket::SetLinger(int seconds) noexcept
     return ::setsockopt(m_fd, SOL_SOCKET, SO_LINGER, &option, sizeof(option)) < 0 ? SysError() : std::error_code{};
 }
 
-std::error_code
-NativeSocket::SetKeepAlive(bool enabled, std::chrono::seconds idle, std::chrono::seconds interval, int count) noexcept
+std::error_code NativeSocket::SetKeepAlive(
+    bool enabled,
+    std::chrono::seconds idle,
+    std::chrono::seconds interval,
+    int count) noexcept
 {
     if (!IsTcp()) {
         return Unsupported();

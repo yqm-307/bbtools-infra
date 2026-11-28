@@ -408,8 +408,11 @@ struct Client::State {
     {
     }
 
-    static result<PreparedRequest>
-    BuildRequest(const State& state, std::string_view method, std::string_view url, const RequestOptions& options);
+    static result<PreparedRequest> BuildRequest(
+        const State& state,
+        std::string_view method,
+        std::string_view url,
+        const RequestOptions& options);
     static bbt_co_async(result<Response>)
         Send(std::shared_ptr<State> state, const PreparedRequest& request, const CallOptions& call);
 
@@ -476,14 +479,19 @@ Client::~Client() noexcept
     _BeginClose();
 }
 
-result<PreparedRequest>
-Client::BuildRequest(std::string_view method, std::string_view url, const RequestOptions& options) const
+result<PreparedRequest> Client::BuildRequest(
+    std::string_view method,
+    std::string_view url,
+    const RequestOptions& options) const
 {
     return State::BuildRequest(*m_state, method, url, options);
 }
 
 result<PreparedRequest> Client::State::BuildRequest(
-    const State& state, std::string_view method, std::string_view url, const RequestOptions& options)
+    const State& state,
+    std::string_view method,
+    std::string_view url,
+    const RequestOptions& options)
 {
     if (!Token(method)) {
         return result<PreparedRequest>::err(InvalidArgument("method must not be empty"));
@@ -584,8 +592,8 @@ bbt_co_async(result<Response>) Client::Get(std::string_view url, const RequestOp
     });
 }
 
-bbt_co_async(result<Response>) Client::Post(
-    std::string_view url, RequestBody body, const RequestOptions& options, const CallOptions& call)
+bbt_co_async(result<Response>)
+    Client::Post(std::string_view url, RequestBody body, const RequestOptions& options, const CallOptions& call)
 {
     return bbt_co_bind(
         [state = m_state, url = std::string(url), body = std::move(body), options, call]() mutable -> result<Response> {
@@ -615,7 +623,10 @@ bbt_co_async(result<Response>) Client::Post(
 }
 
 bbt_co_async(result<Response>) Client::Request(
-    std::string_view method, std::string_view url, const RequestOptions& options, const CallOptions& call)
+    std::string_view method,
+    std::string_view url,
+    const RequestOptions& options,
+    const CallOptions& call)
 {
     return bbt_co_bind(
         [state = m_state, method = std::string(method), url = std::string(url), options, call]() -> result<Response> {
@@ -632,8 +643,8 @@ bbt_co_async(result<Response>) Client::Send(const PreparedRequest& request, cons
     return State::Send(m_state, request, call);
 }
 
-bbt_co_async(result<Response>) Client::State::Send(
-    std::shared_ptr<State> state, const PreparedRequest& request, const CallOptions& call)
+bbt_co_async(result<Response>)
+    Client::State::Send(std::shared_ptr<State> state, const PreparedRequest& request, const CallOptions& call)
 {
     return bbt_co_bind([state = std::move(state), request, call]() -> result<Response> {
         if (bbt::coroutine::GetLocalCoroutineId() == 0) {

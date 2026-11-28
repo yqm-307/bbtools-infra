@@ -955,8 +955,7 @@ BOOST_AUTO_TEST_CASE(watch_close_options_co_graceful_does_not_block_workers)
     std::atomic_int pulses{0};
     std::atomic_bool pulse_started{false};
     bool pulse_registered = false;
-    bbtco_noexcept(&pulse_registered)[&]
-    {
+    bbtco_noexcept(&pulse_registered) [&]() {
         pulse_started.store(true, std::memory_order_release);
         while (!stop_pulse.load(std::memory_order_acquire)) {
             CoSleepMs(5);
@@ -975,8 +974,7 @@ BOOST_AUTO_TEST_CASE(watch_close_options_co_graceful_does_not_block_workers)
     std::atomic_bool close_done{false};
     std::atomic<long long> close_returned_at{0};
     bool close_registered = false;
-    bbtco_noexcept(&close_registered)[&]
-    {
+    bbtco_noexcept(&close_registered) [&]() {
         close_result.emplace(watcher->Close(
             bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::seconds{5})));
         close_returned_at.store(CloseNowMs(), std::memory_order_release);
@@ -1108,8 +1106,7 @@ BOOST_AUTO_TEST_CASE(watch_close_options_rejects_unbounded_graceful)
     std::optional<bbt::infra::result<void>> co_release;
     std::atomic_bool co_done{false};
     bool co_registered = false;
-    bbtco_noexcept(&co_registered)[&]
-    {
+    bbtco_noexcept(&co_registered) [&]() {
         bbt::infra::CloseOptions options = bbt::infra::CloseOptions::Immediate();
         options.wait_release = true;
         options.deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};

@@ -89,8 +89,9 @@ public:
     /**
      * @brief 协程内组合等待写；契约见 ICoConnection::Write。
      */
-    std::tuple<std::size_t, std::error_code>
-    Write(std::string data, const bbt::coroutine::WaitOptions& options = {}) override;
+    std::tuple<std::size_t, std::error_code> Write(
+        std::string data,
+        const bbt::coroutine::WaitOptions& options = {}) override;
 
     /**
      * @brief 等待逻辑关闭终态；契约见 ICoConnection::WaitClosed。

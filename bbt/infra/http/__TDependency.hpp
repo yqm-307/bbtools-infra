@@ -28,8 +28,10 @@ result<void> ResolveOne(const Tuple& declarations, DependencyScope& scope, Reque
 }
 
 template <class... Dependencies>
-result<ResolvedValues<Dependencies...>>
-ResolveAll(const std::tuple<Dependencies...>& declarations, DependencyScope& scope, Request& request)
+result<ResolvedValues<Dependencies...>> ResolveAll(
+    const std::tuple<Dependencies...>& declarations,
+    DependencyScope& scope,
+    Request& request)
 {
     ResolvedValues<Dependencies...> values;
     auto resolved = ResolveOne<0>(declarations, scope, request, values.values);

@@ -667,8 +667,9 @@ result<void> detail::SessionOwnerClose(const std::shared_ptr<SessionOwnerState>&
         options, [owner](bbt::coroutine::Deadline deadline) { return SessionOwnerWaitStopped(owner, deadline); });
 }
 
-result<void>
-detail::SessionOwnerWaitStopped(const std::shared_ptr<SessionOwnerState>& owner, bbt::coroutine::Deadline deadline)
+result<void> detail::SessionOwnerWaitStopped(
+    const std::shared_ptr<SessionOwnerState>& owner,
+    bbt::coroutine::Deadline deadline)
 {
     if (!bbt::coroutine::IsInCoroutineContext()) {
         return ErrV(ErrorCode::InvalidContext, "rpc client: WaitStopped requires coroutine context");

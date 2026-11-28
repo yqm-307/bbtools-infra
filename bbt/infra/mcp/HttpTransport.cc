@@ -934,8 +934,10 @@ struct McpHttpTransport::Impl {
 /**
  * 公共 API
  */
-result<std::shared_ptr<McpHttpTransport>>
-McpHttpTransport::Create(std::shared_ptr<McpServer> server, std::shared_ptr<net::Engine> engine, McpHttpOptions options)
+result<std::shared_ptr<McpHttpTransport>> McpHttpTransport::Create(
+    std::shared_ptr<McpServer> server,
+    std::shared_ptr<net::Engine> engine,
+    McpHttpOptions options)
 {
     using R = result<std::shared_ptr<McpHttpTransport>>;
     if (!server || !server->IsStarted())

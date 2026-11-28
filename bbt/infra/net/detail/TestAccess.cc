@@ -31,7 +31,8 @@ bool ConnectionTestAccess::ExerciseReadContention(const Connection& connection, 
 }
 
 bool ConnectionTestAccess::ExerciseReadContention(
-    const std::shared_ptr<ConnectionState>& state, const std::function<void()>& during)
+    const std::shared_ptr<ConnectionState>& state,
+    const std::function<void()>& during)
 {
     return state && state->ExerciseReadContentionForTest(during);
 }

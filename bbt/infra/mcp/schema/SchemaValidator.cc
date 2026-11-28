@@ -1062,8 +1062,11 @@ bool CountInstance(const jsoncons::json& n, int depth, const SchemaOptions& o, l
  * runtime_failed：仅 ICU/UErrorCode 级运行期失败置位并写 *err；成功与
  * 普通 schema mismatch 不触碰 error，避免默认 Internal 值污染成功路径。
  */
-ValidationResult
-ValidateImpl(const SchemaValidator::Impl& impl, const jsoncons::json& root, SchemaError* err, bool* runtime_failed)
+ValidationResult ValidateImpl(
+    const SchemaValidator::Impl& impl,
+    const jsoncons::json& root,
+    SchemaError* err,
+    bool* runtime_failed)
 {
     ValidationResult r;
     bool ok = true;
@@ -1294,7 +1297,10 @@ void ValidateMetaSchema(const jsoncons::json& doc)
  * 公共 API
  */
 bool SchemaValidator::Compile(
-    const JsonValue& schema, const SchemaOptions& options, SchemaValidator* out, SchemaError* error)
+    const JsonValue& schema,
+    const SchemaOptions& options,
+    SchemaValidator* out,
+    SchemaError* error)
 {
 
     /**

@@ -211,7 +211,9 @@ bool RootsOk(const JsonValue& capabilities, bool legacy)
  * sampling/elicitation（legacy 2025-11-25 要求 object + 已知子字段约束）。
  */
 bool ObjectSubfieldsOk(
-    const JsonValue& capabilities, std::string_view field, std::initializer_list<std::string_view> subfields)
+    const JsonValue& capabilities,
+    std::string_view field,
+    std::initializer_list<std::string_view> subfields)
 {
     if (!ObjectIfPresent(capabilities, field))
         return false;
@@ -395,8 +397,9 @@ ProtocolFailure ToProtocolFailure(const Error& error)
     return Failure(JsonRpcErrorCode::InternalError, "Internal error");
 }
 
-std::variant<ModernMeta, ProtocolFailure>
-ValidateModernMeta(const std::optional<JsonValue>& params, const std::vector<std::string>& advertised_versions)
+std::variant<ModernMeta, ProtocolFailure> ValidateModernMeta(
+    const std::optional<JsonValue>& params,
+    const std::vector<std::string>& advertised_versions)
 {
     if (!params || !params->IsObject())
         return MetaShapeFailure("Invalid params: params object with _meta is required");
@@ -463,8 +466,9 @@ ValidateModernMeta(const std::optional<JsonValue>& params, const std::vector<std
     return result;
 }
 
-std::variant<JsonValue, ProtocolFailure>
-ValidateClientCapabilities(const JsonValue& capabilities, CapabilitiesRevision revision)
+std::variant<JsonValue, ProtocolFailure> ValidateClientCapabilities(
+    const JsonValue& capabilities,
+    CapabilitiesRevision revision)
 {
     if (!capabilities.IsObject())
         return MetaShapeFailure("Invalid params: clientCapabilities must be an object");
@@ -739,7 +743,8 @@ result<JsonValue> MakeInputRequiredResult(const InputRequired& input_required)
 }
 
 std::optional<ProtocolFailure> CheckInputRequestCapabilities(
-    const JsonValue& client_capabilities, const std::map<std::string, ClientInputRequest>& input_requests)
+    const JsonValue& client_capabilities,
+    const std::map<std::string, ClientInputRequest>& input_requests)
 {
     static const char* kInvalidMethod = "Invalid params: unknown input request method";
     JsonValue missing = JsonValue::Object();

@@ -273,8 +273,11 @@ struct GateProbe {
  * 在给定调用域内跑四个 Co 入口；调用者预先放好"快路径"条件（有数据/零长写/
  * 已就绪 handoff 队列），从而证明拒绝发生在消费/提交/出队之前。
  */
-GateProbe
-RunAllCoEntries(Connection& connection, Engine& accept_engine, Engine& dial_engine, const Address& dial_address)
+GateProbe RunAllCoEntries(
+    Connection& connection,
+    Engine& accept_engine,
+    Engine& dial_engine,
+    const Address& dial_address)
 {
     GateProbe probe;
     CoTcpConnection co_conn{connection};

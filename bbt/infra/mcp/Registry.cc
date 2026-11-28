@@ -768,8 +768,10 @@ result<DispatchOutcome> McpSession::HandleFrame(std::string_view raw)
     return outcome;
 }
 
-result<DispatchOutcome>
-McpServer::Impl::Dispatch(McpSession& session, std::string_view raw, const std::shared_ptr<RequestOwner>& owner)
+result<DispatchOutcome> McpServer::Impl::Dispatch(
+    McpSession& session,
+    std::string_view raw,
+    const std::shared_ptr<RequestOwner>& owner)
 {
     ProtocolLimits limits;
     limits.max_message_bytes = m_options.max_message_bytes;
@@ -846,7 +848,9 @@ void McpServer::Impl::ApplyNotification(McpSession& session, const JsonRpcReques
 }
 
 result<DispatchOutcome> McpServer::Impl::DispatchModern(
-    McpSession& session, const JsonRpcRequest& request, const std::shared_ptr<RequestOwner>& owner)
+    McpSession& session,
+    const JsonRpcRequest& request,
+    const std::shared_ptr<RequestOwner>& owner)
 {
 
     /**
@@ -908,7 +912,9 @@ result<DispatchOutcome> McpServer::Impl::DispatchModern(
 }
 
 result<DispatchOutcome> McpServer::Impl::DispatchLegacy(
-    McpSession& session, const JsonRpcRequest& request, const std::shared_ptr<RequestOwner>& owner) const
+    McpSession& session,
+    const JsonRpcRequest& request,
+    const std::shared_ptr<RequestOwner>& owner) const
 {
     if (request.method == "initialize")
         return HandleInitialize(session, request);
@@ -1038,8 +1044,10 @@ result<DispatchOutcome> McpServer::Impl::HandleInitialize(McpSession& session, c
     return result<DispatchOutcome>::ok(SuccessOutcome(request.id, std::move(initialize_result)));
 }
 
-result<DispatchOutcome>
-McpServer::Impl::DispatchBusiness(const RequestContext& context, const JsonRpcRequest& request, bool modern) const
+result<DispatchOutcome> McpServer::Impl::DispatchBusiness(
+    const RequestContext& context,
+    const JsonRpcRequest& request,
+    bool modern) const
 {
     const std::string& method = request.method;
     auto invalid = [&](const char* detail) {
@@ -1801,7 +1809,10 @@ void McpServer::Impl::EndSubscription(const McpSession& session, const RequestId
  * request 栈外 owner 的登记/退休与 cancel 会话域路由
  */
 std::shared_ptr<RequestOwner> McpServer::Impl::RegisterRequestOwner(
-    const McpSession& session, const RequestId& id, std::chrono::steady_clock::time_point deadline, bool dedup_id)
+    const McpSession& session,
+    const RequestId& id,
+    std::chrono::steady_clock::time_point deadline,
+    bool dedup_id)
 {
     auto owner = std::make_shared<RequestOwner>(id);
     owner->deadline = deadline;

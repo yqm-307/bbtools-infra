@@ -183,8 +183,9 @@ public:
      * @param options I/O fd 与有界队列配置
      * @return transport 或启动失败原因
      */
-    static result<std::shared_ptr<McpStdioTransport>>
-    Start(std::shared_ptr<McpServer> server, StdioOptions options = {});
+    static result<std::shared_ptr<McpStdioTransport>> Start(
+        std::shared_ptr<McpServer> server,
+        StdioOptions options = {});
     ~McpStdioTransport();
 
     /**

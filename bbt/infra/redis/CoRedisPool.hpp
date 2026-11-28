@@ -130,8 +130,10 @@ public:
      * @param options 建池参数，见 PoolOptions。
      * @return 成功返回池句柄；参数非法返回 InvalidArgument。
      */
-    static result<std::shared_ptr<CoRedisPool>>
-    Create(std::shared_ptr<net::Engine> engine, net::Address address, PoolOptions options);
+    static result<std::shared_ptr<CoRedisPool>> Create(
+        std::shared_ptr<net::Engine> engine,
+        net::Address address,
+        PoolOptions options);
 
     /**
      * @brief 只调用 Close()，不等在途命令退出。

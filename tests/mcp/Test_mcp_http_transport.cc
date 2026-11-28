@@ -459,8 +459,10 @@ std::vector<std::pair<std::string, std::string>> AcceptBoth()
     return {{"Accept", "application/json, text/event-stream"}};
 }
 
-std::string
-PostModern(const McpHost& host, const std::string& body, std::vector<std::pair<std::string, std::string>> headers)
+std::string PostModern(
+    const McpHost& host,
+    const std::string& body,
+    std::vector<std::pair<std::string, std::string>> headers)
 {
     headers.insert(headers.begin(), {"Accept", "application/json, text/event-stream"});
     headers.insert(headers.begin(), {"Content-Type", "application/json"});

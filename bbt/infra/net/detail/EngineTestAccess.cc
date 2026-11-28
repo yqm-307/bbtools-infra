@@ -116,7 +116,9 @@ std::size_t EngineTestAccess::RecvHoldBytes(Engine& engine)
 }
 
 std::size_t EngineTestAccess::FillConnectHub(
-    Engine& engine, std::uint64_t id, std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>>& keep)
+    Engine& engine,
+    std::uint64_t id,
+    std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>>& keep)
 {
     return engine.OccupyConnectWaitersForTest(id, keep);
 }

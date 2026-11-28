@@ -113,8 +113,10 @@ public:
      *
      * update 为更新文档，须包含 $set 等更新算子。返回 matched、modified、upserted 计数。
      */
-    result<MongoUpdateResult>
-    UpdateOne(const MongoDocument& filter, const MongoDocument& update, const CallOptions& options);
+    result<MongoUpdateResult> UpdateOne(
+        const MongoDocument& filter,
+        const MongoDocument& update,
+        const CallOptions& options);
 
     /**
      * @brief 删除首个命中 filter 的文档。

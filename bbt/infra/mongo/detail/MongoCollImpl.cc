@@ -280,7 +280,9 @@ bbt_co_async(result<std::uint64_t>)
 }
 
 MongoCollImpl::MongoCollImpl(
-    std::shared_ptr<MongoRuntime> runtime, mongo::MongoTarget target, bbt::coroutine::CoObjectInfo info)
+    std::shared_ptr<MongoRuntime> runtime,
+    mongo::MongoTarget target,
+    bbt::coroutine::CoObjectInfo info)
     : m_runtime(std::move(runtime))
     , m_target(std::move(target))
     , m_info(std::move(info))

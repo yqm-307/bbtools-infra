@@ -29,8 +29,10 @@ LoadBalancer::LoadBalancer(LoadBalancing mode, std::size_t loop_count, std::erro
     error.clear();
 }
 
-std::size_t
-LoadBalancer::Next(const Address& remote, const std::vector<std::uint64_t>& connection_counts, std::error_code& error)
+std::size_t LoadBalancer::Next(
+    const Address& remote,
+    const std::vector<std::uint64_t>& connection_counts,
+    std::error_code& error)
 {
 
     /**

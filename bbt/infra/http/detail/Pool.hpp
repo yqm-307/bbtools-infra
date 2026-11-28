@@ -305,8 +305,10 @@ private:
     /**
      * 完成预留的 Dialing entry：锁外 Engine::CoDial，失败/封口在锁内出账。
      */
-    static result<Lease>
-    DialReserved(const std::shared_ptr<State>& state, Entry* dial_entry, const PhaseDeadlines& deadlines);
+    static result<Lease> DialReserved(
+        const std::shared_ptr<State>& state,
+        Entry* dial_entry,
+        const PhaseDeadlines& deadlines);
 
     static Error ClosedError();
 

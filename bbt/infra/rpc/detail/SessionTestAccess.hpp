@@ -22,8 +22,9 @@ class LinkReleaseProbe {
 public:
     static std::optional<LinkReleaseProbe> ForPeer(const CoRpcClient& client, const std::string& peer);
     // endpoint 与 Call/Send 的 target 相同；仅返回仍在建立台账中的有效凭据。
-    static std::optional<net::ReclaimReceipt>
-    EstablishingReceipt(const CoRpcClient& client, const std::string& endpoint);
+    static std::optional<net::ReclaimReceipt> EstablishingReceipt(
+        const CoRpcClient& client,
+        const std::string& endpoint);
     // 从此 owner 当前绑定的 server 捕获尚未移交给 link 的握手连接。
     static std::vector<LinkReleaseProbe> ForHandshakes(const CoRpcClient& client);
 

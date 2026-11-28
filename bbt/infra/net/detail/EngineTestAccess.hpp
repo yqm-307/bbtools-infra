@@ -47,7 +47,9 @@ public:
      */
     static bool ConnectReceiverClaimed(Engine& engine, std::uint64_t id);
     static std::size_t FillConnectHub(
-        Engine& engine, std::uint64_t id, std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>>& keep);
+        Engine& engine,
+        std::uint64_t id,
+        std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>>& keep);
     static void SetCancelPostFailureOnce(Engine& engine);
     static void SetSealDelay(Engine& engine, std::chrono::milliseconds delay);
 

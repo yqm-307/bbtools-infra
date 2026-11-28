@@ -79,8 +79,10 @@ result<void> ResolveOne(const Tuple& declarations, DependencyScope& scope, Reque
  * @brief 解析整条依赖链；成功时把各节点对象按声明顺序交给 ResolvedValues。
  */
 template <class... Dependencies>
-result<ResolvedValues<Dependencies...>>
-ResolveAll(const std::tuple<Dependencies...>& declarations, DependencyScope& scope, Request& request);
+result<ResolvedValues<Dependencies...>> ResolveAll(
+    const std::tuple<Dependencies...>& declarations,
+    DependencyScope& scope,
+    Request& request);
 
 // clang-format off
 }

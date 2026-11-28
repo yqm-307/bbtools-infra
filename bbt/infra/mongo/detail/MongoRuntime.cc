@@ -1191,7 +1191,11 @@ void MongoRuntime::FinalizeOnce() noexcept
 namespace bbt::infra::mongo_detail {
 
 MongoOp::MongoOp(
-    std::shared_ptr<MongoRuntime> rt, std::shared_ptr<MongoCollImpl> h, Kind k, MongoDocument d, MongoDocument u)
+    std::shared_ptr<MongoRuntime> rt,
+    std::shared_ptr<MongoCollImpl> h,
+    Kind k,
+    MongoDocument d,
+    MongoDocument u)
     : runtime(std::move(rt))
     , handle(std::move(h))
     , kind(k)

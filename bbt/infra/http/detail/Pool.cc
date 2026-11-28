@@ -611,8 +611,10 @@ result<ConnectionPool::Lease> ConnectionPool::AcquireLease(
     }
 }
 
-result<ConnectionPool::Lease>
-ConnectionPool::DialReserved(const std::shared_ptr<State>& state, Entry* dial_entry, const PhaseDeadlines& deadlines)
+result<ConnectionPool::Lease> ConnectionPool::DialReserved(
+    const std::shared_ptr<State>& state,
+    Entry* dial_entry,
+    const PhaseDeadlines& deadlines)
 {
     net::ConnectionResult dialed;
     auto error = CheckCall(deadlines.total);

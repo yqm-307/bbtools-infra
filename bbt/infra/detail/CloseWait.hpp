@@ -64,8 +64,9 @@ bbt::coroutine::Deadline NextCloseSlice(bbt::coroutine::Deadline deadline) noexc
  * 单等待位另有等待者，本片让出 5ms 后按未命中处理，由调用方复查谓词。
  * 取消、非法域与登记失败如实映射为错误。
  */
-result<bool>
-WaitCloseSlice(const std::shared_ptr<bbt::coroutine::sync::CoWaiter>& signal, bbt::coroutine::Deadline until);
+result<bool> WaitCloseSlice(
+    const std::shared_ptr<bbt::coroutine::sync::CoWaiter>& signal,
+    bbt::coroutine::Deadline until);
 
 /**
  * @brief CloseOptions 值校验：需要等待的组合必须给有限绝对期限。

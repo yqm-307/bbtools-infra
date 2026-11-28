@@ -7,7 +7,10 @@
 namespace bbt::infra::net {
 
 ReceiveRing::ReceiveRing(
-    std::size_t max_bytes, WaitSet& waiters, std::shared_ptr<TestHooks> hooks, const OwnerWake* ownerWake)
+    std::size_t max_bytes,
+    WaitSet& waiters,
+    std::shared_ptr<TestHooks> hooks,
+    const OwnerWake* ownerWake)
     : m_ring(max_bytes)
     , m_max_bytes(max_bytes)
     , m_waiters(waiters)

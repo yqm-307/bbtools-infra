@@ -117,8 +117,9 @@ struct ModernMeta {
  * 失败分支需要结构化 data，而本仓 Error.details 只有 string 键值对，无法忠实承载
  * supported 数组，故用 variant 表达「二择一」而不是伪造第二个通用错误类型。
  */
-std::variant<ModernMeta, ProtocolFailure>
-ValidateModernMeta(const std::optional<JsonValue>& params, const std::vector<std::string>& advertised_versions);
+std::variant<ModernMeta, ProtocolFailure> ValidateModernMeta(
+    const std::optional<JsonValue>& params,
+    const std::vector<std::string>& advertised_versions);
 
 /**
  * @brief 客户端 capabilities 声明所依据的 revision（决定校验用的「已知 shape」集合）。
@@ -146,8 +147,9 @@ enum class CapabilitiesRevision {
  *   - 成功返回 owned object 副本（raw，不做规范化）；失败返回 -32602，message 为
  *     固定诊断、不回显任何输入值。
  */
-std::variant<JsonValue, ProtocolFailure>
-ValidateClientCapabilities(const JsonValue& capabilities, CapabilitiesRevision revision);
+std::variant<JsonValue, ProtocolFailure> ValidateClientCapabilities(
+    const JsonValue& capabilities,
+    CapabilitiesRevision revision);
 
 /**
  * @brief modern 成功结果由库写 resultType=complete（业务不可覆盖）。
@@ -222,7 +224,8 @@ result<JsonValue> MakeInputRequiredResult(const InputRequired& input_required);
  * 未知 method → -32602（服务端缺陷面，不回显输入）。
  */
 std::optional<ProtocolFailure> CheckInputRequestCapabilities(
-    const JsonValue& client_capabilities, const std::map<std::string, ClientInputRequest>& input_requests);
+    const JsonValue& client_capabilities,
+    const std::map<std::string, ClientInputRequest>& input_requests);
 
 /**
  * @brief MRTR 重试请求的 owned 输入（RequestContext 用；legacy 恒空）。

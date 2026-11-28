@@ -893,8 +893,9 @@ bool StdioTestAccess::OnlyWritingFrame(const McpStdioTransport& transport)
 /**
  * 公共 API
  */
-result<std::shared_ptr<McpStdioTransport>>
-McpStdioTransport::Start(std::shared_ptr<McpServer> server, StdioOptions options)
+result<std::shared_ptr<McpStdioTransport>> McpStdioTransport::Start(
+    std::shared_ptr<McpServer> server,
+    StdioOptions options)
 {
     if (!server)
         return result<std::shared_ptr<McpStdioTransport>>::err(
@@ -961,12 +962,10 @@ McpStdioTransport::Start(std::shared_ptr<McpServer> server, StdioOptions options
      */
     bool reader_started = false;
     bool writer_started = false;
-    bbtco_noexcept(&reader_started)[impl]
-    {
+    bbtco_noexcept(&reader_started) [impl]() {
         impl->ReaderLoop();
     };
-    bbtco_noexcept(&writer_started)[impl]
-    {
+    bbtco_noexcept(&writer_started) [impl]() {
         impl->WriterLoop();
     };
     if (!reader_started || !writer_started) {

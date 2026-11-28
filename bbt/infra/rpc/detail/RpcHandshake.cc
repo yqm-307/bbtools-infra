@@ -51,7 +51,10 @@ constexpr std::size_t kHandshakeFeedChunk = 32 * 1024;
  * decoder，大声明仍按握手限额拒绝）。stash 无跨批语义，每帧调用清零。
  */
 result<SessionFrame> ReadHandshakeFrame(
-    detail::ICoChannel& channel, SessionFrameDecoder& decoder, bbt::coroutine::Deadline deadline, HandshakeStash& stash)
+    detail::ICoChannel& channel,
+    SessionFrameDecoder& decoder,
+    bbt::coroutine::Deadline deadline,
+    HandshakeStash& stash)
 {
 
     /**
@@ -193,7 +196,10 @@ result<void> CommitStashAfterFinalAck(SessionFrameDecoder& decoder, HandshakeSta
 }
 
 result<void> WriteHandshakeFrame(
-    detail::ICoChannel& channel, const SessionFrame& frame, bbt::coroutine::Deadline deadline, std::size_t max_frame)
+    detail::ICoChannel& channel,
+    const SessionFrame& frame,
+    bbt::coroutine::Deadline deadline,
+    std::size_t max_frame)
 {
     auto bytes = EncodeFramedSessionFrame(frame, max_frame);
     if (!bytes) {

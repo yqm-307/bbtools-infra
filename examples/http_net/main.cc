@@ -63,8 +63,10 @@ void setup_runtime()
     g_bbt_coroutine_config->m_cfg_processer_auto_scale = false;
 }
 
-bbt::infra::result<http::Response>
-Handle(IncomingCallContext ctx, http::IncomingRequest request, std::atomic<unsigned>& peer_requests)
+bbt::infra::result<http::Response> Handle(
+    IncomingCallContext ctx,
+    http::IncomingRequest request,
+    std::atomic<unsigned>& peer_requests)
 {
     Check(ctx.peer_principal.empty(), "unauthenticated peer is not a principal");
     Check(ctx.deadline > std::chrono::steady_clock::now(), "finite incoming deadline");

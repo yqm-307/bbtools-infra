@@ -399,8 +399,7 @@ result<Watcher::SPtr> Watcher::Create(SourcePtr source, WatchCallback callback, 
     const auto sleeper = impl->sleeper;
     const auto exit_signal = impl->exit_signal;
     bool registered = false;
-    bbtco_noexcept(&registered)[weak, sleeper, exit_signal]()
-    {
+    bbtco_noexcept(&registered) [weak, sleeper, exit_signal]() {
         RunWatchLoop(weak, sleeper, exit_signal);
     };
     if (!registered)

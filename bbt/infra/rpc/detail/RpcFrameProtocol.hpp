@@ -22,8 +22,9 @@ public:
     /**
      * @brief 完整编码一帧：u32be 前缀 + protobuf body；超 kind 上限即拒绝。
      */
-    static result<std::vector<std::uint8_t>>
-    Encode(const SessionFrame& frame, std::size_t max_frame_bytes = kRpcV2DefaultMaxFrameBytes)
+    static result<std::vector<std::uint8_t>> Encode(
+        const SessionFrame& frame,
+        std::size_t max_frame_bytes = kRpcV2DefaultMaxFrameBytes)
     {
         return EncodeFramedSessionFrame(frame, max_frame_bytes);
     }
