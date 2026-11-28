@@ -13,3 +13,10 @@ build-*/
 
 # VSCode 本地工作区文件（含本机绝对路径与个人配置，不入仓）
 *.code-workspace
+
+# git worktree 工作区
+.worktrees/
+
+# Python 字节码缓存（scripts/ci 下的脚本运行时生成）
+__pycache__/
+*.py[cod]
