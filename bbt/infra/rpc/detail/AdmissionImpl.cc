@@ -167,8 +167,10 @@ void AdmissionWorker(std::shared_ptr<detail::AdmissionQueueImpl> impl)
 /**
  * --- AdmissionQueue 公共方法 -------------------------------------------------
  */
-result<std::shared_ptr<AdmissionQueue>>
-AdmissionQueue::Create(std::size_t max_items, std::size_t max_bytes, AdmissionHandler handler)
+result<std::shared_ptr<AdmissionQueue>> AdmissionQueue::Create(
+    std::size_t max_items,
+    std::size_t max_bytes,
+    AdmissionHandler handler)
 {
     using R = result<std::shared_ptr<AdmissionQueue>>;
     if (max_items == 0 || max_bytes == 0 || !handler) {
@@ -214,7 +216,8 @@ std::shared_ptr<detail::ReplyCompletionImpl> detail::AdmissionAccess::ClaimTermi
 }
 
 void detail::AdmissionAccess::AttachQueue(
-    const std::shared_ptr<AdmissionQueue>& queue, const std::shared_ptr<ServerState>& server)
+    const std::shared_ptr<AdmissionQueue>& queue,
+    const std::shared_ptr<ServerState>& server)
 {
     if (!queue || !queue->m_impl) {
         return;

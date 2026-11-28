@@ -488,7 +488,10 @@ private:
 };
 
 bbt_co_async(result<http::Response>) Client::State::Send(
-    std::string_view method, const std::string& target, std::string body, std::chrono::milliseconds read_budget) const
+    std::string_view method,
+    const std::string& target,
+    std::string body,
+    std::chrono::milliseconds read_budget) const
 {
     http::RequestOptions request;
     request.headers.emplace_back("Accept", "application/json");
@@ -777,8 +780,10 @@ bbt_co_async(result<ServiceSnapshot>) Client::HealthyInstances(std::string_view 
     });
 }
 
-result<void>
-Client::WaitUntil(const std::shared_ptr<State>& state, bbt::coroutine::Deadline deadline, bool terminal) noexcept
+result<void> Client::WaitUntil(
+    const std::shared_ptr<State>& state,
+    bbt::coroutine::Deadline deadline,
+    bool terminal) noexcept
 {
     const auto satisfied = [&state, terminal] {
         // clang-format off

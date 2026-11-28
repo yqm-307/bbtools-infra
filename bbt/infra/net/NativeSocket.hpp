@@ -245,8 +245,11 @@ public:
     /**
      * @brief 设置 TCP keepalive 的空闲、间隔与探测次数；非 TCP 返回 operation_not_supported。
      */
-    std::error_code
-    SetKeepAlive(bool enabled, std::chrono::seconds idle, std::chrono::seconds interval, int count) noexcept;
+    std::error_code SetKeepAlive(
+        bool enabled,
+        std::chrono::seconds idle,
+        std::chrono::seconds interval,
+        int count) noexcept;
 
 private:
     NativeSocket(int fd, AddressFamily family, SocketType type) noexcept;

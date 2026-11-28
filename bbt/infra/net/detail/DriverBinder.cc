@@ -54,8 +54,10 @@ std::error_code DriverBinder::MapStatus(ProcesserDriverStatus status)
     return std::make_error_code(std::errc::io_error);
 }
 
-std::error_code
-DriverBinder::BindSlots(std::size_t count, std::vector<DriverSlot>& out, std::vector<DriverSlot>* residual)
+std::error_code DriverBinder::BindSlots(
+    std::size_t count,
+    std::vector<DriverSlot>& out,
+    std::vector<DriverSlot>* residual)
 {
     if (count == 0) {
         return {};

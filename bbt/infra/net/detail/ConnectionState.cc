@@ -47,8 +47,9 @@ std::error_code ConnectionState::Read(Buffer& out, const bbt::coroutine::WaitOpt
     return ring.Read(out, options);
 }
 
-std::tuple<std::size_t, std::error_code>
-ConnectionState::Write(std::string data, const bbt::coroutine::WaitOptions& options)
+std::tuple<std::size_t, std::error_code> ConnectionState::Write(
+    std::string data,
+    const bbt::coroutine::WaitOptions& options)
 {
     const auto wanted = data.size();
     const auto no_buffer = std::make_error_code(std::errc::no_buffer_space);
@@ -346,8 +347,10 @@ WriteWait ConnectionState::QueryWrite(const WriteWait& waiter)
     return waiter;
 }
 
-std::tuple<std::size_t, std::error_code>
-ConnectionState::CancelWrite(std::uint64_t id, WriteWait& waiter, std::error_code error)
+std::tuple<std::size_t, std::error_code> ConnectionState::CancelWrite(
+    std::uint64_t id,
+    WriteWait& waiter,
+    std::error_code error)
 {
     WriteGuard lock(*this);
     if (!waiter.terminal) {

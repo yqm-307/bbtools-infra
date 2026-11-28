@@ -49,8 +49,10 @@ Error TcpCallError(std::error_code cause, const char* message, bool committed);
  * @brief 按已发前缀结算写结果。零字节未提交，部分发送为未知结果，全部发送成功。
  * 调用方取消保留原取消码；连接作废仍由会话负责。
  */
-result<void>
-TcpSettleWrite(const std::tuple<std::size_t, std::error_code>& report, std::size_t total, const char* message);
+result<void> TcpSettleWrite(
+    const std::tuple<std::size_t, std::error_code>& report,
+    std::size_t total,
+    const char* message);
 
 // clang-format off
 }

@@ -627,7 +627,9 @@ void Reactor::AdoptFdOnOwner(
 }
 
 void Reactor::BeginConnectOnOwner(
-    const Address& address, std::uint64_t connect_id, const std::shared_ptr<ReclaimRecord>& reclaim)
+    const Address& address,
+    std::uint64_t connect_id,
+    const std::shared_ptr<ReclaimRecord>& reclaim)
 {
     if (m_sealed.load() || m_impl->IsSealed()) {
 
@@ -701,7 +703,9 @@ void Reactor::BeginConnectOnOwner(
 }
 
 void Reactor::StartConnectSocketOnOwner(
-    const Address& address, std::uint64_t connect_id, const std::shared_ptr<ReclaimRecord>& reclaim)
+    const Address& address,
+    std::uint64_t connect_id,
+    const std::shared_ptr<ReclaimRecord>& reclaim)
 {
 
     /**

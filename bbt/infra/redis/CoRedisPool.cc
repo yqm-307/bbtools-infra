@@ -260,7 +260,10 @@ void PoolTestAccess::SetWaitHook(CoRedisPool& pool, std::function<void(int)> hoo
 }
 
 CoRedisPool::Borrow::Borrow(
-    std::shared_ptr<State> state, std::shared_ptr<CoRedisCli> client, std::size_t index, std::uint64_t borrower)
+    std::shared_ptr<State> state,
+    std::shared_ptr<CoRedisCli> client,
+    std::size_t index,
+    std::uint64_t borrower)
     : client(std::move(client))
     , state_(std::move(state))
     , index_(index)
@@ -348,8 +351,10 @@ CoRedisPool::~CoRedisPool() noexcept
     (void)Close();
 }
 
-result<std::shared_ptr<CoRedisPool>>
-CoRedisPool::Create(std::shared_ptr<net::Engine> engine, net::Address address, PoolOptions options)
+result<std::shared_ptr<CoRedisPool>> CoRedisPool::Create(
+    std::shared_ptr<net::Engine> engine,
+    net::Address address,
+    PoolOptions options)
 {
     if (!engine || !address.Valid()
         || (address.Family() != net::AddressFamily::IPv4 && address.Family() != net::AddressFamily::IPv6)) {
@@ -916,7 +921,10 @@ bbt_co_async(result<void>) CoRedisPool::Set(std::string_view key, std::string_vi
 }
 
 bbt_co_async(result<bool>) CoRedisPool::Set(
-    std::string_view key, std::string_view value, const SetOptions& set_options, const CallOptions& options)
+    std::string_view key,
+    std::string_view value,
+    const SetOptions& set_options,
+    const CallOptions& options)
 {
     return RunBorrowed<result<bool>>(
         state_,

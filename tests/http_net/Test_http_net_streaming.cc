@@ -323,8 +323,8 @@ struct Peer {
     }
 };
 
-http::StreamingServerHandler
-Route(std::function<result<http::ServerReply>(IncomingCallContext, http::IncomingRequest)> fn)
+http::StreamingServerHandler Route(
+    std::function<result<http::ServerReply>(IncomingCallContext, http::IncomingRequest)> fn)
 {
     return fn;
 }

@@ -195,8 +195,8 @@ struct Fixture {
         : sealed(std::make_shared<std::atomic<bool>>(false))
         , hooks(std::make_shared<TestHooks>())
         , state(
-              std::make_shared<ConnectionState>(
-                  1, 65536, kOutboundMax, kMaxOps, sealed, std::shared_ptr<ReclaimRecord>{}, hooks))
+              std::make_shared<
+                  ConnectionState>(1, 65536, kOutboundMax, kMaxOps, sealed, std::shared_ptr<ReclaimRecord>{}, hooks))
     {
         std::uint64_t id = 0;
         BOOST_REQUIRE_MESSAGE(!state->SubmitWrite(std::string(kOpBytes, 'A'), id), "op1 接纳失败");
@@ -232,8 +232,10 @@ struct DanceResult {
     ExitExpectation exit_outcome;
 };
 
-DanceResult
-RunDance(std::shared_ptr<ConnectionState> state, MockSink& sink, const std::function<ExitExpectation()>& exit_fn)
+DanceResult RunDance(
+    std::shared_ptr<ConnectionState> state,
+    MockSink& sink,
+    const std::function<ExitExpectation()>& exit_fn)
 {
     std::atomic<bool> busy_seen{false};
     ConnectionState::SendResult first{};

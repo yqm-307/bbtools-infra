@@ -199,8 +199,10 @@ public:
      * @return 队列；参数非法为 InvalidArgument，worker 登记失败为
      *         RuntimeUnavailable（此时没有留下常驻任务）。
      */
-    static result<std::shared_ptr<AdmissionQueue>>
-    Create(std::size_t max_items, std::size_t max_bytes, AdmissionHandler handler);
+    static result<std::shared_ptr<AdmissionQueue>> Create(
+        std::size_t max_items,
+        std::size_t max_bytes,
+        AdmissionHandler handler);
 
     /**
      * @brief 不可挂起；满 → Overloaded，封口后 → Closed。

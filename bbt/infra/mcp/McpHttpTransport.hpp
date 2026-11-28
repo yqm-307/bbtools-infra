@@ -151,8 +151,10 @@ public:
      * @param options 安全门禁、请求体上限与 SSE 流配额
      * @return transport 或装配失败原因
      */
-    static result<std::shared_ptr<McpHttpTransport>>
-    Create(std::shared_ptr<McpServer> server, std::shared_ptr<net::Engine> engine, McpHttpOptions options);
+    static result<std::shared_ptr<McpHttpTransport>> Create(
+        std::shared_ptr<McpServer> server,
+        std::shared_ptr<net::Engine> engine,
+        McpHttpOptions options);
     ~McpHttpTransport();
 
     /**

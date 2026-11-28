@@ -149,7 +149,9 @@ public:
     DriverSlot SlotLocked(const EngineControl::Guard&, std::size_t index) const;
     std::error_code InjectFailureLocked(const EngineControl::Guard&);
     void OwnerIdsLocked(
-        const EngineControl::Guard&, std::vector<std::uint64_t>& main, std::vector<std::uint64_t>& subs) const;
+        const EngineControl::Guard&,
+        std::vector<std::uint64_t>& main,
+        std::vector<std::uint64_t>& subs) const;
 
 private:
     std::vector<DriverSlot> slots;
@@ -258,12 +260,16 @@ public:
     bool Complete(std::uint64_t id, Connection connection, std::error_code error, bool raw);
     void AuthorizeDelivery(std::uint64_t id);
     bool CancelRequested(std::uint64_t id);
-    std::error_code
-    Wait(EngineImpl& engine, std::uint64_t id, Connection& out, const bbt::coroutine::WaitOptions& options);
+    std::error_code Wait(
+        EngineImpl& engine,
+        std::uint64_t id,
+        Connection& out,
+        const bbt::coroutine::WaitOptions& options);
     EngineTestSnapshot InspectForTest();
     ConnectTestSnapshot InspectConnectForTest(std::uint64_t id);
-    std::size_t
-    OccupyWaitersForTest(std::uint64_t id, std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>>& keep);
+    std::size_t OccupyWaitersForTest(
+        std::uint64_t id,
+        std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>>& keep);
 
 private:
     std::shared_ptr<ConnectOp> Find(std::uint64_t id);
@@ -326,12 +332,15 @@ public:
     std::error_code RunImpl(const EngineConfig& config);
     std::error_code LocalAddresses(std::vector<Address>& out) const;
     std::size_t CountConnections() const;
-    std::error_code
-    ReactorOwnerIds(std::vector<std::uint64_t>& main_owners, std::vector<std::uint64_t>& sub_owners) const;
+    std::error_code ReactorOwnerIds(
+        std::vector<std::uint64_t>& main_owners,
+        std::vector<std::uint64_t>& sub_owners) const;
     result<void> CoWaitRunning(const bbt::coroutine::WaitOptions& options);
     std::error_code CoWaitAccepted(Connection& out, const bbt::coroutine::WaitOptions& options);
-    std::error_code
-    CoWaitConnect(std::uint64_t connect_id, Connection& out, const bbt::coroutine::WaitOptions& options);
+    std::error_code CoWaitConnect(
+        std::uint64_t connect_id,
+        Connection& out,
+        const bbt::coroutine::WaitOptions& options);
     std::error_code StartConnect(
         const Address& address,
         std::uint64_t& out_connect_id,
@@ -439,8 +448,9 @@ private:
     void DelayForTest(std::size_t point, std::chrono::milliseconds delay);
     void ArmHookForTest(std::size_t point, std::function<void()> hook, bool once);
     void ArmFaultForTest(std::size_t point);
-    std::size_t
-    OccupyConnectWaitersForTest(std::uint64_t id, std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>>& keep);
+    std::size_t OccupyConnectWaitersForTest(
+        std::uint64_t id,
+        std::vector<std::shared_ptr<bbt::coroutine::sync::CoWaiter>>& keep);
     void RequestOwnerPumpForTest();
     void OverrideWaitOnceForTest(int status);
     void ClearConnectInjectionForTest();

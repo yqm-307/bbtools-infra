@@ -170,8 +170,10 @@ public:
      * @param options 会话/头/体上限与交接队列配置
      * @return 装配失败时为错误
      */
-    static result<std::shared_ptr<Server>>
-    Create(std::shared_ptr<net::Engine> engine, ServerHandler handler, ServerOptions options = {});
+    static result<std::shared_ptr<Server>> Create(
+        std::shared_ptr<net::Engine> engine,
+        ServerHandler handler,
+        ServerOptions options = {});
 
     /**
      * @brief 流式工厂：handler 可返回完整 Response 或 ResponseBody 拉取源。

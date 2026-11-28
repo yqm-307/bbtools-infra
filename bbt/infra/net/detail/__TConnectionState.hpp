@@ -3,22 +3,29 @@
 namespace bbt::infra::net {
 
 template <class Sink>
-inline ConnectionState::SendResult
-ConnectionState::PumpWrites(std::size_t max_rounds, std::size_t byte_budget, Sink&& sink)
+inline ConnectionState::SendResult ConnectionState::PumpWrites(
+    std::size_t max_rounds,
+    std::size_t byte_budget,
+    Sink&& sink)
 {
     return _PumpWrites(max_rounds, byte_budget, std::forward<Sink>(sink), false);
 }
 
 template <class Sink>
-inline ConnectionState::SendResult
-ConnectionState::TryPumpWrites(std::size_t max_rounds, std::size_t byte_budget, Sink&& sink)
+inline ConnectionState::SendResult ConnectionState::TryPumpWrites(
+    std::size_t max_rounds,
+    std::size_t byte_budget,
+    Sink&& sink)
 {
     return _PumpWrites(max_rounds, byte_budget, std::forward<Sink>(sink), true);
 }
 
 template <class Sink>
-inline ConnectionState::SendResult
-ConnectionState::_PumpWrites(std::size_t max_rounds, std::size_t byte_budget, Sink&& sink, bool try_lock)
+inline ConnectionState::SendResult ConnectionState::_PumpWrites(
+    std::size_t max_rounds,
+    std::size_t byte_budget,
+    Sink&& sink,
+    bool try_lock)
 {
     SendResult result;
     for (std::size_t round = 0; round == 0 || (round < max_rounds && result.bytes < byte_budget); ++round) {

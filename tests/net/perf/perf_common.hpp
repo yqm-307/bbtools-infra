@@ -129,8 +129,11 @@ struct Args {
     std::string error;
 };
 
-inline Args
-ParseArgs(int argc, char** argv, const std::vector<std::string>& required, const std::vector<std::string>& optional);
+inline Args ParseArgs(
+    int argc,
+    char** argv,
+    const std::vector<std::string>& required,
+    const std::vector<std::string>& optional);
 
 inline std::uint64_t ArgU64(const Args& args, const std::string& key, std::uint64_t dflt);
 

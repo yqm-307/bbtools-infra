@@ -237,8 +237,9 @@ struct AppHost {
     /**
      * framework 逐个处理 admitted item（echo / 自定义 make_response）。
      */
-    void
-    ProcessAdmitted(const std::function<rpc::Response(const rpc::Request&)>& make_response, std::size_t max_items = 64)
+    void ProcessAdmitted(
+        const std::function<rpc::Response(const rpc::Request&)>& make_response,
+        std::size_t max_items = 64)
     {
         for (std::size_t i = 0; i != max_items; ++i) {
             std::shared_ptr<rpc::ReplyCompletion> reply;
@@ -1263,8 +1264,9 @@ public:
 
     std::error_code WriteBytes(std::string bytes) override { return m_conn.AsyncWrite(std::move(bytes)); }
 
-    std::tuple<std::size_t, std::error_code>
-    WriteBytes(std::string bytes, const bbt::coroutine::WaitOptions& options) override
+    std::tuple<std::size_t, std::error_code> WriteBytes(
+        std::string bytes,
+        const bbt::coroutine::WaitOptions& options) override
     {
         return m_conn.Write(std::move(bytes), options);
     }
@@ -5105,7 +5107,10 @@ void SendSendAcceptedOnPeer(RawTcpPeer& peer, const std::string& message_id, std
  *  读拨方 HelloAck echo；随后恰读一帧 boot 业务帧并回 Response。boot 后旧链
  *  不再有读事件（目标操作尚在取号屏障前，首号编码/入队均未发生）。 */
 void BootOldChainWithOwnerHandshake(
-    AppHost& a, RawTcpListener& listener, const std::string& listener_identity, const std::string& dialer_identity)
+    AppHost& a,
+    RawTcpListener& listener,
+    const std::string& listener_identity,
+    const std::string& dialer_identity)
 {
     auto boot =
         SubmitCo([&] { return bbt_co_await a.client->Call(listener.Target(), MakeCall("boot", 1, "k"), UntilMs()); });

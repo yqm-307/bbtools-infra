@@ -332,8 +332,10 @@ public:
      * @param options 请求级覆盖项
      * @return 已解析的待发请求；解析失败（非法 URL、非正值超时等）为错误
      */
-    result<PreparedRequest>
-    BuildRequest(std::string_view method, std::string_view url, const RequestOptions& options) const;
+    result<PreparedRequest> BuildRequest(
+        std::string_view method,
+        std::string_view url,
+        const RequestOptions& options) const;
 
     /**
      * @name 请求入口

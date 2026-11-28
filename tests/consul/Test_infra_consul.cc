@@ -590,8 +590,10 @@ Fixture MakeClient(
     return fixture;
 }
 
-consul::ServiceRegistration
-Catalog(const std::string& id, std::uint16_t port, const std::string& name = "ecommerce-catalog")
+consul::ServiceRegistration Catalog(
+    const std::string& id,
+    std::uint16_t port,
+    const std::string& name = "ecommerce-catalog")
 {
     consul::ServiceRegistration registration;
     registration.id = id;
@@ -1381,7 +1383,11 @@ bool WaitReady(Host& host, consul::Client& client)
  * 有限轮询取快照：轮询只是等待 agent 视图收敛，不是用固定 sleep 冒充同步。
  */
 consul::ServiceSnapshot WaitForCount(
-    Host& host, consul::Client& client, const std::string& service, std::size_t expected, milliseconds timeout = 5s)
+    Host& host,
+    consul::Client& client,
+    const std::string& service,
+    std::size_t expected,
+    milliseconds timeout = 5s)
 {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     consul::ServiceSnapshot last;

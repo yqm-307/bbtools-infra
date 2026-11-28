@@ -218,8 +218,7 @@ int Run()
     auto completion = std::make_shared<std::promise<void>>();
     auto done = completion->get_future();
     bool registered = false;
-    bbtco_noexcept(&registered)[coll, completion, id]
-    {
+    bbtco_noexcept(&registered) [coll, completion, id]() {
         try {
             Crud(coll, id);
             completion->set_value();

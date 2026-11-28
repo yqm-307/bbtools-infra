@@ -70,7 +70,9 @@ struct PhaseDeadlines {
 bbt::coroutine::Deadline StageDeadline(std::chrono::milliseconds phase, bbt::coroutine::Deadline total);
 std::error_code CheckCall(bbt::coroutine::Deadline deadline);
 PhaseDeadlines ResolveDeadlines(
-    const PreparedRequest& request, bbt::coroutine::Deadline total_deadline, std::chrono::steady_clock::time_point now);
+    const PreparedRequest& request,
+    bbt::coroutine::Deadline total_deadline,
+    std::chrono::steady_clock::time_point now);
 
 /**
  * @brief 序列化必须在借用连接前完成：输入异常不占用池名额。

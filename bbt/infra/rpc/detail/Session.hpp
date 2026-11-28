@@ -119,8 +119,9 @@ result<void> SessionOwnerClose(const std::shared_ptr<SessionOwnerState>& owner, 
  * @brief owner 物理收口等待：已封口后等台账 link 租约与建立中记录归还。
  * 逐轮重驱各 link 的真实 Released 观察；到期返回 TimedOut 并保留责任。
  */
-result<void>
-SessionOwnerWaitStopped(const std::shared_ptr<SessionOwnerState>& owner, bbt::coroutine::Deadline deadline);
+result<void> SessionOwnerWaitStopped(
+    const std::shared_ptr<SessionOwnerState>& owner,
+    bbt::coroutine::Deadline deadline);
 
 /**
  * Call/Send 的接纳责任：与 Closed/Draining 同门（owner->mu）拒绝或计数；

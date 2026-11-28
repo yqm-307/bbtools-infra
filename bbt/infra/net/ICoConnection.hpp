@@ -160,8 +160,9 @@ public:
      * @param options 容量与完成等待共用的绝对期限和取消条件。
      * @return 已交给内核的字节数与最终错误；部分发送后的协议收口由调用方决定。
      */
-    virtual std::tuple<std::size_t, std::error_code>
-    Write(std::string data, const bbt::coroutine::WaitOptions& options = {}) = 0;
+    virtual std::tuple<std::size_t, std::error_code> Write(
+        std::string data,
+        const bbt::coroutine::WaitOptions& options = {}) = 0;
 
     /**
      * ---- 关闭 ----

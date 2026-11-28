@@ -55,8 +55,10 @@ public:
      * @param handshake 连接级握手配置。
      * @return 成功返回 client 句柄；参数非法返回 InvalidArgument，reader 分配失败返回 InternalError。
      */
-    static result<std::shared_ptr<CoRedisCli>>
-    Create(std::shared_ptr<net::Engine> engine, net::Address address, RedisHandshake handshake);
+    static result<std::shared_ptr<CoRedisCli>> Create(
+        std::shared_ptr<net::Engine> engine,
+        net::Address address,
+        RedisHandshake handshake);
 
     /**
      * @brief 只调用 Close()，不等在途操作退出。

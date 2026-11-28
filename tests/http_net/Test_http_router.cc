@@ -50,8 +50,11 @@ IncomingCallContext CallContext()
  * 直接驱动 Build 产出的 ServerHandler：匹配/参数/中间件顺序/配置错误等契约
  * 不需要真实 socket，直接断言 Response 比绕网络更精确。
  */
-result<http::Response>
-Dispatch(const http::ServerHandler& handler, std::string method, std::string target, std::string body = {})
+result<http::Response> Dispatch(
+    const http::ServerHandler& handler,
+    std::string method,
+    std::string target,
+    std::string body = {})
 {
     http::IncomingRequest request;
     request.method = std::move(method);

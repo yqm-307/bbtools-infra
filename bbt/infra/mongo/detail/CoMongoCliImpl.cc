@@ -136,8 +136,10 @@ result<std::optional<MongoDocument>> CoMongoCliImpl::FindOne(const MongoDocument
     return result<std::optional<MongoDocument>>::ok(std::move(r).value().doc);
 }
 
-result<MongoUpdateResult>
-CoMongoCliImpl::UpdateOne(const MongoDocument& filter, const MongoDocument& update, const CallOptions& options)
+result<MongoUpdateResult> CoMongoCliImpl::UpdateOne(
+    const MongoDocument& filter,
+    const MongoDocument& update,
+    const CallOptions& options)
 {
     if (filter.bytes.empty())
         return result<MongoUpdateResult>::err(MakeError(ErrorCode::InvalidArgument, "mongo UpdateOne: empty filter"));
@@ -336,8 +338,10 @@ result<std::optional<MongoDocument>> CoMongoCli::FindOne(const MongoDocument& fi
     return m_impl->FindOne(filter, options);
 }
 
-result<MongoUpdateResult>
-CoMongoCli::UpdateOne(const MongoDocument& filter, const MongoDocument& update, const CallOptions& options)
+result<MongoUpdateResult> CoMongoCli::UpdateOne(
+    const MongoDocument& filter,
+    const MongoDocument& update,
+    const CallOptions& options)
 {
     return m_impl->UpdateOne(filter, update, options);
 }
@@ -362,8 +366,8 @@ bbt::coroutine::CoObjectInfo CoMongoCli::GetObjectInfo() const
     return m_impl->GetObjectInfo();
 }
 
-std::shared_ptr<mongo_detail::CoMongoCliImpl>
-mongo_detail::CoMongoCliImpl::ForTest(const std::shared_ptr<CoMongoCli>& client)
+std::shared_ptr<mongo_detail::CoMongoCliImpl> mongo_detail::CoMongoCliImpl::ForTest(
+    const std::shared_ptr<CoMongoCli>& client)
 {
     return std::shared_ptr<CoMongoCliImpl>(client, client->m_impl.get());
 }

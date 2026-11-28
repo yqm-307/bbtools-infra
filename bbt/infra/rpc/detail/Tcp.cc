@@ -77,8 +77,10 @@ Error TcpCallError(std::error_code cause, const char* message, bool committed)
     return error;
 }
 
-result<void>
-TcpSettleWrite(const std::tuple<std::size_t, std::error_code>& report, std::size_t total, const char* message)
+result<void> TcpSettleWrite(
+    const std::tuple<std::size_t, std::error_code>& report,
+    std::size_t total,
+    const char* message)
 {
     const auto [sent, cause] = report;
     if (!cause && sent == total)

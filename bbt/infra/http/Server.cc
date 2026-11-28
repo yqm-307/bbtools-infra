@@ -229,7 +229,12 @@ result<std::string> SerializeResponse(Response response, bool head, bool keep_al
 }
 
 result<std::string> SerializeResponseHead(
-    int status_code, const Headers& headers, bool head, bool chunked, bool keep_alive, const ServerOptions& options)
+    int status_code,
+    const Headers& headers,
+    bool head,
+    bool chunked,
+    bool keep_alive,
+    const ServerOptions& options)
 {
     if (status_code < 200 || status_code > 599) {
         return result<std::string>::err(MakeError(ErrorCode::InvalidArgument, "invalid server response"));
@@ -1085,7 +1090,9 @@ struct Server::State : std::enable_shared_from_this<Server::State> {
     }
 
     bool Dispatch(
-        const std::shared_ptr<Session>& session, const std::shared_ptr<RequestRecord>& record, IncomingRequest request)
+        const std::shared_ptr<Session>& session,
+        const std::shared_ptr<RequestRecord>& record,
+        IncomingRequest request)
     {
         auto state = shared_from_this();
         {
@@ -1331,8 +1338,10 @@ struct Server::State : std::enable_shared_from_this<Server::State> {
      * 写再取 stream_write_timeout 较早者)。commit 后源错误/超时/peer EOF 取消
      * 源并关闭连接（不重发、不写 trailer），只留本地诊断责任。
      */
-    bool
-    WriteStream(const std::shared_ptr<Session>& session, const std::shared_ptr<RequestRecord>& record, bool keep_alive)
+    bool WriteStream(
+        const std::shared_ptr<Session>& session,
+        const std::shared_ptr<RequestRecord>& record,
+        bool keep_alive)
     {
         bool cancel_now = false;
         {
@@ -1482,8 +1491,10 @@ Server::~Server() noexcept
     _BeginClose();
 }
 
-result<std::shared_ptr<Server>>
-Server::Create(std::shared_ptr<net::Engine> engine, ServerHandler handler, ServerOptions options)
+result<std::shared_ptr<Server>> Server::Create(
+    std::shared_ptr<net::Engine> engine,
+    ServerHandler handler,
+    ServerOptions options)
 {
     using R = result<std::shared_ptr<Server>>;
     const auto valid = ValidateNetworkLimits(options.limits);

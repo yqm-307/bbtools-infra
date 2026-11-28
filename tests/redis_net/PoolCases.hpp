@@ -4,8 +4,11 @@
  */
 using PoolAccess = redis::PoolTestAccess;
 
-std::shared_ptr<redis::CoRedisPool>
-PeerPool(Host& host, net::Address address, std::size_t size = 1, std::size_t waiters = 1)
+std::shared_ptr<redis::CoRedisPool> PeerPool(
+    Host& host,
+    net::Address address,
+    std::size_t size = 1,
+    std::size_t waiters = 1)
 {
     auto created = redis::CoRedisPool::Create(host.engine, address, {size, waiters});
     CHECK(created);

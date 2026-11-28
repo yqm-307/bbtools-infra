@@ -346,7 +346,10 @@ struct CoRedisCli::State {
      */
 
     bbt_co_async(result<RawReply>) RedisRoundtrip(
-        std::vector<std::string> args, const CallOptions& options, bool set_nil_ok, net::Connection local)
+        std::vector<std::string> args,
+        const CallOptions& options,
+        bool set_nil_ok,
+        net::Connection local)
     {
         return bbt_co_bind([this, args = std::move(args), options, set_nil_ok, local]() mutable -> result<RawReply> {
             std::vector<const char*> argv;
@@ -527,8 +530,10 @@ result<std::shared_ptr<CoRedisCli>> CoRedisCli::Create(std::shared_ptr<net::Engi
     return Create(std::move(engine), std::move(address), RedisHandshake{});
 }
 
-result<std::shared_ptr<CoRedisCli>>
-CoRedisCli::Create(std::shared_ptr<net::Engine> engine, net::Address address, RedisHandshake handshake)
+result<std::shared_ptr<CoRedisCli>> CoRedisCli::Create(
+    std::shared_ptr<net::Engine> engine,
+    net::Address address,
+    RedisHandshake handshake)
 {
     if (!engine || !address.Valid()
         || (address.Family() != net::AddressFamily::IPv4 && address.Family() != net::AddressFamily::IPv6)) {
@@ -637,7 +642,10 @@ bbt_co_async(result<std::uint64_t>) CoRedisCli::Delete(std::vector<std::string> 
 }
 
 bbt_co_async(result<bool>) CoRedisCli::Set(
-    std::string_view key, std::string_view value, const SetOptions& set_options, const CallOptions& options)
+    std::string_view key,
+    std::string_view value,
+    const SetOptions& set_options,
+    const CallOptions& options)
 {
     return bbt_co_bind(
         [state = state_, key = std::string(key), value = std::string(value), set_options, options]() -> result<bool> {

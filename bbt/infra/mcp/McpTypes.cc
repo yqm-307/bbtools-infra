@@ -124,7 +124,8 @@ Content Content::Text(std::string text)
 namespace bbt::infra::mcp {
 
 result<InputRequired> InputRequired::Create(
-    std::map<std::string, ClientInputRequest> input_requests, std::optional<std::string> request_state)
+    std::map<std::string, ClientInputRequest> input_requests,
+    std::optional<std::string> request_state)
 {
     if (input_requests.empty() && !request_state) {
         Error error;
@@ -168,14 +169,27 @@ bool CancellationView::Cancelled() const noexcept
 
 RequestContext::RequestContext(RequestId id, std::string protocol_version, JsonValue client_capabilities)
     : RequestContext(
-          std::move(id), std::move(protocol_version), std::move(client_capabilities), CancellationView{}, {}, {})
+          std::move(id),
+          std::move(protocol_version),
+          std::move(client_capabilities),
+          CancellationView{},
+          {},
+          {})
 {
 }
 
 RequestContext::RequestContext(
-    RequestId id, std::string protocol_version, JsonValue client_capabilities, CancellationView cancellation)
+    RequestId id,
+    std::string protocol_version,
+    JsonValue client_capabilities,
+    CancellationView cancellation)
     : RequestContext(
-          std::move(id), std::move(protocol_version), std::move(client_capabilities), std::move(cancellation), {}, {})
+          std::move(id),
+          std::move(protocol_version),
+          std::move(client_capabilities),
+          std::move(cancellation),
+          {},
+          {})
 {
 }
 

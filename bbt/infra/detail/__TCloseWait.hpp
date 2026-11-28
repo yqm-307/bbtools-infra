@@ -22,8 +22,9 @@ inline bbt::coroutine::Deadline NextCloseSlice(bbt::coroutine::Deadline deadline
     return std::min(deadline, now + std::chrono::milliseconds(50));
 }
 
-inline result<bool>
-WaitCloseSlice(const std::shared_ptr<bbt::coroutine::sync::CoWaiter>& signal, bbt::coroutine::Deadline until)
+inline result<bool> WaitCloseSlice(
+    const std::shared_ptr<bbt::coroutine::sync::CoWaiter>& signal,
+    bbt::coroutine::Deadline until)
 {
     using bbt::coroutine::WaitStatus;
     if (!signal) {

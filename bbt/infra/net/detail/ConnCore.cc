@@ -82,7 +82,10 @@ ssize_t SendViewsRaw(int fd, const std::string_view* views, std::size_t count, s
 // clang-format on
 
 ConnCore::ConnCore(
-    std::shared_ptr<ConnectionState> state, TcpWait descriptor, Reactor* owner, std::shared_ptr<RawHandler> handler)
+    std::shared_ptr<ConnectionState> state,
+    TcpWait descriptor,
+    Reactor* owner,
+    std::shared_ptr<RawHandler> handler)
     : m_state(std::move(state))
     , m_desc(std::move(descriptor))
     , m_observedFd(m_desc.native_handle())

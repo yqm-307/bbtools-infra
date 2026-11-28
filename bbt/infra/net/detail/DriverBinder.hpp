@@ -37,8 +37,10 @@ public:
      * 失败时 out 不变；若本次已绑定项因解绑被拒而无法回收，移入 *residual
      * （residual 非空时不再承担；为空则返回 no_buffer_space 表示责任未收回）。
      */
-    static std::error_code
-    BindSlots(std::size_t count, std::vector<DriverSlot>& out, std::vector<DriverSlot>* residual = nullptr);
+    static std::error_code BindSlots(
+        std::size_t count,
+        std::vector<DriverSlot>& out,
+        std::vector<DriverSlot>* residual = nullptr);
 
     /**
      * 同代同步解绑：成功项原地移出（不分配额外容器）；解绑被拒项保留在

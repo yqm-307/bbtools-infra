@@ -68,8 +68,9 @@ std::error_code CoTcpConnection::AsyncWrite(std::string data)
     return m_conn.AsyncWrite(std::move(data));
 }
 
-std::tuple<std::size_t, std::error_code>
-CoTcpConnection::Write(std::string data, const bbt::coroutine::WaitOptions& options)
+std::tuple<std::size_t, std::error_code> CoTcpConnection::Write(
+    std::string data,
+    const bbt::coroutine::WaitOptions& options)
 {
     return CoAccess::Write(m_conn, std::move(data), options);
 }

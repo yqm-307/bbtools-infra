@@ -38,7 +38,11 @@ std::shared_ptr<Client> MakeHandshake(Host& host, net::Address address, RedisHan
 }
 
 std::shared_ptr<Pool> MakePoolWith(
-    Host& host, net::Address address, std::size_t connections, std::size_t max_waiters, RedisHandshake handshake = {})
+    Host& host,
+    net::Address address,
+    std::size_t connections,
+    std::size_t max_waiters,
+    RedisHandshake handshake = {})
 {
     Pool::PoolOptions opts{connections, max_waiters, std::move(handshake)};
     auto value = Pool::Create(host.engine, address, opts);

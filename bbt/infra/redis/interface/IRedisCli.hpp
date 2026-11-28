@@ -62,8 +62,11 @@ public:
      *
      * options.expire 越界在接纳前返回 InvalidArgument（零接纳，什么都不发）。空 key 同样 InvalidArgument。
      */
-    virtual bbt_co_async(result<bool>) Set(
-        std::string_view key, std::string_view value, const SetOptions& set_options, const CallOptions& options) = 0;
+    virtual bbt_co_async(result<bool>)
+        Set(std::string_view key,
+            std::string_view value,
+            const SetOptions& set_options,
+            const CallOptions& options) = 0;
 
     /**
      * @brief EXISTS：键存在为 true。

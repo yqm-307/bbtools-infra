@@ -173,8 +173,10 @@ struct McpServer::Impl {
      * 分派（唯一帧入口，内部面）。owner 为本帧的 request 栈外 owner：
      * HandleFrame 在分派前登记、在唯一提交出口按其终态落定 wire 去留。
      */
-    result<DispatchOutcome>
-    Dispatch(McpSession& session, std::string_view raw, const std::shared_ptr<struct RequestOwner>& owner);
+    result<DispatchOutcome> Dispatch(
+        McpSession& session,
+        std::string_view raw,
+        const std::shared_ptr<struct RequestOwner>& owner);
 
     /**
      * 准入 RAII：任何返回路径（含异常）都归还名额。
@@ -218,9 +220,13 @@ struct McpServer::Impl {
     bool Sealed() const;
 
     result<DispatchOutcome> DispatchModern(
-        McpSession& session, const JsonRpcRequest& request, const std::shared_ptr<struct RequestOwner>& owner);
+        McpSession& session,
+        const JsonRpcRequest& request,
+        const std::shared_ptr<struct RequestOwner>& owner);
     result<DispatchOutcome> DispatchLegacy(
-        McpSession& session, const JsonRpcRequest& request, const std::shared_ptr<struct RequestOwner>& owner) const;
+        McpSession& session,
+        const JsonRpcRequest& request,
+        const std::shared_ptr<struct RequestOwner>& owner) const;
     result<DispatchOutcome> HandleInitialize(McpSession& session, const JsonRpcRequest& request) const;
     void ApplyNotification(McpSession& session, const JsonRpcRequest& request);
 
@@ -287,7 +293,10 @@ struct McpServer::Impl {
      * 调用方以 -32600 拒绝重复帧、handler 不双调用。
      */
     std::shared_ptr<RequestOwner> RegisterRequestOwner(
-        const McpSession& session, const RequestId& id, std::chrono::steady_clock::time_point deadline, bool dedup_id);
+        const McpSession& session,
+        const RequestId& id,
+        std::chrono::steady_clock::time_point deadline,
+        bool dedup_id);
     void RetireOwner(const RequestOwner* owner);
     result<std::size_t> PublishResourceChanged(const std::string& uri);
 
@@ -310,8 +319,10 @@ struct McpServer::Impl {
      * 业务方法（resources 与 prompts 各组）。modern 与 legacy 共用同一实现，差异只在
      * 结果外壳（modern 写 resultType/cacheScope）与 legacy 生命周期门禁。
      */
-    result<DispatchOutcome>
-    DispatchBusiness(const RequestContext& context, const JsonRpcRequest& request, bool modern) const;
+    result<DispatchOutcome> DispatchBusiness(
+        const RequestContext& context,
+        const JsonRpcRequest& request,
+        bool modern) const;
 
     /**
      * 真实注册能力（只含已注册的原语；resources 有显式发布入口故宣告

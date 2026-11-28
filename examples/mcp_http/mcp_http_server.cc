@@ -54,8 +54,9 @@ void OnStopSignal(int)
     g_stop = 1;
 }
 
-bbt::infra::result<bbt::infra::mcp::ResourceResult>
-EchoResource(const bbt::infra::mcp::RequestContext&, const std::string& uri)
+bbt::infra::result<bbt::infra::mcp::ResourceResult> EchoResource(
+    const bbt::infra::mcp::RequestContext&,
+    const std::string& uri)
 {
     auto content = bbt::infra::mcp::ResourceContents::Text(uri, "text/plain", "echo:" + uri);
     if (!content)
@@ -65,8 +66,9 @@ EchoResource(const bbt::infra::mcp::RequestContext&, const std::string& uri)
     return bbt::infra::result<bbt::infra::mcp::ResourceResult>::ok(std::move(out));
 }
 
-bbt::infra::result<bbt::infra::mcp::PromptResult>
-EchoPrompt(const bbt::infra::mcp::RequestContext&, const bbt::infra::mcp::JsonValue& arguments)
+bbt::infra::result<bbt::infra::mcp::PromptResult> EchoPrompt(
+    const bbt::infra::mcp::RequestContext&,
+    const bbt::infra::mcp::JsonValue& arguments)
 {
     std::string text = "你好";
     if (arguments.IsObject()) {

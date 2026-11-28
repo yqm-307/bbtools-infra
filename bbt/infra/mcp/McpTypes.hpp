@@ -578,8 +578,9 @@ public:
      * @param request_state opaque 状态字符串
      * @return 两者皆空时为 InvalidArgument
      */
-    static result<InputRequired>
-    Create(std::map<std::string, ClientInputRequest> input_requests, std::optional<std::string> request_state);
+    static result<InputRequired> Create(
+        std::map<std::string, ClientInputRequest> input_requests,
+        std::optional<std::string> request_state);
 
     /**
      * @brief id-keyed 输入请求。
@@ -747,7 +748,10 @@ public:
      * @param cancellation 关闭域只读视图
      */
     RequestContext(
-        RequestId id, std::string protocol_version, JsonValue client_capabilities, CancellationView cancellation);
+        RequestId id,
+        std::string protocol_version,
+        JsonValue client_capabilities,
+        CancellationView cancellation);
 
     /**
      * @brief 完整构造：附带 modern MRTR 重试输入与期限。

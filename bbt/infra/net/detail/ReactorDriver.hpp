@@ -111,8 +111,9 @@ public:
     // clang-format on
 
 private:
-    bbt::coroutine::detail::ProcesserDriverResult
-    RunBounded(bool can_block, std::chrono::steady_clock::duration budget);
+    bbt::coroutine::detail::ProcesserDriverResult RunBounded(
+        bool can_block,
+        std::chrono::steady_clock::duration budget);
     void RecordUnhandledFailure(std::exception_ptr error);
 
     const std::size_t m_tick_budget;

@@ -112,8 +112,9 @@ std::string Shape(const std::string& pattern)
  * 按 pattern 重新从实际请求段取参数名：参数归属最终选中的路由，不能沿用
  * 其它方法同形状候选的名字（POST /u/{name} 选中后不得交付 GET /u/{id} 的名字）。
  */
-std::map<std::string, std::string>
-ExtractParams(const std::vector<std::string>& pattern, const std::vector<std::string>& parts)
+std::map<std::string, std::string> ExtractParams(
+    const std::vector<std::string>& pattern,
+    const std::vector<std::string>& parts)
 {
     std::map<std::string, std::string> params;
     for (std::size_t i = 0; i < pattern.size(); ++i) {

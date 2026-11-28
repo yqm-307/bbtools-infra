@@ -81,8 +81,10 @@ public:
      * @param[out] error 成功时清空，失败时写入原因。
      * @return 被选中的 owner 索引；失败时为 Size()。
      */
-    std::size_t
-    Next(const Address& remote, const std::vector<std::uint64_t>& connection_counts, std::error_code& error);
+    std::size_t Next(
+        const Address& remote,
+        const std::vector<std::uint64_t>& connection_counts,
+        std::error_code& error);
 
 private:
     LoadBalancing mode_{LoadBalancing::RoundRobin};

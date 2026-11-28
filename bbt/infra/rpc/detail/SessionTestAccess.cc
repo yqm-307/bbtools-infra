@@ -23,8 +23,9 @@ std::function<void(std::string_view)> g_attempt_id_barrier;
 
 } // namespace
 
-std::optional<detail::LinkReleaseProbe>
-detail::LinkReleaseProbe::ForPeer(const CoRpcClient& client, const std::string& peer)
+std::optional<detail::LinkReleaseProbe> detail::LinkReleaseProbe::ForPeer(
+    const CoRpcClient& client,
+    const std::string& peer)
 {
     const auto& owner = client.m_owner;
     std::lock_guard<std::mutex> lock(owner->mu);
@@ -37,8 +38,9 @@ detail::LinkReleaseProbe::ForPeer(const CoRpcClient& client, const std::string& 
     return std::nullopt;
 }
 
-std::optional<net::ReclaimReceipt>
-detail::LinkReleaseProbe::EstablishingReceipt(const CoRpcClient& client, const std::string& endpoint)
+std::optional<net::ReclaimReceipt> detail::LinkReleaseProbe::EstablishingReceipt(
+    const CoRpcClient& client,
+    const std::string& endpoint)
 {
     const auto& owner = client.m_owner;
     std::lock_guard<std::mutex> lock(owner->mu);

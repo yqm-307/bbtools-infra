@@ -38,8 +38,9 @@ public:
 
     static Observation Inspect(const Connection& connection);
     static bool ExerciseReadContention(const Connection& connection, const std::function<void()>& during);
-    static bool
-    ExerciseReadContention(const std::shared_ptr<ConnectionState>& state, const std::function<void()>& during);
+    static bool ExerciseReadContention(
+        const std::shared_ptr<ConnectionState>& state,
+        const std::function<void()>& during);
     static bool DeferReceived(const Connection& connection, const std::string& data);
 };
 

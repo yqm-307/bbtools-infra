@@ -65,8 +65,10 @@ std::error_code CoAccess::Read(const Connection& connection, Buffer& out, const 
     return connection.ReadCo(out, options);
 }
 
-std::tuple<std::size_t, std::error_code>
-CoAccess::Write(const Connection& connection, std::string data, const bbt::coroutine::WaitOptions& options)
+std::tuple<std::size_t, std::error_code> CoAccess::Write(
+    const Connection& connection,
+    std::string data,
+    const bbt::coroutine::WaitOptions& options)
 {
     return connection.WriteCo(std::move(data), options);
 }
@@ -94,7 +96,10 @@ ReclaimReceipt CoAccess::MakeReceipt(std::shared_ptr<ReclaimRecord> record)
 }
 
 std::error_code CoAccess::WaitConnect(
-    Engine& engine, std::uint64_t connect_id, Connection& out, const bbt::coroutine::WaitOptions& options)
+    Engine& engine,
+    std::uint64_t connect_id,
+    Connection& out,
+    const bbt::coroutine::WaitOptions& options)
 {
     return engine.CoWaitConnect(connect_id, out, options);
 }

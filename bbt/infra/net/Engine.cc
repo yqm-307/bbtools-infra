@@ -125,8 +125,9 @@ std::size_t Engine::CountConnections() const
     return m_impl->CountConnections();
 }
 
-std::error_code
-Engine::ReactorOwnerIds(std::vector<std::uint64_t>& main_owners, std::vector<std::uint64_t>& sub_owners) const
+std::error_code Engine::ReactorOwnerIds(
+    std::vector<std::uint64_t>& main_owners,
+    std::vector<std::uint64_t>& sub_owners) const
 {
     return m_impl->ReactorOwnerIds(main_owners, sub_owners);
 }
@@ -151,7 +152,9 @@ std::error_code Engine::CoSubmitConnect(const Address& address, std::uint64_t& o
 }
 
 std::error_code Engine::CoSubmitConnect(
-    const Address& address, std::uint64_t& out_connect_id, const std::shared_ptr<ReclaimRecord>& reclaim)
+    const Address& address,
+    std::uint64_t& out_connect_id,
+    const std::shared_ptr<ReclaimRecord>& reclaim)
 {
 
     /**
@@ -244,8 +247,10 @@ result<void> Engine::CoWaitRunning(const bbt::coroutine::WaitOptions& options)
  * CoDial 的领取步骤（内部）：成功才写 out；任何未交付失败都归还 claim 并让
  * owner 回收 fd。有 handler 的 Engine 在写任何等待/取消状态之前拒绝。
  */
-std::error_code
-Engine::CoWaitConnect(std::uint64_t connect_id, Connection& out, const bbt::coroutine::WaitOptions& options)
+std::error_code Engine::CoWaitConnect(
+    std::uint64_t connect_id,
+    Connection& out,
+    const bbt::coroutine::WaitOptions& options)
 {
     return m_impl->CoWaitConnect(connect_id, out, options);
 }

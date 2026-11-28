@@ -200,8 +200,7 @@ template <class F> bool RunInCoroutine(F&& f, int budget_ms = kBudgetMs)
 {
     bbt::core::thread::CountDownLatch done{1};
     bool succ = false;
-    bbtco_noexcept(&succ)[fn = std::forward<F>(f), &done]() mutable
-    {
+    bbtco_noexcept(&succ) [fn = std::forward<F>(f), &done]() mutable {
         fn();
         done.Down();
     };
@@ -326,7 +325,8 @@ std::shared_ptr<mongo_detail::MongoRuntime> RuntimeOf(const std::shared_ptr<mong
  * Release 面同样成立）。Debug 面追加在途 driver 调用计数归零。
  */
 void CloseOwnerAndDrain(
-    const std::shared_ptr<mongo::CoMongoDb>& db, const std::shared_ptr<mongo_detail::MongoRuntime>& rt)
+    const std::shared_ptr<mongo::CoMongoDb>& db,
+    const std::shared_ptr<mongo_detail::MongoRuntime>& rt)
 {
     BOOST_REQUIRE(db->Close(
         bbt::infra::CloseOptions{
@@ -532,8 +532,7 @@ BOOST_AUTO_TEST_CASE(t_owner_close_single_worker_wait_release)
     std::optional<result<std::vector<MongoDocument>>> out;
     std::atomic_bool out_ready{false};
     bool find_task = false;
-    bbtco_noexcept(&find_task)[&, coll]
-    {
+    bbtco_noexcept(&find_task) [&, coll]() {
         out.emplace(bbt_co_await coll->Find(EmptyDoc(), fo, Opt(40000)));
         out_ready.store(true, std::memory_order_release);
     };
@@ -553,8 +552,7 @@ BOOST_AUTO_TEST_CASE(t_owner_close_single_worker_wait_release)
     std::atomic_int ticks{0};
     std::atomic_bool pulse_done{false};
     bool pulse_task = false;
-    bbtco_noexcept(&pulse_task)[&]
-    {
+    bbtco_noexcept(&pulse_task) [&]() {
         while (!in_wait.load(std::memory_order_acquire))
             bbtco_sleep(1);
         while (!close_returned.load(std::memory_order_acquire)) {
@@ -569,8 +567,7 @@ BOOST_AUTO_TEST_CASE(t_owner_close_single_worker_wait_release)
     std::atomic_bool closed_ready{false};
     std::atomic<long long> close_ms{0};
     bool close_task = false;
-    bbtco_noexcept(&close_task)[&]
-    {
+    bbtco_noexcept(&close_task) [&]() {
         CloseOptions options;
         options.mode = CloseMode::Immediate;
         options.wait_release = true;
@@ -787,8 +784,7 @@ BOOST_AUTO_TEST_CASE(t_capacity_overloaded)
     std::atomic_int done{0};
     auto submit = [&](int budget_ms) {
         bool succ = false;
-        bbtco_noexcept(&succ)[&, budget_ms]
-        {
+        bbtco_noexcept(&succ) [&, budget_ms]() {
             auto r = cli->FindOne(EmptyDoc(), Opt(budget_ms));
             if (!r && r.error().code == ErrorCode::Overloaded)
                 overloaded.fetch_add(1);
@@ -852,8 +848,7 @@ BOOST_AUTO_TEST_CASE(t_deadline_only)
     std::optional<result<std::optional<MongoDocument>>> out;
     std::atomic_bool out_ready{false};
     bool succ0 = false;
-    bbtco_noexcept(&succ0)[&]
-    {
+    bbtco_noexcept(&succ0) [&]() {
         out.emplace(cli->FindOne(EmptyDoc(), Opt(500)));
         out_ready.store(true, std::memory_order_release);
     };
@@ -905,8 +900,7 @@ BOOST_AUTO_TEST_CASE(t_close_during_inflight)
     std::optional<result<std::optional<MongoDocument>>> out;
     std::atomic_bool out_ready{false};
     bool succ = false;
-    bbtco_noexcept(&succ)[&]
-    {
+    bbtco_noexcept(&succ) [&]() {
         out.emplace(cli->FindOne(EmptyDoc(), Opt(40000)));
         out_ready.store(true, std::memory_order_release);
     };
@@ -958,8 +952,7 @@ BOOST_AUTO_TEST_CASE(t_worker_threads_bound)
     bbt::core::thread::CountDownLatch all{4};
     for (int i = 0; i < 4; ++i) {
         bool succ = false;
-        bbtco_noexcept(&succ)[&]
-        {
+        bbtco_noexcept(&succ) [&]() {
             // clang-format off
 
             /**
@@ -1176,8 +1169,7 @@ BOOST_AUTO_TEST_CASE(t_finalizer_spawn_failure_bounded)
     std::optional<result<void>> closed;
     std::atomic_bool closed_ready{false};
     bool close_task = false;
-    bbtco_noexcept(&close_task)[&]
-    {
+    bbtco_noexcept(&close_task) [&]() {
         CloseOptions options;
         options.mode = CloseMode::Immediate;
         options.wait_release = true;
@@ -1580,8 +1572,7 @@ BOOST_AUTO_TEST_CASE(t_dp_queue_overloaded)
     std::atomic_int done{0};
     auto submit_find = [&](int budget_ms) {
         bool succ = false;
-        bbtco_noexcept(&succ)[&, budget_ms]
-        {
+        bbtco_noexcept(&succ) [&, budget_ms]() {
             auto r = bbt_co_await coll->Find(EmptyDoc(), fo, Opt(budget_ms));
             if (!r && r.error().code == ErrorCode::Overloaded)
                 overloaded.fetch_add(1);
@@ -1650,8 +1641,7 @@ BOOST_AUTO_TEST_CASE(t_dp_handle_close_scoped)
     fo.limit = 1;
     std::atomic_bool h1_done{false};
     bool succ = false;
-    bbtco_noexcept(&succ)[&]
-    {
+    bbtco_noexcept(&succ) [&]() {
         auto r = bbt_co_await c1->Find(EmptyDoc(), fo, Opt(30000));
         (void)r;
         h1_done.store(true);
@@ -1722,8 +1712,7 @@ BOOST_AUTO_TEST_CASE(t_dp_owner_close_drains_inflight)
     std::atomic_bool out_ready{false};
     std::atomic_bool inflight_at_return{false};
     bool succ = false;
-    bbtco_noexcept(&succ)[&]
-    {
+    bbtco_noexcept(&succ) [&]() {
         out.emplace(bbt_co_await coll->Find(EmptyDoc(), fo, Opt(40000)));
 
         /**
@@ -1813,8 +1802,7 @@ BOOST_AUTO_TEST_CASE(t_owner_close_options_graceful_then_physical)
     std::optional<result<std::vector<MongoDocument>>> out;
     std::atomic_bool out_ready{false};
     bool succ = false;
-    bbtco_noexcept(&succ)[&]
-    {
+    bbtco_noexcept(&succ) [&]() {
         out.emplace(bbt_co_await coll->Find(EmptyDoc(), fo, Opt(40000)));
         out_ready.store(true, std::memory_order_release);
     };
@@ -1830,8 +1818,7 @@ BOOST_AUTO_TEST_CASE(t_owner_close_options_graceful_then_physical)
     std::atomic_bool graceful_ready{false};
     std::atomic<long long> graceful_ms{0};
     bool close_task = false;
-    bbtco_noexcept(&close_task)[&]
-    {
+    bbtco_noexcept(&close_task) [&]() {
         const auto begin = std::chrono::steady_clock::now();
         graceful.emplace(
             db->Close(CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::milliseconds{1000})));
@@ -1899,8 +1886,7 @@ BOOST_AUTO_TEST_CASE(t_owner_close_immediate_keeps_driver_thread)
     std::optional<result<std::vector<MongoDocument>>> out;
     std::atomic_bool out_ready{false};
     bool succ = false;
-    bbtco_noexcept(&succ)[&]
-    {
+    bbtco_noexcept(&succ) [&]() {
         out.emplace(bbt_co_await coll->Find(EmptyDoc(), fo, Opt(40000)));
         out_ready.store(true, std::memory_order_release);
     };
@@ -1971,8 +1957,7 @@ BOOST_AUTO_TEST_CASE(t_owner_wait_stopped_preconditions)
     std::optional<result<void>> from_co;
     std::atomic_bool from_co_ready{false};
     bool succ = false;
-    bbtco_noexcept(&succ)[&]
-    {
+    bbtco_noexcept(&succ) [&]() {
         from_co.emplace(db->Close(
             bbt::infra::CloseOptions{
                 bbt::infra::CloseMode::Immediate,
@@ -2021,8 +2006,7 @@ BOOST_AUTO_TEST_CASE(t_owner_wait_release_co_suspends_until_physical)
     std::optional<result<std::vector<MongoDocument>>> out;
     std::atomic_bool out_ready{false};
     bool succ = false;
-    bbtco_noexcept(&succ)[&]
-    {
+    bbtco_noexcept(&succ) [&]() {
         out.emplace(bbt_co_await coll->Find(EmptyDoc(), fo, Opt(40000)));
         out_ready.store(true, std::memory_order_release);
     };
@@ -2037,8 +2021,7 @@ BOOST_AUTO_TEST_CASE(t_owner_wait_release_co_suspends_until_physical)
     std::atomic_int ticks{0};
     std::atomic_bool pulse_done{false};
     bool pulse_task = false;
-    bbtco_noexcept(&pulse_task)[&]
-    {
+    bbtco_noexcept(&pulse_task) [&]() {
         while (window.load(std::memory_order_acquire) == CloseWaitWindow::kNotStarted)
             bbtco_sleep(1);
         while (window.load(std::memory_order_acquire) == CloseWaitWindow::kInFlight) {
@@ -2053,8 +2036,7 @@ BOOST_AUTO_TEST_CASE(t_owner_wait_release_co_suspends_until_physical)
     std::atomic_bool closed_ready{false};
     std::atomic<long long> close_ms{0};
     bool close_task = false;
-    bbtco_noexcept(&close_task)[&]
-    {
+    bbtco_noexcept(&close_task) [&]() {
         CloseOptions options;
         options.mode = CloseMode::Immediate;
         options.wait_release = true;
@@ -2117,8 +2099,7 @@ BOOST_AUTO_TEST_CASE(t_owner_wait_release_timeout_keeps_worker)
     std::optional<result<std::vector<MongoDocument>>> out;
     std::atomic_bool out_ready{false};
     bool succ = false;
-    bbtco_noexcept(&succ)[&]
-    {
+    bbtco_noexcept(&succ) [&]() {
         out.emplace(bbt_co_await coll->Find(EmptyDoc(), fo, Opt(40000)));
         out_ready.store(true, std::memory_order_release);
     };
@@ -2131,8 +2112,7 @@ BOOST_AUTO_TEST_CASE(t_owner_wait_release_timeout_keeps_worker)
     std::optional<result<void>> closed;
     std::atomic_bool closed_ready{false};
     bool close_task = false;
-    bbtco_noexcept(&close_task)[&]
-    {
+    bbtco_noexcept(&close_task) [&]() {
         CloseOptions options;
         options.mode = CloseMode::Immediate;
         options.wait_release = true;
@@ -2239,8 +2219,7 @@ BOOST_AUTO_TEST_CASE(t_owner_release_last_ref_in_coroutine_no_join)
     std::optional<result<std::vector<MongoDocument>>> out;
     std::atomic_bool out_ready{false};
     bool succ = false;
-    bbtco_noexcept(&succ)[&]
-    {
+    bbtco_noexcept(&succ) [&]() {
         out.emplace(bbt_co_await coll->Find(EmptyDoc(), fo, Opt(40000)));
         out_ready.store(true, std::memory_order_release);
     };
@@ -2255,8 +2234,7 @@ BOOST_AUTO_TEST_CASE(t_owner_release_last_ref_in_coroutine_no_join)
     std::atomic_int post_drop_ticks{0};
     std::atomic_bool pulse_done{false};
     bool pulse_task = false;
-    bbtco_noexcept(&pulse_task)[&]
-    {
+    bbtco_noexcept(&pulse_task) [&]() {
         while (!dropped.load(std::memory_order_acquire))
             bbtco_sleep(1);
         while (!rt->IsClosed()) {
@@ -2275,8 +2253,7 @@ BOOST_AUTO_TEST_CASE(t_owner_release_last_ref_in_coroutine_no_join)
     std::atomic<long long> drop_ms{0};
     std::atomic_bool workers_alive_at_drop{false};
     bool drop_task = false;
-    bbtco_noexcept(&drop_task)[&]
-    {
+    bbtco_noexcept(&drop_task) [&]() {
         const auto begin = std::chrono::steady_clock::now();
         db.reset();
         drop_ms.store(
@@ -2358,8 +2335,7 @@ BOOST_AUTO_TEST_CASE(t_owner_runtime_last_ref_reclaimed)
     std::atomic_bool out_ready{false};
     bool find_task = false;
     auto* hp = coll.get();
-    bbtco_noexcept(&find_task)[&, hp]
-    {
+    bbtco_noexcept(&find_task) [&, hp]() {
         out.emplace(bbt_co_await hp->Find(EmptyDoc(), fo, Opt(40000)));
         out_ready.store(true, std::memory_order_release);
     };
@@ -2374,8 +2350,7 @@ BOOST_AUTO_TEST_CASE(t_owner_runtime_last_ref_reclaimed)
     std::atomic_bool workers_alive_at_drop{false};
     std::atomic<long long> drop_ms{0};
     bool drop_task = false;
-    bbtco_noexcept(&drop_task)[&]
-    {
+    bbtco_noexcept(&drop_task) [&]() {
         const auto begin = std::chrono::steady_clock::now();
         workers_alive_at_drop.store(rt->LiveWorkersForTest() == 1);
         db.reset();
@@ -2457,8 +2432,7 @@ BOOST_AUTO_TEST_CASE(t_owner_finalizer_handoff_overlaps_last_ref)
     std::atomic<long long> drop_ms{0};
     std::atomic<std::thread::id> drop_thread{};
     bool drop_task = false;
-    bbtco_noexcept(&drop_task)[&]
-    {
+    bbtco_noexcept(&drop_task) [&]() {
         const auto begin = std::chrono::steady_clock::now();
         db.reset();
         coll.reset();
@@ -2565,8 +2539,7 @@ BOOST_AUTO_TEST_CASE(t_owner_multi_handles_share_workers)
     for (auto& h : handles) {
         bool succ = false;
         auto* hp = h.get();
-        bbtco_noexcept(&succ)[hp, &submitted]
-        {
+        bbtco_noexcept(&succ) [hp, &submitted]() {
             auto r = bbt_co_await hp->FindOne(EmptyDoc(), Opt(30000));
             (void)r;
             submitted.fetch_add(1);
@@ -2711,8 +2684,7 @@ BOOST_AUTO_TEST_CASE(t_shared_backpressure_queue_one)
     std::atomic_int c_done{0};
     auto submit = [&](mongo::CoMongoColl* h, std::atomic_int& overloaded, std::atomic_int& done, int budget_ms) {
         bool succ = false;
-        bbtco_noexcept(&succ)[h, budget_ms, &overloaded, &done]
-        {
+        bbtco_noexcept(&succ) [h, budget_ms, &overloaded, &done]() {
             auto r = bbt_co_await h->FindOne(EmptyDoc(), Opt(budget_ms));
             if (!r && r.error().code == ErrorCode::Overloaded)
                 overloaded.fetch_add(1);
@@ -2804,8 +2776,7 @@ BOOST_AUTO_TEST_CASE(t_handle_close_scoped)
      */
     std::atomic_bool h1_done{false};
     bool succ = false;
-    bbtco_noexcept(&succ)[&]
-    {
+    bbtco_noexcept(&succ) [&]() {
         auto r = bbt_co_await c1->FindOne(EmptyDoc(), Opt(30000));
         (void)r;
         h1_done.store(true);
@@ -2836,8 +2807,7 @@ BOOST_AUTO_TEST_CASE(t_handle_close_scoped)
      * 在途收口后正常执行）。
      */
     std::atomic_bool h2_done{false};
-    bbtco_noexcept(&succ)[&]
-    {
+    bbtco_noexcept(&succ) [&]() {
         auto r = bbt_co_await c2->FindOne(EmptyDoc(), Opt(30000));
         (void)r;
         h2_done.store(true);
@@ -2910,8 +2880,7 @@ BOOST_AUTO_TEST_CASE(t_owner_close_not_premature_during_inflight)
      */
     for (int i = 0; i < 2; ++i) {
         bool succ = false;
-        bbtco_noexcept(&succ)[hp]
-        {
+        bbtco_noexcept(&succ) [hp]() {
             auto r = bbt_co_await hp->FindOne(EmptyDoc(), Opt(30000));
             (void)r;
         };
@@ -2977,8 +2946,7 @@ BOOST_AUTO_TEST_CASE(t_owner_concurrent_close_two_threads)
      */
     for (int i = 0; i < 3; ++i) {
         bool succ = false;
-        bbtco_noexcept(&succ)[hp]
-        {
+        bbtco_noexcept(&succ) [hp]() {
             auto r = bbt_co_await hp->FindOne(EmptyDoc(), Opt(30000));
             (void)r;
         };

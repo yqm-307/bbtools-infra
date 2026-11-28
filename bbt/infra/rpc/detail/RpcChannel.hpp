@@ -59,8 +59,9 @@ public:
     /**
      * @brief 同一绝对 deadline 依次等容量、接纳与本地完成；不等待业务回包。
      */
-    virtual std::tuple<std::size_t, std::error_code>
-    WriteBytes(std::string bytes, const bbt::coroutine::WaitOptions& options) = 0;
+    virtual std::tuple<std::size_t, std::error_code> WriteBytes(
+        std::string bytes,
+        const bbt::coroutine::WaitOptions& options) = 0;
 
     /**
      * @brief 请求物理封口：任意域、不挂起、幂等；首次 reason 固定。
@@ -128,8 +129,9 @@ public:
 
     std::error_code WriteBytes(std::string bytes) override { return m_conn.AsyncWrite(std::move(bytes)); }
 
-    std::tuple<std::size_t, std::error_code>
-    WriteBytes(std::string bytes, const bbt::coroutine::WaitOptions& options) override
+    std::tuple<std::size_t, std::error_code> WriteBytes(
+        std::string bytes,
+        const bbt::coroutine::WaitOptions& options) override
     {
         return m_conn.Write(std::move(bytes), options);
     }

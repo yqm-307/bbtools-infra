@@ -193,8 +193,11 @@ public:
      * @param error 失败时填充的错误（可空）
      * @return 是否编译成功
      */
-    static bool
-    Compile(const JsonValue& schema, const SchemaOptions& options, SchemaValidator* out, SchemaError* error);
+    static bool Compile(
+        const JsonValue& schema,
+        const SchemaOptions& options,
+        SchemaValidator* out,
+        SchemaError* error);
 
     /**
      * @brief 验证 instance（线程安全，可并发调用）。
