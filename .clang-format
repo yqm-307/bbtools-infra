@@ -32,5 +32,8 @@ AlignTrailingComments:
 BreakConstructorInitializers: BeforeComma
 PackConstructorInitializers: Never
 AlignAfterOpenBracket: AlwaysBreak
+# 长函数签名优先在左括号后断行，让返回类型和函数名留在一起，每行一个参数。
+PenaltyReturnTypeOnItsOwnLine: 1000
+AllowAllParametersOfDeclarationOnNextLine: false
 BinPackParameters: false
 BinPackArguments: false
