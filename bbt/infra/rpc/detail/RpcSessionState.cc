@@ -195,7 +195,7 @@ bool ServerState::DrainedLocked() const
      * 在写项不属于排队丢弃口径）——不能用 !dead 跳过。
      */
     for (const auto& lease : links) {
-        if (auto session = lease.session.lock(); session && session->writes_outstanding.load() != 0) {
+        if (auto session = lease.session.lock(); session && session->OutstandingWrites() != 0) {
             return false;
         }
     }
@@ -225,6 +225,18 @@ void ServerState::NoteInflight(std::size_t lane, long delta)
     value = static_cast<std::uint64_t>(static_cast<long>(value) + delta);
     if (close_signal) {
         close_signal->Notify();
+    }
+}
+
+void ServerState::NoteReplyOpenedLocked()
+{
+    ++open_replies;
+}
+
+void ServerState::NoteReplySettledLocked()
+{
+    if (open_replies != 0) {
+        --open_replies;
     }
 }
 

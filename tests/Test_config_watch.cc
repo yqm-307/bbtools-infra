@@ -60,27 +60,29 @@ Value Map(std::initializer_list<std::pair<std::string, std::string>> kv)
     return Value::FromMap(std::move(m));
 }
 
-struct EventLog {
-    std::mutex mtx;
-    std::vector<WatchEvent> events;
-
+class EventLog {
+public:
     void Add(WatchEvent e)
     {
-        std::lock_guard<std::mutex> lk(mtx);
-        events.push_back(std::move(e));
+        std::lock_guard<std::mutex> lk(m_mtx);
+        m_events.push_back(std::move(e));
     }
 
     std::size_t Size()
     {
-        std::lock_guard<std::mutex> lk(mtx);
-        return events.size();
+        std::lock_guard<std::mutex> lk(m_mtx);
+        return m_events.size();
     }
 
     WatchEvent At(std::size_t i)
     {
-        std::lock_guard<std::mutex> lk(mtx);
-        return events.at(i);
+        std::lock_guard<std::mutex> lk(m_mtx);
+        return m_events.at(i);
     }
+
+private:
+    std::mutex m_mtx;
+    std::vector<WatchEvent> m_events;
 };
 
 bool WaitUntil(const std::function<bool()>& cond, int timeout_ms)
@@ -136,20 +138,17 @@ std::string MakeTempFile(const char* name, const std::string& content)
 /**
  * 「关闭与正在读取/待投递通知交错」的确定性测试源：Read() 在本次拍内
  * 执行测试指定的关闭（不阻塞线程、不 sleep），命中次序由原子计数握手
- * 指定。关闭在轮询协程内联调用 RequestClose() —— 契约规定回调/源内可
- * 调用 RequestClose()，封口后本拍已读出的结果被丢弃、循环在下一拍退出。
+ * 指定。关闭在轮询协程内联调用 Close(Immediate) —— 契约规定回调/源内可
+ * 调用 Close(Immediate)，封口后本拍已读出的结果被丢弃、循环在下一拍退出。
  */
-struct GateSource : ISource {
+class GateSource : public ISource {
+public:
     std::atomic<int> reads{0};
 
-    /**
-     * 非 owning：Watcher 生命周期由测试持有
-     */
+    /* 非 owning：Watcher 生命周期由测试持有。 */
     std::atomic<Watcher*> closer{nullptr};
 
-    /**
-     * 命中该读次序时于同一拍内关闭
-     */
+    /* 命中该读次序时于同一拍内关闭。 */
     std::atomic<int> close_on_read{0};
     std::atomic<bool> close_requested_from_tick{false};
     Snapshot current;
@@ -171,7 +170,7 @@ struct GateSource : ISource {
 
             /**
              * 本拍读到的是新版本（其余拍在本窗口内仍返回旧版本，不产生事件），
-             * 随后在同一拍内 RequestClose()：该更新事件必须被丢弃。
+             * 随后在同一拍内 Close(Immediate)：该更新事件必须被丢弃。
              */
             current.version = 2;
             current.revision = "rev-2";
@@ -190,14 +189,13 @@ struct GateSource : ISource {
 /**
  * 测试门闩：gate 为 true 时 Read 自旋阻塞在轮询协程内，制造「协程确实未
  * 退出」的确定性窗口（突破「Read 必须同步返回」的前置——仅用于负向探针，
- * 验证 WaitStopped 在协程未退出时返回 TimedOut 而不冒充完成）。
+ * 验证 wait_release 在协程未退出时返回 TimedOut 而不冒充完成）。
  */
-struct BlockableSource : ISource {
+class BlockableSource : public ISource {
+public:
     std::atomic<int> reads{0};
 
-    /**
-     * true：Read 自旋，直到测试放行
-     */
+    /* true：Read 自旋，直到测试放行。 */
     std::atomic<bool> gate{false};
     Snapshot current;
 
@@ -230,7 +228,8 @@ struct BlockableSource : ISource {
  * 带析构标记的测试源：验证收口之后耐久资源（源）随句柄释放而析构，
  * 不依赖被销毁协程的栈展开。
  */
-struct TrackedSource : ISource {
+class TrackedSource : public ISource {
+public:
     std::shared_ptr<std::atomic_bool> destroyed;
     Snapshot current;
 
@@ -317,7 +316,7 @@ BOOST_AUTO_TEST_CASE(watch_initial_dedup_update_memory)
     BOOST_CHECK_EQUAL(port.value(), 9090);
 
     /**
-     * 显式收口：RequestClose 封口（IsClosed 报逻辑封口），WaitStopped 等
+     * 显式收口：Close 封口（IsClosed 报逻辑封口），wait_release 等
      * 轮询协程真退出——返回即等待与定时器已释放，物理收口落定。
      */
     (void)watcher->Close(bbt::infra::CloseOptions::Immediate());
@@ -380,14 +379,14 @@ BOOST_AUTO_TEST_CASE(watch_close_during_inflight_read_drops_pending_event)
     BOOST_CHECK(log->At(0).kind == WatchEventKind::Initial);
 
     /**
-     * 武装：下一拍在 Read 内（投递之前）RequestClose()。
+     * 武装：下一拍在 Read 内（投递之前）Close(Immediate)。
      */
     source->closer.store(watcher.get(), std::memory_order_release);
     source->close_on_read.store(source->reads.load() + 1, std::memory_order_release);
 
     /**
-     * 关闭在轮询协程内发生：RequestClose 是逻辑封口，IsClosed 立即为真；
-     * 物理退出由 WaitStopped 证明。
+     * 关闭在轮询协程内发生：Close 是逻辑封口，IsClosed 立即为真；
+     * 物理退出由 wait_release 证明。
      */
     BOOST_REQUIRE(WaitUntil([&] { return watcher->IsClosed(); }, 3000));
     auto stopped = watcher->Close(
@@ -480,8 +479,8 @@ BOOST_AUTO_TEST_CASE(watch_failure_recovery_file)
 
 /**
  * 资源边界（进程寿命修订版）：轮询协程确定性地挂起在 poll_interval 睡眠中
- * （初始投递后循环进入 200ms 挂起），此时 RequestClose() 必须封口并唤醒它，
- * WaitStopped 在调用线程上等它真退出；释放句柄后源（耐久资源）由
+ * （初始投递后循环进入 200ms 挂起），此时 Close() 必须封口并唤醒它，
+ * wait_release 在调用线程上等它真退出；释放句柄后源（耐久资源）由
  * 句柄析构释放——不再用 Scheduler::Stop 的硬停/栈不展开口径。
  */
 BOOST_AUTO_TEST_CASE(watch_close_stops_loop_and_releases_source)
@@ -509,7 +508,7 @@ BOOST_AUTO_TEST_CASE(watch_close_stops_loop_and_releases_source)
     BOOST_REQUIRE(WaitUntil([&] { return log->Size() >= 1; }, 2000));
 
     /**
-     * 初始投递后循环已进入 200ms 挂起；再等 100ms，确保 RequestClose 命中挂起点。
+     * 初始投递后循环已进入 200ms 挂起；再等 100ms，确保 Close 命中挂起点。
      */
     SleepRawMs(100);
 
@@ -519,7 +518,7 @@ BOOST_AUTO_TEST_CASE(watch_close_stops_loop_and_releases_source)
     BOOST_CHECK(!destroyed->load());
 
     /**
-     * 显式收口：RequestClose 封口 + 唤醒挂起的轮询协程，WaitStopped 等其退出。
+     * 显式收口：Close 封口 + 唤醒挂起的轮询协程，wait_release 等其退出。
      */
     (void)watcher->Close(bbt::infra::CloseOptions::Immediate());
     BOOST_CHECK(watcher->IsClosed());
@@ -549,7 +548,7 @@ BOOST_AUTO_TEST_CASE(watch_close_stops_loop_and_releases_source)
 }
 
 /**
- * 未封口的 WaitStopped 不是合法等待（轮询协程不会自行退出），返回
+ * 未封口的 wait_release 不是合法等待（轮询协程不会自行退出），返回
  * InvalidArgument——关闭决定归 owner，不允许「等一个永不发生的事件」。
  */
 BOOST_AUTO_TEST_CASE(watch_close_release_requires_finite_deadline)
@@ -575,11 +574,11 @@ BOOST_AUTO_TEST_CASE(watch_close_release_requires_finite_deadline)
 }
 
 /**
- * 回调内 RequestClose 只完成逻辑封口（不提前 MarkClosed），外部
- * WaitStopped 等到的是协程真实退出；回调内 WaitStopped 是等待自身，
+ * 回调内 Close(Immediate) 只完成逻辑封口（不提前 MarkClosed），外部
+ * wait_release 等到的是协程真实退出；回调内 Close(Graceful) 是等待自身，
  * 立即返回 InvalidContext。
  */
-BOOST_AUTO_TEST_CASE(watch_request_close_from_callback_then_waitstopped)
+BOOST_AUTO_TEST_CASE(watch_close_from_callback_then_wait_release)
 {
     BOOST_REQUIRE(EnsureRuntime());
 
@@ -590,8 +589,8 @@ BOOST_AUTO_TEST_CASE(watch_request_close_from_callback_then_waitstopped)
         std::atomic<int> calls{0};
         std::atomic<Watcher*> watcher{nullptr};
         std::atomic<bool> create_returned{false};
-        std::atomic<bool> waitstopped_from_callback_done{false};
-        std::atomic<int> waitstopped_from_callback_code{0};
+        std::atomic<bool> close_from_callback_done{false};
+        std::atomic<int> close_from_callback_code{0};
     };
 
     auto probe = std::make_shared<CallbackProbe>();
@@ -619,19 +618,19 @@ BOOST_AUTO_TEST_CASE(watch_request_close_from_callback_then_waitstopped)
                     /**
                      * 发布门超时：记失败码离开（不触发空指针解引用）。
                      */
-                    probe->waitstopped_from_callback_code.store(-1, std::memory_order_release);
-                    probe->waitstopped_from_callback_done.store(true, std::memory_order_release);
+                    probe->close_from_callback_code.store(-1, std::memory_order_release);
+                    probe->close_from_callback_done.store(true, std::memory_order_release);
                     return;
                 }
 
                 /**
-                 * 回调内 WaitStopped：受管协程域，必须立即 InvalidContext。
+                 * 回调内 Close(Graceful)：等待自身，必须立即 InvalidContext。
                  */
                 auto r = w->Close(
                     bbt::infra::CloseOptions::Graceful(std::chrono::steady_clock::now() + std::chrono::seconds(1)));
-                probe->waitstopped_from_callback_code.store(
+                probe->close_from_callback_code.store(
                     r ? 0 : static_cast<int>(r.error().code), std::memory_order_release);
-                probe->waitstopped_from_callback_done.store(true, std::memory_order_release);
+                probe->close_from_callback_done.store(true, std::memory_order_release);
 
                 /**
                  * 回调内自关闭：只逻辑封口，循环在回调返回后的下一拍退出。
@@ -645,8 +644,8 @@ BOOST_AUTO_TEST_CASE(watch_request_close_from_callback_then_waitstopped)
     probe->watcher.store(watcher.get(), std::memory_order_release);
     probe->create_returned.store(true, std::memory_order_release);
 
-    BOOST_REQUIRE(WaitUntil([&] { return probe->waitstopped_from_callback_done.load(); }, 3000));
-    BOOST_CHECK(probe->waitstopped_from_callback_code.load() == static_cast<int>(ErrorCode::InvalidContext));
+    BOOST_REQUIRE(WaitUntil([&] { return probe->close_from_callback_done.load(); }, 3000));
+    BOOST_CHECK(probe->close_from_callback_code.load() == static_cast<int>(ErrorCode::InvalidContext));
 
     /**
      * 逻辑封口立即为真
@@ -665,10 +664,10 @@ BOOST_AUTO_TEST_CASE(watch_request_close_from_callback_then_waitstopped)
 }
 
 /**
- * 协程确实未退出时 WaitStopped 到期返回 TimedOut，不冒充完成；
- * 放行后同一 watcher 的 WaitStopped 成功（真实退出），不残留等待责任。
+ * 协程确实未退出时 wait_release 到期返回 TimedOut，不冒充完成；
+ * 放行后同一 watcher 的 wait_release 成功（真实退出），不残留等待责任。
  */
-BOOST_AUTO_TEST_CASE(watch_waitstopped_timeout_not_fake_completion)
+BOOST_AUTO_TEST_CASE(watch_wait_release_timeout_not_fake_completion)
 {
     BOOST_REQUIRE(EnsureRuntime());
 
@@ -708,7 +707,7 @@ BOOST_AUTO_TEST_CASE(watch_waitstopped_timeout_not_fake_completion)
     BOOST_CHECK(static_cast<int>(timed_out.error().code) == static_cast<int>(ErrorCode::TimedOut));
 
     /**
-     * 放行：本拍返回后下一拍见封口退出，WaitStopped 真实成功。
+     * 放行：本拍返回后下一拍见封口退出，wait_release 真实成功。
      */
     source->gate.store(false, std::memory_order_release);
     auto stopped = watcher->Close(
@@ -725,8 +724,8 @@ BOOST_AUTO_TEST_CASE(watch_waitstopped_timeout_not_fake_completion)
  * 复现探针（非回归用例）：Watcher::Create 注册轮询协程后、返回前，
  * 运行时可在另一线程调度首个 initial 回调。若回调首次执行时测试尚未
  * 发布 Watcher*（probe->watcher 仍为 nullptr），则
- * watch_request_close_from_callback_then_waitstopped 的 `w->WaitStopped()`
- * 是空指针解引用。本探针不改写既有测试：循环 N 次，记录首次回调
+ * watch_close_from_callback_then_wait_release 在回调内读 `w` 就是
+ * 空指针解引用。本探针不改写既有测试：循环 N 次，记录首次回调
  * (a) 是否运行在 Create 返回前（create_returned==false），
  * (b) 是否看到 probe->watcher 仍为 nullptr。
  */
@@ -765,7 +764,7 @@ BOOST_AUTO_TEST_CASE(probe_initial_callback_before_watcher_published)
 
                     /**
                      * 修复后：回调侧按发布门等待 watcher 指针（同
-                     * watch_request_close_from_callback_then_waitstopped），
+                     * watch_close_from_callback_then_wait_release），
                      * 故首调读到的必非 nullptr——该位仍是产品可见事实。
                      */
                     if (probe->create_returned.load(std::memory_order_acquire)
@@ -813,9 +812,9 @@ BOOST_AUTO_TEST_CASE(probe_initial_callback_before_watcher_published)
 }
 
 /**
- * ==================== CloseOptions 分层关闭（T5/D10 adapters） ====================
- * 三条终态分别取证：Close/RequestClose 后逻辑封口（IsClosed/CloseReason 可读）、
- * Graceful 等已获准回调返回（责任终态）、WaitStopped 等轮询协程退出（物理）。
+ * ==================== CloseOptions 分层关闭 ====================
+ * 三条终态分别取证：Close 后逻辑封口（IsClosed/CloseReason 可读）、
+ * Graceful 等已获准回调返回（责任终态）、wait_release 等轮询协程退出（物理）。
  * 并发项：Co 域 Graceful 用 50ms 分片，等待期间同 worker 的 pulse 协程必须继续推进。
  */
 namespace {
@@ -839,31 +838,35 @@ void CoSleepMs(int ms)
  * 首个回调内阻塞（native 条件变量）：用来把「已获准回调尚未返回」这一阶段
  * 确定性钉住。回调不得阻塞是契约前置，这里只在用例内短窗口使用并自行释放。
  */
-struct BlockingCallback {
-    std::mutex mtx;
-    std::condition_variable cv;
+class BlockingCallback {
+public:
     std::atomic_bool entered{false};
     std::atomic_bool release{false};
     std::atomic_int calls{0};
-    std::atomic<long long> left_at{0};
+    std::atomic_long left_at{0};
 
     void operator()(const WatchEvent&)
     {
         calls.fetch_add(1);
         entered.store(true, std::memory_order_release);
-        std::unique_lock<std::mutex> lk(mtx);
-        cv.wait_for(lk, std::chrono::seconds(10), [this] { return release.load(); });
+        std::unique_lock<std::mutex> lk(m_mtx);
+        m_cv.wait_for(lk, std::chrono::seconds(10), [this] { return release.load(); });
         left_at.store(CloseNowMs(), std::memory_order_release);
     }
 
     void Release()
     {
         {
-            std::lock_guard<std::mutex> lk(mtx);
+            std::lock_guard<std::mutex> lk(m_mtx);
             release.store(true);
         }
-        cv.notify_all();
+        m_cv.notify_all();
     }
+
+private:
+    /* 保护 release 的等待谓词。 */
+    std::mutex m_mtx;
+    std::condition_variable m_cv;
 };
 
 // clang-format off
@@ -922,7 +925,7 @@ BOOST_AUTO_TEST_CASE(watch_close_options_native_graceful_timeout_keeps_responsib
     BOOST_CHECK_EQUAL(after->message, reason->message);
 
     /**
-     * 物理终态仍由 WaitStopped 证明；回调不重复。
+     * 物理终态仍由 wait_release 证明；回调不重复。
      */
     auto stopped = watcher->Close(
         bbt::infra::CloseOptions{
@@ -1014,7 +1017,7 @@ BOOST_AUTO_TEST_CASE(watch_close_options_co_graceful_does_not_block_workers)
 
 /**
  * 自等待拒绝：回调内 Graceful 等的是自己 → 副作用前 InvalidContext；Immediate
- * 与 RequestClose 在回调内合法（封口但不等待）。
+ * 在回调内合法（封口但不等待）。
  */
 BOOST_AUTO_TEST_CASE(watch_close_options_self_wait_rejected)
 {
@@ -1099,13 +1102,14 @@ BOOST_AUTO_TEST_CASE(watch_close_options_rejects_unbounded_graceful)
      */
     BOOST_CHECK(!watcher->IsClosed());
 
-    /**
-     * Co 受管协程域请求 wait_release：物理凭据只由 native-only 的 WaitStopped 提供，
-     * 该组合在副作用前按 InvalidArgument 拒绝，对象仍保持打开。
-     */
     std::optional<bbt::infra::result<void>> co_release;
     std::atomic_bool co_done{false};
     bool co_registered = false;
+
+    /**
+     * Co 受管协程域请求 wait_release：物理凭据只在 native 宿主域提供，
+     * 该组合在副作用前按 InvalidArgument 拒绝，对象仍保持打开。
+     */
     bbtco_noexcept(&co_registered) [&]() {
         bbt::infra::CloseOptions options = bbt::infra::CloseOptions::Immediate();
         options.wait_release = true;
@@ -1120,13 +1124,14 @@ BOOST_AUTO_TEST_CASE(watch_close_options_rejects_unbounded_graceful)
     BOOST_CHECK(co_release->error().code == ErrorCode::InvalidArgument);
     BOOST_CHECK(!watcher->IsClosed());
 
-    /**
-     * native 宿主域的 wait_release：同一 Close 内等轮询协程真实退出，成功返回即
-     * 物理终态（WaitStopped 只是幂等复核）。
-     */
     bbt::infra::CloseOptions native_release = bbt::infra::CloseOptions::Immediate();
     native_release.wait_release = true;
     native_release.deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+
+    /**
+     * native 宿主域的 wait_release：同一 Close 内等轮询协程真实退出，成功返回即
+     * 物理终态（后续 wait_release 只是幂等复核）。
+     */
     BOOST_REQUIRE(watcher->Close(native_release));
     auto stopped = watcher->Close(
         bbt::infra::CloseOptions{

@@ -68,7 +68,7 @@
 
 ## 4. framework 唯一消费映射
 
-framework 不注册 `Server::RegisterRpc`：其 service/method 表带 actor key 提取、schema 校验与有序入口，且 ADR 0014 §4.2 要求「唯一按序接纳入口」。注册路由会为每帧派生独立协程、绕过该 FIFO 与有序接纳，故 framework 一律走 admission handler（未注册路由即回落 admission，`Session.cc:1433` `DispatchAdmission` 已验证）。
+framework 不注册 `Server::RegisterRpc`：其 service/method 表带 actor key 提取、schema 校验与有序入口，且 ADR 0014 §4.2 要求「唯一按序接纳入口」。注册路由会为每帧派生独立协程、绕过该 FIFO 与有序接纳，故 framework 一律走 admission handler（未注册路由即回落 admission，`detail/RpcInbound.cc:512` 的 `DispatchAdmission` 已验证）。
 
 | 职责 | 唯一入口 | 必须保持的不变量 |
 |---|---|---|
@@ -99,7 +99,7 @@ infra 删除（整文件）：`bbt/infra/rpc/{RpcWire,Transport,HttpTransport,Tc
 
 framework 删除（整文件）：`internal/RpcWireBridge.{hpp,cc}`、`internal/RpcHttpBridge.{hpp,cc}`、`tests/Test_framework_rpc_profile.cc`；`CoAppOptions::inbound_bridge`、`RpcInboundBridge`、`RpcEgressProfile`、`RpcSendAppFn` 的旧签名、`RpcCallView` 的 `RpcAddress` 字段。
 
-保留（不得整块误删）：`bbt::infra::Codec<T>`、`rpc::RpcPayload` 与 `bbt.rpc.positional/v1`、`SessionCodec`、`Request`/`Response`、`Admission`、`Session.cc` 内 `detail/Tcp` 的 `ParseTcpEndpoint`/`TcpCallError`/`TcpSettleWrite`、HTTP 的 `IncomingCallContext` 与 `bbt::infra::http`、MCP/Mongo/Redis。
+保留（不得整块误删）：`bbt::infra::Codec<T>`、`rpc::RpcPayload` 与 `bbt.rpc.positional/v1`、`SessionCodec`、`Request`/`Response`、`Admission`、`detail/Session.cc` 内 `detail/Tcp` 的 `ParseTcpEndpoint`/`TcpCallError`/`TcpSettleWrite`、HTTP 的 `IncomingCallContext` 与 `bbt::infra::http`、MCP/Mongo/Redis。
 
 负向验证（必须真实运行，不以「文件不存在」自述代替）：新增 CTest `rpc.net.v1_absent`，判据分三层，编译拒绝为主。
 

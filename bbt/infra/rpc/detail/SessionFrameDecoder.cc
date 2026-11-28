@@ -10,21 +10,16 @@
 
 namespace bbt::infra::rpc {
 
-struct SessionFrameDecoder::Impl {
+class SessionFrameDecoder::Impl {
+    friend class SessionFrameDecoder;
+
+public:
     explicit Impl(std::size_t max_frame_bytes)
         : max_frame_bytes(max_frame_bytes)
     {
     }
 
-    std::size_t max_frame_bytes;
-    std::vector<std::uint8_t> buffer;
-    std::optional<Error> terminal_error;
-
-    /**
-     * hello_phase=true（默认）：握手态，前缀限额收窄到 min(max,64KiB)。
-     */
-    bool hello_phase{true};
-
+private:
     /**
      * 当前阶段的单帧声明上限：握手态 min(max,64KiB)，数据态 max。
      */
@@ -39,6 +34,16 @@ struct SessionFrameDecoder::Impl {
      * 前缀在复制 body 前已被 DeclaredLimit 拒绝。
      */
     std::size_t PendingLimit() const noexcept { return 4 + 2 * std::min(DeclaredLimit(), kRpcV2MaxFrameBytes); }
+
+private:
+    std::size_t max_frame_bytes;
+    std::vector<std::uint8_t> buffer;
+    std::optional<Error> terminal_error;
+
+    /*
+     * hello_phase=true（默认）：握手态，前缀限额收窄到 min(max,64KiB)。
+     */
+    bool hello_phase{true};
 };
 
 SessionFrameDecoder::SessionFrameDecoder(std::size_t max_frame_bytes)

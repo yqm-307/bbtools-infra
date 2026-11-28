@@ -1,11 +1,10 @@
 # Consul agent HTTP adapter（BBT_INFRA_CONSUL=ON 时经 cmake/Consul.cmake 接入）。
 # 布局对齐 bbt/infra/http、bbt/infra/redis：公开头与实现同目录，include 路径是
 # <bbt/infra/consul/...>，以 PROJECT_SOURCE_DIR 为 include root；namespace
-# bbt::infra::consul。detail/ 暂不需要——本模块只有一次 HTTP 交换与一段 JSON
-# 解析，没有可独立测试的内部状态机。
+# bbt::infra::consul。关闭状态机与测试接缝归 detail/，不进公共接口面。
 #
 # HTTP 提供出网，Boost.JSON 是私有实现；不依赖其他协议模块。
-add_library(bbt_infra_consul STATIC Client.cc)
+add_library(bbt_infra_consul STATIC Client.cc detail/ClientState.cc)
 add_library(bbt::infra_consul ALIAS bbt_infra_consul)
 target_include_directories(bbt_infra_consul
     PUBLIC "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>"

@@ -22,39 +22,25 @@ namespace bbt::infra::config {
  */
 struct Snapshot {
 
-    /**
-     * 配置命名空间。
-     */
+    /* 配置命名空间。 */
     std::string ns;
 
-    /**
-     * 命名空间内的键。
-     */
+    /* 命名空间内的键。 */
     std::string key;
 
-    /**
-     * 源给出的版本号。
-     */
+    /* 源给出的版本号。 */
     std::uint64_t version{0};
 
-    /**
-     * 内容指纹，与 Value::Fingerprint 一致。
-     */
+    /* 内容指纹，与 Value::Fingerprint 一致。 */
     std::string revision;
 
-    /**
-     * 观测时刻，仅作元数据。
-     */
+    /* 观测时刻，仅作元数据。 */
     std::chrono::system_clock::time_point observed_at{};
 
-    /**
-     * 源标识，如 "memory:<ns>/<key>" 或 "file:<path>"。
-     */
+    /* 源标识，如 "memory:<ns>/<key>" 或 "file:<path>"。 */
     std::string source;
 
-    /**
-     * 配置值。
-     */
+    /* 配置值。 */
     Value value;
 
     /**

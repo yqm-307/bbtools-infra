@@ -45,7 +45,7 @@ namespace detail {
  */
 struct ReplyCompletionImpl;
 struct AdmissionLeaseImpl;
-struct AdmissionQueueImpl;
+class AdmissionQueueImpl;
 
 /**
  * 内部接缝的唯一入口，见 detail/Session.hpp

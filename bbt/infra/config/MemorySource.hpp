@@ -55,9 +55,7 @@ public:
     Snapshot Current() const;
 
 private:
-    /**
-     * 保护 m_current 与发布顺序。
-     */
+    /* 保护 m_current 与发布顺序。 */
     mutable std::mutex m_mtx;
     std::string m_ns;
     std::string m_key;

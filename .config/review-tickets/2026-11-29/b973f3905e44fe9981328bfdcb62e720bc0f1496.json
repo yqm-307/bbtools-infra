@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-29",
+  "commit": "b973f3905e44fe9981328bfdcb62e720bc0f1496",
+  "base": "ff3ae400196f8cbf445ae9ccacf26ab377db729c",
+  "result": "pass",
+  "reviewer": "gpt-6.2-astra（独立审查 deleg_239c1e9c）",
+  "summary": "独立审查放行：核对 config、Consul、HTTP、RPC 的契约保持型布局重构；未发现阻断项。运行时验证另见 PR。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "核对公共 API、关闭与资源寿命、HTTP 响应顺序、RPC 握手和 wire 契约以及 detail 归属；覆盖本轮代码、文档和测试变更。",
+      "evidence": {
+        "reviewer": "gpt-6.2-astra（deleg_239c1e9c）",
+        "scope": "ff3ae400196f8cbf445ae9ccacf26ab377db729c..b973f3905e44fe9981328bfdcb62e720bc0f1496；静态审查，未运行 CTest 或 CI"
+      }
+    }
+  ]
+}

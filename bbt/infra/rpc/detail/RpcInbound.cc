@@ -193,7 +193,7 @@ void SessionCore::AdmitInbound(const SessionFrame& frame, Request request)
              * 不要求确认的 Send 没有可结算的回复写责任，不能计入。
              */
             if (item.reply) {
-                ++server->open_replies;
+                server->NoteReplyOpenedLocked();
             }
         }
     }
@@ -260,8 +260,8 @@ void SessionCore::AdmitInbound(const SessionFrame& frame, Request request)
             /**
              * 与入账同一判据：只有持有回复写责任的项才归还 open_replies。
              */
-            if (reply && server->open_replies != 0) {
-                --server->open_replies;
+            if (reply) {
+                server->NoteReplySettledLocked();
             }
             if (server->close_signal) {
                 server->close_signal->Notify();
@@ -537,7 +537,7 @@ result<void> detail::DispatchAdmission(const std::shared_ptr<ServerState>& serve
     }
 
     bool registered = false;
-    // bbt-lint: ignore-next-line coroutine-sugar -- route task needs the explicit 128 KiB stack
+    // NOLINTNEXTLINE(coroutine-sugar) -- route task needs the explicit 128 KiB stack
     g_scheduler->RegistCoroutineTask(
         128 * 1024,
         [server, handler = std::move(route_handler), item = std::move(item)]() mutable {

@@ -37,6 +37,15 @@ cmake/                 CMake 模块
 
 - 需要拆分实现时统一使用同目录三件套：`Xxx.hpp` 放类型定义和函数声明，`__TXxx.hpp` 放模板实现并由 `Xxx.hpp` 末尾包含，`Xxx.cc` 放非模板实现并注册到对应 CMake target；参考 coroutine 的 `Chan.hpp` / `__TChan.hpp`。混合实现按模板与非模板分别归位，不把普通实现头直接改成 `__T`；`constexpr`、inline 变量及模板实例化必须可见的定义保留在头中。
 
+### 文件内部布局与拆分判断
+
+- 文件内部按职责组织为“依赖与声明 → 类型及常量 → 对外操作 → 私有辅助与实现”，具体顺序随文件性质调整；同一职责的声明、实现和注释靠近放置，功能组之间留出清晰边界。`.cc` 不按函数名或历史提交机械排序，先保证阅读者能沿着入口找到状态变化和资源收口。
+- `struct` 用于字段是调用者需要直接构造、读取或匹配的值、配置、帧和记录，且约束主要由字段本身表达；可以包含保持值语义的轻量方法。`class` 用于拥有资源、协调并发、维护生命周期或隐藏状态不变量的对象，调用者通过操作而不是字段组合改变状态。字段数量、公开字段数量或扫描器候选不能单独决定二者的选择。
+- `detail/` 是模块内部实现边界，不是未分类代码的收集处。只被单一模块使用的协议、传输、会话状态、关闭支撑和测试接缝归该模块的 `detail/`；确实服务多个 infra 模块、且语义与模块无关的底层机制才考虑 `bbt/infra/detail/`。配置 watch、consul client、HTTP 连接/连接池和 RPC session/state 等内部对象按所属模块归档，不能因名字通用就提升为公共 API。
+- 常量按语义分块并靠近所属类型或操作：调用者需要编译期使用的协议值、公开默认值留在公共头；模块策略、超时/容量和实现细节留在实现文件或 `detail/`。相关常量放在同一组，避免把不同生命周期、协议层或所有权的值堆进一个全局常量区。
+- 不为预想中的复用预建 `utils`、`common` 或类似工具层；出现真实的重复实现时，先确认语义、所有权和错误边界，再放到已有的明确归属处。不预建通用事件系统或事件总线来连接模块，事件只在拥有该时序的 adapter 或模块内表达，跨模块通信使用已经存在且有契约的接口。不预建未经真实消费、运行时边界和时序测试验证的 `session pump`；会话循环必须由具体传输/协议责任和可复现的关闭、取消行为驱动。
+- 以上是文件和对象设计的评审判断，不把文件行数、字段计数、复杂度提示或静态扫描候选直接当成重构门槛。拆分、聚合或改用另一种类型时，应能指出实际调用者、职责边界和验证路径。
+
 ## 3. 语言、架构与依赖
 
 - 新增与迁移代码以 C++17 为基线，不得静默提升标准。遵循目标仓库的 CMake 配置；coroutine 现有 `-fno-rtti` 约束继续由其构建配置管理，不扩展为三仓新约束。
@@ -62,6 +71,8 @@ cmake/                 CMake 模块
 - **复杂机制配图**：状态机、多阶段关闭、责任转移这类靠文字很难读准的机制，允许并鼓励用几行 ASCII 图或一段 PlantUML 说明事件流；图只服务于这段代码，不新建文档站点、不接 CI 渲染。
 - **人味儿**：写成一个了解这段代码的人在解释取舍——先说清约束和目标，再落到实现；避免「本模块致力于」「赋能」「全方位」这类空话，也避免把同一句话换个说法重复三遍。
 - `TODO` 写明已知的改进方向与升级条件。
+- 注释收敛到责任拥有者：公共契约写在稳定声明处，成员只保留声明未表达的值域、顺序、借用寿命或失效条件，实现处只补当前代码难以直接读出的原因、时序和资源收口。相同不变量在多个文件出现时，保留一处完整说明，其余位置用短句指向所属抽象，避免多份正文逐渐分叉。
+- 行为调整时同步删除失效注释并合并重复说明；不为满足工具提示机械补空泛注释，也不把历史、Issue/PR、审查阶段或临时重构理由写进源码。需要长期保留的取舍仍进入 `docs/architecture/`、`docs/decisions/` 或对应指南，源码只保留理解当前实现所需的约束。
 
 正反例：
 
@@ -170,6 +181,6 @@ cmake/                 CMake 模块
 
 - 业务与示例的默认执行域是受管协程。禁止在协程内阻塞 OS 线程、等待 native 条件变量、`join` 或 `future.wait/get`；阻塞型第三方 driver/线程 join 只能留在 infra adapter 的 native 执行域，由显式 owner 收口。
 - 示例与消费骨架只写 `int bbtco_main()`（需要 Start 前配置时配 `setup_runtime()`，需要 native 阶段时用 `bbtco_main_thread_hook()` 或提交后 host hook），由 runtime 的 `BBTCO_MAIN*` 宏生成 native main；runtime 负责 Start、hook 顺序、主任务完成与退出码。示例不得调用 `g_scheduler->Start()`、自建 runner 线程或等待 future/join；Engine 由应用入口 native host hook 在主线程直接 `Run` 一次，业务侧不建线程、不 join（见 `docs/architecture/native-lifecycle-seam-contract.md`）。
-- 关闭与排空只使用 `Close(CloseOptions)` + `RequestClose` + `WaitStopped`；不得恢复 `Shutdown`/`Drain`/`Close(Error)` 双入口。Co 域等待按绝对期限以 `min(deadline, now+50ms)` 分片，禁止静默退回 native CV/join。
+- 关闭与排空的公开控制面只使用 `Close(CloseOptions)`；模块内部可按资源职责使用 `RequestClose`、`WaitStopped` 等实现细节，但不得恢复 `Shutdown`/`Drain`/`Close(Error)` 双入口。Co 域等待按绝对期限以 `min(deadline, now+50ms)` 分片，禁止静默退回 native CV/join。
 - HTTP 服务端按每连接 reader/parser + 请求任务 + 单 writer/sequencer 实现：reader 唯一解析并分配序号，writer 唯一写 socket、唯一拉取 `ResponseBody`，且不得占用 handler 执行身份；`inflight` 只在写终态或明确放弃时减一次。
 - 存量迁移状态以各仓 README/模块指南为准。infra 当前只有 `examples/http_net` 迁移到 `bbtco_main`；其余示例仍是旧入口，新增代码不得把旧入口或 native 等待写成上层先例。

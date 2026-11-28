@@ -26,8 +26,8 @@ namespace bbt::infra::rpc {
 
 class CoRpcClient;
 class CoRpcServer;
-struct SessionOwnerState;
-struct ServerState;
+class SessionOwnerState;
+class ServerState;
 
 namespace detail {
 
@@ -100,7 +100,7 @@ bool SessionOwnerSealed(const SessionOwnerState& owner) noexcept;
 std::optional<Error> SessionOwnerCloseReason(const SessionOwnerState& owner);
 
 /**
- * @brief owner 统一关闭入口（实现唯一在 Session.cc）。
+ * @brief owner 统一关闭入口（实现唯一在 detail/Session.cc）。
  *
  * 与公共 CloseOptions 同义：
  *   - Immediate：立即 Seal；仅在 wait_release 时再等物理收口。
@@ -132,7 +132,7 @@ bool SessionOwnerBeginOperation(const std::shared_ptr<SessionOwnerState>& owner,
 void SessionOwnerEndOperation(const std::shared_ptr<SessionOwnerState>& owner) noexcept;
 
 /**
- * @brief Server 生命周期入口（实现唯一在 Session.cc）。
+ * @brief Server 生命周期入口（实现唯一在 detail/Session.cc）。
  *
  * Seal 是立即逻辑封口并发布原因，不等待（RequestClose）。Close 与
  * SessionOwnerClose 同构：Immediate 立即 Seal；Graceful 先 StopAccepting +
@@ -150,7 +150,7 @@ result<void> ServerClose(const std::shared_ptr<ServerState>& state, const CloseO
 result<void> ServerWaitStopped(const std::shared_ptr<ServerState>& state, bbt::coroutine::Deadline deadline);
 
 /**
- * @brief Server 入站状态装配（实现唯一在 Session.cc）。
+ * @brief Server 入站状态装配（实现唯一在 detail/Session.cc）。
  *
  * 校验 options、Engine Idle、accept-handoff 容量，构造 ServerState 并把
  * 完成握手的入站 link 挂回同一 session_owner（inbound_server）。CoRpcServer

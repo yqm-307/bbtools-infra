@@ -2,7 +2,7 @@
  * RPC admission 公共类型的不透明实现：AdmissionQueue 单 FIFO worker、
  * ReplyCompletion 写终态、AdmissionLease 单次释放与 AdmissionAccess 构造
  * 接缝。impl 类型见 detail/RpcSessionState.hpp；会话内使用点（reader 的
- * AdmitInbound/拒绝路径）在 detail/RpcSession.cc。
+ * AdmitInbound/拒绝路径）在 detail/RpcInbound.cc。
  */
 #include <bbt/coroutine/syntax/SyntaxMacro.hpp>
 #include <bbt/infra/rpc/Admission.hpp>
@@ -23,40 +23,41 @@ using bbt::coroutine::sync::CoWaiter;
 
 namespace {
 
+constexpr auto kAdmissionIdlePoll = 25ms;
+constexpr auto kReplyWriteBudget = 30s;
+constexpr std::size_t kAdmissionWorkerStackBytes = 128 * 1024;
+
 /**
  * 回复写终态前保持 server 的排空责任：admission lease 可能在回复入队后立即
  * 归还，Graceful 不能据此提前 Seal。作用域覆盖 Complete/Fail 的全部退出路径。
  */
-struct OpenReplyGuard {
-    std::weak_ptr<ServerState> server;
+class OpenReplyGuard {
+public:
+    explicit OpenReplyGuard(const std::weak_ptr<ServerState>& server)
+        : server(server)
+    {
+    }
 
     ~OpenReplyGuard()
     {
         if (auto state = server.lock()) {
             std::lock_guard<std::mutex> lock(state->mu);
-            if (state->open_replies != 0) {
-                --state->open_replies;
-            }
+            state->NoteReplySettledLocked();
             if (state->close_signal) {
                 state->close_signal->Notify();
             }
         }
     }
+
+private:
+    std::weak_ptr<ServerState> server;
 };
-
-/**
- * Complete 延迟体：终态唯一结算 + Response 关联校验 + 回复入队与写终态等待。
- */
-
-/**
- * Fail 延迟体：终态唯一结算 + 错误帧入队与写终态等待，语义同 Complete。
- */
 
 // clang-format off
 }
 // clang-format on
 
-void AdmissionWorker(std::shared_ptr<detail::AdmissionQueueImpl> impl)
+void detail::AdmissionQueueImpl::Work(std::shared_ptr<AdmissionQueueImpl> impl)
 {
     for (;;) {
         AdmissionItem item;
@@ -83,7 +84,7 @@ void AdmissionWorker(std::shared_ptr<detail::AdmissionQueueImpl> impl)
                     return;
                 }
             }
-            const auto status = impl->signal->WaitWithCallback({RpcClock::now() + 25ms}, [impl] {
+            const auto status = impl->signal->WaitWithCallback({RpcClock::now() + kAdmissionIdlePoll}, [impl] {
                 bool ready;
                 {
                     std::lock_guard<std::mutex> lock(impl->mu);
@@ -184,8 +185,9 @@ result<std::shared_ptr<AdmissionQueue>> AdmissionQueue::Create(
     impl->max_bytes = max_bytes;
     impl->handler = std::move(handler);
     bool registered = false;
-    // bbt-lint: ignore-next-line coroutine-sugar -- admission worker needs the explicit 128 KiB stack
-    g_scheduler->RegistCoroutineTask(128 * 1024, [impl] { AdmissionWorker(impl); }, registered);
+    // NOLINTNEXTLINE(coroutine-sugar) -- admission worker needs the explicit 128 KiB stack
+    g_scheduler->RegistCoroutineTask(
+        kAdmissionWorkerStackBytes, [impl] { detail::AdmissionQueueImpl::Work(impl); }, registered);
     if (!registered) {
         return R::err(Err(ErrorCode::RuntimeUnavailable, "admission worker registration failed"));
     }
@@ -400,8 +402,8 @@ bbt_co_async(result<void>) ReplyCompletion::Complete(Response response)
                     auto enqueued = session->Enqueue(std::move(item));
                     if (enqueued) {
                         const auto wait_deadline = write_deadline == RpcClock::time_point::max()
-                                                       ? RpcClock::now() + 30s
-                                                       : std::min(write_deadline, RpcClock::now() + 30s);
+                                                       ? RpcClock::now() + kReplyWriteBudget
+                                                       : std::min(write_deadline, RpcClock::now() + kReplyWriteBudget);
                         (void)settle->Wait(wait_deadline);
                     }
                 }
@@ -440,8 +442,8 @@ bbt_co_async(result<void>) ReplyCompletion::Complete(Response response)
          * 不另起计时。
          */
         const auto wait_deadline = write_deadline == RpcClock::time_point::max()
-                                       ? RpcClock::now() + 30s
-                                       : std::min(write_deadline, RpcClock::now() + 30s);
+                                       ? RpcClock::now() + kReplyWriteBudget
+                                       : std::min(write_deadline, RpcClock::now() + kReplyWriteBudget);
         return settle->Wait(wait_deadline);
     });
 }
@@ -519,8 +521,8 @@ bbt_co_async(result<void>) ReplyCompletion::Fail(Error error)
          * Fail 同 Complete——成功终态对应 socket 真实写终态。
          */
         const auto wait_deadline = write_deadline == RpcClock::time_point::max()
-                                       ? RpcClock::now() + 30s
-                                       : std::min(write_deadline, RpcClock::now() + 30s);
+                                       ? RpcClock::now() + kReplyWriteBudget
+                                       : std::min(write_deadline, RpcClock::now() + kReplyWriteBudget);
         return settle->Wait(wait_deadline);
     });
 }

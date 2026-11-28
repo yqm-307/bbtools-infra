@@ -20,26 +20,41 @@ using namespace std::chrono_literals;
 using bbt::coroutine::WaitStatus;
 using bbt::coroutine::sync::CoWaiter;
 
-namespace {
-
-std::uint64_t NextEpoch(SessionOwnerState& owner)
+std::uint64_t SessionOwnerState::NextEpoch()
 {
-    std::lock_guard<std::mutex> lock(owner.mu);
-    if (++owner.epoch_counter == 0) {
-        ++owner.epoch_counter;
+    std::lock_guard<std::mutex> lock(mu);
+    if (++epoch_counter == 0) {
+        ++epoch_counter;
     }
-    return owner.epoch_counter;
+    return epoch_counter;
 }
 
-std::uint64_t NextNonce(SessionOwnerState& owner)
+std::uint64_t SessionOwnerState::NextNonce()
 {
-    std::lock_guard<std::mutex> lock(owner.mu);
+    std::lock_guard<std::mutex> lock(mu);
     std::uint64_t nonce = 0;
     do {
-        nonce = owner.random();
+        nonce = random();
     } while (nonce == 0);
     return nonce;
 }
+
+result<std::string> SessionOwnerState::NextAttemptId()
+{
+
+    /* Fencing 后仍用 fresh ID；耗尽时拒绝而不是回卷到旧 ID。 */
+    constexpr std::string_view kAutoAttemptIdPrefix = "~bbt-rpc:";
+    auto& counter = next_attempt_id;
+    auto next = counter.load(std::memory_order_relaxed);
+    do {
+        if (next == std::numeric_limits<std::uint64_t>::max()) {
+            return result<std::string>::err(Err(ErrorCode::Overloaded, "automatic attempt IDs exhausted"));
+        }
+    } while (!counter.compare_exchange_weak(next, next + 1, std::memory_order_relaxed));
+    return result<std::string>::ok(std::string(kAutoAttemptIdPrefix) + std::to_string(next));
+}
+
+namespace {
 
 /**
  * 在发布事务内交接连接；替换只改路由赢家，不移除旧 link 的租约。
@@ -191,8 +206,8 @@ result<std::shared_ptr<SessionCore>> EstablishOutbound(
         return R::err(gate.error());
     }
     std::string peer_identity;
-    const auto proposal = NextEpoch(*owner);
-    const auto nonce = NextNonce(*owner);
+    const auto proposal = owner->NextEpoch();
+    const auto nonce = owner->NextNonce();
     SessionFrameDecoder decoder(owner->options.MaxFrameBytes());
     auto epoch =
         detail::OutboundHandshakeOnChannel(channel, owner->options, proposal, nonce, peer_identity, decoder, deadline);
@@ -326,8 +341,8 @@ void detail::ServeInbound(std::shared_ptr<ServerState> server, detail::TcpChanne
         return;
     }
     std::string peer_identity;
-    const auto proposal = NextEpoch(*owner);
-    const auto nonce = NextNonce(*owner);
+    const auto proposal = owner->NextEpoch();
+    const auto nonce = owner->NextNonce();
     SessionFrameDecoder decoder(owner->options.MaxFrameBytes());
     auto epoch =
         detail::InboundHandshakeOnChannel(channel, owner->options, proposal, nonce, peer_identity, decoder, deadline);
@@ -371,10 +386,17 @@ result<void> ParseTarget(std::string_view target, std::string& host, std::uint16
  * 已接纳调用的一次性责任：与 owner 封口同门登记，作用域结束（含所有
  * 早退/异常路径）归还并通知等待排空的 Close 调用方。
  */
-struct OwnerOperationGuard {
-    std::shared_ptr<SessionOwnerState> owner;
+class OwnerOperationGuard {
+public:
+    explicit OwnerOperationGuard(const std::shared_ptr<SessionOwnerState>& owner)
+        : owner(owner)
+    {
+    }
 
     ~OwnerOperationGuard() { detail::SessionOwnerEndOperation(owner); }
+
+private:
+    std::shared_ptr<SessionOwnerState> owner;
 };
 
 /**
@@ -399,21 +421,6 @@ void AttachOwnerCloseReason(const std::shared_ptr<SessionOwnerState>& owner, Err
         }
     }
     AttachCloseReason(error, *reason);
-}
-
-constexpr std::string_view kAutoAttemptIdPrefix = "~bbt-rpc:";
-
-result<std::string> NextAttemptId(SessionOwnerState& owner)
-{
-    // Fencing 后仍用 fresh ID；耗尽时拒绝而不是回卷到旧 ID。
-    auto& counter = owner.next_attempt_id;
-    auto next = counter.load(std::memory_order_relaxed);
-    do {
-        if (next == std::numeric_limits<std::uint64_t>::max()) {
-            return result<std::string>::err(Err(ErrorCode::Overloaded, "automatic attempt IDs exhausted"));
-        }
-    } while (!counter.compare_exchange_weak(next, next + 1, std::memory_order_relaxed));
-    return result<std::string>::ok(std::string(kAutoAttemptIdPrefix) + std::to_string(next));
 }
 
 result<Response> CallImpl(
@@ -470,7 +477,7 @@ result<Response> CallImpl(
         }
 
         if (automatic_id) {
-            auto id = NextAttemptId(*owner);
+            auto id = owner->NextAttemptId();
             if (!id) {
                 return R::err(id.error());
             }
@@ -638,7 +645,7 @@ result<void> SendImpl(
         }
 
         if (automatic_id) {
-            auto id = NextAttemptId(*owner);
+            auto id = owner->NextAttemptId();
             if (!id) {
                 return R::err(id.error());
             }
