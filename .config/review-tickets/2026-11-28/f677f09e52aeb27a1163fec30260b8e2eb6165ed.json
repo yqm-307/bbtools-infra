@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-28",
+  "commit": "f677f09e52aeb27a1163fec30260b8e2eb6165ed",
+  "base": "e7d20dc00b829bd981bc77733c6f88365b5efcf1",
+  "result": "pass",
+  "reviewer": "Hermes Agent（独立审查）",
+  "summary": "审查完整两提交范围，未发现 P0/P1 阻塞。pub 指针与上游 main 一致，两项格式选项与 pub 一致；102 个 C/C++ 文件除排版外仅在 48 处 bbtco_noexcept 无参 lambda 补 ()，未恢复 ICoCloseable 或夹带业务改动。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "完整范围 git diff --check 通过；核对现有日志：327 文件第二遍零差异，定向 CTest 7/7，构建日志未见编译警告，coroutine 锁定 d11679b。未重跑构建、测试或全仓格式化。",
+      "evidence": {
+        "reviewer": "Hermes Agent（独立审查）",
+        "scope": "e7d20dc00b829bd981bc77733c6f88365b5efcf1..f677f09e52aeb27a1163fec30260b8e2eb6165ed：pub gitlink、.clang-format、全部 102 个 C/C++ 文件的 diff 与语义边界，以及现有格式、构建和定向测试日志。"
+      }
+    }
+  ]
+}
