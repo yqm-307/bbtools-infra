@@ -152,7 +152,7 @@ public:
      * @brief 立即逻辑封口并请求关闭已发布连接；不等 fd、在途拨号或 API 任务退出。
      *
      * 宿主最终须 Close 全部 client、Close(Immediate) Engine、join Run 且核 Stopped、
-     * 等登记的全部 API 任务完成并释放捕获。不可当作 ICoCloseable 的同步资源使用。
+     * 等登记的全部 API 任务完成并释放捕获。
      */
     virtual result<void> Close(const CloseOptions& options = {}) = 0;
 

@@ -35,7 +35,6 @@
 #include <bbt/coroutine/sync/CoWaiter.hpp>
 #include <bbt/coroutine/io/IoExecutor.hpp>
 
-#include <bbt/infra/ICoCloseable.hpp>
 #include <bbt/infra/Result.hpp>
 
 namespace bbt::infra::mongo_detail {

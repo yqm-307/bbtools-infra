@@ -1,10 +1,8 @@
 /**
  * 公共契约最小验证：result 表面、Error.details 校验、NetworkLimits 校验、
- * Codec<void>/Codec<std::string>、ICoObject/ICoNetwork/ICoCloseable 可派生。
+ * Codec<void>/Codec<std::string>、ICoObject/ICoNetwork 可派生。
  * 无第三方测试框架依赖，失败时输出到 stderr 并以非零退出。
  *
- * 关闭面只有 Close()/IsClosed()：RequestClose/WaitClosed/ReleaseClosed/CloseStatus、
- * CancellationToken、运行时代际都不存在，本件不为它们保留断言。
  * CallOptions / IncomingCallContext / WaitOptions 只携带 deadline——
  * 用 sizeof 直接钉住「没有取消令牌残留的兼容字段」。
  */
@@ -17,7 +15,6 @@
 #include <vector>
 
 #include <bbt/infra/Codec.hpp>
-#include <bbt/infra/ICoCloseable.hpp>
 #include <bbt/infra/ICoNetwork.hpp>
 #include <bbt/infra/ICoObject.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
@@ -361,19 +358,6 @@ struct FakeNet : ICoNetwork {
     }
 };
 
-/**
- * 关闭面最小实现：只给出 Close()/IsClosed() 即可满足 ICoCloseable——
- * 这本身就是「接口只剩两个纯虚函数」的编译期证据（旧面还需实现
- * RequestClose/WaitClosed，缺一个就无法实例化）。
- */
-struct FakeCloseable : ICoCloseable {
-    void Close() noexcept override { closed = true; }
-
-    bool IsClosed() const noexcept override { return closed; }
-
-    bool closed = false;
-};
-
 void TestInterfaces()
 {
     FakeObject obj;
@@ -382,16 +366,6 @@ void TestInterfaces()
     FakeNet net;
     bbt::coroutine::ICoObject& base = net;
     CHECK(base.GetObjectInfo().kind == "net");
-
-    /**
-     * Close() 幂等、返回即终态；IsClosed() 只读查询，不重开。
-     */
-    FakeCloseable c;
-    CHECK(!c.IsClosed());
-    (void)c.Close();
-    CHECK(c.IsClosed());
-    (void)c.Close();
-    CHECK(c.IsClosed());
 
     /**
      * 已删取消令牌不留兼容字段：调用选项/等待选项的尺寸就是 deadline

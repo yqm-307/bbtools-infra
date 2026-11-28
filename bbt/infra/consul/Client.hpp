@@ -17,7 +17,6 @@
 
 #include <bbt/coroutine/syntax/Async.hpp>
 #include <bbt/infra/CloseOptions.hpp>
-#include <bbt/infra/ICoCloseable.hpp>
 #include <bbt/infra/Result.hpp>
 #include <bbt/infra/http/Client.hpp>
 

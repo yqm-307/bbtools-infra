@@ -1,7 +1,7 @@
 {
   "project": "bbtools-infra",
   "modules": {
-    "infra": "根部公共头：公共值契约（Result、NetworkTypes、NetError、Codec）、基础接口（ICoObject、ICoNetwork、ICoCloseable），以及保留的 CoMongoCli 入口",
+    "infra": "根部公共头：公共值契约（Result、NetworkTypes、NetError、Codec）、基础接口（ICoObject、ICoNetwork），以及保留的 CoMongoCli 入口",
     "net": "TCP 网络执行域：Engine、ICoConnection、Connection、Options、Buffer 与 Co 消费面",
     "http": "HTTP Client / Server（唯一现役 HTTP 实现）",
     "redis": "Redis 协程客户端 CoRedisCli 与有界连接池 CoRedisPool",

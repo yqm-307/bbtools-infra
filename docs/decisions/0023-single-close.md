@@ -17,3 +17,5 @@ net 保持 `std::error_code`，协议保持 `result<void>`。Engine 只统一发
 这是破坏性迁移：调用方不再拼接两次操作，直接以同一 Close 输入指定是否等待物理回收。framework 在独立候选集成，不由 infra 代改。低层同步 ICoCloseable 与 socket Shutdown 不是第二条 owner 控制面，保持各自职责。
 
 本决定取代 ADR 0015、0007 与 0012 中的公开关闭入口约定，不改写其历史正文。当前唯一语义真源为 [关闭契约](../architecture/close-options-contract.md)。
+
+其中保留 `ICoCloseable` 的决定已由[现行关闭契约](../architecture/close-options-contract.md#3-模块职责与能力)取代。
