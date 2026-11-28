@@ -4,11 +4,7 @@
 # bbt::infra::consul。detail/ 暂不需要——本模块只有一次 HTTP 交换与一段 JSON
 # 解析，没有可独立测试的内部状态机。
 #
-# 依赖方向：只消费 bbt::infra_http_net（出网）与 bbt::infra_common（result/
-# ErrorCode/ICoCloseable）。不依赖 RPC/Redis/Mongo/旧栈，也不被它们依赖。
-# Boost.JSON 以源码方式内联进 Client.cc（不链接 libboost_json）；该 TU 是仓内
-# 除 mcp/JsonValue.cc 之外唯一包含 boost/json/src.hpp 的位置，两者同开会重复
-# 定义，故顶层 CMake 对 BBT_INFRA_CONSUL + BBT_INFRA_MCP 同做 fail-closed 门禁。
+# HTTP 提供出网，Boost.JSON 是私有实现；不依赖其他协议模块。
 add_library(bbt_infra_consul STATIC Client.cc)
 add_library(bbt::infra_consul ALIAS bbt_infra_consul)
 target_include_directories(bbt_infra_consul
@@ -17,7 +13,7 @@ target_include_directories(bbt_infra_consul
 target_compile_features(bbt_infra_consul PUBLIC cxx_std_17)
 target_link_libraries(bbt_infra_consul
     PUBLIC bbt::infra_http_net bbt::infra_common
-    PRIVATE Boost::headers Threads::Threads)
+    PRIVATE bbt_infra_boost_json Boost::headers Threads::Threads)
 target_compile_options(bbt_infra_consul PRIVATE -Wall -Wextra -Wpedantic)
 
 # 公开头自给编译自检：公开头各自单独成 TU。

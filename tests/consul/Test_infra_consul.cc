@@ -19,6 +19,10 @@
 #include <bbt/infra/http/Client.hpp>
 #include <bbt/infra/net/Engine.hpp>
 
+#ifdef BBT_CONSUL_TEST_WITH_MCP
+#include <bbt/infra/mcp/JsonValue.hpp>
+#endif
+
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -778,6 +782,14 @@ void CaseWireAndErrors(Host& host)
         CHECK(snapshot.value().instances[0].name == "ecommerce-catalog");
         CHECK(snapshot.value().instances[0].address == "127.0.0.1");
         CHECK(snapshot.value().instances[0].port == 19001);
+
+#ifdef BBT_CONSUL_TEST_WITH_MCP
+        auto wire = bbt::infra::mcp::JsonValue::Parse(body, body.size(), 16);
+        CHECK(wire && wire.value().IsArray());
+        if (wire) {
+            CHECK(wire.value().Size() == snapshot.value().instances.size());
+        }
+#endif
 
         /**
          * 阻塞查询参数：index 与 wait 都在 wire 上。

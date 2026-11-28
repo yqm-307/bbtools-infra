@@ -5,9 +5,7 @@
  * @brief MCP 协议核：Boost.JSON 的轻值语义封装。
  *
  * 契约来源：官方 MCP 规范 2026-07-28。
- *   - 公共头不出现任何 Boost/第三方类型；唯一实现单元 bbt/infra/mcp/JsonValue.cc 是
- *     全仓唯一包含 boost/json/src.hpp 的 TU（Boost.JSON 以源码方式内联进本库，
- *     不需要 libboost_json、不需要额外系统安装）。
+ *   - 公共头不暴露 Boost 或其他第三方类型。
  *   - 不造第二套 JSON parser/DOM：解析、序列化、整数/浮点词法全部交给 Boost.JSON。
  *   - 拒绝面：非法 UTF-8、重复对象键、不可表示数值、超深/超大帧、单一完整文档
  *     之外的尾随数据。不可表示数值 = 非有限（NaN/±Inf 字面量、1e309/1e400）或

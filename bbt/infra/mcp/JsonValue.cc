@@ -1,5 +1,5 @@
 /**
- * MCP JsonValue 实现：全仓唯一包含 Boost.JSON 源码实现的 TU。
+ * MCP JsonValue 实现：将 Boost.JSON 解析事件映射为 MCP 值与错误。
  *
  * 解析与值语义约束：
  *   - 解析走 Boost 的 basic_parser + 自定义 SAX handler：词法/转义/UTF-8/数字
@@ -17,7 +17,8 @@
  */
 #include <bbt/infra/mcp/JsonValue.hpp>
 
-#include <boost/json/src.hpp>
+#include <boost/json.hpp>
+#include <boost/json/basic_parser_impl.hpp>
 
 #include <cmath>
 #include <limits>

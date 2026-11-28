@@ -28,11 +28,10 @@ cmake --build <私有 build 目录> --parallel 2 --target \
 ```
 
 - target：`bbt::infra_consul`（alias）；公开头 `<bbt/infra/consul/Client.hpp>`。
-- 依赖闭包：`bbt::infra_http_net` + `bbt::infra_common` + `Boost::headers`。Boost.JSON
-  以 `boost/json/src.hpp` 源码内联进 `Client.cc`，不链接 `libboost_json`，不新增第三方依赖。
+- 依赖 `bbt::infra_http_net` 和 `bbt::infra_common`；Boost.JSON 实现与 MCP 共用一个
+  仓内私有目标，不需要系统 `libboost_json`。普通模式下可同时启用 Consul 和 MCP。
 - 开关 fail-closed：`BBT_INFRA_CONSUL=ON` 必须同时 `BBT_INFRA_HTTP_NET=ON`，否则
-  configure 失败；`BBT_INFRA_CONSUL` 与 `BBT_INFRA_MCP` 同开也会失败（两者各有一个
-  `boost/json/src.hpp` TU，同一最终链接会重复定义）。
+  configure 失败。
 - 普通模式与 `BBT_INFRA_NETWORK_ONLY=ON` 共用同一入口（`cmake/Consul.cmake`）。
 
 ## 最小消费
