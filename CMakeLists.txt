@@ -191,7 +191,6 @@ set(BBT_INFRA_PUBLIC_HEADERS
     NetError.hpp
     ICoObject.hpp
     ICoNetwork.hpp
-    ICoCloseable.hpp
     NetworkTypes.hpp
     Codec.hpp
     MongoClientConfig.hpp

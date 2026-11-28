@@ -16,7 +16,7 @@ C++17 基础接入层：TCP 网络执行域、HTTP、Redis、RPC、Mongo 与基�
 | RPC over TCP / MCP | 按模块开关导出 | 可选模块，不属于默认构建；接口和依赖以各模块 CMake 为准 |
 | 高层 UDP | 无 | 显式 include 拒绝；NativeSocket datagram 原语与测试保留 |
 
-旧 HTTP/TCP/UDP/transport/Redis 实现与旧扁平网络入口已移除，不保留转发兼容副本。现役 owner 的公开关闭操作统一为 `Close(CloseOptions)`；模式、支持域、物理凭据与 Engine 能力限制见 [关闭契约](docs/architecture/close-options-contract.md)。同步低层 `ICoCloseable` 与 socket 半关闭仍保留各自职责。Mongo 公共入口为 `mongo/CoMongoDb.hpp`、`mongo/CoMongoColl.hpp` 和 `mongo/MongoTypes.hpp`。
+旧 HTTP/TCP/UDP/transport/Redis 实现与旧扁平网络入口已移除，不保留转发兼容副本。现役 owner 的公开关闭操作统一为 `Close(CloseOptions)`；模式、支持域、物理凭据与 Engine 能力限制见 [关闭契约](docs/architecture/close-options-contract.md)。Mongo 公共入口为 `mongo/CoMongoDb.hpp`、`mongo/CoMongoColl.hpp` 和 `mongo/MongoTypes.hpp`。
 
 执行域与入口告警：受管协程内不得阻塞 OS 线程、等待 native CV/join/`future`；阻塞型第三方调用只能留在 adapter 的 native 执行域。示例与消费骨架只写 `bbtco_main`（`BBTCO_MAIN*` 生成 native main），不得自行 `g_scheduler->Start`、建 runner 线程或 `future.wait/get`；Engine 只由应用入口 native host hook 在主线程调用一次 `Run`，主任务用 `Engine::CoWaitRunning` 等 Running，`EngineLifecycle` 与其 runner/join 路径已删除。`examples/http_net` 仍待迁移到该入口，其余示例仍是旧入口，新增代码不得以其为先例。规则详见 [代码约定 §11](docs/conventions.md)。
 

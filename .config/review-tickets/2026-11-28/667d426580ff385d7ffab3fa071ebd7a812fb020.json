@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-28",
+  "commit": "667d426580ff385d7ffab3fa071ebd7a812fb020",
+  "base": "78f3645dcfa3635eee2efb25cf017171be0e6eda",
+  "result": "pass",
+  "reviewer": "alice-session-subagent",
+  "summary": "独立复核完整提交范围，无 P0/P1。旧公共基类及构建和测试引用已移除，Mongo 具体类型的 Close/IsClosed 保留且实现不变；现行关闭契约第 3 节明确要求旧消费者迁移并重编。",
+  "checks": [
+    {
+      "id": "llm-review",
+      "kind": "attested",
+      "status": "pass",
+      "summary": "完整 diff、旧补丁对照、残留引用检索及 git diff --check 均通过。既有日志显示 coroutine 锁定 d11679b、公共头自检编过、构建日志无编译警告、CTest 6/6（含 contract.basics）及额外 Mongo 定向用例 6/6；本轮未重跑构建或测试。",
+      "evidence": {
+        "reviewer": "alice-session-subagent",
+        "scope": "78f3645dcfa3635eee2efb25cf017171be0e6eda..667d426580ff385d7ffab3fa071ebd7a812fb020"
+      }
+    }
+  ]
+}

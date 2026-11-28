@@ -104,8 +104,8 @@ header 直接返回 `ProtocolError`。
 - `Close(options)（wait_release=true，有限 deadline）`：物理凭据——专属 HTTP Client 封口后连接真实退役（`http::Client::Close(wait_release=true)`）。
   前置是先封口，否则 `InvalidArgument`；到期 `TimedOut` 保留连接责任。
 
-`Close()`（无参）等价于默认 `CloseOptions{}`：Immediate、不等待物理回收。Client 不再继承
-`ICoCloseable`，没有另一条同步关闭面；物理凭据只由有限期限的 `Close(wait_release=true)` 证明。
+`Close()`（无参）等价于默认 `CloseOptions{}`：Immediate、不等待物理回收。物理凭据只由有限期限的
+`Close(wait_release=true)` 证明。
 
 取消域：等待被 `RequestCancel` 打断时，统一分片等待把 `Cancelled` 如实映射为 `Close` 的错误
 返回（不空转重试、不伪造进度），封口保留、在途责任保留，由后续 `Close(wait_release=true)` 收口。因此

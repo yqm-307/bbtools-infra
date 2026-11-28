@@ -109,8 +109,6 @@ key/value 二进制安全；拒绝空 key 和空 DEL 列表。PING 只接受 PON
 
 最终收尾由普通 native 宿主执行：停止接纳业务、Close 所有 client、整体 Engine Close(Immediate)、等待 Run 返回并 join，确认 Phase 是 Stopped 及检查错误；运行时继续推进直至全部登记任务完成、任务捕获与 client 释放，随后核对 fd/driver/未交付拨号等资源。Run 返回但仍 Closing 不构成排空；CountConnections==0 和 IsClosed 也不能单独证明完成。没有 coroutine Stop/restart。示例在所有局部业务资源收口后以 `_Exit` 结束进程寿命 runtime，不验证全局静态析构；测试统一复用 `tests/net/ProcessRuntimeTestMain.hpp` 的退出边界。
 
-新类不继承旧 ICoCloseable。framework 原有同步资源关闭视图不能直接使用这个异步 Close；framework owner 仍须明确登记、最终 Engine/任务排空和消费者迁移，再验证其自身集成。
-
 ## 验证边界
 
 `tests/redis_net` 按注册计划维护稳定契约名称（原有九个之外，数据面增量新增九个，见下），另有分帧、断连、解析/Feed/意外帧/取消/超限回归及公开示例。真实 Redis 用例通过同步 hiredis helper 只对本次唯一 key 做 LPUSH，再用公开 Get 观察 WRONGTYPE，同流 Ping/Get 验证继续同步；同时验证二进制数据和 256 KiB 回复。受控 TCP 只补充分帧、断连和生命周期时序。

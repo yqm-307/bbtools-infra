@@ -3,15 +3,13 @@
  */
 #pragma once
 
+#include <bbt/infra/ICoNetwork.hpp>
 #include <bbt/infra/mongo/MongoTypes.hpp>
 
 namespace bbt::infra::mongo {
 
 /**
  * @brief 集合句柄（轻量目标值 + owner 引用）：句柄不拥有 worker/队列/pool。
- *
- * Close() 只封该句柄的接纳与新命令前置校验（幂等、任意线程），不影响同 owner 的兄弟
- * 句柄，也不等待 owner 在途归零。
  *
  * 等待入口：CRUD 用上游 bbt_co_async 标记返回类型，调用方必须经 bbt_co_await 消费
  * （`auto r = bbt_co_await coll->FindOne(...)`）。接口返回惰性 async 操作，必须通过
@@ -28,8 +26,18 @@ namespace bbt::infra::mongo {
  *     例如 `{"_id":{"$exists":true}}`；
  *   - Find / CountDocuments 的空 filter 表示「全集合」谓词，合法。
  */
-class CoMongoColl : public ICoNetwork, public ICoCloseable {
+class CoMongoColl : public ICoNetwork {
 public:
+    /**
+     * @brief 幂等封口本句柄，可在任意线程调用；不影响兄弟句柄，也不等待 owner 的在途操作。
+     */
+    virtual void Close() noexcept = 0;
+
+    /**
+     * @brief 只查询本句柄是否已封口，不反映 owner 的状态或在途操作是否结束。
+     */
+    virtual bool IsClosed() const noexcept = 0;
+
     /**
      * @brief 句柄级命令：语义与 CoMongoCli 同名方法一致，差别只在目标集合由句柄携带
      * 而非 owner 绑定。

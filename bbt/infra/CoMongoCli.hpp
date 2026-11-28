@@ -13,7 +13,6 @@
 
 #include <optional>
 
-#include <bbt/infra/ICoCloseable.hpp>
 #include <bbt/infra/ICoNetwork.hpp>
 #include <bbt/infra/MongoClientConfig.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
@@ -66,12 +65,8 @@ using mongo::kMongoLimitsMaxWorkerThreads;
  *     pool wait queue 超时为 Overloaded；
  *   - 已派发（进入 driver）的调用不可强杀，继续到 driver timeout 或完成：operation state、
  *     client lease 与 payload 保活到物理收口；每个请求只向业务交付一次终态，迟到的 driver 结果只消费不交付。
- *   - 关闭由 owner 主动发起：Close() 幂等、任意线程可调用，返回即接纳封口、挂起等待者已收到终态、
- *     在途计数已在有界窗口内归零（超过上限后由 worker 完成路径补跑物理落定）。Close 与在途 Start
- *     并发时先封口、再等该次 Start 完成：已封口的 Start 不发布资源并返回 Closed，否则其已建资源由
- *     本次 Close 同步收口。因此 Close 返回时 worker 与 lease 已收口、终态不回退，此后 Start 一律 Closed。
  */
-class CoMongoCli final : public ICoNetwork, public ICoCloseable {
+class CoMongoCli final : public ICoNetwork {
 public:
     /**
      * @brief 校验装配参数并取对象身份，不建立任何资源。
@@ -128,14 +123,17 @@ public:
     result<std::uint64_t> DeleteOne(const MongoDocument& filter, const CallOptions& options);
 
     /**
-     * @brief 按既有 owner 关闭协议封口并收口资源。
+     * @brief 幂等封口，关闭后不可重开。
+     *
+     * 与在途 Start 并发时先封口，再等该次 Start 完成，防止返回后发布资源。
+     * 原生宿主等待已发布的运行时完成物理回收；受管协程与 Processer 上的非协程域不等待后台回收。
      */
-    void Close() noexcept override;
+    void Close() noexcept;
 
     /**
      * @brief 查询实现的物理收口状态。
      */
-    bool IsClosed() const noexcept override;
+    bool IsClosed() const noexcept;
 
     /**
      * @brief 返回创建时取得的对象身份。

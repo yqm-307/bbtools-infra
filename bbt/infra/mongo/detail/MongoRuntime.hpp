@@ -216,15 +216,9 @@ public:
     std::optional<Error> CloseReason() const noexcept;
 
     /**
-     * 同步关闭（ICoCloseable 面，等价「Immediate 封口 + 物理收口」）：取得关闭权
-     * 者封口 → 唤醒全部挂起业务等待者 → 唯一配对 finalizer 等待真实物理落定
-     * （在途 driver 返回 + op 清空 + worker 全退）→ join → 归还本 owner lease →
-     * 发布终态；并发/重复 Close 阻塞等待同一 finalizer 事实后返回，不重复
-     * join/reset、不提前 Closed。返回即 op/worker 已收口，且 runtime 不再接纳新
-     * 命令；driver 自身超时是在途调用返回上界。
-     * 执行域：native 宿主等 finalizer 完成；受管协程（及 Processer 上的非协程域）
-     * 只封口并交后台 finalizer——join 不在 Co worker 上执行，需要物理凭据的协程
-     * 调用方改用 Close(Immediate + wait_release=true)。
+     * 旧客户端入口：封口并交后台 finalizer；只有原生宿主等待物理回收。
+     * 并发宿主调用等待同一回收终态，不重复 join。需要在受管协程等待物理凭据时，
+     * owner 走带有限期限及 wait_release=true 的 Close(CloseOptions)。
      */
     void Close() noexcept;
 

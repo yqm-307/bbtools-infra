@@ -44,7 +44,9 @@ result<void> Close(const CloseOptions& options = {});
 
 net 返回 `std::error_code`，协议 adapter 返回 `result<void>`；不强行合并错误层。连接 `Close(options, native_reason)` 保留原生首因，`options.reason` 的非空协议错误不是 native error，副作用前返回 invalid_argument；Engine 同样拒绝非空协议 reason。Engine 无业务排空或独立 runner；`wait_release` 与现有「主任务完成才关闭宿主」存在自依赖，因此在副作用前明确拒绝该参数，不创建 reaper/runner 或隐式等待 HostGate。此能力限制须由集成方独立确认，不能把 Engine 非等待成功当作物理回收。
 
-`ICoCloseable`、NativeSocket 与旧 CoMongoCli/集合句柄仍是同步低层接口，不是上述 owner 的第二条控制面。socket `Shutdown` 是读写半关闭，不释放 fd，不替换为 Close。
+旧 `CoMongoCli` 与 `mongo::CoMongoColl` 保留各自的 `Close()` / `IsClosed()`，不是 owner 的第二条控制面。旧客户端仅在原生宿主等待已发布资源的物理回收，集合句柄只封自己的接纳；以各自头文件的执行域和状态承诺为准。socket `Shutdown` 是读写半关闭，不释放 fd，不替换为 Close。
+
+移除公共基类 `ICoCloseable`：同一签名不能保证不同资源在相同执行域、相同时机完成回收。直接调用具体类型的方法不变；原来接收该基类的代码改用具体类型，框架组件通过自身生命周期钩子收口。依赖旧公共头或继承关系的代码须迁移，并重新编译受影响的使用方。
 
 ## 4. HTTP 请求与响应所有权
 

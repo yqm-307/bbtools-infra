@@ -27,7 +27,6 @@
 #include <bbt/coroutine/syntax/Async.hpp>
 
 #include <bbt/infra/CloseOptions.hpp>
-#include <bbt/infra/ICoCloseable.hpp>
 #include <bbt/infra/ICoNetwork.hpp>
 #include <bbt/infra/NetworkTypes.hpp>
 #include <bbt/infra/Result.hpp>
